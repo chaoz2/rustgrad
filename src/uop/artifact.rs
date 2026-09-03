@@ -38,51 +38,180 @@ const MAX_SYMBOLIC_DEPTH: usize = 256;
 const MAX_TAG_DEPTH: usize = 64;
 const MAX_TAG_VALUES: usize = 1 << 12;
 
-/// Private RGUA opcode vocabulary. It exists only while encoding or decoding
-/// stable wire tags and is never stored in a UOp node.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WireOpcode {
-    Const,
-    VConst,
-    DefineVar,
-    DefineGlobal,
-    DefineLocal,
-    DefineRegister,
-    Special,
-    Range,
-    EndRange,
-    If,
-    EndIf,
-    Unary(Unary),
-    Binary(Binary),
-    GraphUnary(UnaryOp),
-    GraphBinary(BinaryOp),
-    GraphCompare(CompareOp),
-    GraphLogical(LogicalOp),
-    Threefry,
-    Matmul,
-    Conv2d,
-    Movement,
-    Random,
-    PrefixScan,
-    Sort,
-    TensorGuard,
-    ReduceInit,
-    ReduceAccumulate,
-    ReduceFinalize,
-    Ternary(super::Ternary),
-    Cast,
-    Bitcast,
-    Vectorize,
-    Gep,
-    Index,
-    Load,
-    Store,
-    EffectStore,
-    After,
-    Barrier,
-    Sink,
+macro_rules! wire_subtag {
+    (none) => {
+        None
+    };
+    (unary, $value:ident) => {
+        Some(tag_unary(*$value))
+    };
+    (binary, $value:ident) => {
+        Some(tag_binary(*$value))
+    };
+    (graph_unary, $value:ident) => {
+        Some(tag_graph_unary(*$value))
+    };
+    (graph_binary, $value:ident) => {
+        Some(tag_graph_binary(*$value))
+    };
+    (compare, $value:ident) => {
+        Some(tag_compare(*$value))
+    };
+    (logical, $value:ident) => {
+        Some(tag_logical(*$value))
+    };
+    (ternary, $value:ident) => {{
+        let _ = $value;
+        Some(0)
+    }};
 }
+
+macro_rules! wire_payload {
+    (unary, $reader:ident) => {
+        enum_unary($reader.u8()?)?
+    };
+    (binary, $reader:ident) => {
+        enum_binary($reader.u8()?)?
+    };
+    (graph_unary, $reader:ident) => {
+        enum_graph_unary($reader.u8()?)?
+    };
+    (graph_binary, $reader:ident) => {
+        enum_graph_binary($reader.u8()?)?
+    };
+    (compare, $reader:ident) => {
+        enum_compare($reader.u8()?)?
+    };
+    (logical, $reader:ident) => {
+        enum_logical($reader.u8()?)?
+    };
+    (ternary, $reader:ident) => {
+        match $reader.u8()? {
+            0 => super::Ternary::Where,
+            _ => return Err(ArtifactError::Format("ternary")),
+        }
+    };
+}
+
+macro_rules! write_wire_kind {
+    ($writer:ident, $effects:ident, effect, $tag:literal, $sub:ident $(, $value:ident)?) => {{
+        if !$effects {
+            Err(ArtifactError::Unsupported)
+        } else {
+            $writer.u8($tag)?;
+            if let Some(subtag) = wire_subtag!($sub $(, $value)?) {
+                $writer.u8(subtag)?;
+            }
+            Ok(())
+        }
+    }};
+    ($writer:ident, $effects:ident, $gate:ident, $tag:literal, $sub:ident $(, $value:ident)?) => {{
+        $writer.u8($tag)?;
+        if let Some(subtag) = wire_subtag!($sub $(, $value)?) {
+            $writer.u8(subtag)?;
+        }
+        Ok(())
+    }};
+}
+
+macro_rules! read_wire_kind {
+    ($reader:ident, $version:ident, always, $wire:ident, $sub:ident $(, $payload:ty)?) => {
+        Ok(WireOpcode::$wire $(({
+            let payload: $payload = wire_payload!($sub, $reader);
+            payload
+        }))?)
+    };
+    ($reader:ident, $version:ident, $gate:ident, $wire:ident, $sub:ident $(, $payload:ty)?) => {{
+        if wire_read_allowed!($version, $gate) {
+            Ok(WireOpcode::$wire $(({
+                let payload: $payload = wire_payload!($sub, $reader);
+                payload
+            }))?)
+        } else {
+            Err(ArtifactError::Format("kind tag"))
+        }
+    }};
+}
+
+macro_rules! wire_read_allowed {
+    ($version:ident, v3) => {
+        $version >= 3
+    };
+    ($version:ident, v4) => {
+        $version >= 4
+    };
+    ($version:ident, v9) => {
+        $version >= 9
+    };
+    ($version:ident, v10) => {
+        $version >= 10
+    };
+    ($version:ident, v11) => {
+        $version >= 11
+    };
+    ($version:ident, v16) => {
+        $version >= 16
+    };
+    ($version:ident, v17) => {
+        $version >= 17
+    };
+    ($version:ident, v19) => {
+        $version >= 19
+    };
+    ($version:ident, effect) => {
+        $version == LEGACY_EFFECT_VERSION || $version >= PREVIOUS_EFFECT_VERSION
+    };
+}
+
+macro_rules! define_wire_opcodes {
+    (
+        $(
+            $(#[$docs:meta])*
+            $variant:ident $(($binding:ident : $payload:ty))?
+                => [$arity:ident, $purity:ident, $wire:ident $(($wire_binding:ident : $wire_payload:ty))?, $tag:literal, $gate:ident, $sub:ident];
+        )*
+    ) => {
+        /// Private RGUA opcode vocabulary. It exists only while encoding or decoding
+        /// stable wire tags and is never stored in a UOp node.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum WireOpcode {
+            $(
+                $wire $(($wire_payload))?,
+            )*
+        }
+
+        #[cfg(test)]
+        const STRUCTURAL_WIRE_TAGS: &[u8] = &[$($tag),*];
+
+        fn write_kind(
+            writer: &mut Writer,
+            kind: &WireOpcode,
+            effects: bool,
+        ) -> Result<(), ArtifactError> {
+            match kind {
+                $(
+                    WireOpcode::$wire $(($wire_binding))? => {
+                        write_wire_kind!(writer, effects, $gate, $tag, $sub $(, $wire_binding)?)
+                    }
+                )*
+            }
+        }
+
+        fn read_kind(reader: &mut Reader<'_>, version: u8) -> Result<WireOpcode, ArtifactError> {
+            let tag = reader.u8()?;
+            match tag {
+                $(
+                    $tag => read_wire_kind!(
+                        reader, version, $gate, $wire, $sub $(, $wire_payload)?
+                    ),
+                )*
+                _ => Err(ArtifactError::Format("kind tag")),
+            }
+        }
+    };
+}
+
+super::schema::uop_operation_schema!(define_wire_opcodes);
 
 /// Private owned payload used only by the stable RGUA codec. Runtime UOps
 /// store the corresponding typed [`Operation`] variant directly.
@@ -1419,107 +1548,6 @@ fn read_tag_value(
         }
         _ => Err(ArtifactError::Format("tag kind")),
     }
-}
-
-fn write_kind(w: &mut Writer, kind: &WireOpcode, effects: bool) -> Result<(), ArtifactError> {
-    use WireOpcode::*;
-    let (tag, sub) = match kind {
-        Const => (0, None),
-        VConst => (1, None),
-        DefineVar => (2, None),
-        DefineGlobal => (3, None),
-        DefineLocal => (4, None),
-        DefineRegister => (5, None),
-        Special => (6, None),
-        Range => (7, None),
-        EndRange => (8, None),
-        If => (9, None),
-        EndIf => (10, None),
-        Unary(x) => (11, Some(tag_unary(*x))),
-        Binary(x) => (12, Some(tag_binary(*x))),
-        GraphUnary(x) => (13, Some(tag_graph_unary(*x))),
-        GraphBinary(x) => (14, Some(tag_graph_binary(*x))),
-        GraphCompare(x) => (15, Some(tag_compare(*x))),
-        GraphLogical(x) => (16, Some(tag_logical(*x))),
-        ReduceInit => (17, None),
-        ReduceAccumulate => (18, None),
-        ReduceFinalize => (19, None),
-        Ternary(super::Ternary::Where) => (20, Some(0)),
-        Cast => (21, None),
-        Bitcast => (22, None),
-        Vectorize => (23, None),
-        Gep => (24, None),
-        Index => (25, None),
-        Load => (26, None),
-        Store => (27, None),
-        Barrier => (28, None),
-        Sink => (29, None),
-        Matmul => (30, None),
-        Conv2d => (35, None),
-        Movement => (31, None),
-        Random => (32, None),
-        PrefixScan => (36, None),
-        Sort => (37, None),
-        TensorGuard => (38, None),
-        Threefry => (39, None),
-        EffectStore if effects => (33, None),
-        After if effects => (34, None),
-        EffectStore | After => return Err(ArtifactError::Unsupported),
-    };
-    w.u8(tag)?;
-    if let Some(x) = sub {
-        w.u8(x)?;
-    }
-    Ok(())
-}
-fn read_kind(r: &mut Reader<'_>, version: u8) -> Result<WireOpcode, ArtifactError> {
-    use WireOpcode::*;
-    Ok(match r.u8()? {
-        0 => Const,
-        1 => VConst,
-        2 => DefineVar,
-        3 => DefineGlobal,
-        4 => DefineLocal,
-        5 => DefineRegister,
-        6 => Special,
-        7 => Range,
-        8 => EndRange,
-        9 => If,
-        10 => EndIf,
-        11 => Unary(enum_unary(r.u8()?)?),
-        12 => Binary(enum_binary(r.u8()?)?),
-        13 => GraphUnary(enum_graph_unary(r.u8()?)?),
-        14 => GraphBinary(enum_graph_binary(r.u8()?)?),
-        15 => GraphCompare(enum_compare(r.u8()?)?),
-        16 => GraphLogical(enum_logical(r.u8()?)?),
-        17 => ReduceInit,
-        18 => ReduceAccumulate,
-        19 => ReduceFinalize,
-        20 => Ternary(match r.u8()? {
-            0 => super::Ternary::Where,
-            _ => return Err(ArtifactError::Format("ternary")),
-        }),
-        21 => Cast,
-        22 => Bitcast,
-        23 => Vectorize,
-        24 => Gep,
-        25 => Index,
-        26 => Load,
-        27 => Store,
-        28 => Barrier,
-        29 => Sink,
-        30 if version >= 3 => Matmul,
-        31 if version >= 4 => Movement,
-        32 if version >= 9 => Random,
-        33 if version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION => EffectStore,
-        34 if version == LEGACY_EFFECT_VERSION || version >= PREVIOUS_EFFECT_VERSION => After,
-        35 if version >= 10 => Conv2d,
-        36 if version >= 11 => PrefixScan,
-        37 if version >= 16 => Sort,
-        38 if version >= 17 => TensorGuard,
-        39 if version >= 19 => Threefry,
-        _ => return Err(ArtifactError::Format("kind tag")),
-    })
 }
 
 fn write_arg(w: &mut Writer, arg: &WireArg, effects: bool) -> Result<(), ArtifactError> {
@@ -3339,6 +3367,73 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decode_wire_kind(tag: u8, version: u8) -> Result<WireOpcode, ArtifactError> {
+        let bytes = [tag, 0];
+        read_kind(&mut Reader::new(&bytes), version)
+    }
+
+    #[test]
+    fn structural_wire_schema_preserves_tags_and_discontinuous_gates() {
+        let tags = STRUCTURAL_WIRE_TAGS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tags.len(), STRUCTURAL_WIRE_TAGS.len());
+        assert_eq!(tags, (0_u8..=39).collect::<std::collections::BTreeSet<_>>());
+        for tag in STRUCTURAL_WIRE_TAGS {
+            let kind = decode_wire_kind(*tag, VERSION).unwrap();
+            let mut writer = Writer::new();
+            write_kind(&mut writer, &kind, true).unwrap();
+            assert_eq!(writer.out[0], *tag);
+            assert_eq!(writer.out.get(1).copied().unwrap_or(0), 0);
+        }
+
+        for (tag, introduced) in [
+            (30, 3),
+            (31, 4),
+            (32, 9),
+            (35, 10),
+            (36, 11),
+            (37, 16),
+            (38, 17),
+            (39, 19),
+        ] {
+            assert_eq!(
+                decode_wire_kind(tag, introduced - 1),
+                Err(ArtifactError::Format("kind tag")),
+                "tag {tag} before v{introduced}"
+            );
+            assert!(
+                decode_wire_kind(tag, introduced).is_ok(),
+                "tag {tag} at v{introduced}"
+            );
+        }
+        assert_eq!(decode_wire_kind(0, 2), Ok(WireOpcode::Const));
+        for tag in [33, 34] {
+            assert_eq!(
+                decode_wire_kind(tag, 12),
+                Err(ArtifactError::Format("kind tag"))
+            );
+            assert!(decode_wire_kind(tag, LEGACY_EFFECT_VERSION).is_ok());
+            assert_eq!(
+                decode_wire_kind(tag, 14),
+                Err(ArtifactError::Format("kind tag"))
+            );
+            assert!(decode_wire_kind(tag, PREVIOUS_EFFECT_VERSION).is_ok());
+        }
+
+        for (kind, tag) in [(WireOpcode::EffectStore, 33), (WireOpcode::After, 34)] {
+            let mut writer = Writer::new();
+            assert_eq!(
+                write_kind(&mut writer, &kind, false),
+                Err(ArtifactError::Unsupported)
+            );
+            assert!(writer.out.is_empty());
+            write_kind(&mut writer, &kind, true).unwrap();
+            assert_eq!(writer.out, [tag]);
+        }
+    }
 
     fn finish(mut w: Writer) -> Vec<u8> {
         let sum = checksum(&w.out);

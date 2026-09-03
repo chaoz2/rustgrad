@@ -1559,12 +1559,13 @@ the checked-in compiler uses: text, signed integers, concrete `DType` values,
 and recursively composed tuples. They are rewrite metadata, not operation
 kinds; unsupported arbitrary Python objects have no Rust representation. Each
 `Operation` variant owns its payload, removing the former invalid cross-product
-of an independently stored kind and untyped argument. The enum is declared
-directly and is the sole in-memory operation taxonomy. DAG validation, rewrite
-purity, interpretation, schedules, and renderers match it explicitly where
-their semantic policies differ. Artifact encoding alone projects operations to
-a private wire opcode and payload. Untagged DAGs retain their historical writer
-envelopes and schedule/cache identities. Standalone tagged DAGs use RGUA v22;
+of an independently stored kind and untyped argument. One private structural
+declaration emits that sole in-memory enum, payload-aware source arity, purity,
+and the private RGUA top-level opcode/tag mapping. Contextual dtype/topology
+validation, payload codecs, interpretation, scheduling, and renderer policy
+remain explicit at their semantic boundaries. Untagged DAGs retain their
+historical writer envelopes and schedule/cache identities. Standalone tagged
+DAGs use RGUA v22;
 every admitted pre-v22 artifact decodes with no tag metadata. Executable
 schedule identity rejects a tag until a rewrite explicitly removes it, so
 compilation cannot silently discard metadata or perturb historical cache keys.

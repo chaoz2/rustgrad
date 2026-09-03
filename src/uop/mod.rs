@@ -3,6 +3,7 @@
 use crate::{DType, Shape, SymbolicExpr};
 pub mod artifact;
 mod operation;
+mod schema;
 pub use operation::{
     AddressValue, IndexAddressing, IndexValue, LiteralValue, MatmulValue, MovementValue, Operation,
     PrefixScanValue, ReductionValue, SortValue, TensorGuardValue, ThreefryValue, VariableValue,
@@ -768,17 +769,7 @@ impl UOp {
         Ok(out)
     }
     pub fn is_pure(&self) -> bool {
-        !matches!(
-            self.operation(),
-            Operation::EndRange
-                | Operation::If
-                | Operation::EndIf
-                | Operation::Store
-                | Operation::EffectStore(_)
-                | Operation::After(_)
-                | Operation::Barrier
-                | Operation::Sink
-        )
+        self.operation().is_pure()
     }
     pub fn validate(&self) -> Result<(), UOpError> {
         let nodes = self.topological()?;
@@ -1017,57 +1008,12 @@ impl fmt::Display for UOpError {
 impl std::error::Error for UOpError {}
 fn validate_operation_arity(n: &UOp) -> Result<(), UOpError> {
     let actual = n.sources().len();
-    let (accepted, expected) = match n.operation() {
-        Operation::Const(_)
-        | Operation::VConst(_)
-        | Operation::DefineVar(_)
-        | Operation::DefineGlobal(_)
-        | Operation::DefineLocal(_)
-        | Operation::DefineRegister(_)
-        | Operation::Special(_)
-        | Operation::Matmul(_)
-        | Operation::Conv2d(_)
-        | Operation::Movement(_)
-        | Operation::Random(_)
-        | Operation::Threefry(_)
-        | Operation::PrefixScan(_)
-        | Operation::Sort(_)
-        | Operation::TensorGuard(_)
-        | Operation::ReduceInit(_)
-        | Operation::EffectStore(_)
-        | Operation::Barrier => (actual == 0, "no sources"),
-        Operation::Range(_)
-        | Operation::EndRange
-        | Operation::If
-        | Operation::EndIf
-        | Operation::Unary(_)
-        | Operation::GraphUnary(_)
-        | Operation::ReduceFinalize
-        | Operation::Cast
-        | Operation::Bitcast
-        | Operation::Gep(_)
-        | Operation::Load
-        | Operation::After(_) => (actual == 1, "one source"),
-        Operation::Binary(_)
-        | Operation::GraphBinary(_)
-        | Operation::GraphCompare(_)
-        | Operation::ReduceAccumulate
-        | Operation::Store => (actual == 2, "two sources"),
-        Operation::Index(IndexValue::Buffer {
-            addressing: IndexAddressing::Predicated,
-            ..
-        }) => (actual == 3, "three sources"),
-        Operation::Index(_) => (actual == 2, "two sources"),
-        Operation::GraphLogical(crate::LogicalOp::Not) => (actual == 1, "one source"),
-        Operation::GraphLogical(crate::LogicalOp::And | crate::LogicalOp::Or) => {
-            (actual == 2, "two sources")
-        }
-        Operation::Ternary(_) => (actual == 3, "three sources"),
-        Operation::Vectorize => (actual != 0, "one or more sources"),
-        Operation::Sink => (true, "any source count"),
-    };
-    if !accepted {
-        Err(UOpError::InvalidArity { expected, actual })
+    let arity = n.operation().source_arity();
+    if !arity.accepts(actual) {
+        Err(UOpError::InvalidArity {
+            expected: arity.expected(),
+            actual,
+        })
     } else {
         Ok(())
     }

@@ -1,4 +1,4 @@
-use super::{AddressSpace, AffineView, Binary, Ternary, UType, Unary as CoreUnary};
+use super::{AddressSpace, AffineView, UType};
 use crate::{DType, NodeId, Shape, SymbolicExpr};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -157,59 +157,196 @@ impl ThreefryValue {
     }
 }
 
-/// A closed, typed universal operation. The variant is the semantic identity;
-/// payload-bearing operations cannot exist without their matching payload.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum Operation {
-    Const(LiteralValue),
-    VConst(LiteralValue),
-    DefineVar(VariableValue),
-    DefineGlobal(AddressValue),
-    DefineLocal(AddressValue),
-    DefineRegister(AddressValue),
-    Special(String),
-    Range(u32),
-    EndRange,
-    If,
-    EndIf,
-    Unary(CoreUnary),
-    Binary(Binary),
-    /// High-level ALU semantic retained by the portable interpreter.
-    GraphUnary(crate::UnaryOp),
-    GraphBinary(crate::BinaryOp),
-    GraphCompare(crate::CompareOp),
-    GraphLogical(crate::LogicalOp),
-    /// Live, two-input packed-U64 Threefry2x32 permutation.
-    Threefry(ThreefryValue),
-    /// Complete static generalized-matmul semantic.
-    Matmul(MatmulValue),
-    /// Narrow static F32 NCHW 1x1 convolution semantic.
-    Conv2d(Box<crate::StaticConv2dPlan>),
-    /// Complete materializing concat/gather/scatter semantic and ordered ABI.
-    Movement(MovementValue),
-    /// Captured random source semantic with an immutable stream reservation.
-    Random(Box<crate::random::plan::RandomKernelPlan>),
-    /// Static inclusive prefix scan.
-    PrefixScan(PrefixScanValue),
-    /// Stable CPU-static ordering with values and I32-index outputs.
-    Sort(SortValue),
-    /// Value-preserving CPU-static distribution validation boundary.
-    TensorGuard(TensorGuardValue),
-    ReduceInit(ReductionValue),
-    ReduceAccumulate,
-    ReduceFinalize,
-    Ternary(Ternary),
-    Cast,
-    Bitcast,
-    Vectorize,
-    Gep(u16),
-    Index(IndexValue),
-    Load,
-    Store,
-    /// Immutable graph-adjacent assignment commit; never a pure kernel store.
-    EffectStore(Box<crate::EffectPayload>),
-    /// Orders an effect store after explicitly named predecessor effect IDs.
-    After(Box<crate::EffectPayload>),
-    Barrier,
-    Sink,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceArity {
+    Exact(usize),
+    NonEmpty,
+    Any,
+}
+
+impl SourceArity {
+    pub(crate) fn accepts(self, actual: usize) -> bool {
+        match self {
+            Self::Exact(expected) => actual == expected,
+            Self::NonEmpty => actual != 0,
+            Self::Any => true,
+        }
+    }
+
+    pub(crate) fn expected(self) -> &'static str {
+        match self {
+            Self::Exact(0) => "no sources",
+            Self::Exact(1) => "one source",
+            Self::Exact(2) => "two sources",
+            Self::Exact(3) => "three sources",
+            Self::Exact(_) => "the declared source count",
+            Self::NonEmpty => "one or more sources",
+            Self::Any => "any source count",
+        }
+    }
+}
+
+macro_rules! operation_source_arity {
+    (zero) => {
+        SourceArity::Exact(0)
+    };
+    (zero, $value:ident) => {{
+        let _ = $value;
+        SourceArity::Exact(0)
+    }};
+    (one) => {
+        SourceArity::Exact(1)
+    };
+    (one, $value:ident) => {{
+        let _ = $value;
+        SourceArity::Exact(1)
+    }};
+    (two) => {
+        SourceArity::Exact(2)
+    };
+    (two, $value:ident) => {{
+        let _ = $value;
+        SourceArity::Exact(2)
+    }};
+    (three) => {
+        SourceArity::Exact(3)
+    };
+    (three, $value:ident) => {{
+        let _ = $value;
+        SourceArity::Exact(3)
+    }};
+    (nonempty) => {
+        SourceArity::NonEmpty
+    };
+    (nonempty, $value:ident) => {{
+        let _ = $value;
+        SourceArity::NonEmpty
+    }};
+    (any) => {
+        SourceArity::Any
+    };
+    (any, $value:ident) => {{
+        let _ = $value;
+        SourceArity::Any
+    }};
+    (graph_logical, $value:ident) => {
+        match $value {
+            crate::LogicalOp::Not => SourceArity::Exact(1),
+            crate::LogicalOp::And | crate::LogicalOp::Or => SourceArity::Exact(2),
+        }
+    };
+    (index, $value:ident) => {
+        match $value {
+            IndexValue::Buffer {
+                addressing: IndexAddressing::Predicated,
+                ..
+            } => SourceArity::Exact(3),
+            _ => SourceArity::Exact(2),
+        }
+    };
+}
+
+macro_rules! operation_is_pure {
+    (pure) => {
+        true
+    };
+    (pure, $value:ident) => {{
+        let _ = $value;
+        true
+    }};
+    (impure) => {
+        false
+    };
+    (impure, $value:ident) => {{
+        let _ = $value;
+        false
+    }};
+}
+
+macro_rules! define_operations {
+    (
+        $(
+            $(#[$docs:meta])*
+            $variant:ident $(($binding:ident : $payload:ty))?
+                => [$arity:ident, $purity:ident, $wire:ident $(($wire_binding:ident : $wire_payload:ty))?, $tag:literal, $gate:ident, $sub:ident];
+        )*
+    ) => {
+        /// A closed, typed universal operation. The variant is the semantic identity;
+        /// payload-bearing operations cannot exist without their matching payload.
+        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub enum Operation {
+            $(
+                $(#[$docs])*
+                $variant $(($payload))?,
+            )*
+        }
+
+        impl Operation {
+            pub(crate) fn source_arity(&self) -> SourceArity {
+                match self {
+                    $(
+                        Self::$variant $(($binding))? =>
+                            operation_source_arity!($arity $(, $binding)?),
+                    )*
+                }
+            }
+
+            pub(crate) fn is_pure(&self) -> bool {
+                match self {
+                    $(
+                        Self::$variant $(($binding))? =>
+                            operation_is_pure!($purity $(, $binding)?),
+                    )*
+                }
+            }
+        }
+    };
+}
+
+super::schema::uop_operation_schema!(define_operations);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index(addressing: IndexAddressing) -> Operation {
+        Operation::Index(IndexValue::Buffer {
+            buffer: 0,
+            elements: 1,
+            input_shape: Shape::from([1]),
+            output_shape: Shape::from([1]),
+            addressing,
+        })
+    }
+
+    #[test]
+    fn structural_metadata_handles_payload_arity_and_effects() {
+        assert_eq!(
+            Operation::GraphLogical(crate::LogicalOp::Not).source_arity(),
+            SourceArity::Exact(1)
+        );
+        assert_eq!(
+            Operation::GraphLogical(crate::LogicalOp::And).source_arity(),
+            SourceArity::Exact(2)
+        );
+        assert_eq!(
+            index(IndexAddressing::Broadcast).source_arity(),
+            SourceArity::Exact(2)
+        );
+        assert_eq!(
+            index(IndexAddressing::Projected).source_arity(),
+            SourceArity::Exact(2)
+        );
+        assert_eq!(
+            index(IndexAddressing::Predicated).source_arity(),
+            SourceArity::Exact(3)
+        );
+        assert_eq!(Operation::Vectorize.source_arity(), SourceArity::NonEmpty);
+        assert_eq!(Operation::Sink.source_arity(), SourceArity::Any);
+
+        assert!(Operation::Load.is_pure());
+        assert!(!Operation::Store.is_pure());
+        assert!(!Operation::Barrier.is_pure());
+        assert!(!Operation::Sink.is_pure());
+    }
 }
