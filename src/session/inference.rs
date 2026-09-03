@@ -3,7 +3,8 @@ use crate::nn::{Module, ModuleForward, Parameter, module_input_node_bindings};
 use crate::{
     Backend, CapturedReplayExecutor, CapturedReplayTrace, CapturedSchedule, CompileTrace,
     CpuBackend, DType, Error, ExecutionPlanSummary, ExecutionPlanSummaryError, Graph, NodeId, Op,
-    ReplayError, ReplayInput, Result, Schedule, ScheduleError, TensorData, schedule, schedule_many,
+    ReplayError, ReplayInput, Result, Schedule, ScheduleError, Shape, TensorData, schedule,
+    schedule_many,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
@@ -46,15 +47,15 @@ pub struct InferenceStateLink {
 }
 
 /// One append-only recurrent state update. The output must be an exact raw
-/// Scatter-replace of `updates` into `input` through the live I32 `index`
-/// tensor along `axis`; Metal may then authenticate and execute it in place.
-/// The row-shaped index is a dedicated authenticated input. Model wrappers
-/// that also expose a scalar position must derive it from that scalar and
-/// preserve their equality before constructing this lower-level contract.
+/// Scatter-replace of `updates` into `input` through the materialized I32
+/// `index` tensor along `axis`; Metal may then authenticate and execute it in
+/// place. `index` must be an exact reshape/expand/materialization of the scalar
+/// I32 `position` input.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct InferenceAppendStateLink {
     input: NodeId,
     output: NodeId,
+    position: NodeId,
     index: NodeId,
     updates: NodeId,
     axis: usize,
@@ -64,6 +65,7 @@ impl InferenceAppendStateLink {
     pub const fn new(
         input: NodeId,
         output: NodeId,
+        position: NodeId,
         index: NodeId,
         updates: NodeId,
         axis: usize,
@@ -71,6 +73,7 @@ impl InferenceAppendStateLink {
         Self {
             input,
             output,
+            position,
             index,
             updates,
             axis,
@@ -87,6 +90,10 @@ impl InferenceAppendStateLink {
 
     pub const fn index(self) -> NodeId {
         self.index
+    }
+
+    pub const fn position(self) -> NodeId {
+        self.position
     }
 
     pub const fn updates(self) -> NodeId {
@@ -123,7 +130,8 @@ pub(crate) struct CapturedInferenceState {
 pub(crate) struct CapturedInferenceAppendState {
     pub(crate) link: InferenceAppendStateLink,
     pub(crate) input: ReplayInput,
-    pub(crate) index: ReplayInput,
+    pub(crate) position: ReplayInput,
+    pub(crate) index: crate::BufferDesc,
     pub(crate) updates: crate::BufferDesc,
     pub(crate) output: crate::BufferDesc,
     pub(crate) axis_extent: usize,
@@ -592,6 +600,52 @@ impl CapturedStatefulInference {
     }
 }
 
+fn authenticate_append_index_graph(
+    graph: &Graph,
+    link: InferenceAppendStateLink,
+    index_shape: &Shape,
+) -> std::result::Result<(), CapturedInferenceError> {
+    let Op::Expand {
+        input: reshaped,
+        shape: expanded_shape,
+    } = graph
+        .op(link.index)
+        .map_err(CapturedInferenceError::State)?
+    else {
+        return Err(CapturedInferenceError::Binding(
+            "append index must be one scalar expansion".into(),
+        ));
+    };
+    let Op::Reshape {
+        input: position,
+        shape: scalar_shape,
+    } = graph.op(*reshaped).map_err(CapturedInferenceError::State)?
+    else {
+        return Err(CapturedInferenceError::Binding(
+            "append index must reshape one scalar position".into(),
+        ));
+    };
+    if *position != link.position
+        || scalar_shape.rank() != index_shape.rank()
+        || scalar_shape.dims().iter().any(|&dimension| dimension != 1)
+        || expanded_shape != index_shape
+        || graph
+            .shape(link.position)
+            .map_err(CapturedInferenceError::State)?
+            .dims()
+            != [1]
+        || graph
+            .dtype(link.position)
+            .map_err(CapturedInferenceError::State)?
+            != DType::I32
+    {
+        return Err(CapturedInferenceError::Binding(
+            "append index position lineage is inconsistent".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl CapturedAppendStateInference {
     pub fn from_module_graph(
         module: &(impl Module + ?Sized),
@@ -661,9 +715,12 @@ impl CapturedAppendStateInference {
             graph
                 .op(link.index)
                 .map_err(CapturedInferenceError::State)?;
-            if public.contains(&link.index) {
+            graph
+                .op(link.position)
+                .map_err(CapturedInferenceError::State)?;
+            if public.contains(&link.index) || public.contains(&link.position) {
                 return Err(CapturedInferenceError::Binding(
-                    "append position cannot be a public output".into(),
+                    "append position/index cannot be a public output".into(),
                 ));
             }
             combined.push(link.output);
@@ -689,6 +746,7 @@ impl CapturedAppendStateInference {
         let mut states = Vec::with_capacity(state_links.len());
         let mut state_names = BTreeSet::new();
         let mut shared_index = None;
+        let mut shared_position = None;
         let mut shared_extent = None;
         for link in state_links {
             let Op::Input { name: state_name } = graph
@@ -699,12 +757,14 @@ impl CapturedAppendStateInference {
                     "append state input must be a graph Input".into(),
                 ));
             };
-            let Op::Input { name: index_name } = graph
-                .op(link.index)
+            let Op::Input {
+                name: position_name,
+            } = graph
+                .op(link.position)
                 .map_err(CapturedInferenceError::State)?
             else {
                 return Err(CapturedInferenceError::Binding(
-                    "append position index must be a graph Input".into(),
+                    "append position must be a graph Input".into(),
                 ));
             };
             let Op::Scatter {
@@ -754,6 +814,7 @@ impl CapturedAppendStateInference {
             let index_shape = graph
                 .shape(link.index)
                 .map_err(CapturedInferenceError::State)?;
+            authenticate_append_index_graph(graph, *link, index_shape)?;
             if index_shape
                 != graph
                     .shape(link.updates)
@@ -776,6 +837,9 @@ impl CapturedAppendStateInference {
             if shared_index
                 .replace(link.index)
                 .is_some_and(|id| id != link.index)
+                || shared_position
+                    .replace(link.position)
+                    .is_some_and(|id| id != link.position)
                 || shared_extent
                     .replace(axis_extent)
                     .is_some_and(|extent| extent != axis_extent)
@@ -786,7 +850,7 @@ impl CapturedAppendStateInference {
             }
             if !state_names.insert(state_name.as_str())
                 || inference.resident_bindings.contains_key(state_name)
-                || inference.resident_bindings.contains_key(index_name)
+                || inference.resident_bindings.contains_key(position_name)
             {
                 return Err(CapturedInferenceError::Binding(
                     "append state inputs must not alias immutable residents".into(),
@@ -794,17 +858,25 @@ impl CapturedAppendStateInference {
             }
             let input =
                 captured_owned_input(&inference.capture, link.input, state_name, "append state")?;
-            let index =
-                captured_owned_input(&inference.capture, link.index, index_name, "append index")?;
+            let position = captured_owned_input(
+                &inference.capture,
+                link.position,
+                position_name,
+                "append position",
+            )?;
+            let index = captured_owned_output(&inference.capture, link.index, "append index")?;
             let updates =
                 captured_owned_output(&inference.capture, link.updates, "append updates")?;
             let output = captured_owned_output(&inference.capture, link.output, "append state")?;
             validate_state_descriptors(&input, &output, "append state")?;
             if updates.view.is_some()
                 || updates.read_only
-                || updates.shape != index.desc.shape
+                || index.view.is_some()
+                || index.read_only
+                || index.dtype != DType::I32
+                || updates.shape != index.shape
                 || updates.dtype != DType::F32
-                || updates.bytes != index.desc.bytes
+                || updates.bytes != index.bytes
             {
                 return Err(CapturedInferenceError::Binding(
                     "append update is not an owned dense F32 row".into(),
@@ -828,6 +900,7 @@ impl CapturedAppendStateInference {
             states.push(CapturedInferenceAppendState {
                 link: *link,
                 input,
+                position,
                 index,
                 updates,
                 output,
@@ -853,6 +926,27 @@ impl CapturedAppendStateInference {
                     })
             })
             .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+        let static_links = states
+            .iter()
+            .map(
+                |state| crate::runtime::static_schedule::StaticAppendStateLink {
+                    input: state.input.desc.id,
+                    output: state.output.id,
+                    position: state.position.desc.id,
+                    index: state.index.id,
+                    updates: state.updates.id,
+                    axis: state.link.axis(),
+                    axis_extent: state.axis_extent,
+                    row_elements: state.row_elements,
+                    row_bytes: state.row_bytes,
+                },
+            )
+            .collect::<Vec<_>>();
+        crate::runtime::static_schedule::authenticate_append_state_index_lineage(
+            &inference.capture.items,
+            &static_links,
+        )
+        .map_err(CapturedInferenceError::Binding)?;
         for state in &states {
             let owner = output_owners
                 .get(&state.output.id)
@@ -895,13 +989,13 @@ impl CapturedAppendStateInference {
                 .filter(|item| {
                     item.ordered_inputs()
                         .iter()
-                        .any(|input| input.desc.id == state.index.desc.id)
+                        .any(|input| input.desc.id == state.index.id)
                 })
                 .map(|item| item.id)
                 .collect::<BTreeSet<_>>();
             if index_consumers != append_owner_ids {
                 return Err(CapturedInferenceError::Binding(
-                    "append position must be shared only by append-state owners".into(),
+                    "append index must be shared only by append-state owners".into(),
                 ));
             }
         }
@@ -990,12 +1084,13 @@ fn captured_append_state_identity(
     initial_state: &BTreeMap<String, TensorData>,
 ) -> std::result::Result<u64, CapturedInferenceError> {
     let mut hasher = DefaultHasher::new();
-    "rustgrad-captured-append-state-inference-v1".hash(&mut hasher);
+    "rustgrad-captured-append-state-inference-v2".hash(&mut hasher);
     inference_identity.hash(&mut hasher);
     public_output_count.hash(&mut hasher);
     for state in states {
         state.link.hash(&mut hasher);
         state.input.hash(&mut hasher);
+        state.position.hash(&mut hasher);
         state.index.hash(&mut hasher);
         state.updates.hash(&mut hasher);
         state.output.hash(&mut hasher);
@@ -1430,6 +1525,16 @@ mod tests {
     };
     use crate::{Conv2dOptions, NodeId, Scalar};
 
+    fn append_index(graph: &mut Graph, name: &str, shape: impl Into<Shape>) -> (NodeId, NodeId) {
+        let shape = shape.into();
+        let position = graph.input_dtype(name, [1], DType::I32);
+        let expanded = graph
+            .reshape(position, vec![1; shape.rank()])
+            .and_then(|value| graph.expand(value, shape))
+            .unwrap();
+        (position, expanded)
+    }
+
     struct DuplicateTraversal {
         first: Parameter,
         second: Parameter,
@@ -1773,10 +1878,10 @@ mod tests {
         let module = Sequential::default();
         let mut graph = Graph::new();
         let state = graph.input_dtype("cache", [2, 3], DType::F32);
-        let position = graph.input_dtype("position", [1, 3], DType::I32);
+        let (position, index) = append_index(&mut graph, "position", [1, 3]);
         let update_source = graph.input_dtype("update_source", [1, 3], DType::F32);
         let updates = graph.relu(update_source).unwrap();
-        let output = graph.scatter(state, position, updates, 0).unwrap();
+        let output = graph.scatter(state, index, updates, 0).unwrap();
         let public = graph.square(output).unwrap();
         let initial = BTreeMap::from([(
             "cache".into(),
@@ -1787,7 +1892,7 @@ mod tests {
             &graph,
             &[public],
             &[InferenceAppendStateLink::new(
-                state, output, position, updates, 0,
+                state, output, position, index, updates, 0,
             )],
             initial.clone(),
         )
@@ -1806,12 +1911,47 @@ mod tests {
                 .iter()
                 .all(|input| input.node != updates)
         );
+        assert!(
+            capture
+                .transient_inputs()
+                .iter()
+                .any(|input| input.node == position)
+        );
+        assert!(
+            capture
+                .transient_inputs()
+                .iter()
+                .all(|input| input.node != index)
+        );
+        let index_owner = capture
+            .capture()
+            .items
+            .iter()
+            .find(|item| {
+                item.outputs
+                    .iter()
+                    .any(|output| output.id == index.index() as u64)
+            })
+            .unwrap();
+        let append_output_id = output.index() as u64;
+        let append_owner = capture
+            .capture()
+            .items
+            .iter()
+            .find(|item| {
+                item.outputs
+                    .iter()
+                    .any(|descriptor| descriptor.id == append_output_id)
+            })
+            .unwrap();
+        assert_eq!(index_owner.consumers, [append_owner.id]);
+        assert!(append_owner.dependencies.contains(&index_owner.id));
         let changed = CapturedAppendStateInference::from_module_graph(
             &module,
             &graph,
             &[public],
             &[InferenceAppendStateLink::new(
-                state, output, position, updates, 0,
+                state, output, position, index, updates, 0,
             )],
             BTreeMap::from([(
                 "cache".into(),
@@ -1821,7 +1961,8 @@ mod tests {
         .unwrap();
         assert_ne!(capture.deployment_identity(), changed.deployment_identity());
 
-        let partial_index = graph.input_dtype("partial_position", [1, 1], DType::I32);
+        let (partial_position, partial_index) =
+            append_index(&mut graph, "partial_position", [1, 1]);
         let partial_source = graph.input_dtype("partial_source", [1, 1], DType::F32);
         let partial_update = graph.relu(partial_source).unwrap();
         let partial = graph
@@ -1835,6 +1976,7 @@ mod tests {
                 &[InferenceAppendStateLink::new(
                     state,
                     partial,
+                    partial_position,
                     partial_index,
                     partial_update,
                     0,
@@ -1843,14 +1985,62 @@ mod tests {
             ),
             Err(CapturedInferenceError::Binding(_))
         ));
-        let additive = graph.scatter_add(state, position, updates, 0).unwrap();
+
+        let raw_index = graph.input_dtype("raw_position_row", [1, 3], DType::I32);
+        let raw_output = graph.scatter(state, raw_index, updates, 0).unwrap();
         assert!(matches!(
             CapturedAppendStateInference::from_module_graph(
                 &module,
                 &graph,
                 &[public],
                 &[InferenceAppendStateLink::new(
-                    state, additive, position, updates, 0,
+                    state, raw_output, position, raw_index, updates, 0,
+                )],
+                initial.clone(),
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+
+        let unrelated_position = graph.input_dtype("unrelated_position", [1], DType::I32);
+        assert!(matches!(
+            CapturedAppendStateInference::from_module_graph(
+                &module,
+                &graph,
+                &[public],
+                &[InferenceAppendStateLink::new(
+                    state,
+                    output,
+                    unrelated_position,
+                    index,
+                    updates,
+                    0,
+                )],
+                initial.clone(),
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+
+        let leaked_index = graph.cast(index, DType::F32).unwrap();
+        assert!(matches!(
+            CapturedAppendStateInference::from_module_graph(
+                &module,
+                &graph,
+                &[public, leaked_index],
+                &[InferenceAppendStateLink::new(
+                    state, output, position, index, updates, 0,
+                )],
+                initial.clone(),
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+        let additive = graph.scatter_add(state, index, updates, 0).unwrap();
+        assert!(matches!(
+            CapturedAppendStateInference::from_module_graph(
+                &module,
+                &graph,
+                &[public],
+                &[InferenceAppendStateLink::new(
+                    state, additive, position, index, updates, 0,
                 )],
                 initial.clone(),
             ),
@@ -1863,7 +2053,7 @@ mod tests {
                 &graph,
                 &[state_alias],
                 &[InferenceAppendStateLink::new(
-                    state, output, position, updates, 0,
+                    state, output, position, index, updates, 0,
                 )],
                 initial.clone(),
             ),
@@ -1875,7 +2065,7 @@ mod tests {
                 &graph,
                 &[output],
                 &[InferenceAppendStateLink::new(
-                    state, output, position, updates, 0,
+                    state, output, position, index, updates, 0,
                 )],
                 initial,
             ),

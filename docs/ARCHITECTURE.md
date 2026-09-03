@@ -2562,16 +2562,17 @@ overwrites the uncommitted candidate bank.
 
 `CapturedAppendStateInference` is a narrower Metal-first policy for fixed
 capacity KV-style state. It authenticates an existing raw Scatter-replace as
-one complete F32 row selected by a live I32 index tensor, requires a
-capture-produced dense update buffer with an exact producer dependency,
-requires the state and update to be consumed exclusively by that item, and
-retains the full state output only as a protected downstream owner. The Metal
-plan renders that exact item with a distinct append cache identity, aliases only its proven
+one complete F32 row selected by a device-produced I32 index tensor, requires
+that tensor to be the exact materialized affine expansion of one scalar I32
+position input, requires a capture-produced dense update buffer with an exact
+producer dependency, requires the state and update to be consumed exclusively
+by that item, and retains the full state output only as a protected downstream
+owner. The Metal plan renders that exact item with a distinct append cache identity, aliases only its proven
 input/output descriptors to one physical bank, and launches one work-item per
-row element. The row-shaped index is a dedicated authenticated runtime input;
-a model wrapper that also accepts a scalar position must expand that scalar and
-enforce their equality. Before any driver call, every live index lane must equal
-the session's next committed position and that position must be in range. Later
+row element. The row-shaped index has one captured producer and may be consumed
+by exactly the declared append owners and no others. Before any driver call,
+the scalar source must equal the session's next committed position and that
+position must be in range. Later
 items in the same capture observe the updated bank. A failure may leave only
 the uncommitted row provisional; retry must name the same position and
 overwrites the complete row, while the successful-run count, committed
@@ -2635,9 +2636,9 @@ Each layer materializes one dense
 `[1, kv_heads, 1, head_dim]` key row and value row, then authenticated raw
 Scatter-replace owners append them in place to one fixed
 `[1, kv_heads, max_context, head_dim]` physical bank per tensor. The dedicated
-row-shaped I32 append index and scalar model position are generated from the
-session's single committed position. Every index lane must match that next
-position before driver work. Only `[1, vocab]` logits cross device-to-host.
+row-shaped I32 append index is expanded and materialized on device from the
+scalar model position. The scalar must match the session's next position before
+driver work. Only `[1, vocab]` logits cross device-to-host.
 Position, row-byte/work metrics, state, and output publish only after every layer's K/V
 append and logits succeed, so a partial failure retries and overwrites the same
 uncommitted row without a full-state copy.

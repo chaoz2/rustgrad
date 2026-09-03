@@ -1215,39 +1215,41 @@ pub(crate) struct StaticHostGather {
     pub(crate) index_elements: usize,
 }
 
-fn authenticate_host_gather_index_producer(
+fn authenticate_scalar_expansion_producer(
     index_item: &ScheduleItem,
-    gather_item: &ScheduleItem,
-    link: &StaticHostGather,
+    input: u64,
+    expected_input_desc: Option<&BufferDesc>,
+    index: u64,
     index_shape: &Shape,
+    consumers: &[&ScheduleItem],
 ) -> Result<(), String> {
     index_item
         .kernel
         .validate()
         .map_err(|error| error.to_string())?;
     let [store, end_range] = index_item.kernel.sources() else {
-        return Err("host Gather index producer must be one scalar store".into());
+        return Err("scalar expansion producer must be one store".into());
     };
     let crate::Operation::Sink = index_item.kernel.operation() else {
-        return Err("host Gather index producer must be a scalar sink".into());
+        return Err("scalar expansion producer must be a sink".into());
     };
     let crate::Operation::Store = store.operation() else {
-        return Err("host Gather index producer must contain one store".into());
+        return Err("scalar expansion producer must contain one store".into());
     };
     let [output_index, value] = store.sources() else {
-        return Err("host Gather index store is malformed".into());
+        return Err("scalar expansion store is malformed".into());
     };
     let crate::Operation::Load = value.operation() else {
-        return Err("host Gather index producer is not value-preserving".into());
+        return Err("scalar expansion producer is not value-preserving".into());
     };
     let [input_index] = value.sources() else {
-        return Err("host Gather index load is malformed".into());
+        return Err("scalar expansion load is malformed".into());
     };
     let crate::Operation::EndRange = end_range.operation() else {
-        return Err("host Gather index producer has no terminal range".into());
+        return Err("scalar expansion producer has no terminal range".into());
     };
     let [terminal_range] = end_range.sources() else {
-        return Err("host Gather index terminal range is malformed".into());
+        return Err("scalar expansion terminal range is malformed".into());
     };
     let crate::Operation::Index(crate::IndexValue::Buffer {
         buffer: output_buffer,
@@ -1257,7 +1259,7 @@ fn authenticate_host_gather_index_producer(
         addressing: crate::IndexAddressing::Broadcast,
     }) = output_index.operation()
     else {
-        return Err("host Gather index output addressing is invalid".into());
+        return Err("scalar expansion output addressing is invalid".into());
     };
     let crate::Operation::Index(crate::IndexValue::View {
         buffer: input_buffer,
@@ -1267,36 +1269,53 @@ fn authenticate_host_gather_index_producer(
         view,
     }) = input_index.operation()
     else {
-        return Err("host Gather index source is not an affine view".into());
+        return Err("scalar expansion source is not an affine view".into());
     };
     let [output_address, output_range] = output_index.sources() else {
-        return Err("host Gather index output addressing is malformed".into());
+        return Err("scalar expansion output addressing is malformed".into());
     };
     let [input_address, input_range] = input_index.sources() else {
-        return Err("host Gather index source addressing is malformed".into());
+        return Err("scalar expansion source addressing is malformed".into());
     };
     let crate::Operation::DefineGlobal(output_addressing) = output_address.operation() else {
-        return Err("host Gather index output pointer is malformed".into());
+        return Err("scalar expansion output pointer is malformed".into());
     };
     let crate::Operation::DefineGlobal(input_addressing) = input_address.operation() else {
-        return Err("host Gather index source pointer is malformed".into());
+        return Err("scalar expansion source pointer is malformed".into());
     };
     let crate::Operation::Range(0) = terminal_range.operation() else {
-        return Err("host Gather index range is invalid".into());
+        return Err("scalar expansion range is invalid".into());
     };
     let [extent] = terminal_range.sources() else {
-        return Err("host Gather index range extent is malformed".into());
+        return Err("scalar expansion range extent is malformed".into());
     };
     let crate::Operation::Const(crate::LiteralValue::Int(extent)) = extent.operation() else {
-        return Err("host Gather index range extent is not constant".into());
+        return Err("scalar expansion range extent is not constant".into());
     };
     let [source_binding] = index_item.ordered_inputs() else {
-        return Err("host Gather index producer must have one ordered source".into());
+        return Err("scalar expansion producer must have one ordered source".into());
     };
     crate::schedule::validate_buffer_desc(&source_binding.desc)
         .map_err(|error| error.to_string())?;
-    let Some(captured_view) = link.input_desc.view.as_ref() else {
-        return Err("host Gather scalar has no authenticated affine view".into());
+    let input_desc = &source_binding.desc;
+    if let Some(expected) = expected_input_desc {
+        crate::schedule::validate_buffer_desc(expected).map_err(|error| error.to_string())?;
+        // Replay inputs own the physical scalar descriptor. Each scheduled
+        // expansion owns its local affine view, so one scalar may safely feed
+        // differently shaped authenticated expansions without making the
+        // capture's first retained view authoritative for every consumer.
+        if expected.id != input_desc.id
+            || expected.shape != input_desc.shape
+            || expected.dtype != input_desc.dtype
+            || expected.bytes != input_desc.bytes
+            || expected.alignment != input_desc.alignment
+            || expected.read_only != input_desc.read_only
+        {
+            return Err("scalar expansion physical source is inconsistent".into());
+        }
+    }
+    let Some(captured_view) = input_desc.view.as_ref() else {
+        return Err("scalar expansion source has no authenticated affine view".into());
     };
     let normalized = captured_view
         .normalized_read()
@@ -1305,35 +1324,34 @@ fn authenticate_host_gather_index_producer(
     let elements = index_shape.numel().map_err(|error| error.to_string())?;
     let bytes = elements
         .checked_mul(DType::I32.itemsize())
-        .ok_or_else(|| "host Gather index byte extent overflow".to_owned())?;
+        .ok_or_else(|| "scalar expansion byte extent overflow".to_owned())?;
     let scalar_ty = crate::UType::scalar(DType::I32);
     let range_ty = crate::UType::scalar(DType::I64);
     if index_item.outputs.len() != 1
-        || index_item.node.index() as u64 != link.index
-        || output.id != link.index
+        || index_item.node.index() as u64 != index
+        || output.id != index
         || output.shape != *index_shape
         || output.dtype != DType::I32
         || output.bytes != bytes
         || output.alignment != DType::I32.itemsize()
         || output.view.is_some()
         || output.read_only
-        || source_binding.input_node.index() as u64 != link.input_desc.id
-        || source_binding.desc != link.input_desc
+        || source_binding.input_node.index() as u64 != input_desc.id
         || source_binding.abi_index != 0
-        || link.input_desc.id != link.input
-        || link.input_desc.dtype != DType::I32
-        || link.input_desc.shape.numel().ok() != Some(1)
-        || link.input_desc.bytes != DType::I32.itemsize()
-        || link.input_desc.alignment != DType::I32.itemsize()
-        || !link.input_desc.read_only
-        || captured_view.source_shape != link.input_desc.shape
+        || input_desc.id != input
+        || input_desc.dtype != DType::I32
+        || input_desc.shape.numel().ok() != Some(1)
+        || input_desc.bytes != DType::I32.itemsize()
+        || input_desc.alignment != DType::I32.itemsize()
+        || !input_desc.read_only
+        || captured_view.source_shape != input_desc.shape
         || captured_view.logical_shape != *index_shape
         || view != captured_view
-        || *input_buffer != link.input
+        || *input_buffer != input
         || *input_elements != elements
         || input_shape != index_shape
         || output_shape != index_shape
-        || *output_buffer != link.index
+        || *output_buffer != index
         || *output_elements != elements
         || output_input_shape != index_shape
         || output_output_shape != index_shape
@@ -1344,24 +1362,26 @@ fn authenticate_host_gather_index_producer(
         || input_address.ty() != Some(scalar_ty)
         || terminal_range.ty() != Some(range_ty)
         || *extent
-            != i64::try_from(elements).map_err(|_| "host Gather extent overflow".to_owned())?
+            != i64::try_from(elements).map_err(|_| "scalar expansion extent overflow".to_owned())?
         || output_addressing.space != crate::AddressSpace::Global
-        || output_addressing.name != format!("b{}", link.index)
+        || output_addressing.name != format!("b{index}")
         || output_addressing.element != scalar_ty
         || input_addressing.space != crate::AddressSpace::Global
-        || input_addressing.name != format!("b{}", link.input)
+        || input_addressing.name != format!("b{input}")
         || input_addressing.element != scalar_ty
         || !output_range.shares_node_with(terminal_range)
         || !input_range.shares_node_with(terminal_range)
-        || !gather_item.dependencies.contains(&index_item.id)
-        || index_item.consumers.as_slice() != [gather_item.id]
+        || index_item.consumers != consumers.iter().map(|item| item.id).collect::<Vec<_>>()
+        || consumers
+            .iter()
+            .any(|item| !item.dependencies.contains(&index_item.id))
         || normalized.offset != 0
         || normalized
             .axes
             .iter()
             .any(|axis| axis.stride != 0 || axis.reversed)
     {
-        return Err("host Gather affine provenance is inconsistent".into());
+        return Err("scalar expansion affine provenance is inconsistent".into());
     }
     Ok(())
 }
@@ -1433,7 +1453,61 @@ pub(crate) fn authenticate_host_gather_lineage(
     {
         return Err("host Gather affine provenance is inconsistent".into());
     }
-    authenticate_host_gather_index_producer(index_item, gather_item, link, &index_output.shape)
+    authenticate_scalar_expansion_producer(
+        index_item,
+        link.input,
+        Some(&link.input_desc),
+        link.index,
+        &index_output.shape,
+        &[gather_item],
+    )
+}
+
+/// Reauthenticates one device-produced row index as the exact materialized
+/// affine expansion of the append session's scalar position input.
+pub(crate) fn authenticate_append_state_index_lineage(
+    items: &[ScheduleItem],
+    links: &[StaticAppendStateLink],
+) -> Result<(), String> {
+    let Some(first) = links.first() else {
+        return Err("append-state index lineage is absent".into());
+    };
+    if links
+        .iter()
+        .any(|link| link.index != first.index || link.position != first.position)
+    {
+        return Err("append-state links do not share one position-derived index".into());
+    }
+    let index_items = items
+        .iter()
+        .filter(|item| item.outputs.iter().any(|output| output.id == first.index))
+        .collect::<Vec<_>>();
+    let [index_item] = index_items.as_slice() else {
+        return Err("append-state index must have one captured producer".into());
+    };
+    let index_output = index_item.outputs.primary();
+    let append_outputs = links
+        .iter()
+        .map(|link| link.output)
+        .collect::<BTreeSet<_>>();
+    if append_outputs.len() != links.len() {
+        return Err("append-state outputs must be unique".into());
+    }
+    let consumers = items
+        .iter()
+        .filter(|item| append_outputs.contains(&item.outputs.primary().id))
+        .collect::<Vec<_>>();
+    if consumers.len() != links.len() {
+        return Err("append-state index consumers are incomplete".into());
+    }
+    authenticate_scalar_expansion_producer(
+        index_item,
+        first.position,
+        None,
+        first.index,
+        &index_output.shape,
+        &consumers,
+    )
 }
 
 /// One authenticated fixed-shape input/output pair whose two private slots
@@ -1450,6 +1524,7 @@ pub(crate) struct StaticStateLink {
 pub(crate) struct StaticAppendStateLink {
     pub(crate) input: u64,
     pub(crate) output: u64,
+    pub(crate) position: u64,
     pub(crate) index: u64,
     pub(crate) updates: u64,
     pub(crate) axis: usize,
@@ -1999,6 +2074,10 @@ impl<R> StaticSchedulePlan<R> {
             }
         }
 
+        if !append_state_links.is_empty() {
+            authenticate_append_state_index_lineage(items, &append_state_links)
+                .map_err(A::invalid_binding)?;
+        }
         for link in &append_state_links {
             if link.input == link.output
                 || state_ids.contains(&link.input)
@@ -2025,6 +2104,12 @@ impl<R> StaticSchedulePlan<R> {
             let index = buffers.get(&link.index).ok_or_else(|| {
                 A::invalid_binding(format!("static append index {} is absent", link.index))
             })?;
+            let position = buffers.get(&link.position).ok_or_else(|| {
+                A::invalid_binding(format!(
+                    "static append position {} is absent",
+                    link.position
+                ))
+            })?;
             let updates = buffers.get(&link.updates).ok_or_else(|| {
                 A::invalid_binding(format!("static append updates {} is absent", link.updates))
             })?;
@@ -2034,21 +2119,33 @@ impl<R> StaticSchedulePlan<R> {
             let update_producer = updates.producer.ok_or_else(|| {
                 A::invalid_binding("static append update has no device producer".into())
             })?;
+            let index_producer = index.producer.ok_or_else(|| {
+                A::invalid_binding("static append index has no device producer".into())
+            })?;
             let item = &planned[producer];
             let source_item = &items[producer];
             if input.producer.is_some()
                 || !external_inputs.contains(&link.input)
                 || !protected_outputs.contains(&link.output)
                 || host_outputs.contains(&link.output)
-                || index.producer.is_some()
+                || position.producer.is_some()
+                || !external_inputs.contains(&link.position)
+                || index_producer >= producer
                 || update_producer >= producer
                 || !source_item
                     .dependencies
                     .contains(&items[update_producer].id)
+                || !source_item.dependencies.contains(&items[index_producer].id)
                 || input.dtype != DType::F32
                 || output.dtype != DType::F32
                 || index.dtype != DType::I32
+                || position.dtype != DType::I32
+                || position.source_shape.dims() != [1]
+                || position.elements != 1
+                || position.bytes != DType::I32.itemsize()
+                || position.alignment != DType::I32.itemsize()
                 || updates.dtype != DType::F32
+                || index.source_shape != updates.source_shape
                 || input.source_shape != output.source_shape
                 || input.elements != output.elements
                 || input.bytes != output.bytes
@@ -2608,19 +2705,23 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                     && !value.bytes().is_empty()
             })
             .collect::<Vec<_>>();
-        let report = StaticExecutionReport {
-            h2d_calls: uploads
-                .len()
-                .checked_add(packed_uploads.len())
-                .ok_or_else(A::overflow)?,
-            h2d_bytes: uploads
-                .iter()
-                .map(|(_, bytes)| bytes.len())
-                .chain(packed_uploads.iter().map(|(_, value)| value.bytes().len()))
-                .try_fold(0usize, |total, bytes| {
-                    total.checked_add(bytes).ok_or_else(A::overflow)
-                })?,
-            ..StaticExecutionReport::default()
+        let report = if self.queue.is_some() {
+            StaticExecutionReport {
+                h2d_calls: uploads
+                    .len()
+                    .checked_add(packed_uploads.len())
+                    .ok_or_else(A::overflow)?,
+                h2d_bytes: uploads
+                    .iter()
+                    .map(|(_, bytes)| bytes.len())
+                    .chain(packed_uploads.iter().map(|(_, value)| value.bytes().len()))
+                    .try_fold(0usize, |total, bytes| {
+                        total.checked_add(bytes).ok_or_else(A::overflow)
+                    })?,
+                ..StaticExecutionReport::default()
+            }
+        } else {
+            StaticExecutionReport::default()
         };
         if let Some(queue) = &self.queue {
             for (id, bytes) in &uploads {
@@ -2680,19 +2781,23 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             .iter()
             .map(|id| (*id, vec![0; self.buffer_plans[id].bytes]))
             .collect::<Vec<_>>();
-        let report = StaticExecutionReport {
-            h2d_calls: uploads.len(),
-            h2d_bytes: uploads.iter().try_fold(0usize, |total, (_, bytes)| {
-                total.checked_add(bytes.len()).ok_or_else(A::overflow)
-            })?,
-            d2h_calls: downloads
-                .iter()
-                .filter(|(_, bytes)| !bytes.is_empty())
-                .count(),
-            d2h_bytes: downloads.iter().try_fold(0usize, |total, (_, bytes)| {
-                total.checked_add(bytes.len()).ok_or_else(A::overflow)
-            })?,
-            kernel_launches: self.items.iter().filter(|item| item.extent != 0).count(),
+        let report = if self.queue.is_some() {
+            StaticExecutionReport {
+                h2d_calls: uploads.len(),
+                h2d_bytes: uploads.iter().try_fold(0usize, |total, (_, bytes)| {
+                    total.checked_add(bytes.len()).ok_or_else(A::overflow)
+                })?,
+                d2h_calls: downloads
+                    .iter()
+                    .filter(|(_, bytes)| !bytes.is_empty())
+                    .count(),
+                d2h_bytes: downloads.iter().try_fold(0usize, |total, (_, bytes)| {
+                    total.checked_add(bytes.len()).ok_or_else(A::overflow)
+                })?,
+                kernel_launches: self.items.iter().filter(|item| item.extent != 0).count(),
+            }
+        } else {
+            StaticExecutionReport::default()
         };
 
         if let Some(queue) = &self.queue {
@@ -2774,27 +2879,23 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                     link.axis_extent
                 )));
             }
-            let index = values.get(&link.index).ok_or_else(|| {
-                A::invalid_binding(format!("append index {} is absent", link.index))
+            let position = values.get(&link.position).ok_or_else(|| {
+                A::invalid_binding(format!("append position {} is absent", link.position))
             })?;
-            if index.dtype() != DType::I32
-                || index.shape() != &self.buffer_plans[&link.index].source_shape
+            if position.dtype() != DType::I32
+                || position.shape() != &self.buffer_plans[&link.position].source_shape
             {
                 return Err(A::invalid_binding(
-                    "append index descriptor mismatch".into(),
+                    "append position descriptor mismatch".into(),
                 ));
             }
             let expected = i32::try_from(committed_position).map_err(|_| A::overflow())?;
-            let bytes = index
+            let bytes = position
                 .to_le_bytes()
-                .map_err(|_| A::invalid_binding("append index bytes".into()))?;
-            if bytes.len() != link.row_elements.checked_mul(4).ok_or_else(A::overflow)?
-                || bytes.chunks_exact(4).any(|chunk| {
-                    i32::from_le_bytes(chunk.try_into().expect("four-byte chunk")) != expected
-                })
-            {
+                .map_err(|_| A::invalid_binding("append position bytes".into()))?;
+            if bytes.as_slice() != expected.to_le_bytes().as_slice() {
                 return Err(A::invalid_binding(
-                    "append index is not the next monotonic position".into(),
+                    "append position is not the next monotonic position".into(),
                 ));
             }
         }
