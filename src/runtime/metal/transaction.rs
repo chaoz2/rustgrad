@@ -6,7 +6,64 @@ use crate::{
 use std::collections::BTreeMap;
 
 pub const METAL_TRANSACTION_ABI_VERSION: u32 = 1;
+pub const METAL_INDEXED_MOVEMENT_ABI_VERSION: u32 = 1;
 pub(super) const CLEAN_STATUS: u32 = u32::MAX;
+
+/// Checked status ABI for one data-dependent indexed movement kernel.
+///
+/// The shader stores the lowest invalid row-major index position. The host
+/// reads that exact I32 lane from the already-authenticated input buffer only
+/// after the command has completed; a clean status is the sole publication
+/// authority for the provisional output generation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct MetalIndexedMovementAbi {
+    /// Indexed-movement status schema version.
+    pub version: u32,
+    /// Position of the logical output pointer in the ordinary pointer ABI.
+    pub output_abi_index: usize,
+    /// Position of the dense I32 index pointer in the ordinary pointer ABI.
+    pub index_abi_index: usize,
+    /// Indexed logical axis.
+    pub axis: usize,
+    /// Valid exclusive upper bound for every index lane.
+    pub axis_extent: usize,
+    /// Number of row-major index lanes authenticated by the movement plan.
+    pub index_elements: usize,
+}
+
+impl MetalIndexedMovementAbi {
+    pub(super) fn new(
+        output_abi_index: usize,
+        index_abi_index: usize,
+        axis: usize,
+        axis_extent: usize,
+        index_elements: usize,
+    ) -> Result<Self, MetalError> {
+        if index_elements >= CLEAN_STATUS as usize || (axis_extent == 0 && index_elements != 0) {
+            return Err(MetalError::Unsupported(
+                "indexed movement exceeds the exact Metal status domain".into(),
+            ));
+        }
+        Ok(Self {
+            version: METAL_INDEXED_MOVEMENT_ABI_VERSION,
+            output_abi_index,
+            index_abi_index,
+            axis,
+            axis_extent,
+            index_elements,
+        })
+    }
+
+    pub(super) fn decode(&self, status: u32) -> Result<usize, MetalError> {
+        let index = status as usize;
+        if status == CLEAN_STATUS || index >= self.index_elements {
+            return Err(MetalError::InvalidBinding(
+                "invalid indexed-movement status".into(),
+            ));
+        }
+        Ok(index)
+    }
+}
 
 /// Guarded integer operation encoded in the staged Metal ABI.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

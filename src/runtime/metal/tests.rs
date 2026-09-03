@@ -1,5 +1,6 @@
 use super::renderer::{
-    METAL_PORTABLE_BITCAST_RENDERER_VERSION, METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
+    METAL_INDEXED_MOVEMENT_RENDERER_VERSION, METAL_PORTABLE_BITCAST_RENDERER_VERSION,
+    METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
     METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION, METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
     METAL_PORTABLE_SORT_RENDERER_VERSION, METAL_PORTABLE_THREEFRY_RENDERER_VERSION,
     METAL_RAW_COPY_RENDERER_VERSION, METAL_RENDERER_VERSION,
@@ -1860,7 +1861,9 @@ impl Dispatch for MockDispatch {
             .cloned()
             .ok_or_else(|| MetalError::InvalidBinding("mock semantics absent".into()))?;
         let transaction = semantics.transaction.as_ref();
-        let expected_buffers = semantics.buffers.len() + usize::from(transaction.is_some());
+        let indexed_movement = semantics.indexed_movement.as_ref();
+        let expected_buffers = semantics.buffers.len()
+            + usize::from(transaction.is_some() || indexed_movement.is_some());
         if geometry.extent as usize != semantics.extent
             || geometry.extent_index != semantics.buffers.len()
             || geometry.local == 0
@@ -1914,7 +1917,7 @@ impl Dispatch for MockDispatch {
                 outputs.push((*raw, logical));
             }
         }
-        if let Some(transaction) = transaction {
+        if transaction.is_some() || indexed_movement.is_some() {
             let stored = semantics
                 .buffers
                 .iter()
@@ -1927,18 +1930,42 @@ impl Dispatch for MockDispatch {
                     Ok((abi.clone(), bytes.clone()))
                 })
                 .collect::<Result<Vec<_>, MetalError>>()?;
+            let fault_extent =
+                indexed_movement.map_or(semantics.extent, |indexed| indexed.index_elements);
             let order = if state.fault_order.is_empty() {
-                (0..semantics.extent).collect::<Vec<_>>()
+                (0..fault_extent).collect::<Vec<_>>()
             } else {
                 state.fault_order.clone()
             };
             let mut status = transaction::CLEAN_STATUS;
             for logical in order {
-                if logical >= semantics.extent {
+                if logical >= fault_extent {
                     return Err(MetalError::InvalidBinding(
                         "mock fault order exceeds extent".into(),
                     ));
                 }
+                if let Some(indexed) = indexed_movement {
+                    let (abi, bytes) = stored.get(indexed.index_abi_index).ok_or_else(|| {
+                        MetalError::InvalidBinding("mock indexed buffer absent".into())
+                    })?;
+                    if abi.dtype != DType::I32 || abi.elements != indexed.index_elements {
+                        return Err(MetalError::InvalidBinding(
+                            "mock indexed buffer descriptor mismatch".into(),
+                        ));
+                    }
+                    let start = logical.checked_mul(4).ok_or(MetalError::Overflow)?;
+                    let selected = i32::from_le_bytes(
+                        bytes[start..start + 4]
+                            .try_into()
+                            .map_err(|_| MetalError::Bounds)?,
+                    );
+                    if selected < 0 || selected as usize >= indexed.axis_extent {
+                        status =
+                            status.min(u32::try_from(logical).map_err(|_| MetalError::Overflow)?);
+                    }
+                    continue;
+                }
+                let transaction = transaction.expect("integer transaction present");
                 if let Some(id) =
                     transaction::first_fault_at(transaction, logical, |arg, dtype, logical| {
                         let buffer_id = match arg {
@@ -2322,7 +2349,8 @@ fn execute_mock(
     assert!(Rc::ptr_eq(&pipeline, &cache.load(&rendered).unwrap()));
     assert_eq!(cache.len(), 1);
     let refs = buffers.iter().collect::<Vec<_>>();
-    let completion = if rendered.transaction.is_some() {
+    let transactional = rendered.transaction.is_some() || rendered.indexed_movement().is_some();
+    let completion = if transactional {
         let transaction = pipeline.launch_transactional(&queue, &refs, 8).unwrap();
         assert!(!transaction.query().unwrap());
         transaction.collect().unwrap()
@@ -2334,7 +2362,7 @@ fn execute_mock(
     assert_eq!(completion.extent, rendered.extent);
     assert_eq!(
         completion.retained_resources,
-        rendered.buffers.len() + usize::from(rendered.transaction.is_some()) * 2
+        rendered.buffers.len() + usize::from(transactional) * 2
     );
     let output_abi = rendered.buffers.last().unwrap();
     let mut bytes = vec![0; output_abi.elements * output_abi.dtype.itemsize()];
@@ -2531,12 +2559,331 @@ fn raw_movement_copy_metal_preserves_zero_domain_and_rejects_other_movements() {
     );
     assert_eq!((rendered.extent, rendered.buffers.len()), (4, 2));
 
-    let index = graph.input_dtype("index", [2], DType::I32);
-    let gathered = graph.gather(pad_input, index, 0).unwrap();
+    let unsupported_base = graph.input_dtype("unsupported_base", [2], DType::U64);
+    let unsupported_index = graph.input_dtype("unsupported_index", [2], DType::I32);
+    let gathered = graph
+        .gather(unsupported_base, unsupported_index, 0)
+        .unwrap();
     let gathered_item = schedule(&graph, gathered).unwrap().items.pop().unwrap();
     assert!(matches!(
         renderer.render(&gathered_item.kernel),
-        Err(MetalError::Unsupported(reason)) if reason.contains("only raw AffineCopy and Contiguous")
+        Err(MetalError::Unsupported(reason)) if reason.contains("F32 values and I32 indices")
+    ));
+}
+
+#[test]
+fn indexed_movement_metal_is_checked_f32_i32_and_row_major() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut gather_graph = Graph::new();
+    let input = gather_graph.input_dtype("input", [2, 3], DType::F32);
+    let index = gather_graph.input_dtype("index", [2, 2], DType::I32);
+    let output = gather_graph.gather(input, index, 1).unwrap();
+    let item = schedule(&gather_graph, output)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    rendered
+        .validate_schedule_bindings(item.ordered_inputs())
+        .unwrap();
+    let mut malformed_bindings = item.ordered_inputs().to_vec();
+    malformed_bindings[0].desc.id ^= 1;
+    assert!(matches!(
+        rendered.validate_schedule_bindings(&malformed_bindings),
+        Err(MetalError::InvalidBinding(_))
+    ));
+    let indexed = rendered.indexed_movement().unwrap();
+    assert_eq!(indexed.version, METAL_INDEXED_MOVEMENT_ABI_VERSION);
+    assert_eq!(
+        (indexed.axis, indexed.axis_extent, indexed.index_elements),
+        (1, 3, 4)
+    );
+    assert_eq!((rendered.extent, rendered.buffers.len()), (4, 3));
+    assert!(
+        rendered
+            .source
+            .contains(METAL_INDEXED_MOVEMENT_RENDERER_VERSION)
+    );
+    assert!(rendered.source.contains("atomic_fetch_min_explicit"));
+    assert!(rendered.source.contains("device const int* b1"));
+    assert_eq!(
+        renderer.render(&item.kernel).unwrap().cache_key,
+        rendered.cache_key
+    );
+    let (actual, _) = execute_mock(
+        &gather_graph,
+        output,
+        &HashMap::from([
+            (
+                "input".into(),
+                TensorData::new([2, 3], vec![10.0, 11.0, 12.0, 20.0, 21.0, 22.0]).unwrap(),
+            ),
+            (
+                "index".into(),
+                TensorData::from_storage([2, 2], Storage::I32(vec![2, 0, 1, 1])).unwrap(),
+            ),
+        ]),
+    );
+    assert_eq!(
+        actual,
+        TensorData::new([2, 2], vec![12.0, 10.0, 21.0, 21.0]).unwrap()
+    );
+
+    for add in [false, true] {
+        let mut graph = Graph::new();
+        let base = graph.input_dtype("base", [1, 4], DType::F32);
+        let index = graph.input_dtype("index", [1, 3], DType::I32);
+        let updates = graph.input_dtype("updates", [1, 3], DType::F32);
+        let output = if add {
+            graph.scatter_add(base, index, updates, 1).unwrap()
+        } else {
+            graph.scatter(base, index, updates, 1).unwrap()
+        };
+        let (actual, _) = execute_mock(
+            &graph,
+            output,
+            &HashMap::from([
+                (
+                    "base".into(),
+                    TensorData::new([1, 4], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                ),
+                (
+                    "index".into(),
+                    TensorData::from_storage([1, 3], Storage::I32(vec![2, 1, 2])).unwrap(),
+                ),
+                (
+                    "updates".into(),
+                    TensorData::new([1, 3], vec![10.0, 20.0, 30.0]).unwrap(),
+                ),
+            ]),
+        );
+        let expected = if add {
+            vec![1.0, 22.0, 43.0, 4.0]
+        } else {
+            vec![1.0, 20.0, 30.0, 4.0]
+        };
+        assert_eq!(actual, TensorData::new([1, 4], expected).unwrap());
+    }
+
+    let mut graph = Graph::new();
+    let base = graph.input_dtype("base", [1], DType::F32);
+    let index = graph.input_dtype("index", [2], DType::I32);
+    let updates = graph.input_dtype("updates", [2], DType::F32);
+    let output = graph.scatter_add(base, index, updates, 0).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert!(rendered.source.contains("float rg_value = b0[gid]"));
+    assert!(rendered.source.contains("rg_value +="));
+    let (actual, _) = execute_mock(
+        &graph,
+        output,
+        &HashMap::from([
+            (
+                "base".into(),
+                TensorData::new([1], vec![100_000_000.0]).unwrap(),
+            ),
+            (
+                "index".into(),
+                TensorData::from_storage([2], Storage::I32(vec![0, 0])).unwrap(),
+            ),
+            (
+                "updates".into(),
+                TensorData::new([2], vec![1.0, -100_000_000.0]).unwrap(),
+            ),
+        ]),
+    );
+    assert_eq!(actual, TensorData::new([1], vec![0.0]).unwrap());
+}
+
+#[test]
+fn indexed_movement_metal_rejects_bad_indices_before_publication_and_retries() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [3], DType::F32);
+    let index = graph.input_dtype("index", [2], DType::I32);
+    let output = graph.gather(input, index, 0).unwrap();
+    let item = schedule(&graph, output).unwrap().items.pop().unwrap();
+    let rendered = MetalRenderer::new(2, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    let indexed = rendered.indexed_movement().unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock.clone());
+    let values = BTreeMap::from([
+        (
+            input.index() as u64,
+            TensorData::new([3], vec![4.0, 5.0, 6.0]).unwrap(),
+        ),
+        (
+            index.index() as u64,
+            TensorData::from_storage([2], Storage::I32(vec![3, -1])).unwrap(),
+        ),
+    ]);
+    mock.state.lock().unwrap().fault_order = vec![1, 0];
+    let buffers = allocate_rendered(&device, &queue, &rendered, &values);
+    let refs = buffers.iter().collect::<Vec<_>>();
+    let output_buffer = &buffers[indexed.output_abi_index];
+    let sentinel = [0x5a; 8];
+    queue.write(output_buffer, 0, &sentinel).unwrap();
+    let generation = output_buffer.generation();
+    let pipeline = device.cache().load(&rendered).unwrap();
+    assert!(matches!(
+        pipeline.launch(&queue, &refs, 2),
+        Err(MetalError::InvalidArgument(
+            "guarded kernel requires transactional launch"
+        ))
+    ));
+    assert_eq!(
+        pipeline
+            .launch_transactional(&queue, &refs, 2)
+            .unwrap()
+            .wait()
+            .unwrap_err(),
+        MetalError::IndexOutOfBounds {
+            axis: 0,
+            index: 0,
+            value: 3,
+            dim: 3,
+        }
+    );
+    let mut unchanged = [0; 8];
+    queue.read(output_buffer, 0, &mut unchanged).unwrap();
+    assert_eq!(unchanged, sentinel);
+    assert_eq!(output_buffer.generation(), generation);
+
+    queue
+        .write(
+            &buffers[indexed.index_abi_index],
+            0,
+            &TensorData::from_storage([2], Storage::I32(vec![1, 2]))
+                .unwrap()
+                .to_le_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+    pipeline
+        .launch_transactional(&queue, &refs, 2)
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(output_buffer.generation(), generation + 1);
+    let mut bytes = [0; 8];
+    queue.read(output_buffer, 0, &mut bytes).unwrap();
+    assert_eq!(
+        bytes,
+        [5.0f32.to_le_bytes(), 6.0f32.to_le_bytes()]
+            .concat()
+            .as_slice()
+    );
+}
+
+#[test]
+fn captured_indexed_movement_metal_is_atomic_and_projects_duplicate_outputs() {
+    let mut graph = Graph::new();
+    let source = graph.input_dtype("source", [3], DType::F32);
+    let input = graph.square(source).unwrap();
+    let index = graph.input_dtype("index", [2], DType::I32);
+    let output = graph.gather(input, index, 0).unwrap();
+    let requested = [output, output];
+    let scheduled = crate::schedule_many(&graph, &requested).unwrap();
+    let capture = CapturedSchedule::capture(&graph, &scheduled, &requested).unwrap();
+    let capture = CapturedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+    let plan = MetalDeviceSessionPlan::from_capture(
+        capture,
+        std::iter::empty(),
+        MetalRenderer::new(2, capabilities()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.summary().requested_output_count, 2);
+    assert_eq!(plan.rendered_items().count(), 2);
+    assert!(
+        plan.rendered_items()
+            .any(|rendered| rendered.indexed_movement().is_some())
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = plan.prepare(test_device(mock), BTreeMap::new()).unwrap();
+    let input_value = TensorData::new([3], vec![4.0, 5.0, 6.0]).unwrap();
+    let bad = BTreeMap::from([
+        ("source".into(), input_value.clone()),
+        (
+            "index".into(),
+            TensorData::from_storage([2], Storage::I32(vec![3, 0])).unwrap(),
+        ),
+    ]);
+    assert_eq!(
+        session.run(&bad).err().expect("invalid index must fail"),
+        MetalError::IndexOutOfBounds {
+            axis: 0,
+            index: 0,
+            value: 3,
+            dim: 3,
+        }
+    );
+    assert_eq!(session.successful_run_count(), 0);
+    let run = session
+        .run(&BTreeMap::from([
+            ("source".into(), input_value),
+            (
+                "index".into(),
+                TensorData::from_storage([2], Storage::I32(vec![2, 0])).unwrap(),
+            ),
+        ]))
+        .unwrap();
+    assert_eq!(session.successful_run_count(), 1);
+    assert_eq!(run.outputs().len(), 2);
+    assert_eq!(
+        run.outputs()[0],
+        TensorData::new([2], vec![36.0, 16.0]).unwrap()
+    );
+    assert_eq!(run.outputs()[0], run.outputs()[1]);
+    assert_eq!(run.report().kernel_launch_count, 2);
+}
+
+#[test]
+fn indexed_movement_metal_zero_domain_is_resource_free_and_dtypes_fail_closed() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut empty = Graph::new();
+    let input = empty.input_dtype("input", [0, 4], DType::F32);
+    let index = empty.input_dtype("index", [0, 2], DType::I32);
+    let output = empty.gather(input, index, 1).unwrap();
+    let requested = [output, output];
+    let scheduled = crate::schedule_many(&empty, &requested).unwrap();
+    let capture = CapturedSchedule::capture(&empty, &scheduled, &requested).unwrap();
+    let plan = MetalDeviceSessionPlan::from_capture(capture, std::iter::empty(), renderer.clone())
+        .unwrap();
+    assert_eq!(plan.summary().nonzero_item_count, 0);
+    assert_eq!(plan.summary().zero_item_count, 1);
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut session = plan.prepare(device, BTreeMap::new()).unwrap();
+    assert!(mock.calls().is_empty());
+    let run = session
+        .run(&BTreeMap::from([
+            (
+                "input".into(),
+                TensorData::from_storage([0, 4], Storage::F32(Vec::new())).unwrap(),
+            ),
+            (
+                "index".into(),
+                TensorData::from_storage([0, 2], Storage::I32(Vec::new())).unwrap(),
+            ),
+        ]))
+        .unwrap();
+    assert!(mock.calls().is_empty());
+    assert_eq!(run.outputs().len(), 2);
+    assert!(run.outputs()[0].is_empty());
+    assert_eq!(run.report().kernel_launch_count, 0);
+
+    let mut i64_indexed = Graph::new();
+    let input = i64_indexed.input_dtype("input", [1], DType::F32);
+    let index = i64_indexed.input_dtype("index", [1], DType::I64);
+    let output = i64_indexed.gather(input, index, 0).unwrap();
+    let item = schedule(&i64_indexed, output).unwrap().items.pop().unwrap();
+    assert!(matches!(
+        renderer.render(&item.kernel),
+        Err(MetalError::Unsupported(reason)) if reason.contains("F32 values and I32 indices")
     ));
 }
 

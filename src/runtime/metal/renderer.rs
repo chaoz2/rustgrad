@@ -20,6 +20,7 @@ pub const METAL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-metal-raw-copy-v1";
 pub const METAL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-metal-portable-bitcast-v1";
 pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-dense-materialization-v1";
+pub const METAL_INDEXED_MOVEMENT_RENDERER_VERSION: &str = "rustgrad-metal-indexed-movement-v1";
 pub const METAL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-metal-static-position-v1";
 pub const METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-f32-matmul-v1";
@@ -69,11 +70,20 @@ pub struct RenderedMetal {
     pub capabilities: MetalCapabilities,
     /// Guard/status metadata when the output must be committed transactionally.
     pub transaction: Option<MetalTransactionAbi>,
+    /// Renderer-private data-dependent movement status contract. Keeping it
+    /// separate preserves every historical integer-transaction cache key.
+    pub(super) indexed_movement: Option<super::MetalIndexedMovementAbi>,
     pub(super) schedule_inputs: Vec<MetalBufferAbi>,
     pub(super) semantic_program: Arc<super::dispatch::KernelSemanticProgram>,
 }
 
 impl RenderedMetal {
+    /// Returns the checked data-dependent movement status contract, when this
+    /// artifact uses one. Its presence requires transactional launch.
+    pub fn indexed_movement(&self) -> Option<&super::MetalIndexedMovementAbi> {
+        self.indexed_movement.as_ref()
+    }
+
     /// Validates schedule-owned first-use ordering against the Metal pointer ABI.
     pub fn validate_schedule_bindings(
         &self,
@@ -129,6 +139,18 @@ impl RenderedMetal {
             )
         {
             crate::movement_plan::PortableDenseMaterialization::new(plan)
+                .and_then(|portable| portable.validate_schedule_bindings(bindings))
+                .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+        }
+        if let super::dispatch::KernelSemanticProgram::UOp(root) = self.semantic_program.as_ref()
+            && let Operation::Movement(MovementValue::Plan(plan)) = root.operation()
+            && matches!(
+                &plan.kind,
+                crate::MovementKernelKind::Gather { .. }
+                    | crate::MovementKernelKind::Scatter { .. }
+            )
+        {
+            crate::movement_plan::PortableIndexedMovement::new(plan)
                 .and_then(|portable| portable.validate_schedule_bindings(bindings))
                 .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
         }
@@ -218,6 +240,15 @@ impl MetalRenderer {
                     ) =>
                 {
                     render_portable_dense_materialization(self, root, plan)
+                }
+                MovementValue::Plan(plan)
+                    if matches!(
+                        &plan.kind,
+                        crate::MovementKernelKind::Gather { .. }
+                            | crate::MovementKernelKind::Scatter { .. }
+                    ) =>
+                {
+                    render_indexed_movement(self, root, plan)
                 }
                 MovementValue::Plan(plan) => render_raw_copy(self, root, plan),
                 MovementValue::QuantizedRowGather(_) => Err(MetalError::Unsupported(
@@ -502,6 +533,7 @@ impl MetalRenderer {
             cache_key,
             capabilities: self.capabilities.clone(),
             transaction,
+            indexed_movement: None,
             schedule_inputs,
             semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
                 root.clone(),
@@ -600,6 +632,7 @@ fn render_portable_threefry(
         cache_key,
         capabilities: renderer.capabilities.clone(),
         transaction: None,
+        indexed_movement: None,
         schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -722,6 +755,7 @@ fn render_portable_sort(
         cache_key,
         capabilities: renderer.capabilities.clone(),
         transaction: None,
+        indexed_movement: None,
         schedule_inputs: vec![input],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -820,6 +854,7 @@ fn render_portable_prefix_scan(
         cache_key,
         capabilities: renderer.capabilities.clone(),
         transaction: None,
+        indexed_movement: None,
         schedule_inputs: vec![input],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -1149,6 +1184,7 @@ fn render_portable_f32_matmul(
         cache_key,
         capabilities: renderer.capabilities.clone(),
         transaction: None,
+        indexed_movement: None,
         schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -1229,6 +1265,7 @@ fn render_portable_bitcast(
         cache_key,
         capabilities: renderer.capabilities.clone(),
         transaction: None,
+        indexed_movement: None,
         schedule_inputs: vec![input_abi],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -1324,11 +1361,279 @@ fn render_portable_dense_materialization(
         cache_key,
         capabilities: renderer.capabilities.clone(),
         transaction: None,
+        indexed_movement: None,
         schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
         ))),
     })
+}
+
+fn render_indexed_movement(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    plan: &crate::MovementKernelPlan,
+) -> Result<RenderedMetal, MetalError> {
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let portable = crate::movement_plan::PortableIndexedMovement::new(plan).map_err(|error| {
+        if matches!(error, crate::MovementPlanError::UnsupportedDType) {
+            MetalError::Unsupported(
+                "Metal indexed movement requires F32 values and I32 indices".into(),
+            )
+        } else {
+            MetalError::InvalidBinding(error.to_string())
+        }
+    })?;
+    if portable.output_elements() > u32::MAX as usize {
+        return Err(MetalError::Unsupported(
+            "Metal indexed movement output exceeds uint thread indexing".into(),
+        ));
+    }
+    let mut buffers = portable
+        .inputs()
+        .iter()
+        .map(|input| {
+            Ok(MetalBufferAbi {
+                id: input.node.index() as u64,
+                dtype: input.dtype,
+                source_shape: input.shape.clone(),
+                elements: input.shape.numel().map_err(|_| MetalError::Overflow)?,
+                mutable: false,
+                view: None,
+            })
+        })
+        .collect::<Result<Vec<_>, MetalError>>()?;
+    let schedule_inputs = buffers.clone();
+    let output_position = buffers.len();
+    buffers.push(MetalBufferAbi {
+        id: plan.output.index() as u64,
+        dtype: plan.dtype,
+        source_shape: plan.output_shape.clone(),
+        elements: portable.output_elements(),
+        mutable: true,
+        view: None,
+    });
+    let transaction = super::MetalIndexedMovementAbi::new(
+        output_position,
+        portable.index_abi(),
+        portable.axis(),
+        portable.axis_extent(),
+        portable.index_elements(),
+    )?;
+    let entry = match portable.scatter_add() {
+        None => "rg_metal_gather_f32_i32",
+        Some(false) => "rg_metal_scatter_f32_i32",
+        Some(true) => "rg_metal_scatter_add_f32_i32",
+    }
+    .to_owned();
+    let mut lines = vec![
+        format!("// {METAL_INDEXED_MOVEMENT_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        format!("kernel void {entry}("),
+    ];
+    for (position, input) in portable.inputs().iter().enumerate() {
+        lines.push(format!(
+            "    device const {}* b{position} [[buffer({position})]],",
+            metal_storage_type(input.dtype)
+        ));
+    }
+    lines.extend([
+        format!("    device float* b{output_position} [[buffer({output_position})]],"),
+        format!("    constant ulong& extent [[buffer({})]],", buffers.len()),
+        format!(
+            "    device atomic_uint* rg_status [[buffer({})]],",
+            buffers.len() + 1
+        ),
+        "    uint rg_gid [[thread_position_in_grid]]) {".into(),
+        "  const ulong gid = (ulong)rg_gid;".into(),
+        "  if (gid >= extent) return;".into(),
+    ]);
+    if portable.output_elements() != 0 {
+        match portable.scatter_add() {
+            None => emit_metal_gather_body(&portable, output_position, &mut lines),
+            Some(add) => emit_metal_scatter_body(&portable, output_position, add, &mut lines),
+        }
+    }
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        METAL_INDEXED_MOVEMENT_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.plan(),
+        &source,
+        &buffers,
+        &transaction,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        buffers,
+        extent: portable.output_elements(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        indexed_movement: Some(transaction),
+        schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
+}
+
+fn indexed_coordinate(linear: &str, divisor: usize, dimension: usize) -> String {
+    format!("(({linear} / (ulong){divisor}ul) % (ulong){dimension}ul)")
+}
+
+fn emit_metal_gather_body(
+    portable: &crate::movement_plan::PortableIndexedMovement<'_>,
+    output_position: usize,
+    lines: &mut Vec<String>,
+) {
+    let index = portable.index_abi();
+    lines.push(format!("  const int rg_selected = b{index}[gid];"));
+    lines.push(format!(
+        "  if (rg_selected < 0 || (ulong)rg_selected >= (ulong){}ul) {{",
+        portable.axis_extent()
+    ));
+    lines.push("    atomic_fetch_min_explicit(rg_status, rg_gid, memory_order_relaxed);".into());
+    lines.push("    return;".into());
+    lines.push("  }".into());
+    let source = portable
+        .axes()
+        .iter()
+        .map(|axis| {
+            let coordinate = if axis.axis == portable.axis() {
+                "(ulong)rg_selected".into()
+            } else {
+                indexed_coordinate("gid", axis.index_divisor, axis.index_dimension)
+            };
+            format!("({coordinate} * (ulong){}ul)", axis.data_stride)
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    lines.push(format!(
+        "  b{output_position}[gid] = b0[{}];",
+        if source.is_empty() { "0ul" } else { &source }
+    ));
+}
+
+fn emit_metal_scatter_body(
+    portable: &crate::movement_plan::PortableIndexedMovement<'_>,
+    output_position: usize,
+    add: bool,
+    lines: &mut Vec<String>,
+) {
+    lines.push("  float rg_value = b0[gid];".into());
+    if portable.index_elements() != 0 {
+        let index = portable.index_abi();
+        let update = portable
+            .update_abi()
+            .expect("checked Scatter has an update operand");
+        let indexed_axis = portable
+            .axes()
+            .iter()
+            .find(|axis| axis.axis == portable.axis())
+            .expect("checked Scatter axis");
+        let destination_coordinates = portable
+            .axes()
+            .iter()
+            .map(|axis| {
+                (
+                    axis.axis,
+                    indexed_coordinate("gid", axis.data_divisor, axis.data_dimension),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let covered = portable
+            .axes()
+            .iter()
+            .filter(|axis| axis.axis != portable.axis())
+            .map(|axis| {
+                format!(
+                    "({} < (ulong){}ul)",
+                    destination_coordinates[&axis.axis], axis.index_dimension
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let index_base = portable
+            .axes()
+            .iter()
+            .filter(|axis| axis.axis != portable.axis())
+            .map(|axis| {
+                format!(
+                    "({} * (ulong){}ul)",
+                    destination_coordinates[&axis.axis], axis.index_divisor
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+        lines.push(format!(
+            "  if ({}) {{",
+            if covered.is_empty() { "true" } else { &covered }
+        ));
+        lines.push(format!(
+            "    const ulong rg_index_base = {};",
+            if index_base.is_empty() {
+                "0ul"
+            } else {
+                &index_base
+            }
+        ));
+        lines.push(format!(
+            "    for (ulong rg_axis_index = 0ul; rg_axis_index < (ulong){}ul; ++rg_axis_index) {{",
+            indexed_axis.index_dimension
+        ));
+        lines.push(format!(
+            "      const ulong rg_index = rg_index_base + rg_axis_index * (ulong){}ul;",
+            indexed_axis.index_divisor
+        ));
+        lines.push(format!("      const int rg_selected = b{index}[rg_index];"));
+        lines.push(format!(
+            "      if (rg_selected < 0 || (ulong)rg_selected >= (ulong){}ul) {{",
+            portable.axis_extent()
+        ));
+        lines.push(
+            "        atomic_fetch_min_explicit(rg_status, (uint)rg_index, memory_order_relaxed);"
+                .into(),
+        );
+        lines.push("        continue;".into());
+        lines.push("      }".into());
+        let update_offset = portable
+            .axes()
+            .iter()
+            .map(|axis| {
+                let coordinate = if axis.axis == portable.axis() {
+                    "rg_axis_index"
+                } else {
+                    &destination_coordinates[&axis.axis]
+                };
+                format!(
+                    "({coordinate} * (ulong){}ul)",
+                    axis.update_stride.expect("checked update stride")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let operator = if add { "+=" } else { "=" };
+        lines.push(format!(
+            "      if ({} == (ulong)rg_selected) rg_value {operator} b{update}[{}];",
+            destination_coordinates[&portable.axis()],
+            if update_offset.is_empty() {
+                "0ul"
+            } else {
+                &update_offset
+            }
+        ));
+        lines.push("    }".into());
+        lines.push("  }".into());
+    }
+    lines.push(format!("  b{output_position}[gid] = rg_value;"));
 }
 
 fn render_raw_copy(
@@ -1442,6 +1747,7 @@ fn render_raw_copy(
         cache_key,
         capabilities: renderer.capabilities.clone(),
         transaction: None,
+        indexed_movement: None,
         schedule_inputs: vec![input_abi],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),
@@ -1573,6 +1879,7 @@ fn render_static_positions(
         cache_key,
         capabilities: renderer.capabilities.clone(),
         transaction: None,
+        indexed_movement: None,
         schedule_inputs: vec![input_abi],
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
             root.clone(),

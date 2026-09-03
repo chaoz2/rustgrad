@@ -320,6 +320,219 @@ pub(crate) struct PortableDenseMaterialization<'a> {
     elements: usize,
 }
 
+/// One checked row-major coordinate term shared by portable indexed movement.
+/// The index coordinate is `(linear / index_divisor) % index_dimension`;
+/// `data_stride` and `update_stride` project it into the dense data operands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PortableIndexedAxis {
+    pub(crate) axis: usize,
+    pub(crate) index_dimension: usize,
+    pub(crate) index_divisor: usize,
+    pub(crate) data_dimension: usize,
+    pub(crate) data_divisor: usize,
+    pub(crate) data_stride: usize,
+    pub(crate) update_stride: Option<usize>,
+}
+
+/// Existing Gather/Scatter semantics projected into a checked dense pointer ABI.
+///
+/// This is deliberately a borrowed view of [`MovementKernelPlan`], not another
+/// movement operation. It authenticates the exact F32/I32 Metal subset and
+/// provides all row-major geometry so the renderer only spells MSL.
+#[derive(Clone, Debug)]
+pub(crate) struct PortableIndexedMovement<'a> {
+    plan: &'a MovementKernelPlan,
+    inputs: Vec<&'a MovementOperand>,
+    axes: Vec<PortableIndexedAxis>,
+    index_abi: usize,
+    update_abi: Option<usize>,
+    axis: usize,
+    axis_extent: usize,
+    index_elements: usize,
+    output_elements: usize,
+    add: Option<bool>,
+}
+
+/// Applies one validated ScatterAdd update in the output storage dtype.
+///
+/// ScatterAdd is an ordered sequence of tensor writes, so each F32 update is
+/// rounded at that write boundary before a later duplicate observes it. F64
+/// storage already has the same width as [`Scalar::F`].
+pub(crate) fn scatter_add_storage_value(dtype: DType, lhs: Scalar, rhs: Scalar) -> Scalar {
+    match dtype {
+        DType::F32 => Scalar::F(f64::from(lhs.as_f64() as f32 + rhs.as_f64() as f32)),
+        DType::F64 => Scalar::F(lhs.as_f64() + rhs.as_f64()),
+        _ => unreachable!("validated ScatterAdd output is F32 or F64"),
+    }
+}
+
+impl<'a> PortableIndexedMovement<'a> {
+    pub(crate) fn new(plan: &'a MovementKernelPlan) -> Result<Self, MovementPlanError> {
+        plan.validate()?;
+        if plan.dtype != DType::F32 {
+            return Err(MovementPlanError::UnsupportedDType);
+        }
+        let (data, index, updates, axis, add) = match &plan.kind {
+            MovementKernelKind::Gather { input, index, axis } => {
+                if input.dtype != DType::F32 {
+                    return Err(MovementPlanError::UnsupportedDType);
+                }
+                (input, index, None, *axis, None)
+            }
+            MovementKernelKind::Scatter {
+                base,
+                index,
+                updates,
+                axis,
+                add,
+            } => {
+                if base.dtype != DType::F32 || updates.dtype != DType::F32 {
+                    return Err(MovementPlanError::UnsupportedDType);
+                }
+                (base, index, Some(updates), *axis, Some(*add))
+            }
+            _ => return Err(MovementPlanError::InvalidGeometry),
+        };
+        if index.dtype != DType::I32 {
+            return Err(MovementPlanError::UnsupportedDType);
+        }
+        let index_elements = index
+            .shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?;
+        let output_elements = plan
+            .output_shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?;
+        let axis_extent = *data
+            .shape
+            .dims()
+            .get(axis)
+            .ok_or(MovementPlanError::InvalidGeometry)?;
+        // A nonempty index domain into an empty axis is unconditionally invalid;
+        // reject it before a renderer can manufacture an address or resource.
+        if axis_extent == 0 && index_elements != 0 {
+            return Err(MovementPlanError::InvalidGeometry);
+        }
+
+        let index_strides = checked_dense_strides(&index.shape)?;
+        let data_strides = checked_dense_strides(&data.shape)?;
+        let update_strides = updates
+            .map(|value| checked_dense_strides(&value.shape))
+            .transpose()?;
+        let output_strides = checked_dense_strides(&plan.output_shape)?;
+        let axes = index
+            .shape
+            .dims()
+            .iter()
+            .enumerate()
+            .map(|(position, &index_dimension)| PortableIndexedAxis {
+                axis: position,
+                index_dimension,
+                index_divisor: index_strides[position],
+                data_dimension: data.shape.dims()[position],
+                data_divisor: output_strides[position],
+                data_stride: data_strides[position],
+                update_stride: update_strides.as_ref().map(|strides| strides[position]),
+            })
+            .collect::<Vec<_>>();
+
+        let mut inputs = Vec::new();
+        let data_abi = push_unique_dense_input(&mut inputs, data, DType::F32)?;
+        if data_abi != 0 {
+            return Err(MovementPlanError::InvalidGeometry);
+        }
+        let index_abi = push_unique_dense_input(&mut inputs, index, DType::I32)?;
+        let update_abi = updates
+            .map(|value| push_unique_dense_input(&mut inputs, value, DType::F32))
+            .transpose()?;
+        if inputs.iter().any(|input| input.node == plan.output) {
+            return Err(MovementPlanError::InvalidGeometry);
+        }
+        Ok(Self {
+            plan,
+            inputs,
+            axes,
+            index_abi,
+            update_abi,
+            axis,
+            axis_extent,
+            index_elements,
+            output_elements,
+            add,
+        })
+    }
+
+    pub(crate) fn plan(&self) -> &'a MovementKernelPlan {
+        self.plan
+    }
+
+    pub(crate) fn inputs(&self) -> &[&'a MovementOperand] {
+        &self.inputs
+    }
+
+    pub(crate) fn axes(&self) -> &[PortableIndexedAxis] {
+        &self.axes
+    }
+
+    pub(crate) fn index_abi(&self) -> usize {
+        self.index_abi
+    }
+
+    pub(crate) fn update_abi(&self) -> Option<usize> {
+        self.update_abi
+    }
+
+    pub(crate) fn axis(&self) -> usize {
+        self.axis
+    }
+
+    pub(crate) fn axis_extent(&self) -> usize {
+        self.axis_extent
+    }
+
+    pub(crate) fn index_elements(&self) -> usize {
+        self.index_elements
+    }
+
+    pub(crate) fn output_elements(&self) -> usize {
+        self.output_elements
+    }
+
+    pub(crate) fn scatter_add(&self) -> Option<bool> {
+        self.add
+    }
+
+    pub(crate) fn validate_schedule_bindings(
+        &self,
+        bindings: &[ScheduleInputBinding],
+    ) -> Result<(), MovementPlanError> {
+        if bindings.len() != self.inputs.len() {
+            return Err(MovementPlanError::InvalidGeometry);
+        }
+        for (abi_index, (binding, input)) in bindings.iter().zip(&self.inputs).enumerate() {
+            let bytes = input
+                .shape
+                .numel()
+                .map_err(|_| MovementPlanError::Overflow)?
+                .checked_mul(input.dtype.itemsize())
+                .ok_or(MovementPlanError::Overflow)?;
+            if binding.abi_index != abi_index
+                || binding.input_node != input.node
+                || binding.desc.id != input.node.index() as u64
+                || binding.desc.shape != input.shape
+                || binding.desc.dtype != input.dtype
+                || binding.desc.bytes != bytes
+                || !binding.desc.read_only
+                || binding.desc.view.is_some()
+            {
+                return Err(MovementPlanError::InvalidGeometry);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<'a> PortableDenseMaterialization<'a> {
     pub(crate) fn new(plan: &'a MovementKernelPlan) -> Result<Self, MovementPlanError> {
         plan.validate()?;
@@ -1712,7 +1925,7 @@ impl MovementKernelPlan {
                 for (destination, source) in map {
                     let update = updates_value.scalar_at(source);
                     values[destination] = if add {
-                        Scalar::F(values[destination].as_f64() + update.as_f64())
+                        scatter_add_storage_value(self.dtype, values[destination], update)
                     } else {
                         update
                     };
@@ -2325,6 +2538,29 @@ mod tests {
                 "{dtype:?}"
             );
         }
+
+        let mut graph = Graph::new();
+        let base = graph.input_dtype("base", [1], DType::F32);
+        let index = graph.input_dtype("index", [2], DType::I32);
+        let updates = graph.input_dtype("updates", [2], DType::F32);
+        let output = graph.scatter_add(base, index, updates, 0).unwrap();
+        let base_value = TensorData::new([1], vec![100_000_000.0]).unwrap();
+        let index_value = TensorData::from_storage([2], Storage::I32(vec![0, 0])).unwrap();
+        let updates_value = TensorData::new([2], vec![1.0, -100_000_000.0]).unwrap();
+        let oracle = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([
+                    ("base".into(), base_value.clone()),
+                    ("index".into(), index_value.clone()),
+                    ("updates".into(), updates_value.clone()),
+                ]),
+            )
+            .unwrap();
+        let planned = plan_result(&graph, output, &[base_value, index_value, updates_value]);
+        assert_eq!(oracle, TensorData::new([1], vec![0.0]).unwrap());
+        assert_eq!(planned, oracle);
     }
 
     #[test]

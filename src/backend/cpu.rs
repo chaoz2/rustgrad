@@ -2960,7 +2960,13 @@ fn indexed_scatter(
         let update_coords = DenseIndex::new(index.shape().clone())?.coords(update_linear)?;
         let update_value = updates.scalar_at(update_index.offset(&update_coords)?);
         let destination = base_index.offset(&destination)?;
-        output[destination] = if add {
+        output[destination] = if add && matches!(dtype, DType::F32 | DType::F64) {
+            crate::movement_plan::scatter_add_storage_value(
+                dtype,
+                output[destination],
+                update_value,
+            )
+        } else if add {
             binary_scalar(output[destination], update_value, dtype, BinaryOp::Add)
         } else {
             update_value
@@ -6106,6 +6112,42 @@ mod tests {
                 .unwrap(),
             data([2, 2, 2], &[2., 0., 4., 5., 6., 7., 11., 9.])
         );
+    }
+
+    #[test]
+    fn scatter_add_retains_bool_cpu_semantics_outside_the_portable_plan() {
+        let mut graph = Graph::new();
+        let base = graph.input_dtype("base", [1], DType::Bool);
+        let index = graph.input_dtype("index", [2], DType::I32);
+        let updates = graph.input_dtype("updates", [2], DType::Bool);
+        let output = graph.scatter_add(base, index, updates, 0).unwrap();
+        let actual = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([
+                    (
+                        "base".into(),
+                        TensorData::from_scalars([1], DType::Bool, [Scalar::Bool(false)]).unwrap(),
+                    ),
+                    (
+                        "index".into(),
+                        TensorData::from_scalars([2], DType::I32, [Scalar::I(0), Scalar::I(0)])
+                            .unwrap(),
+                    ),
+                    (
+                        "updates".into(),
+                        TensorData::from_scalars(
+                            [2],
+                            DType::Bool,
+                            [Scalar::Bool(true), Scalar::Bool(false)],
+                        )
+                        .unwrap(),
+                    ),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(actual.storage(), &Storage::Bool(vec![true]));
     }
 
     #[test]

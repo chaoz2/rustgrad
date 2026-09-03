@@ -61,6 +61,7 @@ pub(super) struct KernelSemantics {
     pub extent: usize,
     pub program: Arc<KernelSemanticProgram>,
     pub transaction: Option<MetalTransactionAbi>,
+    pub indexed_movement: Option<super::MetalIndexedMovementAbi>,
 }
 
 /// Typed immutable mock payload. Native Metal always executes rendered MSL;
