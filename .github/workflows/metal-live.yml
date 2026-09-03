@@ -1,0 +1,73 @@
+name: RustGrad Live Metal
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact reviewed lowercase 40-character commit SHA
+        required: true
+        type: string
+
+concurrency:
+  group: live-metal-${{ inputs.expected_sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  live-metal:
+    name: Live Metal (Apple GPU)
+    runs-on: [self-hosted, macOS, ARM64, rustgrad-metal]
+    environment: live-metal
+    timeout-minutes: 30
+    env:
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      RUSTGRAD_METAL_EXPECTED_SHA: ${{ inputs.expected_sha }}
+      RUSTGRAD_METAL_SCOREBOARD_PATH: ${{ runner.temp }}/metal-live-scoreboard.json
+    steps:
+      - name: Validate requested revision
+        shell: bash
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected_sha must be a lowercase full Git SHA" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_SHA:-}" != "$EXPECTED_SHA" ]]; then
+            echo "workflow dispatch revision does not match expected_sha" >&2
+            exit 1
+          fi
+      - name: Check out exact reviewed revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.expected_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Authenticate checkout
+        shell: bash
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "checked-out revision does not match expected_sha" >&2
+            exit 1
+          fi
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05
+        with:
+          toolchain: 1.89.0
+      - name: Run exact live Metal acceptance
+        shell: bash
+        run: >-
+          cargo test --test metal_live
+          live_metal_linear_persistent_session_emits_scoreboard --
+          --ignored --exact --nocapture --test-threads=1
+      - name: Print live evidence
+        shell: bash
+        run: cat "$RUSTGRAD_METAL_SCOREBOARD_PATH"
+      - name: Upload live Metal scoreboard
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: metal-live-${{ inputs.expected_sha }}
+          path: ${{ env.RUSTGRAD_METAL_SCOREBOARD_PATH }}
+          if-no-files-found: error
+          retention-days: 30
