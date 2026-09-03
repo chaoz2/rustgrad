@@ -4,6 +4,7 @@ use super::{
     BatchNorm2d, Conv2d, Mode, ModeForwardOutput, ModeModuleForward, Module, Parameter,
     PendingModeEffects, StateKind,
     init::{InitCursor, glorot_uniform_bound},
+    norm::visit_source_batch_norm,
     state::join,
 };
 use crate::{Conv2dOptions, Error, Graph, NodeId, Pool2dOptions, Result, Shape, TensorData};
@@ -270,30 +271,6 @@ fn batch_norm(channels: usize, track_running_stats: bool) -> BatchNorm2d {
         0.1,
     )
     .expect("EfficientNet constructor preflighted BatchNorm geometry")
-}
-
-fn visit_source_batch_norm(
-    norm: &BatchNorm2d,
-    prefix: &str,
-    visitor: &mut dyn FnMut(String, &Parameter, StateKind),
-) {
-    if let Some(weight) = &norm.weight {
-        visitor(join(prefix, "weight"), weight, StateKind::Parameter);
-    }
-    if let Some(bias) = &norm.bias {
-        visitor(join(prefix, "bias"), bias, StateKind::Parameter);
-    }
-    visitor(
-        join(prefix, "num_batches_tracked"),
-        &norm.num_batches_tracked,
-        StateKind::Buffer,
-    );
-    if let Some(mean) = &norm.running_mean {
-        visitor(join(prefix, "running_mean"), mean, StateKind::Buffer);
-    }
-    if let Some(variance) = &norm.running_var {
-        visitor(join(prefix, "running_var"), variance, StateKind::Buffer);
-    }
 }
 
 struct PreparedMBConvBlock {

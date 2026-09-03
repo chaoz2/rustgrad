@@ -69,4 +69,9 @@ impl InitCursor {
         let bound = glorot_uniform_bound(&shape)?;
         uniform(shape, -bound, bound, self.take())
     }
+
+    /// One source-ordered host-uniform draw for composite module constructors.
+    pub(super) fn uniform(&mut self, shape: Shape, low: f32, high: f32) -> Result<TensorData> {
+        uniform(shape, low, high, self.take())
+    }
 }
