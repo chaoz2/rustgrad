@@ -199,12 +199,14 @@ fn portable_threefry_metal_renders_and_executes_broadcast_bits() {
 }
 use super::*;
 use crate::kernel::execute_lowered_elementwise;
+use crate::nn::{Linear, Module, Parameter, StateKind};
 use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
-    Backend, BinaryOp, BufferRole, CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule,
-    CompareOp, CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime, Graph, IndexValue,
-    KernelBindings, KernelBufferDesc, LaneInstruction, MovementKernelKind, MovementValue, NodeId,
-    Operation, ReduceKind, Scalar, Shape, Slice, Storage, TensorData, TypedValue, UType, schedule,
+    Backend, BinaryOp, BufferRole, CapturedInference, CapturedMixedBatch, CapturedReplayExecutor,
+    CapturedSchedule, CompareOp, CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime,
+    Graph, IndexValue, KernelBindings, KernelBufferDesc, LaneInstruction, MovementKernelKind,
+    MovementValue, NodeId, Operation, ReduceKind, Scalar, Shape, Slice, Storage, TensorData,
+    TypedValue, UType, schedule,
 };
 use dispatch::{
     CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
@@ -246,6 +248,26 @@ fn residual_residents() -> BTreeMap<String, TensorData> {
             TensorData::new([2, 4], vec![1.0, 2.0, 0.5, 0.25, 1.5, 1.0, 0.75, 2.0]).unwrap(),
         ),
     ])
+}
+
+struct IdentityModule;
+
+impl Module for IdentityModule {
+    fn visit(&self, _: &str, _: &mut dyn FnMut(String, &Parameter, StateKind)) {}
+}
+
+impl crate::nn::ModuleForward for IdentityModule {
+    fn forward(&self, _: &mut Graph, input: NodeId) -> crate::Result<NodeId> {
+        Ok(input)
+    }
+}
+
+struct DirectParameterModule(Parameter);
+
+impl Module for DirectParameterModule {
+    fn visit(&self, _: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        visitor("value".into(), &self.0, StateKind::Buffer);
+    }
 }
 
 #[test]
@@ -363,6 +385,133 @@ fn metal_device_session_reuses_residents_and_reports_exact_driver_activity() {
         );
     }
     assert_eq!(session.successful_run_count(), 2);
+}
+
+#[test]
+fn metal_inference_plan_freezes_module_residents_and_preserves_inspection() {
+    let model = Linear::new_static(2, 2, true, 701).unwrap();
+    model
+        .weight
+        .replace(TensorData::new([2, 2], vec![1., -2., 0.5, 3.]).unwrap())
+        .unwrap();
+    model
+        .bias
+        .as_ref()
+        .unwrap()
+        .replace(TensorData::new([2], vec![0.25, -0.75]).unwrap())
+        .unwrap();
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("features", [2, 2], DType::F32);
+    let output = model.forward(&mut graph, input).unwrap();
+    let input_value = TensorData::new([2, 2], vec![1., 2., -1., 0.5]).unwrap();
+    let mut oracle_bindings = model.input_bindings(&graph).unwrap();
+    oracle_bindings.insert("features".into(), input_value.clone());
+    let expected = CpuBackend
+        .execute(&graph, output, &oracle_bindings)
+        .unwrap();
+
+    let inference = CapturedInference::from_module_graph(&model, &graph, &[output]).unwrap();
+    let deployment_identity = inference.deployment_identity();
+    let capture_identity = inference.capture().identity;
+    let logical_identity = inference.execution_plan().identity;
+    let plan =
+        MetalInferencePlan::new(inference, MetalRenderer::new(8, capabilities()).unwrap()).unwrap();
+    assert_eq!(plan.deployment_identity(), deployment_identity);
+    assert_eq!(plan.capture().identity, capture_identity);
+    assert_eq!(plan.execution_plan().identity, logical_identity);
+    assert_eq!(plan.resident_inputs().len(), 2);
+    assert_eq!(
+        plan.transient_inputs()
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<Vec<_>>(),
+        ["features"]
+    );
+    assert_eq!(
+        plan.rendered_items().count(),
+        plan.summary().nonzero_item_count
+    );
+    assert_eq!(plan.summary().fallback_count, 0);
+
+    // A deployment owns the values admitted by its graph even when the live
+    // module changes before device preparation.
+    model
+        .weight
+        .replace(TensorData::zeros([2, 2]).unwrap())
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let mut session = plan.prepare(device).unwrap();
+    assert_eq!(session.preparation_report().resident_h2d_calls, 2);
+    for invocation in 1..=2 {
+        mock.clear_calls();
+        let run = session
+            .run(&BTreeMap::from([("features".into(), input_value.clone())]))
+            .unwrap();
+        assert_eq!(run.outputs(), std::slice::from_ref(&expected));
+        assert_eq!(run.report().successful_invocation, invocation);
+        assert_eq!(run.report().transient_h2d_calls, 1);
+        assert_eq!(run.report().retained_d2h_calls, 1);
+        assert!(!mock.calls().iter().any(|call| {
+            call.starts_with("buffer_create:")
+                || call.starts_with("library_compile:")
+                || call.starts_with("pipeline_create:")
+                || call.starts_with("queue_create:")
+        }));
+    }
+}
+
+#[test]
+fn metal_inference_plan_runs_identity_and_direct_parameter_without_resources() {
+    let mut identity_graph = Graph::new();
+    let input = identity_graph.input_dtype("features", [2], DType::F32);
+    let output =
+        crate::nn::ModuleForward::forward(&IdentityModule, &mut identity_graph, input).unwrap();
+    let identity =
+        CapturedInference::from_module_graph(&IdentityModule, &identity_graph, &[output, output])
+            .unwrap();
+    assert_eq!(identity.execution_plan().schedule_item_count, 0);
+    assert_eq!(identity.execution_plan().requested_outputs.len(), 2);
+    let identity_plan =
+        MetalInferencePlan::new(identity, MetalRenderer::new(8, capabilities()).unwrap()).unwrap();
+    assert_eq!(identity_plan.summary().planned_slot_count, 0);
+    assert_eq!(identity_plan.summary().nonzero_item_count, 0);
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut identity_session = identity_plan.prepare(device).unwrap();
+    assert!(mock.calls().is_empty());
+    let input_value = TensorData::new([2], vec![1.25, -3.5]).unwrap();
+    let identity_run = identity_session
+        .run(&BTreeMap::from([("features".into(), input_value.clone())]))
+        .unwrap();
+    assert_eq!(identity_run.outputs(), &[input_value.clone(), input_value]);
+    assert_eq!(identity_run.report().kernel_launch_count, 0);
+    assert_eq!(identity_run.report().transient_h2d_calls, 0);
+    assert_eq!(identity_run.report().retained_d2h_calls, 0);
+    assert!(mock.calls().is_empty());
+
+    let parameter_value = TensorData::new([2], vec![7.0, -2.0]).unwrap();
+    let parameter = DirectParameterModule(Parameter::new(parameter_value.clone(), false));
+    let mut parameter_graph = Graph::new();
+    let parameter_output = parameter.0.bind(&mut parameter_graph).unwrap();
+    let inference =
+        CapturedInference::from_module_graph(&parameter, &parameter_graph, &[parameter_output])
+            .unwrap();
+    assert_eq!(inference.resident_bindings().len(), 1);
+    assert!(inference.transient_inputs().is_empty());
+    let plan =
+        MetalInferencePlan::new(inference, MetalRenderer::new(8, capabilities()).unwrap()).unwrap();
+    assert_eq!(plan.summary().planned_device_bytes, 0);
+    let device = test_device(mock.clone());
+    mock.clear_calls();
+    let mut session = plan.prepare(device).unwrap();
+    assert_eq!(session.preparation_report().resident_h2d_calls, 0);
+    assert!(mock.calls().is_empty());
+    let run = session.run(&BTreeMap::new()).unwrap();
+    assert_eq!(run.outputs(), std::slice::from_ref(&parameter_value));
+    assert_eq!(run.report().kernel_launch_count, 0);
+    assert!(mock.calls().is_empty());
 }
 
 #[test]

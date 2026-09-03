@@ -2451,10 +2451,25 @@ impl Graph {
         &self,
         identities: &BTreeSet<ParameterId>,
     ) -> HashMap<String, TensorData> {
+        self.parameter_node_bindings_for(identities)
+            .into_iter()
+            .map(|(name, (_, data))| (name, data))
+            .collect()
+    }
+
+    pub(crate) fn parameter_node_bindings_for(
+        &self,
+        identities: &BTreeSet<ParameterId>,
+    ) -> HashMap<String, (NodeId, TensorData)> {
         self.parameter_bindings
             .iter()
             .filter(|((identity, _), _)| identities.contains(identity))
-            .map(|(_, binding)| (binding.input_name.clone(), binding.data.clone()))
+            .map(|(_, binding)| {
+                (
+                    binding.input_name.clone(),
+                    (binding.node, binding.data.clone()),
+                )
+            })
             .collect()
     }
 

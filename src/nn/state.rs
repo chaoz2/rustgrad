@@ -2,7 +2,7 @@
 
 use super::parameter::next_version;
 use super::{
-    Parameter, ParameterRestore, ParameterSnapshot,
+    Parameter, ParameterId, ParameterRestore, ParameterSnapshot,
     norm::{BatchNorm, PendingBatchNormStats},
     restore_parameters,
 };
@@ -387,18 +387,7 @@ pub trait Module {
         }
     }
     fn input_bindings(&self, graph: &Graph) -> Result<HashMap<String, TensorData>> {
-        let mut seen = BTreeSet::new();
-        let mut error = None;
-        self.visit("", &mut |_, parameter, _| match parameter.snapshot() {
-            Ok(snapshot) => {
-                seen.insert(snapshot.identity);
-            }
-            Err(err) => error = Some(err),
-        });
-        match error {
-            Some(err) => Err(err),
-            None => Ok(graph.parameter_bindings_for(&seen)),
-        }
+        Ok(graph.parameter_bindings_for(&module_parameter_identities(self)?))
     }
     fn load_state_dict(
         &self,
@@ -536,6 +525,28 @@ pub trait Module {
         let bytes = read_safetensors_file_bounded(path, limits)?;
         self.load_safetensors_strict_with_limits(&bytes, limits)
     }
+}
+
+fn module_parameter_identities(module: &(impl Module + ?Sized)) -> Result<BTreeSet<ParameterId>> {
+    let mut seen = BTreeSet::new();
+    let mut error = None;
+    module.visit("", &mut |_, parameter, _| match parameter.snapshot() {
+        Ok(snapshot) => {
+            seen.insert(snapshot.identity);
+        }
+        Err(err) => error = Some(err),
+    });
+    match error {
+        Some(err) => Err(err),
+        None => Ok(seen),
+    }
+}
+
+pub(crate) fn module_input_node_bindings(
+    module: &(impl Module + ?Sized),
+    graph: &Graph,
+) -> Result<HashMap<String, (NodeId, TensorData)>> {
+    Ok(graph.parameter_node_bindings_for(&module_parameter_identities(module)?))
 }
 
 /// A statically shaped module that composes one graph input into one graph
