@@ -4,14 +4,19 @@ use super::{
     MetalRenderer,
 };
 use crate::{ScheduleItem, TensorData};
-use std::{cell::Cell, collections::BTreeMap, rc::Rc, time::Duration};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+    time::Duration,
+};
 
 use crate::runtime::static_schedule::{
     InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticAppendStateLink,
     StaticBufferAllocation, StaticDeviceAdapter, StaticExecutionReport, StaticHostGather,
     StaticHostOutputSelection, StaticPlanAdapter, StaticQuantizedBufferPlan, StaticRendered,
     StaticRenderedBuffer, StaticRenderedQuantizedBuffer, StaticSchedulePlan, StaticStateLink,
-    bind_rendered_buffers,
+    StaticSharedResources, bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
@@ -185,7 +190,7 @@ impl StaticPlanAdapter for MetalStaticAdapter {
 impl StaticDeviceAdapter for MetalStaticAdapter {
     type Kernel = Rc<MetalPipeline>;
     type Buffer = MetalBuffer;
-    type Queue = MetalCommandQueue;
+    type Queue = Rc<MetalCommandQueue>;
 
     fn prepare_zero_extent(&self) -> bool {
         false
@@ -216,8 +221,55 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
     ) -> Result<Self::Buffer, Self::Error> {
         self.device()?.allocate_static_quantized(plan)
     }
+    fn validate_shared_buffer(
+        &self,
+        buffer: &Self::Buffer,
+        plan: &crate::runtime::static_schedule::StaticBufferPlan,
+        allocation: StaticBufferAllocation,
+    ) -> Result<(), Self::Error> {
+        let device = self.device()?;
+        if buffer.owner_id() != device.owner_id()
+            || buffer.len() != plan.bytes
+            || buffer.dtype() != Some(plan.dtype)
+            || buffer.physical_len() != allocation.physical_bytes()
+            || buffer.has_native_handle() != (allocation.physical_bytes() != 0)
+        {
+            return Err(MetalError::InvalidBinding(
+                "shared Metal buffer does not match the target plan".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn validate_shared_quantized_buffer(
+        &self,
+        buffer: &Self::Buffer,
+        plan: &StaticQuantizedBufferPlan,
+    ) -> Result<(), Self::Error> {
+        let device = self.device()?;
+        let physical_bytes = if plan.desc.bytes == 0 { 4 } else { plan.desc.bytes };
+        if buffer.owner_id() != device.owner_id()
+            || buffer.len() != plan.desc.bytes
+            || buffer.dtype().is_some()
+            || buffer.physical_len() != physical_bytes
+            || !buffer.has_native_handle()
+        {
+            return Err(MetalError::InvalidBinding(
+                "shared packed Metal buffer does not match the target plan".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn validate_shared_queue(&self, queue: &Self::Queue) -> Result<(), Self::Error> {
+        if queue.owner_id() != self.device()?.owner_id() {
+            return Err(MetalError::OwnerMismatch);
+        }
+        Ok(())
+    }
+    fn shared_buffer_identity(&self, buffer: &Self::Buffer) -> Result<u64, Self::Error> {
+        u64::try_from(buffer.logical_identity()).map_err(|_| MetalError::Overflow)
+    }
     fn create_queue(&self) -> Result<Self::Queue, Self::Error> {
-        self.device()?.create_queue()
+        self.device()?.create_queue().map(Rc::new)
     }
     fn write(
         &self,
@@ -408,10 +460,20 @@ impl MetalPrefixPlan {
 pub struct PreparedMetalPrefix {
     inner: PreparedStaticSchedule<MetalStaticAdapter>,
     cache_miss_pipeline_build_wall_time: Duration,
+    imported_dense: BTreeSet<u64>,
+    imported_quantized: BTreeSet<u64>,
 }
 
 pub(super) struct InitializedMetalPrefix {
     inner: InitializedStaticSchedule<MetalStaticAdapter>,
+}
+
+/// Opaque handles borrowed from one fully initialized Metal prefix. Logical
+/// target ids are supplied only by a separately authenticated program map.
+pub(super) struct MetalSharedResources {
+    dense: BTreeMap<u64, MetalBuffer>,
+    quantized: BTreeMap<u64, MetalBuffer>,
+    queue: Option<Rc<MetalCommandQueue>>,
 }
 
 /// An authenticated captured schedule bound to one prepared Metal prefix.
@@ -453,6 +515,45 @@ impl PreparedMetalPrefix {
         Ok(Self {
             inner: PreparedStaticSchedule::from_plan(adapter, plan.plan)?,
             cache_miss_pipeline_build_wall_time: build_wall_time.get(),
+            imported_dense: BTreeSet::new(),
+            imported_quantized: BTreeSet::new(),
+        })
+    }
+
+    pub(super) fn from_plan_with_shared(
+        device: MetalDevice,
+        plan: MetalPrefixPlan,
+        resources: MetalSharedResources,
+        allowed_dense: &BTreeSet<u64>,
+        allowed_quantized: &BTreeSet<u64>,
+    ) -> Result<Self, MetalError> {
+        if plan.item_counts().0 != 0 && resources.queue.is_none() {
+            return Err(MetalError::InvalidBinding(
+                "shared Metal execution queue is absent".into(),
+            ));
+        }
+        let append_state = plan.plan.append_state_links().to_vec();
+        let host_gathers = plan.plan.host_gathers().to_vec();
+        let adapter = MetalStaticAdapter::runtime(device, plan.renderer)
+            .with_append_state(&append_state)?
+            .with_host_gathers(&host_gathers)?;
+        let imported_dense = resources.dense.keys().copied().collect();
+        let imported_quantized = resources.quantized.keys().copied().collect();
+        let shared = StaticSharedResources::checked(
+            &adapter,
+            &plan.plan,
+            resources.dense,
+            resources.quantized,
+            resources.queue,
+            allowed_dense,
+            allowed_quantized,
+        )?;
+        let build_wall_time = adapter.cache_miss_pipeline_build_wall_time.clone();
+        Ok(Self {
+            inner: PreparedStaticSchedule::from_plan_with_shared(adapter, plan.plan, shared)?,
+            cache_miss_pipeline_build_wall_time: build_wall_time.get(),
+            imported_dense,
+            imported_quantized,
         })
     }
 
@@ -476,9 +577,13 @@ impl PreparedMetalPrefix {
         resident_ids: &std::collections::BTreeSet<u64>,
         quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
     ) -> Result<(InitializedMetalPrefix, StaticExecutionReport), MetalError> {
-        let (inner, report) =
-            self.inner
-                .initialize_resident_with_quantized(values, resident_ids, quantized)?;
+        let (inner, report) = self.inner.initialize_resident_with_quantized_skipping(
+            values,
+            resident_ids,
+            quantized,
+            &self.imported_dense,
+            &self.imported_quantized,
+        )?;
         Ok((InitializedMetalPrefix { inner }, report))
     }
 }
@@ -486,6 +591,36 @@ impl PreparedMetalPrefix {
 impl InitializedMetalPrefix {
     pub(super) fn rendered_kernels(&self) -> impl Iterator<Item = &super::RenderedMetal> {
         self.inner.kernels().map(|kernel| kernel.rendered())
+    }
+
+    pub(super) fn share_resources(
+        &self,
+        dense: &BTreeMap<u64, u64>,
+        quantized: &BTreeMap<u64, u64>,
+    ) -> Result<MetalSharedResources, MetalError> {
+        let share = |id| {
+            self.inner
+                .shared_buffer(id)
+                .ok_or_else(|| {
+                    MetalError::InvalidBinding(format!(
+                        "shared Metal source buffer {id} is absent"
+                    ))
+                })?
+                .share()
+        };
+        let dense = dense
+            .iter()
+            .map(|(target, source)| share(*source).map(|buffer| (*target, buffer)))
+            .collect::<Result<_, _>>()?;
+        let quantized = quantized
+            .iter()
+            .map(|(target, source)| share(*source).map(|buffer| (*target, buffer)))
+            .collect::<Result<_, _>>()?;
+        Ok(MetalSharedResources {
+            dense,
+            quantized,
+            queue: self.inner.shared_queue().cloned(),
+        })
     }
 
     pub(super) fn execute(

@@ -2051,6 +2051,35 @@ pub(crate) trait StaticDeviceAdapter: StaticPlanAdapter {
             "packed static buffers are unsupported by this device adapter".into(),
         ))
     }
+    fn validate_shared_buffer(
+        &self,
+        _buffer: &Self::Buffer,
+        _plan: &StaticBufferPlan,
+        _allocation: StaticBufferAllocation,
+    ) -> Result<(), Self::Error> {
+        Err(Self::unsupported(
+            "shared static buffers are unsupported by this device adapter".into(),
+        ))
+    }
+    fn validate_shared_quantized_buffer(
+        &self,
+        _buffer: &Self::Buffer,
+        _plan: &StaticQuantizedBufferPlan,
+    ) -> Result<(), Self::Error> {
+        Err(Self::unsupported(
+            "shared packed buffers are unsupported by this device adapter".into(),
+        ))
+    }
+    fn validate_shared_queue(&self, _queue: &Self::Queue) -> Result<(), Self::Error> {
+        Err(Self::unsupported(
+            "shared queues are unsupported by this device adapter".into(),
+        ))
+    }
+    fn shared_buffer_identity(&self, _buffer: &Self::Buffer) -> Result<u64, Self::Error> {
+        Err(Self::unsupported(
+            "shared buffer identity is unsupported by this device adapter".into(),
+        ))
+    }
     fn create_queue(&self) -> Result<Self::Queue, Self::Error>;
     fn write(
         &self,
@@ -2952,6 +2981,98 @@ pub(crate) struct PreparedStaticSchedule<A: StaticDeviceAdapter> {
     compiled_cache_keys: Vec<String>,
 }
 
+/// Preauthenticated physical resources shared from another concrete program.
+/// Keys belong to the target plan; callers must validate descriptor and owner
+/// equivalence before construction.
+pub(crate) struct StaticSharedResources<B, Q> {
+    dense: BTreeMap<u64, B>,
+    quantized: BTreeMap<u64, B>,
+    queue: Option<Q>,
+}
+
+impl<B, Q> StaticSharedResources<B, Q> {
+    fn empty() -> Self {
+        Self {
+            dense: BTreeMap::new(),
+            quantized: BTreeMap::new(),
+            queue: None,
+        }
+    }
+}
+
+impl<A: StaticDeviceAdapter> StaticSharedResources<A::Buffer, A::Queue> {
+    pub(crate) fn checked(
+        adapter: &A,
+        plan: &StaticSchedulePlan<A::Rendered>,
+        dense: BTreeMap<u64, A::Buffer>,
+        quantized: BTreeMap<u64, A::Buffer>,
+        queue: Option<A::Queue>,
+        allowed_dense: &BTreeSet<u64>,
+        allowed_quantized: &BTreeSet<u64>,
+    ) -> Result<Self, A::Error> {
+        if !dense.keys().all(|id| allowed_dense.contains(id))
+            || !quantized.keys().all(|id| allowed_quantized.contains(id))
+        {
+            return Err(A::invalid_binding(
+                "shared resource is outside the authenticated import inventory".into(),
+            ));
+        }
+        let mut source_slots = BTreeMap::<u64, usize>::new();
+        let mut target_slots = BTreeMap::<usize, u64>::new();
+        let mut source_identities = BTreeSet::new();
+        for (id, buffer) in &dense {
+            let buffer_plan = plan.buffers.get(id).ok_or_else(|| {
+                A::invalid_binding(format!("shared logical buffer {id} is absent"))
+            })?;
+            let slot = plan.allocations.logical_slots.get(id).ok_or_else(|| {
+                A::invalid_binding(format!("shared logical buffer {id} has no target slot"))
+            })?;
+            adapter.validate_shared_buffer(buffer, buffer_plan, plan.allocations.slots[*slot])?;
+            let identity = adapter.shared_buffer_identity(buffer)?;
+            if !source_identities.insert(identity) {
+                return Err(A::invalid_binding(
+                    "one shared physical buffer names multiple target resources".into(),
+                ));
+            }
+            if source_slots
+                .insert(identity, *slot)
+                .is_some_and(|previous| previous != *slot)
+                || target_slots
+                    .insert(*slot, identity)
+                    .is_some_and(|previous| previous != identity)
+            {
+                return Err(A::invalid_binding(
+                    "shared dense resources alias incompatible target slots".into(),
+                ));
+            }
+        }
+        for (id, buffer) in &quantized {
+            let packed = plan.quantized_buffers.get(id).ok_or_else(|| {
+                A::invalid_binding(format!("shared packed buffer {id} is absent"))
+            })?;
+            if !packed.requires_native_handle {
+                return Err(A::invalid_binding(
+                    "addressless packed buffer cannot be shared".into(),
+                ));
+            }
+            adapter.validate_shared_quantized_buffer(buffer, packed)?;
+            if !source_identities.insert(adapter.shared_buffer_identity(buffer)?) {
+                return Err(A::invalid_binding(
+                    "one shared physical buffer names multiple target resources".into(),
+                ));
+            }
+        }
+        if let Some(queue) = &queue {
+            adapter.validate_shared_queue(queue)?;
+        }
+        Ok(Self {
+            dense,
+            quantized,
+            queue,
+        })
+    }
+}
+
 /// Prepared static resources after one authenticated immutable input set has
 /// been uploaded successfully. The owned set is the only set skipped later.
 pub(crate) struct InitializedStaticSchedule<A: StaticDeviceAdapter> {
@@ -2978,6 +3099,18 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
     pub(crate) fn from_plan(
         adapter: A,
         plan: StaticSchedulePlan<A::Rendered>,
+    ) -> Result<Self, A::Error> {
+        Self::from_plan_with_shared(
+            adapter,
+            plan,
+            StaticSharedResources::empty(),
+        )
+    }
+
+    pub(crate) fn from_plan_with_shared(
+        adapter: A,
+        plan: StaticSchedulePlan<A::Rendered>,
+        mut shared: StaticSharedResources<A::Buffer, A::Queue>,
     ) -> Result<Self, A::Error> {
         let StaticSchedulePlan {
             items,
@@ -3017,21 +3150,53 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                 buffer_ids: item.buffer_ids,
             });
         }
+        let mut shared_slots = BTreeMap::new();
+        for (id, buffer) in std::mem::take(&mut shared.dense) {
+            let slot = allocations.logical_slots.get(&id).copied().ok_or_else(|| {
+                A::invalid_binding(format!("shared logical buffer {id} is absent"))
+            })?;
+            if shared_slots.insert(slot, buffer).is_some() {
+                return Err(A::invalid_binding(
+                    "shared logical buffers alias one target slot".into(),
+                ));
+            }
+        }
         let mut slots = Vec::with_capacity(allocations.slots.len());
-        for allocation in &allocations.slots {
-            slots.push(adapter.allocate(*allocation)?);
+        for (slot, allocation) in allocations.slots.iter().enumerate() {
+            slots.push(match shared_slots.remove(&slot) {
+                Some(buffer) => buffer,
+                None => adapter.allocate(*allocation)?,
+            });
+        }
+        if !shared_slots.is_empty() {
+            return Err(A::invalid_binding(
+                "shared dense buffer is absent from the target allocation".into(),
+            ));
         }
         let mut quantized_buffers = BTreeMap::new();
         for (id, packed) in &quantized_plans {
             if packed.requires_native_handle {
-                quantized_buffers.insert(*id, adapter.allocate_quantized(packed)?);
+                let buffer = match shared.quantized.remove(id) {
+                    Some(buffer) => buffer,
+                    None => adapter.allocate_quantized(packed)?,
+                };
+                quantized_buffers.insert(*id, buffer);
             }
         }
-        let queue = prepared_items
-            .iter()
-            .any(|item| item.extent != 0)
-            .then(|| adapter.create_queue())
-            .transpose()?;
+        if !shared.quantized.is_empty() {
+            return Err(A::invalid_binding(
+                "shared packed buffer is absent from the target plan".into(),
+            ));
+        }
+        let has_work = prepared_items.iter().any(|item| item.extent != 0);
+        let queue = if has_work {
+            match shared.queue {
+                Some(queue) => Some(queue),
+                None => Some(adapter.create_queue()?),
+            }
+        } else {
+            None
+        };
         let compiled_cache_keys = prepared_items
             .iter()
             .filter_map(|item| item.cache_key.clone())
@@ -3072,6 +3237,14 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                 .get(&id)
                 .and_then(|slot| self.slots.get(*slot))
         })
+    }
+
+    pub(crate) fn shared_buffer(&self, id: u64) -> Option<&A::Buffer> {
+        self.buffer(id)
+    }
+
+    pub(crate) fn shared_queue(&self) -> Option<&A::Queue> {
+        self.queue.as_ref()
     }
 
     fn buffer_for_epoch(&self, id: u64, alternate: bool) -> Option<&A::Buffer> {
@@ -3176,6 +3349,23 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         resident_ids: &BTreeSet<u64>,
         quantized: &BTreeMap<u64, QuantizedTensorData>,
     ) -> Result<(InitializedStaticSchedule<A>, StaticExecutionReport), A::Error> {
+        self.initialize_resident_with_quantized_skipping(
+            values,
+            resident_ids,
+            quantized,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+    }
+
+    pub(crate) fn initialize_resident_with_quantized_skipping(
+        self,
+        values: &BTreeMap<u64, TensorData>,
+        resident_ids: &BTreeSet<u64>,
+        quantized: &BTreeMap<u64, QuantizedTensorData>,
+        shared_dense: &BTreeSet<u64>,
+        shared_quantized: &BTreeSet<u64>,
+    ) -> Result<(InitializedStaticSchedule<A>, StaticExecutionReport), A::Error> {
         if let Some(id) = resident_ids
             .iter()
             .find(|id| !self.external_inputs.contains(id) && !self.quantized_plans.contains_key(id))
@@ -3195,13 +3385,24 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                 "capture-owned packed constants do not match the static plan".into(),
             ));
         }
-        let uploads = self.validated_uploads(values, |id| resident_ids.contains(&id))?;
+        let planned_quantized = self.quantized_plans.keys().copied().collect::<BTreeSet<_>>();
+        if !shared_dense.is_subset(resident_ids)
+            || !shared_quantized.is_subset(&planned_quantized)
+        {
+            return Err(A::invalid_binding(
+                "shared resident inventory is outside the target plan".into(),
+            ));
+        }
+        let uploads = self.validated_uploads(values, |id| {
+            resident_ids.contains(&id) && !shared_dense.contains(&id)
+        })?;
         let packed_uploads = quantized
             .iter()
             .filter(|(id, value)| {
                 self.quantized_plans
                     .get(*id)
                     .is_some_and(|plan| plan.requires_native_handle)
+                    && !shared_quantized.contains(*id)
                     && !value.bytes().is_empty()
             })
             .collect::<Vec<_>>();
@@ -3251,7 +3452,6 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             report,
         ))
     }
-
     pub(crate) fn execute(&self, values: &mut BTreeMap<u64, TensorData>) -> Result<(), A::Error> {
         self.execute_skipping_residents(values, &BTreeSet::new())?;
         Ok(())
@@ -3415,6 +3615,14 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
 impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
     pub(crate) fn kernels(&self) -> impl Iterator<Item = &A::Kernel> {
         self.prepared.kernels()
+    }
+
+    pub(crate) fn shared_buffer(&self, id: u64) -> Option<&A::Buffer> {
+        self.prepared.shared_buffer(id)
+    }
+
+    pub(crate) fn shared_queue(&self) -> Option<&A::Queue> {
+        self.prepared.shared_queue()
     }
 
     pub(crate) fn execute(

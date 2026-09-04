@@ -36,6 +36,7 @@ struct LogicalBuffer {
     visible: RefCell<VisibleGeneration>,
     desc: BufferDesc,
     closed: Cell<bool>,
+    owners: Cell<usize>,
 }
 
 /// Stable, thread-confined Metal buffer identity.
@@ -124,7 +125,27 @@ impl MetalBuffer {
                     dtype,
                 },
                 closed: Cell::new(false),
+                owners: Cell::new(1),
             }),
+        })
+    }
+
+    /// Creates another private owner of the same authenticated logical buffer.
+    /// Snapshots remain generation-checked and the buffer closes only after
+    /// the last owning handle is dropped.
+    pub(super) fn share(&self) -> Result<Self, MetalError> {
+        if self.inner.closed.get() {
+            return Err(MetalError::Closed("buffer"));
+        }
+        let owners = self
+            .inner
+            .owners
+            .get()
+            .checked_add(1)
+            .ok_or(MetalError::Overflow)?;
+        self.inner.owners.set(owners);
+        Ok(Self {
+            inner: self.inner.clone(),
         })
     }
 
@@ -152,6 +173,18 @@ impl MetalBuffer {
     /// Returns the stable safe owner identity, never a native handle.
     pub fn owner_id(&self) -> u64 {
         self.inner.device.owner
+    }
+
+    pub(super) fn physical_len(&self) -> usize {
+        self.inner.desc.physical_bytes
+    }
+
+    pub(super) fn has_native_handle(&self) -> bool {
+        self.inner.visible.borrow().physical.raw.is_some()
+    }
+
+    pub(super) fn logical_identity(&self) -> usize {
+        Rc::as_ptr(&self.inner) as usize
     }
 
     pub(super) fn snapshot(
@@ -233,6 +266,12 @@ impl MetalBuffer {
 
 impl Drop for MetalBuffer {
     fn drop(&mut self) {
-        self.inner.closed.set(true);
+        let owners = self.inner.owners.get();
+        debug_assert!(owners != 0);
+        let remaining = owners.saturating_sub(1);
+        self.inner.owners.set(remaining);
+        if remaining == 0 {
+            self.inner.closed.set(true);
+        }
     }
 }

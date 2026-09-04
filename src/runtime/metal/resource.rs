@@ -275,6 +275,10 @@ pub struct MetalCommandQueue {
 }
 
 impl MetalCommandQueue {
+    pub(super) fn owner_id(&self) -> u64 {
+        self.device.owner
+    }
+
     fn live(&self) -> Result<(), MetalError> {
         self.device.live()?;
         if self.closed.get() {

@@ -9,7 +9,7 @@ use crate::{
     ExecutionPlanSummary, ReplayInput, TensorData,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -266,6 +266,59 @@ struct MetalCapturePolicy {
     runtime_controls: Vec<ReplayInput>,
 }
 
+/// Private proof that one append-state plan may import immutable/state storage
+/// from one already initialized append-state session. Ids are program-local;
+/// correspondence is authenticated by semantic input names and exact payloads.
+pub(crate) struct MetalSharedAppendProof {
+    source_capture_identity: u64,
+    source_deployment_identity: u64,
+    target_capture_identity: u64,
+    target_deployment_identity: u64,
+    dense: BTreeMap<u64, u64>,
+    quantized: BTreeMap<u64, u64>,
+}
+
+fn same_storage_descriptor(left: &crate::BufferDesc, right: &crate::BufferDesc) -> bool {
+    left.shape == right.shape
+        && left.dtype == right.dtype
+        && left.bytes == right.bytes
+        && left.alignment == right.alignment
+        && left.read_only == right.read_only
+        && left.view == right.view
+}
+
+fn exact_input_by_name<'a>(
+    inputs: &'a [ReplayInput],
+    name: &str,
+) -> Result<&'a ReplayInput, MetalError> {
+    let mut matching = inputs.iter().filter(|input| input.name == name);
+    let input = matching.next().ok_or_else(|| {
+        MetalError::InvalidBinding(format!("shared Metal input {name} is absent"))
+    })?;
+    if matching.next().is_some() {
+        return Err(MetalError::InvalidBinding(format!(
+            "shared Metal input {name} is ambiguous"
+        )));
+    }
+    Ok(input)
+}
+
+fn quantized_input(
+    capture: &CapturedSchedule,
+    id: u64,
+) -> Result<&ReplayInput, MetalError> {
+    let mut matching = capture.inputs.iter().filter(|input| input.desc.id == id);
+    let input = matching.next().ok_or_else(|| {
+        MetalError::InvalidBinding(format!("packed Metal input {id} is absent"))
+    })?;
+    if matching.next().is_some() {
+        return Err(MetalError::InvalidBinding(format!(
+            "packed Metal input {id} is ambiguous"
+        )));
+    }
+    Ok(input)
+}
+
 fn static_host_gathers(links: &[crate::session::CapturedHostGather]) -> Vec<StaticHostGather> {
     links
         .iter()
@@ -385,6 +438,137 @@ impl MetalAppendStateInferencePlan {
             self.initial_state,
             Some(self.deployment_identity),
         )
+    }
+
+    pub(crate) fn prepare_shared(
+        self,
+        device: MetalDevice,
+        source: &MetalDeviceSession,
+        proof: MetalSharedAppendProof,
+    ) -> Result<MetalDeviceSession, MetalError> {
+        self.inner.prepare_with_shared_state_and_deployment(
+            device,
+            self.resident_bindings,
+            self.initial_state,
+            self.deployment_identity,
+            source,
+            proof,
+        )
+    }
+
+    /// Authenticates the exact immutable/state inventory this plan may import
+    /// from an initialized sibling deployment. Program-local ids are never
+    /// compared directly across captures.
+    pub(crate) fn authenticate_shared_from(
+        &self,
+        source: &Self,
+    ) -> Result<MetalSharedAppendProof, MetalError> {
+        let (
+            MetalSessionStatePolicy::Append {
+                pair_count: target_pairs,
+                axis_extent: target_extent,
+                ..
+            },
+            MetalSessionStatePolicy::Append {
+                pair_count: source_pairs,
+                axis_extent: source_extent,
+                ..
+            },
+        ) = (self.inner.state_policy, source.inner.state_policy)
+        else {
+            return Err(MetalError::InvalidBinding(
+                "shared Metal plans must both use append state".into(),
+            ));
+        };
+        if target_pairs != source_pairs || target_extent != source_extent {
+            return Err(MetalError::InvalidBinding(
+                "shared Metal append-state geometry differs".into(),
+            ));
+        }
+
+        let mut dense = BTreeMap::new();
+        for target in self
+            .inner
+            .resident_inputs()
+            .iter()
+            .chain(self.inner.state_inputs())
+            .filter(|input| self.inner.device_resident_ids.contains(&input.desc.id))
+        {
+            let source_input = exact_input_by_name(source.capture().inputs.as_slice(), &target.name)?;
+            if !source.inner.device_resident_ids.contains(&source_input.desc.id)
+                || !same_storage_descriptor(&target.desc, &source_input.desc)
+            {
+                return Err(MetalError::InvalidBinding(format!(
+                    "shared Metal input {} descriptor or role differs",
+                    target.name
+                )));
+            }
+            let target_value = self
+                .resident_bindings
+                .get(&target.name)
+                .or_else(|| self.initial_state.get(&target.name));
+            let source_value = source
+                .resident_bindings
+                .get(&target.name)
+                .or_else(|| source.initial_state.get(&target.name));
+            if target_value.is_none() || target_value != source_value {
+                return Err(MetalError::InvalidBinding(format!(
+                    "shared Metal input {} immutable payload differs",
+                    target.name
+                )));
+            }
+            dense.insert(target.desc.id, source_input.desc.id);
+        }
+        if self.inner.state_inputs().len() != source.inner.state_inputs().len()
+            || self.inner.state_inputs().iter().any(|target| {
+                source
+                    .inner
+                    .state_inputs()
+                    .iter()
+                    .filter(|candidate| candidate.name == target.name)
+                    .count()
+                    != 1
+            })
+        {
+            return Err(MetalError::InvalidBinding(
+                "shared Metal state inventory differs".into(),
+            ));
+        }
+
+        let mut quantized = BTreeMap::new();
+        for (target_id, target_value) in self.inner.lifetime.quantized_constants() {
+            let target_input = quantized_input(self.capture(), *target_id)?;
+            let source_input = exact_input_by_name(source.capture().inputs.as_slice(), &target_input.name)?;
+            let source_value = source
+                .inner
+                .lifetime
+                .quantized_constants()
+                .get(&source_input.desc.id)
+                .ok_or_else(|| {
+                    MetalError::InvalidBinding(format!(
+                        "shared packed Metal input {} is not packed in the source",
+                        target_input.name
+                    ))
+                })?;
+            if !same_storage_descriptor(&target_input.desc, &source_input.desc)
+                || target_value != source_value
+            {
+                return Err(MetalError::InvalidBinding(format!(
+                    "shared packed Metal input {} descriptor or payload differs",
+                    target_input.name
+                )));
+            }
+            quantized.insert(*target_id, source_input.desc.id);
+        }
+
+        Ok(MetalSharedAppendProof {
+            source_capture_identity: source.capture().identity,
+            source_deployment_identity: source.deployment_identity,
+            target_capture_identity: self.capture().identity,
+            target_deployment_identity: self.deployment_identity,
+            dense,
+            quantized,
+        })
     }
 }
 
@@ -885,6 +1069,41 @@ impl MetalDeviceSessionPlan {
         initial_state: BTreeMap<String, TensorData>,
         inference_deployment_identity: Option<u64>,
     ) -> Result<MetalDeviceSession, MetalError> {
+        self.prepare_impl(
+            device,
+            resident_inputs,
+            initial_state,
+            inference_deployment_identity,
+            None,
+        )
+    }
+
+    fn prepare_with_shared_state_and_deployment(
+        self,
+        device: MetalDevice,
+        resident_inputs: BTreeMap<String, TensorData>,
+        initial_state: BTreeMap<String, TensorData>,
+        inference_deployment_identity: u64,
+        source: &MetalDeviceSession,
+        proof: MetalSharedAppendProof,
+    ) -> Result<MetalDeviceSession, MetalError> {
+        self.prepare_impl(
+            device,
+            resident_inputs,
+            initial_state,
+            Some(inference_deployment_identity),
+            Some((source, proof)),
+        )
+    }
+
+    fn prepare_impl(
+        self,
+        device: MetalDevice,
+        resident_inputs: BTreeMap<String, TensorData>,
+        initial_state: BTreeMap<String, TensorData>,
+        inference_deployment_identity: Option<u64>,
+        shared: Option<(&MetalDeviceSession, MetalSharedAppendProof)>,
+    ) -> Result<MetalDeviceSession, MetalError> {
         // Value and capability validation precede cache, compilation,
         // allocation, queue creation, or upload.
         let resident_values = if self.lifetime.state_inputs().is_empty() {
@@ -913,6 +1132,20 @@ impl MetalDeviceSessionPlan {
             return Err(MetalError::InvalidBinding(
                 "Metal session renderer/device capability identity mismatch".into(),
             ));
+        }
+        if let Some((source, proof)) = &shared {
+            if proof.target_capture_identity != self.capture().identity
+                || Some(proof.target_deployment_identity) != inference_deployment_identity
+                || proof.source_capture_identity != source.capture().identity
+                || source.inference_deployment_identity()
+                    != Some(proof.source_deployment_identity)
+                || source.device_owner_id() != device.owner_id()
+                || !matches!(source.state_policy, MetalSessionStatePolicy::Append { .. })
+            {
+                return Err(MetalError::InvalidBinding(
+                    "shared Metal session proof does not belong to these deployments".into(),
+                ));
+            }
         }
         let device_info = device.info().clone();
         let device_owner_id = device.owner_id();
@@ -946,7 +1179,33 @@ impl MetalDeviceSessionPlan {
             ));
         }
         let native_prepare_start = Instant::now();
-        let prepared = PreparedMetalPrefix::from_plan(device.clone(), self.prefix)?;
+        let (prepared, imported_dense) = match shared {
+            Some((source, proof)) => {
+                let resources = source
+                    .prepared
+                    .share_resources(&proof.dense, &proof.quantized)?;
+                let imported_dense = proof.dense.keys().copied().collect::<BTreeSet<_>>();
+                let imported_quantized = proof
+                    .quantized
+                    .keys()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                (
+                    PreparedMetalPrefix::from_plan_with_shared(
+                        device.clone(),
+                        self.prefix,
+                        resources,
+                        &imported_dense,
+                        &imported_quantized,
+                    )?,
+                    imported_dense,
+                )
+            }
+            None => (
+                PreparedMetalPrefix::from_plan(device.clone(), self.prefix)?,
+                BTreeSet::new(),
+            ),
+        };
         let native_prepare_wall_time = native_prepare_start.elapsed();
         let cache_miss_pipeline_build_wall_time = prepared.cache_miss_pipeline_build_wall_time();
         let initialization_upload_start = Instant::now();
@@ -960,8 +1219,16 @@ impl MetalDeviceSessionPlan {
             .lifetime
             .state_inputs()
             .iter()
-            .filter(|input| input.desc.bytes != 0)
+            .filter(|input| input.desc.bytes != 0 && !imported_dense.contains(&input.desc.id))
             .count();
+        let initial_state_h2d_bytes = self
+            .lifetime
+            .state_inputs()
+            .iter()
+            .filter(|input| !imported_dense.contains(&input.desc.id))
+            .try_fold(0usize, |total, input| {
+                total.checked_add(input.desc.bytes).ok_or(MetalError::Overflow)
+            })?;
         let preparation = MetalDevicePreparationReport {
             planning_wall_time: self.planning_wall_time,
             native_prepare_wall_time,
@@ -976,10 +1243,10 @@ impl MetalDeviceSessionPlan {
                 .ok_or(MetalError::Overflow)?,
             resident_h2d_bytes: resident_transfer
                 .h2d_bytes
-                .checked_sub(self.summary.logical_state_bytes)
+                .checked_sub(initial_state_h2d_bytes)
                 .ok_or(MetalError::Overflow)?,
             initial_state_h2d_calls,
-            initial_state_h2d_bytes: self.summary.logical_state_bytes,
+            initial_state_h2d_bytes,
         };
         let resident_sources = self.lifetime.retain_projection_sources(resident_values);
         let public_output_count = self.summary.requested_output_count;
