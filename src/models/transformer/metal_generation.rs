@@ -10,7 +10,8 @@ use crate::{
     CapturedSchedule, ExecutionPlanSummary, ReplayInput, TensorData,
     runtime::metal::{
         MetalDevice, MetalDeviceInfo, MetalDevicePreparationReport, MetalDeviceRunReport,
-        MetalDeviceSessionSummary, MetalPlanOptions, RenderedMetal,
+        MetalDeviceSessionSummary, MetalPlanOptions, MetalScoreboardContext, MetalScoreboardError,
+        MetalSessionScoreboard, RenderedMetal,
     },
     tokenizer::{SimpleTokenizer, TokenizerError},
 };
@@ -77,6 +78,7 @@ pub enum LlamaMetalGenerationStage {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LlamaMetalGenerationError {
     Step(LlamaMetalStepError),
+    Scoreboard(MetalScoreboardError),
     Generation(LlamaGenerationError),
     Tokenizer(TokenizerError),
     Chat(LlamaChatError),
@@ -116,6 +118,12 @@ impl error::Error for LlamaMetalGenerationError {}
 impl From<LlamaMetalStepError> for LlamaMetalGenerationError {
     fn from(value: LlamaMetalStepError) -> Self {
         Self::Step(value)
+    }
+}
+
+impl From<MetalScoreboardError> for LlamaMetalGenerationError {
+    fn from(value: MetalScoreboardError) -> Self {
+        Self::Scoreboard(value)
     }
 }
 
@@ -233,6 +241,23 @@ impl LlamaMetalPlan {
             chat_template: self.chat_template,
         })
     }
+
+    /// Creates the persistent device session with an opt-in v4 recorder bound
+    /// before the first token can execute.
+    pub fn prepare_with_scoreboard(
+        self,
+        context: MetalScoreboardContext,
+    ) -> Result<LlamaMetalSession, LlamaMetalGenerationError> {
+        let recorder =
+            MetalSessionScoreboard::new_append_state(context, self.step.append_state_plan());
+        let mut step = self.step.prepare(self.selected_device)?;
+        step.bind_execution_scoreboard(recorder)?;
+        Ok(LlamaMetalSession {
+            step,
+            tokenizer: self.tokenizer,
+            chat_template: self.chat_template,
+        })
+    }
 }
 
 impl LlamaMetalPrefill {
@@ -339,6 +364,27 @@ impl LlamaMetalProgress {
 }
 
 impl LlamaMetalSession {
+    /// Returns the bound token-execution recorder, or `None` for ordinary
+    /// preparation. Recording never changes a successful execution result.
+    pub fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
+        self.step.execution_scoreboard()
+    }
+
+    /// Returns the first fail-soft recording error, if one occurred.
+    pub fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
+        self.step.scoreboard_recording_error()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_scoreboard_recording_error(&mut self, error: MetalScoreboardError) {
+        self.step.inject_scoreboard_recording_error(error);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scoreboard_record_attempts(&self) -> Option<usize> {
+        self.step.scoreboard_record_attempts()
+    }
+
     /// Returns immutable selected-device information without a raw handle.
     pub fn device_info(&self) -> &MetalDeviceInfo {
         self.step.metal_session().device_info()

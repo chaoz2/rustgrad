@@ -146,8 +146,10 @@ Prompt prefill suppresses intermediate logits downloads and retains only the
 last prompt logits; decode remains sequential batch-one/T=1 with host sampling
 and one logits download whenever another token must be selected. Per-token K/V
 commits are atomic, but a later failure does not roll back an already committed
-prefix. Current protected evidence is semantic-mock only; chunk prefill and
-live-device performance evidence remain explicit follow-ups.
+prefix. `prepare_with_scoreboard` optionally binds the existing v4 recorder to
+authenticated token-step execution before the first run. Current protected
+evidence is semantic-mock only; chunk prefill and live-device performance
+evidence remain explicit follow-ups.
 
 ## How the system fits together
 

@@ -7,7 +7,8 @@ use super::{
 };
 use crate::runtime::metal::{
     MetalAppendStateInferencePlan, MetalDevice, MetalDeviceRunReport, MetalDeviceSession,
-    MetalDeviceSessionSummary, MetalError, MetalRenderer, RenderedMetal,
+    MetalDeviceSessionSummary, MetalError, MetalRenderer, MetalScoreboardError,
+    MetalSessionScoreboard, RenderedMetal,
 };
 use crate::{
     AttentionOptions, CapturedAppendStateInference, CapturedInferenceError, CapturedSchedule,
@@ -43,6 +44,14 @@ pub struct LlamaMetalStepSession {
     inner: MetalDeviceSession,
     max_context: usize,
     vocab_size: usize,
+    scoreboard: Option<LlamaMetalScoreboardObserver>,
+}
+
+struct LlamaMetalScoreboardObserver {
+    recorder: MetalSessionScoreboard,
+    first_error: Option<MetalScoreboardError>,
+    #[cfg(test)]
+    record_attempts: usize,
 }
 
 /// One successfully committed token invocation.
@@ -254,7 +263,12 @@ impl LlamaMetalStepPlan {
             inner: self.inner.prepare(device)?,
             max_context: self.max_context,
             vocab_size: self.vocab_size,
+            scoreboard: None,
         })
+    }
+
+    pub(crate) const fn append_state_plan(&self) -> &MetalAppendStateInferencePlan {
+        &self.inner
     }
 }
 
@@ -286,11 +300,50 @@ impl LlamaMetalStepSession {
         &self.inner
     }
 
+    pub(crate) fn bind_execution_scoreboard(
+        &mut self,
+        mut recorder: MetalSessionScoreboard,
+    ) -> Result<(), MetalScoreboardError> {
+        recorder.bind(&self.inner)?;
+        self.scoreboard = Some(LlamaMetalScoreboardObserver {
+            recorder,
+            first_error: None,
+            #[cfg(test)]
+            record_attempts: 0,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
+        self.scoreboard.as_ref().map(|state| &state.recorder)
+    }
+
+    pub(crate) fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
+        self.scoreboard
+            .as_ref()
+            .and_then(|state| state.first_error.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_scoreboard_recording_error(&mut self, error: MetalScoreboardError) {
+        if let Some(state) = &mut self.scoreboard
+            && state.first_error.is_none()
+        {
+            state.first_error = Some(error);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scoreboard_record_attempts(&self) -> Option<usize> {
+        self.scoreboard.as_ref().map(|state| state.record_attempts)
+    }
+
     /// Runs exactly one token. Invalid tokens, a full context, and failed
     /// device transactions preserve both position and the prior committed K/V rows.
     pub fn run_token(&mut self, token: u32) -> Result<LlamaMetalStep, LlamaMetalStepError> {
         let (position, inputs) = self.token_inputs(token)?;
         let run = self.inner.run(&inputs)?;
+        self.observe_run(&run);
         let (mut outputs, report) = run.into_parts();
         debug_assert_eq!(outputs.len(), 1);
         let logits = outputs
@@ -313,6 +366,7 @@ impl LlamaMetalStepSession {
     ) -> Result<LlamaMetalTokenCommit, LlamaMetalStepError> {
         let (position, inputs) = self.token_inputs(token)?;
         let run = self.inner.run_without_host_outputs(&inputs)?;
+        self.observe_run(&run);
         debug_assert!(run.outputs().is_empty());
         let (_, report) = run.into_parts();
         Ok(LlamaMetalTokenCommit { position, report })
@@ -342,6 +396,22 @@ impl LlamaMetalStepSession {
                 TensorData::from_scalars([1, 1], DType::I32, [Scalar::I(i64::from(token))])?,
             )]),
         ))
+    }
+
+    fn observe_run(&mut self, run: &crate::runtime::metal::MetalDeviceRun) {
+        let Some(state) = &mut self.scoreboard else {
+            return;
+        };
+        if state.first_error.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            state.record_attempts += 1;
+        }
+        if let Err(error) = state.recorder.record(run) {
+            state.first_error = Some(error);
+        }
     }
 }
 

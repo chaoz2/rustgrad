@@ -2631,8 +2631,18 @@ GPU timestamps, and host-API copy counts/bytes are not physical-bus
 measurements. Failed, skipped, reordered, foreign-session, or pre-bind records
 cannot mutate the scoreboard. The scoreboard observes an already-authenticated
 append session; it does not build a token generator, choose samples, or advance
-state independently. Fixed epoch-swapped state and model-level generation
-scoreboard facades remain explicit follow-ups.
+state independently. Fixed epoch-swapped state remains an explicit follow-up.
+
+`LlamaMetalPlan::prepare_with_scoreboard` snapshots that exact append-state
+step plan before preparation, then binds the v4 recorder to the fresh prepared
+session before returning it. Both retained-logit and host-output-suppressed
+token invocations pass their authenticated `MetalDeviceRun` to the recorder
+before detaching the public report. Recording is fail-soft: the first recorder
+error is inspectable, freezes the valid recorded prefix, and prevents later
+record attempts without changing a successful device or generation result.
+This observes token-step execution only. It does not classify prompt versus
+decode work or measure tokenization, chat rendering, sampling, tokens per
+second, GPU time, or physical transfers.
 
 The dense-or-packed F32 Llama token-step layer uses the same boundary without
 adding a model-specific runtime. A crate-private capture projection
@@ -2702,8 +2712,8 @@ unique packed owner once even when tied bindings reference it more than once.
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, mutable training state, dynamically
 shaped/capacity-growing state, general output chaining across calls, chunk
-prefill, model-level generation scoreboard wiring, multi-device execution, and live Metal
-numerical/performance evidence remain explicit follow-ons.
+prefill, orchestration-aware generation scoring, multi-device execution, and
+live Metal numerical/performance evidence remain explicit follow-ons.
 The semantic mock covers fixed-shape state ping-pong and a bounded
 residual-style multi-layer graph. Protected acceptance exercises that typed
 facade on the complete default Eval/F32 ResNet-18 `[1,3,224,224]` graph:
@@ -2793,8 +2803,8 @@ Sequential callers may reuse that one T=1 session for prefill and decode. The
 typed prompt facade now suppresses intermediate prefill outputs, retains the
 final prompt logits, and composes tokenizer/chat rendering plus host sampling
 over that persistent session. Chunk prefill, device-side sampling, a
-model-level scoreboard adapter, and live-device-performance evidence remain
-outside this slice.
+prompt/decode-aware performance scoreboard, and live-device-performance
+evidence remain outside this slice.
 
 Devices are returned in deterministic registry-ID/name order with capability
 metadata in renderer and pipeline cache identities. Resources are deliberately
