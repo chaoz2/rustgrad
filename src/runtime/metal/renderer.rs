@@ -22,6 +22,7 @@ pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-dense-materialization-v1";
 pub const METAL_INDEXED_MOVEMENT_RENDERER_VERSION: &str = "rustgrad-metal-indexed-movement-v1";
 pub const METAL_HOST_GATHER_RENDERER_VERSION: &str = "rustgrad-metal-host-gather-v1";
+pub const METAL_FIXED_HOST_GATHER_RENDERER_VERSION: &str = "rustgrad-metal-host-gather-fixed-v1";
 pub const METAL_APPEND_STATE_RENDERER_VERSION: &str = "rustgrad-metal-append-state-v1";
 const METAL_APPEND_SPAN_RENDERER_VERSION: &str = "rustgrad-metal-append-span-v1";
 const METAL_APPEND_SPAN_IOTA_RENDERER_VERSION: &str = "rustgrad-metal-append-span-iota-i32-v1";
@@ -2235,9 +2236,20 @@ fn render_host_gather(
         mutable: true,
         view: None,
     });
-    let entry = "rg_metal_host_gather_f32_i32".to_owned();
+    let fixed = link.input_elements().map_err(MetalError::InvalidBinding)? > 1;
+    let renderer_version = if fixed {
+        METAL_FIXED_HOST_GATHER_RENDERER_VERSION
+    } else {
+        METAL_HOST_GATHER_RENDERER_VERSION
+    };
+    let entry = if fixed {
+        "rg_metal_host_gather_fixed_f32_i32"
+    } else {
+        "rg_metal_host_gather_f32_i32"
+    }
+    .to_owned();
     let mut lines = vec![
-        format!("// {METAL_HOST_GATHER_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+        format!("// {renderer_version} ABI {METAL_ABI_VERSION}"),
         "#include <metal_stdlib>".into(),
         "using namespace metal;".into(),
         format!("kernel void {entry}("),
@@ -2261,7 +2273,7 @@ fn render_host_gather(
     lines.push("}".into());
     let source = lines.join("\n") + "\n";
     let cache_key = stable_key(&(
-        METAL_HOST_GATHER_RENDERER_VERSION,
+        renderer_version,
         METAL_ABI_VERSION,
         renderer.local_size,
         &renderer.capabilities,

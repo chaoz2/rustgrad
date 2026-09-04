@@ -132,8 +132,15 @@ chat template, prepares one persistent Metal session, suppresses intermediate
 prefill logits, and provides sequential T=1 ID/text/chat generation with host
 sampling. The generic Metal append runtime now authenticates fixed nonzero row
 spans and commits their checked position atomically; this is a prerequisite,
-not model chunk-prefill, and scoreboard v4 remains one-row-only. Remaining work
-wires chunk prefill into the Llama graph/facade, proves live-device output
+not model chunk-prefill, and scoreboard v4 remains one-row-only. Private Metal
+admission now also accepts exact dense batch-one `[1,T]` I32 token or position
+vectors only through canonical reshape/expand Gather lineage, checks all lanes
+before driver work, and uses a distinct status-free direct-render cache domain
+while preserving scalar T=1 identity. Integrated packed embedding capture
+accepts the same fixed geometry for Q4_0/Q8_0/Q4_K/Q6_K without host
+dequantization or repeated packed upload. Remaining work
+wires this fixed-cardinality prerequisite into the chunk-prefill Llama graph
+and facade, proves live-device output
 agreement, and adds orchestration-aware prompt/decode performance evidence over
 the existing authenticated token-step scoreboard records.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF

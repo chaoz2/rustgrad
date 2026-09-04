@@ -2602,6 +2602,24 @@ position before driver work. Generic append-state sessions remain caller-
 positioned. Run reports account caller transients and runtime controls
 separately.
 
+Status-free Metal Gather admission also has a capture-private fixed-cardinality
+host-index policy. The existing scalar I32 path and its deployment, renderer,
+and cache identities remain unchanged. A non-scalar input must instead be one
+dense read-only batch-one `[1, T]` I32 replay input whose sole materialized
+consumer is the exact `[1, T] -> [1, T, 1] -> [1, T, width]` affine index of one
+internal raw F32 Gather. Capture and static planning independently authenticate
+the producer, dependency, owner, source/output slots, normalized strides, and
+axis extent. Every host lane is checked in order before uploads or driver work;
+the separately versioned direct MSL owner therefore needs no status or
+candidate resource. Integrated packed embedding substitution accepts the same
+batch-one index geometry for Q4_0, Q8_0, Q4_K, and Q6_K while retaining its
+existing packed renderer and one-time resident upload ABI. Arbitrary computed,
+reversed, broadcast-only, shared, public, non-I32, non-batch-one, and ordinary
+Gather inputs keep the guarded or fail-closed path. This policy does not yet
+synthesize chunk positions from the sealed append scalar; a model/session layer
+may supply an independently authenticated `[1, T]` position vector until that
+runtime-control composition is added.
+
 The plan exposes exact typed input schemas, every rendered schedule item,
 nonzero compiled-kernel cache keys, planned slot bytes including private
 zero-byte sentinels, and nonzero/zero item counts. The prepared session exposes
@@ -2918,18 +2936,22 @@ compositions.
 
 A private inference-capture sidecar may authorize one narrower Gather path by
 transient input name. Authorization inspects only the already-owned captured
-schedule: it proves an exact dense scalar I32 input, one capture-owned
-`AffineCopy` whose normalized read maps every reachable index lane to physical
-offset zero, its exact dependency into one internal raw Gather owner, and the
-owner's `PortableIndexedMovement` axis and extent. Static planning repeats the
-same provenance proof over logical/physical slots. Static execution reports the
-ordinary typed `IndexOutOfBounds` error for a bad scalar before any driver call;
-only then does a separately versioned MSL kernel write its final output directly,
-without candidate/status resources or a status download. Requested Gather
-outputs, resident/state inputs,
-multi-element or transformed indices, ambiguous owners, and ordinary Gather
-rendering retain the checked transactional path. This runtime-only permission
-does not alter graph, schedule, capture, or artifact bytes.
+schedule: it proves either an exact dense scalar I32 input or a dense batch-one
+`[1, T]` I32 input, plus one capture-owned `AffineCopy`. The scalar normalized
+read maps every reachable index lane to physical offset zero; the fixed path is
+exactly `[1, T] -> [1, T, 1] -> [1, T, width]` with normalized strides
+`[0, 1, 0]`. Both require the exact dependency into one internal raw F32 Gather
+owner and authenticate the owner's `PortableIndexedMovement` axis and extent.
+Static planning repeats the same provenance proof over logical/physical slots.
+Static execution checks every host index lane in order and reports the ordinary
+typed `IndexOutOfBounds` error before any driver call. Only then does a direct
+MSL kernel write the final output without candidate/status resources or a
+status download; T>1 uses a separate renderer/cache domain while scalar T=1
+retains its exact identity. Requested Gather outputs, resident/state inputs,
+non-batch-one, reversed, broadcast-only, computed, shared, or otherwise
+transformed fixed indices, ambiguous owners, and ordinary Gather rendering
+retain the checked transactional or fail-closed path. This runtime-only
+permission does not alter graph, schedule, capture, or artifact bytes.
 
 Source identity includes renderer/ABI/transaction versions, local size,
 complete device capabilities, ordered buffer/view/guard metadata, and emitted

@@ -921,6 +921,18 @@ fn authenticate_quantized_row_gather<'a>(
         .dims()
         .try_into()
         .map_err(|_| ReplayError::Descriptor("packed row-gather weight rank".into()))?;
+    let indices_shape = graph
+        .shape(indices)
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
+    let [batch, tokens]: [usize; 2] = indices_shape
+        .dims()
+        .try_into()
+        .map_err(|_| ReplayError::Corrupt("packed row-gather index rank".into()))?;
+    if batch != 1 {
+        return Err(ReplayError::Corrupt(
+            "packed row-gather requires one fixed batch-one token vector".into(),
+        ));
+    }
     authenticate_quantized_view_owner(graph, schedule, item, *gathered, weight)?;
     authenticate_quantized_view_owner(graph, schedule, item, *index, indices)?;
     let expected = crate::MovementKernelPlan::from_scheduled_graph(graph, output)
@@ -929,17 +941,13 @@ fn authenticate_quantized_row_gather<'a>(
         || *gathered_weight != weight
         || *scalar_indices != indices
         || gathered_shape.dims() != [1, rows, columns]
-        || index_shape.dims() != [1, 1, 1]
-        || expanded_shape.dims() != [1, 1, columns]
+        || index_shape.dims() != [1, tokens, 1]
+        || expanded_shape.dims() != [1, tokens, columns]
         || graph
             .shape(output)
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?
             != expanded_shape
-        || graph
-            .shape(indices)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
-            .dims()
-            != [1, 1]
+        || indices_shape.dims() != [1, tokens]
         || graph
             .dtype(indices)
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?
@@ -978,10 +986,7 @@ fn authenticate_quantized_row_gather<'a>(
         indices,
         weight,
         output,
-        graph
-            .shape(indices)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))?
-            .clone(),
+        indices_shape.clone(),
         crate::DType::I32,
         value,
     )
@@ -2004,6 +2009,55 @@ mod tests {
                 .iter()
                 .all(|item| item.node != gathered_weight && item.node != index)
         );
+    }
+
+    #[test]
+    fn integrated_quantized_row_gather_authenticates_fixed_batch_one_indices() {
+        for (kind, columns, bytes) in [
+            (crate::GgmlType::Q4_0, 32, 36),
+            (crate::GgmlType::Q8_0, 32, 68),
+            (crate::GgmlType::Q4K, 256, 288),
+            (crate::GgmlType::Q6K, 256, 420),
+        ] {
+            let mut graph = Graph::new();
+            let weight = graph.input("weight", Shape::from([2, columns]));
+            let indices = graph.input_dtype("indices", [1, 3], crate::DType::I32);
+            let gathered_weight = graph.reshape(weight, [1, 2, columns]).unwrap();
+            let index_view = graph.reshape(indices, [1, 3, 1]).unwrap();
+            let index = graph.expand(index_view, [1, 3, columns]).unwrap();
+            let output = graph.gather(gathered_weight, index, 1).unwrap();
+            let schedule = crate::schedule(&graph, output).unwrap();
+            let value =
+                crate::QuantizedTensorData::new(kind, Shape::from([2, columns]), vec![0; bytes])
+                    .unwrap();
+            let capture = CapturedSchedule::capture_with_quantized_bindings(
+                &graph,
+                &schedule,
+                &[output],
+                &[QuantizedCaptureBinding::RowGather {
+                    output,
+                    indices,
+                    weight,
+                    value,
+                }],
+            )
+            .unwrap();
+            assert_eq!(capture.items.len(), 1);
+            let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+                capture.items[0].kernel.operation()
+            else {
+                panic!("fixed row gather was not substituted");
+            };
+            assert_eq!(plan.indices_shape.dims(), [1, 3]);
+            assert_eq!(plan.output_shape.dims(), [1, 3, columns]);
+            assert_eq!(capture.items[0].ordered_inputs()[0].input_node, indices);
+            assert!(
+                capture
+                    .items
+                    .iter()
+                    .all(|item| item.node != gathered_weight && item.node != index)
+            );
+        }
     }
 
     #[test]
