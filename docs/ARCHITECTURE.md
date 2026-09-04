@@ -2759,9 +2759,18 @@ protected prompt, positive token bound, and independently pinned greedy token
 IDs. It performs no model download, prepares
 one persistent dense-or-packed session, checks ordered token-step reports,
 resident/cache ownership, zero fallback, suppressed prompt downloads, and
-retained logits downloads, then uploads a distinct v4 scoreboard. The expected
-IDs prove only the pinned model/prompt execution contract, not broad numerical
-parity with another runtime.
+retained logits downloads, then uploads a distinct v4 scoreboard, typed
+provenance attestation, and basename-only `SHA256SUMS`. The create-new
+attestation records the reviewed code SHA, supplied model SHA-256, filename and
+size (never the runner-local absolute path), immutable model locator/revision,
+license and conversion/quantization provenance, actual device identity, exact
+prompt mode/text/bound, expected and actual IDs, oracle name/revision/command,
+workflow run identity, scoreboard filename, execution identities, and final
+successful-run/position/fallback facts. The workflow authenticates the GGUF
+against the supplied hash before Cargo; the companion JSON records that prior
+check but does not independently prove the model bytes. The expected IDs prove
+only the pinned model/prompt execution contract, not broad numerical parity
+with another runtime.
 These paths prove stable resident schemas, compiled cache identities, device
 ownership, zero run-time resident upload, and zero fallback. The release profile
 keeps the one complete CPU oracle practical without weakening the device
@@ -2775,8 +2784,13 @@ reviewers on `live-metal`, and define protected
 `RUSTGRAD_METAL_LLAMA_GGUF_PATH`, `RUSTGRAD_METAL_LLAMA_GGUF_SHA256`,
 `RUSTGRAD_METAL_LLAMA_REGISTRY_ID`, `RUSTGRAD_METAL_LLAMA_PROMPT`,
 `RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS`, and
-`RUSTGRAD_METAL_LLAMA_EXPECTED_IDS` values. The model remains outside the
-checkout and the workflow never downloads it.
+`RUSTGRAD_METAL_LLAMA_EXPECTED_IDS` values, plus single-line protected
+`RUSTGRAD_METAL_LLAMA_MODEL_SOURCE`, `RUSTGRAD_METAL_LLAMA_MODEL_LICENSE`,
+`RUSTGRAD_METAL_LLAMA_MODEL_CONVERSION`,
+`RUSTGRAD_METAL_LLAMA_ORACLE_NAME`,
+`RUSTGRAD_METAL_LLAMA_ORACLE_REVISION`, and
+`RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND` provenance. The model remains outside
+the checkout and the workflow never downloads it.
 
 `runtime/metal/mod.rs` is the facade for the first Apple Metal execution
 boundary. `ffi.rs` dynamically loads the Objective-C runtime, CoreGraphics, and

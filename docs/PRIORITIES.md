@@ -89,8 +89,12 @@ workflow. A separate job authenticates the selected Metal registry ID and
 runner-local GGUF bytes against protected values, uses an independently pinned
 prompt and greedy token IDs, checks the persistent token-step
 ownership/transfer contract, and emits its own
-v4 scoreboard without downloading a model. Those IDs are bounded conformance
-evidence, not a broad cross-runtime numerical oracle. The release-profile lane
+v4 scoreboard plus a typed provenance attestation and checksum manifest without
+downloading or uploading a model. The attestation preserves the protected
+model/oracle provenance and exact prompt/ID contract but records, rather than
+independently re-proves, the workflow's prior GGUF hash check. Those IDs are
+bounded conformance evidence, not a broad cross-runtime numerical oracle. The
+release-profile lane
 is dormant until the matching runner, protected environment, and authenticated
 model are provisioned; the repository workflow only references those external
 controls. Ordinary macOS CI remains mock-only and no live-device result is
