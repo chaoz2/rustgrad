@@ -20,6 +20,7 @@ struct MetalStaticAdapter {
     cache: Option<MetalCache>,
     cache_miss_pipeline_build_wall_time: Rc<Cell<Duration>>,
     append_state: BTreeMap<u64, StaticAppendStateLink>,
+    append_span_iota: BTreeMap<u64, StaticAppendStateLink>,
     host_gathers: BTreeMap<u64, StaticHostGather>,
 }
 
@@ -31,6 +32,7 @@ impl MetalStaticAdapter {
             cache: None,
             cache_miss_pipeline_build_wall_time: Rc::new(Cell::new(Duration::ZERO)),
             append_state: BTreeMap::new(),
+            append_span_iota: BTreeMap::new(),
             host_gathers: BTreeMap::new(),
         }
     }
@@ -43,6 +45,7 @@ impl MetalStaticAdapter {
             cache: Some(cache),
             cache_miss_pipeline_build_wall_time: Rc::new(Cell::new(Duration::ZERO)),
             append_state: BTreeMap::new(),
+            append_span_iota: BTreeMap::new(),
             host_gathers: BTreeMap::new(),
         }
     }
@@ -53,6 +56,9 @@ impl MetalStaticAdapter {
                 return Err(MetalError::InvalidBinding(
                     "duplicate Metal append-state output".into(),
                 ));
+            }
+            if let Some(iota) = link.iota {
+                self.append_span_iota.entry(iota).or_insert(*link);
             }
         }
         Ok(self)
@@ -89,16 +95,20 @@ impl StaticPlanAdapter for MetalStaticAdapter {
     fn render(&self, item: &ScheduleItem) -> Result<StaticRendered<Self::Rendered>, Self::Error> {
         let rendered = match (
             self.append_state.get(&item.outputs.primary().id),
+            self.append_span_iota.get(&item.outputs.primary().id),
             self.host_gathers.get(&item.outputs.primary().id),
         ) {
-            (Some(_), Some(_)) => {
+            (Some(_), _, Some(_)) | (_, Some(_), Some(_)) | (Some(_), Some(_), _) => {
                 return Err(MetalError::InvalidBinding(
-                    "Metal item cannot mix append state and host Gather policy".into(),
+                    "Metal item cannot mix append state, span iota, and host Gather policy".into(),
                 ));
             }
-            (Some(link), None) => self.renderer.render_append_state(&item.kernel, link)?,
-            (None, Some(link)) => self.renderer.render_host_gather(&item.kernel, link)?,
-            (None, None) => self.renderer.render(&item.kernel)?,
+            (Some(link), None, None) => self.renderer.render_append_state(&item.kernel, link)?,
+            (None, Some(link), None) => self
+                .renderer
+                .render_authenticated_append_span_iota(&item.kernel, link)?,
+            (None, None, Some(link)) => self.renderer.render_host_gather(&item.kernel, link)?,
+            (None, None, None) => self.renderer.render(&item.kernel)?,
         };
         rendered.validate_schedule_bindings(item.ordered_inputs())?;
         rendered.validate_quantized_schedule_bindings(&item.quantized_input_bindings)?;

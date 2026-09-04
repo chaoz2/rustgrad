@@ -1545,11 +1545,15 @@ pub(crate) fn authenticate_append_state_index_lineage(
     let Some(first) = links.first() else {
         return Err("append-state index lineage is absent".into());
     };
-    if links
-        .iter()
-        .any(|link| link.index != first.index || link.position != first.position)
-    {
-        return Err("append-state links do not share one position-derived index".into());
+    if links.iter().any(|link| {
+        link.index != first.index
+            || link.position != first.position
+            || link.iota != first.iota
+            || link.axis != first.axis
+            || link.axis_extent != first.axis_extent
+            || link.span != first.span
+    }) {
+        return Err("append-state links do not share one position-derived span".into());
     }
     let index_items = items
         .iter()
@@ -1573,14 +1577,343 @@ pub(crate) fn authenticate_append_state_index_lineage(
     if consumers.len() != links.len() {
         return Err("append-state index consumers are incomplete".into());
     }
-    authenticate_scalar_expansion_producer(
+    if first.span.rows == 1 || first.span.total_elements == 0 {
+        return authenticate_scalar_expansion_producer(
+            index_item,
+            first.position,
+            None,
+            first.index,
+            &index_output.shape,
+            &consumers,
+        );
+    }
+    authenticate_append_span_producer(items, index_item, first, &consumers)
+}
+
+pub(crate) enum AppendSpanEndError {
+    Overflow,
+    InvalidBinding(String),
+}
+
+pub(crate) fn checked_append_span_end(
+    committed_position: usize,
+    span_rows: usize,
+    axis_extent: usize,
+) -> Result<usize, AppendSpanEndError> {
+    let end = committed_position
+        .checked_add(span_rows)
+        .ok_or(AppendSpanEndError::Overflow)?;
+    let last = end.checked_sub(1).ok_or_else(|| {
+        AppendSpanEndError::InvalidBinding("append span must contain at least one row".to_owned())
+    })?;
+    if end > axis_extent || i32::try_from(last).is_err() {
+        return Err(AppendSpanEndError::InvalidBinding(format!(
+            "append span {committed_position}..{end} exceeds state extent {axis_extent} or I32 index admission"
+        )));
+    }
+    Ok(end)
+}
+
+fn authenticate_append_span_producer(
+    items: &[ScheduleItem],
+    index_item: &ScheduleItem,
+    link: &StaticAppendStateLink,
+    consumers: &[&ScheduleItem],
+) -> Result<(), String> {
+    index_item
+        .kernel
+        .validate()
+        .map_err(|error| error.to_string())?;
+    let [store, end_range] = index_item.kernel.sources() else {
+        return Err("append span index producer must be one store".into());
+    };
+    let crate::Operation::Sink = index_item.kernel.operation() else {
+        return Err("append span index producer must be a sink".into());
+    };
+    let crate::Operation::Store = store.operation() else {
+        return Err("append span index producer must contain one store".into());
+    };
+    let [output_index, value] = store.sources() else {
+        return Err("append span index store is malformed".into());
+    };
+    let crate::Operation::GraphBinary(crate::BinaryOp::Add) = value.operation() else {
+        return Err("append span index must contain one exact Add".into());
+    };
+    let [position_load, iota_load] = value.sources() else {
+        return Err("append span index Add is malformed".into());
+    };
+    fn parse_load(load: &crate::UOp) -> Result<(&crate::IndexValue, &crate::UOp), String> {
+        let crate::Operation::Load = load.operation() else {
+            return Err("append span index operand is not a load".into());
+        };
+        let [index] = load.sources() else {
+            return Err("append span index load is malformed".into());
+        };
+        let crate::Operation::Index(index_value) = index.operation() else {
+            return Err("append span index load has no Index".into());
+        };
+        Ok((index_value, index))
+    }
+    let (position_value, position_index) = parse_load(position_load)?;
+    let (iota_value, iota_index) = parse_load(iota_load)?;
+    let crate::IndexValue::View {
+        buffer: position_buffer,
+        elements: position_elements,
+        input_shape: position_input_shape,
+        output_shape: position_output_shape,
+        view: position_view,
+    } = position_value
+    else {
+        return Err("append span position is not an affine view".into());
+    };
+    let crate::IndexValue::View {
+        buffer: iota_buffer,
+        elements: iota_elements,
+        input_shape: iota_input_shape,
+        output_shape: iota_output_shape,
+        view: iota_view,
+    } = iota_value
+    else {
+        return Err("append span iota is not one affine load".into());
+    };
+    let output = index_item.outputs.primary();
+    let elements = output.shape.numel().map_err(|error| error.to_string())?;
+    let position_normalized = position_view
+        .normalized_read()
+        .map_err(|error| error.to_string())?;
+    let ordered_inputs = index_item.ordered_inputs();
+    let position_binding = ordered_inputs
+        .iter()
+        .find(|binding| binding.desc.id == link.position)
+        .ok_or_else(|| "append span position binding is absent".to_owned())?;
+    let iota_id = link
+        .iota
+        .ok_or_else(|| "append span ShapeIota identity is absent".to_owned())?;
+    let iota_binding = ordered_inputs
+        .iter()
+        .find(|binding| binding.desc.id == iota_id)
+        .ok_or_else(|| "append span ShapeIota binding is absent".to_owned())?;
+    crate::schedule::validate_buffer_desc(&position_binding.desc)
+        .map_err(|error| error.to_string())?;
+    let crate::Operation::Index(crate::IndexValue::Buffer {
+        buffer: output_buffer,
+        elements: output_elements,
+        input_shape: output_input_shape,
+        output_shape: output_output_shape,
+        addressing: crate::IndexAddressing::Broadcast,
+    }) = output_index.operation()
+    else {
+        return Err("append span output addressing is invalid".into());
+    };
+    let crate::Operation::EndRange = end_range.operation() else {
+        return Err("append span index has no terminal range".into());
+    };
+    let [terminal_range] = end_range.sources() else {
+        return Err("append span terminal range is malformed".into());
+    };
+    let crate::Operation::Range(0) = terminal_range.operation() else {
+        return Err("append span range is invalid".into());
+    };
+    if index_item.outputs.len() != 1
+        || index_item.node.index() as u64 != link.index
+        || output.id != link.index
+        || output.dtype != DType::I32
+        || output.view.is_some()
+        || output.read_only
+        || *output_buffer != link.index
+        || *output_elements != elements
+        || output_input_shape != &output.shape
+        || output_output_shape != &output.shape
+        || *position_buffer != link.position
+        || *position_elements != elements
+        || position_input_shape != &output.shape
+        || position_output_shape != &output.shape
+        || ordered_inputs.len() != 2
+        || position_binding.desc.id != link.position
+        || position_binding.abi_index != 0
+        || position_binding.desc.dtype != DType::I32
+        || position_binding.desc.shape.numel().ok() != Some(1)
+        || position_binding.desc.bytes != DType::I32.itemsize()
+        || position_binding.desc.alignment != DType::I32.itemsize()
+        || !position_binding.desc.read_only
+        || position_binding.desc.view.as_ref() != Some(position_view)
+        || position_view.source_shape != position_binding.desc.shape
+        || position_view.logical_shape != output.shape
+        || position_index.ty() != Some(crate::UType::scalar(DType::I32))
+        || iota_load.ty() != Some(crate::UType::scalar(DType::I32))
+        || value.ty() != Some(crate::UType::scalar(DType::I32))
+        || position_normalized.offset != 0
+        || position_normalized
+            .axes
+            .iter()
+            .any(|axis| axis.stride != 0 || axis.reversed)
+        || !position_index.sources()[1].shares_node_with(terminal_range)
+        || !iota_index.sources()[1].shares_node_with(terminal_range)
+        || !output_index.sources()[1].shares_node_with(terminal_range)
+        || index_item.consumers != consumers.iter().map(|item| item.id).collect::<Vec<_>>()
+        || consumers
+            .iter()
+            .any(|item| !item.dependencies.contains(&index_item.id))
+    {
+        return Err("append span index provenance is inconsistent".into());
+    }
+    authenticate_append_span_iota(
+        items,
         index_item,
-        first.position,
-        None,
-        first.index,
-        &index_output.shape,
-        &consumers,
+        iota_id,
+        AppendSpanIotaLoad {
+            binding: iota_binding,
+            view: iota_view,
+            buffer: *iota_buffer,
+            elements: *iota_elements,
+            input_shape: iota_input_shape,
+            output_shape: iota_output_shape,
+        },
+        link,
     )
+}
+
+struct AppendSpanIotaLoad<'a> {
+    binding: &'a ScheduleInputBinding,
+    view: &'a crate::AffineView,
+    buffer: u64,
+    elements: usize,
+    input_shape: &'a Shape,
+    output_shape: &'a Shape,
+}
+
+fn authenticate_append_span_iota(
+    items: &[ScheduleItem],
+    index_item: &ScheduleItem,
+    iota_id: u64,
+    load: AppendSpanIotaLoad<'_>,
+    link: &StaticAppendStateLink,
+) -> Result<(), String> {
+    let normalized = load
+        .view
+        .normalized_read()
+        .map_err(|error| error.to_string())?;
+    let source_shape = Shape::from([link.span.rows]);
+    let expected_bytes = link
+        .span
+        .rows
+        .checked_mul(DType::I32.itemsize())
+        .ok_or_else(|| "append span ShapeIota byte extent overflow".to_owned())?;
+    crate::schedule::validate_buffer_desc(&load.binding.desc).map_err(|error| error.to_string())?;
+    if load.buffer != iota_id
+        || load.elements != link.span.total_elements
+        || load.input_shape != load.output_shape
+        || load.output_shape != &load.view.logical_shape
+        || load.view.source_shape != source_shape
+        || load.binding.input_node.index() as u64 != iota_id
+        || load.binding.abi_index != 1
+        || load.binding.desc.id != iota_id
+        || load.binding.desc.shape != source_shape
+        || load.binding.desc.dtype != DType::I32
+        || load.binding.desc.bytes != expected_bytes
+        || load.binding.desc.alignment != DType::I32.itemsize()
+        || !load.binding.desc.read_only
+        || load.binding.desc.view.as_ref() != Some(load.view)
+        || normalized.offset != 0
+        || normalized.axes.len() != load.output_shape.rank()
+        || normalized
+            .axes
+            .iter()
+            .enumerate()
+            .any(|(axis, map)| map.reversed || map.stride != usize::from(axis == link.axis))
+    {
+        return Err("append span ShapeIota affine provenance is inconsistent".into());
+    }
+
+    let producers = items
+        .iter()
+        .filter(|item| item.outputs.iter().any(|output| output.id == iota_id))
+        .collect::<Vec<_>>();
+    let [producer] = producers.as_slice() else {
+        return Err("append span ShapeIota must have one captured producer".into());
+    };
+    producer
+        .kernel
+        .validate()
+        .map_err(|error| error.to_string())?;
+    let [store, end_range] = producer.kernel.sources() else {
+        return Err("append span ShapeIota producer must be one store".into());
+    };
+    let crate::Operation::Sink = producer.kernel.operation() else {
+        return Err("append span ShapeIota producer must be a sink".into());
+    };
+    let crate::Operation::Store = store.operation() else {
+        return Err("append span ShapeIota producer must contain one store".into());
+    };
+    let [store_index, stored_value] = store.sources() else {
+        return Err("append span ShapeIota store is malformed".into());
+    };
+    let crate::Operation::Index(crate::IndexValue::Buffer {
+        buffer: store_buffer,
+        elements: store_elements,
+        input_shape: store_input_shape,
+        output_shape: store_output_shape,
+        addressing: crate::IndexAddressing::Broadcast,
+    }) = store_index.operation()
+    else {
+        return Err("append span ShapeIota output addressing is invalid".into());
+    };
+    let crate::Operation::EndRange = end_range.operation() else {
+        return Err("append span ShapeIota has no terminal range".into());
+    };
+    let [range] = end_range.sources() else {
+        return Err("append span ShapeIota terminal range is malformed".into());
+    };
+    let crate::Operation::Range(0) = range.operation() else {
+        return Err("append span ShapeIota range is invalid".into());
+    };
+    let [extent] = range.sources() else {
+        return Err("append span ShapeIota range extent is malformed".into());
+    };
+    let crate::Operation::Const(crate::LiteralValue::Int(range_extent)) = extent.operation() else {
+        return Err("append span ShapeIota range extent is not an integer literal".into());
+    };
+    let coordinate_is_exact = match (stored_value.operation(), stored_value.sources()) {
+        (crate::Operation::Cast, [coordinate]) => {
+            stored_value.ty() == Some(crate::UType::scalar(DType::I32))
+                && coordinate.ty() == Some(crate::UType::scalar(DType::I64))
+                && coordinate.shares_node_with(range)
+        }
+        _ => {
+            stored_value.ty() == Some(crate::UType::scalar(DType::I32))
+                && range.ty() == Some(crate::UType::scalar(DType::I32))
+                && stored_value.shares_node_with(range)
+        }
+    };
+    let output = producer.outputs.primary();
+    if producer.outputs.len() != 1
+        || producer.node.index() as u64 != iota_id
+        || output.id != iota_id
+        || output.shape != source_shape
+        || output.dtype != DType::I32
+        || output.bytes != expected_bytes
+        || output.alignment != DType::I32.itemsize()
+        || output.read_only
+        || output.view.is_some()
+        || producer.boundary.is_some()
+        || !producer.inputs.is_empty()
+        || !producer.ordered_inputs().is_empty()
+        || !producer.ordered_quantized_inputs().is_empty()
+        || !producer.external_materializations.is_empty()
+        || !producer.dependencies.is_empty()
+        || producer.consumers.as_slice() != [index_item.id]
+        || !index_item.dependencies.contains(&producer.id)
+        || *store_buffer != iota_id
+        || *store_elements != link.span.rows
+        || store_input_shape != &source_shape
+        || store_output_shape != &source_shape
+        || !store_index.sources()[1].shares_node_with(range)
+        || usize::try_from(*range_extent).ok() != Some(link.span.rows)
+        || !coordinate_is_exact
+    {
+        return Err("append span ShapeIota producer provenance is inconsistent".into());
+    }
+    Ok(())
 }
 
 /// One authenticated fixed-shape input/output pair whose two private slots
@@ -1591,19 +1924,30 @@ pub(crate) struct StaticStateLink {
     pub(crate) output: u64,
 }
 
+/// Checked geometry for one fixed append span. Totals stay distinct from one
+/// row so execution accounting cannot accidentally multiply them twice.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct AppendSpanGeometry {
+    pub(crate) rows: usize,
+    pub(crate) elements_per_row: usize,
+    pub(crate) bytes_per_row: usize,
+    pub(crate) total_elements: usize,
+    pub(crate) total_bytes: usize,
+}
+
 /// One authenticated full-buffer logical Scatter output that aliases its
-/// exclusively owned input allocation while writing exactly one complete row.
+/// exclusively owned input allocation while writing one fixed row span.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct StaticAppendStateLink {
     pub(crate) input: u64,
     pub(crate) output: u64,
     pub(crate) position: u64,
     pub(crate) index: u64,
+    pub(crate) iota: Option<u64>,
     pub(crate) updates: u64,
     pub(crate) axis: usize,
     pub(crate) axis_extent: usize,
-    pub(crate) row_elements: usize,
-    pub(crate) row_bytes: usize,
+    pub(crate) span: AppendSpanGeometry,
 }
 
 struct StaticOutputPolicy<'a> {
@@ -1818,6 +2162,12 @@ impl<R> StaticSchedulePlan<R> {
         }
 
         validate_prefix::<A>(items)?;
+        if let Some(policy) = &outputs
+            && !policy.append_state_links.is_empty()
+        {
+            authenticate_append_state_index_lineage(items, policy.append_state_links)
+                .map_err(A::invalid_binding)?;
+        }
 
         for (item_index, item) in items.iter().enumerate() {
             if item.boundary.is_some() || item.is_effect() {
@@ -1896,7 +2246,7 @@ impl<R> StaticSchedulePlan<R> {
             }
             let expected_work_items = append_by_output
                 .get(&item.outputs.primary().id)
-                .map_or(launch.work_items, |link| link.row_elements);
+                .map_or(launch.work_items, |link| link.span.total_elements);
             if rendered.extent != expected_work_items {
                 return Err(A::invalid_binding(
                     "rendered launch extent mismatches scheduled output".into(),
@@ -2147,20 +2497,32 @@ impl<R> StaticSchedulePlan<R> {
             }
         }
 
-        if !append_state_links.is_empty() {
-            authenticate_append_state_index_lineage(items, &append_state_links)
-                .map_err(A::invalid_binding)?;
-        }
         for link in &append_state_links {
             if link.input == link.output
                 || state_ids.contains(&link.input)
                 || state_ids.contains(&link.output)
                 || !state_ids.insert(link.input)
                 || !state_ids.insert(link.output)
-                || link.axis_extent == 0 && link.row_elements != 0
-                || link.row_bytes
+                || link.span.rows == 0
+                || link.iota.is_some() != (link.span.rows > 1 && link.span.total_elements > 0)
+                || link.span.rows > link.axis_extent
+                || link.axis_extent == 0 && link.span.total_elements != 0
+                || link.span.total_elements
                     != link
-                        .row_elements
+                        .span
+                        .rows
+                        .checked_mul(link.span.elements_per_row)
+                        .ok_or_else(A::overflow)?
+                || link.span.bytes_per_row
+                    != link
+                        .span
+                        .elements_per_row
+                        .checked_mul(DType::F32.itemsize())
+                        .ok_or_else(A::overflow)?
+                || link.span.total_bytes
+                    != link
+                        .span
+                        .total_elements
                         .checked_mul(DType::F32.itemsize())
                         .ok_or_else(A::overflow)?
             {
@@ -2217,15 +2579,16 @@ impl<R> StaticSchedulePlan<R> {
                 || position.elements != 1
                 || position.bytes != DType::I32.itemsize()
                 || position.alignment != DType::I32.itemsize()
+                || index.source_shape.dims().get(link.axis) != Some(&link.span.rows)
                 || updates.dtype != DType::F32
                 || index.source_shape != updates.source_shape
                 || input.source_shape != output.source_shape
                 || input.elements != output.elements
                 || input.bytes != output.bytes
                 || input.alignment != output.alignment
-                || index.elements != link.row_elements
-                || updates.elements != link.row_elements
-                || item.extent != link.row_elements
+                || index.elements != link.span.total_elements
+                || updates.elements != link.span.total_elements
+                || item.extent != link.span.total_elements
                 || source_item.outputs.len() != 1
                 || source_item.outputs.primary().id != link.output
                 || !item.input_ids.contains(&link.input)
@@ -2961,12 +3324,12 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             ));
         }
         for link in &self.append_state_links {
-            if committed_position >= link.axis_extent {
-                return Err(A::invalid_binding(format!(
-                    "append position {committed_position} exceeds state extent {}",
-                    link.axis_extent
-                )));
-            }
+            checked_append_span_end(committed_position, link.span.rows, link.axis_extent).map_err(
+                |error| match error {
+                    AppendSpanEndError::Overflow => A::overflow(),
+                    AppendSpanEndError::InvalidBinding(reason) => A::invalid_binding(reason),
+                },
+            )?;
             let position = values.get(&link.position).ok_or_else(|| {
                 A::invalid_binding(format!("append position {} is absent", link.position))
             })?;
@@ -3085,6 +3448,28 @@ mod tests {
     use super::*;
     use crate::{Graph, Shape, Storage, schedule_many};
     use std::{cell::RefCell, rc::Rc};
+
+    #[test]
+    fn append_span_end_authenticates_every_i32_index_before_execution() {
+        let i32_extent = i32::MAX as usize + 1;
+        assert!(matches!(
+            checked_append_span_end(i32_extent - 3, 3, i32_extent),
+            Ok(end) if end == i32_extent
+        ));
+        assert!(matches!(
+            checked_append_span_end(i32_extent - 2, 3, usize::MAX),
+            Err(AppendSpanEndError::InvalidBinding(reason))
+                if reason.contains("I32 index admission")
+        ));
+        assert!(matches!(
+            checked_append_span_end(0, 0, i32_extent),
+            Err(AppendSpanEndError::InvalidBinding(_))
+        ));
+        assert!(matches!(
+            checked_append_span_end(usize::MAX, 1, usize::MAX),
+            Err(AppendSpanEndError::Overflow)
+        ));
+    }
 
     #[derive(Default)]
     struct Calls {

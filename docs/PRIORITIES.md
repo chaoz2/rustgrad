@@ -130,7 +130,10 @@ dense/packed models. Sequential T=1 calls reuse one compiled/resident session.
 The typed model facade now consumes the same GGUF-bound model, tokenizer, and
 chat template, prepares one persistent Metal session, suppresses intermediate
 prefill logits, and provides sequential T=1 ID/text/chat generation with host
-sampling. Remaining work adds chunk prefill, proves live-device output
+sampling. The generic Metal append runtime now authenticates fixed nonzero row
+spans and commits their checked position atomically; this is a prerequisite,
+not model chunk-prefill, and scoreboard v4 remains one-row-only. Remaining work
+wires chunk prefill into the Llama graph/facade, proves live-device output
 agreement, and adds orchestration-aware prompt/decode performance evidence over
 the existing authenticated token-step scoreboard records.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF

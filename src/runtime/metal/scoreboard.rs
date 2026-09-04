@@ -344,6 +344,8 @@ pub enum MetalScoreboardError {
     NotBound,
     /// The session is not a fresh preparation of the snapshotted deployment.
     PlanMismatch,
+    /// Scoreboard v4 defines one committed row per successful invocation.
+    UnsupportedAppendSpan { span_rows: usize },
     /// The successful run belongs to another prepared session.
     WrongSession,
     /// A successful run was skipped, repeated, or reordered.
@@ -375,6 +377,10 @@ impl fmt::Display for MetalScoreboardError {
             Self::PlanMismatch => write!(
                 formatter,
                 "Metal session does not match the scoreboard inference plan"
+            ),
+            Self::UnsupportedAppendSpan { span_rows } => write!(
+                formatter,
+                "Metal scoreboard v4 does not support append spans of {span_rows} rows"
             ),
             Self::WrongSession => write!(formatter, "Metal run belongs to another session"),
             Self::OutOfOrder { expected, actual } => write!(
@@ -414,6 +420,7 @@ pub struct MetalSessionScoreboard {
     peak_logical_temporary_bytes: usize,
     plan_summary: MetalDeviceSessionSummary,
     state_policy: MetalScoreboardStatePolicy,
+    append_span_rows: usize,
     inputs: Vec<MetalScoreboardInput>,
     binding: Option<BoundScoreboard>,
     runs: Vec<MetalScoreboardRun>,
@@ -455,11 +462,16 @@ impl MetalSessionScoreboard {
 
     /// Snapshots one authenticated append-state deployment without creating a
     /// Metal resource. Generation/model orchestration remains caller-owned.
+    ///
+    /// Version-4 callers should use [`Self::try_new_append_state_v4`] so a
+    /// multirow plan rejects before preparation. This source-compatible legacy
+    /// constructor permits inspection, but its recorder rejects a multirow
+    /// session with [`MetalScoreboardError::UnsupportedAppendSpan`] at bind.
     pub fn new_append_state(
         context: MetalScoreboardContext,
         plan: &MetalAppendStateInferencePlan,
     ) -> Self {
-        Self::from_plan(
+        let mut scoreboard = Self::from_plan(
             context,
             ScoreboardPlanView {
                 deployment_identity: plan.deployment_identity(),
@@ -470,7 +482,21 @@ impl MetalSessionScoreboard {
                 state_inputs: plan.state_inputs(),
                 state_policy: MetalScoreboardStatePolicy::Append,
             },
-        )
+        );
+        scoreboard.append_span_rows = plan.append_span_rows();
+        scoreboard
+    }
+
+    /// Creates a v4 recorder only when one success commits exactly one row.
+    pub fn try_new_append_state_v4(
+        context: MetalScoreboardContext,
+        plan: &MetalAppendStateInferencePlan,
+    ) -> Result<Self, MetalScoreboardError> {
+        let span_rows = plan.append_span_rows();
+        if span_rows != 1 {
+            return Err(MetalScoreboardError::UnsupportedAppendSpan { span_rows });
+        }
+        Ok(Self::new_append_state(context, plan))
     }
 
     fn from_plan(context: MetalScoreboardContext, plan: ScoreboardPlanView<'_>) -> Self {
@@ -508,6 +534,7 @@ impl MetalSessionScoreboard {
             peak_logical_temporary_bytes: plan.execution_plan.peak_logical_bytes,
             plan_summary: plan.summary.clone(),
             state_policy: plan.state_policy,
+            append_span_rows: 0,
             inputs,
             binding: None,
             runs: Vec::new(),
@@ -518,6 +545,11 @@ impl MetalSessionScoreboard {
     /// Binds this recorder once to the session prepared from its exact inference
     /// deployment. No measurement is recorded by binding.
     pub fn bind(&mut self, session: &MetalDeviceSession) -> Result<(), MetalScoreboardError> {
+        if self.state_policy == MetalScoreboardStatePolicy::Append && self.append_span_rows != 1 {
+            return Err(MetalScoreboardError::UnsupportedAppendSpan {
+                span_rows: self.append_span_rows,
+            });
+        }
         if self.binding.is_some() {
             return Err(MetalScoreboardError::AlreadyBound);
         }

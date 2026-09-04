@@ -799,10 +799,20 @@ fn lower_graph_elementwise_with_substitutions(
                 Op::Constant(_) => load(graph, id, out, range, None, context.iteration)?,
                 Op::Random { .. } => return Err(UOpError::InvalidArgument),
                 Op::ShapeIota { .. } => {
-                    if context.iteration.is_some() || &shape != out {
-                        return Err(UOpError::InvalidArgument);
+                    if let Some(iteration) = context.iteration {
+                        let projected =
+                            crate::rangeify::projected_view(graph, iteration.movement, out, range)
+                                .map_err(|_| UOpError::InvalidArgument)?;
+                        if projected.source != id || projected.predicate.is_some() {
+                            return Err(UOpError::InvalidArgument);
+                        }
+                        UOp::cast(projected.expression, ty)
+                    } else {
+                        if &shape != out {
+                            return Err(UOpError::InvalidArgument);
+                        }
+                        UOp::cast(range.clone(), ty)
                     }
-                    UOp::cast(range.clone(), ty)
                 }
                 // A reduction is a schedule materialization boundary.  The DAG
                 // executor supplies its owned buffer under this stable node ID.
@@ -848,7 +858,11 @@ fn lower_graph_elementwise_with_substitutions(
                                         context.iteration,
                                     )?
                                 } else if context.iteration.is_none()
-                                    && context.affine_sources.contains(&planned.source.index())
+                                    && (context.affine_sources.contains(&planned.source.index())
+                                        || matches!(
+                                            graph.op(planned.source),
+                                            Ok(Op::ShapeIota { .. })
+                                        ))
                                 {
                                     let nested = ElementwiseLowering {
                                         materialized: context.materialized,
@@ -1613,6 +1627,9 @@ pub(crate) fn execute_lowered_elementwise(
     let output_shape = output_shape.clone();
     let plan = IterationPlan::new(output_shape.clone());
     let len = plan.len()?;
+    if let Some(values) = direct_i32_store_iteration(kernel, store, index, len)? {
+        return TensorData::from_storage(output_shape, Storage::I32(values));
+    }
     if output_dtype == DType::BF16
         && let Some(raw) = direct_f32_to_bf16(store, bindings, &plan, len)?
     {
@@ -1623,6 +1640,68 @@ pub(crate) fn execute_lowered_elementwise(
         values.push(eval_store_value(store, bindings, linear, &plan)?);
     }
     TensorData::from_storage(output_shape, fused_storage(output_dtype, values))
+}
+
+/// Executes only a dense I32 Store whose value is the Store's own canonical
+/// iteration Range, optionally narrowed by one exact I64-to-I32 Cast. This is
+/// the retained semantic counterpart of specialized ShapeIota renderers; an
+/// unrelated or merely structurally equal Range remains unsupported.
+fn direct_i32_store_iteration(
+    kernel: &UOp,
+    store: &UOp,
+    index: &UOp,
+    len: usize,
+) -> Result<Option<Vec<i32>>> {
+    let [store_index, value] = store.sources() else {
+        return Err(Error::InvalidIndex);
+    };
+    let candidate = match (value.operation(), value.sources()) {
+        (Operation::Cast, [source])
+            if value.ty() == Some(UType::scalar(DType::I32))
+                && source.ty() == Some(UType::scalar(DType::I64))
+                && matches!(source.operation(), Operation::Range(0)) =>
+        {
+            source
+        }
+        (Operation::Range(0), _) if value.ty() == Some(UType::scalar(DType::I32)) => value,
+        _ => return Ok(None),
+    };
+    let Operation::Index(IndexValue::Buffer { elements, .. }) = index.operation() else {
+        return Err(Error::InvalidIndex);
+    };
+    let [_, iteration] = index.sources() else {
+        return Err(Error::InvalidIndex);
+    };
+    let [bound] = iteration.sources() else {
+        return Err(Error::InvalidIndex);
+    };
+    let [kernel_store, end_range] = kernel.sources() else {
+        return Err(Error::InvalidIndex);
+    };
+    let [terminal_iteration] = end_range.sources() else {
+        return Err(Error::InvalidIndex);
+    };
+    if !matches!(kernel.operation(), Operation::Sink)
+        || !kernel_store.shares_node_with(store)
+        || !store_index.shares_node_with(index)
+        || !matches!(end_range.operation(), Operation::EndRange)
+        || !terminal_iteration.shares_node_with(iteration)
+        || index.ty() != Some(UType::scalar(DType::I32))
+        || !matches!(iteration.operation(), Operation::Range(0))
+        || !candidate.shares_node_with(iteration)
+        || *elements != len
+        || !matches!(
+            bound.operation(),
+            Operation::Const(LiteralValue::Int(expected))
+                if usize::try_from(*expected).ok() == Some(len)
+        )
+    {
+        return Err(Error::InvalidIndex);
+    }
+    (0..len)
+        .map(|linear| i32::try_from(linear).map_err(|_| Error::InvalidIndex))
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 fn fused_storage(dtype: DType, values: Vec<FusedValue>) -> Storage {
@@ -2456,6 +2535,68 @@ fn compare_float8(a: f64, b: f64, op: CompareOp) -> bool {
 mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, Shape, SymbolicExpr};
+
+    #[test]
+    fn dense_shape_iota_semantics_substitute_only_the_store_iteration() {
+        let mut graph = Graph::new();
+        let source = graph.input_dtype("source", [3], DType::F32);
+        let iota = graph.shape_iota(source, 0).unwrap();
+        let lowered = lower_graph_elementwise(&graph, iota).unwrap();
+        assert_eq!(
+            execute_lowered_elementwise(&lowered, &KernelBindings::default())
+                .unwrap()
+                .storage(),
+            &Storage::I32(vec![0, 1, 2])
+        );
+
+        let store = &lowered.sources()[0];
+        let index = store.sources()[0].clone();
+        let end_range = lowered.sources()[1].clone();
+        let iteration = &end_range.sources()[0];
+        let detached = UOp::from_operation(
+            iteration.operation().clone(),
+            iteration.ty(),
+            iteration.sources().to_vec(),
+        );
+        let detached_value = UOp::cast(detached, UType::scalar(DType::I32));
+        let forged = UOp::sink(vec![
+            UOp::from_operation(Operation::Store, None, vec![index, detached_value]),
+            end_range,
+        ]);
+        assert!(matches!(
+            execute_lowered_elementwise(&forged, &KernelBindings::default()),
+            Err(Error::InvalidIndex)
+        ));
+
+        let wrong_iteration = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![UOp::constant(4, UType::scalar(DType::I64))],
+        );
+        let wrong_index = UOp::from_operation(
+            store.sources()[0].operation().clone(),
+            store.sources()[0].ty(),
+            vec![
+                store.sources()[0].sources()[0].clone(),
+                wrong_iteration.clone(),
+            ],
+        );
+        let wrong_bound = UOp::sink(vec![
+            UOp::from_operation(
+                Operation::Store,
+                None,
+                vec![
+                    wrong_index,
+                    UOp::cast(wrong_iteration.clone(), UType::scalar(DType::I32)),
+                ],
+            ),
+            UOp::from_operation(Operation::EndRange, None, vec![wrong_iteration]),
+        ]);
+        assert!(matches!(
+            execute_lowered_elementwise(&wrong_bound, &KernelBindings::default()),
+            Err(Error::InvalidIndex)
+        ));
+    }
 
     #[test]
     fn reciprocal_promotes_nonfloats_before_homogeneous_graph_unary_lowering() {

@@ -2563,22 +2563,34 @@ overwrites the uncommitted candidate bank.
 
 `CapturedAppendStateInference` is a narrower Metal-first policy for fixed
 capacity KV-style state. It authenticates an existing raw Scatter-replace as
-one complete F32 row selected by a device-produced I32 index tensor, requires
-that tensor to be the exact materialized affine expansion of one scalar I32
-position input, requires a capture-produced dense update buffer with an exact
+one fixed nonzero F32 row span selected by a device-produced I32 index tensor.
+The historical one-row path retains its exact scalar expansion. Populated
+larger spans must be the exact Add of that expanded scalar and an axis-aligned
+`ShapeIota(update, axis)` reshape/expansion; addressless spans retain the
+canonical scalar expansion because no index lane exists. Alternate arithmetic,
+casts, permutations, gaps, repeats, and divergent link geometry are rejected. It
+requires a capture-produced dense update buffer with an exact
 producer dependency, requires the state and update to be consumed exclusively
 by that item, and retains the full state output only as a protected downstream
-owner. The Metal plan renders that exact item with a distinct append cache identity, aliases only its proven
+owner. The Metal plan renders one-row and larger-span work in distinct cache
+domains. After the schedule authenticates a populated larger span's unique
+materialized `ShapeIota` producer and dense affine load, a private I32 ramp
+renderer emits that producer without admitting its construction-time I64
+`Range` to the ordinary Metal subset; its source/cache domain is distinct from
+both ordinary kernels and the append owner. The plan aliases only its proven
 input/output descriptors to one physical bank, and launches one work-item per
-row element. The row-shaped index has one captured producer and may be consumed
+span element. The index has one captured producer and may be consumed
 by exactly the declared append owners and no others. Before any driver call,
-the scalar source must equal the session's next committed position and that
-position must be in range. Later
+the scalar source must equal the session's next committed position and the
+checked span end must fit the shared capacity and I32 contract. Later
 items in the same capture observe the updated bank. A failure may leave only
-the uncommitted row provisional; retry must name the same position and
-overwrites the complete row, while the successful-run count, committed
-position, outputs, and metrics advance only after all launches, waits, public
-downloads, decoding, and projection succeed. Empty rows remain addressless.
+uncommitted rows provisional; retry uses the same start and overwrites the
+complete span, while the successful-run count, committed position, outputs,
+and metrics advance only after all launches, waits, public downloads, decoding,
+and projection succeed. A zero non-axis payload remains addressless but advances
+by the authenticated span. Scoreboard v4 remains one-row-only: maintained paths
+can reject larger spans before preparation and legacy construction rejects them
+at bind without changing its JSON semantics.
 This is not generic in-place Scatter, dynamic state, or alias permission.
 
 The Llama capture may consume a private seal over that exact shared dense I32

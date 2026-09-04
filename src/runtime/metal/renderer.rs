@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     AffineView, DType, GgmlType, IndexValue, LiteralValue, MovementValue, Operation,
-    QuantizedBufferDesc, QuantizedScheduleInputBinding, ScheduleInputBinding, Shape, UOp,
+    QuantizedBufferDesc, QuantizedScheduleInputBinding, ScheduleInputBinding, Shape, UOp, UType,
     runtime::scalar_lane::{
         ScalarLaneDialect, dialect_seal, emit_scalar_lane, project_scalar_lane,
     },
@@ -23,6 +23,8 @@ pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
 pub const METAL_INDEXED_MOVEMENT_RENDERER_VERSION: &str = "rustgrad-metal-indexed-movement-v1";
 pub const METAL_HOST_GATHER_RENDERER_VERSION: &str = "rustgrad-metal-host-gather-v1";
 pub const METAL_APPEND_STATE_RENDERER_VERSION: &str = "rustgrad-metal-append-state-v1";
+const METAL_APPEND_SPAN_RENDERER_VERSION: &str = "rustgrad-metal-append-span-v1";
+const METAL_APPEND_SPAN_IOTA_RENDERER_VERSION: &str = "rustgrad-metal-append-span-iota-i32-v1";
 pub const METAL_STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-metal-static-position-v1";
 pub const METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION: &str =
     "rustgrad-metal-portable-f32-matmul-v1";
@@ -68,7 +70,7 @@ pub(super) enum MetalPointerAbi {
     Quantized(usize),
 }
 
-/// Handle-free authenticated ABI for one complete-row append into an
+/// Handle-free authenticated ABI for one fixed-span append into an
 /// exclusively owned recurrent state allocation.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MetalAppendStateAbi {
@@ -652,10 +654,10 @@ impl MetalRenderer {
             || updates.node.index() as u64 != link.updates
             || *axis != link.axis
             || portable.axis_extent() != link.axis_extent
-            || portable.index_elements() != link.row_elements
+            || portable.index_elements() != link.span.total_elements
             || index.shape != updates.shape
             || index.shape.rank() != base.shape.rank()
-            || index.shape.dims()[*axis] != 1
+            || index.shape.dims()[*axis] != link.span.rows
             || index
                 .shape
                 .dims()
@@ -699,17 +701,27 @@ impl MetalRenderer {
             updates: link.updates,
             axis: link.axis,
             axis_extent: link.axis_extent,
-            row_elements: link.row_elements,
+            row_elements: link.span.total_elements,
         };
         let index_position = portable.index_abi();
         let update_position = portable
             .update_abi()
             .ok_or_else(|| MetalError::InvalidBinding("append updates ABI is absent".into()))?;
+        let renderer_version = if link.span.rows == 1 {
+            METAL_APPEND_STATE_RENDERER_VERSION
+        } else {
+            METAL_APPEND_SPAN_RENDERER_VERSION
+        };
+        let entry = if link.span.rows == 1 {
+            "rg_metal_append_state_f32_i32"
+        } else {
+            "rg_metal_append_span_f32_i32"
+        };
         let mut lines = vec![
-            format!("// {METAL_APPEND_STATE_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+            format!("// {renderer_version} ABI {METAL_ABI_VERSION}"),
             "#include <metal_stdlib>".into(),
             "using namespace metal;".into(),
-            "kernel void rg_metal_append_state_f32_i32(".into(),
+            format!("kernel void {entry}("),
         ];
         for (position, input) in portable.inputs().iter().enumerate() {
             lines.push(format!(
@@ -749,7 +761,7 @@ impl MetalRenderer {
         lines.push("}".into());
         let source = lines.join("\n") + "\n";
         let cache_key = stable_key(&(
-            METAL_APPEND_STATE_RENDERER_VERSION,
+            renderer_version,
             METAL_ABI_VERSION,
             self.local_size,
             &self.capabilities,
@@ -764,14 +776,104 @@ impl MetalRenderer {
             pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
             quantized_buffers: Vec::new(),
             buffers,
-            extent: link.row_elements,
-            entry: "rg_metal_append_state_f32_i32".into(),
+            extent: link.span.total_elements,
+            entry: entry.into(),
             cache_key,
             capabilities: self.capabilities.clone(),
             transaction: None,
             indexed_movement: None,
             append_state: Some(abi),
             schedule_inputs,
+            semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+                root.clone(),
+            ))),
+        })
+    }
+
+    /// Renders only the materialized ShapeIota producer that the static append
+    /// planner has already authenticated as the exact dense `[0, span)` ramp.
+    /// Ordinary I64 UOps continue through `render` and remain unsupported.
+    pub(crate) fn render_authenticated_append_span_iota(
+        &self,
+        root: &UOp,
+        link: &crate::runtime::static_schedule::StaticAppendStateLink,
+    ) -> Result<RenderedMetal, MetalError> {
+        root.validate()
+            .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+        let iota = link.iota.ok_or_else(|| {
+            MetalError::InvalidBinding("authenticated append span has no ShapeIota".into())
+        })?;
+        let [store, _] = root.sources() else {
+            return Err(MetalError::InvalidBinding(
+                "authenticated append span ShapeIota is malformed".into(),
+            ));
+        };
+        let [_, value] = store.sources() else {
+            return Err(MetalError::InvalidBinding(
+                "authenticated append span ShapeIota store is malformed".into(),
+            ));
+        };
+        let output_shape = Shape::from([link.span.rows]);
+        if !matches!(root.operation(), Operation::Sink)
+            || !matches!(store.operation(), Operation::Store)
+            || root.ty().is_some()
+            || value.ty() != Some(UType::scalar(DType::I32))
+            || link.span.rows <= 1
+            || link.span.total_elements == 0
+        {
+            return Err(MetalError::InvalidBinding(
+                "authenticated append span ShapeIota contract is invalid".into(),
+            ));
+        }
+        let output = MetalBufferAbi {
+            id: iota,
+            dtype: DType::I32,
+            source_shape: output_shape,
+            elements: link.span.rows,
+            mutable: true,
+            view: None,
+        };
+        let entry = "rg_metal_append_span_iota_i32";
+        let source = [
+            format!("// {METAL_APPEND_SPAN_IOTA_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"),
+            "#include <metal_stdlib>".into(),
+            "using namespace metal;".into(),
+            format!("kernel void {entry}("),
+            "    device int* b0 [[buffer(0)]],".into(),
+            "    constant ulong& extent [[buffer(1)]],".into(),
+            "    uint rg_gid [[thread_position_in_grid]]) {".into(),
+            "  const ulong gid = (ulong)rg_gid;".into(),
+            "  if (gid >= extent) return;".into(),
+            "  b0[gid] = (int)rg_gid;".into(),
+            "}".into(),
+        ]
+        .join("\n")
+            + "\n";
+        let buffers = vec![output];
+        let cache_key = stable_key(&(
+            METAL_APPEND_SPAN_IOTA_RENDERER_VERSION,
+            METAL_ABI_VERSION,
+            self.local_size,
+            &self.capabilities,
+            iota,
+            link.span,
+            &source,
+            &buffers,
+        ));
+        Ok(RenderedMetal {
+            source,
+            source_map: BTreeMap::new(),
+            pointer_order: vec![MetalPointerAbi::Dense(0)],
+            quantized_buffers: Vec::new(),
+            buffers,
+            extent: link.span.rows,
+            entry: entry.into(),
+            cache_key,
+            capabilities: self.capabilities.clone(),
+            transaction: None,
+            indexed_movement: None,
+            append_state: None,
+            schedule_inputs: Vec::new(),
             semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
                 root.clone(),
             ))),

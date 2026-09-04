@@ -579,6 +579,29 @@ fn append_position(graph: &mut Graph, name: &str, shape: impl Into<Shape>) -> (N
     (position, expanded)
 }
 
+fn append_span_position(
+    graph: &mut Graph,
+    name: &str,
+    updates: NodeId,
+    axis: usize,
+) -> (NodeId, NodeId) {
+    let shape = graph.shape(updates).unwrap().clone();
+    let scalar_position = graph.input_dtype(name, [1], DType::I32);
+    let position = graph
+        .reshape(scalar_position, vec![1; shape.rank()])
+        .and_then(|value| graph.expand(value, shape.clone()))
+        .unwrap();
+    let iota = graph.shape_iota(updates, axis).unwrap();
+    let mut iota_shape = vec![1; shape.rank()];
+    iota_shape[axis] = shape.dims()[axis];
+    let iota = graph
+        .reshape(iota, iota_shape)
+        .and_then(|value| graph.expand(value, shape))
+        .unwrap();
+    let index = graph.add(position, iota).unwrap();
+    (scalar_position, index)
+}
+
 fn captured_metal_residual_block() -> (Graph, CapturedSchedule, NodeId, NodeId) {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [2, 4], DType::F32);
@@ -1200,6 +1223,124 @@ fn metal_append_scoreboard_reports_packed_constants_exactly() {
 }
 
 #[test]
+fn metal_append_state_fixed_span_commits_consecutive_rows_and_retries_tail() {
+    let mut graph = Graph::new();
+    let state = graph.input_dtype("cache", [7, 2], DType::F32);
+    let update_source = graph.input_dtype("updates", [3, 2], DType::F32);
+    let updates = graph.relu(update_source).unwrap();
+    let (position, index) = append_span_position(&mut graph, "position", updates, 0);
+    let next = graph.scatter(state, index, updates, 0).unwrap();
+    let visible = graph.square(next).unwrap();
+    let captured = CapturedAppendStateInference::from_module_graph(
+        &IdentityModule,
+        &graph,
+        &[visible],
+        &[InferenceAppendStateLink::new(
+            state, next, position, index, updates, 0,
+        )],
+        BTreeMap::from([("cache".into(), TensorData::zeros([7, 2]).unwrap())]),
+    )
+    .unwrap();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let plan = MetalAppendStateInferencePlan::new(captured, renderer.clone()).unwrap();
+    assert_eq!(plan.append_span_rows(), 3);
+    assert_eq!(plan.summary().append_state_row_bytes, 24);
+    assert_eq!(plan.summary().append_state_work_items, 6);
+    let rendered = plan
+        .rendered_items()
+        .find(|rendered| rendered.append_state().is_some())
+        .unwrap();
+    assert_eq!(rendered.entry, "rg_metal_append_span_f32_i32");
+    assert!(rendered.source.contains("rustgrad-metal-append-span-v1"));
+    assert!(!rendered.source.contains("rustgrad-metal-append-state-v1"));
+    let iota_rendered = plan
+        .rendered_items()
+        .find(|rendered| rendered.entry == "rg_metal_append_span_iota_i32")
+        .expect("authenticated fixed-span ShapeIota renderer");
+    assert!(
+        iota_rendered
+            .source
+            .contains("rustgrad-metal-append-span-iota-i32-v1")
+    );
+    assert!(iota_rendered.source.contains("device int* b0"));
+    assert!(iota_rendered.source.contains("b0[gid] = (int)rg_gid;"));
+    assert!(!iota_rendered.source.contains("device long*"));
+    assert_eq!(iota_rendered.buffers.len(), 1);
+    assert_eq!(iota_rendered.buffers[0].dtype, DType::I32);
+    assert_eq!(iota_rendered.extent, 3);
+    assert_ne!(iota_rendered.cache_key, rendered.cache_key);
+    let ordinary_iota = plan
+        .capture()
+        .items
+        .iter()
+        .find(|item| item.outputs.primary().id == iota_rendered.buffers[0].id)
+        .expect("captured ShapeIota producer");
+    assert!(matches!(
+        renderer.render(&ordinary_iota.kernel),
+        Err(MetalError::Unsupported(reason))
+            if reason.contains("dtype I64 is outside the exact Metal static subset")
+    ));
+
+    let context =
+        || MetalScoreboardContext::new("append-span", "test-revision", "semantic mock").unwrap();
+    assert!(matches!(
+        MetalSessionScoreboard::try_new_append_state_v4(context(), &plan),
+        Err(MetalScoreboardError::UnsupportedAppendSpan { span_rows: 3 })
+    ));
+    let mut legacy_scoreboard = MetalSessionScoreboard::new_append_state(context(), &plan);
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = plan.prepare(test_device(mock.clone())).unwrap();
+    assert_eq!(
+        legacy_scoreboard.bind(&session),
+        Err(MetalScoreboardError::UnsupportedAppendSpan { span_rows: 3 })
+    );
+
+    let invocation = |position: i32, values: [f32; 6]| {
+        BTreeMap::from([
+            (
+                "position".into(),
+                TensorData::from_scalars([1], DType::I32, [Scalar::I(i64::from(position))])
+                    .unwrap(),
+            ),
+            (
+                "updates".into(),
+                TensorData::new([3, 2], values.to_vec()).unwrap(),
+            ),
+        ])
+    };
+    let first = session
+        .run(&invocation(0, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+        .unwrap();
+    assert_eq!(first.report().committed_state_position, Some(3));
+    assert_eq!(first.report().committed_state_bytes, 24);
+    assert_eq!(first.report().committed_state_work_items, 6);
+    assert_eq!(session.committed_state_position(), Some(3));
+    let second = session
+        .run(&invocation(3, [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]))
+        .unwrap();
+    assert_eq!(second.report().committed_state_position, Some(6));
+    assert_eq!(
+        second.outputs()[0],
+        TensorData::new(
+            [7, 2],
+            vec![
+                1.0, 4.0, 9.0, 16.0, 25.0, 36.0, 49.0, 64.0, 81.0, 100.0, 121.0, 144.0, 0.0, 0.0,
+            ],
+        )
+        .unwrap()
+    );
+    let calls = mock.calls().len();
+    assert!(
+        session
+            .run(&invocation(6, [13.0, 14.0, 15.0, 16.0, 17.0, 18.0]))
+            .is_err()
+    );
+    assert_eq!(mock.calls().len(), calls);
+    assert_eq!(session.committed_state_position(), Some(6));
+    assert_eq!(session.successful_run_count(), 2);
+}
+
+#[test]
 fn metal_append_state_kv_links_commit_together_after_partial_failure() {
     let mut graph = Graph::new();
     let key_state = graph.input_dtype("key_cache", [2, 2], DType::F32);
@@ -1311,6 +1452,152 @@ fn metal_append_state_kv_links_commit_together_after_partial_failure() {
     assert_eq!(session.committed_state_position(), Some(2));
     assert_eq!(session.successful_run_count(), 2);
     assert!(!mock.calls().iter().any(|call| call.starts_with("copy:")));
+}
+
+#[test]
+fn metal_append_state_empty_fixed_span_is_addressless_but_advances_rows() {
+    let mut graph = Graph::new();
+    let state = graph.input_dtype("empty_cache", [6, 0], DType::F32);
+    let (position, index) = append_position(&mut graph, "empty_position", [3, 0]);
+    let update_source = graph.input_dtype("empty_updates", [3, 0], DType::F32);
+    let updates = graph.relu(update_source).unwrap();
+    let next = graph.scatter(state, index, updates, 0).unwrap();
+    let visible = graph.square(next).unwrap();
+    let captured = CapturedAppendStateInference::from_module_graph(
+        &IdentityModule,
+        &graph,
+        &[visible],
+        &[InferenceAppendStateLink::new(
+            state, next, position, index, updates, 0,
+        )],
+        BTreeMap::from([("empty_cache".into(), TensorData::zeros([6, 0]).unwrap())]),
+    )
+    .unwrap();
+    let plan = MetalAppendStateInferencePlan::new(
+        captured,
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.append_span_rows(), 3);
+    assert_eq!(plan.summary().append_state_row_bytes, 0);
+    assert_eq!(plan.summary().append_state_work_items, 0);
+    assert_eq!(plan.summary().nonzero_item_count, 0);
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    assert_eq!(
+        mock.calls(),
+        vec!["devices".to_owned(), "device_release:2".to_owned()]
+    );
+    mock.clear_calls();
+    let mut session = plan.prepare(device).unwrap();
+    assert!(mock.calls().is_empty());
+    let run = session
+        .run(&BTreeMap::from([
+            (
+                "empty_position".into(),
+                TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap(),
+            ),
+            ("empty_updates".into(), TensorData::zeros([3, 0]).unwrap()),
+        ]))
+        .unwrap();
+    assert_eq!(run.outputs(), &[TensorData::zeros([6, 0]).unwrap()]);
+    assert_eq!(run.report().committed_state_position, Some(3));
+    assert_eq!(run.report().kernel_launch_count, 0);
+    assert_eq!(run.report().transient_h2d_calls, 0);
+    assert_eq!(run.report().runtime_control_h2d_calls, 0);
+    assert_eq!(run.report().retained_d2h_calls, 0);
+    assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn metal_append_state_fixed_span_two_link_failure_retries_the_same_rows() {
+    let mut graph = Graph::new();
+    let key_state = graph.input_dtype("span_key_cache", [6, 1], DType::F32);
+    let value_state = graph.input_dtype("span_value_cache", [6, 1], DType::F32);
+    let key_source = graph.input_dtype("span_key_updates", [3, 1], DType::F32);
+    let value_source = graph.input_dtype("span_value_updates", [3, 1], DType::F32);
+    let key_updates = graph.relu(key_source).unwrap();
+    let value_updates = graph.relu(value_source).unwrap();
+    let (position, index) = append_span_position(&mut graph, "span_position", key_updates, 0);
+    let next_keys = graph.scatter(key_state, index, key_updates, 0).unwrap();
+    let next_values = graph.scatter(value_state, index, value_updates, 0).unwrap();
+    let visible = graph.add(next_keys, next_values).unwrap();
+    let captured = CapturedAppendStateInference::from_module_graph(
+        &IdentityModule,
+        &graph,
+        &[visible],
+        &[
+            InferenceAppendStateLink::new(key_state, next_keys, position, index, key_updates, 0),
+            InferenceAppendStateLink::new(
+                value_state,
+                next_values,
+                position,
+                index,
+                value_updates,
+                0,
+            ),
+        ],
+        BTreeMap::from([
+            ("span_key_cache".into(), TensorData::zeros([6, 1]).unwrap()),
+            (
+                "span_value_cache".into(),
+                TensorData::zeros([6, 1]).unwrap(),
+            ),
+        ]),
+    )
+    .unwrap();
+    let plan = MetalAppendStateInferencePlan::new(
+        captured,
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    let append_launches = plan
+        .rendered_items()
+        .filter(|item| item.extent != 0)
+        .enumerate()
+        .filter_map(|(ordinal, item)| item.append_state().map(|_| ordinal))
+        .collect::<Vec<_>>();
+    assert_eq!(append_launches.len(), 2);
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = plan.prepare(test_device(mock.clone())).unwrap();
+    let invocation = |keys: [f32; 3], values: [f32; 3]| {
+        BTreeMap::from([
+            (
+                "span_position".into(),
+                TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap(),
+            ),
+            (
+                "span_key_updates".into(),
+                TensorData::new([3, 1], keys.to_vec()).unwrap(),
+            ),
+            (
+                "span_value_updates".into(),
+                TensorData::new([3, 1], values.to_vec()).unwrap(),
+            ),
+        ])
+    };
+    mock.state.lock().unwrap().failures.launch_after =
+        Some((append_launches[1], "second span append"));
+    assert!(matches!(
+        session.run(&invocation([9.0; 3], [8.0; 3])),
+        Err(MetalError::Driver { operation: "launch", detail })
+            if detail == "second span append"
+    ));
+    assert!(mock.state.lock().unwrap().failures.launch_after.is_none());
+    assert_eq!(session.committed_state_position(), Some(0));
+    assert_eq!(session.successful_run_count(), 0);
+
+    let retry = session
+        .run(&invocation([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]))
+        .unwrap();
+    assert_eq!(
+        retry.outputs(),
+        &[TensorData::new([6, 1], vec![5.0, 7.0, 9.0, 0.0, 0.0, 0.0]).unwrap()]
+    );
+    assert_eq!(retry.report().committed_state_pair_count, 2);
+    assert_eq!(retry.report().committed_state_position, Some(3));
+    assert_eq!(session.committed_state_position(), Some(3));
+    assert_eq!(session.successful_run_count(), 1);
 }
 
 #[test]
@@ -4628,8 +4915,9 @@ impl Dispatch for MockDispatch {
                 return Ok(Self::command(&mut state, owner));
             }
         }
-        // This is RustGrad's retained semantic artifact, not CpuBackend or
-        // native Metal. Captured random stays graph-free and immutable.
+        // This is RustGrad's retained or authenticated typed semantic
+        // artifact, not CpuBackend or native Metal. Captured random stays
+        // graph-free and immutable.
         let results = match semantics.program.as_ref() {
             dispatch::KernelSemanticProgram::UOp(program) => match program.operation() {
                 crate::Operation::Sort(value) => {

@@ -49,8 +49,12 @@ pub struct InferenceStateLink {
 /// One append-only recurrent state update. The output must be an exact raw
 /// Scatter-replace of `updates` into `input` through the materialized I32
 /// `index` tensor along `axis`; Metal may then authenticate and execute it in
-/// place. `index` must be an exact reshape/expand/materialization of the scalar
-/// I32 `position` input.
+/// place. A one-row `index` preserves the exact reshape/expand/materialization
+/// of scalar I32 `position`. A populated multirow index must add that expanded
+/// position to the exact axis-aligned reshape and any required expansion of
+/// `ShapeIota(updates, axis)`. When every non-axis lane is empty, the index is
+/// addressless and retains the canonical scalar reshape/expand without an iota
+/// producer.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct InferenceAppendStateLink {
     input: NodeId,
@@ -132,11 +136,11 @@ pub(crate) struct CapturedInferenceAppendState {
     pub(crate) input: ReplayInput,
     pub(crate) position: ReplayInput,
     pub(crate) index: crate::BufferDesc,
+    pub(crate) iota: Option<u64>,
     pub(crate) updates: crate::BufferDesc,
     pub(crate) output: crate::BufferDesc,
     pub(crate) axis_extent: usize,
-    pub(crate) row_elements: usize,
-    pub(crate) row_bytes: usize,
+    pub(crate) span: crate::runtime::static_schedule::AppendSpanGeometry,
 }
 
 /// Resource-free authenticated capture with fixed-shape recurrent state.
@@ -150,8 +154,8 @@ pub struct CapturedStatefulInference {
     identity: u64,
 }
 
-/// Resource-free authenticated capture whose fixed F32 state is updated one
-/// complete row at a time through an authenticated monotonic I32 position.
+/// Resource-free authenticated capture whose fixed F32 state is updated by
+/// one fixed nonzero row span through an authenticated monotonic I32 position.
 #[derive(Clone, Debug)]
 pub struct CapturedAppendStateInference {
     inference: CapturedInference,
@@ -605,43 +609,157 @@ fn authenticate_append_index_graph(
     graph: &Graph,
     link: InferenceAppendStateLink,
     index_shape: &Shape,
+) -> std::result::Result<Option<(NodeId, NodeId)>, CapturedInferenceError> {
+    let span_rows = index_shape.dims().get(link.axis).copied().ok_or_else(|| {
+        CapturedInferenceError::Binding("append index axis is outside its rank".into())
+    })?;
+    if span_rows == 0 {
+        return Err(CapturedInferenceError::Binding(
+            "append index span must be nonzero".into(),
+        ));
+    }
+    if index_shape.numel().map_err(CapturedInferenceError::State)? == 0 {
+        // No index lane is reachable. Preserve the existing canonical
+        // addressless scalar expansion so an empty span creates no iota work.
+        authenticate_append_expansion(graph, link.index, link.position, index_shape)?;
+        return Ok(None);
+    }
+    if span_rows > 1 {
+        let Op::Binary {
+            op: crate::BinaryOp::Add,
+            lhs: position_index,
+            rhs: iota_index,
+        } = graph
+            .op(link.index)
+            .map_err(CapturedInferenceError::State)?
+        else {
+            return Err(CapturedInferenceError::Binding(
+                "append span index must add position and shape iota".into(),
+            ));
+        };
+        authenticate_append_expansion(graph, *position_index, link.position, index_shape)?;
+        let reshaped_iota = match graph
+            .op(*iota_index)
+            .map_err(CapturedInferenceError::State)?
+        {
+            Op::Expand { input, shape } if shape == index_shape => *input,
+            Op::Reshape { .. } | Op::ShapeIota { .. }
+                if graph
+                    .shape(*iota_index)
+                    .map_err(CapturedInferenceError::State)?
+                    == index_shape =>
+            {
+                *iota_index
+            }
+            _ => {
+                return Err(CapturedInferenceError::Binding(
+                    "append span iota must be expanded over update lanes when required".into(),
+                ));
+            }
+        };
+        let (iota, iota_shape) = match graph
+            .op(reshaped_iota)
+            .map_err(CapturedInferenceError::State)?
+        {
+            Op::Reshape { input, shape } => (*input, shape),
+            Op::ShapeIota { .. }
+                if index_shape.rank() == 1
+                    && graph
+                        .shape(reshaped_iota)
+                        .map_err(CapturedInferenceError::State)?
+                        == index_shape =>
+            {
+                (reshaped_iota, index_shape)
+            }
+            _ => {
+                return Err(CapturedInferenceError::Binding(
+                    "append span iota must have one axis-aligned reshape when required".into(),
+                ));
+            }
+        };
+        let Op::ShapeIota { source, axis } =
+            graph.op(iota).map_err(CapturedInferenceError::State)?
+        else {
+            return Err(CapturedInferenceError::Binding(
+                "append span index is not derived from ShapeIota".into(),
+            ));
+        };
+        if *axis != link.axis
+            || iota_shape.rank() != index_shape.rank()
+            || iota_shape.dims()[link.axis] != span_rows
+            || iota_shape
+                .dims()
+                .iter()
+                .enumerate()
+                .any(|(axis, &dimension)| axis != link.axis && dimension != 1)
+            || graph
+                .shape(iota)
+                .map_err(CapturedInferenceError::State)?
+                .dims()
+                != [span_rows]
+            || graph.dtype(iota).map_err(CapturedInferenceError::State)? != DType::I32
+            || graph
+                .shape(*source)
+                .map_err(CapturedInferenceError::State)?
+                != index_shape
+        {
+            return Err(CapturedInferenceError::Binding(
+                "append span iota lineage is inconsistent".into(),
+            ));
+        }
+        return Ok(Some((iota, *source)));
+    }
+    authenticate_append_expansion(graph, link.index, link.position, index_shape)?;
+    Ok(None)
+}
+
+fn authenticate_append_expansion(
+    graph: &Graph,
+    expanded: NodeId,
+    source: NodeId,
+    expanded_shape: &Shape,
 ) -> std::result::Result<(), CapturedInferenceError> {
+    if expanded == source
+        && graph.shape(source).map_err(CapturedInferenceError::State)? == expanded_shape
+        && expanded_shape.dims() == [1]
+        && graph.dtype(source).map_err(CapturedInferenceError::State)? == DType::I32
+    {
+        return Ok(());
+    }
     let Op::Expand {
         input: reshaped,
-        shape: expanded_shape,
-    } = graph
-        .op(link.index)
-        .map_err(CapturedInferenceError::State)?
+        shape: actual_expanded_shape,
+    } = graph.op(expanded).map_err(CapturedInferenceError::State)?
     else {
         return Err(CapturedInferenceError::Binding(
             "append index must be one scalar expansion".into(),
         ));
     };
-    let Op::Reshape {
-        input: position,
-        shape: scalar_shape,
-    } = graph.op(*reshaped).map_err(CapturedInferenceError::State)?
-    else {
-        return Err(CapturedInferenceError::Binding(
-            "append index must reshape one scalar position".into(),
-        ));
+    let scalar_shape = Shape::from(vec![1; expanded_shape.rank()]);
+    let reshaped_source = match graph.op(*reshaped).map_err(CapturedInferenceError::State)? {
+        Op::Reshape { input, shape } if shape == &scalar_shape => *input,
+        _ if *reshaped == source
+            && graph.shape(source).map_err(CapturedInferenceError::State)? == &scalar_shape =>
+        {
+            source
+        }
+        _ => {
+            return Err(CapturedInferenceError::Binding(
+                "append index must reshape one scalar position when required".into(),
+            ));
+        }
     };
-    if *position != link.position
-        || scalar_shape.rank() != index_shape.rank()
-        || scalar_shape.dims().iter().any(|&dimension| dimension != 1)
-        || expanded_shape != index_shape
+    if reshaped_source != source
+        || actual_expanded_shape != expanded_shape
         || graph
-            .shape(link.position)
+            .shape(source)
             .map_err(CapturedInferenceError::State)?
             .dims()
             != [1]
-        || graph
-            .dtype(link.position)
-            .map_err(CapturedInferenceError::State)?
-            != DType::I32
+        || graph.dtype(source).map_err(CapturedInferenceError::State)? != DType::I32
     {
         return Err(CapturedInferenceError::Binding(
-            "append index position lineage is inconsistent".into(),
+            "append index expansion lineage is inconsistent".into(),
         ));
     }
     Ok(())
@@ -748,7 +866,11 @@ impl CapturedAppendStateInference {
         let mut state_names = BTreeSet::new();
         let mut shared_index = None;
         let mut shared_position = None;
+        let mut shared_axis = None;
         let mut shared_extent = None;
+        let mut shared_span = None;
+        let mut shared_iota_source = None;
+        let mut shared_iota = None;
         for link in state_links {
             let Op::Input { name: state_name } = graph
                 .op(link.input)
@@ -815,14 +937,14 @@ impl CapturedAppendStateInference {
             let index_shape = graph
                 .shape(link.index)
                 .map_err(CapturedInferenceError::State)?;
-            authenticate_append_index_graph(graph, *link, index_shape)?;
+            let iota = authenticate_append_index_graph(graph, *link, index_shape)?;
             if index_shape
                 != graph
                     .shape(link.updates)
                     .map_err(CapturedInferenceError::State)?
                 || index_shape.rank() != state_shape.rank()
                 || link.axis >= state_shape.rank()
-                || index_shape.dims()[link.axis] != 1
+                || index_shape.dims()[link.axis] == 0
                 || index_shape
                     .dims()
                     .iter()
@@ -831,22 +953,38 @@ impl CapturedAppendStateInference {
                     .any(|(axis, (index, state))| axis != link.axis && index != state)
             {
                 return Err(CapturedInferenceError::Binding(
-                    "append update is not one complete state row".into(),
+                    "append update is not one nonempty fixed state span".into(),
                 ));
             }
             let axis_extent = state_shape.dims()[link.axis];
+            let span_rows = index_shape.dims()[link.axis];
             if shared_index
                 .replace(link.index)
                 .is_some_and(|id| id != link.index)
                 || shared_position
                     .replace(link.position)
                     .is_some_and(|id| id != link.position)
+                || shared_axis
+                    .replace(link.axis)
+                    .is_some_and(|axis| axis != link.axis)
                 || shared_extent
                     .replace(axis_extent)
                     .is_some_and(|extent| extent != axis_extent)
+                || shared_span
+                    .replace((span_rows, index_shape.clone()))
+                    .is_some_and(|geometry| geometry != (span_rows, index_shape.clone()))
+                || iota.is_some_and(|(node, source)| {
+                    shared_iota
+                        .replace(node)
+                        .is_some_and(|previous| previous != node)
+                        || shared_iota_source
+                            .replace(source)
+                            .is_some_and(|previous| previous != source)
+                })
             {
                 return Err(CapturedInferenceError::Binding(
-                    "append state links must share one position and capacity".into(),
+                    "append state links must share one position, axis, capacity, and span geometry"
+                        .into(),
                 ));
             }
             if !state_names.insert(state_name.as_str())
@@ -888,7 +1026,13 @@ impl CapturedAppendStateInference {
             })?;
             validate_captured_inference_binding(&input, link.input, initial)?;
             let row_elements = index_shape.numel().map_err(CapturedInferenceError::State)?;
-            if (axis_extent == 0 && row_elements != 0) || axis_extent > i32::MAX as usize + 1 {
+            let elements_per_row = row_elements.checked_div(span_rows).ok_or_else(|| {
+                CapturedInferenceError::Binding("append span geometry is invalid".into())
+            })?;
+            if span_rows > axis_extent
+                || (axis_extent == 0 && row_elements != 0)
+                || axis_extent > i32::MAX as usize + 1
+            {
                 return Err(CapturedInferenceError::Binding(
                     "append state capacity is outside the live I32 position contract".into(),
                 ));
@@ -898,17 +1042,35 @@ impl CapturedAppendStateInference {
                 .ok_or_else(|| {
                     CapturedInferenceError::State(Error::ShapeOverflow(index_shape.clone()))
                 })?;
+            let bytes_per_row = elements_per_row
+                .checked_mul(DType::F32.itemsize())
+                .ok_or_else(|| {
+                    CapturedInferenceError::State(Error::ShapeOverflow(index_shape.clone()))
+                })?;
             states.push(CapturedInferenceAppendState {
                 link: *link,
                 input,
                 position,
                 index,
+                iota: iota.map(|(node, _)| node.index() as u64),
                 updates,
                 output,
                 axis_extent,
-                row_elements,
-                row_bytes,
+                span: crate::runtime::static_schedule::AppendSpanGeometry {
+                    rows: span_rows,
+                    elements_per_row,
+                    bytes_per_row,
+                    total_elements: row_elements,
+                    total_bytes: row_bytes,
+                },
             });
+        }
+        if let Some(source) = shared_iota_source
+            && !state_links.iter().any(|link| link.updates == source)
+        {
+            return Err(CapturedInferenceError::Binding(
+                "append span ShapeIota source is not one declared update".into(),
+            ));
         }
         let output_owners = inference
             .capture
@@ -935,11 +1097,11 @@ impl CapturedAppendStateInference {
                     output: state.output.id,
                     position: state.position.desc.id,
                     index: state.index.id,
+                    iota: state.iota,
                     updates: state.updates.id,
                     axis: state.link.axis(),
                     axis_extent: state.axis_extent,
-                    row_elements: state.row_elements,
-                    row_bytes: state.row_bytes,
+                    span: state.span,
                 },
             )
             .collect::<Vec<_>>();
@@ -1172,7 +1334,12 @@ fn captured_append_state_identity(
         state.updates.hash(&mut hasher);
         state.output.hash(&mut hasher);
         state.axis_extent.hash(&mut hasher);
-        state.row_elements.hash(&mut hasher);
+        state.span.total_elements.hash(&mut hasher);
+        if state.span.rows > 1 {
+            "rustgrad-append-state-fixed-span-v1".hash(&mut hasher);
+            state.span.hash(&mut hasher);
+            state.iota.hash(&mut hasher);
+        }
         initial_state[&state.input.name]
             .to_le_bytes()
             .map_err(CapturedInferenceError::State)?
@@ -1610,6 +1777,31 @@ mod tests {
             .and_then(|value| graph.expand(value, shape))
             .unwrap();
         (position, expanded)
+    }
+
+    fn append_span_index(
+        graph: &mut Graph,
+        name: &str,
+        updates: NodeId,
+        axis: usize,
+    ) -> (NodeId, NodeId) {
+        let shape = graph.shape(updates).unwrap().clone();
+        let position = graph.input_dtype(name, [1], DType::I32);
+        let expanded_position = graph
+            .reshape(position, vec![1; shape.rank()])
+            .and_then(|value| graph.expand(value, shape.clone()))
+            .unwrap();
+        let iota = graph.shape_iota(updates, axis).unwrap();
+        let mut iota_shape = vec![1; shape.rank()];
+        iota_shape[axis] = shape.dims()[axis];
+        let expanded_iota = graph
+            .reshape(iota, iota_shape)
+            .and_then(|value| graph.expand(value, shape))
+            .unwrap();
+        (
+            position,
+            graph.add(expanded_position, expanded_iota).unwrap(),
+        )
     }
 
     struct DuplicateTraversal {
@@ -2205,6 +2397,244 @@ mod tests {
             ),
             Err(CapturedInferenceError::Binding(_))
         ));
+    }
+
+    #[test]
+    fn append_state_capture_authenticates_only_exact_fixed_span_iota_lineage() {
+        let module = Sequential::default();
+        let mut graph = Graph::new();
+        let state = graph.input_dtype("span_cache", [6, 2], DType::F32);
+        let update_source = graph.input_dtype("span_updates", [3, 2], DType::F32);
+        let updates = graph.relu(update_source).unwrap();
+        let (position, index) = append_span_index(&mut graph, "span_position", updates, 0);
+        let output = graph.scatter(state, index, updates, 0).unwrap();
+        let visible = graph.square(output).unwrap();
+        let initial = BTreeMap::from([("span_cache".into(), TensorData::zeros([6, 2]).unwrap())]);
+        let captured = CapturedAppendStateInference::from_module_graph(
+            &module,
+            &graph,
+            &[visible],
+            &[InferenceAppendStateLink::new(
+                state, output, position, index, updates, 0,
+            )],
+            initial.clone(),
+        )
+        .unwrap();
+        assert_eq!(captured.states[0].span.rows, 3);
+        assert_eq!(captured.states[0].span.elements_per_row, 2);
+        assert_eq!(captured.states[0].span.bytes_per_row, 8);
+        assert_eq!(captured.states[0].span.total_elements, 6);
+        assert_eq!(captured.states[0].span.total_bytes, 24);
+        let state_capture = &captured.states[0];
+        let static_link = crate::runtime::static_schedule::StaticAppendStateLink {
+            input: state_capture.input.desc.id,
+            output: state_capture.output.id,
+            position: state_capture.position.desc.id,
+            index: state_capture.index.id,
+            iota: state_capture.iota,
+            updates: state_capture.updates.id,
+            axis: state_capture.link.axis(),
+            axis_extent: state_capture.axis_extent,
+            span: state_capture.span,
+        };
+        crate::runtime::static_schedule::authenticate_append_state_index_lineage(
+            &captured.inference.capture.items,
+            &[static_link],
+        )
+        .unwrap();
+        let iota_id = static_link.iota.unwrap();
+
+        let mut wrong_producer = captured.inference.capture.items.clone();
+        wrong_producer
+            .iter_mut()
+            .find(|item| item.outputs.iter().any(|output| output.id == iota_id))
+            .unwrap()
+            .node = updates;
+        assert!(
+            crate::runtime::static_schedule::authenticate_append_state_index_lineage(
+                &wrong_producer,
+                &[static_link],
+            )
+            .is_err()
+        );
+
+        let mut missing_dependency = captured.inference.capture.items.clone();
+        let iota_owner = missing_dependency
+            .iter()
+            .find(|item| item.outputs.iter().any(|output| output.id == iota_id))
+            .unwrap()
+            .id;
+        missing_dependency
+            .iter_mut()
+            .find(|item| {
+                item.outputs
+                    .iter()
+                    .any(|output| output.id == static_link.index)
+            })
+            .unwrap()
+            .dependencies
+            .retain(|dependency| *dependency != iota_owner);
+        assert!(
+            crate::runtime::static_schedule::authenticate_append_state_index_lineage(
+                &missing_dependency,
+                &[static_link],
+            )
+            .is_err()
+        );
+
+        let mut wrong_affine = captured.inference.capture.items.clone();
+        let binding = wrong_affine
+            .iter_mut()
+            .find(|item| {
+                item.outputs
+                    .iter()
+                    .any(|output| output.id == static_link.index)
+            })
+            .unwrap()
+            .input_bindings
+            .iter_mut()
+            .find(|binding| binding.desc.id == iota_id)
+            .unwrap();
+        binding.desc.view.as_mut().unwrap().strides[0] = 0;
+        assert!(
+            crate::runtime::static_schedule::authenticate_append_state_index_lineage(
+                &wrong_affine,
+                &[static_link],
+            )
+            .is_err()
+        );
+
+        let one = graph.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
+        let offset_index = graph.add(index, one).unwrap();
+        let offset_output = graph.scatter(state, offset_index, updates, 0).unwrap();
+        assert!(matches!(
+            CapturedAppendStateInference::from_module_graph(
+                &module,
+                &graph,
+                &[visible],
+                &[InferenceAppendStateLink::new(
+                    state,
+                    offset_output,
+                    position,
+                    offset_index,
+                    updates,
+                    0,
+                )],
+                initial.clone(),
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+
+        let zero_source = graph.input_dtype("zero_span_updates", [0, 2], DType::F32);
+        let zero_updates = graph.relu(zero_source).unwrap();
+        let (zero_position, zero_index) = append_index(&mut graph, "zero_position", [0, 2]);
+        let zero_output = graph.scatter(state, zero_index, zero_updates, 0).unwrap();
+        assert!(matches!(
+            CapturedAppendStateInference::from_module_graph(
+                &module,
+                &graph,
+                &[visible],
+                &[InferenceAppendStateLink::new(
+                    state,
+                    zero_output,
+                    zero_position,
+                    zero_index,
+                    zero_updates,
+                    0,
+                )],
+                initial,
+            ),
+            Err(CapturedInferenceError::Binding(_))
+        ));
+    }
+
+    #[test]
+    fn append_span_graph_lineage_rejects_gaps_repeats_reverse_and_permutations() {
+        let mut rank_one = Graph::new();
+        let rank_one_state = rank_one.input_dtype("rank_one_cache", [6], DType::F32);
+        let rank_one_updates = rank_one.input_dtype("rank_one_updates", [3], DType::F32);
+        let (rank_one_position, rank_one_index) =
+            append_span_index(&mut rank_one, "rank_one_position", rank_one_updates, 0);
+        let Op::Binary {
+            rhs: rank_one_iota, ..
+        } = rank_one.op(rank_one_index).unwrap()
+        else {
+            panic!("fixed-span helper must add the iota")
+        };
+        assert_eq!(
+            authenticate_append_index_graph(
+                &rank_one,
+                InferenceAppendStateLink::new(
+                    rank_one_state,
+                    rank_one_state,
+                    rank_one_position,
+                    rank_one_index,
+                    rank_one_updates,
+                    0,
+                ),
+                &Shape::from([3]),
+            )
+            .unwrap(),
+            Some((*rank_one_iota, rank_one_updates))
+        );
+
+        let mut graph = Graph::new();
+        let state = graph.input_dtype("lineage_cache", [6, 2], DType::F32);
+        let updates = graph.input_dtype("lineage_updates", [3, 2], DType::F32);
+        let shape = graph.shape(updates).unwrap().clone();
+        let position = graph.input_dtype("lineage_position", [1], DType::I32);
+        let expanded_position = graph
+            .reshape(position, [1, 1])
+            .and_then(|value| graph.expand(value, shape.clone()))
+            .unwrap();
+        let iota = graph.shape_iota(updates, 0).unwrap();
+        let expanded_iota = graph
+            .reshape(iota, [3, 1])
+            .and_then(|value| graph.expand(value, shape.clone()))
+            .unwrap();
+        let exact = graph.add(expanded_position, expanded_iota).unwrap();
+        assert_eq!(
+            authenticate_append_index_graph(
+                &graph,
+                InferenceAppendStateLink::new(state, state, position, exact, updates, 0),
+                &shape,
+            )
+            .unwrap(),
+            Some((iota, updates))
+        );
+
+        let gap_iota = graph.mul_scalar(expanded_iota, Scalar::I(2)).unwrap();
+        let gap = graph.add(expanded_position, gap_iota).unwrap();
+        let repeated_iota = graph.modulo_scalar(expanded_iota, Scalar::I(2)).unwrap();
+        let repeated = graph.add(expanded_position, repeated_iota).unwrap();
+        let reversed_iota = graph.flip(expanded_iota, [0isize]).unwrap();
+        let reversed = graph.add(expanded_position, reversed_iota).unwrap();
+        let transposed_iota = graph.permute(expanded_iota, [1, 0]).unwrap();
+        let permuted_iota = graph.permute(transposed_iota, [1, 0]).unwrap();
+        let permuted = graph.add(expanded_position, permuted_iota).unwrap();
+        let one = graph.constant(TensorData::scalar_with_dtype(Scalar::I(1), DType::I32));
+        let offset_iota = graph.add(expanded_iota, one).unwrap();
+        let offset = graph.add(expanded_position, offset_iota).unwrap();
+
+        for (name, index) in [
+            ("gaps", gap),
+            ("repeats", repeated),
+            ("reverse", reversed),
+            ("permutation", permuted),
+            ("offset", offset),
+        ] {
+            assert!(
+                matches!(
+                    authenticate_append_index_graph(
+                        &graph,
+                        InferenceAppendStateLink::new(state, state, position, index, updates, 0,),
+                        &shape,
+                    ),
+                    Err(CapturedInferenceError::Binding(_))
+                ),
+                "{name} lineage was accepted"
+            );
+        }
     }
 
     #[test]
