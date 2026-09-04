@@ -321,18 +321,18 @@ impl LlamaMetalPlan {
                     .append_state_plan()
                     .authenticate_shared_from(self.step.append_state_plan())
             })
-            .transpose()?;
+            .transpose()
+            .map_err(LlamaMetalStepError::Metal)?;
         let step = self.step.prepare(self.selected_device.clone())?;
         let prefill = match (self.prefill, shared) {
             (Some(prefill), Some(proof)) => {
                 let span_rows = prefill.span_rows();
                 let token_input_name = prefill.token_input().name.clone();
                 let position_input_name = prefill.position_vector_input().name.clone();
-                let inner = prefill.into_append_state_plan().prepare_shared(
-                    self.selected_device,
-                    step.metal_session(),
-                    proof,
-                )?;
+                let inner = prefill
+                    .into_append_state_plan()
+                    .prepare_shared(self.selected_device, step.metal_session(), proof)
+                    .map_err(LlamaMetalStepError::Metal)?;
                 Some(LlamaMetalPrefillSession {
                     inner,
                     span_rows,
