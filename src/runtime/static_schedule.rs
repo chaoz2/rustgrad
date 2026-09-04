@@ -3000,16 +3000,19 @@ impl<B, Q> StaticSharedResources<B, Q> {
     }
 }
 
-impl<A: StaticDeviceAdapter> StaticSharedResources<A::Buffer, A::Queue> {
-    pub(crate) fn checked(
+impl<B, Q> StaticSharedResources<B, Q> {
+    pub(crate) fn checked<A>(
         adapter: &A,
         plan: &StaticSchedulePlan<A::Rendered>,
-        dense: BTreeMap<u64, A::Buffer>,
-        quantized: BTreeMap<u64, A::Buffer>,
-        queue: Option<A::Queue>,
+        dense: BTreeMap<u64, B>,
+        quantized: BTreeMap<u64, B>,
+        queue: Option<Q>,
         allowed_dense: &BTreeSet<u64>,
         allowed_quantized: &BTreeSet<u64>,
-    ) -> Result<Self, A::Error> {
+    ) -> Result<Self, A::Error>
+    where
+        A: StaticDeviceAdapter<Buffer = B, Queue = Q>,
+    {
         if !dense.keys().all(|id| allowed_dense.contains(id))
             || !quantized.keys().all(|id| allowed_quantized.contains(id))
         {

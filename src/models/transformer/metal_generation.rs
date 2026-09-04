@@ -2,9 +2,10 @@
 
 use super::{
     LlamaChatError, LlamaChatMessage, LlamaChatTemplate, LlamaGeneration, LlamaGenerationError,
-    LlamaMetalPrefillPlan, LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan,
-    LlamaMetalStepSession, LlamaPromptWorkflow, LlamaSampling,
+    LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
+    LlamaPromptWorkflow, LlamaSampling,
     generation::{select_last, validate_sampling},
+    metal_step::LlamaMetalPrefillPlan,
 };
 use crate::{
     CapturedSchedule, DType, ExecutionPlanSummary, ReplayInput, Scalar, TensorData,
