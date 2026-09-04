@@ -28,6 +28,19 @@ pub struct LlamaGeneration {
 }
 
 impl LlamaGeneration {
+    pub(super) fn from_parts(
+        prompt_ids: Vec<u32>,
+        generated_ids: Vec<u32>,
+        decoded: String,
+        stopped: bool,
+    ) -> Self {
+        Self {
+            prompt_ids,
+            generated_ids,
+            decoded,
+            stopped,
+        }
+    }
     /// Returns the exact encoded prompt, including an inserted BOS if enabled.
     pub fn prompt_ids(&self) -> &[u32] {
         &self.prompt_ids

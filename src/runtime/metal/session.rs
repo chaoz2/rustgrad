@@ -360,6 +360,11 @@ impl MetalAppendStateInferencePlan {
         self.inner.transient_inputs()
     }
 
+    /// Returns capture-authenticated inputs synthesized by the session.
+    pub fn runtime_control_inputs(&self) -> &[ReplayInput] {
+        self.inner.runtime_control_inputs()
+    }
+
     pub fn rendered_items(&self) -> impl ExactSizeIterator<Item = &RenderedMetal> {
         self.inner.rendered_items()
     }
@@ -828,6 +833,11 @@ impl MetalDeviceSessionPlan {
         self.lifetime.transient_inputs()
     }
 
+    /// Returns capture-authenticated inputs synthesized by the session.
+    pub fn runtime_control_inputs(&self) -> &[ReplayInput] {
+        self.lifetime.runtime_controls()
+    }
+
     /// Returns deterministic planned resource and execution metadata.
     pub fn summary(&self) -> &MetalDeviceSessionSummary {
         &self.summary
@@ -1010,6 +1020,11 @@ impl MetalDeviceSession {
     /// Returns the typed per-invocation named-input schemas.
     pub fn transient_inputs(&self) -> &[ReplayInput] {
         self.lifetime.transient_inputs()
+    }
+
+    /// Returns capture-authenticated inputs synthesized by the session.
+    pub fn runtime_control_inputs(&self) -> &[ReplayInput] {
+        self.lifetime.runtime_controls()
     }
 
     /// Returns immutable information for the selected Metal device.

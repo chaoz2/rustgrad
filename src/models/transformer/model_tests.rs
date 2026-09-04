@@ -306,7 +306,7 @@ pub(super) fn make_variant_model_with_state_delta(
     (model, tokenizer, state)
 }
 
-pub(super) fn serialized_model_with_template(context: u32, template: Option<&str>) -> Vec<u8> {
+pub(crate) fn serialized_model_with_template(context: u32, template: Option<&str>) -> Vec<u8> {
     let state = fixed_state();
     let mut metadata = metadata(context);
     if let Some(template) = template {

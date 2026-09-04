@@ -119,19 +119,35 @@ The lower-level session and opt-in scoreboard remain available for detailed
 deployment evidence. Their host wall-clock and host API copy counts do not
 claim GPU time, physical bus traffic, allocator RSS, energy, or throughput.
 
-Dense-or-packed F32 GGUF Llama models also expose a fixed batch-one Metal
-token-step plan. It freezes exact named weights and a precomputed RoPE table,
-keeps one fixed-capacity K/V bank per tensor on device, and appends only the
-current complete K/V rows. Each call stages only an I32 token; the session
-synthesizes its sealed committed position, and one shared row-shaped append
-index is expanded and materialized on device from that same control. Packed
-Q4_0/Q8_0/Q4_K/Q6_K weights upload once and decode directly in the selected
-row-gather or matmul kernel. Retained steps download only F32 logits, while
-typed prompt commits run the identical graph and atomically publish K/V state
-without downloading logits. The lower-level append session can emit ordered
-stateful scoreboard evidence; a typed model-level scoreboard adapter, chunked
-prefill, tokenizer/generator/sampling integration, and live-device evidence
-remain explicit follow-ups.
+Dense-or-packed F32 GGUF Llama models also have a typed persistent Metal
+prompt-to-tokens facade. One GGUF parse owns the matching model, tokenizer, and
+chat template; planning binds them to an explicitly selected device, uploads
+Q4_0/Q8_0/Q4_K/Q6_K or dense weights once, and retains fixed-capacity K/V state.
+
+```rust,no_run
+use rustgrad::{LlamaMetalPlan, LlamaPromptWorkflow, LlamaSampling};
+use rustgrad::runtime::metal::{MetalPlanOptions, MetalRuntime};
+
+let device = MetalRuntime::load()?.device(0)?;
+let workflow = LlamaPromptWorkflow::from_path("model.gguf")?;
+let plan = LlamaMetalPlan::from_workflow(
+    workflow,
+    &device,
+    MetalPlanOptions::default(),
+)?;
+assert_eq!(plan.summary().fallback_count, 0);
+let mut session = plan.prepare()?;
+let output = session.generate_text("Hello", 32, LlamaSampling::Greedy)?;
+println!("{}", output.generation().decoded());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Prompt prefill suppresses intermediate logits downloads and retains only the
+last prompt logits; decode remains sequential batch-one/T=1 with host sampling
+and one logits download whenever another token must be selected. Per-token K/V
+commits are atomic, but a later failure does not roll back an already committed
+prefix. Current protected evidence is semantic-mock only; chunk prefill and
+live-device performance evidence remain explicit follow-ups.
 
 ## How the system fits together
 

@@ -332,6 +332,10 @@ pub(crate) fn models() -> (LlamaModel, SimpleTokenizer, LlamaModel, SimpleTokeni
     (packed_model, packed_tokenizer, dense_model, dense_tokenizer)
 }
 
+pub(crate) fn packed_workflow_bytes() -> Vec<u8> {
+    fixture(&packed_state())
+}
+
 fn assert_close(actual: &TensorData, expected: &TensorData) {
     assert_eq!(actual.shape(), expected.shape());
     // Packed kernels partition dequantized products differently from the

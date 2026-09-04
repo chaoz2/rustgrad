@@ -214,6 +214,11 @@ impl LlamaMetalStepPlan {
         self.inner.transient_inputs()
     }
 
+    /// Returns the sealed scalar-position schema synthesized per invocation.
+    pub fn runtime_control_inputs(&self) -> &[ReplayInput] {
+        self.inner.runtime_control_inputs()
+    }
+
     /// Returns every rendered schedule item for inspection.
     pub fn rendered_items(&self) -> impl ExactSizeIterator<Item = &RenderedMetal> {
         self.inner.rendered_items()
@@ -259,6 +264,16 @@ impl LlamaMetalStepSession {
         self.inner
             .committed_state_position()
             .expect("Llama plans always use append-state sessions")
+    }
+
+    /// Returns the fixed K/V capacity authenticated by this session.
+    pub const fn max_context(&self) -> usize {
+        self.max_context
+    }
+
+    /// Returns the exact GGUF vocabulary size authenticated by this session.
+    pub const fn vocab_size(&self) -> usize {
+        self.vocab_size
     }
 
     /// Returns true after the final valid context position commits.

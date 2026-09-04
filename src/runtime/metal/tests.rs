@@ -506,7 +506,11 @@ fn portable_threefry_metal_renders_and_executes_broadcast_bits() {
 use super::*;
 use crate::engine::capture::QuantizedCaptureBinding;
 use crate::kernel::execute_lowered_elementwise;
-use crate::models::transformer::{LlamaMetalStepPlan, packed_metal_fixture_models};
+use crate::models::transformer::{
+    LLAMA_SIMPLE_CHAT_TEMPLATE, LlamaChatMessage, LlamaChatRole, LlamaGenerator,
+    LlamaMetalStepPlan, LlamaPromptWorkflow, LlamaSampling, packed_metal_fixture_models,
+    packed_metal_workflow_bytes,
+};
 use crate::nn::{Linear, Module, Parameter, StateKind};
 use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
@@ -1472,6 +1476,341 @@ fn packed_llama_token_session_matches_dense_oracle_and_retries_atomically() {
         session.metal_session().compiled_kernels().count(),
         stable_compiled
     );
+    assert!(!mock.calls().iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("library_compile:")
+            || call.starts_with("pipeline_create:")
+            || call.starts_with("queue_create:")
+    }));
+}
+
+#[test]
+fn llama_metal_prompt_facade_prefills_with_one_read_and_matches_cpu() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        16,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (cpu_model, cpu_tokenizer) =
+        crate::models::transformer::LlamaModel::from_gguf(&file).unwrap();
+    let prompt = [3, 4, 5];
+    let expected = cpu_model.forward(&prompt).unwrap();
+    let vocab = cpu_model.config().schema().vocab_size();
+    let expected_last = TensorData::new(
+        [1, vocab],
+        expected.values()[expected.values().len() - vocab..].to_vec(),
+    )
+    .unwrap();
+
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
+    let plan = crate::models::transformer::LlamaMetalPlan::from_workflow(
+        workflow,
+        &device,
+        MetalPlanOptions::new(8),
+    )
+    .unwrap();
+    assert_eq!(plan.selected_device_owner_id(), device.owner_id());
+    assert_eq!(plan.transient_inputs().len(), 1);
+    assert_eq!(plan.runtime_control_inputs().len(), 1);
+    assert_eq!(plan.summary().fallback_count, 0);
+    let stable_identity = plan.step_deployment_identity();
+    let stable_capture = plan.capture().identity;
+    let mut session = plan.prepare().unwrap();
+    let stable_kernels = session.compiled_kernels().count();
+    let calls_after_prepare = mock.calls();
+
+    let zero = session
+        .generate_ids(&prompt, 0, LlamaSampling::Greedy)
+        .unwrap();
+    assert!(zero.reports().is_empty());
+    assert_eq!(session.position(), 0);
+    assert_eq!(mock.calls(), calls_after_prepare);
+
+    let chat = session
+        .generate_chat(
+            &[LlamaChatMessage::new(LlamaChatRole::User, "a").unwrap()],
+            0,
+            LlamaSampling::Greedy,
+        )
+        .unwrap();
+    assert!(chat.rendered_prompt().contains("assistant"));
+    assert!(chat.generation().reports().is_empty());
+    assert_eq!(session.position(), 0);
+    assert_eq!(mock.calls(), calls_after_prepare);
+
+    mock.clear_calls();
+    let prefill = session.prefill_ids(&prompt).unwrap();
+    assert_eq!(prefill.logits().shape(), expected_last.shape());
+    for (actual, expected) in prefill.logits().values().iter().zip(expected_last.values()) {
+        assert!(actual.is_finite() && (actual - expected).abs() <= 1e-3);
+    }
+    assert_eq!(prefill.reports().len(), 3);
+    assert_eq!(prefill.reports()[0].retained_d2h_calls, 0);
+    assert_eq!(prefill.reports()[1].retained_d2h_calls, 0);
+    assert_eq!(prefill.reports()[2].retained_d2h_calls, 1);
+    assert!(
+        prefill
+            .reports()
+            .iter()
+            .all(|report| report.transient_h2d_calls == 1
+                && report.transient_h2d_bytes == 4
+                && report.runtime_control_h2d_calls == 1
+                && report.runtime_control_h2d_bytes == 4)
+    );
+    assert_eq!(session.position(), prompt.len());
+    assert_eq!(session.compiled_kernels().count(), stable_kernels);
+    assert_eq!(session.capture().identity, stable_capture);
+    assert!(!mock.calls().iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("library_compile:")
+            || call.starts_with("pipeline_create:")
+            || call.starts_with("queue_create:")
+    }));
+
+    let expected_generation = LlamaGenerator::new(&cpu_model, &cpu_tokenizer)
+        .generate_ids(&prompt, 2, LlamaSampling::Greedy)
+        .unwrap();
+    let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
+    let fresh = crate::models::transformer::LlamaMetalPlan::from_workflow(
+        workflow,
+        &device,
+        MetalPlanOptions::new(8),
+    )
+    .unwrap();
+    assert_eq!(fresh.step_deployment_identity(), stable_identity);
+    let mut fresh = fresh.prepare().unwrap();
+    let generation = fresh
+        .generate_ids(&prompt, 2, LlamaSampling::Greedy)
+        .unwrap();
+    assert_eq!(generation.generation(), &expected_generation);
+    assert_eq!(
+        fresh.position(),
+        prompt.len()
+            + generation
+                .generation()
+                .generated_ids()
+                .len()
+                .saturating_sub(1)
+    );
+}
+
+#[test]
+fn llama_metal_prompt_facade_preflights_and_reports_partial_commits() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        16,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let prepare = |mock: Arc<MockDispatch>| {
+        let device = test_device(mock);
+        let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
+        crate::models::transformer::LlamaMetalPlan::from_workflow(
+            workflow,
+            &device,
+            MetalPlanOptions::new(8),
+        )
+        .unwrap()
+        .prepare()
+        .unwrap()
+    };
+
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = prepare(mock.clone());
+    mock.clear_calls();
+    for invalid in [
+        session.generate_ids(&[], 1, LlamaSampling::Greedy),
+        session.generate_ids(&[u32::MAX], 1, LlamaSampling::Greedy),
+        session.generate_ids(&[3, u32::MAX], 1, LlamaSampling::Greedy),
+        session.generate_ids(&[3; 16], 1, LlamaSampling::Greedy),
+        session.generate_ids(
+            &[3],
+            1,
+            LlamaSampling::GumbelMax {
+                temperature: 1.0,
+                uniforms: &[],
+            },
+        ),
+    ] {
+        assert!(invalid.is_err());
+        assert_eq!(session.position(), 0);
+        assert!(mock.calls().is_empty());
+    }
+
+    for stage in ["launch", "wait"] {
+        match stage {
+            "launch" => mock.state.lock().unwrap().failures.launch = Some("prompt launch"),
+            "wait" => mock.state.lock().unwrap().failures.wait = Some("prompt wait"),
+            _ => unreachable!(),
+        }
+        let failure = session.prefill_ids(&[3, 4, 5]).unwrap_err();
+        assert!(matches!(
+            failure,
+            crate::models::transformer::LlamaMetalGenerationError::Execution {
+                progress,
+                stage: crate::models::transformer::LlamaMetalGenerationStage::Prompt,
+                token_offset: 0,
+                token: 3,
+                ..
+            } if progress.committed_position() == 0 && progress.reports().is_empty()
+        ));
+        assert_eq!(session.position(), 0);
+        mock.clear_failures();
+    }
+
+    mock.state.lock().unwrap().failures.read = Some("prompt final read");
+    let failure = session.prefill_ids(&[3, 4, 5]).unwrap_err();
+    assert!(matches!(
+        failure,
+        crate::models::transformer::LlamaMetalGenerationError::Execution {
+            progress,
+            stage: crate::models::transformer::LlamaMetalGenerationStage::Prompt,
+            token_offset: 2,
+            token: 5,
+            ..
+        } if progress.committed_position() == 2 && progress.reports().len() == 2
+    ));
+    assert_eq!(session.position(), 2);
+    mock.clear_failures();
+    let retry = session.run_token(5).unwrap();
+    assert_eq!(retry.position(), 2);
+    assert_eq!(session.position(), 3);
+
+    mock.clear_calls();
+    assert!(matches!(
+        session.generate_ids(&[3], 1, LlamaSampling::Greedy),
+        Err(
+            crate::models::transformer::LlamaMetalGenerationError::FreshSessionRequired {
+                position: 3
+            }
+        )
+    ));
+    assert!(mock.calls().is_empty());
+
+    let mock = Arc::new(MockDispatch::default());
+    let mut gumbel_session = prepare(mock);
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (model, tokenizer) = crate::models::transformer::LlamaModel::from_gguf(&file).unwrap();
+    let vocab = model.config().schema().vocab_size();
+    let uniforms = (0..2 * vocab)
+        .map(|index| (index as f32 + 0.5) / (2 * vocab) as f32)
+        .collect::<Vec<_>>();
+    let sampling = LlamaSampling::GumbelMax {
+        temperature: 0.75,
+        uniforms: &uniforms,
+    };
+    let expected = LlamaGenerator::new(&model, &tokenizer)
+        .generate_ids(&[3], 2, sampling)
+        .unwrap();
+    let actual = gumbel_session.generate_ids(&[3], 2, sampling).unwrap();
+    assert_eq!(actual.generation(), &expected);
+
+    for stop_token in [1usize, 2] {
+        let mock = Arc::new(MockDispatch::default());
+        let mut stop_session = prepare(mock.clone());
+        let vocab = stop_session.vocab_size();
+        let mut uniforms = vec![0.0; 4 * vocab];
+        uniforms[stop_token] = 1.0 - f32::EPSILON;
+        mock.clear_calls();
+        let stopped = stop_session
+            .generate_ids(
+                &[3],
+                4,
+                LlamaSampling::GumbelMax {
+                    temperature: f32::MAX,
+                    uniforms: &uniforms,
+                },
+            )
+            .unwrap();
+        assert_eq!(stopped.generated_ids(), &[stop_token as u32]);
+        assert!(stopped.stopped());
+        assert_eq!(stopped.reports().len(), 1);
+        assert_eq!(stop_session.position(), 1);
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| call.starts_with("launch:"))
+                .count(),
+            stopped.reports()[0].kernel_launch_count
+        );
+    }
+
+    let mock = Arc::new(MockDispatch::default());
+    let mut failed_decode = prepare(mock.clone());
+    let vocab = failed_decode.vocab_size();
+    let kernels_per_token = failed_decode.summary().nonzero_item_count;
+    let mut uniforms = vec![0.0; 2 * vocab];
+    uniforms[4] = 1.0 - f32::EPSILON;
+    mock.state.lock().unwrap().failures.launch_after =
+        Some((kernels_per_token, "generated token launch"));
+    let failure = failed_decode
+        .generate_ids(
+            &[3],
+            2,
+            LlamaSampling::GumbelMax {
+                temperature: f32::MAX,
+                uniforms: &uniforms,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        failure,
+        crate::models::transformer::LlamaMetalGenerationError::Execution {
+            progress,
+            stage: crate::models::transformer::LlamaMetalGenerationStage::Decode,
+            token_offset: 1,
+            token: 4,
+            ..
+        } if progress.prompt_ids() == [3]
+            && progress.generated_ids() == [4]
+            && progress.reports().len() == 1
+            && progress.committed_position()
+                == progress.start_position() + progress.reports().len()
+    ));
+    assert_eq!(failed_decode.position(), 1);
+    mock.clear_failures();
+    let retry = failed_decode.run_token(4).unwrap();
+    assert_eq!(retry.position(), 1);
+    assert_eq!(retry.report().successful_invocation, 2);
+    assert_eq!(failed_decode.position(), 2);
+}
+
+#[test]
+fn llama_metal_prompt_facade_preserves_packed_and_tied_ownership() {
+    let bytes = packed_metal_workflow_bytes();
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (oracle, tokenizer) = crate::models::transformer::LlamaModel::from_gguf(&file).unwrap();
+    let expected = LlamaGenerator::new(&oracle, &tokenizer)
+        .generate_ids(&[3], 1, LlamaSampling::Greedy)
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
+    let plan = crate::models::transformer::LlamaMetalPlan::from_workflow(
+        workflow,
+        &device,
+        MetalPlanOptions::new(8),
+    )
+    .unwrap();
+    assert_eq!(plan.summary().quantized_constant_count, 1 + 2 * 7);
+    assert_eq!(
+        plan.capture()
+            .quantized_constants
+            .values()
+            .map(|value| value.descriptor().ggml_type)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q6K])
+    );
+    let stable_owner = plan.selected_device_owner_id();
+    let mut session = plan.prepare().unwrap();
+    mock.clear_calls();
+    let actual = session
+        .generate_ids(&[3], 1, LlamaSampling::Greedy)
+        .unwrap();
+    assert_eq!(actual.generation(), &expected);
+    assert_eq!(session.device_owner_id(), stable_owner);
+    assert_eq!(actual.reports().len(), 1);
+    assert_eq!(actual.reports()[0].retained_d2h_calls, 1);
     assert!(!mock.calls().iter().any(|call| {
         call.starts_with("buffer_create:")
             || call.starts_with("library_compile:")

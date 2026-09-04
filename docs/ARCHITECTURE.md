@@ -54,6 +54,7 @@ src/
       layer.rs           authoritative dense block Graph composition
       model.rs           GGUF config/state binding and N-layer graph/cache path
       generation.rs      greedy and explicit-uniform Gumbel-max generation
+      metal_generation.rs typed persistent Metal prompt/chat generation
       batch.rs           padded batched Graph planning and transactional KV caches
       batch_generation.rs deterministic per-row stopping and sampling
       chat.rs            checked Llama fallback/chat-template formatting
@@ -2665,6 +2666,34 @@ Position, row-byte/work metrics, state, and output publish only after every laye
 append and logits succeed, so a partial failure retries and overwrites the same
 uncommitted row without a full-state copy.
 
+`LlamaMetalPlan::from_workflow` is the model-specific deployment facade above
+that token primitive. It consumes one validated `LlamaPromptWorkflow`, so the
+captured dense-or-packed model, `SimpleTokenizer`, and checked
+`LlamaChatTemplate` cannot originate from different GGUF inputs. The plan owns
+the explicitly selected `MetalDevice`, exposes capture/schedule/schemas/MSL and
+resource facts, and prepares without another device argument. Its
+`step_deployment_identity` names only the captured compute deployment; it does
+not claim to identify tokenizer or chat policy. The prepared
+`LlamaMetalSession` retains no host model or dense weight object. It prevalidates
+the complete prompt, context bound, token range, and explicit sampling tape
+before the first driver call. Sequential prefill executes `commit_token` for
+every prompt token except the last, then `run_token` once for the retained
+`[1,vocab]` logits. Decode uses the existing greedy or explicit-tape Gumbel
+selector and incremental UTF-8 decoder on the host, feeding a selected token
+back only when another logits row is required. EOS/EOT and the final selected
+token are returned without another K/V append. A zero generation bound performs
+all source-compatible validation but no Metal work.
+
+Each successfully executed token invocation is a durable append-state commit.
+Therefore a later launch, wait, read, selection, or decode failure cannot
+promise whole-call rollback. Typed errors instead retain the prompt/decode
+stage, token offset, committed device position, already selected generated IDs,
+and every successful run report, while the failed token leaves the current row
+retryable. High-level
+prompt/text/chat generation requires a fresh session; `prefill_ids` and
+`run_token` remain explicit continuation seams. The current evidence is
+protected semantic-mock execution, not a live-device or performance result.
+
 Packed bytes are immutable `Arc<[u8]>` payloads: model, capture, and prepared
 session ownership clone handles rather than full weights. Capture identity
 still hashes exact content and descriptors, and preparation uploads each
@@ -2673,8 +2702,7 @@ unique packed owner once even when tied bindings reference it more than once.
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, mutable training state, dynamically
 shaped/capacity-growing state, general output chaining across calls, chunk
-prefill, tokenizer/generator/sampling integration, model-level generation
-scoreboard wiring, multi-device execution, and live Metal
+prefill, model-level generation scoreboard wiring, multi-device execution, and live Metal
 numerical/performance evidence remain explicit follow-ons.
 The semantic mock covers fixed-shape state ping-pong and a bounded
 residual-style multi-layer graph. Protected acceptance exercises that typed
@@ -2761,9 +2789,12 @@ requires a renderer-identity revision and new numerical evidence. There is no
 hidden full-weight dequantization or CPU fallback. The fixed batch-one Llama
 token-step deployment substitutes these exact packed plans for embedding,
 every q/k/v/o and gated-FFN projection, and explicit or tied output projection.
-Sequential callers may reuse that one T=1 session for prefill and decode;
-chunk prefill, final-only prefill logits, generator wiring, and
-live-device-performance evidence remain outside this slice.
+Sequential callers may reuse that one T=1 session for prefill and decode. The
+typed prompt facade now suppresses intermediate prefill outputs, retains the
+final prompt logits, and composes tokenizer/chat rendering plus host sampling
+over that persistent session. Chunk prefill, device-side sampling, a
+model-level scoreboard adapter, and live-device-performance evidence remain
+outside this slice.
 
 Devices are returned in deterministic registry-ID/name order with capability
 metadata in renderer and pipeline cache identities. Resources are deliberately
