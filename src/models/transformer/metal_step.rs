@@ -288,7 +288,9 @@ impl LlamaMetalStepPlan {
 impl LlamaMetalPrefillPlan {
     /// Builds and captures one state-only fixed-span program without creating
     /// Metal resources. The scalar append position is sealed; exact token and
-    /// position vectors remain typed inputs for the future session coordinator.
+    /// position vectors remain typed inputs for the private session coordinator.
+    /// That coordinator alone may consume this plan, and must validate before
+    /// driver work that `positions[j] == scalar_position + j` for every row.
     pub(crate) fn new(
         model: &LlamaModel,
         renderer: MetalRenderer,
@@ -429,11 +431,13 @@ impl LlamaMetalPrefillPlan {
         self.output_binding
     }
 
-    pub(crate) const fn append_state_plan(&self) -> &MetalAppendStateInferencePlan {
+    /// Borrows the sealed append plan for the sibling generation coordinator.
+    pub(super) const fn append_state_plan(&self) -> &MetalAppendStateInferencePlan {
         &self.inner
     }
 
-    pub(crate) fn into_append_state_plan(self) -> MetalAppendStateInferencePlan {
+    /// Transfers the sealed append plan to the sibling generation coordinator.
+    pub(super) fn into_append_state_plan(self) -> MetalAppendStateInferencePlan {
         self.inner
     }
 }
@@ -507,10 +511,25 @@ impl LlamaMetalStepSession {
     /// Runs exactly one token. Invalid tokens, a full context, and failed
     /// device transactions preserve both position and the prior committed K/V rows.
     pub fn run_token(&mut self, token: u32) -> Result<LlamaMetalStep, LlamaMetalStepError> {
-        let (position, inputs) = self.token_inputs(token)?;
-        let run = self.inner.run(&inputs)?;
+        let position = self.position();
+        let invocation = self.inner.successful_run_count().checked_add(1).ok_or(
+            LlamaMetalStepError::Dimension("invocation counter overflow"),
+        )?;
+        self.run_token_at(token, position, invocation)
+    }
+
+    pub(crate) fn run_token_at(
+        &mut self,
+        token: u32,
+        position: usize,
+        invocation: u64,
+    ) -> Result<LlamaMetalStep, LlamaMetalStepError> {
+        let inputs = self.token_inputs_at(token, position)?;
+        let run = self.inner.run_at(&inputs, position)?;
         self.observe_run(&run);
-        let (mut outputs, report) = run.into_parts();
+        let (mut outputs, mut report) = run.into_parts();
+        report.successful_invocation = invocation;
+        report.first_successful_run = invocation == 1;
         debug_assert_eq!(outputs.len(), 1);
         let logits = outputs
             .pop()
@@ -530,38 +549,50 @@ impl LlamaMetalStepSession {
         &mut self,
         token: u32,
     ) -> Result<LlamaMetalTokenCommit, LlamaMetalStepError> {
-        let (position, inputs) = self.token_inputs(token)?;
-        let run = self.inner.run_without_host_outputs(&inputs)?;
+        let position = self.position();
+        let invocation = self.inner.successful_run_count().checked_add(1).ok_or(
+            LlamaMetalStepError::Dimension("invocation counter overflow"),
+        )?;
+        self.commit_token_at(token, position, invocation)
+    }
+
+    pub(crate) fn commit_token_at(
+        &mut self,
+        token: u32,
+        position: usize,
+        invocation: u64,
+    ) -> Result<LlamaMetalTokenCommit, LlamaMetalStepError> {
+        let inputs = self.token_inputs_at(token, position)?;
+        let run = self.inner.run_without_host_outputs_at(&inputs, position)?;
         self.observe_run(&run);
         debug_assert!(run.outputs().is_empty());
-        let (_, report) = run.into_parts();
+        let (_, mut report) = run.into_parts();
+        report.successful_invocation = invocation;
+        report.first_successful_run = invocation == 1;
         Ok(LlamaMetalTokenCommit { position, report })
     }
 
-    fn token_inputs(
+    fn token_inputs_at(
         &self,
         token: u32,
-    ) -> Result<(usize, BTreeMap<String, TensorData>), LlamaMetalStepError> {
+        position: usize,
+    ) -> Result<BTreeMap<String, TensorData>, LlamaMetalStepError> {
         if token > i32::MAX as u32 || token as usize >= self.vocab_size {
             return Err(LlamaMetalStepError::TokenOutOfRange {
                 token,
                 vocab_size: self.vocab_size,
             });
         }
-        let position = self.position();
         if position >= self.max_context {
             return Err(LlamaMetalStepError::ContextExhausted {
                 position,
                 maximum: self.max_context,
             });
         }
-        Ok((
-            position,
-            BTreeMap::from([(
-                TOKEN_INPUT.to_owned(),
-                TensorData::from_scalars([1, 1], DType::I32, [Scalar::I(i64::from(token))])?,
-            )]),
-        ))
+        Ok(BTreeMap::from([(
+            TOKEN_INPUT.to_owned(),
+            TensorData::from_scalars([1, 1], DType::I32, [Scalar::I(i64::from(token))])?,
+        )]))
     }
 
     fn observe_run(&mut self, run: &crate::runtime::metal::MetalDeviceRun) {
@@ -1700,6 +1731,121 @@ mod tests {
         }
     }
 
+    fn state_name(graph: &Graph, link: InferenceAppendStateLink) -> String {
+        let Op::Input { name } = graph.op(link.input()).unwrap() else {
+            unreachable!("append state input is authenticated by name")
+        };
+        name.clone()
+    }
+
+    fn execute_step_state(
+        built: &BuiltStepGraph,
+        states: &BTreeMap<String, TensorData>,
+        token: u32,
+        position: usize,
+    ) -> BTreeMap<String, TensorData> {
+        let mut bindings = built
+            .residents
+            .iter()
+            .map(|(name, (_, value))| (name.clone(), value.clone()))
+            .chain(states.clone())
+            .collect::<HashMap<_, _>>();
+        bindings.insert(
+            TOKEN_INPUT.into(),
+            TensorData::from_scalars([1, 1], DType::I32, [Scalar::I(i64::from(token))]).unwrap(),
+        );
+        bindings.insert(
+            POSITION_INPUT.into(),
+            TensorData::from_scalars([1], DType::I32, [Scalar::I(position as i64)]).unwrap(),
+        );
+        built
+            .state_links
+            .iter()
+            .map(|link| {
+                (
+                    state_name(&built.graph, *link),
+                    CpuBackend
+                        .execute(&built.graph, link.output(), &bindings)
+                        .unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn execute_step_tokens(
+        built: &BuiltStepGraph,
+        mut states: BTreeMap<String, TensorData>,
+        tokens: &[u32],
+        start: usize,
+    ) -> BTreeMap<String, TensorData> {
+        for (offset, token) in tokens.iter().copied().enumerate() {
+            states = execute_step_state(built, &states, token, start + offset);
+        }
+        states
+    }
+
+    fn execute_prefill_state(
+        built: &BuiltPrefillGraph,
+        states: &BTreeMap<String, TensorData>,
+        tokens: &[u32],
+        start: usize,
+    ) -> BTreeMap<String, TensorData> {
+        let rows = tokens.len();
+        let mut bindings = built
+            .residents
+            .iter()
+            .map(|(name, (_, value))| (name.clone(), value.clone()))
+            .chain(states.clone())
+            .collect::<HashMap<_, _>>();
+        bindings.insert(
+            PREFILL_TOKEN_INPUT.into(),
+            TensorData::from_scalars(
+                [1, rows],
+                DType::I32,
+                tokens.iter().map(|token| Scalar::I(i64::from(*token))),
+            )
+            .unwrap(),
+        );
+        bindings.insert(
+            POSITION_INPUT.into(),
+            TensorData::from_scalars([1], DType::I32, [Scalar::I(start as i64)]).unwrap(),
+        );
+        bindings.insert(
+            PREFILL_POSITIONS_INPUT.into(),
+            TensorData::from_scalars(
+                [1, rows],
+                DType::I32,
+                (start..start + rows).map(|position| Scalar::I(position as i64)),
+            )
+            .unwrap(),
+        );
+        built
+            .state_links
+            .iter()
+            .map(|link| {
+                (
+                    state_name(&built.graph, *link),
+                    CpuBackend
+                        .execute(&built.graph, link.output(), &bindings)
+                        .unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_state_close(
+        actual: &BTreeMap<String, TensorData>,
+        expected: &BTreeMap<String, TensorData>,
+    ) {
+        assert_eq!(
+            actual.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        for (name, actual) in actual {
+            assert_close(actual, &expected[name]);
+        }
+    }
+
     #[test]
     fn dense_gqa_step_graph_uses_raw_gathers_and_owned_append_rows() {
         let (model, _, _) = super::super::model_tests::make_variant_model(4);
@@ -2060,6 +2206,64 @@ mod tests {
     }
 
     #[test]
+    fn fixed_prefill_state_matches_sequential_t1_at_zero_and_nonzero_prefix() {
+        let (model, _, _) = super::super::model_tests::make_variant_model(8);
+        let step = build_step_graph(&model).unwrap();
+        let prefill = build_prefill_graph(&model, NonZeroUsize::new(3).unwrap()).unwrap();
+
+        let initial = step.initial_state.clone();
+        let expected = execute_step_tokens(&step, initial.clone(), &[3, 4, 5], 0);
+        let actual = execute_prefill_state(&prefill, &initial, &[3, 4, 5], 0);
+        assert_state_close(&actual, &expected);
+
+        let prefix = execute_step_tokens(&step, initial, &[1, 2], 0);
+        let expected = execute_step_tokens(&step, prefix.clone(), &[3, 4, 5], 2);
+        let actual = execute_prefill_state(&prefill, &prefix, &[3, 4, 5], 2);
+        assert_state_close(&actual, &expected);
+    }
+
+    #[test]
+    fn fixed_prefill_dense_inventory_is_exact_and_typed() {
+        let (model, _, _) = super::super::model_tests::make_variant_model(6);
+        let plan =
+            LlamaMetalPrefillPlan::new(&model, renderer(), NonZeroUsize::new(3).unwrap()).unwrap();
+        let expected = BTreeSet::from([
+            TOKEN_EMBEDDING,
+            ROPE_TABLE,
+            "blk.0.attn_norm.weight",
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_norm.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+            "blk.0.attn_q_norm.weight",
+            "blk.0.attn_k_norm.weight",
+            "blk.0.attn_q.bias",
+            "blk.0.attn_k.bias",
+            "blk.0.attn_v.bias",
+            "blk.1.attn_norm.weight",
+            "blk.1.attn_k.weight",
+            "blk.1.attn_v.weight",
+            "blk.1.attn_k_norm.weight",
+            "blk.1.attn_k.bias",
+            "blk.1.attn_v.bias",
+        ]);
+        let actual = plan
+            .resident_inputs()
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        for input in plan.resident_inputs() {
+            assert_eq!(input.desc.dtype, DType::F32, "{}", input.name);
+            assert_eq!(input.desc.bytes, input.desc.shape.numel().unwrap() * 4);
+        }
+    }
+
+    #[test]
     fn fixed_prefill_captures_every_supported_packed_format_without_logits() {
         let (packed, _, _, _) = super::super::packed_metal_fixture_models();
         let plan =
@@ -2080,6 +2284,55 @@ mod tests {
         assert_eq!(plan.transient_inputs().len(), 2);
         assert_eq!(plan.runtime_control_inputs().len(), 1);
         assert!(plan.summary().quantized_constant_count > 0);
+        let expected_names = BTreeSet::from([
+            TOKEN_EMBEDDING,
+            "blk.0.attn_q.weight",
+            "blk.0.attn_k.weight",
+            "blk.0.attn_v.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+            "blk.1.attn_k.weight",
+            "blk.1.attn_v.weight",
+        ]);
+        let packed_inputs = plan
+            .capture()
+            .quantized_constants
+            .keys()
+            .map(|id| {
+                plan.capture()
+                    .inputs
+                    .iter()
+                    .find(|input| input.desc.id == *id)
+                    .expect("each packed owner is one named capture input")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            packed_inputs
+                .iter()
+                .map(|input| input.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            expected_names
+        );
+        assert_eq!(
+            packed_inputs
+                .iter()
+                .map(|input| input.desc.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            packed_inputs.len()
+        );
+        for input in &packed_inputs {
+            let packed = &plan.capture().quantized_constants[&input.desc.id];
+            assert_eq!(input.desc.dtype, DType::F32, "{}", input.name);
+            assert_eq!(input.desc.shape, packed.descriptor().logical_shape);
+        }
+        assert!(packed_inputs.iter().all(|packed| {
+            plan.resident_inputs()
+                .iter()
+                .all(|dense| dense.desc.id != packed.desc.id)
+        }));
     }
 
     #[test]

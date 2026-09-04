@@ -3100,11 +3100,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         adapter: A,
         plan: StaticSchedulePlan<A::Rendered>,
     ) -> Result<Self, A::Error> {
-        Self::from_plan_with_shared(
-            adapter,
-            plan,
-            StaticSharedResources::empty(),
-        )
+        Self::from_plan_with_shared(adapter, plan, StaticSharedResources::empty())
     }
 
     pub(crate) fn from_plan_with_shared(
@@ -3385,9 +3381,12 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                 "capture-owned packed constants do not match the static plan".into(),
             ));
         }
-        let planned_quantized = self.quantized_plans.keys().copied().collect::<BTreeSet<_>>();
-        if !shared_dense.is_subset(resident_ids)
-            || !shared_quantized.is_subset(&planned_quantized)
+        let planned_quantized = self
+            .quantized_plans
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if !shared_dense.is_subset(resident_ids) || !shared_quantized.is_subset(&planned_quantized)
         {
             return Err(A::invalid_binding(
                 "shared resident inventory is outside the target plan".into(),

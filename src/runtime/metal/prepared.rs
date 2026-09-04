@@ -15,8 +15,8 @@ use crate::runtime::static_schedule::{
     InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticAppendStateLink,
     StaticBufferAllocation, StaticDeviceAdapter, StaticExecutionReport, StaticHostGather,
     StaticHostOutputSelection, StaticPlanAdapter, StaticQuantizedBufferPlan, StaticRendered,
-    StaticRenderedBuffer, StaticRenderedQuantizedBuffer, StaticSchedulePlan, StaticStateLink,
-    StaticSharedResources, bind_rendered_buffers,
+    StaticRenderedBuffer, StaticRenderedQuantizedBuffer, StaticSchedulePlan, StaticSharedResources,
+    StaticStateLink, bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
@@ -246,7 +246,11 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
         plan: &StaticQuantizedBufferPlan,
     ) -> Result<(), Self::Error> {
         let device = self.device()?;
-        let physical_bytes = if plan.desc.bytes == 0 { 4 } else { plan.desc.bytes };
+        let physical_bytes = if plan.desc.bytes == 0 {
+            4
+        } else {
+            plan.desc.bytes
+        };
         if buffer.owner_id() != device.owner_id()
             || buffer.len() != plan.desc.bytes
             || buffer.dtype().is_some()
@@ -602,9 +606,7 @@ impl InitializedMetalPrefix {
             self.inner
                 .shared_buffer(id)
                 .ok_or_else(|| {
-                    MetalError::InvalidBinding(format!(
-                        "shared Metal source buffer {id} is absent"
-                    ))
+                    MetalError::InvalidBinding(format!("shared Metal source buffer {id} is absent"))
                 })?
                 .share()
         };

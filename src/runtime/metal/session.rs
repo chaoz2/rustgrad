@@ -287,6 +287,15 @@ fn same_storage_descriptor(left: &crate::BufferDesc, right: &crate::BufferDesc) 
         && left.view == right.view
 }
 
+fn same_tensor_payload(left: &TensorData, right: &TensorData) -> Result<bool, MetalError> {
+    if left.shape() != right.shape() || left.dtype() != right.dtype() {
+        return Ok(false);
+    }
+    let left = left.to_le_bytes().map_err(|_| MetalError::Overflow)?;
+    let right = right.to_le_bytes().map_err(|_| MetalError::Overflow)?;
+    Ok(left == right)
+}
+
 fn exact_input_by_name<'a>(
     inputs: &'a [ReplayInput],
     name: &str,
@@ -303,14 +312,11 @@ fn exact_input_by_name<'a>(
     Ok(input)
 }
 
-fn quantized_input(
-    capture: &CapturedSchedule,
-    id: u64,
-) -> Result<&ReplayInput, MetalError> {
+fn quantized_input(capture: &CapturedSchedule, id: u64) -> Result<&ReplayInput, MetalError> {
     let mut matching = capture.inputs.iter().filter(|input| input.desc.id == id);
-    let input = matching.next().ok_or_else(|| {
-        MetalError::InvalidBinding(format!("packed Metal input {id} is absent"))
-    })?;
+    let input = matching
+        .next()
+        .ok_or_else(|| MetalError::InvalidBinding(format!("packed Metal input {id} is absent")))?;
     if matching.next().is_some() {
         return Err(MetalError::InvalidBinding(format!(
             "packed Metal input {id} is ambiguous"
@@ -445,15 +451,16 @@ impl MetalAppendStateInferencePlan {
         device: MetalDevice,
         source: &MetalDeviceSession,
         proof: MetalSharedAppendProof,
-    ) -> Result<MetalDeviceSession, MetalError> {
-        self.inner.prepare_with_shared_state_and_deployment(
+    ) -> Result<MetalSharedAppendSession, MetalError> {
+        let inner = self.inner.prepare_with_shared_state_and_deployment(
             device,
             self.resident_bindings,
             self.initial_state,
             self.deployment_identity,
             source,
             proof,
-        )
+        )?;
+        Ok(MetalSharedAppendSession { inner })
     }
 
     /// Authenticates the exact immutable/state inventory this plan may import
@@ -494,8 +501,12 @@ impl MetalAppendStateInferencePlan {
             .chain(self.inner.state_inputs())
             .filter(|input| self.inner.device_resident_ids.contains(&input.desc.id))
         {
-            let source_input = exact_input_by_name(source.capture().inputs.as_slice(), &target.name)?;
-            if !source.inner.device_resident_ids.contains(&source_input.desc.id)
+            let source_input =
+                exact_input_by_name(source.capture().inputs.as_slice(), &target.name)?;
+            if !source
+                .inner
+                .device_resident_ids
+                .contains(&source_input.desc.id)
                 || !same_storage_descriptor(&target.desc, &source_input.desc)
             {
                 return Err(MetalError::InvalidBinding(format!(
@@ -511,7 +522,13 @@ impl MetalAppendStateInferencePlan {
                 .resident_bindings
                 .get(&target.name)
                 .or_else(|| source.initial_state.get(&target.name));
-            if target_value.is_none() || target_value != source_value {
+            let (Some(target_value), Some(source_value)) = (target_value, source_value) else {
+                return Err(MetalError::InvalidBinding(format!(
+                    "shared Metal input {} immutable payload differs",
+                    target.name
+                )));
+            };
+            if !same_tensor_payload(target_value, source_value)? {
                 return Err(MetalError::InvalidBinding(format!(
                     "shared Metal input {} immutable payload differs",
                     target.name
@@ -538,7 +555,8 @@ impl MetalAppendStateInferencePlan {
         let mut quantized = BTreeMap::new();
         for (target_id, target_value) in self.inner.lifetime.quantized_constants() {
             let target_input = quantized_input(self.capture(), *target_id)?;
-            let source_input = exact_input_by_name(source.capture().inputs.as_slice(), &target_input.name)?;
+            let source_input =
+                exact_input_by_name(source.capture().inputs.as_slice(), &target_input.name)?;
             let source_value = source
                 .inner
                 .lifetime
@@ -1137,10 +1155,11 @@ impl MetalDeviceSessionPlan {
             if proof.target_capture_identity != self.capture().identity
                 || Some(proof.target_deployment_identity) != inference_deployment_identity
                 || proof.source_capture_identity != source.capture().identity
-                || source.inference_deployment_identity()
-                    != Some(proof.source_deployment_identity)
+                || source.inference_deployment_identity() != Some(proof.source_deployment_identity)
                 || source.device_owner_id() != device.owner_id()
                 || !matches!(source.state_policy, MetalSessionStatePolicy::Append { .. })
+                || source.successful_runs != 0
+                || source.committed_state_position != 0
             {
                 return Err(MetalError::InvalidBinding(
                     "shared Metal session proof does not belong to these deployments".into(),
@@ -1185,11 +1204,7 @@ impl MetalDeviceSessionPlan {
                     .prepared
                     .share_resources(&proof.dense, &proof.quantized)?;
                 let imported_dense = proof.dense.keys().copied().collect::<BTreeSet<_>>();
-                let imported_quantized = proof
-                    .quantized
-                    .keys()
-                    .copied()
-                    .collect::<BTreeSet<_>>();
+                let imported_quantized = proof.quantized.keys().copied().collect::<BTreeSet<_>>();
                 (
                     PreparedMetalPrefix::from_plan_with_shared(
                         device.clone(),
@@ -1227,7 +1242,9 @@ impl MetalDeviceSessionPlan {
             .iter()
             .filter(|input| !imported_dense.contains(&input.desc.id))
             .try_fold(0usize, |total, input| {
-                total.checked_add(input.desc.bytes).ok_or(MetalError::Overflow)
+                total
+                    .checked_add(input.desc.bytes)
+                    .ok_or(MetalError::Overflow)
             })?;
         let preparation = MetalDevicePreparationReport {
             planning_wall_time: self.planning_wall_time,
@@ -1285,6 +1302,31 @@ pub struct MetalDeviceSession {
     public_output_count: usize,
     session_token: Rc<()>,
     inference_deployment_identity: Option<u64>,
+}
+
+/// Private half of a checked two-program append deployment. It deliberately
+/// exposes no independent implicit-position run API.
+pub(crate) struct MetalSharedAppendSession {
+    inner: MetalDeviceSession,
+}
+
+impl MetalSharedAppendSession {
+    pub(crate) fn preparation_report(&self) -> &MetalDevicePreparationReport {
+        self.inner.preparation_report()
+    }
+
+    pub(crate) fn compiled_kernels(&self) -> impl Iterator<Item = &RenderedMetal> {
+        self.inner.compiled_kernels()
+    }
+
+    pub(crate) fn run_without_host_outputs_at(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+        committed_position: usize,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        self.inner
+            .run_without_host_outputs_at(transient_inputs, committed_position)
+    }
 }
 
 impl MetalDeviceSession {
@@ -1386,6 +1428,57 @@ impl MetalDeviceSession {
         transient_inputs: &BTreeMap<String, TensorData>,
         host_outputs: StaticHostOutputSelection,
     ) -> Result<MetalDeviceRun, MetalError> {
+        self.run_with_host_outputs_at(
+            transient_inputs,
+            host_outputs,
+            self.committed_state_position,
+        )
+    }
+
+    pub(crate) fn run_at(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+        committed_position: usize,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        self.run_append_at(
+            transient_inputs,
+            StaticHostOutputSelection::All,
+            committed_position,
+        )
+    }
+
+    pub(crate) fn run_without_host_outputs_at(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+        committed_position: usize,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        self.run_append_at(
+            transient_inputs,
+            StaticHostOutputSelection::None,
+            committed_position,
+        )
+    }
+
+    fn run_append_at(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+        host_outputs: StaticHostOutputSelection,
+        committed_position: usize,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        if !matches!(self.state_policy, MetalSessionStatePolicy::Append { .. }) {
+            return Err(MetalError::InvalidBinding(
+                "explicit Metal position requires append-state inference".into(),
+            ));
+        }
+        self.run_with_host_outputs_at(transient_inputs, host_outputs, committed_position)
+    }
+
+    fn run_with_host_outputs_at(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+        host_outputs: StaticHostOutputSelection,
+        committed_position: usize,
+    ) -> Result<MetalDeviceRun, MetalError> {
         if host_outputs == StaticHostOutputSelection::None
             && (!matches!(self.state_policy, MetalSessionStatePolicy::Append { .. })
                 || self.lifetime.runtime_controls().len() != 1)
@@ -1405,7 +1498,7 @@ impl MetalDeviceSession {
                 ..
             } => {
                 let end = crate::runtime::static_schedule::checked_append_span_end(
-                    self.committed_state_position,
+                    committed_position,
                     span_rows,
                     axis_extent,
                 )
@@ -1429,7 +1522,7 @@ impl MetalDeviceSession {
         let (runtime_control_h2d_calls, runtime_control_h2d_bytes) = match self.state_policy {
             MetalSessionStatePolicy::Append { .. } => self
                 .lifetime
-                .stage_committed_position(self.committed_state_position, &mut values)
+                .stage_committed_position(committed_position, &mut values)
                 .map_err(MetalError::InvalidBinding)?,
             _ => (0, 0),
         };
@@ -1448,11 +1541,10 @@ impl MetalDeviceSession {
             MetalSessionStatePolicy::Epoch { .. } => self
                 .prepared
                 .execute_stateful(&mut values, self.state_epoch)?,
-            MetalSessionStatePolicy::Append { .. } => self.prepared.execute_append_state(
-                &mut values,
-                self.committed_state_position,
-                host_outputs,
-            )?,
+            MetalSessionStatePolicy::Append { .. } => {
+                self.prepared
+                    .execute_append_state(&mut values, committed_position, host_outputs)?
+            }
         };
         let synchronous_transaction_wall_time = execute_start.elapsed();
         let outputs = match host_outputs {
@@ -1598,5 +1690,48 @@ fn metal_quantized_gather_error(
             value,
             dim: rows,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_tensor_payload;
+    use crate::{Storage, TensorData};
+
+    #[test]
+    fn shared_dense_payload_authentication_uses_exact_storage_bits() {
+        let payload = TensorData::from_storage(
+            [3],
+            Storage::F32(vec![
+                f32::from_bits(0x0000_0000),
+                f32::from_bits(0x7fc0_1234),
+                f32::from_bits(0xff80_0000),
+            ]),
+        )
+        .unwrap();
+        let identical = payload.clone();
+        assert!(same_tensor_payload(&payload, &identical).unwrap());
+
+        let signed_zero = TensorData::from_storage(
+            [3],
+            Storage::F32(vec![
+                f32::from_bits(0x8000_0000),
+                f32::from_bits(0x7fc0_1234),
+                f32::from_bits(0xff80_0000),
+            ]),
+        )
+        .unwrap();
+        assert!(!same_tensor_payload(&payload, &signed_zero).unwrap());
+
+        let different_nan = TensorData::from_storage(
+            [3],
+            Storage::F32(vec![
+                f32::from_bits(0x0000_0000),
+                f32::from_bits(0x7fc0_5678),
+                f32::from_bits(0xff80_0000),
+            ]),
+        )
+        .unwrap();
+        assert!(!same_tensor_payload(&payload, &different_nan).unwrap());
     }
 }
