@@ -17,10 +17,12 @@ use crate::{
     engine::capture::QuantizedCaptureBinding,
     gguf::{GgmlType, QuantizedTensorData},
 };
-use std::{collections::BTreeMap, error, fmt};
+use std::{collections::BTreeMap, error, fmt, num::NonZeroUsize};
 
 const TOKEN_INPUT: &str = "llama.token";
 const POSITION_INPUT: &str = "llama.position";
+const PREFILL_TOKEN_INPUT: &str = "llama.tokens";
+const PREFILL_POSITIONS_INPUT: &str = "llama.positions";
 const ROPE_TABLE: &str = "llama.rope.table";
 
 /// Resource-free deployment of one dense F32, batch-one Llama token body.
@@ -32,6 +34,17 @@ const ROPE_TABLE: &str = "llama.rope.table";
 /// immutable named residents.
 pub struct LlamaMetalStepPlan {
     inner: MetalAppendStateInferencePlan,
+    max_context: usize,
+    vocab_size: usize,
+    layer_count: usize,
+    output_binding: LlamaOutputBinding,
+}
+
+/// Resource-free, state-only fixed-span Llama program used by the private
+/// multi-program Metal session coordinator.
+pub(crate) struct LlamaMetalPrefillPlan {
+    inner: MetalAppendStateInferencePlan,
+    span_rows: NonZeroUsize,
     max_context: usize,
     vocab_size: usize,
     layer_count: usize,
@@ -272,6 +285,159 @@ impl LlamaMetalStepPlan {
     }
 }
 
+impl LlamaMetalPrefillPlan {
+    /// Builds and captures one state-only fixed-span program without creating
+    /// Metal resources. The scalar append position is sealed; exact token and
+    /// position vectors remain typed inputs for the future session coordinator.
+    pub(crate) fn new(
+        model: &LlamaModel,
+        renderer: MetalRenderer,
+        span_rows: NonZeroUsize,
+    ) -> Result<Self, LlamaMetalStepError> {
+        let config = model.config();
+        let schema = config.schema();
+        let rows = span_rows.get();
+        if schema.vocab_size() > i32::MAX as usize {
+            return Err(LlamaMetalStepError::Dimension("vocabulary exceeds I32"));
+        }
+        if config.max_context() > i32::MAX as usize {
+            return Err(LlamaMetalStepError::Dimension("context exceeds I32"));
+        }
+        if rows == 1 {
+            return Err(LlamaMetalStepError::Dimension(
+                "prefill span must exceed the existing token-step row",
+            ));
+        }
+        if rows > config.max_context() || rows > i32::MAX as usize {
+            return Err(LlamaMetalStepError::Dimension(
+                "prefill span exceeds the fixed I32 context",
+            ));
+        }
+        let built = build_prefill_graph(model, span_rows)?;
+        let host_gathers = if built.packed_embedding {
+            &[PREFILL_POSITIONS_INPUT][..]
+        } else {
+            &[PREFILL_TOKEN_INPUT, PREFILL_POSITIONS_INPUT][..]
+        };
+        let captured = CapturedAppendStateInference::from_graph_residents(
+            &built.graph,
+            &[],
+            &built.state_links,
+            built.initial_state,
+            built.residents,
+            &built.quantized,
+            host_gathers,
+        )?
+        .seal_committed_position()?;
+        let inner = MetalAppendStateInferencePlan::new(captured, renderer)?;
+        if inner.summary().fallback_count != 0 {
+            return Err(LlamaMetalStepError::Metal(MetalError::Unsupported(
+                "Llama prefill plan admitted a fallback".into(),
+            )));
+        }
+        if inner.append_span_rows() != rows || inner.summary().requested_output_count != 0 {
+            return Err(LlamaMetalStepError::Metal(MetalError::InvalidBinding(
+                "Llama prefill plan does not retain its exact state-only span".into(),
+            )));
+        }
+        Ok(Self {
+            inner,
+            span_rows,
+            max_context: config.max_context(),
+            vocab_size: schema.vocab_size(),
+            layer_count: config.layer_count(),
+            output_binding: model.output_binding(),
+        })
+    }
+
+    pub(crate) const fn deployment_identity(&self) -> u64 {
+        self.inner.deployment_identity()
+    }
+
+    pub(crate) fn capture(&self) -> &CapturedSchedule {
+        self.inner.capture()
+    }
+
+    pub(crate) const fn execution_plan(&self) -> &ExecutionPlanSummary {
+        self.inner.execution_plan()
+    }
+
+    pub(crate) fn summary(&self) -> &MetalDeviceSessionSummary {
+        self.inner.summary()
+    }
+
+    pub(crate) fn resident_inputs(&self) -> &[ReplayInput] {
+        self.inner.resident_inputs()
+    }
+
+    pub(crate) fn state_inputs(&self) -> &[ReplayInput] {
+        self.inner.state_inputs()
+    }
+
+    pub(crate) fn transient_inputs(&self) -> &[ReplayInput] {
+        self.inner.transient_inputs()
+    }
+
+    pub(crate) fn token_input(&self) -> &ReplayInput {
+        self.inner
+            .transient_inputs()
+            .iter()
+            .find(|input| input.name == PREFILL_TOKEN_INPUT)
+            .expect("prefill capture authenticates its token vector")
+    }
+
+    pub(crate) fn position_vector_input(&self) -> &ReplayInput {
+        self.inner
+            .transient_inputs()
+            .iter()
+            .find(|input| input.name == PREFILL_POSITIONS_INPUT)
+            .expect("prefill capture authenticates its position vector")
+    }
+
+    pub(crate) fn runtime_control_inputs(&self) -> &[ReplayInput] {
+        self.inner.runtime_control_inputs()
+    }
+
+    pub(crate) fn scalar_position_input(&self) -> &ReplayInput {
+        let [position] = self.inner.runtime_control_inputs() else {
+            unreachable!("prefill capture seals one scalar position")
+        };
+        position
+    }
+
+    pub(crate) fn rendered_items(&self) -> impl ExactSizeIterator<Item = &RenderedMetal> {
+        self.inner.rendered_items()
+    }
+
+    pub(crate) const fn span_rows(&self) -> NonZeroUsize {
+        self.span_rows
+    }
+
+    pub(crate) const fn max_context(&self) -> usize {
+        self.max_context
+    }
+
+    pub(crate) const fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub(crate) const fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+
+    pub(crate) const fn output_binding(&self) -> LlamaOutputBinding {
+        self.output_binding
+    }
+
+    pub(crate) const fn append_state_plan(&self) -> &MetalAppendStateInferencePlan {
+        &self.inner
+    }
+
+    pub(crate) fn into_append_state_plan(self) -> MetalAppendStateInferencePlan {
+        self.inner
+    }
+}
+
 impl LlamaMetalStepSession {
     /// Returns the number of tokens atomically committed to device K/V state.
     pub fn position(&self) -> usize {
@@ -423,6 +589,195 @@ struct BuiltStepGraph {
     state_links: Vec<InferenceAppendStateLink>,
     packed_embedding: bool,
     logits: NodeId,
+}
+
+struct BuiltPrefillGraph {
+    graph: Graph,
+    residents: BTreeMap<String, (NodeId, TensorData)>,
+    quantized: Vec<QuantizedCaptureBinding>,
+    initial_state: BTreeMap<String, TensorData>,
+    state_links: Vec<InferenceAppendStateLink>,
+    packed_embedding: bool,
+}
+
+fn build_prefill_graph(
+    model: &LlamaModel,
+    span_rows: NonZeroUsize,
+) -> Result<BuiltPrefillGraph, LlamaMetalStepError> {
+    let config = model.config();
+    let schema = config.schema();
+    let rows = span_rows.get();
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype_requires_grad(PREFILL_TOKEN_INPUT, [1, rows], DType::I32, false);
+    let position = graph.input_dtype_requires_grad(POSITION_INPUT, [1], DType::I32, false);
+    let positions =
+        graph.input_dtype_requires_grad(PREFILL_POSITIONS_INPUT, [1, rows], DType::I32, false);
+    let terminal_layer_prefix = config
+        .layer_count()
+        .checked_sub(1)
+        .map(|layer| format!("blk.{layer}."));
+    let terminal_only = |name: &str| {
+        let Some(suffix) = terminal_layer_prefix
+            .as_deref()
+            .and_then(|prefix| name.strip_prefix(prefix))
+        else {
+            return false;
+        };
+        matches!(
+            suffix,
+            "attn_q.weight"
+                | "attn_q.bias"
+                | "attn_q_norm.weight"
+                | "attn_output.weight"
+                | "ffn_norm.weight"
+                | "ffn_gate.weight"
+                | "ffn_up.weight"
+                | "ffn_down.weight"
+        )
+    };
+    let mut residents = BTreeMap::new();
+    let mut nodes = BTreeMap::new();
+    let mut packed = BTreeMap::new();
+    insert_weight(
+        &mut graph,
+        &mut residents,
+        &mut nodes,
+        &mut packed,
+        TOKEN_EMBEDDING,
+        model.embedding_weight(),
+    )?;
+    for (name, value) in model.dense_state().iter().filter(|(name, _)| {
+        name.as_str() != ROPE_FREQS && name.as_str() != OUTPUT_NORM && !terminal_only(name)
+    }) {
+        insert_resident(&mut graph, &mut residents, &mut nodes, name, value)?;
+    }
+    for (name, weight) in model
+        .linear_weights()
+        .iter()
+        .filter(|(name, _)| name.as_str() != OUTPUT_WEIGHT && !terminal_only(name))
+    {
+        insert_weight(
+            &mut graph,
+            &mut residents,
+            &mut nodes,
+            &mut packed,
+            name,
+            weight,
+        )?;
+    }
+    let rope = rope_table(config.max_context(), schema.rope_dim(), config.rope_theta())?;
+    insert_resident(&mut graph, &mut residents, &mut nodes, ROPE_TABLE, &rope)?;
+
+    let mut quantized = Vec::new();
+    let mut x = lookup_prefill_embedding(
+        &mut graph,
+        nodes[TOKEN_EMBEDDING],
+        tokens,
+        rows,
+        schema.vocab_size(),
+        schema.embedding_dim(),
+    )?;
+    let packed_embedding = packed.contains_key(TOKEN_EMBEDDING);
+    if let Some(weight) = packed.get(TOKEN_EMBEDDING) {
+        quantized.push(QuantizedCaptureBinding::RowGather {
+            output: x,
+            indices: tokens,
+            weight: nodes[TOKEN_EMBEDDING],
+            value: weight.clone(),
+        });
+    }
+    let rope_rows = lookup_prefill_rope_rows(
+        &mut graph,
+        nodes[ROPE_TABLE],
+        positions,
+        rows,
+        config.max_context(),
+        schema.rope_dim(),
+    )?;
+    let absolute_positions = TensorData::from_scalars(
+        [config.max_context()],
+        DType::I32,
+        (0..config.max_context()).map(|value| Scalar::I(value as i64)),
+    )?;
+    let absolute_positions = graph.constant(absolute_positions);
+    let absolute_positions = graph.reshape(absolute_positions, [1, 1, 1, config.max_context()])?;
+    let query_positions = graph.reshape(positions, [1, 1, rows, 1])?;
+    let attention_mask = graph.le(absolute_positions, query_positions)?;
+
+    let cache_shape = Shape::new([
+        1,
+        schema.kv_heads(),
+        config.max_context(),
+        schema.head_dim(),
+    ]);
+    let mut initial_state = BTreeMap::new();
+    let state_count = config
+        .layer_count()
+        .checked_mul(2)
+        .ok_or(LlamaMetalStepError::Dimension("KV state count overflow"))?;
+    let mut state_links = Vec::with_capacity(state_count);
+    let mut append_index = None;
+    for layer in 0..config.layer_count() {
+        let key_name = format!("llama.state.{layer}.key");
+        let value_name = format!("llama.state.{layer}.value");
+        let past_key =
+            graph.input_dtype_requires_grad(&key_name, cache_shape.clone(), DType::F32, false);
+        let past_value =
+            graph.input_dtype_requires_grad(&value_name, cache_shape.clone(), DType::F32, false);
+        initial_state.insert(
+            key_name,
+            TensorData::zeros_with_dtype(cache_shape.clone(), DType::F32)?,
+        );
+        initial_state.insert(
+            value_name,
+            TensorData::zeros_with_dtype(cache_shape.clone(), DType::F32)?,
+        );
+        let built = PrefillLayerBuildContext {
+            graph: &mut graph,
+            nodes: &nodes,
+            packed: &packed,
+            quantized: &mut quantized,
+            config,
+            rope_rows,
+            append_index,
+            position,
+            attention_mask,
+            rows,
+            needs_output: layer + 1 < config.layer_count(),
+        }
+        .append(x, layer, past_key, past_value)?;
+        append_index = Some(built.append_index);
+        if let Some(output) = built.output {
+            x = output;
+        }
+        state_links.extend([
+            InferenceAppendStateLink::new(
+                past_key,
+                built.key,
+                position,
+                built.append_index,
+                built.key_update,
+                2,
+            ),
+            InferenceAppendStateLink::new(
+                past_value,
+                built.value,
+                position,
+                built.append_index,
+                built.value_update,
+                2,
+            ),
+        ]);
+    }
+
+    Ok(BuiltPrefillGraph {
+        graph,
+        residents,
+        quantized,
+        initial_state,
+        state_links,
+        packed_embedding,
+    })
 }
 
 fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStepError> {
@@ -673,6 +1028,51 @@ fn lookup_rope_row(
     graph.gather(table, index, 0)
 }
 
+fn lookup_prefill_embedding(
+    graph: &mut Graph,
+    embedding: NodeId,
+    tokens: NodeId,
+    rows: usize,
+    vocab_size: usize,
+    embedding_dim: usize,
+) -> Result<NodeId, Error> {
+    let embedding = graph.reshape(embedding, [1, vocab_size, embedding_dim])?;
+    let index = graph.reshape(tokens, [1, rows, 1])?;
+    let index = graph.expand(index, [1, rows, embedding_dim])?;
+    graph.gather(embedding, index, 1)
+}
+
+fn lookup_prefill_rope_rows(
+    graph: &mut Graph,
+    table: NodeId,
+    positions: NodeId,
+    rows: usize,
+    max_context: usize,
+    rope_dim: usize,
+) -> Result<NodeId, Error> {
+    let table = graph.reshape(table, [1, max_context, rope_dim])?;
+    let index = graph.reshape(positions, [1, rows, 1])?;
+    let index = graph.expand(index, [1, rows, rope_dim])?;
+    graph.gather(table, index, 1)
+}
+
+fn fixed_span_append_index(
+    graph: &mut Graph,
+    position: NodeId,
+    update: NodeId,
+    axis: usize,
+) -> Result<NodeId, Error> {
+    let shape = graph.shape(update)?.clone();
+    let expanded_position = graph.reshape(position, vec![1; shape.rank()])?;
+    let expanded_position = graph.expand(expanded_position, shape.clone())?;
+    let iota = graph.shape_iota(update, axis)?;
+    let mut iota_shape = vec![1; shape.rank()];
+    iota_shape[axis] = shape.dims()[axis];
+    let expanded_iota = graph.reshape(iota, iota_shape)?;
+    let expanded_iota = graph.expand(expanded_iota, shape)?;
+    graph.add(expanded_position, expanded_iota)
+}
+
 // Keep the exact materialized row and raw Scatter boundary isolated so the
 // append-state capture can authenticate one device-produced dense update.
 fn append_cache_row(
@@ -716,6 +1116,246 @@ struct StepLayerNodes {
     value: NodeId,
     key_update: NodeId,
     value_update: NodeId,
+}
+
+struct PrefillLayerNodes {
+    output: Option<NodeId>,
+    key: NodeId,
+    value: NodeId,
+    key_update: NodeId,
+    value_update: NodeId,
+    append_index: NodeId,
+}
+
+struct PrefillLayerBuildContext<'a> {
+    graph: &'a mut Graph,
+    nodes: &'a BTreeMap<String, NodeId>,
+    packed: &'a BTreeMap<String, QuantizedTensorData>,
+    quantized: &'a mut Vec<QuantizedCaptureBinding>,
+    config: &'a super::LlamaModelConfig,
+    rope_rows: NodeId,
+    append_index: Option<NodeId>,
+    position: NodeId,
+    attention_mask: NodeId,
+    rows: usize,
+    needs_output: bool,
+}
+
+impl PrefillLayerBuildContext<'_> {
+    fn append(
+        self,
+        mut x: NodeId,
+        layer: usize,
+        past_key: NodeId,
+        past_value: NodeId,
+    ) -> Result<PrefillLayerNodes, LlamaMetalStepError> {
+        let Self {
+            graph,
+            nodes,
+            packed,
+            quantized,
+            config,
+            rope_rows,
+            append_index,
+            position,
+            attention_mask,
+            rows,
+            needs_output,
+        } = self;
+        let schema = config.schema();
+        let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+        let attn_norm = rms_norm(
+            graph,
+            x,
+            nodes[&name("attn_norm.weight")],
+            schema.embedding_dim(),
+            config.norm_eps(),
+        )?;
+        let mut key = model_linear(
+            graph,
+            attn_norm,
+            &name("attn_k.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
+        let value = model_linear(
+            graph,
+            attn_norm,
+            &name("attn_v.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
+        key = permute_rope_projection(
+            graph,
+            key,
+            schema.kv_heads(),
+            schema.head_dim(),
+            schema.rope_dim(),
+            false,
+        )?;
+        key = add_bias(
+            graph,
+            key,
+            config.qkv_bias().then(|| nodes[&name("attn_k.bias")]),
+        )?;
+        let value = add_bias(
+            graph,
+            value,
+            config.qkv_bias().then(|| nodes[&name("attn_v.bias")]),
+        )?;
+        if config.qk_norm() == LlamaQkNorm::PerProjection {
+            key = rms_norm(
+                graph,
+                key,
+                nodes[&name("attn_k_norm.weight")],
+                schema.kv_heads() * schema.head_dim(),
+                config.norm_eps(),
+            )?;
+        }
+        key = graph.reshape(key, [1, rows, schema.kv_heads(), schema.head_dim()])?;
+        key = graph.permute(key, vec![0, 2, 1, 3])?;
+        let mut value = graph.reshape(value, [1, rows, schema.kv_heads(), schema.head_dim()])?;
+        value = graph.permute(value, vec![0, 2, 1, 3])?;
+        if config.qk_norm() == LlamaQkNorm::PerHead {
+            key = rms_norm(
+                graph,
+                key,
+                nodes[&name("attn_k_norm.weight")],
+                schema.head_dim(),
+                config.norm_eps(),
+            )?;
+        }
+        key = apply_prefill_rope(graph, key, rope_rows, rows, schema)?;
+        let key_update = graph.contiguous(key)?;
+        let append_index = append_index
+            .map(Ok)
+            .unwrap_or_else(|| fixed_span_append_index(graph, position, key_update, 2))?;
+        let key = graph.scatter(past_key, append_index, key_update, 2)?;
+        let value_update = graph.contiguous(value)?;
+        let value = graph.scatter(past_value, append_index, value_update, 2)?;
+
+        if !needs_output {
+            return Ok(PrefillLayerNodes {
+                output: None,
+                key,
+                value,
+                key_update,
+                value_update,
+                append_index,
+            });
+        }
+
+        let mut query = model_linear(
+            graph,
+            attn_norm,
+            &name("attn_q.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
+        query = permute_rope_projection(
+            graph,
+            query,
+            schema.query_heads(),
+            schema.head_dim(),
+            schema.rope_dim(),
+            true,
+        )?;
+        query = add_bias(
+            graph,
+            query,
+            config.qkv_bias().then(|| nodes[&name("attn_q.bias")]),
+        )?;
+        if config.qk_norm() == LlamaQkNorm::PerProjection {
+            query = rms_norm(
+                graph,
+                query,
+                nodes[&name("attn_q_norm.weight")],
+                schema.query_heads() * schema.head_dim(),
+                config.norm_eps(),
+            )?;
+        }
+        query = graph.reshape(query, [1, rows, schema.query_heads(), schema.head_dim()])?;
+        query = graph.permute(query, vec![0, 2, 1, 3])?;
+        if config.qk_norm() == LlamaQkNorm::PerHead {
+            query = rms_norm(
+                graph,
+                query,
+                nodes[&name("attn_q_norm.weight")],
+                schema.head_dim(),
+                config.norm_eps(),
+            )?;
+        }
+        query = apply_prefill_rope(graph, query, rope_rows, rows, schema)?;
+        let attended = graph.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            Some(attention_mask),
+            AttentionOptions {
+                enable_gqa: true,
+                ..AttentionOptions::default()
+            },
+        )?;
+        let attended = graph.permute(attended, vec![0, 2, 1, 3])?;
+        let attended = graph.reshape(
+            attended,
+            [1, rows, schema.query_heads() * schema.head_dim()],
+        )?;
+        let attended = model_linear(
+            graph,
+            attended,
+            &name("attn_output.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
+        x = graph.add(x, attended)?;
+        let normalized = rms_norm(
+            graph,
+            x,
+            nodes[&name("ffn_norm.weight")],
+            schema.embedding_dim(),
+            config.norm_eps(),
+        )?;
+        let gate = model_linear(
+            graph,
+            normalized,
+            &name("ffn_gate.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
+        let gate = graph.silu(gate)?;
+        let up = model_linear(
+            graph,
+            normalized,
+            &name("ffn_up.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
+        let gated = graph.mul(gate, up)?;
+        let down = model_linear(
+            graph,
+            gated,
+            &name("ffn_down.weight"),
+            nodes,
+            packed,
+            quantized,
+        )?;
+        x = graph.add(x, down)?;
+        Ok(PrefillLayerNodes {
+            output: Some(x),
+            key,
+            value,
+            key_update,
+            value_update,
+            append_index,
+        })
+    }
 }
 
 struct StepLayerBuildContext<'a> {
@@ -962,6 +1602,31 @@ fn apply_resident_rope(
     ))
 }
 
+fn apply_prefill_rope(
+    graph: &mut Graph,
+    input: NodeId,
+    rows: NodeId,
+    span_rows: usize,
+    schema: super::LlamaDecoderSchema,
+) -> Result<NodeId, LlamaMetalStepError> {
+    let half = schema.rope_dim() / 2;
+    let cos = graph.shrink(rows, vec![(0, 1), (0, span_rows), (0, half)])?;
+    let sin = graph.shrink(
+        rows,
+        vec![(0, 1), (0, span_rows), (half, schema.rope_dim())],
+    )?;
+    let cos = graph.reshape(cos, [1, 1, span_rows, half])?;
+    let sin = graph.reshape(sin, [1, 1, span_rows, half])?;
+    Ok(rotate(
+        graph,
+        input,
+        cos,
+        sin,
+        schema.rope_dim(),
+        schema.head_dim(),
+    )?)
+}
+
 fn rotate(
     graph: &mut Graph,
     input: NodeId,
@@ -1010,7 +1675,7 @@ mod tests {
     use super::*;
     use crate::runtime::metal::MetalCapabilities;
     use crate::{Backend, CpuBackend, Op};
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     fn renderer() -> MetalRenderer {
         MetalRenderer::new(
@@ -1257,5 +1922,197 @@ mod tests {
         );
         assert_eq!(authenticated.transient_inputs().len(), 1);
         assert_eq!(authenticated.transient_inputs()[0].name, TOKEN_INPUT);
+    }
+
+    #[test]
+    fn fixed_prefill_capture_is_state_only_with_exact_typed_schemas() {
+        let (model, _, _) = super::super::model_tests::make_variant_model(6);
+        let plan =
+            LlamaMetalPrefillPlan::new(&model, renderer(), NonZeroUsize::new(3).unwrap()).unwrap();
+        assert_eq!(plan.span_rows().get(), 3);
+        assert_eq!(plan.max_context(), 6);
+        assert_eq!(plan.vocab_size(), model.config().schema().vocab_size());
+        assert_eq!(plan.layer_count(), model.config().layer_count());
+        assert_eq!(plan.output_binding(), model.output_binding());
+        assert_eq!(plan.append_state_plan().append_span_rows(), 3);
+        assert!(plan.capture().requested.is_empty());
+        assert_eq!(plan.summary().requested_output_count, 0);
+        assert_eq!(plan.summary().fallback_count, 0);
+        assert_eq!(
+            plan.summary().append_state_work_items,
+            model.config().layer_count()
+                * 2
+                * 3
+                * model.config().schema().kv_heads()
+                * model.config().schema().head_dim()
+        );
+        assert_eq!(
+            plan.transient_inputs()
+                .iter()
+                .map(|input| (
+                    input.name.as_str(),
+                    input.desc.dtype,
+                    input.desc.shape.dims().to_vec(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (PREFILL_TOKEN_INPUT, DType::I32, vec![1, 3]),
+                (PREFILL_POSITIONS_INPUT, DType::I32, vec![1, 3]),
+            ]
+        );
+        assert_eq!(plan.token_input().desc.shape.dims(), [1, 3]);
+        assert_eq!(plan.position_vector_input().desc.shape.dims(), [1, 3]);
+        assert_eq!(plan.runtime_control_inputs().len(), 1);
+        assert_eq!(plan.scalar_position_input().name, POSITION_INPUT);
+        assert_eq!(plan.scalar_position_input().desc.shape.dims(), [1]);
+        assert_eq!(plan.state_inputs().len(), model.config().layer_count() * 2);
+        assert!(
+            plan.resident_inputs()
+                .iter()
+                .all(|input| input.name != OUTPUT_NORM && input.name != OUTPUT_WEIGHT)
+        );
+        assert!(
+            plan.capture()
+                .items
+                .iter()
+                .all(|item| item.boundary.is_none())
+        );
+        assert!(
+            plan.rendered_items()
+                .all(|item| item.extent == 0 || !item.source.is_empty())
+        );
+        assert_eq!(
+            plan.rendered_items()
+                .filter(|item| item.source.contains("rg_metal_host_gather_fixed_f32_i32"))
+                .count(),
+            2
+        );
+        assert_ne!(plan.deployment_identity(), 0);
+        assert!(!plan.execution_plan().items.is_empty());
+        let inner = plan.into_append_state_plan();
+        assert_eq!(inner.append_span_rows(), 3);
+    }
+
+    #[test]
+    fn fixed_prefill_graph_authenticates_one_shared_position_plus_iota_index() {
+        let (model, _, _) = super::super::model_tests::make_variant_model(6);
+        let built = build_prefill_graph(&model, NonZeroUsize::new(3).unwrap()).unwrap();
+        assert_eq!(built.state_links.len(), model.config().layer_count() * 2);
+        let first = built.state_links[0];
+        assert!(
+            built
+                .state_links
+                .iter()
+                .all(|link| link.index() == first.index() && link.position() == first.position())
+        );
+        let Op::Binary {
+            op: crate::BinaryOp::Add,
+            lhs,
+            rhs,
+        } = built.graph.op(first.index()).unwrap()
+        else {
+            panic!("fixed prefill append index must add position and ShapeIota")
+        };
+        let Op::Expand {
+            input: position_reshape,
+            shape,
+        } = built.graph.op(*lhs).unwrap()
+        else {
+            panic!("fixed prefill position must be expanded")
+        };
+        assert_eq!(
+            shape.dims(),
+            [
+                1,
+                model.config().schema().kv_heads(),
+                3,
+                model.config().schema().head_dim(),
+            ]
+        );
+        assert!(matches!(
+            built.graph.op(*position_reshape).unwrap(),
+            Op::Reshape { input, .. } if *input == first.position()
+        ));
+        let Op::Expand {
+            input: iota_reshape,
+            shape,
+        } = built.graph.op(*rhs).unwrap()
+        else {
+            panic!("fixed prefill ShapeIota must be expanded over update lanes")
+        };
+        assert_eq!(shape, built.graph.shape(first.updates()).unwrap());
+        let Op::Reshape { input: iota, shape } = built.graph.op(*iota_reshape).unwrap() else {
+            panic!("fixed prefill ShapeIota must be axis-aligned")
+        };
+        assert_eq!(shape.dims(), [1, 1, 3, 1]);
+        assert!(matches!(
+            built.graph.op(*iota).unwrap(),
+            Op::ShapeIota { source, axis: 2 } if *source == first.updates()
+        ));
+        assert!((0..built.graph.node_count()).any(|index| {
+            let node = NodeId::from_index(index);
+            matches!(built.graph.op(node), Ok(Op::Compare { .. }))
+                && built
+                    .graph
+                    .shape(node)
+                    .is_ok_and(|shape| shape.dims() == [1, 1, 3, 6])
+        }));
+    }
+
+    #[test]
+    fn fixed_prefill_captures_every_supported_packed_format_without_logits() {
+        let (packed, _, _, _) = super::super::packed_metal_fixture_models();
+        let plan =
+            LlamaMetalPrefillPlan::new(&packed, renderer(), NonZeroUsize::new(3).unwrap()).unwrap();
+        let formats = plan
+            .capture()
+            .quantized_constants
+            .values()
+            .map(|value| value.descriptor().ggml_type)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            formats,
+            BTreeSet::from([GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q6K])
+        );
+        assert!(plan.capture().requested.is_empty());
+        assert_eq!(plan.summary().requested_output_count, 0);
+        assert_eq!(plan.summary().fallback_count, 0);
+        assert_eq!(plan.transient_inputs().len(), 2);
+        assert_eq!(plan.runtime_control_inputs().len(), 1);
+        assert!(plan.summary().quantized_constant_count > 0);
+    }
+
+    #[test]
+    fn fixed_prefill_rejects_t1_and_capacity_overflow_without_changing_t1_plan() {
+        let (model, _, _) = super::super::model_tests::make_variant_model(4);
+        assert!(matches!(
+            LlamaMetalPrefillPlan::new(&model, renderer(), NonZeroUsize::new(1).unwrap()),
+            Err(LlamaMetalStepError::Dimension(
+                "prefill span must exceed the existing token-step row"
+            ))
+        ));
+        assert!(matches!(
+            LlamaMetalPrefillPlan::new(&model, renderer(), NonZeroUsize::new(5).unwrap()),
+            Err(LlamaMetalStepError::Dimension(
+                "prefill span exceeds the fixed I32 context"
+            ))
+        ));
+        let first = LlamaMetalStepPlan::new(&model, renderer()).unwrap();
+        let second = LlamaMetalStepPlan::new(&model, renderer()).unwrap();
+        assert_eq!(first.deployment_identity(), second.deployment_identity());
+        assert_eq!(first.capture().identity, second.capture().identity);
+        assert_eq!(first.summary(), second.summary());
+        assert_eq!(
+            first.summary().rendered_cache_keys,
+            second.summary().rendered_cache_keys
+        );
+        assert_eq!(first.summary().requested_output_count, 1);
+        assert_eq!(first.transient_inputs()[0].desc.shape.dims(), [1, 1]);
+        assert_eq!(first.runtime_control_inputs()[0].desc.shape.dims(), [1]);
+        assert!(
+            first
+                .rendered_items()
+                .all(|item| !item.source.contains("rg_metal_host_gather_fixed_f32_i32"))
+        );
     }
 }
