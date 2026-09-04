@@ -94,6 +94,8 @@ pub struct MetalDeviceSessionSummary {
     /// Physical slot bytes remain in `planned_device_bytes`.
     pub state_device_bytes: usize,
     /// Sparse F32 payload bytes written by one successful append invocation.
+    /// This is one row for the historical T=1 contract and the complete span
+    /// for fixed-span execution.
     pub append_state_row_bytes: usize,
     /// Sparse state elements written by one successful append invocation.
     pub append_state_work_items: usize,
@@ -247,6 +249,8 @@ enum MetalSessionStatePolicy {
     },
     Append {
         pair_count: usize,
+        span_rows: usize,
+        axis_extent: usize,
         row_bytes: usize,
         work_items: usize,
     },
@@ -303,11 +307,11 @@ impl MetalAppendStateInferencePlan {
                 output: state.output.id,
                 position: state.position.desc.id,
                 index: state.index.id,
+                iota: state.iota,
                 updates: state.updates.id,
                 axis: state.link.axis(),
                 axis_extent: state.axis_extent,
-                row_elements: state.row_elements,
-                row_bytes: state.row_bytes,
+                span: state.span,
             })
             .collect::<Vec<_>>();
         let inner = MetalDeviceSessionPlan::from_capture_policy(
@@ -346,6 +350,11 @@ impl MetalAppendStateInferencePlan {
 
     pub fn summary(&self) -> &MetalDeviceSessionSummary {
         self.inner.summary()
+    }
+
+    /// Returns the authenticated number of state-axis rows committed by one run.
+    pub fn append_span_rows(&self) -> usize {
+        self.inner.append_span_rows()
     }
 
     pub fn state_inputs(&self) -> &[ReplayInput] {
@@ -736,13 +745,13 @@ impl MetalDeviceSessionPlan {
         let append_state_row_bytes =
             append_state_links.iter().try_fold(0usize, |total, link| {
                 total
-                    .checked_add(link.row_bytes)
+                    .checked_add(link.span.total_bytes)
                     .ok_or(MetalError::Overflow)
             })?;
         let append_state_work_items =
             append_state_links.iter().try_fold(0usize, |total, link| {
                 total
-                    .checked_add(link.row_elements)
+                    .checked_add(link.span.total_elements)
                     .ok_or(MetalError::Overflow)
             })?;
         let state_bank_count = if !append_state_links.is_empty() {
@@ -756,8 +765,11 @@ impl MetalDeviceSessionPlan {
             .checked_mul(state_bank_count)
             .ok_or(MetalError::Overflow)?;
         let state_policy = if !append_state_links.is_empty() {
+            let first = append_state_links[0];
             MetalSessionStatePolicy::Append {
                 pair_count: append_state_links.len(),
+                span_rows: first.span.rows,
+                axis_extent: first.axis_extent,
                 row_bytes: append_state_row_bytes,
                 work_items: append_state_work_items,
             }
@@ -841,6 +853,13 @@ impl MetalDeviceSessionPlan {
     /// Returns deterministic planned resource and execution metadata.
     pub fn summary(&self) -> &MetalDeviceSessionSummary {
         &self.summary
+    }
+
+    fn append_span_rows(&self) -> usize {
+        match self.state_policy {
+            MetalSessionStatePolicy::Append { span_rows, .. } => span_rows,
+            _ => 0,
+        }
     }
 
     /// Returns every inspectable rendered schedule item, including zero-work
@@ -1113,11 +1132,26 @@ impl MetalDeviceSession {
             .checked_add(1)
             .ok_or(MetalError::Overflow)?;
         let next_committed_position = match self.state_policy {
-            MetalSessionStatePolicy::Append { .. } => Some(
-                self.committed_state_position
-                    .checked_add(1)
-                    .ok_or(MetalError::Overflow)?,
-            ),
+            MetalSessionStatePolicy::Append {
+                span_rows,
+                axis_extent,
+                ..
+            } => {
+                let end = crate::runtime::static_schedule::checked_append_span_end(
+                    self.committed_state_position,
+                    span_rows,
+                    axis_extent,
+                )
+                .map_err(|error| match error {
+                    crate::runtime::static_schedule::AppendSpanEndError::Overflow => {
+                        MetalError::Overflow
+                    }
+                    crate::runtime::static_schedule::AppendSpanEndError::InvalidBinding(reason) => {
+                        MetalError::InvalidBinding(reason)
+                    }
+                })?;
+                Some(end)
+            }
             _ => None,
         };
         let run_start = Instant::now();
@@ -1194,6 +1228,7 @@ impl MetalDeviceSession {
                     pair_count,
                     row_bytes,
                     work_items,
+                    ..
                 } => CommittedState {
                     pair_count,
                     bytes: row_bytes,

@@ -248,8 +248,10 @@ impl LlamaMetalPlan {
         self,
         context: MetalScoreboardContext,
     ) -> Result<LlamaMetalSession, LlamaMetalGenerationError> {
-        let recorder =
-            MetalSessionScoreboard::new_append_state(context, self.step.append_state_plan());
+        let recorder = MetalSessionScoreboard::try_new_append_state_v4(
+            context,
+            self.step.append_state_plan(),
+        )?;
         let mut step = self.step.prepare(self.selected_device)?;
         step.bind_execution_scoreboard(recorder)?;
         Ok(LlamaMetalSession {
