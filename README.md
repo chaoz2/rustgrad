@@ -148,8 +148,16 @@ and one logits download whenever another token must be selected. Per-token K/V
 commits are atomic, but a later failure does not roll back an already committed
 prefix. `prepare_with_scoreboard` optionally binds the existing v4 recorder to
 authenticated token-step execution before the first run. Current protected
-evidence is semantic-mock only; chunk prefill and live-device performance
-evidence remain explicit follow-ups.
+evidence is semantic-mock only; the maintained
+`metal_llama_generate` example is the manual live-lane entry point:
+
+```text
+cargo run --release --example metal_llama_generate -- model.gguf "Hello"
+```
+
+The protected harness pins model bytes and expected greedy IDs. It remains
+dormant until its external runner, environment, and model are provisioned;
+chunk prefill and live-device performance evidence remain explicit follow-ups.
 
 ## How the system fits together
 

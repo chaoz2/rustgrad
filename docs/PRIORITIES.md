@@ -77,18 +77,25 @@ it freezes the model, binds capability admission and preparation to one explicit
 device, exposes its capture/plan/schemas/MSL, and returns a persistent typed
 session whose only transient is the exact F32 NCHW image.
 
-An exact ignored Linear acceptance and a deterministic typed ResNet-18
-benchmark plus a manual-only exact-SHA workflow are checked in for
+An exact ignored Linear acceptance, deterministic typed ResNet-18 benchmark,
+and public GGUF Llama prompt-to-tokens harness plus a manual-only exact-SHA
+workflow are checked in for
 `[self-hosted, macOS, ARM64, rustgrad-metal]` behind the `live-metal`
 environment. The benchmark executes the complete initialized body with one
 deterministic image, computes one complete CPU oracle, compares finite logits
 under a documented F32 native-compilation tolerance, and records ten persistent
 session runs by default without duplicating the full execution elsewhere in the
-workflow. The release-profile lane is dormant until the matching
-runner and protected environment, including reviewers and deployment-ref
-restrictions, are provisioned; the repository workflow only references those
-external controls. Ordinary macOS CI remains mock-only and no live-device
-result is claimed by the workflow definition itself.
+workflow. A separate job authenticates the selected Metal registry ID and
+runner-local GGUF bytes against protected values, uses an independently pinned
+prompt and greedy token IDs, checks the persistent token-step
+ownership/transfer contract, and emits its own
+v4 scoreboard without downloading a model. Those IDs are bounded conformance
+evidence, not a broad cross-runtime numerical oracle. The release-profile lane
+is dormant until the matching runner, protected environment, and authenticated
+model are provisioned; the repository workflow only references those external
+controls. Ordinary macOS CI remains mock-only and no live-device result is
+claimed by the workflow definition itself. Its host-wall/API-copy observations
+are not GPU time, tokens per second, or physical transfer measurements.
 
 ### 2. P0 — ResNet-18 Metal conformance
 
