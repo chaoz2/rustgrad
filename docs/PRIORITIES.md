@@ -65,9 +65,12 @@ one exact stateless or append-only session's successful prefix with ordered
 per-run host-wall/copy/launch and append-position/row-commit records, checked
 aggregates, successful cache-miss pipeline-build time, logical schedule/peak-live
 facts, and distinct physical Metal slot/state-bank facts. Failed attempts cannot
-enter that prefix or advance recorder-owned counters. It remains measurement
-plumbing, not generation wiring, live workload evidence, allocator peak memory,
-bus traffic, or GPU timing.
+enter that prefix or advance recorder-owned counters. The Llama facade can bind
+this recorder before preparation and observe retained or suppressed token-step
+runs fail-soft, but the records deliberately do not classify tokenization,
+prompt, decode, chat, or sampling work. It remains host-observed execution
+measurement plumbing, not live workload evidence, allocator peak memory, bus
+traffic, GPU timing, or tokens-per-second evidence.
 
 `ResNetMetalPlan::eval_f32` is the concise public entry point for this vertical:
 it freezes the model, binds capability admission and preparation to one explicit
@@ -117,8 +120,8 @@ The typed model facade now consumes the same GGUF-bound model, tokenizer, and
 chat template, prepares one persistent Metal session, suppresses intermediate
 prefill logits, and provides sequential T=1 ID/text/chat generation with host
 sampling. Remaining work adds chunk prefill, proves live-device output
-agreement, and adds a model-level adapter for the existing stateful
-resident-memory/transfer scoreboard evidence.
+agreement, and adds orchestration-aware prompt/decode performance evidence over
+the existing authenticated token-step scoreboard records.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
 serving path.
 

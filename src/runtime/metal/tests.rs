@@ -1518,6 +1518,8 @@ fn llama_metal_prompt_facade_prefills_with_one_read_and_matches_cpu() {
     let stable_identity = plan.step_deployment_identity();
     let stable_capture = plan.capture().identity;
     let mut session = plan.prepare().unwrap();
+    assert!(session.execution_scoreboard().is_none());
+    assert!(session.scoreboard_recording_error().is_none());
     let stable_kernels = session.compiled_kernels().count();
     let calls_after_prepare = mock.calls();
 
@@ -1817,6 +1819,227 @@ fn llama_metal_prompt_facade_preserves_packed_and_tied_ownership() {
             || call.starts_with("pipeline_create:")
             || call.starts_with("queue_create:")
     }));
+}
+
+#[test]
+fn llama_metal_scoreboard_records_exact_token_execution_prefix_fail_soft() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        16,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let make_plan = |device: &MetalDevice| {
+        let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
+        crate::models::transformer::LlamaMetalPlan::from_workflow(
+            workflow,
+            device,
+            MetalPlanOptions::new(8),
+        )
+        .unwrap()
+    };
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let ordinary = make_plan(&device);
+    let ordinary_identity = ordinary.step_deployment_identity();
+    let ordinary_cache_keys = ordinary
+        .rendered_items()
+        .map(|rendered| rendered.cache_key.clone())
+        .collect::<Vec<_>>();
+    let scored = make_plan(&device);
+    assert_eq!(scored.step_deployment_identity(), ordinary_identity);
+    assert_eq!(
+        scored
+            .rendered_items()
+            .map(|rendered| rendered.cache_key.clone())
+            .collect::<Vec<_>>(),
+        ordinary_cache_keys
+    );
+    let mut session = scored
+        .prepare_with_scoreboard(
+            MetalScoreboardContext::new("llama-token-execution", "test-revision", "semantic mock")
+                .unwrap(),
+        )
+        .unwrap();
+    let empty = session.execution_scoreboard().unwrap().report().unwrap();
+    assert_eq!(empty.format_version, 4);
+    assert_eq!(empty.successful_run_count, 0);
+    assert_eq!(empty.committed_state_position, Some(0));
+    assert!(session.scoreboard_recording_error().is_none());
+
+    let calls_after_prepare = mock.calls();
+    let no_work = session
+        .generate_ids(&[3, 4], 0, LlamaSampling::Greedy)
+        .unwrap();
+    assert!(no_work.reports().is_empty());
+    assert_eq!(session.position(), 0);
+    assert_eq!(mock.calls(), calls_after_prepare);
+    assert_eq!(
+        session.execution_scoreboard().unwrap().report().unwrap(),
+        empty
+    );
+
+    let vocab = session.vocab_size();
+    let mut uniforms = vec![0.0; 2 * vocab];
+    uniforms[4] = 1.0 - f32::EPSILON;
+    uniforms[vocab + 5] = 1.0 - f32::EPSILON;
+    let generation = session
+        .generate_ids(
+            &[3, 4, 5],
+            2,
+            LlamaSampling::GumbelMax {
+                temperature: f32::MAX,
+                uniforms: &uniforms,
+            },
+        )
+        .unwrap();
+    assert_eq!(generation.generated_ids(), [4, 5]);
+    assert_eq!(generation.reports().len(), 4);
+    assert_eq!(session.position(), 4);
+    assert_eq!(
+        session.position(),
+        generation.prompt_ids().len() + generation.generated_ids().len() - 1
+    );
+    let report = session.execution_scoreboard().unwrap().report().unwrap();
+    assert_eq!(report.successful_run_count, 4);
+    assert_eq!(report.committed_state_position, Some(4));
+    assert_eq!(
+        report
+            .successful_runs
+            .iter()
+            .map(|run| run.retained_host_api_d2h_calls)
+            .collect::<Vec<_>>(),
+        [0, 0, 1, 1]
+    );
+    for (recorded, executed) in report.successful_runs.iter().zip(generation.reports()) {
+        assert_eq!(
+            recorded.successful_invocation,
+            executed.successful_invocation
+        );
+        assert_eq!(recorded.kernel_launch_count, executed.kernel_launch_count);
+        assert_eq!(
+            recorded.committed_state_position,
+            executed.committed_state_position
+        );
+    }
+    assert!(session.scoreboard_recording_error().is_none());
+
+    let stop_mock = Arc::new(MockDispatch::default());
+    let stop_device = test_device(stop_mock);
+    let mut stop = make_plan(&stop_device)
+        .prepare_with_scoreboard(
+            MetalScoreboardContext::new("llama-stop", "test-revision", "semantic mock").unwrap(),
+        )
+        .unwrap();
+    let mut stop_uniforms = vec![0.0; 4 * stop.vocab_size()];
+    stop_uniforms[1] = 1.0 - f32::EPSILON;
+    let stopped = stop
+        .generate_ids(
+            &[3],
+            4,
+            LlamaSampling::GumbelMax {
+                temperature: f32::MAX,
+                uniforms: &stop_uniforms,
+            },
+        )
+        .unwrap();
+    assert_eq!(stopped.generated_ids(), [1]);
+    assert!(stopped.stopped());
+    assert_eq!(stopped.reports().len(), 1);
+    assert_eq!(stop.position(), 1);
+    assert_eq!(
+        stop.execution_scoreboard()
+            .unwrap()
+            .report()
+            .unwrap()
+            .successful_run_count,
+        1
+    );
+
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let mut retry = make_plan(&device)
+        .prepare_with_scoreboard(
+            MetalScoreboardContext::new("llama-retry", "test-revision", "semantic mock").unwrap(),
+        )
+        .unwrap();
+    mock.state.lock().unwrap().failures.launch = Some("token launch");
+    assert!(retry.run_token(3).is_err());
+    assert_eq!(retry.position(), 0);
+    assert_eq!(
+        retry
+            .execution_scoreboard()
+            .unwrap()
+            .report()
+            .unwrap()
+            .successful_run_count,
+        0
+    );
+    mock.clear_failures();
+    assert_eq!(retry.run_token(3).unwrap().position(), 0);
+    assert_eq!(retry.position(), 1);
+    assert_eq!(retry.scoreboard_record_attempts(), Some(1));
+    assert_eq!(
+        retry
+            .execution_scoreboard()
+            .unwrap()
+            .report()
+            .unwrap()
+            .successful_run_count,
+        1
+    );
+    retry.inject_scoreboard_recording_error(MetalScoreboardError::Overflow);
+    assert_eq!(retry.run_token(4).unwrap().position(), 1);
+    assert_eq!(retry.run_token(5).unwrap().position(), 2);
+    assert_eq!(retry.position(), 3);
+    assert_eq!(retry.scoreboard_record_attempts(), Some(1));
+    assert_eq!(
+        retry.scoreboard_recording_error(),
+        Some(&MetalScoreboardError::Overflow)
+    );
+    assert_eq!(
+        retry
+            .execution_scoreboard()
+            .unwrap()
+            .report()
+            .unwrap()
+            .successful_run_count,
+        1
+    );
+}
+
+#[test]
+fn llama_metal_scoreboard_preserves_packed_execution_evidence() {
+    let bytes = packed_metal_workflow_bytes();
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock);
+    let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
+    let mut session = crate::models::transformer::LlamaMetalPlan::from_workflow(
+        workflow,
+        &device,
+        MetalPlanOptions::new(8),
+    )
+    .unwrap()
+    .prepare_with_scoreboard(
+        MetalScoreboardContext::new("packed-llama", "test-revision", "semantic mock").unwrap(),
+    )
+    .unwrap();
+    let step = session.run_token(3).unwrap();
+    let report = session.execution_scoreboard().unwrap().report().unwrap();
+    assert_eq!(report.successful_run_count, 1);
+    assert_eq!(report.committed_state_position, Some(1));
+    assert_eq!(
+        report.captured_quantized_constant_count,
+        session.summary().quantized_constant_count
+    );
+    assert_eq!(
+        report.captured_quantized_constant_bytes,
+        session.summary().quantized_constant_bytes
+    );
+    assert_eq!(
+        report.successful_runs[0].successful_invocation,
+        step.report().successful_invocation
+    );
+    assert_eq!(report.successful_runs[0].retained_host_api_d2h_calls, 1);
+    assert!(session.scoreboard_recording_error().is_none());
 }
 
 #[test]
