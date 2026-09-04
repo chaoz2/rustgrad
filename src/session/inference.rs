@@ -26,7 +26,7 @@ pub struct CapturedInference {
 }
 
 /// Capture-authenticated permission for one internal Gather to omit its
-/// device status path after its scalar host index has been checked.  This is
+/// device status path after its scalar-or-fixed host indices have been checked. This is
 /// runtime policy, not part of the captured schedule or graph operation ABI.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct CapturedHostGather {
@@ -273,7 +273,7 @@ impl CapturedInference {
     }
 
     /// Adds a private, capture-derived status-free Gather policy. Every name
-    /// must denote one dense scalar I32 transient whose only admitted Gather
+    /// must denote one dense I32 transient whose only admitted Gather
     /// lineage is a value-preserving Reshape/Expand chain. The Gather itself
     /// must be an internal single-output raw movement owner.
     pub(crate) fn with_authenticated_host_gathers(
@@ -321,19 +321,27 @@ impl CapturedInference {
                     "host Gather input {name} cannot be a public output"
                 )));
             }
+            let input_elements = captured
+                .desc
+                .shape
+                .numel()
+                .map_err(CapturedInferenceError::State)?;
             if captured.desc.id != source.index() as u64
                 || captured.desc.dtype != DType::I32
-                || captured
-                    .desc
-                    .shape
-                    .numel()
-                    .map_err(CapturedInferenceError::State)?
-                    != 1
-                || captured.desc.bytes != DType::I32.itemsize()
+                || input_elements == 0
+                || captured.desc.bytes
+                    != input_elements
+                        .checked_mul(DType::I32.itemsize())
+                        .ok_or_else(|| {
+                            CapturedInferenceError::Binding(
+                                "host Gather input byte extent overflow".into(),
+                            )
+                        })?
                 || !captured.desc.read_only
+                || (input_elements > 1 && captured.desc.shape.dims() != [1, input_elements])
             {
                 return Err(CapturedInferenceError::Binding(format!(
-                    "host Gather input {name} must be one dense scalar I32 transient"
+                    "host Gather input {name} must be one dense scalar or batch-one fixed I32 transient"
                 )));
             }
             for item in &self.capture.items {
@@ -399,7 +407,19 @@ impl CapturedInference {
         }
         host_gathers.sort_by_key(|link| link.output);
         let mut hasher = DefaultHasher::new();
-        "rustgrad-captured-host-gather-v1".hash(&mut hasher);
+        let has_fixed_policy = host_gathers.iter().any(|link| {
+            link.input
+                .desc
+                .shape
+                .numel()
+                .ok()
+                .is_none_or(|elements| elements != 1)
+        });
+        if !has_fixed_policy {
+            "rustgrad-captured-host-gather-v1".hash(&mut hasher);
+        } else {
+            "rustgrad-captured-host-gather-fixed-v1".hash(&mut hasher);
+        }
         self.identity.hash(&mut hasher);
         host_gathers.hash(&mut hasher);
         self.identity = hasher.finish();

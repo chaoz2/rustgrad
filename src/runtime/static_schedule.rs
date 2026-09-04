@@ -6,8 +6,8 @@
 
 use crate::{
     BufferDesc, CapturedSchedule, DType, Operation, QuantizedBufferDesc, QuantizedTensorData,
-    ReplayError, ReplayInput, RequestedPassthrough, ScheduleInputBinding, ScheduleItem, Shape,
-    SymbolicInvocation, TensorData,
+    ReplayError, ReplayInput, RequestedPassthrough, Scalar, ScheduleInputBinding, ScheduleItem,
+    Shape, SymbolicInvocation, TensorData,
     engine::{AuthenticatedSymbolicBody, AuthenticatedSymbolicInvocation},
     memory_plan::{ExactSlotPolicy, ExactSlotRequest, assign_exact_slots},
 };
@@ -414,6 +414,34 @@ pub(crate) enum StaticQuantizedGatherError {
     },
 }
 
+enum CheckedI32IndexError {
+    Descriptor,
+    IndexOutOfBounds { position: usize, value: i32 },
+}
+
+fn validate_i32_index_domain(
+    value: &TensorData,
+    shape: &Shape,
+    extent: usize,
+) -> Result<(), CheckedI32IndexError> {
+    if value.dtype() != DType::I32 || value.shape() != shape {
+        return Err(CheckedI32IndexError::Descriptor);
+    }
+    for position in 0..value.len() {
+        let Scalar::I(raw) = value.scalar_at(position) else {
+            return Err(CheckedI32IndexError::Descriptor);
+        };
+        let selected = i32::try_from(raw).map_err(|_| CheckedI32IndexError::Descriptor)?;
+        if !usize::try_from(selected).is_ok_and(|selected| selected < extent) {
+            return Err(CheckedI32IndexError::IndexOutOfBounds {
+                position,
+                value: selected,
+            });
+        }
+    }
+    Ok(())
+}
+
 impl StaticLifetimePlan {
     pub(crate) fn new(
         capture: CapturedStaticExecution,
@@ -572,26 +600,23 @@ impl StaticLifetimePlan {
                     "quantized row-gather indices {id} are absent"
                 )));
             };
-            plan.preflight_indices(indices)
-                .map_err(|error| match error {
-                    crate::QuantizedRowGatherError::NegativeIndex { position, index } => {
+            plan.validate()
+                .map_err(|error| StaticQuantizedGatherError::Invalid(error.to_string()))?;
+            let rows = plan.weight_desc.logical_shape.dims()[0];
+            validate_i32_index_domain(indices, &plan.indices_shape, rows).map_err(|error| {
+                match error {
+                    CheckedI32IndexError::Descriptor => StaticQuantizedGatherError::Invalid(
+                        "quantized row-gather index descriptor mismatch".into(),
+                    ),
+                    CheckedI32IndexError::IndexOutOfBounds { position, value } => {
                         StaticQuantizedGatherError::IndexOutOfBounds {
                             position,
-                            value: i32::try_from(index).unwrap_or(i32::MIN),
-                            rows: plan.weight_desc.logical_shape.dims()[0],
+                            value,
+                            rows,
                         }
                     }
-                    crate::QuantizedRowGatherError::IndexOutOfBounds {
-                        position,
-                        index,
-                        rows,
-                    } => StaticQuantizedGatherError::IndexOutOfBounds {
-                        position,
-                        value: i32::try_from(index).unwrap_or(i32::MAX),
-                        rows,
-                    },
-                    error => StaticQuantizedGatherError::Invalid(error.to_string()),
-                })?;
+                }
+            })?;
         }
         Ok(())
     }
@@ -1276,7 +1301,7 @@ pub(crate) struct StaticSchedulePlan<R> {
 }
 
 /// Runtime-only proof that one internal Gather consumes an affine expansion
-/// of a host-validated scalar I32 transient.
+/// of a host-validated scalar-or-fixed batch-one I32 transient.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct StaticHostGather {
     pub(crate) input: u64,
@@ -1288,7 +1313,16 @@ pub(crate) struct StaticHostGather {
     pub(crate) index_elements: usize,
 }
 
-fn authenticate_scalar_expansion_producer(
+impl StaticHostGather {
+    pub(crate) fn input_elements(&self) -> Result<usize, String> {
+        self.input_desc
+            .shape
+            .numel()
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn authenticate_host_index_producer(
     index_item: &ScheduleItem,
     input: u64,
     expected_input_desc: Option<&BufferDesc>,
@@ -1301,28 +1335,28 @@ fn authenticate_scalar_expansion_producer(
         .validate()
         .map_err(|error| error.to_string())?;
     let [store, end_range] = index_item.kernel.sources() else {
-        return Err("scalar expansion producer must be one store".into());
+        return Err("host index producer must be one store".into());
     };
     let crate::Operation::Sink = index_item.kernel.operation() else {
-        return Err("scalar expansion producer must be a sink".into());
+        return Err("host index producer must be a sink".into());
     };
     let crate::Operation::Store = store.operation() else {
-        return Err("scalar expansion producer must contain one store".into());
+        return Err("host index producer must contain one store".into());
     };
     let [output_index, value] = store.sources() else {
-        return Err("scalar expansion store is malformed".into());
+        return Err("host index store is malformed".into());
     };
     let crate::Operation::Load = value.operation() else {
-        return Err("scalar expansion producer is not value-preserving".into());
+        return Err("host index producer is not value-preserving".into());
     };
     let [input_index] = value.sources() else {
-        return Err("scalar expansion load is malformed".into());
+        return Err("host index load is malformed".into());
     };
     let crate::Operation::EndRange = end_range.operation() else {
-        return Err("scalar expansion producer has no terminal range".into());
+        return Err("host index producer has no terminal range".into());
     };
     let [terminal_range] = end_range.sources() else {
-        return Err("scalar expansion terminal range is malformed".into());
+        return Err("host index terminal range is malformed".into());
     };
     let crate::Operation::Index(crate::IndexValue::Buffer {
         buffer: output_buffer,
@@ -1332,49 +1366,49 @@ fn authenticate_scalar_expansion_producer(
         addressing: crate::IndexAddressing::Broadcast,
     }) = output_index.operation()
     else {
-        return Err("scalar expansion output addressing is invalid".into());
+        return Err("host index output addressing is invalid".into());
     };
     let crate::Operation::Index(crate::IndexValue::View {
         buffer: input_buffer,
-        elements: input_elements,
+        elements: view_elements,
         input_shape,
         output_shape,
         view,
     }) = input_index.operation()
     else {
-        return Err("scalar expansion source is not an affine view".into());
+        return Err("host index source is not an affine view".into());
     };
     let [output_address, output_range] = output_index.sources() else {
-        return Err("scalar expansion output addressing is malformed".into());
+        return Err("host index output addressing is malformed".into());
     };
     let [input_address, input_range] = input_index.sources() else {
-        return Err("scalar expansion source addressing is malformed".into());
+        return Err("host index source addressing is malformed".into());
     };
     let crate::Operation::DefineGlobal(output_addressing) = output_address.operation() else {
-        return Err("scalar expansion output pointer is malformed".into());
+        return Err("host index output pointer is malformed".into());
     };
     let crate::Operation::DefineGlobal(input_addressing) = input_address.operation() else {
-        return Err("scalar expansion source pointer is malformed".into());
+        return Err("host index source pointer is malformed".into());
     };
     let crate::Operation::Range(0) = terminal_range.operation() else {
-        return Err("scalar expansion range is invalid".into());
+        return Err("host index range is invalid".into());
     };
     let [extent] = terminal_range.sources() else {
-        return Err("scalar expansion range extent is malformed".into());
+        return Err("host index range extent is malformed".into());
     };
     let crate::Operation::Const(crate::LiteralValue::Int(extent)) = extent.operation() else {
-        return Err("scalar expansion range extent is not constant".into());
+        return Err("host index range extent is not constant".into());
     };
     let [source_binding] = index_item.ordered_inputs() else {
-        return Err("scalar expansion producer must have one ordered source".into());
+        return Err("host index producer must have one ordered source".into());
     };
     crate::schedule::validate_buffer_desc(&source_binding.desc)
         .map_err(|error| error.to_string())?;
     let input_desc = &source_binding.desc;
     if let Some(expected) = expected_input_desc {
         crate::schedule::validate_buffer_desc(expected).map_err(|error| error.to_string())?;
-        // Replay inputs own the physical scalar descriptor. Each scheduled
-        // expansion owns its local affine view, so one scalar may safely feed
+        // Replay inputs own the physical dense descriptor. Each scheduled
+        // materialization owns its local affine view, so one source may feed
         // differently shaped authenticated expansions without making the
         // capture's first retained view authoritative for every consumer.
         if expected.id != input_desc.id
@@ -1384,11 +1418,11 @@ fn authenticate_scalar_expansion_producer(
             || expected.alignment != input_desc.alignment
             || expected.read_only != input_desc.read_only
         {
-            return Err("scalar expansion physical source is inconsistent".into());
+            return Err("host index physical source is inconsistent".into());
         }
     }
     let Some(captured_view) = input_desc.view.as_ref() else {
-        return Err("scalar expansion source has no authenticated affine view".into());
+        return Err("host index source has no authenticated affine view".into());
     };
     let normalized = captured_view
         .normalized_read()
@@ -1397,9 +1431,29 @@ fn authenticate_scalar_expansion_producer(
     let elements = index_shape.numel().map_err(|error| error.to_string())?;
     let bytes = elements
         .checked_mul(DType::I32.itemsize())
-        .ok_or_else(|| "scalar expansion byte extent overflow".to_owned())?;
+        .ok_or_else(|| "host index byte extent overflow".to_owned())?;
     let scalar_ty = crate::UType::scalar(DType::I32);
     let range_ty = crate::UType::scalar(DType::I64);
+    let input_elements = input_desc
+        .shape
+        .numel()
+        .map_err(|error| error.to_string())?;
+    let canonical_fixed_axes = input_elements > 1
+        && input_desc.shape.dims() == [1, input_elements]
+        && index_shape.rank() == 3
+        && index_shape.dims()[..2] == [1, input_elements]
+        && normalized.axes.len() == 3
+        && normalized.axes[0].stride == 0
+        && !normalized.axes[0].reversed
+        && normalized.axes[1].stride == 1
+        && !normalized.axes[1].reversed
+        && normalized.axes[2].stride == 0
+        && !normalized.axes[2].reversed;
+    let canonical_scalar_axes = input_elements == 1
+        && normalized
+            .axes
+            .iter()
+            .all(|axis| axis.stride == 0 && !axis.reversed);
     if index_item.outputs.len() != 1
         || index_item.node.index() as u64 != index
         || output.id != index
@@ -1413,15 +1467,18 @@ fn authenticate_scalar_expansion_producer(
         || source_binding.abi_index != 0
         || input_desc.id != input
         || input_desc.dtype != DType::I32
-        || input_desc.shape.numel().ok() != Some(1)
-        || input_desc.bytes != DType::I32.itemsize()
+        || input_elements == 0
+        || input_desc.bytes
+            != input_elements
+                .checked_mul(DType::I32.itemsize())
+                .ok_or_else(|| "host Gather input byte extent overflow".to_owned())?
         || input_desc.alignment != DType::I32.itemsize()
         || !input_desc.read_only
         || captured_view.source_shape != input_desc.shape
         || captured_view.logical_shape != *index_shape
         || view != captured_view
         || *input_buffer != input
-        || *input_elements != elements
+        || *view_elements != elements
         || input_shape != index_shape
         || output_shape != index_shape
         || *output_buffer != index
@@ -1435,7 +1492,7 @@ fn authenticate_scalar_expansion_producer(
         || input_address.ty() != Some(scalar_ty)
         || terminal_range.ty() != Some(range_ty)
         || *extent
-            != i64::try_from(elements).map_err(|_| "scalar expansion extent overflow".to_owned())?
+            != i64::try_from(elements).map_err(|_| "host index extent overflow".to_owned())?
         || output_addressing.space != crate::AddressSpace::Global
         || output_addressing.name != format!("b{index}")
         || output_addressing.element != scalar_ty
@@ -1449,19 +1506,16 @@ fn authenticate_scalar_expansion_producer(
             .iter()
             .any(|item| !item.dependencies.contains(&index_item.id))
         || normalized.offset != 0
-        || normalized
-            .axes
-            .iter()
-            .any(|axis| axis.stride != 0 || axis.reversed)
+        || !(canonical_scalar_axes || canonical_fixed_axes)
     {
-        return Err("scalar expansion affine provenance is inconsistent".into());
+        return Err("host Gather index affine provenance is inconsistent".into());
     }
     Ok(())
 }
 
-/// Reauthenticates the exact capture-owned scalar expansion feeding one raw
-/// Gather. This is shared by capture policy construction and static planning;
-/// neither boundary trusts graph-local NodeId coincidence.
+/// Reauthenticates the exact capture-owned affine materialization feeding one
+/// raw Gather. This is shared by capture policy construction and static
+/// planning; neither boundary trusts graph-local NodeId coincidence.
 pub(crate) fn authenticate_host_gather_lineage(
     items: &[ScheduleItem],
     link: &StaticHostGather,
@@ -1496,6 +1550,7 @@ pub(crate) fn authenticate_host_gather_lineage(
         .ok_or_else(|| "host Gather output byte extent overflow".to_owned())?;
     if gather_item.outputs.len() != 1
         || gather_item.node != gather_plan.output
+        || gather_plan.dtype != DType::F32
         || gather_output.id != gather_plan.output.index() as u64
         || gather_output.shape != gather_plan.output_shape
         || gather_output.dtype != gather_plan.dtype
@@ -1526,7 +1581,7 @@ pub(crate) fn authenticate_host_gather_lineage(
     {
         return Err("host Gather affine provenance is inconsistent".into());
     }
-    authenticate_scalar_expansion_producer(
+    authenticate_host_index_producer(
         index_item,
         link.input,
         Some(&link.input_desc),
@@ -1578,7 +1633,7 @@ pub(crate) fn authenticate_append_state_index_lineage(
         return Err("append-state index consumers are incomplete".into());
     }
     if first.span.rows == 1 || first.span.total_elements == 0 {
-        return authenticate_scalar_expansion_producer(
+        return authenticate_host_index_producer(
             index_item,
             first.position,
             None,
@@ -2620,8 +2675,8 @@ impl<R> StaticSchedulePlan<R> {
                     "static host Gather declaration is inconsistent".into(),
                 ));
             }
-            let scalar = buffers.get(&link.input).ok_or_else(|| {
-                A::invalid_binding(format!("host Gather scalar {} is absent", link.input))
+            let source = buffers.get(&link.input).ok_or_else(|| {
+                A::invalid_binding(format!("host Gather input {} is absent", link.input))
             })?;
             let index = buffers.get(&link.index).ok_or_else(|| {
                 A::invalid_binding(format!("host Gather index {} is absent", link.index))
@@ -2635,6 +2690,10 @@ impl<R> StaticSchedulePlan<R> {
             let producer = output
                 .producer
                 .ok_or_else(|| A::invalid_binding("host Gather output has no producer".into()))?;
+            let input_elements = link.input_elements().map_err(A::invalid_binding)?;
+            let input_bytes = input_elements
+                .checked_mul(DType::I32.itemsize())
+                .ok_or_else(A::overflow)?;
             let slots_are_distinct = index.bytes == 0
                 || match (
                     allocations.logical_slots.get(&link.input),
@@ -2644,11 +2703,11 @@ impl<R> StaticSchedulePlan<R> {
                     (Some(input), Some(index), Some(output)) => input != index && index != output,
                     _ => false,
                 };
-            if scalar.producer.is_some()
+            if source.producer.is_some()
                 || !external_inputs.contains(&link.input)
-                || scalar.dtype != DType::I32
-                || scalar.elements != 1
-                || scalar.bytes != DType::I32.itemsize()
+                || source.dtype != DType::I32
+                || source.elements != input_elements
+                || source.bytes != input_bytes
                 || index.dtype != DType::I32
                 || index.elements != link.index_elements
                 || index_producer >= producer
@@ -3077,35 +3136,34 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                 continue;
             }
             let value = values.get(&link.input).ok_or_else(|| {
-                A::invalid_binding(format!("host Gather scalar {} is absent", link.input))
+                A::invalid_binding(format!("host Gather input {} is absent", link.input))
             })?;
-            let bytes = value
-                .to_le_bytes()
-                .map_err(|_| A::invalid_binding("host Gather scalar bytes".into()))?;
+            let input_elements = link.input_elements().map_err(A::invalid_binding)?;
+            let expected_bytes = input_elements
+                .checked_mul(DType::I32.itemsize())
+                .ok_or_else(A::overflow)?;
             if value.dtype() != DType::I32
                 || value.shape() != &self.buffer_plans[&link.input].source_shape
-                || bytes.len() != 4
+                || value.len() != input_elements
+                || self.buffer_plans[&link.input].bytes != expected_bytes
             {
                 return Err(A::invalid_binding(
-                    "host Gather scalar descriptor mismatch".into(),
+                    "host Gather input descriptor mismatch".into(),
                 ));
             }
-            let selected = i32::from_le_bytes(
-                bytes
-                    .as_slice()
-                    .try_into()
-                    .expect("validated four-byte host Gather scalar"),
-            );
-            let in_bounds =
-                usize::try_from(selected).is_ok_and(|selected| selected < link.axis_extent);
-            if !in_bounds {
-                return Err(A::index_out_of_bounds(
-                    link.axis,
-                    0,
-                    selected,
-                    link.axis_extent,
-                ));
-            }
+            validate_i32_index_domain(
+                value,
+                &self.buffer_plans[&link.input].source_shape,
+                link.axis_extent,
+            )
+            .map_err(|error| match error {
+                CheckedI32IndexError::Descriptor => {
+                    A::invalid_binding("host Gather input descriptor mismatch".into())
+                }
+                CheckedI32IndexError::IndexOutOfBounds { position, value } => {
+                    A::index_out_of_bounds(link.axis, position, value, link.axis_extent)
+                }
+            })?;
         }
         Ok(())
     }

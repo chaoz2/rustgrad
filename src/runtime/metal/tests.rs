@@ -1,6 +1,7 @@
 use super::renderer::{
-    METAL_HOST_GATHER_RENDERER_VERSION, METAL_INDEXED_MOVEMENT_RENDERER_VERSION,
-    METAL_PORTABLE_BITCAST_RENDERER_VERSION, METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
+    METAL_FIXED_HOST_GATHER_RENDERER_VERSION, METAL_HOST_GATHER_RENDERER_VERSION,
+    METAL_INDEXED_MOVEMENT_RENDERER_VERSION, METAL_PORTABLE_BITCAST_RENDERER_VERSION,
+    METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION,
     METAL_PORTABLE_F32_MATMUL_RENDERER_VERSION, METAL_PORTABLE_PREFIX_SCAN_RENDERER_VERSION,
     METAL_PORTABLE_SORT_RENDERER_VERSION, METAL_PORTABLE_THREEFRY_RENDERER_VERSION,
     METAL_RAW_COPY_RENDERER_VERSION, METAL_RENDERER_VERSION,
@@ -33,6 +34,12 @@ fn captured_scalar_host_gather_is_direct_atomic_and_fail_closed() {
         .unwrap();
     assert_eq!(inference.capture().to_bytes().unwrap(), frozen_capture);
     assert_ne!(inference.deployment_identity(), ordinary_identity);
+    let (_, _, _, scalar_links, _) = inference.clone().into_parts();
+    let mut legacy_identity = std::collections::hash_map::DefaultHasher::new();
+    "rustgrad-captured-host-gather-v1".hash(&mut legacy_identity);
+    ordinary_identity.hash(&mut legacy_identity);
+    scalar_links.hash(&mut legacy_identity);
+    assert_eq!(inference.deployment_identity(), legacy_identity.finish());
 
     let renderer = MetalRenderer::new(8, capabilities()).unwrap();
     let gather_item = inference
@@ -161,6 +168,87 @@ fn captured_scalar_host_gather_is_direct_atomic_and_fail_closed() {
 }
 
 #[test]
+fn captured_fixed_host_gather_checks_every_lane_before_driver_work() {
+    let mut graph = Graph::new();
+    let table = graph.input_dtype("table", [1, 4, 2], DType::F32);
+    let token = graph.input_dtype("token", [1, 3], DType::I32);
+    let token_rows = graph.reshape(token, [1, 3, 1]).unwrap();
+    let indices = graph.expand(token_rows, [1, 3, 2]).unwrap();
+    let gathered = graph.gather(table, indices, 1).unwrap();
+    let output = graph.square(gathered).unwrap();
+    let ordinary =
+        CapturedInference::from_module_graph(&IdentityModule, &graph, &[output]).unwrap();
+    let frozen_capture = ordinary.capture().to_bytes().unwrap();
+    let ordinary_identity = ordinary.deployment_identity();
+    let inference = ordinary
+        .with_authenticated_host_gathers(&["token"])
+        .unwrap();
+    assert_eq!(inference.capture().to_bytes().unwrap(), frozen_capture);
+    assert_ne!(inference.deployment_identity(), ordinary_identity);
+
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let plan = MetalInferencePlan::new(inference, renderer).unwrap();
+    let direct = plan
+        .rendered_items()
+        .find(|rendered| {
+            rendered
+                .source
+                .contains(METAL_FIXED_HOST_GATHER_RENDERER_VERSION)
+        })
+        .expect("authenticated fixed-cardinality Gather renderer");
+    assert_eq!(direct.entry, "rg_metal_host_gather_fixed_f32_i32");
+    assert!(direct.indexed_movement().is_none());
+    assert!(direct.transaction.is_none());
+    assert!(!direct.source.contains("rg_status"));
+
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let mut session = plan.prepare(device).unwrap();
+    let table_value =
+        TensorData::new([1, 4, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
+    let invocation = |selected: [i32; 3]| {
+        BTreeMap::from([
+            ("table".into(), table_value.clone()),
+            (
+                "token".into(),
+                TensorData::from_scalars(
+                    [1, 3],
+                    DType::I32,
+                    selected.map(|value| Scalar::I(i64::from(value))),
+                )
+                .unwrap(),
+            ),
+        ])
+    };
+    for (selected, lane, value) in [([-1, 1, 2], 0, -1), ([0, 4, 2], 1, 4), ([0, 1, -2], 2, -2)] {
+        mock.clear_calls();
+        assert!(matches!(
+            session.run(&invocation(selected)),
+            Err(MetalError::IndexOutOfBounds {
+                axis: 1,
+                index,
+                value: actual,
+                dim: 4,
+            }) if index == lane && actual == value
+        ));
+        assert!(mock.calls().is_empty());
+        assert_eq!(session.successful_run_count(), 0);
+    }
+    mock.clear_calls();
+    let run = session.run(&invocation([3, 0, 2])).unwrap();
+    assert_eq!(
+        run.outputs(),
+        &[TensorData::new([1, 3, 2], vec![49.0, 64.0, 1.0, 4.0, 25.0, 36.0]).unwrap()]
+    );
+    assert_eq!(run.report().transient_h2d_calls, 2);
+    assert_eq!(
+        run.report().transient_h2d_bytes,
+        8 * DType::F32.itemsize() + 3 * DType::I32.itemsize()
+    );
+    assert_eq!(run.report().retained_d2h_calls, 1);
+}
+
+#[test]
 fn captured_scalar_host_gather_rejects_ambiguous_transformed_and_public_indices() {
     let capture = |graph: &Graph, output| {
         CapturedInference::from_module_graph(&IdentityModule, graph, &[output]).unwrap()
@@ -219,7 +307,7 @@ fn captured_scalar_host_gather_rejects_ambiguous_transformed_and_public_indices(
     assert!(matches!(
         capture(&multiple, output).with_authenticated_host_gathers(&["token"]),
         Err(crate::CapturedInferenceError::Binding(reason))
-            if reason.contains("one dense scalar I32 transient")
+            if reason.contains("one dense scalar or batch-one fixed I32 transient")
     ));
 
     let mut wrong_dtype = Graph::new();
@@ -232,7 +320,7 @@ fn captured_scalar_host_gather_rejects_ambiguous_transformed_and_public_indices(
     assert!(matches!(
         capture(&wrong_dtype, output).with_authenticated_host_gathers(&["token"]),
         Err(crate::CapturedInferenceError::Binding(reason))
-            if reason.contains("one dense scalar I32 transient")
+            if reason.contains("one dense scalar or batch-one fixed I32 transient")
                 || reason.contains("0 authenticated internal owners")
     ));
 
@@ -565,6 +653,7 @@ use dispatch::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    hash::{Hash, Hasher},
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -3720,7 +3809,7 @@ fn packed_row_gather_preflights_indices_and_retries_without_reuploading_weight()
         NodeId::from_index(90),
         NodeId::from_index(91),
         NodeId::from_index(92),
-        Shape::from([2]),
+        Shape::from([1, 3]),
         DType::I32,
         weight.clone(),
     )
@@ -3772,7 +3861,7 @@ fn packed_row_gather_preflights_indices_and_retries_without_reuploading_weight()
 
     let invalid = BTreeMap::from([(
         "indices".into(),
-        TensorData::from_storage([2], Storage::I32(vec![0, -1])).unwrap(),
+        TensorData::from_storage([1, 3], Storage::I32(vec![0, -1, 2])).unwrap(),
     )]);
     assert!(matches!(
         session.run(&invalid),
@@ -3788,7 +3877,7 @@ fn packed_row_gather_preflights_indices_and_retries_without_reuploading_weight()
 
     let valid = BTreeMap::from([(
         "indices".into(),
-        TensorData::from_storage([2], Storage::I32(vec![2, 0])).unwrap(),
+        TensorData::from_storage([1, 3], Storage::I32(vec![2, 0, 1])).unwrap(),
     )]);
     mock.state.lock().unwrap().failures.launch = Some("packed gather retry");
     assert!(session.run(&valid).is_err());
@@ -3799,7 +3888,7 @@ fn packed_row_gather_preflights_indices_and_retries_without_reuploading_weight()
     let Storage::F32(values) = run.outputs()[0].storage() else {
         panic!("packed Metal gather output")
     };
-    assert_eq!(values, &vec![1.0; 64]);
+    assert_eq!(values, &vec![1.0; 96]);
     assert_eq!(run.report().transient_h2d_calls, 1);
     assert_eq!(run.report().retained_d2h_calls, 1);
     assert_eq!(run.report().kernel_launch_count, 1);
