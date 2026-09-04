@@ -95,7 +95,17 @@ jobs:
       RUSTGRAD_METAL_LLAMA_PROMPT: ${{ vars.RUSTGRAD_METAL_LLAMA_PROMPT }}
       RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS: ${{ vars.RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS }}
       RUSTGRAD_METAL_LLAMA_EXPECTED_IDS: ${{ vars.RUSTGRAD_METAL_LLAMA_EXPECTED_IDS }}
+      RUSTGRAD_METAL_LLAMA_MODEL_SOURCE: ${{ vars.RUSTGRAD_METAL_LLAMA_MODEL_SOURCE }}
+      RUSTGRAD_METAL_LLAMA_MODEL_LICENSE: ${{ vars.RUSTGRAD_METAL_LLAMA_MODEL_LICENSE }}
+      RUSTGRAD_METAL_LLAMA_MODEL_CONVERSION: ${{ vars.RUSTGRAD_METAL_LLAMA_MODEL_CONVERSION }}
+      RUSTGRAD_METAL_LLAMA_ORACLE_NAME: ${{ vars.RUSTGRAD_METAL_LLAMA_ORACLE_NAME }}
+      RUSTGRAD_METAL_LLAMA_ORACLE_REVISION: ${{ vars.RUSTGRAD_METAL_LLAMA_ORACLE_REVISION }}
+      RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND: ${{ vars.RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND }}
       RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-llama-scoreboard.json
+      RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH: ${{ github.workspace }}/metal-live-llama-attestation.json
+      RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH: ${{ github.workspace }}/SHA256SUMS
+      RUSTGRAD_METAL_LLAMA_WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      RUSTGRAD_METAL_LLAMA_WORKFLOW_RUN_ID: ${{ github.run_id }}
     steps:
       - name: Validate requested revision and protected configuration
         shell: bash
@@ -134,6 +144,19 @@ jobs:
             echo "protected expected token IDs must be a nonempty comma-separated integer list" >&2
             exit 1
           fi
+          for variable in \
+            RUSTGRAD_METAL_LLAMA_MODEL_SOURCE \
+            RUSTGRAD_METAL_LLAMA_MODEL_LICENSE \
+            RUSTGRAD_METAL_LLAMA_MODEL_CONVERSION \
+            RUSTGRAD_METAL_LLAMA_ORACLE_NAME \
+            RUSTGRAD_METAL_LLAMA_ORACLE_REVISION \
+            RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND; do
+            value="${!variable:-}"
+            if [[ -z "$value" || "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+              echo "$variable must be nonempty and single-line" >&2
+              exit 1
+            fi
+          done
       - name: Check out exact reviewed revision
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -154,6 +177,15 @@ jobs:
             echo "runner-local GGUF does not match the protected SHA-256" >&2
             exit 1
           fi
+          for output_path in \
+            "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH" \
+            "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH" \
+            "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"; do
+            if [[ -e "$output_path" || -L "$output_path" ]]; then
+              echo "live Llama evidence path already exists: $output_path" >&2
+              exit 1
+            fi
+          done
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05
         with:
@@ -169,16 +201,42 @@ jobs:
             --scoreboard "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH" \
             --revision "$EXPECTED_SHA" \
             --expected-ids "$RUSTGRAD_METAL_LLAMA_EXPECTED_IDS" \
+            --attestation "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH" \
+            --model-sha256 "$RUSTGRAD_METAL_LLAMA_GGUF_SHA256" \
+            --model-source "$RUSTGRAD_METAL_LLAMA_MODEL_SOURCE" \
+            --model-license "$RUSTGRAD_METAL_LLAMA_MODEL_LICENSE" \
+            --model-conversion "$RUSTGRAD_METAL_LLAMA_MODEL_CONVERSION" \
+            --oracle-name "$RUSTGRAD_METAL_LLAMA_ORACLE_NAME" \
+            --oracle-revision "$RUSTGRAD_METAL_LLAMA_ORACLE_REVISION" \
+            --oracle-command "$RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND" \
+            --workflow-run-url "$RUSTGRAD_METAL_LLAMA_WORKFLOW_RUN_URL" \
+            --workflow-run-id "$RUSTGRAD_METAL_LLAMA_WORKFLOW_RUN_ID" \
             -- \
             "$RUSTGRAD_METAL_LLAMA_GGUF_PATH" \
             "$RUSTGRAD_METAL_LLAMA_PROMPT"
-      - name: Print live GGUF Llama evidence
+      - name: Bind and print live GGUF Llama evidence
         shell: bash
-        run: cat "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH"
-      - name: Upload live GGUF Llama scoreboard
+        run: |
+          set -euo pipefail
+          scoreboard_name="$(basename -- "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH")"
+          attestation_name="$(basename -- "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH")"
+          (
+            cd "$GITHUB_WORKSPACE"
+            set -o noclobber
+            shasum -a 256 "$scoreboard_name" "$attestation_name" \
+              > "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"
+            shasum -a 256 -c "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"
+          )
+          cat "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH"
+          cat "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH"
+          cat "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"
+      - name: Upload live GGUF Llama evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: metal-live-llama-${{ inputs.expected_sha }}-${{ env.RUSTGRAD_METAL_LLAMA_GGUF_SHA256 }}
-          path: ${{ env.RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH }}
+          path: |
+            ${{ env.RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH }}
+            ${{ env.RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH }}
+            ${{ env.RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH }}
           if-no-files-found: error
           retention-days: 30

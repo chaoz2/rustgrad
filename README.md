@@ -155,7 +155,8 @@ evidence is semantic-mock only; the maintained
 cargo run --release --example metal_llama_generate -- model.gguf "Hello"
 ```
 
-The protected harness pins model bytes and expected greedy IDs. It remains
+The protected harness pins model bytes and expected greedy IDs, then emits a
+create-new scoreboard, provenance attestation, and checksum manifest. It remains
 dormant until its external runner, environment, and model are provisioned;
 chunk prefill and live-device performance evidence remain explicit follow-ups.
 
