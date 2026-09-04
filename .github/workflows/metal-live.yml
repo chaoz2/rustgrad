@@ -80,3 +80,105 @@ jobs:
             ${{ env.RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH }}
           if-no-files-found: error
           retention-days: 30
+
+  live-metal-llama:
+    name: Live Metal GGUF Llama (Apple GPU)
+    runs-on: [self-hosted, macOS, ARM64, rustgrad-metal]
+    environment: live-metal
+    timeout-minutes: 60
+    env:
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      RUSTGRAD_METAL_EXPECTED_SHA: ${{ inputs.expected_sha }}
+      RUSTGRAD_METAL_LLAMA_GGUF_PATH: ${{ vars.RUSTGRAD_METAL_LLAMA_GGUF_PATH }}
+      RUSTGRAD_METAL_LLAMA_GGUF_SHA256: ${{ vars.RUSTGRAD_METAL_LLAMA_GGUF_SHA256 }}
+      RUSTGRAD_METAL_LLAMA_REGISTRY_ID: ${{ vars.RUSTGRAD_METAL_LLAMA_REGISTRY_ID }}
+      RUSTGRAD_METAL_LLAMA_PROMPT: ${{ vars.RUSTGRAD_METAL_LLAMA_PROMPT }}
+      RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS: ${{ vars.RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS }}
+      RUSTGRAD_METAL_LLAMA_EXPECTED_IDS: ${{ vars.RUSTGRAD_METAL_LLAMA_EXPECTED_IDS }}
+      RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-llama-scoreboard.json
+    steps:
+      - name: Validate requested revision and protected configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "expected_sha must be a lowercase full Git SHA" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_SHA:-}" != "$EXPECTED_SHA" ]]; then
+            echo "workflow dispatch revision does not match expected_sha" >&2
+            exit 1
+          fi
+          if [[ -z "$RUSTGRAD_METAL_LLAMA_GGUF_PATH" || ! -f "$RUSTGRAD_METAL_LLAMA_GGUF_PATH" ]]; then
+            echo "protected GGUF path is missing or not a regular file" >&2
+            exit 1
+          fi
+          if [[ ! "$RUSTGRAD_METAL_LLAMA_GGUF_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "protected GGUF SHA-256 must be 64 lowercase hexadecimal characters" >&2
+            exit 1
+          fi
+          if [[ ! "$RUSTGRAD_METAL_LLAMA_REGISTRY_ID" =~ ^[0-9]+$ ]]; then
+            echo "protected Metal registry ID must be an unsigned integer" >&2
+            exit 1
+          fi
+          if [[ -z "$RUSTGRAD_METAL_LLAMA_PROMPT" ]]; then
+            echo "protected Llama prompt must be nonempty" >&2
+            exit 1
+          fi
+          if [[ ! "$RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS" =~ ^[1-9][0-9]{0,3}$ ]] ||
+             (( RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS > 4096 )); then
+            echo "protected max-new-tokens must be between 1 and 4096" >&2
+            exit 1
+          fi
+          if [[ ! "$RUSTGRAD_METAL_LLAMA_EXPECTED_IDS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+            echo "protected expected token IDs must be a nonempty comma-separated integer list" >&2
+            exit 1
+          fi
+      - name: Check out exact reviewed revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.expected_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Authenticate checkout and runner-local model
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "checked-out revision does not match expected_sha" >&2
+            exit 1
+          fi
+          actual_model_sha="$(shasum -a 256 "$RUSTGRAD_METAL_LLAMA_GGUF_PATH" | awk '{print $1}')"
+          if [[ "$actual_model_sha" != "$RUSTGRAD_METAL_LLAMA_GGUF_SHA256" ]]; then
+            echo "runner-local GGUF does not match the protected SHA-256" >&2
+            exit 1
+          fi
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05
+        with:
+          toolchain: 1.89.0
+      - name: Generate with exact live Metal GGUF Llama deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --release --example metal_llama_generate -- \
+            --device 0 \
+            --expected-registry-id "$RUSTGRAD_METAL_LLAMA_REGISTRY_ID" \
+            --max-new-tokens "$RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS" \
+            --scoreboard "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH" \
+            --revision "$EXPECTED_SHA" \
+            --expected-ids "$RUSTGRAD_METAL_LLAMA_EXPECTED_IDS" \
+            -- \
+            "$RUSTGRAD_METAL_LLAMA_GGUF_PATH" \
+            "$RUSTGRAD_METAL_LLAMA_PROMPT"
+      - name: Print live GGUF Llama evidence
+        shell: bash
+        run: cat "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH"
+      - name: Upload live GGUF Llama scoreboard
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: metal-live-llama-${{ inputs.expected_sha }}-${{ env.RUSTGRAD_METAL_LLAMA_GGUF_SHA256 }}
+          path: ${{ env.RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH }}
+          if-no-files-found: error
+          retention-days: 30

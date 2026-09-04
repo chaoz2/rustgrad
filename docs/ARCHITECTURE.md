@@ -2735,8 +2735,9 @@ discovery step returns a device. `MetalRuntime::device(index)` is the concise
 selection seam over that same ordered inventory; an absent inventory remains
 `NoDevices`, while an out-of-range nonempty selection is an invalid argument.
 
-`tests/metal_live.rs` and `examples/metal_resnet_benchmark.rs` contain the exact
-public-API hardware acceptance and benchmark entry points for this boundary.
+`tests/metal_live.rs`, `examples/metal_resnet_benchmark.rs`, and
+`examples/metal_llama_generate.rs` contain the public-API hardware acceptance,
+benchmark, and prompt-to-tokens entry points for this boundary.
 The manual-only `metal-live.yml` workflow requires a caller-
 supplied lowercase full commit SHA, verifies that the checkout matches it, and
 targets `[self-hosted, macOS, ARM64, rustgrad-metal]` behind the protected
@@ -2752,12 +2753,30 @@ Metal session, and checks ten repeated session outputs by default under the
 documented F32 native-compilation tolerance. The workflow runs that complete
 benchmark exactly once rather than duplicating it through the ignored live
 test, and uploads its deterministic v4 scoreboard beside the Linear report.
+The separate Llama job accepts only the protected Metal registry identity and
+a runner-local GGUF whose SHA-256 matches protected configuration, plus a
+protected prompt, positive token bound, and independently pinned greedy token
+IDs. It performs no model download, prepares
+one persistent dense-or-packed session, checks ordered token-step reports,
+resident/cache ownership, zero fallback, suppressed prompt downloads, and
+retained logits downloads, then uploads a distinct v4 scoreboard. The expected
+IDs prove only the pinned model/prompt execution contract, not broad numerical
+parity with another runtime.
 These paths prove stable resident schemas, compiled cache identities, device
 ownership, zero run-time resident upload, and zero fallback. The release profile
 keeps the one complete CPU oracle practical without weakening the device
-workload. The workflow has no push or pull-request trigger. No matching runner
-or environment is currently provisioned, so this lane is dormant and its
-presence is not live-device or performance evidence.
+workload. Scoreboard durations are host wall time and copy counters are host API
+calls; neither is a GPU timestamp, tokens-per-second result, nor physical-bus
+traffic. The workflow has no push or pull-request trigger. No matching runner,
+environment, or authenticated GGUF is currently provisioned, so this lane is
+dormant and its presence is not live-device or performance evidence.
+Provisioning must attach the exact runner labels, restrict deployment refs and
+reviewers on `live-metal`, and define protected
+`RUSTGRAD_METAL_LLAMA_GGUF_PATH`, `RUSTGRAD_METAL_LLAMA_GGUF_SHA256`,
+`RUSTGRAD_METAL_LLAMA_REGISTRY_ID`, `RUSTGRAD_METAL_LLAMA_PROMPT`,
+`RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS`, and
+`RUSTGRAD_METAL_LLAMA_EXPECTED_IDS` values. The model remains outside the
+checkout and the workflow never downloads it.
 
 `runtime/metal/mod.rs` is the facade for the first Apple Metal execution
 boundary. `ffi.rs` dynamically loads the Objective-C runtime, CoreGraphics, and
