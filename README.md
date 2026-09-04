@@ -143,12 +143,13 @@ println!("{}", output.generation().decoded());
 ```
 
 Prompt prefill suppresses intermediate logits downloads and retains only the
-last prompt logits; decode remains sequential batch-one/T=1 with host sampling
-and one logits download whenever another token must be selected. Per-token K/V
-commits are atomic, but a later failure does not roll back an already committed
-prefix. `prepare_with_scoreboard` optionally binds the existing v4 recorder to
-authenticated token-step execution before the first run. Current protected
-evidence is semantic-mock only; the maintained
+last prompt logits. An opt-in fixed span executes complete prompt chunks on
+Metal while sharing the same resident weights, K/V cache, and command queue;
+the final prompt token and decode retain the exact batch-one/T=1 path with host
+sampling. Commits are atomic per device invocation, but a later failure does
+not roll back an already committed prefix. `prepare_with_scoreboard` optionally
+binds the existing v4 recorder to token-step execution before the first run.
+Current protected evidence is semantic-mock only; the maintained
 `metal_llama_generate` example is the manual live-lane entry point:
 
 ```text
@@ -158,7 +159,7 @@ cargo run --release --example metal_llama_generate -- model.gguf "Hello"
 The protected harness pins model bytes and expected greedy IDs, then emits a
 create-new scoreboard, provenance attestation, and checksum manifest. It remains
 dormant until its external runner, environment, and model are provisioned;
-chunk prefill and live-device performance evidence remain explicit follow-ups.
+live-device correctness and performance evidence remain explicit follow-ups.
 
 ## How the system fits together
 
