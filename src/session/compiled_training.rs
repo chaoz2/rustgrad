@@ -6,10 +6,10 @@ use crate::runtime::metal::{
     MetalRenderer, MetalStatefulInferencePlan, RenderedMetal,
 };
 use crate::{
-    BufferState, CapturedMixedSchedule, CapturedSchedule, CapturedStatefulInference, DType,
-    EffectGraph, EffectRuntime, Error, Graph, InferenceStateLink, Metadata, MixedReplayCursor,
-    Module, NodeId, ParameterId, ReplayError, Result, Scalar, Schedule, ScheduleStateBinding,
-    ScheduleValueBinding, Shape, StateDict, TensorData, bind_schedule_states,
+    BufferState, CapturedMixedSchedule, CapturedSchedule, CapturedStatefulInference, CompareOp,
+    DType, EffectGraph, EffectRuntime, Error, Graph, InferenceStateLink, Metadata,
+    MixedReplayCursor, Module, NodeId, ParameterId, ReplayError, Result, Scalar, Schedule,
+    ScheduleStateBinding, ScheduleValueBinding, Shape, StateDict, TensorData, bind_schedule_states,
     combine_mixed_schedules, load_safetensors, save_safetensors, schedule_effects, schedule_many,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -212,6 +212,7 @@ pub struct CompiledAdamWConfig {
     beta2: f32,
     eps: f32,
     weight_decay: f32,
+    gradient_accumulation_steps: u64,
     inputs: BTreeMap<String, (Shape, DType)>,
 }
 
@@ -233,8 +234,23 @@ impl CompiledAdamWConfig {
             beta2,
             eps,
             weight_decay,
+            gradient_accumulation_steps: 1,
             inputs: BTreeMap::new(),
         })
+    }
+
+    /// Accumulates gradients across exactly `steps` recurrent replays before
+    /// committing one averaged AdamW update. Parameters, moments, the
+    /// optimizer step, the partial gradient sums, and the accumulation cursor
+    /// all remain inside the captured state frontier.
+    pub fn with_gradient_accumulation(mut self, steps: u64) -> Result<Self> {
+        if steps == 0 {
+            return Err(training(
+                "compiled AdamW gradient accumulation steps must be positive",
+            ));
+        }
+        self.gradient_accumulation_steps = steps;
+        Ok(self)
     }
 
     pub fn with_input(
@@ -267,6 +283,10 @@ impl CompiledAdamWConfig {
 
     pub fn weight_decay(&self) -> f32 {
         self.weight_decay
+    }
+
+    pub fn gradient_accumulation_steps(&self) -> u64 {
+        self.gradient_accumulation_steps
     }
 
     pub fn inputs(&self) -> impl Iterator<Item = (&str, &Shape, DType)> {
@@ -308,16 +328,63 @@ impl CompiledTrainingStepResult {
 }
 
 pub type CompiledMomentumSgdStepResult = CompiledTrainingStepResult;
-pub type CompiledAdamWStepResult = CompiledTrainingStepResult;
 
-const ADAMW_CHECKPOINT_FORMAT: &str = "rustgrad-compiled-adamw-v1";
+/// One committed replay of a compiled AdamW program.
+///
+/// `step` counts microbatch replays. `optimizer_step` advances only when the
+/// configured accumulation window commits, and `accumulation_index` reports
+/// the number of retained microbatches toward the next update.
+#[derive(Clone, Debug)]
+pub struct CompiledAdamWStepResult {
+    inner: CompiledTrainingStepResult,
+    optimizer_step: u64,
+    accumulation_index: u64,
+}
+
+impl CompiledAdamWStepResult {
+    pub fn loss(&self) -> &TensorData {
+        self.inner.loss()
+    }
+
+    pub fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        self.inner.outputs()
+    }
+
+    pub fn output(&self, name: &str) -> Option<&TensorData> {
+        self.inner.output(name)
+    }
+
+    pub fn step(&self) -> u64 {
+        self.inner.step()
+    }
+
+    pub fn optimizer_step(&self) -> u64 {
+        self.optimizer_step
+    }
+
+    pub fn accumulation_index(&self) -> u64 {
+        self.accumulation_index
+    }
+
+    pub fn did_update(&self) -> bool {
+        self.accumulation_index == 0
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+}
+
+const ADAMW_CHECKPOINT_FORMAT_V1: &str = "rustgrad-compiled-adamw-v1";
+const ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-adamw-v2";
 
 /// Deterministic, portable state for one exact [`CpuCompiledAdamW`] program.
 ///
-/// The safetensors payload contains parameter and moment tensors. String
-/// metadata authenticates the format, ordered parameter names, compiled
-/// capture identity, and logical step. It never serializes executable code,
-/// graphs, runtime slots, or host pointers.
+/// The safetensors payload contains parameter and moment tensors plus any
+/// partial gradient sums. String metadata authenticates the format, ordered
+/// parameter names, compiled capture identity, replay/optimizer progress, and
+/// accumulation policy. It never serializes executable code, graphs, runtime
+/// slots, or host pointers. Legacy non-accumulating v1 bytes remain accepted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledAdamWCheckpoint {
     bytes: Vec<u8>,
@@ -342,10 +409,30 @@ impl CompiledAdamWCheckpoint {
 
 struct DecodedAdamWCheckpoint {
     capture_identity: u64,
-    step: u64,
+    replay_step: u64,
+    optimizer_step: u64,
+    accumulation_steps: u64,
+    accumulation_index: u64,
     parameters: BTreeMap<String, TensorData>,
     first_moments: BTreeMap<String, TensorData>,
     second_moments: BTreeMap<String, TensorData>,
+    gradient_accumulators: BTreeMap<String, TensorData>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdamWCheckpointProgress {
+    capture_identity: u64,
+    replay_step: u64,
+    optimizer_step: u64,
+    accumulation_steps: u64,
+    accumulation_index: u64,
+}
+
+struct AdamWCheckpointTensors {
+    parameters: BTreeMap<String, TensorData>,
+    first_moments: BTreeMap<String, TensorData>,
+    second_moments: BTreeMap<String, TensorData>,
+    gradient_accumulators: BTreeMap<String, TensorData>,
 }
 
 #[derive(Clone, Debug)]
@@ -449,7 +536,10 @@ impl CompiledOptimizerProgram for AdamWProgram {
     }
 
     fn state_specs(&self, parameters: &BTreeMap<String, TensorData>) -> Result<Vec<StateSpec>> {
-        let mut specs = Vec::with_capacity(parameters.len() * 3 + 1);
+        let accumulating = self.config.gradient_accumulation_steps > 1;
+        let per_parameter = if accumulating { 4 } else { 3 };
+        let mut specs =
+            Vec::with_capacity(parameters.len() * per_parameter + 1 + accumulating as usize);
         for (ordinal, (name, value)) in parameters.iter().enumerate() {
             specs.push(StateSpec {
                 key: parameter_key(name),
@@ -465,6 +555,14 @@ impl CompiledOptimizerProgram for AdamWProgram {
                     requires_grad: false,
                 });
             }
+            if accumulating {
+                specs.push(StateSpec {
+                    key: slot_key(name, "gradient_accumulator"),
+                    input_name: format!("{INTERNAL_PREFIX}gradient_accumulator_{ordinal}"),
+                    value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
+                    requires_grad: false,
+                });
+            }
         }
         specs.push(StateSpec {
             key: "global:step".into(),
@@ -472,6 +570,14 @@ impl CompiledOptimizerProgram for AdamWProgram {
             value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
             requires_grad: false,
         });
+        if accumulating {
+            specs.push(StateSpec {
+                key: "global:accumulation_index".into(),
+                input_name: format!("{INTERNAL_PREFIX}adamw_accumulation_index"),
+                value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
+                requires_grad: false,
+            });
+        }
         Ok(specs)
     }
 
@@ -483,52 +589,130 @@ impl CompiledOptimizerProgram for AdamWProgram {
         gradients: &BTreeMap<String, NodeId>,
         states: &BTreeMap<String, NodeId>,
     ) -> Result<BTreeMap<String, NodeId>> {
-        let one_u64 = graph.full_with_dtype(Shape::from([]), Scalar::U(1), DType::U64)?;
-        let next_step = graph.add(states["global:step"], one_u64)?;
-        let step_f32 = graph.cast(next_step, DType::F32)?;
-        let one = scalar_f32(graph, 1.0)?;
-        let beta1 = scalar_f32(graph, self.config.beta1)?;
-        let beta2 = scalar_f32(graph, self.config.beta2)?;
-        let one_minus_beta1 = scalar_f32(graph, 1.0 - self.config.beta1)?;
-        let one_minus_beta2 = scalar_f32(graph, 1.0 - self.config.beta2)?;
-        let eps = scalar_f32(graph, self.config.eps)?;
-        let weight_decay = scalar_f32(graph, self.config.weight_decay)?;
-        let beta1_power = graph.pow(beta1, step_f32)?;
-        let beta2_power = graph.pow(beta2, step_f32)?;
-        let first_correction = graph.sub(one, beta1_power)?;
-        let second_correction = graph.sub(one, beta2_power)?;
-        let decay = graph.mul(learning_rate, weight_decay)?;
-        let decay_factor = graph.sub(one, decay)?;
+        if self.config.gradient_accumulation_steps == 1 {
+            return lower_adamw_update_candidates(
+                &self.config,
+                graph,
+                learning_rate,
+                parameters,
+                gradients,
+                states,
+            );
+        }
 
-        let mut updates = BTreeMap::from([("global:step".into(), next_step)]);
+        let one_u64 = graph.full_with_dtype(Shape::from([]), Scalar::U(1), DType::U64)?;
+        let zero_u64 = graph.full_with_dtype(Shape::from([]), Scalar::U(0), DType::U64)?;
+        let threshold = graph.full_with_dtype(
+            Shape::from([]),
+            Scalar::U(self.config.gradient_accumulation_steps),
+            DType::U64,
+        )?;
+        let next_index = graph.add(states["global:accumulation_index"], one_u64)?;
+        let commit = graph.compare(CompareOp::Eq, next_index, threshold)?;
+        let reset_index = graph.select(commit, zero_u64, next_index)?;
+        let divisor = scalar_f32(graph, self.config.gradient_accumulation_steps as f32)?;
+
+        let mut averaged_gradients = BTreeMap::new();
+        let mut accumulated_gradients = BTreeMap::new();
+        for (name, gradient) in gradients {
+            let key = slot_key(name, "gradient_accumulator");
+            let accumulated = graph.add(states[&key], *gradient)?;
+            let averaged = graph.div(accumulated, divisor)?;
+            accumulated_gradients.insert(name.clone(), accumulated);
+            averaged_gradients.insert(name.clone(), averaged);
+        }
+
+        let candidates = lower_adamw_update_candidates(
+            &self.config,
+            graph,
+            learning_rate,
+            parameters,
+            &averaged_gradients,
+            states,
+        )?;
+        let mut updates = BTreeMap::new();
+        updates.insert("global:accumulation_index".into(), reset_index);
+        updates.insert(
+            "global:step".into(),
+            graph.select(commit, candidates["global:step"], states["global:step"])?,
+        );
         for (name, parameter) in parameters {
-            let gradient = gradients[name];
             let first_key = slot_key(name, "first_moment");
             let second_key = slot_key(name, "second_moment");
-            let retained_first = graph.mul(beta1, states[&first_key])?;
-            let fresh_first = graph.mul(one_minus_beta1, gradient)?;
-            let next_first = graph.add(retained_first, fresh_first)?;
-            let retained_second = graph.mul(beta2, states[&second_key])?;
-            let gradient_squared = graph.mul(gradient, gradient)?;
-            let fresh_second = graph.mul(one_minus_beta2, gradient_squared)?;
-            let next_second = graph.add(retained_second, fresh_second)?;
-            let corrected_first = graph.div(next_first, first_correction)?;
-            let corrected_second = graph.div(next_second, second_correction)?;
-            let root = graph.sqrt(corrected_second)?;
-            let denominator = graph.add(root, eps)?;
-            let normalized = graph.div(corrected_first, denominator)?;
-            let decayed = graph.mul(*parameter, decay_factor)?;
-            let scaled = graph.mul(learning_rate, normalized)?;
-            let next_parameter = graph.sub(decayed, scaled)?;
+            let accumulator_key = slot_key(name, "gradient_accumulator");
+            let accumulator_shape = graph.shape(accumulated_gradients[name])?.clone();
+            let zero = graph.lazy_full_with_dtype(accumulator_shape, Scalar::I(0), DType::F32)?;
+            let next_accumulator = graph.select(commit, zero, accumulated_gradients[name])?;
+            let next_first = graph.select(commit, candidates[&first_key], states[&first_key])?;
+            let next_second = graph.select(commit, candidates[&second_key], states[&second_key])?;
+            let next_parameter =
+                graph.select(commit, candidates[&parameter_key(name)], *parameter)?;
+            validate_parameter_update(graph, *parameter, next_accumulator)?;
             validate_parameter_update(graph, *parameter, next_first)?;
             validate_parameter_update(graph, *parameter, next_second)?;
             validate_parameter_update(graph, *parameter, next_parameter)?;
+            updates.insert(accumulator_key, next_accumulator);
             updates.insert(first_key, next_first);
             updates.insert(second_key, next_second);
             updates.insert(parameter_key(name), next_parameter);
         }
         Ok(updates)
     }
+}
+
+fn lower_adamw_update_candidates(
+    config: &CompiledAdamWConfig,
+    graph: &mut Graph,
+    learning_rate: NodeId,
+    parameters: &BTreeMap<String, NodeId>,
+    gradients: &BTreeMap<String, NodeId>,
+    states: &BTreeMap<String, NodeId>,
+) -> Result<BTreeMap<String, NodeId>> {
+    let one_u64 = graph.full_with_dtype(Shape::from([]), Scalar::U(1), DType::U64)?;
+    let next_step = graph.add(states["global:step"], one_u64)?;
+    let step_f32 = graph.cast(next_step, DType::F32)?;
+    let one = scalar_f32(graph, 1.0)?;
+    let beta1 = scalar_f32(graph, config.beta1)?;
+    let beta2 = scalar_f32(graph, config.beta2)?;
+    let one_minus_beta1 = scalar_f32(graph, 1.0 - config.beta1)?;
+    let one_minus_beta2 = scalar_f32(graph, 1.0 - config.beta2)?;
+    let eps = scalar_f32(graph, config.eps)?;
+    let weight_decay = scalar_f32(graph, config.weight_decay)?;
+    let beta1_power = graph.pow(beta1, step_f32)?;
+    let beta2_power = graph.pow(beta2, step_f32)?;
+    let first_correction = graph.sub(one, beta1_power)?;
+    let second_correction = graph.sub(one, beta2_power)?;
+    let decay = graph.mul(learning_rate, weight_decay)?;
+    let decay_factor = graph.sub(one, decay)?;
+
+    let mut updates = BTreeMap::from([("global:step".into(), next_step)]);
+    for (name, parameter) in parameters {
+        let gradient = gradients[name];
+        let first_key = slot_key(name, "first_moment");
+        let second_key = slot_key(name, "second_moment");
+        let retained_first = graph.mul(beta1, states[&first_key])?;
+        let fresh_first = graph.mul(one_minus_beta1, gradient)?;
+        let next_first = graph.add(retained_first, fresh_first)?;
+        let retained_second = graph.mul(beta2, states[&second_key])?;
+        let gradient_squared = graph.mul(gradient, gradient)?;
+        let fresh_second = graph.mul(one_minus_beta2, gradient_squared)?;
+        let next_second = graph.add(retained_second, fresh_second)?;
+        let corrected_first = graph.div(next_first, first_correction)?;
+        let corrected_second = graph.div(next_second, second_correction)?;
+        let root = graph.sqrt(corrected_second)?;
+        let denominator = graph.add(root, eps)?;
+        let normalized = graph.div(corrected_first, denominator)?;
+        let decayed = graph.mul(*parameter, decay_factor)?;
+        let scaled = graph.mul(learning_rate, normalized)?;
+        let next_parameter = graph.sub(decayed, scaled)?;
+        validate_parameter_update(graph, *parameter, next_first)?;
+        validate_parameter_update(graph, *parameter, next_second)?;
+        validate_parameter_update(graph, *parameter, next_parameter)?;
+        updates.insert(first_key, next_first);
+        updates.insert(second_key, next_second);
+        updates.insert(parameter_key(name), next_parameter);
+    }
+    Ok(updates)
 }
 
 fn scalar_f32(graph: &mut Graph, value: f32) -> Result<NodeId> {
@@ -551,6 +735,7 @@ pub struct CpuCompiledMomentumSgd {
 /// a graph-owned step counter.
 pub struct CpuCompiledAdamW {
     inner: CpuCompiledTrainingProgram,
+    gradient_accumulation_steps: u64,
 }
 
 /// Resource-free Metal rendering of the same recurrent program owned by a
@@ -564,6 +749,7 @@ pub struct MetalCompiledAdamWPlan {
     state_input_keys: BTreeMap<String, String>,
     program_identity: u64,
     step: u64,
+    gradient_accumulation_steps: u64,
 }
 
 /// Device-resident AdamW training session backed by one fixed Metal capture.
@@ -577,11 +763,12 @@ pub struct MetalCompiledAdamW {
     state_input_keys: BTreeMap<String, String>,
     program_identity: u64,
     step: u64,
+    gradient_accumulation_steps: u64,
 }
 
 /// One committed Metal AdamW step plus its exact device execution report.
 pub struct MetalCompiledAdamWStepResult {
-    inner: CompiledTrainingStepResult,
+    inner: CompiledAdamWStepResult,
     report: MetalDeviceRunReport,
 }
 
@@ -600,6 +787,18 @@ impl MetalCompiledAdamWStepResult {
 
     pub fn step(&self) -> u64 {
         self.inner.step()
+    }
+
+    pub fn optimizer_step(&self) -> u64 {
+        self.inner.optimizer_step()
+    }
+
+    pub fn accumulation_index(&self) -> u64 {
+        self.inner.accumulation_index()
+    }
+
+    pub fn did_update(&self) -> bool {
+        self.inner.did_update()
     }
 
     pub fn capture_identity(&self) -> u64 {
@@ -1144,8 +1343,10 @@ impl CpuCompiledAdamW {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
+        let gradient_accumulation_steps = config.gradient_accumulation_steps;
         Ok(Self {
             inner: CpuCompiledTrainingProgram::compile(AdamWProgram { config }, parameters, build)?,
+            gradient_accumulation_steps,
         })
     }
 
@@ -1189,6 +1390,11 @@ impl CpuCompiledAdamW {
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
         let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
+        if config.gradient_accumulation_steps != decoded.accumulation_steps {
+            return Err(training(
+                "compiled AdamW checkpoint accumulation policy mismatch",
+            ));
+        }
         let parameters = decoded
             .parameters
             .iter()
@@ -1211,11 +1417,30 @@ impl CpuCompiledAdamW {
         for (name, value) in decoded.second_moments {
             values.insert(slot_key(&name, "second_moment"), value);
         }
+        for (name, value) in decoded.gradient_accumulators {
+            values.insert(slot_key(&name, "gradient_accumulator"), value);
+        }
         values.insert(
             "global:step".into(),
-            TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(decoded.step)])?,
+            TensorData::from_scalars(
+                Shape::from([]),
+                DType::U64,
+                [Scalar::U(decoded.optimizer_step)],
+            )?,
         );
-        compiled.inner.restore_frontier(decoded.step, &values)?;
+        if decoded.accumulation_steps > 1 {
+            values.insert(
+                "global:accumulation_index".into(),
+                TensorData::from_scalars(
+                    Shape::from([]),
+                    DType::U64,
+                    [Scalar::U(decoded.accumulation_index)],
+                )?,
+            );
+        }
+        compiled
+            .inner
+            .restore_frontier(decoded.replay_step, &values)?;
         Ok(compiled)
     }
 
@@ -1248,11 +1473,16 @@ impl CpuCompiledAdamW {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<CompiledAdamWStepResult> {
-        self.inner.step(inputs, learning_rate)
+        let result = self.inner.step(inputs, learning_rate)?;
+        adamw_step_result(result, self.gradient_accumulation_steps)
     }
 
     pub fn step_count(&self) -> u64 {
         self.inner.step_count()
+    }
+
+    pub fn gradient_accumulation_steps(&self) -> u64 {
+        self.gradient_accumulation_steps
     }
 
     pub fn optimizer_step(&self) -> Result<u64> {
@@ -1273,6 +1503,24 @@ impl CpuCompiledAdamW {
 
     pub fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         self.inner.slot_snapshots("second_moment")
+    }
+
+    /// Partial F32 gradient sums retained between microbatches. The map is
+    /// empty when accumulation is disabled (`steps == 1`).
+    pub fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.slot_snapshots("gradient_accumulator")
+    }
+
+    /// Number of microbatches currently retained toward the next update.
+    pub fn accumulation_index(&self) -> Result<u64> {
+        if self.gradient_accumulation_steps == 1 {
+            return Ok(0);
+        }
+        Ok(self
+            .inner
+            .global_snapshot("accumulation_index")?
+            .scalar_at(0)
+            .as_u64())
     }
 
     pub fn parameter_versions(&self) -> Result<BTreeMap<String, u64>> {
@@ -1323,22 +1571,35 @@ impl CpuCompiledAdamW {
             state_input_keys: self.inner.state_input_keys.clone(),
             program_identity: self.capture_identity(),
             step: self.step_count(),
+            gradient_accumulation_steps: self.gradient_accumulation_steps,
         })
     }
 
     /// Captures parameter values, both moment sets, the graph-owned optimizer
     /// step, and the exact compiled capture identity into deterministic bytes.
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
-        let step = self.optimizer_step()?;
-        if step != self.step_count() {
-            return Err(training("compiled AdamW host and graph steps diverged"));
-        }
+        let optimizer_step = self.optimizer_step()?;
+        let accumulation_index = self.accumulation_index()?;
+        validate_adamw_progress(
+            self.step_count(),
+            optimizer_step,
+            self.gradient_accumulation_steps,
+            accumulation_index,
+        )?;
         let bytes = encode_adamw_checkpoint(
-            self.capture_identity(),
-            step,
-            self.parameter_snapshots()?,
-            self.first_moment_snapshots()?,
-            self.second_moment_snapshots()?,
+            AdamWCheckpointProgress {
+                capture_identity: self.capture_identity(),
+                replay_step: self.step_count(),
+                optimizer_step,
+                accumulation_steps: self.gradient_accumulation_steps,
+                accumulation_index,
+            },
+            AdamWCheckpointTensors {
+                parameters: self.parameter_snapshots()?,
+                first_moments: self.first_moment_snapshots()?,
+                second_moments: self.second_moment_snapshots()?,
+                gradient_accumulators: self.gradient_accumulator_snapshots()?,
+            },
         )?;
         CompiledAdamWCheckpoint::from_bytes(bytes)
     }
@@ -1350,9 +1611,29 @@ impl CpuCompiledAdamW {
         learning_rate: TensorData,
         injected_failure: Option<u64>,
     ) -> Result<CompiledAdamWStepResult> {
-        self.inner
-            .step_inner(inputs, learning_rate, injected_failure)
+        let result = self
+            .inner
+            .step_inner(inputs, learning_rate, injected_failure)?;
+        adamw_step_result(result, self.gradient_accumulation_steps)
     }
+}
+
+fn adamw_step_result(
+    inner: CompiledTrainingStepResult,
+    accumulation_steps: u64,
+) -> Result<CompiledAdamWStepResult> {
+    if accumulation_steps == 0 {
+        return Err(training(
+            "compiled AdamW gradient accumulation steps must be positive",
+        ));
+    }
+    let optimizer_step = inner.step / accumulation_steps;
+    let accumulation_index = inner.step % accumulation_steps;
+    Ok(CompiledAdamWStepResult {
+        inner,
+        optimizer_step,
+        accumulation_index,
+    })
 }
 
 impl MetalCompiledAdamWPlan {
@@ -1366,6 +1647,10 @@ impl MetalCompiledAdamWPlan {
 
     pub fn step_count(&self) -> u64 {
         self.step
+    }
+
+    pub fn gradient_accumulation_steps(&self) -> u64 {
+        self.gradient_accumulation_steps
     }
 
     pub fn summary(&self) -> &MetalDeviceSessionSummary {
@@ -1387,6 +1672,7 @@ impl MetalCompiledAdamWPlan {
             state_input_keys: self.state_input_keys,
             program_identity: self.program_identity,
             step: self.step,
+            gradient_accumulation_steps: self.gradient_accumulation_steps,
         })
     }
 }
@@ -1413,19 +1699,24 @@ impl MetalCompiledAdamW {
             .expect("compiled Metal output cardinality was authenticated before preparation");
         let outputs = self.output_names.iter().cloned().zip(outputs).collect();
         self.step = next_step;
-        Ok(MetalCompiledAdamWStepResult {
-            inner: CompiledTrainingStepResult {
+        let inner = adamw_step_result(
+            CompiledTrainingStepResult {
                 loss,
                 outputs,
                 step: self.step,
                 capture_identity: self.program_identity,
             },
-            report,
-        })
+            self.gradient_accumulation_steps,
+        )?;
+        Ok(MetalCompiledAdamWStepResult { inner, report })
     }
 
     pub fn step_count(&self) -> u64 {
         self.step
+    }
+
+    pub fn gradient_accumulation_steps(&self) -> u64 {
+        self.gradient_accumulation_steps
     }
 
     pub fn capture_identity(&self) -> u64 {
@@ -1480,6 +1771,21 @@ impl MetalCompiledAdamW {
         metal_slot_snapshots(self.state_snapshots()?, "second_moment")
     }
 
+    pub fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        metal_slot_snapshots(self.state_snapshots()?, "gradient_accumulator")
+    }
+
+    pub fn accumulation_index(&self) -> Result<u64> {
+        if self.gradient_accumulation_steps == 1 {
+            return Ok(0);
+        }
+        let states = self.state_snapshots()?;
+        let index = states
+            .get("global:accumulation_index")
+            .ok_or_else(|| training("compiled Metal accumulation index is absent"))?;
+        Ok(index.scalar_at(0).as_u64())
+    }
+
     pub fn optimizer_step(&self) -> Result<u64> {
         let states = self.state_snapshots()?;
         let step = states
@@ -1497,18 +1803,39 @@ impl MetalCompiledAdamW {
             .ok_or_else(|| training("compiled Metal optimizer step is absent"))?
             .scalar_at(0)
             .as_u64();
-        if optimizer_step != self.step {
-            return Err(training("compiled Metal host and graph steps diverged"));
-        }
+        let accumulation_index = if self.gradient_accumulation_steps == 1 {
+            0
+        } else {
+            states
+                .get("global:accumulation_index")
+                .ok_or_else(|| training("compiled Metal accumulation index is absent"))?
+                .scalar_at(0)
+                .as_u64()
+        };
+        validate_adamw_progress(
+            self.step,
+            optimizer_step,
+            self.gradient_accumulation_steps,
+            accumulation_index,
+        )?;
         let parameters = metal_parameter_snapshots(&states);
         let first_moments = metal_slot_snapshots(states.clone(), "first_moment")?;
-        let second_moments = metal_slot_snapshots(states, "second_moment")?;
+        let second_moments = metal_slot_snapshots(states.clone(), "second_moment")?;
+        let gradient_accumulators = metal_slot_snapshots(states, "gradient_accumulator")?;
         CompiledAdamWCheckpoint::from_bytes(encode_adamw_checkpoint(
-            self.program_identity,
-            optimizer_step,
-            parameters,
-            first_moments,
-            second_moments,
+            AdamWCheckpointProgress {
+                capture_identity: self.program_identity,
+                replay_step: self.step,
+                optimizer_step,
+                accumulation_steps: self.gradient_accumulation_steps,
+                accumulation_index,
+            },
+            AdamWCheckpointTensors {
+                parameters,
+                first_moments,
+                second_moments,
+                gradient_accumulators,
+            },
         )?)
     }
 }
@@ -1541,13 +1868,38 @@ fn metal_slot_snapshots(
 }
 
 fn encode_adamw_checkpoint(
-    capture_identity: u64,
-    step: u64,
-    parameters: BTreeMap<String, TensorData>,
-    first_moments: BTreeMap<String, TensorData>,
-    second_moments: BTreeMap<String, TensorData>,
+    progress: AdamWCheckpointProgress,
+    tensors: AdamWCheckpointTensors,
 ) -> Result<Vec<u8>> {
+    let AdamWCheckpointProgress {
+        capture_identity,
+        replay_step,
+        optimizer_step,
+        accumulation_steps,
+        accumulation_index,
+    } = progress;
+    let AdamWCheckpointTensors {
+        parameters,
+        first_moments,
+        second_moments,
+        gradient_accumulators,
+    } = tensors;
     validate_adamw_checkpoint_maps(&parameters, &first_moments, &second_moments)?;
+    validate_adamw_progress(
+        replay_step,
+        optimizer_step,
+        accumulation_steps,
+        accumulation_index,
+    )?;
+    if accumulation_steps == 1 {
+        if !gradient_accumulators.is_empty() {
+            return Err(training(
+                "compiled AdamW checkpoint has unexpected gradient accumulators",
+            ));
+        }
+    } else {
+        validate_gradient_accumulators(&parameters, &gradient_accumulators)?;
+    }
     let names = parameters.keys().cloned().collect::<Vec<_>>();
     let mut tensors = StateDict::default();
     for (ordinal, name) in names.iter().enumerate() {
@@ -1560,36 +1912,85 @@ fn encode_adamw_checkpoint(
             format!("second_moment.{ordinal}"),
             second_moments[name].clone(),
         );
+        if accumulation_steps > 1 {
+            tensors.insert(
+                format!("gradient_accumulator.{ordinal}"),
+                gradient_accumulators[name].clone(),
+            );
+        }
     }
-    let metadata = Metadata::from([
-        ("format".into(), ADAMW_CHECKPOINT_FORMAT.into()),
-        ("capture_identity".into(), capture_identity.to_string()),
-        ("step".into(), step.to_string()),
-        (
-            "parameter_names".into(),
-            serde_json::to_string(&names)
-                .map_err(|error| training(format!("checkpoint names: {error}")))?,
-        ),
-    ]);
+    let parameter_names = serde_json::to_string(&names)
+        .map_err(|error| training(format!("checkpoint names: {error}")))?;
+    let metadata = if accumulation_steps == 1 {
+        Metadata::from([
+            ("format".into(), ADAMW_CHECKPOINT_FORMAT_V1.into()),
+            ("capture_identity".into(), capture_identity.to_string()),
+            ("step".into(), optimizer_step.to_string()),
+            ("parameter_names".into(), parameter_names),
+        ])
+    } else {
+        Metadata::from([
+            ("format".into(), ADAMW_CHECKPOINT_FORMAT_V2.into()),
+            ("capture_identity".into(), capture_identity.to_string()),
+            ("replay_step".into(), replay_step.to_string()),
+            ("optimizer_step".into(), optimizer_step.to_string()),
+            (
+                "gradient_accumulation_steps".into(),
+                accumulation_steps.to_string(),
+            ),
+            ("accumulation_index".into(), accumulation_index.to_string()),
+            ("parameter_names".into(), parameter_names),
+        ])
+    };
     save_safetensors(&tensors, &metadata)
 }
 
 fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
     let (state, metadata) = load_safetensors(bytes)?;
-    let expected_metadata =
-        BTreeSet::from(["format", "capture_identity", "step", "parameter_names"]);
+    let format = metadata
+        .get("format")
+        .ok_or_else(|| training("compiled AdamW checkpoint format is absent"))?;
+    let expected_metadata = match format.as_str() {
+        ADAMW_CHECKPOINT_FORMAT_V1 => {
+            BTreeSet::from(["format", "capture_identity", "step", "parameter_names"])
+        }
+        ADAMW_CHECKPOINT_FORMAT_V2 => BTreeSet::from([
+            "format",
+            "capture_identity",
+            "replay_step",
+            "optimizer_step",
+            "gradient_accumulation_steps",
+            "accumulation_index",
+            "parameter_names",
+        ]),
+        _ => return Err(training("compiled AdamW checkpoint format mismatch")),
+    };
     if metadata.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_metadata {
         return Err(training("compiled AdamW checkpoint metadata mismatch"));
-    }
-    if metadata["format"] != ADAMW_CHECKPOINT_FORMAT {
-        return Err(training("compiled AdamW checkpoint format mismatch"));
     }
     let capture_identity = metadata["capture_identity"]
         .parse::<u64>()
         .map_err(|_| training("compiled AdamW checkpoint capture identity is invalid"))?;
-    let step = metadata["step"]
-        .parse::<u64>()
-        .map_err(|_| training("compiled AdamW checkpoint step is invalid"))?;
+    let (replay_step, optimizer_step, accumulation_steps, accumulation_index) =
+        if format == ADAMW_CHECKPOINT_FORMAT_V1 {
+            let step = metadata["step"]
+                .parse::<u64>()
+                .map_err(|_| training("compiled AdamW checkpoint step is invalid"))?;
+            (step, step, 1, 0)
+        } else {
+            (
+                parse_checkpoint_u64(&metadata, "replay_step")?,
+                parse_checkpoint_u64(&metadata, "optimizer_step")?,
+                parse_checkpoint_u64(&metadata, "gradient_accumulation_steps")?,
+                parse_checkpoint_u64(&metadata, "accumulation_index")?,
+            )
+        };
+    validate_adamw_progress(
+        replay_step,
+        optimizer_step,
+        accumulation_steps,
+        accumulation_index,
+    )?;
     let names = serde_json::from_str::<Vec<String>>(&metadata["parameter_names"])
         .map_err(|_| training("compiled AdamW checkpoint parameter names are invalid"))?;
     if names.is_empty() {
@@ -1607,6 +2008,7 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
     let mut parameters = BTreeMap::new();
     let mut first_moments = BTreeMap::new();
     let mut second_moments = BTreeMap::new();
+    let mut gradient_accumulators = BTreeMap::new();
     for (ordinal, name) in names.into_iter().enumerate() {
         let parameter = tensors
             .remove(&format!("parameter.{ordinal}"))
@@ -1617,21 +2019,92 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
         let second = tensors
             .remove(&format!("second_moment.{ordinal}"))
             .ok_or_else(|| training("compiled AdamW checkpoint second moment is absent"))?;
+        let accumulator = if accumulation_steps > 1 {
+            Some(
+                tensors
+                    .remove(&format!("gradient_accumulator.{ordinal}"))
+                    .ok_or_else(|| {
+                        training("compiled AdamW checkpoint gradient accumulator is absent")
+                    })?,
+            )
+        } else {
+            None
+        };
         parameters.insert(name.clone(), parameter);
         first_moments.insert(name.clone(), first);
-        second_moments.insert(name, second);
+        second_moments.insert(name.clone(), second);
+        if let Some(accumulator) = accumulator {
+            gradient_accumulators.insert(name, accumulator);
+        }
     }
     if !tensors.is_empty() {
         return Err(training("compiled AdamW checkpoint tensor set mismatch"));
     }
     validate_adamw_checkpoint_maps(&parameters, &first_moments, &second_moments)?;
+    if accumulation_steps > 1 {
+        validate_gradient_accumulators(&parameters, &gradient_accumulators)?;
+    }
     Ok(DecodedAdamWCheckpoint {
         capture_identity,
-        step,
+        replay_step,
+        optimizer_step,
+        accumulation_steps,
+        accumulation_index,
         parameters,
         first_moments,
         second_moments,
+        gradient_accumulators,
     })
+}
+
+fn parse_checkpoint_u64(metadata: &Metadata, name: &str) -> Result<u64> {
+    metadata[name]
+        .parse::<u64>()
+        .map_err(|_| training(format!("compiled AdamW checkpoint {name} is invalid")))
+}
+
+fn validate_adamw_progress(
+    replay_step: u64,
+    optimizer_step: u64,
+    accumulation_steps: u64,
+    accumulation_index: u64,
+) -> Result<()> {
+    if accumulation_steps == 0 || accumulation_index >= accumulation_steps {
+        return Err(training(
+            "compiled AdamW checkpoint accumulation progress is invalid",
+        ));
+    }
+    let expected_replay = optimizer_step
+        .checked_mul(accumulation_steps)
+        .and_then(|step| step.checked_add(accumulation_index))
+        .ok_or_else(|| training("compiled AdamW checkpoint progress overflows"))?;
+    if replay_step != expected_replay {
+        return Err(training(
+            "compiled AdamW checkpoint replay and optimizer progress diverged",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gradient_accumulators(
+    parameters: &BTreeMap<String, TensorData>,
+    accumulators: &BTreeMap<String, TensorData>,
+) -> Result<()> {
+    if parameters.keys().ne(accumulators.keys()) {
+        return Err(training(
+            "compiled AdamW checkpoint gradient accumulator names mismatch",
+        ));
+    }
+    for (name, parameter) in parameters {
+        let accumulator = &accumulators[name];
+        if accumulator.dtype() != DType::F32 || accumulator.shape() != parameter.shape() {
+            return Err(training(
+                "compiled AdamW checkpoint gradient accumulator descriptor mismatch",
+            ));
+        }
+        checked_bytes(accumulator)?;
+    }
+    Ok(())
 }
 
 fn validate_adamw_checkpoint_maps(
@@ -2003,6 +2476,10 @@ mod tests {
             .unwrap()
     }
 
+    fn accumulated_adamw_config(steps: u64) -> CompiledAdamWConfig {
+        adamw_config().with_gradient_accumulation(steps).unwrap()
+    }
+
     fn compiled_adamw() -> CpuCompiledAdamW {
         CpuCompiledAdamW::compile(adamw_config(), initial_parameters(), build_tinybob).unwrap()
     }
@@ -2366,6 +2843,151 @@ mod tests {
     }
 
     #[test]
+    fn adamw_accumulates_recurrent_gradients_and_commits_only_at_window_end() {
+        let mut compiled = CpuCompiledAdamW::compile(
+            accumulated_adamw_config(2),
+            initial_parameters(),
+            build_tinybob,
+        )
+        .unwrap();
+        let identity = compiled.capture_identity();
+        let initial_parameters = compiled.parameter_snapshots().unwrap();
+        let initial_first = compiled.first_moment_snapshots().unwrap();
+        let initial_second = compiled.second_moment_snapshots().unwrap();
+
+        let partial = compiled.step(batch(), lr()).unwrap();
+        assert_eq!(partial.step(), 1);
+        assert_eq!(partial.optimizer_step(), 0);
+        assert_eq!(partial.accumulation_index(), 1);
+        assert!(!partial.did_update());
+        assert_eq!(partial.capture_identity(), identity);
+        assert_eq!(compiled.optimizer_step().unwrap(), 0);
+        assert_eq!(compiled.accumulation_index().unwrap(), 1);
+        assert_eq!(compiled.parameter_snapshots().unwrap(), initial_parameters);
+        assert_eq!(compiled.first_moment_snapshots().unwrap(), initial_first);
+        assert_eq!(compiled.second_moment_snapshots().unwrap(), initial_second);
+        assert!(
+            compiled
+                .gradient_accumulator_snapshots()
+                .unwrap()
+                .values()
+                .any(|value| value
+                    != &TensorData::zeros_with_dtype(value.shape().clone(), DType::F32,).unwrap())
+        );
+
+        let committed = compiled.step(batch(), lr()).unwrap();
+        assert_eq!(committed.step(), 2);
+        assert_eq!(committed.optimizer_step(), 1);
+        assert_eq!(committed.accumulation_index(), 0);
+        assert!(committed.did_update());
+        assert_eq!(compiled.optimizer_step().unwrap(), 1);
+        assert_eq!(compiled.accumulation_index().unwrap(), 0);
+        assert_ne!(compiled.parameter_snapshots().unwrap(), initial_parameters);
+        assert_ne!(compiled.first_moment_snapshots().unwrap(), initial_first);
+        assert_ne!(compiled.second_moment_snapshots().unwrap(), initial_second);
+        assert!(
+            compiled
+                .gradient_accumulator_snapshots()
+                .unwrap()
+                .values()
+                .all(|value| value
+                    == &TensorData::zeros_with_dtype(value.shape().clone(), DType::F32,).unwrap())
+        );
+    }
+
+    #[test]
+    fn adamw_partial_accumulation_checkpoint_resumes_exactly() {
+        let config = accumulated_adamw_config(3);
+        let mut uninterrupted =
+            CpuCompiledAdamW::compile(config.clone(), initial_parameters(), build_tinybob).unwrap();
+        uninterrupted.step(batch(), lr()).unwrap();
+        let checkpoint = uninterrupted.checkpoint().unwrap();
+        let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V2);
+        assert_eq!(metadata["replay_step"], "1");
+        assert_eq!(metadata["optimizer_step"], "0");
+        assert_eq!(metadata["gradient_accumulation_steps"], "3");
+        assert_eq!(metadata["accumulation_index"], "1");
+
+        let mut resumed =
+            CpuCompiledAdamW::compile_from_checkpoint(config, &checkpoint, build_tinybob).unwrap();
+        assert_eq!(resumed.step_count(), 1);
+        assert_eq!(resumed.optimizer_step().unwrap(), 0);
+        assert_eq!(resumed.accumulation_index().unwrap(), 1);
+        assert_eq!(
+            resumed.gradient_accumulator_snapshots().unwrap(),
+            uninterrupted.gradient_accumulator_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.parameter_snapshots().unwrap(),
+            uninterrupted.parameter_snapshots().unwrap()
+        );
+
+        for expected_step in 2..=4 {
+            let expected = uninterrupted.step(batch(), lr()).unwrap();
+            let actual = resumed.step(batch(), lr()).unwrap();
+            assert_eq!(actual.step(), expected_step);
+            assert_eq!(actual.loss(), expected.loss());
+            assert_eq!(actual.outputs(), expected.outputs());
+            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+            assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+            assert_eq!(actual.did_update(), expected.did_update());
+        }
+        assert_eq!(
+            resumed.checkpoint().unwrap(),
+            uninterrupted.checkpoint().unwrap()
+        );
+    }
+
+    #[test]
+    fn adamw_accumulation_failure_preserves_the_partial_frontier() {
+        let mut compiled = CpuCompiledAdamW::compile(
+            accumulated_adamw_config(2),
+            initial_parameters(),
+            build_tinybob,
+        )
+        .unwrap();
+        compiled.step(batch(), lr()).unwrap();
+        let cursor = compiled.inner.cursor.clone();
+        let parameters = compiled.parameter_snapshots().unwrap();
+        let first = compiled.first_moment_snapshots().unwrap();
+        let second = compiled.second_moment_snapshots().unwrap();
+        let accumulators = compiled.gradient_accumulator_snapshots().unwrap();
+
+        assert!(compiled.step_inner(batch(), lr(), Some(0)).is_err());
+        assert_eq!(compiled.step_count(), 1);
+        assert_eq!(compiled.optimizer_step().unwrap(), 0);
+        assert_eq!(compiled.accumulation_index().unwrap(), 1);
+        assert_eq!(compiled.inner.cursor, cursor);
+        assert_eq!(compiled.parameter_snapshots().unwrap(), parameters);
+        assert_eq!(compiled.first_moment_snapshots().unwrap(), first);
+        assert_eq!(compiled.second_moment_snapshots().unwrap(), second);
+        assert_eq!(
+            compiled.gradient_accumulator_snapshots().unwrap(),
+            accumulators
+        );
+    }
+
+    #[test]
+    fn adamw_default_keeps_v1_checkpoint_and_accumulation_one_behavior() {
+        let mut compiled = compiled_adamw();
+        assert_eq!(compiled.gradient_accumulation_steps(), 1);
+        assert!(
+            compiled
+                .gradient_accumulator_snapshots()
+                .unwrap()
+                .is_empty()
+        );
+        let result = compiled.step(batch(), lr()).unwrap();
+        assert_eq!(result.optimizer_step(), 1);
+        assert_eq!(result.accumulation_index(), 0);
+        assert!(result.did_update());
+        let (_, metadata) = load_safetensors(compiled.checkpoint().unwrap().as_bytes()).unwrap();
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V1);
+        assert_eq!(metadata["step"], "1");
+    }
+
+    #[test]
     fn adamw_failure_preserves_parameters_moments_step_and_cursor() {
         let mut compiled = compiled_adamw();
         let parameters = compiled.parameter_snapshots().unwrap();
@@ -2465,6 +3087,12 @@ mod tests {
         ] {
             assert!(config.is_err());
         }
+        assert!(
+            CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+                .unwrap()
+                .with_gradient_accumulation(0)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2551,6 +3179,19 @@ mod tests {
             .unwrap();
         assert!(
             CpuCompiledAdamW::compile_from_checkpoint(wrong, &checkpoint, build_tinybob).is_err()
+        );
+
+        let mut accumulated = CpuCompiledAdamW::compile(
+            accumulated_adamw_config(2),
+            initial_parameters(),
+            build_tinybob,
+        )
+        .unwrap();
+        accumulated.step(batch(), lr()).unwrap();
+        let checkpoint = accumulated.checkpoint().unwrap();
+        assert!(
+            CpuCompiledAdamW::compile_from_checkpoint(adamw_config(), &checkpoint, build_tinybob,)
+                .is_err()
         );
     }
 }

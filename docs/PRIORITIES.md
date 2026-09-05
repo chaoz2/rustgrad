@@ -69,10 +69,13 @@ The protected tiny causal Transformer now trains from deterministic random
 initialization through embedding, causal attention, LayerNorm, tied output
 weights, cross-entropy, one batched reverse traversal, and captured AdamW.
 Eight CPU steps decrease loss, and recompilation from the midpoint checkpoint
-continues with exact outputs and recurrent parameter/moment state. First-class
-gradient accumulation/zeroing, microbatches, clipping, and broader freezing
-semantics remain the next CPU training-runtime work only when this workload or
-its immediate scale-up requires them.
+continues with exact outputs and recurrent parameter/moment state. Compiled
+AdamW now optionally retains F32 gradient sums and an accumulation cursor in
+that same frontier, commits one averaged update at each fixed microbatch
+window, resets the sums in-capture, and checkpoints partial windows exactly.
+The identical recurrent program remains strict-Metal renderable with zero
+fallback. Explicit cancellation, clipping, loss scaling, and broader freezing
+semantics remain workload-driven follow-ups.
 
 ### 3. P1 — lower the identical training capture to Metal
 

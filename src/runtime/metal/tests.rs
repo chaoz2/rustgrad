@@ -1102,7 +1102,13 @@ fn metal_stateful_inference_zero_work_owns_no_native_resources() {
 }
 
 fn compiled_scalar_adamw() -> CpuCompiledAdamW {
+    compiled_scalar_adamw_with_accumulation(1)
+}
+
+fn compiled_scalar_adamw_with_accumulation(steps: u64) -> CpuCompiledAdamW {
     let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_gradient_accumulation(steps)
         .unwrap()
         .with_input("target", [], DType::F32)
         .unwrap();
@@ -1113,6 +1119,40 @@ fn compiled_scalar_adamw() -> CpuCompiledAdamW {
         Ok((loss, BTreeMap::from([("delta".into(), delta)])))
     })
     .unwrap()
+}
+
+#[test]
+fn compiled_adamw_accumulation_uses_the_same_recurrent_capture_on_metal() {
+    let mut cpu = compiled_scalar_adamw_with_accumulation(2);
+    let plan = cpu
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap();
+    assert_eq!(plan.gradient_accumulation_steps(), 2);
+    assert_eq!(plan.summary().state_pair_count, 6);
+    assert_eq!(plan.summary().fallback_count, 0);
+
+    let mock = Arc::new(MockDispatch::default());
+    let mut metal = plan.prepare(test_device(mock)).unwrap();
+    let inputs = || BTreeMap::from([("target".into(), TensorData::scalar(0.0))]);
+    let learning_rate = || TensorData::scalar(0.1);
+    for replay in 1..=3 {
+        let expected = cpu.step(inputs(), learning_rate()).unwrap();
+        let actual = metal.step(inputs(), learning_rate()).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(actual.step(), replay);
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+        assert_eq!(actual.did_update(), expected.did_update());
+        assert_eq!(actual.report().committed_state_pair_count, 6);
+    }
+    assert_eq!(metal.optimizer_step().unwrap(), 1);
+    assert_eq!(metal.accumulation_index().unwrap(), 1);
+    assert_eq!(
+        metal.gradient_accumulator_snapshots().unwrap(),
+        cpu.gradient_accumulator_snapshots().unwrap()
+    );
+    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
 }
 
 #[test]
