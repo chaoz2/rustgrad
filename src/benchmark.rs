@@ -21,6 +21,11 @@ use std::{collections::BTreeSet, fmt, time::Duration};
 /// [`BenchmarkComparison`].
 pub const BENCHMARK_FORMAT_VERSION: u32 = 1;
 
+/// Exact workload label emitted by the maintained ResNet-18 Metal benchmark.
+pub const RUSTGRAD_METAL_RESNET18_WORKLOAD: &str = "resnet18-eval-f32-1x3x224x224";
+/// Exact workload label emitted by the maintained device-greedy GGUF Llama CLI.
+pub const RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD: &str = "gguf-llama-metal-generate";
+
 const MAX_LABEL_BYTES: usize = 1_024;
 const MAX_COMMAND_BYTES: usize = 8_192;
 
@@ -317,7 +322,7 @@ impl BenchmarkObservation {
         if !matches!(&workload, BenchmarkWorkload::ResNet18 { .. }) {
             return Err(BenchmarkError::WorkloadMismatch);
         }
-        validate_metal_source(report, &implementation)?;
+        validate_metal_source(report, &implementation, RUSTGRAD_METAL_RESNET18_WORKLOAD)?;
         let metrics = BenchmarkMetrics {
             planning_time: Some(BenchmarkDuration::from_duration(report.planning_wall_time)),
             pipeline_compile_time: Some(BenchmarkDuration::from_duration(
@@ -694,15 +699,18 @@ fn require_rustgrad(implementation: &BenchmarkImplementation) -> Result<(), Benc
 fn validate_metal_source(
     report: &MetalSessionScoreboardReport,
     implementation: &BenchmarkImplementation,
+    expected_workload: &'static str,
 ) -> Result<(), BenchmarkError> {
     if report.format_version != METAL_SESSION_SCOREBOARD_FORMAT_VERSION {
         return Err(BenchmarkError::InvalidSourceReport(
             "Metal scoreboard format version",
         ));
     }
-    if report.context.implementation_revision() != implementation.revision.as_str() {
+    if report.context.implementation_revision() != implementation.revision.as_str()
+        || report.context.workload() != expected_workload
+    {
         return Err(BenchmarkError::InvalidSourceReport(
-            "implementation revision",
+            "workload or implementation revision",
         ));
     }
     let run_count =
@@ -734,14 +742,22 @@ fn validate_llama_source(
             "Llama scoreboard format version",
         ));
     }
-    validate_metal_source(&report.token_step, implementation)?;
+    validate_metal_source(
+        &report.token_step,
+        implementation,
+        RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD,
+    )?;
     if report.context.implementation_revision() != implementation.revision.as_str()
         || report.context != report.token_step.context
     {
         return Err(BenchmarkError::InvalidSourceReport("Llama context"));
     }
     if let Some(fixed_prefill) = &report.fixed_prefill {
-        validate_metal_source(fixed_prefill, implementation)?;
+        validate_metal_source(
+            fixed_prefill,
+            implementation,
+            RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD,
+        )?;
         if fixed_prefill.context != report.context
             || fixed_prefill.device != report.token_step.device
         {
@@ -757,7 +773,34 @@ fn validate_llama_source(
             "Llama successful run count",
         ));
     }
+    validate_empty_llama_phase(&report.standalone)?;
     Ok(())
+}
+
+fn validate_empty_llama_phase(
+    phase: &LlamaMetalScoreboardPhaseAggregate,
+) -> Result<(), BenchmarkError> {
+    if phase.committed_token_count == 0
+        && phase.successful_invocation_count == 0
+        && phase.host_run_wall_time.is_zero()
+        && phase.host_synchronous_transaction_wall_time.is_zero()
+        && phase.gpu_command_execution_time.is_none()
+        && phase.kernel_launch_count == 0
+        && phase.command_submission_count == 0
+        && phase.command_wait_count == 0
+        && phase.transient_host_api_h2d_calls == 0
+        && phase.transient_host_api_h2d_bytes == 0
+        && phase.runtime_control_host_api_h2d_calls == 0
+        && phase.runtime_control_host_api_h2d_bytes == 0
+        && phase.retained_host_api_d2h_calls == 0
+        && phase.retained_host_api_d2h_bytes == 0
+    {
+        Ok(())
+    } else {
+        Err(BenchmarkError::InvalidSourceReport(
+            "Llama standalone phase is not empty",
+        ))
+    }
 }
 
 fn benchmark_metal_device(device: &MetalDeviceInfo, operating_system: String) -> BenchmarkDevice {
@@ -1037,7 +1080,10 @@ mod tests {
         }
     }
 
-    fn metal_report(runs: Vec<MetalScoreboardRun>) -> MetalSessionScoreboardReport {
+    fn metal_report(
+        workload: &'static str,
+        runs: Vec<MetalScoreboardRun>,
+    ) -> MetalSessionScoreboardReport {
         let first_run_host_wall_time = runs.first().map(|run| run.run_wall_time);
         let steady_run_host_wall_times = runs
             .iter()
@@ -1053,8 +1099,7 @@ mod tests {
             });
         MetalSessionScoreboardReport {
             format_version: METAL_SESSION_SCOREBOARD_FORMAT_VERSION,
-            context: MetalScoreboardContext::new("fixture", "revision", "fixture evidence")
-                .unwrap(),
+            context: MetalScoreboardContext::new(workload, "revision", "fixture evidence").unwrap(),
             deployment_identity: 1,
             capture_identity: 2,
             execution_plan_identity: 3,
@@ -1188,11 +1233,14 @@ mod tests {
 
     #[test]
     fn resnet_metal_adapter_preserves_exact_session_measurements() {
-        let report = metal_report(vec![
-            metal_run(1, 30, Some(12)),
-            metal_run(2, 10, Some(4)),
-            metal_run(3, 20, Some(8)),
-        ]);
+        let report = metal_report(
+            RUSTGRAD_METAL_RESNET18_WORKLOAD,
+            vec![
+                metal_run(1, 30, Some(12)),
+                metal_run(2, 10, Some(4)),
+                metal_run(3, 20, Some(8)),
+            ],
+        );
         let value = BenchmarkObservation::from_metal_session_scoreboard(
             implementation(BenchmarkFramework::RustGrad),
             resnet_workload(),
@@ -1234,7 +1282,10 @@ mod tests {
 
     #[test]
     fn llama_metal_adapter_sums_components_and_uses_global_first_run() {
-        let mut token_step = metal_report(vec![metal_run(1, 70, Some(30))]);
+        let mut token_step = metal_report(
+            RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD,
+            vec![metal_run(1, 70, Some(30))],
+        );
         token_step.state_policy = MetalScoreboardStatePolicy::Append;
         token_step.append_span_rows = 1;
         token_step.planning_wall_time = Duration::new(0, 11);
@@ -1246,7 +1297,10 @@ mod tests {
         token_step.host_api_d2h_calls = 1;
         token_step.host_api_d2h_bytes = 4;
 
-        let mut fixed_prefill = metal_report(vec![metal_run(1, 40, Some(20))]);
+        let mut fixed_prefill = metal_report(
+            RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD,
+            vec![metal_run(1, 40, Some(20))],
+        );
         fixed_prefill.state_policy = MetalScoreboardStatePolicy::Append;
         fixed_prefill.append_span_rows = 4;
         fixed_prefill.planning_wall_time = Duration::new(0, 17);
@@ -1346,11 +1400,28 @@ mod tests {
                 .device_execution_time,
             None
         );
+
+        let mut nonempty_standalone = report.clone();
+        nonempty_standalone.standalone = llama_phase(1, 1, None);
+        assert_eq!(
+            BenchmarkObservation::from_llama_metal_scoreboard(
+                implementation(BenchmarkFramework::RustGrad),
+                llama_workload(),
+                "macOS fixture",
+                &nonempty_standalone,
+            ),
+            Err(BenchmarkError::InvalidSourceReport(
+                "Llama standalone phase is not empty"
+            ))
+        );
     }
 
     #[test]
     fn metal_adapters_reject_wrong_framework_and_workload() {
-        let report = metal_report(vec![metal_run(1, 30, Some(12))]);
+        let report = metal_report(
+            RUSTGRAD_METAL_RESNET18_WORKLOAD,
+            vec![metal_run(1, 30, Some(12))],
+        );
         assert_eq!(
             BenchmarkObservation::from_metal_session_scoreboard(
                 implementation(BenchmarkFramework::Candle),
@@ -1368,6 +1439,19 @@ mod tests {
                 &report,
             ),
             Err(BenchmarkError::WorkloadMismatch)
+        );
+
+        let relabeled = metal_report("linear-1x4", vec![metal_run(1, 30, Some(12))]);
+        assert_eq!(
+            BenchmarkObservation::from_metal_session_scoreboard(
+                implementation(BenchmarkFramework::RustGrad),
+                resnet_workload(),
+                "macOS fixture",
+                &relabeled,
+            ),
+            Err(BenchmarkError::InvalidSourceReport(
+                "workload or implementation revision"
+            ))
         );
     }
 
