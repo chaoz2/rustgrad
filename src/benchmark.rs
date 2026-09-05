@@ -4,6 +4,16 @@
 //! unavailable values.  In particular, `None` means that a runtime did not
 //! provide that measurement, while `Some(0)` is an observed zero.
 
+use crate::{
+    models::transformer::{
+        LLAMA_METAL_EXECUTION_SCOREBOARD_FORMAT_VERSION, LlamaMetalExecutionScoreboardReport,
+        LlamaMetalScoreboardPhaseAggregate, LlamaMetalScoreboardProgram,
+    },
+    runtime::metal::{
+        METAL_SESSION_SCOREBOARD_FORMAT_VERSION, MetalDeviceInfo, MetalHostWallTimeSummary,
+        MetalSessionScoreboardReport,
+    },
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, fmt, time::Duration};
 
@@ -292,6 +302,117 @@ impl BenchmarkObservation {
         Ok(value)
     }
 
+    /// Normalizes an in-memory single-session RustGrad Metal scoreboard.
+    ///
+    /// This adapter is intended for the ResNet-18 comparison workload. The
+    /// caller retains responsibility for supplying the immutable workload,
+    /// implementation, and operating-system provenance.
+    pub fn from_metal_session_scoreboard(
+        implementation: BenchmarkImplementation,
+        workload: BenchmarkWorkload,
+        operating_system: impl Into<String>,
+        report: &MetalSessionScoreboardReport,
+    ) -> Result<Self, BenchmarkError> {
+        require_rustgrad(&implementation)?;
+        if !matches!(&workload, BenchmarkWorkload::ResNet18 { .. }) {
+            return Err(BenchmarkError::WorkloadMismatch);
+        }
+        validate_metal_source(report, &implementation)?;
+        let metrics = BenchmarkMetrics {
+            planning_time: Some(BenchmarkDuration::from_duration(report.planning_wall_time)),
+            pipeline_compile_time: Some(BenchmarkDuration::from_duration(
+                report.cache_miss_pipeline_build_wall_time,
+            )),
+            native_prepare_time: Some(BenchmarkDuration::from_duration(
+                report.native_prepare_wall_time,
+            )),
+            first_run_latency: report
+                .first_run_host_wall_time
+                .map(BenchmarkDuration::from_duration),
+            steady_run_latency: metal_steady_latency(report)?,
+            prompt_prefill: None,
+            steady_decode: None,
+            planned_device_memory_bytes: Some(report.planned_physical_static_tensor_slot_bytes),
+            measured_peak_device_memory_bytes: None,
+            planned_kernel_count: Some(report.planned_kernel_count),
+            executed_kernel_count: Some(report.kernel_launch_count),
+            host_to_device: Some(BenchmarkTransfer {
+                calls: report.host_api_h2d_calls,
+                bytes: report.host_api_h2d_bytes,
+            }),
+            device_to_host: Some(BenchmarkTransfer {
+                calls: report.host_api_d2h_calls,
+                bytes: report.host_api_d2h_bytes,
+            }),
+            fallback_count: Some(report.fallback_count),
+        };
+        Self::new(
+            implementation,
+            workload,
+            benchmark_metal_device(&report.device, operating_system.into()),
+            metrics,
+        )
+    }
+
+    /// Normalizes an in-memory ordered RustGrad Metal Llama scoreboard.
+    ///
+    /// Component preparation, transfer, and executed-launch counters are
+    /// summed with overflow checks. Shared component ownership prevents the v2
+    /// envelope from stating an exact whole-workload planned-memory or planned-
+    /// kernel value, so those fields remain unavailable. The envelope also has
+    /// no comparable global steady-run sample series.
+    pub fn from_llama_metal_scoreboard(
+        implementation: BenchmarkImplementation,
+        workload: BenchmarkWorkload,
+        operating_system: impl Into<String>,
+        report: &LlamaMetalExecutionScoreboardReport,
+    ) -> Result<Self, BenchmarkError> {
+        require_rustgrad(&implementation)?;
+        if !matches!(&workload, BenchmarkWorkload::GgufLlama { .. }) {
+            return Err(BenchmarkError::WorkloadMismatch);
+        }
+        validate_llama_source(report, &implementation)?;
+        let metrics = BenchmarkMetrics {
+            planning_time: Some(BenchmarkDuration::from_duration(sum_component_duration(
+                report,
+                |component| component.planning_wall_time,
+            )?)),
+            pipeline_compile_time: Some(BenchmarkDuration::from_duration(sum_component_duration(
+                report,
+                |component| component.cache_miss_pipeline_build_wall_time,
+            )?)),
+            native_prepare_time: Some(BenchmarkDuration::from_duration(sum_component_duration(
+                report,
+                |component| component.native_prepare_wall_time,
+            )?)),
+            first_run_latency: llama_first_run_latency(report)?,
+            steady_run_latency: None,
+            prompt_prefill: phase_from_llama(&report.prompt_prefill),
+            steady_decode: phase_from_llama(&report.steady_decode),
+            planned_device_memory_bytes: None,
+            measured_peak_device_memory_bytes: None,
+            planned_kernel_count: None,
+            executed_kernel_count: Some(sum_component_usize(report, |component| {
+                component.kernel_launch_count
+            })?),
+            host_to_device: Some(BenchmarkTransfer {
+                calls: sum_component_usize(report, |component| component.host_api_h2d_calls)?,
+                bytes: sum_component_usize(report, |component| component.host_api_h2d_bytes)?,
+            }),
+            device_to_host: Some(BenchmarkTransfer {
+                calls: sum_component_usize(report, |component| component.host_api_d2h_calls)?,
+                bytes: sum_component_usize(report, |component| component.host_api_d2h_bytes)?,
+            }),
+            fallback_count: Some(report.fallback_count),
+        };
+        Self::new(
+            implementation,
+            workload,
+            benchmark_metal_device(&report.token_step.device, operating_system.into()),
+            metrics,
+        )
+    }
+
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, BenchmarkError> {
         let value = serde_json::from_slice::<Self>(bytes)
             .map_err(|error| BenchmarkError::Json(error.to_string()))?;
@@ -405,11 +526,14 @@ pub enum BenchmarkError {
     InvalidTransfer,
     NoMeasurements,
     TooFewObservations,
+    FrameworkMismatch,
     WorkloadMismatch,
     DeviceMismatch,
     DuplicateFramework(BenchmarkFramework),
     MissingBaseline(BenchmarkFramework),
     NonCanonicalOrder,
+    InvalidSourceReport(&'static str),
+    Overflow,
     Json(String),
 }
 
@@ -430,6 +554,9 @@ impl fmt::Display for BenchmarkError {
             Self::TooFewObservations => {
                 f.write_str("benchmark comparison requires at least two observations")
             }
+            Self::FrameworkMismatch => {
+                f.write_str("RustGrad Metal adapters require the rustgrad framework")
+            }
             Self::WorkloadMismatch => f.write_str("benchmark workloads do not match"),
             Self::DeviceMismatch => f.write_str("benchmark devices do not match"),
             Self::DuplicateFramework(framework) => {
@@ -441,6 +568,10 @@ impl fmt::Display for BenchmarkError {
             Self::NonCanonicalOrder => {
                 f.write_str("benchmark observations are not canonically ordered")
             }
+            Self::InvalidSourceReport(field) => {
+                write!(f, "invalid benchmark source report: {field}")
+            }
+            Self::Overflow => f.write_str("benchmark source counter overflow"),
             Self::Json(error) => write!(f, "invalid benchmark JSON: {error}"),
         }
     }
@@ -552,6 +683,232 @@ fn units_per_second(count: usize, elapsed: BenchmarkDuration) -> Option<f64> {
     (count != 0 && nanos != 0).then(|| count as f64 * 1_000_000_000.0 / nanos as f64)
 }
 
+fn require_rustgrad(implementation: &BenchmarkImplementation) -> Result<(), BenchmarkError> {
+    if implementation.framework == BenchmarkFramework::RustGrad {
+        Ok(())
+    } else {
+        Err(BenchmarkError::FrameworkMismatch)
+    }
+}
+
+fn validate_metal_source(
+    report: &MetalSessionScoreboardReport,
+    implementation: &BenchmarkImplementation,
+) -> Result<(), BenchmarkError> {
+    if report.format_version != METAL_SESSION_SCOREBOARD_FORMAT_VERSION {
+        return Err(BenchmarkError::InvalidSourceReport(
+            "Metal scoreboard format version",
+        ));
+    }
+    if report.context.implementation_revision() != implementation.revision.as_str() {
+        return Err(BenchmarkError::InvalidSourceReport(
+            "implementation revision",
+        ));
+    }
+    let run_count =
+        u64::try_from(report.successful_runs.len()).map_err(|_| BenchmarkError::Overflow)?;
+    if report.successful_run_count != run_count
+        || report.first_run_host_wall_time
+            != report.successful_runs.first().map(|run| run.run_wall_time)
+        || report.steady_run_host_wall_times
+            != report
+                .successful_runs
+                .iter()
+                .skip(1)
+                .map(|run| run.run_wall_time)
+                .collect::<Vec<_>>()
+    {
+        return Err(BenchmarkError::InvalidSourceReport(
+            "successful run timing prefix",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_llama_source(
+    report: &LlamaMetalExecutionScoreboardReport,
+    implementation: &BenchmarkImplementation,
+) -> Result<(), BenchmarkError> {
+    if report.format_version != LLAMA_METAL_EXECUTION_SCOREBOARD_FORMAT_VERSION {
+        return Err(BenchmarkError::InvalidSourceReport(
+            "Llama scoreboard format version",
+        ));
+    }
+    validate_metal_source(&report.token_step, implementation)?;
+    if report.context.implementation_revision() != implementation.revision.as_str()
+        || report.context != report.token_step.context
+    {
+        return Err(BenchmarkError::InvalidSourceReport("Llama context"));
+    }
+    if let Some(fixed_prefill) = &report.fixed_prefill {
+        validate_metal_source(fixed_prefill, implementation)?;
+        if fixed_prefill.context != report.context
+            || fixed_prefill.device != report.token_step.device
+        {
+            return Err(BenchmarkError::InvalidSourceReport(
+                "Llama component identity",
+            ));
+        }
+    }
+    if report.successful_run_count
+        != u64::try_from(report.successful_runs.len()).map_err(|_| BenchmarkError::Overflow)?
+    {
+        return Err(BenchmarkError::InvalidSourceReport(
+            "Llama successful run count",
+        ));
+    }
+    Ok(())
+}
+
+fn benchmark_metal_device(device: &MetalDeviceInfo, operating_system: String) -> BenchmarkDevice {
+    BenchmarkDevice {
+        backend: "metal".into(),
+        name: device.name.clone(),
+        hardware_identity: format!(
+            "registry_id={};max_buffer_length={};unified_memory={};family={}",
+            device.registry_id,
+            device.capabilities.max_buffer_length,
+            device.capabilities.unified_memory,
+            device.capabilities.family,
+        ),
+        operating_system,
+    }
+}
+
+fn metal_steady_latency(
+    report: &MetalSessionScoreboardReport,
+) -> Result<Option<BenchmarkLatencySummary>, BenchmarkError> {
+    match (
+        report.steady_run_host_wall_times.is_empty(),
+        &report.steady_run_host_wall_time_summary,
+    ) {
+        (true, None) => Ok(None),
+        (false, Some(summary)) => {
+            let actual =
+                latency_summary_from_metal(report.steady_run_host_wall_times.len(), summary);
+            if Some(actual.clone()) != summarize_durations(&report.steady_run_host_wall_times) {
+                return Err(BenchmarkError::InvalidSourceReport(
+                    "steady run latency summary",
+                ));
+            }
+            Ok(Some(actual))
+        }
+        _ => Err(BenchmarkError::InvalidSourceReport(
+            "steady run latency summary",
+        )),
+    }
+}
+
+fn summarize_durations(samples: &[Duration]) -> Option<BenchmarkLatencySummary> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut ordered = samples.to_vec();
+    ordered.sort_unstable();
+    let nearest_rank = |percentile: usize| {
+        let rank =
+            (ordered.len() / 100) * percentile + ((ordered.len() % 100) * percentile).div_ceil(100);
+        ordered[rank.max(1) - 1]
+    };
+    Some(BenchmarkLatencySummary {
+        sample_count: samples.len(),
+        min: BenchmarkDuration::from_duration(ordered[0]),
+        nearest_rank_p50: BenchmarkDuration::from_duration(nearest_rank(50)),
+        nearest_rank_p95: BenchmarkDuration::from_duration(nearest_rank(95)),
+        max: BenchmarkDuration::from_duration(ordered[ordered.len() - 1]),
+    })
+}
+
+fn latency_summary_from_metal(
+    sample_count: usize,
+    summary: &MetalHostWallTimeSummary,
+) -> BenchmarkLatencySummary {
+    BenchmarkLatencySummary {
+        sample_count,
+        min: BenchmarkDuration::from_duration(summary.min),
+        nearest_rank_p50: BenchmarkDuration::from_duration(summary.nearest_rank_p50),
+        nearest_rank_p95: BenchmarkDuration::from_duration(summary.nearest_rank_p95),
+        max: BenchmarkDuration::from_duration(summary.max),
+    }
+}
+
+fn phase_from_llama(phase: &LlamaMetalScoreboardPhaseAggregate) -> Option<BenchmarkPhase> {
+    (phase.committed_token_count != 0).then(|| BenchmarkPhase {
+        unit_count: phase.committed_token_count,
+        host_wall_time: Some(BenchmarkDuration::from_duration(phase.host_run_wall_time)),
+        device_execution_time: phase
+            .gpu_command_execution_time
+            .map(BenchmarkDuration::from_duration),
+    })
+}
+
+fn llama_first_run_latency(
+    report: &LlamaMetalExecutionScoreboardReport,
+) -> Result<Option<BenchmarkDuration>, BenchmarkError> {
+    let Some(first) = report.successful_runs.first() else {
+        return Ok(None);
+    };
+    if first.successful_invocation != 1 || !first.first_successful_run {
+        return Err(BenchmarkError::InvalidSourceReport(
+            "Llama first successful invocation",
+        ));
+    }
+    let component = match first.program {
+        LlamaMetalScoreboardProgram::TokenStep => &report.token_step,
+        LlamaMetalScoreboardProgram::FixedPrefill => {
+            report
+                .fixed_prefill
+                .as_ref()
+                .ok_or(BenchmarkError::InvalidSourceReport(
+                    "Llama first-run component",
+                ))?
+        }
+    };
+    let index = first
+        .program_successful_invocation
+        .checked_sub(1)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(BenchmarkError::InvalidSourceReport(
+            "Llama first-run local ordinal",
+        ))?;
+    let run = component
+        .successful_runs
+        .get(index)
+        .ok_or(BenchmarkError::InvalidSourceReport(
+            "Llama first-run local record",
+        ))?;
+    if run.successful_invocation != first.program_successful_invocation {
+        return Err(BenchmarkError::InvalidSourceReport(
+            "Llama first-run local record",
+        ));
+    }
+    Ok(Some(BenchmarkDuration::from_duration(run.run_wall_time)))
+}
+
+fn sum_component_duration(
+    report: &LlamaMetalExecutionScoreboardReport,
+    field: impl Fn(&MetalSessionScoreboardReport) -> Duration,
+) -> Result<Duration, BenchmarkError> {
+    match &report.fixed_prefill {
+        Some(fixed_prefill) => field(&report.token_step)
+            .checked_add(field(fixed_prefill))
+            .ok_or(BenchmarkError::Overflow),
+        None => Ok(field(&report.token_step)),
+    }
+}
+
+fn sum_component_usize(
+    report: &LlamaMetalExecutionScoreboardReport,
+    field: impl Fn(&MetalSessionScoreboardReport) -> usize,
+) -> Result<usize, BenchmarkError> {
+    match &report.fixed_prefill {
+        Some(fixed_prefill) => field(&report.token_step)
+            .checked_add(field(fixed_prefill))
+            .ok_or(BenchmarkError::Overflow),
+        None => Ok(field(&report.token_step)),
+    }
+}
+
 fn encode_json(value: &impl Serialize) -> Result<Vec<u8>, BenchmarkError> {
     let mut bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| BenchmarkError::Json(error.to_string()))?;
@@ -562,6 +919,16 @@ fn encode_json(value: &impl Serialize) -> Result<Vec<u8>, BenchmarkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        models::transformer::{
+            LlamaMetalScoreboardInvocation, LlamaMetalScoreboardPhase,
+            LlamaMetalScoreboardPhaseAggregate,
+        },
+        runtime::metal::{
+            MetalCapabilities, MetalDeviceInfo, MetalScoreboardContext, MetalScoreboardRun,
+            MetalScoreboardStatePolicy,
+        },
+    };
 
     fn sha(byte: char) -> String {
         std::iter::repeat_n(byte, 64).collect()
@@ -639,6 +1006,369 @@ mod tests {
         workload: BenchmarkWorkload,
     ) -> BenchmarkObservation {
         BenchmarkObservation::new(implementation(framework), workload, device(), metrics()).unwrap()
+    }
+
+    fn metal_run(
+        successful_invocation: u64,
+        run_nanos: u32,
+        gpu_nanos: Option<u32>,
+    ) -> MetalScoreboardRun {
+        MetalScoreboardRun {
+            successful_invocation,
+            first_successful_run: successful_invocation == 1,
+            run_wall_time: Duration::new(0, run_nanos),
+            synchronous_transaction_wall_time: Duration::new(0, run_nanos / 2),
+            transient_host_api_h2d_calls: 1,
+            transient_host_api_h2d_bytes: 4,
+            runtime_control_host_api_h2d_calls: 0,
+            runtime_control_host_api_h2d_bytes: 0,
+            retained_host_api_d2h_calls: 1,
+            retained_host_api_d2h_bytes: 4,
+            kernel_launch_count: 2,
+            command_submission_count: 1,
+            command_wait_count: 1,
+            gpu_command_execution_time: gpu_nanos.map(|nanos| Duration::new(0, nanos)),
+            zero_item_count: 0,
+            output_count: 1,
+            committed_state_pair_count: 0,
+            committed_state_bytes: 0,
+            committed_state_work_items: 0,
+            committed_state_position: None,
+        }
+    }
+
+    fn metal_report(runs: Vec<MetalScoreboardRun>) -> MetalSessionScoreboardReport {
+        let first_run_host_wall_time = runs.first().map(|run| run.run_wall_time);
+        let steady_run_host_wall_times = runs
+            .iter()
+            .skip(1)
+            .map(|run| run.run_wall_time)
+            .collect::<Vec<_>>();
+        let steady_run_host_wall_time_summary =
+            (!steady_run_host_wall_times.is_empty()).then(|| MetalHostWallTimeSummary {
+                min: *steady_run_host_wall_times.iter().min().unwrap(),
+                nearest_rank_p50: steady_run_host_wall_times[0],
+                nearest_rank_p95: *steady_run_host_wall_times.iter().max().unwrap(),
+                max: *steady_run_host_wall_times.iter().max().unwrap(),
+            });
+        MetalSessionScoreboardReport {
+            format_version: METAL_SESSION_SCOREBOARD_FORMAT_VERSION,
+            context: MetalScoreboardContext::new("fixture", "revision", "fixture evidence")
+                .unwrap(),
+            deployment_identity: 1,
+            capture_identity: 2,
+            execution_plan_identity: 3,
+            device: MetalDeviceInfo {
+                name: "Apple Fixture GPU".into(),
+                registry_id: 42,
+                capabilities: MetalCapabilities {
+                    max_buffer_length: 1 << 30,
+                    unified_memory: true,
+                    family: "apple9".into(),
+                },
+            },
+            inputs: Vec::new(),
+            state_policy: MetalScoreboardStatePolicy::Stateless,
+            append_span_rows: 0,
+            state_pair_count: 0,
+            logical_state_bytes: 0,
+            state_bank_count: 0,
+            state_device_bytes: 0,
+            append_state_row_bytes: 0,
+            append_state_work_items: 0,
+            rendered_cache_keys: vec!["fixture-kernel".into()],
+            requested_output_count: 1,
+            captured_constant_count: 1,
+            captured_constant_bytes: 64,
+            captured_quantized_constant_count: 0,
+            captured_quantized_constant_bytes: 0,
+            declared_resident_input_bytes: 64,
+            declared_transient_input_bytes: 4,
+            declared_runtime_control_input_bytes: 0,
+            planning_wall_time: Duration::new(0, 11),
+            native_prepare_wall_time: Duration::new(0, 13),
+            cache_miss_pipeline_build_wall_time: Duration::new(0, 7),
+            resident_upload_host_wall_time: Duration::new(0, 5),
+            first_run_host_wall_time,
+            steady_run_host_wall_times,
+            steady_run_host_wall_time_summary,
+            first_synchronous_transaction_host_wall_time: runs
+                .first()
+                .map(|run| run.synchronous_transaction_wall_time),
+            steady_synchronous_transaction_host_wall_times: runs
+                .iter()
+                .skip(1)
+                .map(|run| run.synchronous_transaction_wall_time)
+                .collect(),
+            steady_synchronous_transaction_host_wall_time_summary: None,
+            logical_schedule_item_count: 2,
+            peak_logical_temporary_allocation_count: 1,
+            peak_logical_temporary_bytes: 512,
+            planned_physical_static_tensor_slot_count: 2,
+            planned_physical_static_tensor_slot_bytes: 1_024,
+            planned_zero_byte_sentinel_count: 0,
+            planned_kernel_count: 2,
+            planned_zero_item_count: 0,
+            pipeline_cache_request_count: 2,
+            pipeline_cache_hit_count: 0,
+            pipeline_cache_miss_count: 2,
+            resident_host_api_h2d_calls: 1,
+            resident_host_api_h2d_bytes: 64,
+            initial_state_host_api_h2d_calls: 0,
+            initial_state_host_api_h2d_bytes: 0,
+            transient_host_api_h2d_calls: runs.len(),
+            transient_host_api_h2d_bytes: runs.len() * 4,
+            runtime_control_host_api_h2d_calls: 0,
+            runtime_control_host_api_h2d_bytes: 0,
+            retained_host_api_d2h_calls: runs.len(),
+            retained_host_api_d2h_bytes: runs.len() * 4,
+            host_api_h2d_calls: runs.len() + 1,
+            host_api_h2d_bytes: runs.len() * 4 + 64,
+            host_api_d2h_calls: runs.len(),
+            host_api_d2h_bytes: runs.len() * 4,
+            kernel_launch_count: runs.len() * 2,
+            command_submission_count: runs.len(),
+            command_wait_count: runs.len(),
+            gpu_command_execution_time: runs
+                .iter()
+                .map(|run| run.gpu_command_execution_time)
+                .try_fold(Duration::ZERO, |total, value| total.checked_add(value?)),
+            zero_item_count: 0,
+            committed_state_pair_count: 0,
+            committed_state_bytes: 0,
+            committed_state_work_items: 0,
+            committed_state_position: None,
+            successful_run_count: u64::try_from(runs.len()).unwrap(),
+            successful_runs: runs,
+            fallback_count: 0,
+        }
+    }
+
+    fn llama_phase(
+        token_count: usize,
+        host_nanos: u32,
+        gpu_nanos: Option<u32>,
+    ) -> LlamaMetalScoreboardPhaseAggregate {
+        LlamaMetalScoreboardPhaseAggregate {
+            committed_token_count: token_count,
+            successful_invocation_count: 1,
+            host_run_wall_time: Duration::new(0, host_nanos),
+            host_synchronous_transaction_wall_time: Duration::new(0, host_nanos / 2),
+            gpu_command_execution_time: gpu_nanos.map(|nanos| Duration::new(0, nanos)),
+            kernel_launch_count: 2,
+            command_submission_count: 1,
+            command_wait_count: 1,
+            transient_host_api_h2d_calls: 1,
+            transient_host_api_h2d_bytes: 4,
+            runtime_control_host_api_h2d_calls: 0,
+            runtime_control_host_api_h2d_bytes: 0,
+            retained_host_api_d2h_calls: 1,
+            retained_host_api_d2h_bytes: 4,
+        }
+    }
+
+    fn empty_llama_phase() -> LlamaMetalScoreboardPhaseAggregate {
+        LlamaMetalScoreboardPhaseAggregate {
+            committed_token_count: 0,
+            successful_invocation_count: 0,
+            host_run_wall_time: Duration::ZERO,
+            host_synchronous_transaction_wall_time: Duration::ZERO,
+            gpu_command_execution_time: None,
+            kernel_launch_count: 0,
+            command_submission_count: 0,
+            command_wait_count: 0,
+            transient_host_api_h2d_calls: 0,
+            transient_host_api_h2d_bytes: 0,
+            runtime_control_host_api_h2d_calls: 0,
+            runtime_control_host_api_h2d_bytes: 0,
+            retained_host_api_d2h_calls: 0,
+            retained_host_api_d2h_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn resnet_metal_adapter_preserves_exact_session_measurements() {
+        let report = metal_report(vec![
+            metal_run(1, 30, Some(12)),
+            metal_run(2, 10, Some(4)),
+            metal_run(3, 20, Some(8)),
+        ]);
+        let value = BenchmarkObservation::from_metal_session_scoreboard(
+            implementation(BenchmarkFramework::RustGrad),
+            resnet_workload(),
+            "macOS fixture",
+            &report,
+        )
+        .unwrap();
+        assert_eq!(
+            value.device.hardware_identity,
+            "registry_id=42;max_buffer_length=1073741824;unified_memory=true;family=apple9"
+        );
+        assert_eq!(value.metrics.planning_time.unwrap().nanos, 11);
+        assert_eq!(value.metrics.pipeline_compile_time.unwrap().nanos, 7);
+        assert_eq!(value.metrics.native_prepare_time.unwrap().nanos, 13);
+        assert_eq!(value.metrics.first_run_latency.unwrap().nanos, 30);
+        assert_eq!(
+            value.metrics.steady_run_latency.as_ref().unwrap(),
+            &BenchmarkLatencySummary {
+                sample_count: 2,
+                min: BenchmarkDuration::new(0, 10).unwrap(),
+                nearest_rank_p50: BenchmarkDuration::new(0, 10).unwrap(),
+                nearest_rank_p95: BenchmarkDuration::new(0, 20).unwrap(),
+                max: BenchmarkDuration::new(0, 20).unwrap(),
+            }
+        );
+        assert_eq!(value.metrics.planned_device_memory_bytes, Some(1_024));
+        assert_eq!(value.metrics.measured_peak_device_memory_bytes, None);
+        assert_eq!(value.metrics.planned_kernel_count, Some(2));
+        assert_eq!(value.metrics.executed_kernel_count, Some(6));
+        assert_eq!(
+            value.metrics.host_to_device,
+            Some(BenchmarkTransfer {
+                calls: 4,
+                bytes: 76
+            })
+        );
+        assert_eq!(value.metrics.fallback_count, Some(0));
+    }
+
+    #[test]
+    fn llama_metal_adapter_sums_components_and_uses_global_first_run() {
+        let mut token_step = metal_report(vec![metal_run(1, 70, Some(30))]);
+        token_step.state_policy = MetalScoreboardStatePolicy::Append;
+        token_step.append_span_rows = 1;
+        token_step.planning_wall_time = Duration::new(0, 11);
+        token_step.native_prepare_wall_time = Duration::new(0, 13);
+        token_step.cache_miss_pipeline_build_wall_time = Duration::new(0, 7);
+        token_step.kernel_launch_count = 5;
+        token_step.host_api_h2d_calls = 3;
+        token_step.host_api_h2d_bytes = 30;
+        token_step.host_api_d2h_calls = 1;
+        token_step.host_api_d2h_bytes = 4;
+
+        let mut fixed_prefill = metal_report(vec![metal_run(1, 40, Some(20))]);
+        fixed_prefill.state_policy = MetalScoreboardStatePolicy::Append;
+        fixed_prefill.append_span_rows = 4;
+        fixed_prefill.planning_wall_time = Duration::new(0, 17);
+        fixed_prefill.native_prepare_wall_time = Duration::new(0, 19);
+        fixed_prefill.cache_miss_pipeline_build_wall_time = Duration::new(0, 5);
+        fixed_prefill.kernel_launch_count = 7;
+        fixed_prefill.host_api_h2d_calls = 2;
+        fixed_prefill.host_api_h2d_bytes = 20;
+        fixed_prefill.host_api_d2h_calls = 0;
+        fixed_prefill.host_api_d2h_bytes = 0;
+
+        let report = LlamaMetalExecutionScoreboardReport {
+            format_version: LLAMA_METAL_EXECUTION_SCOREBOARD_FORMAT_VERSION,
+            context: token_step.context.clone(),
+            successful_runs: vec![
+                LlamaMetalScoreboardInvocation {
+                    successful_invocation: 1,
+                    first_successful_run: true,
+                    program: LlamaMetalScoreboardProgram::FixedPrefill,
+                    phase: LlamaMetalScoreboardPhase::PromptPrefill,
+                    program_successful_invocation: 1,
+                    append_span_rows: 4,
+                    committed_state_pair_count: 0,
+                    committed_state_bytes: 0,
+                    committed_state_work_items: 0,
+                    committed_state_position: 4,
+                },
+                LlamaMetalScoreboardInvocation {
+                    successful_invocation: 2,
+                    first_successful_run: false,
+                    program: LlamaMetalScoreboardProgram::TokenStep,
+                    phase: LlamaMetalScoreboardPhase::SteadyDecode,
+                    program_successful_invocation: 1,
+                    append_span_rows: 1,
+                    committed_state_pair_count: 0,
+                    committed_state_bytes: 0,
+                    committed_state_work_items: 0,
+                    committed_state_position: 5,
+                },
+            ],
+            successful_run_count: 2,
+            prompt_prefill: llama_phase(4, 40, Some(20)),
+            steady_decode: llama_phase(1, 70, None),
+            standalone: empty_llama_phase(),
+            committed_state_position: 5,
+            committed_state_pair_count: 0,
+            committed_state_bytes: 0,
+            committed_state_work_items: 0,
+            fallback_count: 0,
+            token_step,
+            fixed_prefill: Some(fixed_prefill),
+        };
+        let value = BenchmarkObservation::from_llama_metal_scoreboard(
+            implementation(BenchmarkFramework::RustGrad),
+            llama_workload(),
+            "macOS fixture",
+            &report,
+        )
+        .unwrap();
+        assert_eq!(value.metrics.planning_time.unwrap().nanos, 28);
+        assert_eq!(value.metrics.pipeline_compile_time.unwrap().nanos, 12);
+        assert_eq!(value.metrics.native_prepare_time.unwrap().nanos, 32);
+        assert_eq!(value.metrics.first_run_latency.unwrap().nanos, 40);
+        assert_eq!(value.metrics.steady_run_latency, None);
+        assert_eq!(value.metrics.planned_device_memory_bytes, None);
+        assert_eq!(value.metrics.measured_peak_device_memory_bytes, None);
+        assert_eq!(value.metrics.planned_kernel_count, None);
+        assert_eq!(value.metrics.executed_kernel_count, Some(12));
+        assert_eq!(
+            value.metrics.host_to_device,
+            Some(BenchmarkTransfer {
+                calls: 5,
+                bytes: 50
+            })
+        );
+        assert_eq!(
+            value.metrics.device_to_host,
+            Some(BenchmarkTransfer { calls: 1, bytes: 4 })
+        );
+        assert_eq!(
+            value
+                .metrics
+                .prompt_prefill
+                .as_ref()
+                .unwrap()
+                .device_execution_time
+                .unwrap()
+                .nanos,
+            20
+        );
+        assert_eq!(
+            value
+                .metrics
+                .steady_decode
+                .as_ref()
+                .unwrap()
+                .device_execution_time,
+            None
+        );
+    }
+
+    #[test]
+    fn metal_adapters_reject_wrong_framework_and_workload() {
+        let report = metal_report(vec![metal_run(1, 30, Some(12))]);
+        assert_eq!(
+            BenchmarkObservation::from_metal_session_scoreboard(
+                implementation(BenchmarkFramework::Candle),
+                resnet_workload(),
+                "macOS fixture",
+                &report,
+            ),
+            Err(BenchmarkError::FrameworkMismatch)
+        );
+        assert_eq!(
+            BenchmarkObservation::from_metal_session_scoreboard(
+                implementation(BenchmarkFramework::RustGrad),
+                llama_workload(),
+                "macOS fixture",
+                &report,
+            ),
+            Err(BenchmarkError::WorkloadMismatch)
+        );
     }
 
     #[test]
