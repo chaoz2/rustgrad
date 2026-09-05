@@ -2474,7 +2474,24 @@ fn llama_metal_device_greedy_dense_prefill_matches_cpu_with_one_i32_read() {
     assert_ne!(token_identity, 0);
     assert_ne!(prefill_identity, 0);
 
-    let mut session = plan.prepare().unwrap();
+    let mut session = plan
+        .prepare_with_scoreboard(
+            MetalScoreboardContext::new(
+                "llama-device-greedy-scoreboard",
+                "test-revision",
+                "semantic mock",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        session
+            .execution_scoreboard_report()
+            .unwrap()
+            .unwrap()
+            .successful_run_count,
+        0
+    );
     let prefill_preparation = session.prefill_preparation_report().unwrap();
     assert_eq!(prefill_preparation.resident_h2d_calls, 0);
     assert_eq!(prefill_preparation.initial_state_h2d_calls, 0);
@@ -2533,6 +2550,81 @@ fn llama_metal_device_greedy_dense_prefill_matches_cpu_with_one_i32_read() {
         evidence.steady_decode.retained_d2h_bytes,
         evidence.steady_decode.successful_invocation_count * 4
     );
+    let scoreboard = session.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(
+        scoreboard.successful_run_count,
+        u64::try_from(actual.reports().len()).unwrap()
+    );
+    assert_eq!(
+        scoreboard.prompt_prefill.committed_token_count,
+        prompt.len()
+    );
+    assert_eq!(scoreboard.prompt_prefill.successful_invocation_count, 2);
+    assert_eq!(
+        scoreboard.steady_decode.committed_token_count,
+        actual.reports().len() - 2
+    );
+    assert_eq!(
+        scoreboard.steady_decode.successful_invocation_count,
+        u64::try_from(actual.reports().len() - 2).unwrap()
+    );
+    assert_eq!(scoreboard.standalone.successful_invocation_count, 0);
+    let [fixed_prompt, token_prompt, decode @ ..] = scoreboard.successful_runs.as_slice() else {
+        panic!("device-greedy scoreboard omitted prompt records");
+    };
+    assert_eq!(
+        (
+            fixed_prompt.program,
+            fixed_prompt.phase,
+            fixed_prompt.program_successful_invocation,
+        ),
+        (
+            crate::LlamaMetalScoreboardProgram::FixedPrefill,
+            crate::LlamaMetalScoreboardPhase::PromptPrefill,
+            1,
+        )
+    );
+    assert_eq!(
+        (
+            token_prompt.program,
+            token_prompt.phase,
+            token_prompt.program_successful_invocation,
+        ),
+        (
+            crate::LlamaMetalScoreboardProgram::TokenStep,
+            crate::LlamaMetalScoreboardPhase::PromptPrefill,
+            1,
+        )
+    );
+    assert!(fixed_prompt.first_successful_run);
+    assert!(!token_prompt.first_successful_run);
+    assert!(scoreboard.fixed_prefill.as_ref().unwrap().successful_runs[0].first_successful_run);
+    assert!(scoreboard.token_step.successful_runs[0].first_successful_run);
+    for (index, run) in decode.iter().enumerate() {
+        assert_eq!(run.program, crate::LlamaMetalScoreboardProgram::TokenStep);
+        assert_eq!(run.phase, crate::LlamaMetalScoreboardPhase::SteadyDecode);
+        assert_eq!(
+            run.program_successful_invocation,
+            u64::try_from(index + 2).unwrap()
+        );
+    }
+    assert_eq!(
+        scoreboard.token_step.retained_host_api_d2h_bytes,
+        usize::try_from(scoreboard.token_step.successful_run_count).unwrap() * 4
+    );
+    assert_eq!(
+        scoreboard
+            .fixed_prefill
+            .as_ref()
+            .unwrap()
+            .retained_host_api_d2h_bytes,
+        0
+    );
+    assert!(session.scoreboard_recording_error().is_none());
+    assert_eq!(
+        session.scoreboard_record_attempts(),
+        Some(usize::try_from(scoreboard.token_step.successful_run_count).unwrap())
+    );
 }
 
 #[test]
@@ -2556,11 +2648,62 @@ fn llama_metal_device_greedy_packed_matches_cpu_without_logits_download() {
     assert_eq!(plan.summary().fallback_count, 0);
     assert!(plan.summary().quantized_constant_count > 0);
     let mut session = plan.prepare().unwrap();
+    assert!(session.execution_scoreboard().is_none());
+    assert_eq!(session.execution_scoreboard_report(), Ok(None));
+    assert!(session.scoreboard_recording_error().is_none());
     let actual = session.generate_ids(&[3], 2).unwrap();
     assert_eq!(actual.generation(), &expected);
     assert!(actual.reports().iter().all(|report| {
         report.output_count == 1 && report.retained_d2h_calls == 1 && report.retained_d2h_bytes == 4
     }));
+}
+
+#[test]
+fn llama_metal_device_greedy_scoreboard_failure_is_fail_soft_and_freezes_prefix() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        8,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let device = test_device(Arc::new(MockDispatch::default()));
+    let mut session = LlamaMetalGreedyPlan::from_workflow(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+    )
+    .unwrap()
+    .prepare_with_scoreboard(
+        MetalScoreboardContext::new(
+            "llama-device-greedy-fail-soft",
+            "test-revision",
+            "semantic mock",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    session.inject_scoreboard_recording_error(MetalScoreboardError::Overflow);
+
+    let generation = session.generate_ids(&[3], 2).unwrap();
+    assert_eq!(generation.reports().len(), 2);
+    assert_eq!(session.position(), 2);
+    assert_eq!(session.successful_invocation_count(), 2);
+    assert_eq!(session.scoreboard_record_attempts(), Some(0));
+    assert_eq!(
+        session.scoreboard_recording_error(),
+        Some(&MetalScoreboardError::Overflow)
+    );
+    assert_eq!(
+        session
+            .execution_scoreboard()
+            .unwrap()
+            .report()
+            .unwrap()
+            .successful_run_count,
+        0
+    );
+    assert_eq!(
+        session.execution_scoreboard_report(),
+        Err(MetalScoreboardError::Overflow)
+    );
 }
 
 #[test]

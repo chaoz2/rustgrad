@@ -7,8 +7,8 @@ use rustgrad::runtime::metal::{
 };
 use rustgrad::{
     LlamaMetalExecutionScoreboardReport, LlamaMetalGeneration, LlamaMetalGenerationError,
-    LlamaMetalGenerationStage, LlamaMetalPlan, LlamaMetalWorkloadEvidenceArtifact,
-    LlamaMetalWorkloadEvidenceContext, LlamaPromptWorkflow, LlamaSampling, ReplayInput,
+    LlamaMetalGenerationStage, LlamaMetalGreedyPlan, LlamaMetalWorkloadEvidenceArtifact,
+    LlamaMetalWorkloadEvidenceContext, LlamaPromptWorkflow, ReplayInput,
 };
 use serde::Serialize;
 use std::{
@@ -216,13 +216,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     let cache_entries_before_prepare = cache.len();
     let workflow = LlamaPromptWorkflow::from_path(&args.model_path)?;
     let plan = match args.prefill_span {
-        Some(span_rows) => LlamaMetalPlan::from_workflow_with_prefill_span(
+        Some(span_rows) => LlamaMetalGreedyPlan::from_workflow_with_prefill_span(
             workflow,
             &device,
             MetalPlanOptions::default(),
             span_rows,
         )?,
-        None => LlamaMetalPlan::from_workflow(workflow, &device, MetalPlanOptions::default())?,
+        None => {
+            LlamaMetalGreedyPlan::from_workflow(workflow, &device, MetalPlanOptions::default())?
+        }
     };
     let stable = StablePlanFacts {
         device_info: plan.selected_device_info().clone(),
@@ -284,9 +286,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             LlamaChatRole::User,
             args.prompt.as_str(),
         )?];
-        session.generate_chat(&messages, args.max_new_tokens, LlamaSampling::Greedy)
+        session.generate_chat(&messages, args.max_new_tokens)
     } else {
-        session.generate_text(&args.prompt, args.max_new_tokens, LlamaSampling::Greedy)
+        session.generate_text(&args.prompt, args.max_new_tokens)
     }
     .map_err(generation_error)?;
     let generation = output.generation();
@@ -885,7 +887,7 @@ fn serialize_attestation(attestation: &MetalLlamaAttestation<'_>) -> Result<Vec<
 }
 
 fn validate_stable_session(
-    session: &rustgrad::LlamaMetalSession,
+    session: &rustgrad::LlamaMetalGreedySession,
     expected: &StablePlanFacts,
 ) -> Result<(), io::Error> {
     let cache_keys = session
@@ -934,6 +936,15 @@ fn validate_generation(
     }
     if generation.generated_ids().len() > max_new_tokens {
         return Err(io::Error::other("generation exceeded its token bound"));
+    }
+    if generation
+        .generated_ids()
+        .iter()
+        .any(|token| *token as usize >= vocab_size)
+    {
+        return Err(io::Error::other(
+            "device-greedy generation returned a token outside the vocabulary",
+        ));
     }
     let expected_committed_tokens = if max_new_tokens == 0 {
         0
@@ -986,13 +997,11 @@ fn validate_generation(
             "final device report does not match the committed token position",
         ));
     }
-    let retained_bytes = vocab_size
-        .checked_mul(4)
-        .ok_or_else(|| io::Error::other("retained logits byte count overflow"))?;
+    let retained_bytes = std::mem::size_of::<i32>();
     let prompt_retained_calls: usize = if expected_committed_tokens == 0 { 0 } else { 1 };
     let retained_calls = prompt_retained_calls
         .checked_add(evidence.steady_decode.successful_invocation_count)
-        .ok_or_else(|| io::Error::other("retained logits call count overflow"))?;
+        .ok_or_else(|| io::Error::other("retained token call count overflow"))?;
     let (actual_calls, actual_bytes, actual_outputs) = generation.reports().iter().fold(
         (0usize, 0usize, 0usize),
         |(calls, bytes, outputs), report| {
@@ -1008,7 +1017,7 @@ fn validate_generation(
         || actual_bytes != retained_calls.saturating_mul(retained_bytes)
     {
         return Err(io::Error::other(
-            "generation retained an inconsistent logits projection",
+            "generation retained an inconsistent device-greedy token projection",
         ));
     }
     Ok(())

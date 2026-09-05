@@ -9,7 +9,7 @@ use super::{
         LlamaMetalExecutionScoreboardReport, LlamaMetalScoreboardInvocation,
         LlamaMetalScoreboardPhase, LlamaMetalScoreboardProgram,
     },
-    metal_step::LlamaMetalPrefillPlan,
+    metal_step::{LlamaMetalGreedyStepSession, LlamaMetalPrefillPlan},
     metal_workload_evidence::{LlamaMetalWorkloadEvidence, LlamaMetalWorkloadPhase},
 };
 use crate::{
@@ -61,6 +61,40 @@ struct LlamaMetalPrefillScoreboardObserver {
     first_error: Option<MetalScoreboardError>,
     #[cfg(test)]
     record_attempts: usize,
+}
+
+pub(super) trait LlamaMetalScoreboardStepSession {
+    fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard>;
+    fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError>;
+    fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError);
+}
+
+impl LlamaMetalScoreboardStepSession for LlamaMetalStepSession {
+    fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
+        LlamaMetalStepSession::execution_scoreboard(self)
+    }
+
+    fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
+        LlamaMetalStepSession::scoreboard_recording_error(self)
+    }
+
+    fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError) {
+        LlamaMetalStepSession::freeze_scoreboard_recording(self, error);
+    }
+}
+
+impl LlamaMetalScoreboardStepSession for LlamaMetalGreedyStepSession {
+    fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
+        LlamaMetalGreedyStepSession::execution_scoreboard(self)
+    }
+
+    fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
+        LlamaMetalGreedyStepSession::scoreboard_recording_error(self)
+    }
+
+    fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError) {
+        LlamaMetalGreedyStepSession::freeze_scoreboard_recording(self, error);
+    }
 }
 
 /// Successful prompt ingestion with only its final logits downloaded.
@@ -598,34 +632,12 @@ impl LlamaMetalSession {
     pub fn execution_scoreboard_report(
         &self,
     ) -> Result<Option<LlamaMetalExecutionScoreboardReport>, MetalScoreboardError> {
-        let Some(successful_runs) = &self.scoreboard_invocations else {
-            return Ok(None);
-        };
-        if let Some(error) = self.scoreboard_recording_error() {
-            return Err(error.clone());
-        }
-        let token_step = self
-            .step
-            .execution_scoreboard()
-            .ok_or(MetalScoreboardError::NotBound)?
-            .report()?;
-        let fixed_prefill = self
-            .prefill
-            .as_ref()
-            .and_then(LlamaMetalPrefillSession::execution_scoreboard)
-            .map(MetalSessionScoreboard::report)
-            .transpose()?;
-        LlamaMetalExecutionScoreboardReport::new(token_step, fixed_prefill, successful_runs.clone())
-            .map(Some)
+        execution_scoreboard_report(&self.scoreboard_invocations, &self.step, &self.prefill)
     }
 
     /// Returns the first fail-soft recording error, if one occurred.
     pub fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
-        self.step.scoreboard_recording_error().or_else(|| {
-            self.prefill
-                .as_ref()
-                .and_then(LlamaMetalPrefillSession::scoreboard_recording_error)
-        })
+        scoreboard_recording_error(&self.step, &self.prefill)
     }
 
     #[cfg(test)]
@@ -1158,9 +1170,9 @@ impl LlamaMetalSession {
     }
 }
 
-fn observe_scoreboard_run(
+pub(super) fn observe_scoreboard_run<S: LlamaMetalScoreboardStepSession>(
     scoreboard_invocations: &mut Option<Vec<LlamaMetalScoreboardInvocation>>,
-    step: &mut LlamaMetalStepSession,
+    step: &mut S,
     prefill: &mut Option<LlamaMetalPrefillSession>,
     program: LlamaMetalScoreboardProgram,
     phase: LlamaMetalScoreboardPhase,
@@ -1209,8 +1221,8 @@ fn observe_scoreboard_run(
     }
 }
 
-fn freeze_scoreboard_recording(
-    step: &mut LlamaMetalStepSession,
+pub(super) fn freeze_scoreboard_recording<S: LlamaMetalScoreboardStepSession>(
+    step: &mut S,
     prefill: &mut Option<LlamaMetalPrefillSession>,
     error: MetalScoreboardError,
 ) {
@@ -1218,6 +1230,41 @@ fn freeze_scoreboard_recording(
     if let Some(prefill) = prefill {
         prefill.freeze_scoreboard_recording(error);
     }
+}
+
+pub(super) fn scoreboard_recording_error<'a, S: LlamaMetalScoreboardStepSession>(
+    step: &'a S,
+    prefill: &'a Option<LlamaMetalPrefillSession>,
+) -> Option<&'a MetalScoreboardError> {
+    step.scoreboard_recording_error().or_else(|| {
+        prefill
+            .as_ref()
+            .and_then(LlamaMetalPrefillSession::scoreboard_recording_error)
+    })
+}
+
+pub(super) fn execution_scoreboard_report<S: LlamaMetalScoreboardStepSession>(
+    scoreboard_invocations: &Option<Vec<LlamaMetalScoreboardInvocation>>,
+    step: &S,
+    prefill: &Option<LlamaMetalPrefillSession>,
+) -> Result<Option<LlamaMetalExecutionScoreboardReport>, MetalScoreboardError> {
+    let Some(successful_runs) = scoreboard_invocations else {
+        return Ok(None);
+    };
+    if let Some(error) = scoreboard_recording_error(step, prefill) {
+        return Err(error.clone());
+    }
+    let token_step = step
+        .execution_scoreboard()
+        .ok_or(MetalScoreboardError::NotBound)?
+        .report()?;
+    let fixed_prefill = prefill
+        .as_ref()
+        .and_then(LlamaMetalPrefillSession::execution_scoreboard)
+        .map(MetalSessionScoreboard::report)
+        .transpose()?;
+    LlamaMetalExecutionScoreboardReport::new(token_step, fixed_prefill, successful_runs.clone())
+        .map(Some)
 }
 
 fn authenticate_prefill_pair(

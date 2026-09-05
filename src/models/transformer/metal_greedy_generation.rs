@@ -5,7 +5,12 @@ use super::{
     LlamaMetalGeneration, LlamaMetalGenerationError, LlamaMetalGenerationStage,
     LlamaMetalPromptOutput, LlamaPromptWorkflow,
     metal_generation::{
-        LlamaMetalEvidenceInputs, LlamaMetalPrefillSession, build_workload_evidence, progress,
+        LlamaMetalEvidenceInputs, LlamaMetalPrefillSession, build_workload_evidence,
+        execution_scoreboard_report, observe_scoreboard_run, progress, scoreboard_recording_error,
+    },
+    metal_scoreboard::{
+        LlamaMetalExecutionScoreboardReport, LlamaMetalScoreboardInvocation,
+        LlamaMetalScoreboardPhase, LlamaMetalScoreboardProgram,
     },
     metal_step::{
         LlamaMetalGreedyStepPlan, LlamaMetalGreedyStepSession, LlamaMetalPrefillPlan,
@@ -17,7 +22,8 @@ use crate::{
     CapturedSchedule, ExecutionPlanSummary, ReplayInput,
     runtime::metal::{
         MetalDevice, MetalDeviceInfo, MetalDevicePreparationReport, MetalDeviceRunReport,
-        MetalDeviceSessionSummary, MetalPlanOptions, RenderedMetal,
+        MetalDeviceSessionSummary, MetalPlanOptions, MetalScoreboardContext, MetalScoreboardError,
+        MetalSessionScoreboard, RenderedMetal,
     },
     tokenizer::SimpleTokenizer,
 };
@@ -42,6 +48,7 @@ pub struct LlamaMetalGreedySession {
     fixed_prefill_deployment_identity: Option<u64>,
     committed_position: usize,
     successful_invocations: u64,
+    scoreboard_invocations: Option<Vec<LlamaMetalScoreboardInvocation>>,
     tokenizer: SimpleTokenizer,
     chat_template: LlamaChatTemplate,
 }
@@ -216,6 +223,71 @@ impl LlamaMetalGreedyPlan {
             fixed_prefill_deployment_identity,
             committed_position: 0,
             successful_invocations: 0,
+            scoreboard_invocations: None,
+            tokenizer: self.tokenizer,
+            chat_template: self.chat_template,
+        })
+    }
+
+    /// Creates the device-greedy session with authenticated recorders bound to
+    /// each real physical program before prompt execution begins.
+    pub fn prepare_with_scoreboard(
+        self,
+        context: MetalScoreboardContext,
+    ) -> Result<LlamaMetalGreedySession, LlamaMetalGenerationError> {
+        let token_recorder = MetalSessionScoreboard::try_new_append_state_v4(
+            context.clone(),
+            self.step.append_state_plan(),
+        )?;
+        let token_step_deployment_identity = self.step.deployment_identity();
+        let fixed_prefill_deployment_identity = self
+            .prefill
+            .as_ref()
+            .map(LlamaMetalPrefillPlan::deployment_identity);
+        let prefill_recorder = self.prefill.as_ref().map(|prefill| {
+            MetalSessionScoreboard::new_append_state(context, prefill.append_state_plan())
+        });
+        let shared = self
+            .prefill
+            .as_ref()
+            .map(|prefill| {
+                prefill
+                    .append_state_plan()
+                    .authenticate_shared_from(self.step.append_state_plan())
+            })
+            .transpose()
+            .map_err(LlamaMetalStepError::Metal)?;
+        let mut step = self.step.prepare(self.selected_device.clone())?;
+        step.bind_execution_scoreboard(token_recorder)?;
+        let prefill = match (self.prefill, shared, prefill_recorder) {
+            (Some(prefill), Some(proof), Some(recorder)) => {
+                let span_rows = prefill.span_rows();
+                let token_input_name = prefill.token_input().name.clone();
+                let position_input_name = prefill.position_vector_input().name.clone();
+                let inner = prefill
+                    .into_append_state_plan()
+                    .prepare_shared(self.selected_device, step.metal_session(), proof)
+                    .map_err(LlamaMetalStepError::Metal)?;
+                let mut prefill = LlamaMetalPrefillSession::new(
+                    inner,
+                    span_rows,
+                    token_input_name,
+                    position_input_name,
+                );
+                prefill.bind_execution_scoreboard(recorder)?;
+                Some(prefill)
+            }
+            (None, None, None) => None,
+            _ => unreachable!("fixed prefill proof and recorder follow the optional plan"),
+        };
+        Ok(LlamaMetalGreedySession {
+            step,
+            prefill,
+            token_step_deployment_identity,
+            fixed_prefill_deployment_identity,
+            committed_position: 0,
+            successful_invocations: 0,
+            scoreboard_invocations: Some(Vec::new()),
             tokenizer: self.tokenizer,
             chat_template: self.chat_template,
         })
@@ -223,6 +295,39 @@ impl LlamaMetalGreedyPlan {
 }
 
 impl LlamaMetalGreedySession {
+    /// Returns the bound token-step recorder, or `None` after ordinary
+    /// preparation. Recording never changes a successful generation result.
+    pub fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
+        self.step.execution_scoreboard()
+    }
+
+    /// Returns the authenticated v2 workload report over both physical
+    /// programs and their exact global invocation order.
+    pub fn execution_scoreboard_report(
+        &self,
+    ) -> Result<Option<LlamaMetalExecutionScoreboardReport>, MetalScoreboardError> {
+        execution_scoreboard_report(&self.scoreboard_invocations, &self.step, &self.prefill)
+    }
+
+    /// Returns the first fail-soft recording error, if one occurred.
+    pub fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
+        scoreboard_recording_error(&self.step, &self.prefill)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_scoreboard_recording_error(&mut self, error: MetalScoreboardError) {
+        super::metal_generation::freeze_scoreboard_recording(
+            &mut self.step,
+            &mut self.prefill,
+            error,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scoreboard_record_attempts(&self) -> Option<usize> {
+        self.step.scoreboard_record_attempts()
+    }
+
     pub fn device_info(&self) -> &MetalDeviceInfo {
         self.step.metal_session().device_info()
     }
@@ -380,6 +485,15 @@ impl LlamaMetalGreedySession {
                     .checked_add(1)
                     .ok_or(LlamaGenerationError::ContextOverflow)?;
                 self.successful_invocations = invocation;
+                observe_scoreboard_run(
+                    &mut self.scoreboard_invocations,
+                    &mut self.step,
+                    &mut self.prefill,
+                    LlamaMetalScoreboardProgram::TokenStep,
+                    LlamaMetalScoreboardPhase::SteadyDecode,
+                    1,
+                    &report,
+                );
                 reports.push(report);
                 token = next_token;
             }
@@ -467,6 +581,15 @@ impl LlamaMetalGreedySession {
                     .checked_add(span)
                     .ok_or(LlamaGenerationError::ContextOverflow)?;
                 self.successful_invocations = invocation;
+                observe_scoreboard_run(
+                    &mut self.scoreboard_invocations,
+                    &mut self.step,
+                    &mut self.prefill,
+                    LlamaMetalScoreboardProgram::FixedPrefill,
+                    LlamaMetalScoreboardPhase::PromptPrefill,
+                    span,
+                    &report,
+                );
                 reports.push(report);
                 offset = end;
             }
@@ -496,6 +619,15 @@ impl LlamaMetalGreedySession {
                 .checked_add(1)
                 .ok_or(LlamaGenerationError::ContextOverflow)?;
             self.successful_invocations = invocation;
+            observe_scoreboard_run(
+                &mut self.scoreboard_invocations,
+                &mut self.step,
+                &mut self.prefill,
+                LlamaMetalScoreboardProgram::TokenStep,
+                LlamaMetalScoreboardPhase::PromptPrefill,
+                1,
+                &report,
+            );
             reports.push(report);
         }
         let token_offset = prefix_end;
@@ -523,6 +655,15 @@ impl LlamaMetalGreedySession {
             .checked_add(1)
             .ok_or(LlamaGenerationError::ContextOverflow)?;
         self.successful_invocations = invocation;
+        observe_scoreboard_run(
+            &mut self.scoreboard_invocations,
+            &mut self.step,
+            &mut self.prefill,
+            LlamaMetalScoreboardProgram::TokenStep,
+            LlamaMetalScoreboardPhase::PromptPrefill,
+            1,
+            &report,
+        );
         reports.push(report);
         Ok((selected, reports))
     }

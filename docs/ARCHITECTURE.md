@@ -2679,9 +2679,14 @@ cannot mutate the scoreboard. The scoreboard observes an already-authenticated
 append session; it does not build a token generator, choose samples, or advance
 state independently. Fixed epoch-swapped state remains an explicit follow-up.
 
-`LlamaMetalPlan::prepare_with_scoreboard` snapshots both append-state plans
-before preparation and binds one v7 recorder to each real prepared physical
-session. Fixed-prefill chunks and retained-logit or host-output-suppressed T=1
+`LlamaMetalPlan::prepare_with_scoreboard` and
+`LlamaMetalGreedyPlan::prepare_with_scoreboard` snapshot both append-state
+plans before preparation and bind one v7 recorder to each real prepared
+physical session. Their host-logits and device-greedy T=1 sessions delegate
+bind, observe, fail-soft freeze, error inspection, and focused test counters to
+one crate-private `LlamaMetalScoreboardObserver`; the outer coordinator shares
+the same global/local join and report construction for both facades.
+Fixed-prefill chunks and retained-logit, output-suppressed, or checked-I32 T=1
 invocations pass their authenticated `MetalDeviceRun` to the matching recorder
 before detaching the public report. `LlamaMetalExecutionScoreboardReport` v2
 then links those local records into the outer coordinator's global success
@@ -2689,8 +2694,11 @@ order with program tags and exact span, committed position, byte, and work-item
 facts. Each component retains its own deployment/session identity, local
 ordinal, and physical first-run attribution; only the envelope names the first
 success across the workload. A separate closed workload phase labels direct
-`run_token` calls as standalone, prompt chunks/tails/final logits as prompt
-prefill, and generated-token feedback invocations as steady decode. Checked
+host-logits `run_token` calls as standalone, prompt chunks/tails/final logits or
+the final prompt greedy-selection invocation as prompt prefill, and only
+generated-token feedback invocations after that first selection as steady
+decode. High-level greedy generation therefore reports zero standalone work.
+Checked
 phase aggregates join each label back to the exact physical component run and
 sum committed rows, invocations, host-run and synchronous-transaction wall
 time, all-or-none compute-command GPU time, launches, submissions/waits, and
@@ -2766,10 +2774,13 @@ is in `[0, vocab_size)`. Thus every selecting invocation transfers exactly one
 four-byte token, while state-only prompt commits transfer no output. The
 optional fixed-span prefill plan shares the same authenticated residents, K/V
 buffers, and command queue, and complete prefix chunks remain output-free.
-Dense and supported packed GGUF weights both retain zero fallback. The existing
-`LlamaMetalPlan` remains the host-logits facade for greedy and explicit-tape
-Gumbel selection, its continuation seams, and the ordered fixed-prefill/T=1
-execution scoreboard.
+Dense and supported packed GGUF weights both retain zero fallback. The greedy
+plan/session expose the same authenticated v2 fixed-prefill/T=1 execution
+scoreboard and fail-soft recording contract as the host-logits facade. The
+maintained `metal_llama_generate` CLI uses this device-greedy session, so every
+selecting prompt or decode invocation retains only the checked four-byte I32
+token. The existing `LlamaMetalPlan` remains the separate host-logits facade
+for greedy and explicit-tape Gumbel selection and its continuation seams.
 
 Each successfully executed token invocation is a durable append-state commit.
 Therefore a later launch, wait, read, selection, or decode failure cannot
