@@ -102,13 +102,15 @@ of silently testing the newer revision.
 
 ## Evidence boundary
 
-A successful Linear/ResNet job uploads two v4 scoreboards. A successful Llama
+A successful Linear/ResNet job uploads two v6 scoreboards. A successful Llama
 job uploads versioned workload evidence for its token-step and fixed-span
 programs, a typed provenance attestation, and `SHA256SUMS`. Preserve the
 workflow run URL and ID with any release record.
 
-The reported durations are host wall time, and copy counts are host API calls.
-Host-observed tokens per second is derived only from those workload wall-clock
-durations. It does not establish GPU timing, energy use, allocator RSS, or
-physical bus traffic. Pinned token IDs demonstrate only the configured model,
-prompt, and oracle contract; they are not broad cross-runtime parity.
+Host-wall durations and optional completed-compute-command GPU execution time
+are reported separately, and copy counts are host API calls. Host-observed
+tokens per second is derived only from workload wall-clock durations. Command
+time does not establish end-to-end GPU latency or throughput, copy time, energy
+use, allocator RSS, or physical bus traffic. Pinned token IDs demonstrate only
+the configured model, prompt, and oracle contract; they are not broad
+cross-runtime parity.

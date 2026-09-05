@@ -115,10 +115,12 @@ println!("steady run: {:?}", second.report());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The lower-level session and opt-in v5 scoreboard distinguish kernel encodes
-from compute-command submissions and waits. These host-observed counts exclude
-copy command buffers and do not claim GPU time, live speedup, physical bus
-traffic, allocator RSS, energy, or throughput.
+The lower-level session and opt-in v6 scoreboard distinguish kernel encodes
+from compute-command submissions and waits, and report an optional exact sum of
+completed compute-command `GPUStartTime`/`GPUEndTime` intervals. Unavailable,
+invalid, or unrepresentable timestamp sets remain absent rather than becoming
+zero. Copy command buffers are excluded; command time is not end-to-end
+throughput, physical bus traffic, allocator RSS, or energy.
 
 Dense-or-packed F32 GGUF Llama models also have a typed persistent Metal
 prompt-to-tokens facade. One GGUF parse owns the matching model, tokenizer, and
