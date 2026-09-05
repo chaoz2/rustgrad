@@ -26,6 +26,7 @@ jobs:
       RUSTGRAD_METAL_EXPECTED_SHA: ${{ inputs.expected_sha }}
       RUSTGRAD_METAL_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-linear-scoreboard.json
       RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-resnet18-scoreboard.json
+      RUSTGRAD_METAL_RESNET_OBSERVATION_PATH: ${{ github.workspace }}/metal-live-resnet18-observation-v1.json
       RUSTGRAD_METAL_RESNET_RUNS: "10"
     steps:
       - name: Validate requested revision
@@ -48,11 +49,27 @@ jobs:
       - name: Authenticate checkout
         shell: bash
         run: |
+          set -euo pipefail
           actual_sha="$(git rev-parse HEAD)"
           if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
             echo "checked-out revision does not match expected_sha" >&2
             exit 1
           fi
+          for output_path in \
+            "$RUSTGRAD_METAL_SCOREBOARD_PATH" \
+            "$RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH" \
+            "$RUSTGRAD_METAL_RESNET_OBSERVATION_PATH"; do
+            if [[ -e "$output_path" || -L "$output_path" ]]; then
+              echo "live Metal evidence path already exists: $output_path" >&2
+              exit 1
+            fi
+          done
+          os_label="macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)); $(uname -m)"
+          if [[ "$os_label" == *$'\n'* || "$os_label" == *$'\r'* ]]; then
+            echo "runner operating-system label must be single-line" >&2
+            exit 1
+          fi
+          printf 'RUSTGRAD_METAL_RESNET_OPERATING_SYSTEM=%s\n' "$os_label" >> "$GITHUB_ENV"
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05
         with:
@@ -71,13 +88,15 @@ jobs:
         run: |
           cat "$RUSTGRAD_METAL_SCOREBOARD_PATH"
           cat "$RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH"
-      - name: Upload live Metal scoreboard
+          cat "$RUSTGRAD_METAL_RESNET_OBSERVATION_PATH"
+      - name: Upload live Metal evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: metal-live-${{ inputs.expected_sha }}
           path: |
             ${{ env.RUSTGRAD_METAL_SCOREBOARD_PATH }}
             ${{ env.RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH }}
+            ${{ env.RUSTGRAD_METAL_RESNET_OBSERVATION_PATH }}
           if-no-files-found: error
           retention-days: 30
 

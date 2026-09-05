@@ -99,7 +99,12 @@ environment. The benchmark executes the complete initialized body with one
 deterministic image, computes one complete CPU oracle, compares finite logits
 under a documented F32 native-compilation tolerance, and records ten persistent
 session runs by default without duplicating the full execution elsewhere in the
-workflow. A separate job authenticates the selected Metal registry ID and
+workflow. It publishes both the authentic scoreboard v7 and a create-new
+normalized `BenchmarkObservation` v1 bound to the exact revision, deterministic
+model identity and checked-in raw little-endian F32 input-payload SHA-256,
+selected Metal device, runner OS, and command/configuration; unavailable metrics
+remain null. A separate job authenticates the selected
+Metal registry ID and
 runner-local GGUF bytes against protected values, uses an independently pinned
 prompt and greedy token IDs, checks the persistent token-step
 ownership/transfer contract, and emits its own device-greedy Llama execution
@@ -122,8 +127,10 @@ The normalized comparison plumbing is delivered: `BenchmarkObservation` and
 `BenchmarkComparison` version 1, the two RustGrad Metal scoreboard adapters, and
 the offline `benchmark_compare` CLI require exact workload/device identity and an
 explicit included baseline while preserving unavailable fields as null. They do
-not run workloads or derive speedups. Because the protected lane remains dormant,
-actual live Apple-GPU comparison measurements are still absent.
+not run workloads or derive speedups. The ResNet live harness now emits its
+normalized RustGrad observation directly from the validated in-memory scoreboard,
+but because the protected lane remains dormant, actual live Apple-GPU comparison
+measurements are still absent.
 
 ### 2. P0 — ResNet-18 Metal conformance
 
