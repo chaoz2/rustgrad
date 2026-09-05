@@ -59,24 +59,34 @@ capture-authenticated checkpoint bytes restore values and their exact logical
 versions into that same runtime rather than creating a host optimizer path.
 The module-bound AdamW entry point maps canonical trainable identities directly
 onto that frontier, retains tied weights once, and captures frozen state as
-immutable program data; the tiny Transformer vertical is now the next proof.
+immutable program data. This CPU runtime and its deterministic checkpoint
+boundary are delivered; new optimizer work now requires the Transformer
+workload to demonstrate the need.
 
 ### 2. P0 — tiny Transformer training and exact resume
 
-Train a small causal Transformer from random initialization through the public
-runtime. Use this workload to close only demonstrated autograd gaps in
-embedding, attention, normalization, reductions, broadcasting, views, and
-indexing. Add first-class parameter freezing, tied weights, gradient
-accumulation/zeroing, microbatches, and clipping as the workload requires. The
-acceptance must show decreasing loss and exact checkpoint/resume continuity.
+The protected tiny causal Transformer now trains from deterministic random
+initialization through embedding, causal attention, LayerNorm, tied output
+weights, cross-entropy, one batched reverse traversal, and captured AdamW.
+Eight CPU steps decrease loss, and recompilation from the midpoint checkpoint
+continues with exact outputs and recurrent parameter/moment state. First-class
+gradient accumulation/zeroing, microbatches, clipping, and broader freezing
+semantics remain the next CPU training-runtime work only when this workload or
+its immediate scale-up requires them.
 
 ### 3. P1 — lower the identical training capture to Metal
 
-After CPU replay is correct and checkpointable, execute the same captured
-training program and recurrent-state ownership model on Apple Metal with no
-silent CPU fallback. Preserve inspectable schedules, kernels, state versions,
-memory plans, and failure-atomic commits rather than adding a parallel training
-API.
+The same captured loss/backward/AdamW program now passes strict Metal admission
+with zero fallback and initializes parameter, first/second-moment, and U64-step
+state in failure-atomic epoch-swapped device banks. The checked-in protected
+Apple-GPU acceptance executes eight tiny-Transformer steps, proves decreasing
+loss, checkpoints at step four, prepares a second Metal session from those
+bytes, and requires exact continued outputs and final checkpoint equality. Its
+create-new evidence records the selected device, capture/deployment identities,
+kernel/command/transfer counts, loss endpoints, and resume result. Running that
+manual exact-SHA lane on provisioned Apple hardware is the remaining proof;
+generic epoch-state scoreboard integration follows rather than a parallel
+training API.
 
 ## Deferred hardware inference queue
 
