@@ -21,6 +21,7 @@ mod generation;
 mod layer;
 mod metal_generation;
 mod metal_step;
+mod metal_workload_evidence;
 mod model;
 mod native;
 mod native_generation;
@@ -44,11 +45,15 @@ pub use generation::{LlamaGeneration, LlamaGenerationError, LlamaGenerator, Llam
 pub use metal_generation::{
     LlamaMetalGeneration, LlamaMetalGenerationError, LlamaMetalGenerationStage, LlamaMetalPlan,
     LlamaMetalPrefill, LlamaMetalProgress, LlamaMetalPromptOutput, LlamaMetalSession,
-    LlamaMetalWorkloadEvidence, LlamaMetalWorkloadPhase,
 };
 pub use metal_step::{
     LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
     LlamaMetalTokenCommit,
+};
+pub use metal_workload_evidence::{
+    LLAMA_METAL_WORKLOAD_EVIDENCE_FORMAT_VERSION, LlamaMetalWorkloadEvidence,
+    LlamaMetalWorkloadEvidenceArtifact, LlamaMetalWorkloadEvidenceContext,
+    LlamaMetalWorkloadEvidenceError, LlamaMetalWorkloadPhase,
 };
 pub use model::{
     LlamaLinearWeight, LlamaModel, LlamaModelCache, LlamaModelConfig, LlamaModelError,

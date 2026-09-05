@@ -353,7 +353,6 @@ impl LlamaMetalPrefillPlan {
         })
     }
 
-    #[cfg(test)]
     pub(crate) const fn deployment_identity(&self) -> u64 {
         self.inner.deployment_identity()
     }

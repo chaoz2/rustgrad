@@ -1334,6 +1334,10 @@ pub(crate) struct MetalSharedAppendSession {
 }
 
 impl MetalSharedAppendSession {
+    pub(crate) fn summary(&self) -> &MetalDeviceSessionSummary {
+        self.inner.summary()
+    }
+
     pub(crate) fn preparation_report(&self) -> &MetalDevicePreparationReport {
         self.inner.preparation_report()
     }
