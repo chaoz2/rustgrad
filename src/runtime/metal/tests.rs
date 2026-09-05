@@ -1206,7 +1206,7 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert_eq!(second.report().committed_state_position, Some(2));
     scoreboard.record(&second).unwrap();
     let report = scoreboard.report().unwrap();
-    assert_eq!(report.format_version, 6);
+    assert_eq!(report.format_version, 7);
     assert_eq!(report.successful_run_count, 2);
     assert_eq!(
         report.gpu_command_execution_time,
@@ -1548,13 +1548,12 @@ fn metal_append_state_fixed_span_commits_consecutive_rows_and_retries_tail() {
         error.to_string(),
         "Metal token-step scoreboard requires one appended row per successful invocation; got a span of 3 rows"
     );
-    let mut legacy_scoreboard = MetalSessionScoreboard::new_append_state(context(), &plan);
+    let mut scoreboard = MetalSessionScoreboard::new_append_state(context(), &plan);
+    let mut rejected = MetalSessionScoreboard::new_append_state(context(), &plan);
     let mock = Arc::new(MockDispatch::default());
     let mut session = plan.prepare(test_device(mock.clone())).unwrap();
-    assert_eq!(
-        legacy_scoreboard.bind(&session),
-        Err(MetalScoreboardError::UnsupportedAppendSpan { span_rows: 3 })
-    );
+    scoreboard.bind(&session).unwrap();
+    rejected.bind(&session).unwrap();
 
     let invocation = |position: i32, values: [f32; 6]| {
         BTreeMap::from([
@@ -1576,10 +1575,33 @@ fn metal_append_state_fixed_span_commits_consecutive_rows_and_retries_tail() {
     assert_eq!(first.report().committed_state_bytes, 24);
     assert_eq!(first.report().committed_state_work_items, 6);
     assert_eq!(session.committed_state_position(), Some(3));
+    assert_eq!(
+        rejected.record_from_position(&first, 1),
+        Err(MetalScoreboardError::StateOutOfOrder {
+            expected: Some(4),
+            actual: Some(3),
+        })
+    );
+    assert_eq!(rejected.report().unwrap().successful_run_count, 0);
+    assert_eq!(
+        rejected.record_from_position(&first, usize::MAX),
+        Err(MetalScoreboardError::Overflow)
+    );
+    assert_eq!(rejected.report().unwrap().successful_run_count, 0);
+    scoreboard.record(&first).unwrap();
     let second = session
         .run(&invocation(3, [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]))
         .unwrap();
     assert_eq!(second.report().committed_state_position, Some(6));
+    scoreboard.record(&second).unwrap();
+    let scoreboard_report = scoreboard.report().unwrap();
+    assert_eq!(scoreboard_report.append_span_rows, 3);
+    assert_eq!(scoreboard_report.append_state_row_bytes, 24);
+    assert_eq!(scoreboard_report.append_state_work_items, 6);
+    assert_eq!(scoreboard_report.successful_run_count, 2);
+    assert_eq!(scoreboard_report.committed_state_position, Some(6));
+    assert_eq!(scoreboard_report.committed_state_bytes, 48);
+    assert_eq!(scoreboard_report.committed_state_work_items, 12);
     assert_eq!(
         second.outputs()[0],
         TensorData::new(
@@ -1599,6 +1621,7 @@ fn metal_append_state_fixed_span_commits_consecutive_rows_and_retries_tail() {
     assert_eq!(mock.calls().len(), calls);
     assert_eq!(session.committed_state_position(), Some(6));
     assert_eq!(session.successful_run_count(), 2);
+    assert_eq!(scoreboard.report().unwrap(), scoreboard_report);
 }
 
 #[test]
@@ -2750,6 +2773,209 @@ fn llama_metal_prefill_chunk_failure_is_typed_atomic_and_retryable() {
 }
 
 #[test]
+fn llama_metal_fixed_span_scoreboard_preserves_component_identity_and_global_order() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        8,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let mut session = crate::models::transformer::LlamaMetalPlan::from_workflow_with_prefill_span(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+        NonZeroUsize::new(3).unwrap(),
+    )
+    .unwrap()
+    .prepare_with_scoreboard(
+        MetalScoreboardContext::new("llama-fixed-prefill", "test-revision", "semantic mock")
+            .unwrap(),
+    )
+    .unwrap();
+
+    let empty = session.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(empty.format_version, 1);
+    assert_eq!(empty.successful_run_count, 0);
+    assert_eq!(empty.committed_state_position, 0);
+    assert_eq!(empty.token_step.append_span_rows, 1);
+    assert_eq!(empty.token_step.successful_run_count, 0);
+    assert_eq!(empty.fixed_prefill.as_ref().unwrap().append_span_rows, 3);
+    assert_eq!(
+        empty.fixed_prefill.as_ref().unwrap().successful_run_count,
+        0
+    );
+    assert_ne!(
+        empty.token_step.deployment_identity,
+        empty.fixed_prefill.as_ref().unwrap().deployment_identity
+    );
+
+    mock.state.lock().unwrap().failures.launch = Some("fixed prefill launch");
+    assert!(session.prefill_ids(&[3, 4, 5, 6]).is_err());
+    assert_eq!(session.position(), 0);
+    assert_eq!(
+        session.execution_scoreboard_report().unwrap().unwrap(),
+        empty
+    );
+
+    mock.clear_failures();
+    let prefill = session.prefill_ids(&[3, 4, 5, 6]).unwrap();
+    assert_eq!(prefill.reports().len(), 2);
+    let report = session.execution_scoreboard_report().unwrap().unwrap();
+    let fixed = report.fixed_prefill.as_ref().unwrap();
+    assert_eq!(report.successful_run_count, 2);
+    assert_eq!(report.committed_state_position, 4);
+    assert_eq!(report.fallback_count, 0);
+    assert_eq!(fixed.successful_run_count, 1);
+    assert_eq!(fixed.committed_state_position, Some(3));
+    assert_eq!(report.token_step.successful_run_count, 1);
+    assert_eq!(report.token_step.committed_state_position, Some(4));
+    assert_eq!(fixed.successful_runs[0].successful_invocation, 1);
+    assert!(fixed.successful_runs[0].first_successful_run);
+    assert_eq!(
+        report.token_step.successful_runs[0].successful_invocation,
+        1
+    );
+    assert!(report.token_step.successful_runs[0].first_successful_run);
+    assert_eq!(
+        report
+            .successful_runs
+            .iter()
+            .map(|run| (
+                run.successful_invocation,
+                run.first_successful_run,
+                run.program,
+                run.program_successful_invocation,
+                run.append_span_rows,
+                run.committed_state_position,
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                1,
+                true,
+                crate::LlamaMetalScoreboardProgram::FixedPrefill,
+                1,
+                3,
+                3,
+            ),
+            (
+                2,
+                false,
+                crate::LlamaMetalScoreboardProgram::TokenStep,
+                1,
+                1,
+                4,
+            ),
+        ]
+    );
+    assert_eq!(
+        report.successful_runs[0].committed_state_bytes,
+        fixed.append_state_row_bytes
+    );
+    assert_eq!(
+        report.successful_runs[0].committed_state_work_items,
+        fixed.append_state_work_items
+    );
+    assert_eq!(
+        report.successful_runs[1].committed_state_bytes,
+        report.token_step.append_state_row_bytes
+    );
+    assert_eq!(
+        report.successful_runs[1].committed_state_work_items,
+        report.token_step.append_state_work_items
+    );
+    assert_eq!(
+        report.committed_state_bytes,
+        prefill
+            .reports()
+            .iter()
+            .map(|run| run.committed_state_bytes)
+            .sum::<usize>()
+    );
+    assert_eq!(
+        report.committed_state_work_items,
+        prefill
+            .reports()
+            .iter()
+            .map(|run| run.committed_state_work_items)
+            .sum::<usize>()
+    );
+    let json: serde_json::Value = serde_json::from_slice(&report.to_json_bytes().unwrap()).unwrap();
+    assert_eq!(json["format_version"], 1);
+    assert_eq!(json["successful_runs"][0]["program"], "fixed_prefill");
+    assert_eq!(json["successful_runs"][0]["append_span_rows"], 3);
+    assert_eq!(json["successful_runs"][1]["program"], "token_step");
+    assert_eq!(json["successful_runs"][1]["committed_state_position"], 4);
+
+    let mut wrong_span = fixed.clone();
+    wrong_span.append_span_rows = 2;
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            Some(wrong_span),
+            report.successful_runs.clone(),
+        ),
+        Err(MetalScoreboardError::StateCommitMismatch)
+    );
+    let mut wrong_position = report.successful_runs.clone();
+    wrong_position[0].committed_state_position = 4;
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            report.fixed_prefill.clone(),
+            wrong_position,
+        ),
+        Err(MetalScoreboardError::StateCommitMismatch)
+    );
+    let mut wrong_bytes = report.successful_runs.clone();
+    wrong_bytes[0].committed_state_bytes += 1;
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            report.fixed_prefill.clone(),
+            wrong_bytes,
+        ),
+        Err(MetalScoreboardError::StateCommitMismatch)
+    );
+    let mut wrong_work_items = report.successful_runs.clone();
+    wrong_work_items[1].committed_state_work_items += 1;
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            report.fixed_prefill.clone(),
+            wrong_work_items,
+        ),
+        Err(MetalScoreboardError::StateCommitMismatch)
+    );
+    let mut wrong_order = report.successful_runs.clone();
+    wrong_order.swap(0, 1);
+    assert!(matches!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            report.fixed_prefill.clone(),
+            wrong_order,
+        ),
+        Err(MetalScoreboardError::OutOfOrder { .. })
+    ));
+    let mut overflow_fixed = fixed.clone();
+    overflow_fixed.append_span_rows = usize::MAX;
+    overflow_fixed.successful_runs[0].committed_state_position = Some(usize::MAX);
+    overflow_fixed.committed_state_position = Some(usize::MAX);
+    let mut overflow_runs = report.successful_runs.clone();
+    overflow_runs[0].append_span_rows = usize::MAX;
+    overflow_runs[0].committed_state_position = usize::MAX;
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            Some(overflow_fixed),
+            overflow_runs,
+        ),
+        Err(MetalScoreboardError::Overflow)
+    );
+    assert!(session.scoreboard_recording_error().is_none());
+}
+
+#[test]
 fn llama_metal_prompt_facade_preflights_and_reports_partial_commits() {
     let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
         16,
@@ -3011,7 +3237,7 @@ fn llama_metal_scoreboard_records_exact_token_execution_prefix_fail_soft() {
         )
         .unwrap();
     let empty = session.execution_scoreboard().unwrap().report().unwrap();
-    assert_eq!(empty.format_version, 6);
+    assert_eq!(empty.format_version, 7);
     assert_eq!(empty.successful_run_count, 0);
     assert_eq!(empty.committed_state_position, Some(0));
     assert!(session.scoreboard_recording_error().is_none());

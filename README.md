@@ -115,7 +115,7 @@ println!("steady run: {:?}", second.report());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The lower-level session and opt-in v6 scoreboard distinguish kernel encodes
+The lower-level session and opt-in v7 scoreboard distinguish kernel encodes
 from compute-command submissions and waits, and report an optional exact sum of
 completed compute-command `GPUStartTime`/`GPUEndTime` intervals. Unavailable,
 invalid, or unrepresentable timestamp sets remain absent rather than becoming
@@ -148,9 +148,13 @@ println!("{}", output.generation().decoded());
 The greedy facade reduces finite logits on device and downloads one checked I32
 token per selecting invocation. An opt-in fixed span executes complete prompt
 chunks while sharing the same resident weights, K/V cache, and command queue.
-`LlamaMetalPlan` remains the explicit host-logits facade for Gumbel sampling and
-the v5 token-step scoreboard. Commits are atomic per device invocation, but a
-later failure does not roll back an already committed prefix.
+`LlamaMetalPlan` remains the explicit host-logits facade for Gumbel sampling.
+Its opt-in Llama execution scoreboard can cover fixed-span prompt chunks and
+T=1 tail/decode work together: each physical program keeps its own authenticated
+v7 session report and identity, while a v1 workload envelope records the exact
+global order, committed positions, spans, bytes, and work items. Commits are
+atomic per device invocation, but a later failure does not roll back an already
+committed prefix.
 Current protected evidence is semantic-mock only; the maintained
 `metal_llama_generate` example is the manual live-lane entry point:
 

@@ -2598,9 +2598,10 @@ uncommitted rows provisional; retry uses the same start and overwrites the
 complete span, while the successful-run count, committed position, outputs,
 and metrics advance only after all launches, waits, public downloads, decoding,
 and projection succeed. A zero non-axis payload remains addressless but advances
-by the authenticated span. Scoreboard v6 remains one-row-only: maintained paths
-can reject larger spans before preparation and legacy construction rejects them
-at bind without changing its JSON semantics.
+by the authenticated span. Scoreboard v7 records any authenticated fixed span,
+requires the exact caller-owned start plus span as the committed end, and checks
+the plan's exact per-span bytes and work items before extending its prefix. The
+legacy fallible token-step constructor still rejects spans larger than one.
 This is not generic in-place Scatter, dynamic state, or alias permission.
 
 The Llama capture may consume a private seal over that exact shared dense I32
@@ -2646,7 +2647,7 @@ reach no driver work; a failed execution publishes neither outputs nor a
 successful-run metric and the settled prefix remains retryable. Zero-work
 captures allocate, compile, upload, launch, wait, and read nothing.
 
-`MetalSessionScoreboard` v6 is an opt-in observation layer over that existing
+`MetalSessionScoreboard` v7 is an opt-in observation layer over that existing
 evidence. It snapshots either a stateless `MetalInferencePlan` or an
 append-only `MetalAppendStateInferencePlan`, binds once to the exact prepared
 deployment/session identity, and accepts only its consecutive successful
@@ -2661,8 +2662,9 @@ JSON includes caller-labelled workload, implementation revision, evidence
 provenance, selected handle-free device, captured resident/state/transient
 and runtime-control descriptors, distinct dense-tensor and packed-GGUF captured
 constant counts and raw bytes, one-time initial-state writes, logical
-schedule/peak-live facts, and physical Metal slot/state-bank facts. Version 6
-adds per-run and all-or-none overflow-checked aggregate GPU command execution
+schedule/peak-live facts, and physical Metal slot/state-bank facts. Version 7
+adds the authenticated `append_span_rows` field and permits fixed-span append
+recording; version 6 added per-run and all-or-none overflow-checked aggregate GPU command execution
 time while retaining version 5's compute-only submission/wait counters and
 version 4's distinct runtime-control fields; copy command buffers are not counted or timed.
 `planning_wall_time` is planning and rendering; `native_prepare_wall_time`
@@ -2677,15 +2679,19 @@ cannot mutate the scoreboard. The scoreboard observes an already-authenticated
 append session; it does not build a token generator, choose samples, or advance
 state independently. Fixed epoch-swapped state remains an explicit follow-up.
 
-`LlamaMetalPlan::prepare_with_scoreboard` snapshots that exact append-state
-step plan before preparation, then binds the v6 recorder to the fresh prepared
-session before returning it. Both retained-logit and host-output-suppressed
-token invocations pass their authenticated `MetalDeviceRun` to the recorder
-before detaching the public report. Recording is fail-soft: the first recorder
-error is inspectable, freezes the valid recorded prefix, and prevents later
+`LlamaMetalPlan::prepare_with_scoreboard` snapshots both append-state plans
+before preparation and binds one v7 recorder to each real prepared physical
+session. Fixed-prefill chunks and retained-logit or host-output-suppressed T=1
+invocations pass their authenticated `MetalDeviceRun` to the matching recorder
+before detaching the public report. `LlamaMetalExecutionScoreboardReport` v1
+then links those local records into the outer coordinator's global success
+order with program tags and exact span, committed position, byte, and work-item
+facts. Each component retains its own deployment/session identity, local
+ordinal, and physical first-run attribution; only the envelope names the first
+success across the workload. Recording is fail-soft: the first recorder error
+is inspectable, freezes both valid component prefixes, and prevents later
 record attempts without changing a successful device or generation result.
-This observes token-step execution only. It does not classify prompt versus
-decode work or measure tokenization, chat rendering, sampling, end-to-end GPU
+It does not measure tokenization, chat rendering, sampling, end-to-end GPU
 latency, GPU throughput, copy-command time, or physical transfers.
 
 The dense-or-packed F32 Llama token-step layer uses the same boundary without
@@ -2751,7 +2757,8 @@ optional fixed-span prefill plan shares the same authenticated residents, K/V
 buffers, and command queue, and complete prefix chunks remain output-free.
 Dense and supported packed GGUF weights both retain zero fallback. The existing
 `LlamaMetalPlan` remains the host-logits facade for greedy and explicit-tape
-Gumbel selection, its continuation seams, and the v4 token-step scoreboard.
+Gumbel selection, its continuation seams, and the ordered fixed-prefill/T=1
+execution scoreboard.
 
 Each successfully executed token invocation is a durable append-state commit.
 Therefore a later launch, wait, read, selection, or decode failure cannot
@@ -2771,8 +2778,8 @@ unique packed owner once even when tied bindings reference it more than once.
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, mutable training state, dynamically
 shaped/capacity-growing state, general output chaining across calls,
-orchestration-aware generation scoring, multi-device execution, and
-live Metal numerical/performance evidence remain explicit follow-ons.
+multi-device execution, measured prompt/decode throughput, and live Metal
+numerical/performance evidence remain explicit follow-ons.
 The semantic mock covers fixed-shape state ping-pong and a bounded
 residual-style multi-layer graph. Protected acceptance exercises that typed
 facade on the complete default Eval/F32 ResNet-18 `[1,3,224,224]` graph:
@@ -2811,7 +2818,7 @@ oracle. The typed ResNet benchmark constructs the complete default Eval/F32
 Metal session, and checks ten repeated session outputs by default under the
 documented F32 native-compilation tolerance. The workflow runs that complete
 benchmark exactly once rather than duplicating it through the ignored live
-test, and uploads its deterministic v6 scoreboard beside the Linear report.
+test, and uploads its deterministic v7 scoreboard beside the Linear report.
 The separate Llama job accepts only the protected Metal registry identity and
 a runner-local GGUF whose SHA-256 matches protected configuration, plus a
 protected prompt, positive token bound, and independently pinned greedy token
@@ -2833,7 +2840,7 @@ with another runtime.
 These paths prove stable resident schemas, compiled cache identities, device
 ownership, zero run-time resident upload, and zero fallback. The release profile
 keeps the one complete CPU oracle practical without weakening the device
-workload. Scoreboard v6 and Llama workload-evidence v3 keep host wall time,
+workload. Scoreboard v7 and Llama workload-evidence v3 keep host wall time,
 optional compute-command GPU execution time, host-API copy counters, and
 compute-command submission/wait counters distinct. GPU command time is not
 copy time, end-to-end latency, tokens per second, or a live-device speedup
@@ -2899,8 +2906,9 @@ final prompt logits, and composes tokenizer/chat rendering plus host sampling
 over that persistent session. The sibling finite-guarded greedy facade instead
 downloads one range-proven four-byte I32 token per selecting invocation and can
 share fixed-span state-only prefill with the same resident weights, K/V buffers,
-and command queue. Other device-side sampling, a prompt/decode-aware performance
-scoreboard, and live-device-performance evidence remain outside this slice.
+and command queue. Other device-side sampling, measured prompt/decode
+performance evidence, and live-device-performance evidence remain outside this
+slice.
 
 Devices are returned in deterministic registry-ID/name order with capability
 metadata in renderer and pipeline cache identities. Resources are deliberately

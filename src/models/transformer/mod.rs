@@ -21,6 +21,7 @@ mod generation;
 mod layer;
 mod metal_generation;
 mod metal_greedy_generation;
+mod metal_scoreboard;
 mod metal_step;
 mod metal_workload_evidence;
 mod model;
@@ -48,6 +49,10 @@ pub use metal_generation::{
     LlamaMetalPrefill, LlamaMetalProgress, LlamaMetalPromptOutput, LlamaMetalSession,
 };
 pub use metal_greedy_generation::{LlamaMetalGreedyPlan, LlamaMetalGreedySession};
+pub use metal_scoreboard::{
+    LLAMA_METAL_EXECUTION_SCOREBOARD_FORMAT_VERSION, LlamaMetalExecutionScoreboardReport,
+    LlamaMetalScoreboardInvocation, LlamaMetalScoreboardProgram,
+};
 pub use metal_step::{
     LlamaMetalGreedyStep, LlamaMetalGreedyStepPlan, LlamaMetalGreedyStepSession, LlamaMetalStep,
     LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession, LlamaMetalTokenCommit,

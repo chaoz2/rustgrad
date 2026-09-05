@@ -65,15 +65,19 @@ including that protected semantic ResNet-18 path, prevalidate their launches,
 encode ordered kernels into one compute command buffer, commit once, wait once,
 and retain resources through completion; zero-work invocations submit nothing.
 Any guarded or indexed item keeps the existing per-item transactional path. The
-opt-in Metal scoreboard v6 records
+opt-in Metal scoreboard v7 records
 one exact stateless or append-only session's successful prefix with ordered
 per-run host-wall/copy/kernel/compute-command, optional GPU command execution
 time, and append-position/row-commit records, checked aggregates, successful cache-miss pipeline-build time, logical
 schedule/peak-live facts, and distinct physical Metal slot/state-bank facts.
 Failed attempts cannot enter that prefix or advance recorder-owned counters.
-The Llama facade can bind this recorder before preparation and observe retained
-or suppressed token-step runs fail-soft, but the records deliberately do not classify tokenization,
-prompt, decode, chat, or sampling work. It remains host-observed execution
+The Llama facade binds one recorder to each real token-step or fixed-prefill
+physical session before preparation. Its Llama execution scoreboard v1 keeps
+their local identities and first-run attribution intact while linking exact
+spans, positions, bytes, and work items in one global success order. Failed
+attempts and the first latched recorder error cannot extend that prefix. The
+records deliberately do not classify tokenization, chat, or sampling work. It
+remains host-observed execution
 measurement plumbing, not live workload evidence, allocator peak memory, bus
 traffic, copy timing, end-to-end GPU latency, or tokens-per-second evidence.
 
@@ -114,7 +118,7 @@ Provision the protected Apple-GPU lane and run the checked-in exact-SHA
 acceptance, closing only demonstrated live renderer/runtime gaps. Required
 evidence is full CPU-oracle output agreement, zero fallback, stable resident
 weights and intermediates, inspectable kernels/memory/transfers, and the
-checked-in v6 compile/prepare/first-run/ordered-steady reporting with host-wall
+checked-in v7 compile/prepare/first-run/ordered-steady reporting with host-wall
 versus device evidence labeled exactly. Benchmark comparisons target the
 equivalent tinygrad and Candle workload.
 
@@ -138,18 +142,20 @@ The typed model facade now consumes the same GGUF-bound model, tokenizer, and
 chat template, prepares one persistent Metal session, suppresses intermediate
 prefill logits, and provides sequential T=1 ID/text/chat generation with host
 sampling. The generic Metal append runtime now authenticates fixed nonzero row
-spans and commits their checked position atomically; this is a prerequisite,
-not model chunk-prefill, and scoreboard v6 remains one-row-only. Private Metal
+spans and commits their checked position atomically. Scoreboard v7 records the
+exact authenticated span, expected committed position, bytes, and work items
+for each physical append session. Private Metal
 admission now also accepts exact dense batch-one `[1,T]` I32 token or position
 vectors only through canonical reshape/expand Gather lineage, checks all lanes
 before driver work, and uses a distinct status-free direct-render cache domain
 while preserving scalar T=1 identity. Integrated packed embedding capture
 accepts the same fixed geometry for Q4_0/Q8_0/Q4_K/Q6_K without host
-dequantization or repeated packed upload. Remaining work
-wires this fixed-cardinality prerequisite into the chunk-prefill Llama graph
-and facade, proves live-device output
-agreement, and adds orchestration-aware prompt/decode performance evidence over
-the existing authenticated token-step scoreboard records.
+dequantization or repeated packed upload. The chunk-prefill Llama graph and
+facade bind separate authenticated recorders to the shared fixed-prefill and
+T=1 programs, then publish one ordered Llama execution scoreboard v1 without
+inventing a shared physical-session identity. Remaining work proves live-device
+output agreement and adds measured prompt/decode performance evidence; the
+current scoreboard is host-observed execution accounting, not a speedup claim.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
 serving path.
 
