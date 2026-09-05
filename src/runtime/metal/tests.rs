@@ -2775,7 +2775,7 @@ fn llama_metal_prefill_chunk_failure_is_typed_atomic_and_retryable() {
 #[test]
 fn llama_metal_fixed_span_scoreboard_preserves_component_identity_and_global_order() {
     let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
-        8,
+        16,
         Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
     );
     let mock = Arc::new(MockDispatch::default());
@@ -2794,7 +2794,7 @@ fn llama_metal_fixed_span_scoreboard_preserves_component_identity_and_global_ord
     .unwrap();
 
     let empty = session.execution_scoreboard_report().unwrap().unwrap();
-    assert_eq!(empty.format_version, 1);
+    assert_eq!(empty.format_version, 2);
     assert_eq!(empty.successful_run_count, 0);
     assert_eq!(empty.committed_state_position, 0);
     assert_eq!(empty.token_step.append_span_rows, 1);
@@ -2808,6 +2808,17 @@ fn llama_metal_fixed_span_scoreboard_preserves_component_identity_and_global_ord
         empty.token_step.deployment_identity,
         empty.fixed_prefill.as_ref().unwrap().deployment_identity
     );
+    for phase in [
+        &empty.prompt_prefill,
+        &empty.steady_decode,
+        &empty.standalone,
+    ] {
+        assert_eq!(phase.committed_token_count, 0);
+        assert_eq!(phase.successful_invocation_count, 0);
+        assert_eq!(phase.gpu_command_execution_time, None);
+        assert_eq!(phase.host_tokens_per_second(), None);
+        assert_eq!(phase.gpu_command_tokens_per_second(), None);
+    }
 
     mock.state.lock().unwrap().failures.launch = Some("fixed prefill launch");
     assert!(session.prefill_ids(&[3, 4, 5, 6]).is_err());
@@ -2836,6 +2847,11 @@ fn llama_metal_fixed_span_scoreboard_preserves_component_identity_and_global_ord
         1
     );
     assert!(report.token_step.successful_runs[0].first_successful_run);
+    assert_eq!(report.prompt_prefill.committed_token_count, 4);
+    assert_eq!(report.prompt_prefill.successful_invocation_count, 2);
+    assert_eq!(report.prompt_prefill.gpu_command_execution_time, None);
+    assert_eq!(report.steady_decode.successful_invocation_count, 0);
+    assert_eq!(report.standalone.successful_invocation_count, 0);
     assert_eq!(
         report
             .successful_runs
@@ -2844,6 +2860,7 @@ fn llama_metal_fixed_span_scoreboard_preserves_component_identity_and_global_ord
                 run.successful_invocation,
                 run.first_successful_run,
                 run.program,
+                run.phase,
                 run.program_successful_invocation,
                 run.append_span_rows,
                 run.committed_state_position,
@@ -2854,6 +2871,7 @@ fn llama_metal_fixed_span_scoreboard_preserves_component_identity_and_global_ord
                 1,
                 true,
                 crate::LlamaMetalScoreboardProgram::FixedPrefill,
+                crate::LlamaMetalScoreboardPhase::PromptPrefill,
                 1,
                 3,
                 3,
@@ -2862,6 +2880,7 @@ fn llama_metal_fixed_span_scoreboard_preserves_component_identity_and_global_ord
                 2,
                 false,
                 crate::LlamaMetalScoreboardProgram::TokenStep,
+                crate::LlamaMetalScoreboardPhase::PromptPrefill,
                 1,
                 1,
                 4,
@@ -2901,11 +2920,15 @@ fn llama_metal_fixed_span_scoreboard_preserves_component_identity_and_global_ord
             .sum::<usize>()
     );
     let json: serde_json::Value = serde_json::from_slice(&report.to_json_bytes().unwrap()).unwrap();
-    assert_eq!(json["format_version"], 1);
+    assert_eq!(json["format_version"], 2);
     assert_eq!(json["successful_runs"][0]["program"], "fixed_prefill");
+    assert_eq!(json["successful_runs"][0]["phase"], "prompt_prefill");
     assert_eq!(json["successful_runs"][0]["append_span_rows"], 3);
     assert_eq!(json["successful_runs"][1]["program"], "token_step");
     assert_eq!(json["successful_runs"][1]["committed_state_position"], 4);
+    assert_eq!(json["prompt_prefill"]["committed_token_count"], 4);
+    assert_eq!(json["steady_decode"]["successful_invocation_count"], 0);
+    assert_eq!(json["standalone"]["successful_invocation_count"], 0);
 
     let mut wrong_span = fixed.clone();
     wrong_span.append_span_rows = 2;
@@ -2972,7 +2995,276 @@ fn llama_metal_fixed_span_scoreboard_preserves_component_identity_and_global_ord
         ),
         Err(MetalScoreboardError::Overflow)
     );
+    let mut wrong_phase = report.successful_runs.clone();
+    wrong_phase[0].phase = crate::LlamaMetalScoreboardPhase::SteadyDecode;
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            report.fixed_prefill.clone(),
+            wrong_phase,
+        ),
+        Err(MetalScoreboardError::PlanMismatch)
+    );
+    let mut wrong_program = report.successful_runs.clone();
+    wrong_program[1].program = crate::LlamaMetalScoreboardProgram::FixedPrefill;
+    assert!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            report.fixed_prefill.clone(),
+            wrong_program,
+        )
+        .is_err()
+    );
+    let mut wrong_component = fixed.clone();
+    wrong_component.successful_runs[0].first_successful_run = false;
+    assert!(matches!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            Some(wrong_component),
+            report.successful_runs.clone(),
+        ),
+        Err(MetalScoreboardError::OutOfOrder { .. })
+    ));
+    let mut wrong_component = fixed.clone();
+    wrong_component.committed_state_position = Some(4);
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            Some(wrong_component),
+            report.successful_runs.clone(),
+        ),
+        Err(MetalScoreboardError::StateCommitMismatch)
+    );
+    let mut wrong_component = fixed.clone();
+    wrong_component.successful_runs[0].kernel_launch_count += 1;
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            Some(wrong_component),
+            report.successful_runs.clone(),
+        ),
+        Err(MetalScoreboardError::StateCommitMismatch)
+    );
+    let mut fallback_component = fixed.clone();
+    fallback_component.fallback_count = 1;
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            report.token_step.clone(),
+            Some(fallback_component),
+            report.successful_runs.clone(),
+        ),
+        Err(MetalScoreboardError::PlanMismatch)
+    );
+    let mut overflow_token = report.token_step.clone();
+    overflow_token.successful_runs[0].run_wall_time = std::time::Duration::from_nanos(1);
+    overflow_token.first_run_host_wall_time = Some(std::time::Duration::from_nanos(1));
+    let mut overflow_fixed = fixed.clone();
+    overflow_fixed.successful_runs[0].run_wall_time = std::time::Duration::MAX;
+    overflow_fixed.first_run_host_wall_time = Some(std::time::Duration::MAX);
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            overflow_token,
+            Some(overflow_fixed),
+            report.successful_runs.clone(),
+        ),
+        Err(MetalScoreboardError::Overflow)
+    );
+    let mut overflow_token = report.token_step.clone();
+    overflow_token.successful_runs[0].kernel_launch_count = 1;
+    overflow_token.kernel_launch_count = 1;
+    let mut overflow_fixed = fixed.clone();
+    overflow_fixed.successful_runs[0].kernel_launch_count = usize::MAX;
+    overflow_fixed.kernel_launch_count = usize::MAX;
+    assert_eq!(
+        crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+            overflow_token,
+            Some(overflow_fixed),
+            report.successful_runs.clone(),
+        ),
+        Err(MetalScoreboardError::Overflow)
+    );
     assert!(session.scoreboard_recording_error().is_none());
+
+    let direct = session.run_token(7).unwrap();
+    assert_eq!(direct.report().successful_invocation, 3);
+    let direct_report = session.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(direct_report.prompt_prefill.committed_token_count, 4);
+    assert_eq!(direct_report.standalone.committed_token_count, 1);
+    assert_eq!(direct_report.standalone.successful_invocation_count, 1);
+    assert_eq!(
+        direct_report.successful_runs[2].phase,
+        crate::LlamaMetalScoreboardPhase::Standalone
+    );
+
+    session.prefill_ids(&[3, 4, 5, 6]).unwrap();
+    let interleaved = session.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(interleaved.successful_run_count, 5);
+    assert_eq!(interleaved.committed_state_position, 9);
+    assert_eq!(interleaved.prompt_prefill.committed_token_count, 8);
+    assert_eq!(interleaved.standalone.committed_token_count, 1);
+    assert_eq!(interleaved.token_step.successful_run_count, 3);
+    assert_eq!(
+        interleaved
+            .token_step
+            .successful_runs
+            .iter()
+            .map(|run| run.committed_state_position.unwrap())
+            .collect::<Vec<_>>(),
+        [4, 5, 9]
+    );
+    assert_eq!(
+        interleaved
+            .fixed_prefill
+            .as_ref()
+            .unwrap()
+            .successful_runs
+            .iter()
+            .map(|run| run.committed_state_position.unwrap())
+            .collect::<Vec<_>>(),
+        [3, 8]
+    );
+}
+
+#[test]
+fn llama_metal_scoreboard_aggregates_mixed_prompt_and_decode_from_physical_runs() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        16,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let mock = Arc::new(MockDispatch::default());
+    mock.set_gpu_command_execution_time(Some(std::time::Duration::from_nanos(5)));
+    let device = test_device(mock);
+    let mut session = crate::models::transformer::LlamaMetalPlan::from_workflow_with_prefill_span(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+        NonZeroUsize::new(3).unwrap(),
+    )
+    .unwrap()
+    .prepare_with_scoreboard(
+        MetalScoreboardContext::new("llama-phase-scoreboard", "test-revision", "semantic mock")
+            .unwrap(),
+    )
+    .unwrap();
+
+    let vocab = session.vocab_size();
+    let mut uniforms = vec![0.0; 2 * vocab];
+    uniforms[4] = 1.0 - f32::EPSILON;
+    uniforms[vocab + 5] = 1.0 - f32::EPSILON;
+    let generation = session
+        .generate_ids(
+            &[3, 4, 5, 6],
+            2,
+            LlamaSampling::GumbelMax {
+                temperature: f32::MAX,
+                uniforms: &uniforms,
+            },
+        )
+        .unwrap();
+    assert_eq!(generation.generated_ids(), [4, 5]);
+    let report = session.execution_scoreboard_report().unwrap().unwrap();
+    let decode_invocations = generation.reports().len() - 2;
+    assert_eq!(decode_invocations, 1);
+    assert_eq!(report.prompt_prefill.committed_token_count, 4);
+    assert_eq!(report.prompt_prefill.successful_invocation_count, 2);
+    let prompt_runs = &generation.reports()[..2];
+    assert_eq!(
+        report.prompt_prefill.host_run_wall_time,
+        prompt_runs.iter().map(|run| run.run_wall_time).sum()
+    );
+    assert_eq!(
+        report.prompt_prefill.host_synchronous_transaction_wall_time,
+        prompt_runs
+            .iter()
+            .map(|run| run.synchronous_transaction_wall_time)
+            .sum()
+    );
+    let prompt_counters = prompt_runs.iter().fold([0usize; 9], |mut totals, run| {
+        totals[0] += run.kernel_launch_count;
+        totals[1] += run.command_submission_count;
+        totals[2] += run.command_wait_count;
+        totals[3] += run.transient_h2d_calls;
+        totals[4] += run.transient_h2d_bytes;
+        totals[5] += run.runtime_control_h2d_calls;
+        totals[6] += run.runtime_control_h2d_bytes;
+        totals[7] += run.retained_d2h_calls;
+        totals[8] += run.retained_d2h_bytes;
+        totals
+    });
+    assert_eq!(
+        [
+            report.prompt_prefill.kernel_launch_count,
+            report.prompt_prefill.command_submission_count,
+            report.prompt_prefill.command_wait_count,
+            report.prompt_prefill.transient_host_api_h2d_calls,
+            report.prompt_prefill.transient_host_api_h2d_bytes,
+            report.prompt_prefill.runtime_control_host_api_h2d_calls,
+            report.prompt_prefill.runtime_control_host_api_h2d_bytes,
+            report.prompt_prefill.retained_host_api_d2h_calls,
+            report.prompt_prefill.retained_host_api_d2h_bytes,
+        ],
+        prompt_counters
+    );
+    assert_eq!(
+        report.prompt_prefill.gpu_command_execution_time,
+        Some(std::time::Duration::from_nanos(10))
+    );
+    let mut rate_fixture = report.prompt_prefill.clone();
+    rate_fixture.host_run_wall_time = std::time::Duration::from_secs(2);
+    assert_eq!(rate_fixture.host_tokens_per_second(), Some(2.0));
+    rate_fixture.host_run_wall_time = std::time::Duration::ZERO;
+    assert_eq!(rate_fixture.host_tokens_per_second(), None);
+    rate_fixture.gpu_command_execution_time = Some(std::time::Duration::ZERO);
+    assert_eq!(rate_fixture.gpu_command_tokens_per_second(), None);
+    assert!(
+        report
+            .prompt_prefill
+            .gpu_command_tokens_per_second()
+            .is_some()
+    );
+    assert_eq!(
+        report.steady_decode.successful_invocation_count,
+        u64::try_from(decode_invocations).unwrap()
+    );
+    assert_eq!(
+        report.steady_decode.committed_token_count,
+        decode_invocations
+    );
+    assert_eq!(
+        report.steady_decode.gpu_command_execution_time,
+        (decode_invocations != 0).then_some(std::time::Duration::from_nanos(
+            5 * u64::try_from(decode_invocations).unwrap()
+        ))
+    );
+    assert_eq!(report.standalone.successful_invocation_count, 0);
+    assert!(
+        report.successful_runs[..2]
+            .iter()
+            .all(|run| { run.phase == crate::LlamaMetalScoreboardPhase::PromptPrefill })
+    );
+    assert!(report.successful_runs[2..].iter().all(|run| {
+        run.phase == crate::LlamaMetalScoreboardPhase::SteadyDecode
+            && run.program == crate::LlamaMetalScoreboardProgram::TokenStep
+    }));
+
+    let mut unavailable_token = report.token_step.clone();
+    unavailable_token.successful_runs[1].gpu_command_execution_time = None;
+    unavailable_token.gpu_command_execution_time = None;
+    let unavailable = crate::models::transformer::LlamaMetalExecutionScoreboardReport::new(
+        unavailable_token,
+        report.fixed_prefill.clone(),
+        report.successful_runs.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        unavailable.prompt_prefill.gpu_command_execution_time,
+        Some(std::time::Duration::from_nanos(10))
+    );
+    assert_eq!(unavailable.steady_decode.gpu_command_execution_time, None);
+    assert_eq!(
+        unavailable.steady_decode.gpu_command_tokens_per_second(),
+        None
+    );
 }
 
 #[test]
@@ -3350,6 +3642,9 @@ fn llama_metal_scoreboard_records_exact_token_execution_prefix_fail_soft() {
             .successful_run_count,
         0
     );
+    let empty_outer = retry.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(empty_outer.successful_run_count, 0);
+    assert_eq!(empty_outer.standalone.successful_invocation_count, 0);
     mock.clear_failures();
     assert_eq!(retry.run_token(3).unwrap().position(), 0);
     assert_eq!(retry.position(), 1);
@@ -3362,6 +3657,13 @@ fn llama_metal_scoreboard_records_exact_token_execution_prefix_fail_soft() {
             .unwrap()
             .successful_run_count,
         1
+    );
+    let retry_outer = retry.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(retry_outer.standalone.committed_token_count, 1);
+    assert_eq!(retry_outer.standalone.successful_invocation_count, 1);
+    assert_eq!(
+        retry_outer.successful_runs[0].phase,
+        crate::LlamaMetalScoreboardPhase::Standalone
     );
     retry.inject_scoreboard_recording_error(MetalScoreboardError::Overflow);
     assert_eq!(retry.run_token(4).unwrap().position(), 1);
@@ -3380,6 +3682,10 @@ fn llama_metal_scoreboard_records_exact_token_execution_prefix_fail_soft() {
             .unwrap()
             .successful_run_count,
         1
+    );
+    assert_eq!(
+        retry.execution_scoreboard_report(),
+        Err(MetalScoreboardError::Overflow)
     );
 }
 

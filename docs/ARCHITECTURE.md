@@ -2683,16 +2683,27 @@ state independently. Fixed epoch-swapped state remains an explicit follow-up.
 before preparation and binds one v7 recorder to each real prepared physical
 session. Fixed-prefill chunks and retained-logit or host-output-suppressed T=1
 invocations pass their authenticated `MetalDeviceRun` to the matching recorder
-before detaching the public report. `LlamaMetalExecutionScoreboardReport` v1
+before detaching the public report. `LlamaMetalExecutionScoreboardReport` v2
 then links those local records into the outer coordinator's global success
 order with program tags and exact span, committed position, byte, and work-item
 facts. Each component retains its own deployment/session identity, local
 ordinal, and physical first-run attribution; only the envelope names the first
-success across the workload. Recording is fail-soft: the first recorder error
+success across the workload. A separate closed workload phase labels direct
+`run_token` calls as standalone, prompt chunks/tails/final logits as prompt
+prefill, and generated-token feedback invocations as steady decode. Checked
+phase aggregates join each label back to the exact physical component run and
+sum committed rows, invocations, host-run and synchronous-transaction wall
+time, all-or-none compute-command GPU time, launches, submissions/waits, and
+host API H2D/D2H calls and bytes. The narrowly named host-run and GPU-command
+token-rate helpers reject empty, zero-time, and unavailable timing; neither is
+end-to-end throughput. Component and phase reconciliation rejects overflow,
+invalid phase/program pairs, and inconsistent component records before a
+report is returned. Recording is fail-soft: the first recorder error
 is inspectable, freezes both valid component prefixes, and prevents later
 record attempts without changing a successful device or generation result.
 It does not measure tokenization, chat rendering, sampling, end-to-end GPU
-latency, GPU throughput, copy-command time, or physical transfers.
+latency, copy-command time, allocator/RSS memory, or physical transfers, and it
+does not establish a live-device or cross-runtime speedup claim.
 
 The dense-or-packed F32 Llama token-step layer uses the same boundary without
 adding a model-specific runtime. A crate-private capture projection
@@ -2778,8 +2789,8 @@ unique packed owner once even when tied bindings reference it more than once.
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, mutable training state, dynamically
 shaped/capacity-growing state, general output chaining across calls,
-multi-device execution, measured prompt/decode throughput, and live Metal
-numerical/performance evidence remain explicit follow-ons.
+multi-device execution, measured live-device prompt/decode throughput, and live
+Metal numerical/performance evidence remain explicit follow-ons.
 The semantic mock covers fixed-shape state ping-pong and a bounded
 residual-style multi-layer graph. Protected acceptance exercises that typed
 facade on the complete default Eval/F32 ResNet-18 `[1,3,224,224]` graph:

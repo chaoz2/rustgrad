@@ -29,7 +29,7 @@ const SCOREBOARD_WORKLOAD: &str = "gguf-llama-metal-generate";
 const SCOREBOARD_EVIDENCE: &str = "live self-hosted Apple GPU prompt-to-tokens harness";
 const WORKLOAD_EVIDENCE: &str =
     "host-observed fixed-span prefill and steady-decode Metal workload evidence";
-const SCOREBOARD_EVIDENCE_KIND: &str = "llama_metal_execution_scoreboard_v1";
+const SCOREBOARD_EVIDENCE_KIND: &str = "llama_metal_execution_scoreboard_v2";
 const LLAMA_WORKLOAD_EVIDENCE_KIND: &str = "llama_metal_workload_evidence_v3";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -314,6 +314,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         let report = session
             .execution_scoreboard_report()?
             .ok_or_else(|| io::Error::other("scoreboard was requested but is not bound"))?;
+        let workload = generation.workload_evidence();
         if report.fallback_count != 0
             || report.token_step.deployment_identity != stable.step_deployment_identity
             || report.token_step.capture_identity != stable.capture_identity
@@ -326,6 +327,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             || report.successful_run_count != u64::try_from(generation.reports().len())?
             || report.successful_runs.len() != generation.reports().len()
             || report.committed_state_position != session.position()
+            || report.prompt_prefill.committed_token_count != workload.prompt_prefill.token_count
+            || usize::try_from(report.prompt_prefill.successful_invocation_count)?
+                != workload.prompt_prefill.successful_invocation_count
+            || report.steady_decode.committed_token_count != workload.steady_decode.token_count
+            || usize::try_from(report.steady_decode.successful_invocation_count)?
+                != workload.steady_decode.successful_invocation_count
+            || report.standalone.successful_invocation_count != 0
             || report.successful_runs.iter().zip(generation.reports()).any(
                 |(recorded, executed)| {
                     recorded.successful_invocation != executed.successful_invocation
@@ -1399,7 +1407,7 @@ mod tests {
         assert_eq!(value["evidence"]["fallback_count"], 0);
         assert_eq!(
             SCOREBOARD_EVIDENCE_KIND,
-            "llama_metal_execution_scoreboard_v1"
+            "llama_metal_execution_scoreboard_v2"
         );
         assert_eq!(value["evidence"]["evidence_kind"], SCOREBOARD_EVIDENCE_KIND);
         assert_eq!(

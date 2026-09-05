@@ -151,10 +151,13 @@ chunks while sharing the same resident weights, K/V cache, and command queue.
 `LlamaMetalPlan` remains the explicit host-logits facade for Gumbel sampling.
 Its opt-in Llama execution scoreboard can cover fixed-span prompt chunks and
 T=1 tail/decode work together: each physical program keeps its own authenticated
-v7 session report and identity, while a v1 workload envelope records the exact
-global order, committed positions, spans, bytes, and work items. Commits are
-atomic per device invocation, but a later failure does not roll back an already
-committed prefix.
+v7 session report and identity, while a v2 workload envelope records the exact
+global order and closed prompt-prefill, steady-decode, or standalone phase. Its
+checked phase totals expose host-run and optional compute-command token rates
+alongside exact spans, positions, launches, commands, and host API copies; they
+are not end-to-end, physical-transfer, allocator/RSS, or speedup measurements.
+Commits are atomic per device invocation, but a later failure does not roll back
+an already committed prefix.
 Current protected evidence is semantic-mock only; the maintained
 `metal_llama_generate` example is the manual live-lane entry point:
 
