@@ -923,9 +923,9 @@ fn partial_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_args, serialize_attestation, validate_evidence_paths, write_new_evidence, Args,
-        AttestationArgs, AttestedDevice, AttestedEvidence, AttestedInvocation, AttestedModel,
-        AttestedOracle, MetalLlamaAttestation,
+        Args, AttestationArgs, AttestedDevice, AttestedEvidence, AttestedInvocation, AttestedModel,
+        AttestedOracle, MetalLlamaAttestation, parse_args, serialize_attestation,
+        validate_evidence_paths, write_new_evidence,
     };
     use std::{
         fs,
