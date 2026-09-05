@@ -66,6 +66,7 @@ pub enum MetalError {
         diagnostic: String,
     },
     InvalidArgument(&'static str),
+    InvalidDeviceProof(&'static str),
     InvalidBinding(String),
     Unsupported(String),
     OwnerMismatch,
@@ -107,6 +108,9 @@ impl fmt::Display for MetalError {
                 write!(f, "Metal source compilation failed: {diagnostic}")
             }
             Self::InvalidArgument(reason) => write!(f, "invalid Metal argument: {reason}"),
+            Self::InvalidDeviceProof(reason) => {
+                write!(f, "invalid Metal device proof: {reason}")
+            }
             Self::InvalidBinding(reason) => write!(f, "invalid Metal binding: {reason}"),
             Self::Unsupported(reason) => write!(f, "unsupported Metal kernel: {reason}"),
             Self::OwnerMismatch => write!(f, "Metal resource owner mismatch"),

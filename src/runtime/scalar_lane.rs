@@ -218,6 +218,24 @@ fn graph_binary(
     lhs: &TypedValue<String>,
     rhs: &TypedValue<String>,
 ) -> Result<String, String> {
+    if op == BinaryOp::Maximum {
+        let lhs_dtype = lhs.ty.scalar;
+        let rhs_dtype = rhs.ty.scalar;
+        if lhs_dtype != rhs_dtype
+            || output_dtype != lhs_dtype
+            || !dialect.supports_value(output_dtype)
+        {
+            return Err(unsupported(
+                dialect,
+                "binary dtype",
+                (op, lhs_dtype, rhs_dtype, output_dtype),
+            ));
+        }
+        let lhs_compare = dialect.compare_operand(output_dtype, &lhs.register);
+        let rhs_compare = dialect.compare_operand(output_dtype, &rhs.register);
+        let rhs_wins = format!("({lhs_compare}) < ({rhs_compare})");
+        return Ok(dialect.select(&rhs_wins, &rhs.register, &lhs.register));
+    }
     let (dtype, lhs, rhs) =
         promoted_operands(dialect, "binary dtype", lhs, rhs, Some(output_dtype))?;
     if dtype == DType::Bool {

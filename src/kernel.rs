@@ -1652,8 +1652,26 @@ fn direct_i32_store_iteration(
     index: &UOp,
     len: usize,
 ) -> Result<Option<Vec<i32>>> {
+    if !is_authenticated_i32_store_iteration(kernel, store, index, len) {
+        return Ok(None);
+    }
+    (0..len)
+        .map(|linear| i32::try_from(linear).map_err(|_| Error::InvalidIndex))
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// Authenticates the one internal I64 iteration Range that may safely lower
+/// directly to an I32 Store lane. The Range must be the Store index's exact
+/// canonical iteration, closed by the root Sink, and bounded by that output.
+pub(crate) fn is_authenticated_i32_store_iteration(
+    kernel: &UOp,
+    store: &UOp,
+    index: &UOp,
+    len: usize,
+) -> bool {
     let [store_index, value] = store.sources() else {
-        return Err(Error::InvalidIndex);
+        return false;
     };
     let candidate = match (value.operation(), value.sources()) {
         (Operation::Cast, [source])
@@ -1664,44 +1682,42 @@ fn direct_i32_store_iteration(
             source
         }
         (Operation::Range(0), _) if value.ty() == Some(UType::scalar(DType::I32)) => value,
-        _ => return Ok(None),
+        _ => return false,
     };
     let Operation::Index(IndexValue::Buffer { elements, .. }) = index.operation() else {
-        return Err(Error::InvalidIndex);
+        return false;
     };
     let [_, iteration] = index.sources() else {
-        return Err(Error::InvalidIndex);
+        return false;
     };
     let [bound] = iteration.sources() else {
-        return Err(Error::InvalidIndex);
+        return false;
     };
     let [kernel_store, end_range] = kernel.sources() else {
-        return Err(Error::InvalidIndex);
+        return false;
     };
     let [terminal_iteration] = end_range.sources() else {
-        return Err(Error::InvalidIndex);
+        return false;
     };
-    if !matches!(kernel.operation(), Operation::Sink)
-        || !kernel_store.shares_node_with(store)
-        || !store_index.shares_node_with(index)
-        || !matches!(end_range.operation(), Operation::EndRange)
-        || !terminal_iteration.shares_node_with(iteration)
-        || index.ty() != Some(UType::scalar(DType::I32))
-        || !matches!(iteration.operation(), Operation::Range(0))
-        || !candidate.shares_node_with(iteration)
-        || *elements != len
-        || !matches!(
+    matches!(kernel.operation(), Operation::Sink)
+        && kernel.ty().is_none()
+        && matches!(store.operation(), Operation::Store)
+        && store.ty().is_none()
+        && i32::try_from(len).is_ok()
+        && kernel_store.shares_node_with(store)
+        && store_index.shares_node_with(index)
+        && matches!(end_range.operation(), Operation::EndRange)
+        && terminal_iteration.shares_node_with(iteration)
+        && index.ty() == Some(UType::scalar(DType::I32))
+        && matches!(iteration.operation(), Operation::Range(0))
+        && iteration.ty() == bound.ty()
+        && candidate.shares_node_with(iteration)
+        && *elements == len
+        && matches!(
             bound.operation(),
             Operation::Const(LiteralValue::Int(expected))
                 if usize::try_from(*expected).ok() == Some(len)
         )
-    {
-        return Err(Error::InvalidIndex);
-    }
-    (0..len)
-        .map(|linear| i32::try_from(linear).map_err(|_| Error::InvalidIndex))
-        .collect::<Result<Vec<_>>>()
-        .map(Some)
 }
 
 fn fused_storage(dtype: DType, values: Vec<FusedValue>) -> Storage {

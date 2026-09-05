@@ -125,30 +125,29 @@ chat template; planning binds them to an explicitly selected device, uploads
 Q4_0/Q8_0/Q4_K/Q6_K or dense weights once, and retains fixed-capacity K/V state.
 
 ```rust,no_run
-use rustgrad::{LlamaMetalPlan, LlamaPromptWorkflow, LlamaSampling};
+use rustgrad::{LlamaMetalGreedyPlan, LlamaPromptWorkflow};
 use rustgrad::runtime::metal::{MetalPlanOptions, MetalRuntime};
 
 let device = MetalRuntime::load()?.device(0)?;
 let workflow = LlamaPromptWorkflow::from_path("model.gguf")?;
-let plan = LlamaMetalPlan::from_workflow(
+let plan = LlamaMetalGreedyPlan::from_workflow(
     workflow,
     &device,
     MetalPlanOptions::default(),
 )?;
 assert_eq!(plan.summary().fallback_count, 0);
 let mut session = plan.prepare()?;
-let output = session.generate_text("Hello", 32, LlamaSampling::Greedy)?;
+let output = session.generate_text("Hello", 32)?;
 println!("{}", output.generation().decoded());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Prompt prefill suppresses intermediate logits downloads and retains only the
-last prompt logits. An opt-in fixed span executes complete prompt chunks on
-Metal while sharing the same resident weights, K/V cache, and command queue;
-the final prompt token and decode retain the exact batch-one/T=1 path with host
-sampling. Commits are atomic per device invocation, but a later failure does
-not roll back an already committed prefix. `prepare_with_scoreboard` optionally
-binds the existing v4 recorder to token-step execution before the first run.
+The greedy facade reduces finite logits on device and downloads one checked I32
+token per selecting invocation. An opt-in fixed span executes complete prompt
+chunks while sharing the same resident weights, K/V cache, and command queue.
+`LlamaMetalPlan` remains the explicit host-logits facade for Gumbel sampling and
+the v4 token-step scoreboard. Commits are atomic per device invocation, but a
+later failure does not roll back an already committed prefix.
 Current protected evidence is semantic-mock only; the maintained
 `metal_llama_generate` example is the manual live-lane entry point:
 

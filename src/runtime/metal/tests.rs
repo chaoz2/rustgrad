@@ -402,7 +402,7 @@ fn captured_scalar_host_gather_zero_domain_is_addressless() {
 
 #[test]
 fn predicated_projected_metal_preserves_raw_lanes_and_guards_addressless_reads() {
-    assert_eq!(METAL_RENDERER_VERSION, "rustgrad-metal-static-v8");
+    assert_eq!(METAL_RENDERER_VERSION, "rustgrad-metal-static-v9");
     for (shape, values, expected) in [
         (
             Shape::from([2]),
@@ -596,8 +596,8 @@ use crate::engine::capture::QuantizedCaptureBinding;
 use crate::kernel::execute_lowered_elementwise;
 use crate::models::transformer::{
     LLAMA_SIMPLE_CHAT_TEMPLATE, LlamaChatMessage, LlamaChatRole, LlamaGenerator,
-    LlamaMetalStepPlan, LlamaPromptWorkflow, LlamaSampling, packed_metal_fixture_models,
-    packed_metal_workflow_bytes,
+    LlamaMetalGreedyPlan, LlamaMetalStepPlan, LlamaPromptWorkflow, LlamaSampling,
+    packed_metal_fixture_models, packed_metal_workflow_bytes,
 };
 use crate::nn::{Linear, Module, Parameter, StateKind};
 use crate::runtime::scalar_lane::emit_scalar_lane;
@@ -608,7 +608,7 @@ use crate::{
     IndexValue, InferenceAppendStateLink, InferenceStateLink, KernelBindings, KernelBufferDesc,
     LaneInstruction, MovementKernelKind, MovementValue, NodeId, Operation, QuantizedTensorData,
     ReduceKind, ResNet, ResNetConfig, ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice,
-    Storage, TensorData, TypedValue, UType, schedule,
+    Storage, TensorData, TypedValue, UOp, UType, schedule,
 };
 
 fn packed_ones(kind: GgmlType, rows: usize) -> QuantizedTensorData {
@@ -1357,6 +1357,70 @@ fn metal_append_scoreboard_reports_packed_constants_exactly() {
 }
 
 #[test]
+fn ordinary_i32_shape_iota_renders_only_its_authenticated_store_iteration() {
+    let mut graph = Graph::new();
+    let source = graph.input_dtype("source", [3], DType::F32);
+    let iota = graph.shape_iota(source, 0).unwrap();
+    let item = schedule(&graph, iota).unwrap().items.pop().unwrap();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let rendered = renderer.render(&item.kernel).unwrap();
+    assert_eq!(rendered.extent, 3);
+    assert_eq!(rendered.buffers.len(), 1);
+    assert_eq!(rendered.buffers[0].dtype, DType::I32);
+    assert!(rendered.source.contains("b0[gid] = ((int)((ulong)gid));"));
+    assert!(!rendered.source.contains("device long*"));
+
+    let store = &item.kernel.sources()[0];
+    let index = &store.sources()[0];
+    let address = index.sources()[0].clone();
+    let wrong_iteration = UOp::from_operation(
+        Operation::Range(0),
+        Some(UType::scalar(DType::I64)),
+        vec![UOp::constant(4, UType::scalar(DType::I64))],
+    );
+    let wrong_index = UOp::from_operation(
+        index.operation().clone(),
+        index.ty(),
+        vec![address, wrong_iteration.clone()],
+    );
+    let malformed = UOp::sink(vec![
+        UOp::from_operation(
+            Operation::Store,
+            None,
+            vec![
+                wrong_index,
+                UOp::cast(wrong_iteration.clone(), UType::scalar(DType::I32)),
+            ],
+        ),
+        UOp::from_operation(Operation::EndRange, None, vec![wrong_iteration]),
+    ]);
+    assert!(matches!(
+        renderer.render(&malformed),
+        Err(MetalError::Unsupported(reason))
+            if reason.contains("dtype I64 is outside the exact Metal static subset")
+    ));
+
+    let mut wide_graph = Graph::new();
+    let wide_source = wide_graph.input_dtype(
+        "wide_source",
+        [usize::try_from(i32::MAX).unwrap() + 1],
+        DType::F32,
+    );
+    let wide_iota = wide_graph.shape_iota(wide_source, 0).unwrap();
+    assert_eq!(wide_graph.dtype(wide_iota).unwrap(), DType::I64);
+    let wide_item = schedule(&wide_graph, wide_iota)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    assert!(matches!(
+        renderer.render(&wide_item.kernel),
+        Err(MetalError::Unsupported(reason))
+            if reason.contains("dtype I64 is outside the exact Metal static subset")
+    ));
+}
+
+#[test]
 fn metal_append_state_fixed_span_commits_consecutive_rows_and_retries_tail() {
     let mut graph = Graph::new();
     let state = graph.input_dtype("cache", [7, 2], DType::F32);
@@ -1409,11 +1473,15 @@ fn metal_append_state_fixed_span_commits_consecutive_rows_and_retries_tail() {
         .iter()
         .find(|item| item.outputs.primary().id == iota_rendered.buffers[0].id)
         .expect("captured ShapeIota producer");
-    assert!(matches!(
-        renderer.render(&ordinary_iota.kernel),
-        Err(MetalError::Unsupported(reason))
-            if reason.contains("dtype I64 is outside the exact Metal static subset")
-    ));
+    let ordinary_iota = renderer.render(&ordinary_iota.kernel).unwrap();
+    assert_eq!(ordinary_iota.buffers.len(), 1);
+    assert_eq!(ordinary_iota.buffers[0].dtype, DType::I32);
+    assert!(
+        ordinary_iota
+            .source
+            .contains("b0[gid] = ((int)((ulong)gid));")
+    );
+    assert!(!ordinary_iota.source.contains("device long*"));
 
     let context =
         || MetalScoreboardContext::new("append-span", "test-revision", "semantic mock").unwrap();
@@ -1798,6 +1866,82 @@ fn metal_append_state_empty_rows_are_addressless_but_advance_logically() {
     assert_eq!(report.committed_state_bytes, 0);
     assert_eq!(report.committed_state_work_items, 0);
     assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn bounded_i32_device_proof_rejects_sentinel_and_upper_bound_before_commit() {
+    let mut graph = Graph::new();
+    let state = graph.input_dtype("proof_cache", [2, 1], DType::F32);
+    let (position, index) = append_position(&mut graph, "proof_position", [1, 1]);
+    let update_source = graph.input_dtype("proof_update", [1, 1], DType::F32);
+    let updates = graph.relu(update_source).unwrap();
+    let next = graph.scatter(state, index, updates, 0).unwrap();
+    let candidate = graph.input_dtype("proof_token", [1], DType::I32);
+    let zero = graph.constant(TensorData::from_scalars([1], DType::I32, [Scalar::I(0)]).unwrap());
+    let candidate = graph.add(candidate, zero).unwrap();
+    let captured = CapturedAppendStateInference::from_module_graph(
+        &IdentityModule,
+        &graph,
+        &[candidate],
+        &[InferenceAppendStateLink::new(
+            state, next, position, index, updates, 0,
+        )],
+        BTreeMap::from([(
+            "proof_cache".into(),
+            TensorData::new([2, 1], vec![0.0, 0.0]).unwrap(),
+        )]),
+    )
+    .unwrap()
+    .seal_committed_position()
+    .unwrap();
+    let plan = MetalAppendStateInferencePlan::new(
+        captured,
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    let mut session = plan
+        .prepare(test_device(Arc::new(MockDispatch::default())))
+        .unwrap();
+    let inputs = |token: i64| {
+        BTreeMap::from([
+            (
+                "proof_token".into(),
+                TensorData::from_scalars([1], DType::I32, [Scalar::I(token)]).unwrap(),
+            ),
+            (
+                "proof_update".into(),
+                TensorData::new([1, 1], vec![1.0]).unwrap(),
+            ),
+        ])
+    };
+
+    for (output, upper_exclusive) in [(1, 4), (0, 0)] {
+        assert!(matches!(
+            session.run_at_requiring_bounded_i32(&inputs(2), 0, output, upper_exclusive,),
+            Err(MetalError::InvalidDeviceProof(_))
+        ));
+        assert_eq!(session.committed_state_position(), Some(0));
+        assert_eq!(session.successful_run_count(), 0);
+    }
+
+    for invalid in [-1, 4] {
+        assert!(matches!(
+            session.run_at_requiring_bounded_i32(&inputs(invalid), 0, 0, 4),
+            Err(MetalError::InvalidDeviceProof(_))
+        ));
+        assert_eq!(session.committed_state_position(), Some(0));
+        assert_eq!(session.successful_run_count(), 0);
+    }
+
+    let retry = session
+        .run_at_requiring_bounded_i32(&inputs(2), 0, 0, 4)
+        .unwrap();
+    assert_eq!(retry.outputs()[0].dtype(), DType::I32);
+    assert_eq!(retry.outputs()[0].scalar_at(0).as_i64(), 2);
+    assert_eq!(retry.report().retained_d2h_calls, 1);
+    assert_eq!(retry.report().retained_d2h_bytes, 4);
+    assert_eq!(session.committed_state_position(), Some(1));
+    assert_eq!(session.successful_run_count(), 1);
 }
 
 #[test]
@@ -2198,6 +2342,165 @@ fn llama_metal_fixed_span_prefill_shares_state_and_preserves_t1_tail() {
     assert_eq!(next.report().successful_invocation, 3);
     assert_eq!(session.position(), 5);
     assert_eq!(session.successful_invocation_count(), 3);
+}
+
+#[test]
+fn llama_metal_device_greedy_dense_prefill_matches_cpu_with_one_i32_read() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        16,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (cpu_model, cpu_tokenizer) =
+        crate::models::transformer::LlamaModel::from_gguf(&file).unwrap();
+    let prompt = [3, 4, 5, 6];
+    let expected = LlamaGenerator::new(&cpu_model, &cpu_tokenizer)
+        .generate_ids(&prompt, 3, LlamaSampling::Greedy)
+        .unwrap();
+
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let plan = LlamaMetalGreedyPlan::from_workflow_with_prefill_span(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+        NonZeroUsize::new(3).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.summary().requested_output_count, 1);
+    assert_eq!(plan.summary().fallback_count, 0);
+    assert_eq!(plan.prefill_summary().unwrap().requested_output_count, 0);
+    assert_eq!(plan.prefill_summary().unwrap().fallback_count, 0);
+    let token_identity = plan.step_deployment_identity();
+    let prefill_identity = plan.prefill_deployment_identity().unwrap();
+    assert_ne!(token_identity, 0);
+    assert_ne!(prefill_identity, 0);
+
+    let mut session = plan.prepare().unwrap();
+    let prefill_preparation = session.prefill_preparation_report().unwrap();
+    assert_eq!(prefill_preparation.resident_h2d_calls, 0);
+    assert_eq!(prefill_preparation.initial_state_h2d_calls, 0);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("queue_create:"))
+            .count(),
+        1
+    );
+    let actual = session.generate_ids(&prompt, 3).unwrap();
+    assert_eq!(actual.generation(), &expected);
+    assert!(
+        actual
+            .generated_ids()
+            .iter()
+            .all(|token| (*token as usize) < session.vocab_size())
+    );
+    for report in actual.reports() {
+        match report.output_count {
+            0 => {
+                assert_eq!(report.retained_d2h_calls, 0);
+                assert_eq!(report.retained_d2h_bytes, 0);
+            }
+            1 => {
+                assert_eq!(report.retained_d2h_calls, 1);
+                assert_eq!(report.retained_d2h_bytes, 4);
+            }
+            count => panic!("unexpected device-greedy output count {count}"),
+        }
+    }
+    let evidence = actual.workload_evidence();
+    assert_eq!(
+        evidence.token_step_deployment_identity,
+        session.token_step_deployment_identity()
+    );
+    assert_eq!(
+        evidence.fixed_prefill_deployment_identity,
+        session.fixed_prefill_deployment_identity()
+    );
+    assert_eq!(evidence.token_step_deployment_identity, token_identity);
+    assert_eq!(
+        evidence.fixed_prefill_deployment_identity,
+        Some(prefill_identity)
+    );
+    assert_eq!(evidence.plan.fallback_count, 0);
+    assert_eq!(
+        evidence.fixed_prefill_plan.as_ref().unwrap().fallback_count,
+        0
+    );
+    assert_eq!(evidence.prompt_prefill.token_count, prompt.len());
+    assert_eq!(evidence.prompt_prefill.successful_invocation_count, 2);
+    assert_eq!(evidence.prompt_prefill.retained_d2h_calls, 1);
+    assert_eq!(evidence.prompt_prefill.retained_d2h_bytes, 4);
+    assert_eq!(
+        evidence.steady_decode.retained_d2h_bytes,
+        evidence.steady_decode.successful_invocation_count * 4
+    );
+}
+
+#[test]
+fn llama_metal_device_greedy_packed_matches_cpu_without_logits_download() {
+    let bytes = packed_metal_workflow_bytes();
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (cpu_model, cpu_tokenizer) =
+        crate::models::transformer::LlamaModel::from_gguf(&file).unwrap();
+    let expected = LlamaGenerator::new(&cpu_model, &cpu_tokenizer)
+        .generate_ids(&[3], 2, LlamaSampling::Greedy)
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock);
+    let plan = LlamaMetalGreedyPlan::from_workflow(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+    )
+    .unwrap();
+    assert_eq!(plan.summary().requested_output_count, 1);
+    assert_eq!(plan.summary().fallback_count, 0);
+    assert!(plan.summary().quantized_constant_count > 0);
+    let mut session = plan.prepare().unwrap();
+    let actual = session.generate_ids(&[3], 2).unwrap();
+    assert_eq!(actual.generation(), &expected);
+    assert!(actual.reports().iter().all(|report| {
+        report.output_count == 1 && report.retained_d2h_calls == 1 && report.retained_d2h_bytes == 4
+    }));
+}
+
+#[test]
+fn llama_metal_device_greedy_returns_eos_without_appending_it() {
+    let base = crate::models::transformer::model_tests::serialized_model_with_template(8, None);
+    let file = crate::gguf::read_gguf(&base).unwrap();
+    let (model, tokenizer) = crate::models::transformer::LlamaModel::from_gguf(&file).unwrap();
+    let selected = LlamaGenerator::new(&model, &tokenizer)
+        .generate_ids(&[3], 1, LlamaSampling::Greedy)
+        .unwrap()
+        .generated_ids()[0];
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template_and_eos(
+        8,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+        selected,
+    );
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (model, tokenizer) = crate::models::transformer::LlamaModel::from_gguf(&file).unwrap();
+    let expected = LlamaGenerator::new(&model, &tokenizer)
+        .generate_ids(&[3], 4, LlamaSampling::Greedy)
+        .unwrap();
+    assert_eq!(expected.generated_ids(), [selected]);
+    assert!(expected.stopped());
+
+    let device = test_device(Arc::new(MockDispatch::default()));
+    let mut session = LlamaMetalGreedyPlan::from_workflow(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+    )
+    .unwrap()
+    .prepare()
+    .unwrap();
+    let actual = session.generate_ids(&[3], 4).unwrap();
+    assert_eq!(actual.generation(), &expected);
+    assert_eq!(actual.reports().len(), 1);
+    assert_eq!(session.position(), 1);
+    assert_eq!(session.successful_invocation_count(), 1);
 }
 
 #[test]
@@ -6749,6 +7052,46 @@ fn typed_reduction_recurrence_executes_through_metal_mock() {
 }
 
 #[test]
+fn ordered_graph_maximum_renders_i32_and_preserves_lhs_on_ties_and_nan() {
+    let renderer = MetalRenderer::new(4, capabilities()).unwrap();
+    let mut integer_graph = Graph::new();
+    let integer_lhs = integer_graph.input_dtype("lhs", [3], DType::I32);
+    let integer_rhs = integer_graph.input_dtype("rhs", [3], DType::I32);
+    let integer_maximum = integer_graph.maximum(integer_lhs, integer_rhs).unwrap();
+    let integer_item = schedule(&integer_graph, integer_maximum)
+        .unwrap()
+        .items
+        .pop()
+        .unwrap();
+    let integer_rendered = renderer.render(&integer_item.kernel).unwrap();
+    assert!(integer_rendered.source.contains(" < "));
+    assert!(integer_rendered.source.contains(" ? "));
+
+    let mut float_graph = Graph::new();
+    let float_lhs = float_graph.input_dtype("lhs", [3], DType::F32);
+    let float_rhs = float_graph.input_dtype("rhs", [3], DType::F32);
+    let float_maximum = float_graph.maximum(float_lhs, float_rhs).unwrap();
+    let leading_nan = f32::from_bits(0x7fc0_1234);
+    let (actual, _) = execute_mock(
+        &float_graph,
+        float_maximum,
+        &HashMap::from([
+            (
+                "lhs".into(),
+                TensorData::new([3], vec![leading_nan, -0.0, 1.0]).unwrap(),
+            ),
+            (
+                "rhs".into(),
+                TensorData::new([3], vec![9.0, 0.0, 2.0]).unwrap(),
+            ),
+        ]),
+    );
+    assert!(actual.scalar_at(0).as_f64().is_nan());
+    assert_eq!(actual.scalar_at(1).as_f64().to_bits(), (-0.0f64).to_bits());
+    assert_eq!(actual.scalar_at(2).as_f64(), 2.0);
+}
+
+#[test]
 fn shared_scalar_lane_intrinsics_division_and_bitwise_render_structurally() {
     let renderer = MetalRenderer::new(4, capabilities()).unwrap();
     let dialect = renderer::MetalScalarDialect;
@@ -6774,12 +7117,36 @@ fn shared_scalar_lane_intrinsics_division_and_bitwise_render_structurally() {
         rhs: typed("rhs", DType::F32),
         op: CompareOp::Lt,
     };
+    let maximum = LaneInstruction::GraphBinary {
+        output: typed("out", DType::I32),
+        lhs: typed("lhs", DType::I32),
+        rhs: typed("rhs", DType::I32),
+        op: BinaryOp::Maximum,
+    };
+    let mixed_maximum = LaneInstruction::GraphBinary {
+        output: typed("out", DType::F32),
+        lhs: typed("lhs", DType::I32),
+        rhs: typed("rhs", DType::F32),
+        op: BinaryOp::Maximum,
+    };
+    let minimum = LaneInstruction::GraphBinary {
+        output: typed("out", DType::I32),
+        lhs: typed("lhs", DType::I32),
+        rhs: typed("rhs", DType::I32),
+        op: BinaryOp::Minimum,
+    };
     let bitwise = emit_scalar_lane(&dialect, &mixed_bitwise).unwrap();
     let add = emit_scalar_lane(&dialect, &mixed_add).unwrap();
     let compare_error = emit_scalar_lane(&dialect, &mixed_compare).unwrap_err();
+    let maximum = emit_scalar_lane(&dialect, &maximum).unwrap();
+    let mixed_maximum_error = emit_scalar_lane(&dialect, &mixed_maximum).unwrap_err();
+    let minimum_error = emit_scalar_lane(&dialect, &minimum).unwrap_err();
     assert!(bitwise.contains("(int)(lhs)") && bitwise.contains(" | "));
     assert!(add.contains("(float)(lhs)") && add.contains(" + "));
     assert!(compare_error.contains("compare dtype"));
+    assert_eq!(maximum, "(((lhs) < (rhs)) ? (rhs) : (lhs))");
+    assert!(mixed_maximum_error.contains("binary dtype"));
+    assert!(minimum_error.contains("Minimum"));
 
     for (name, operation) in [
         ("sqrt", crate::UnaryOp::Sqrt),
