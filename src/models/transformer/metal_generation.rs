@@ -7,7 +7,7 @@ use super::{
     generation::{select_last, validate_sampling},
     metal_scoreboard::{
         LlamaMetalExecutionScoreboardReport, LlamaMetalScoreboardInvocation,
-        LlamaMetalScoreboardProgram,
+        LlamaMetalScoreboardPhase, LlamaMetalScoreboardProgram,
     },
     metal_step::LlamaMetalPrefillPlan,
     metal_workload_evidence::{LlamaMetalWorkloadEvidence, LlamaMetalWorkloadPhase},
@@ -766,6 +766,7 @@ impl LlamaMetalSession {
             &mut self.step,
             &mut self.prefill,
             LlamaMetalScoreboardProgram::TokenStep,
+            LlamaMetalScoreboardPhase::Standalone,
             1,
             step.report(),
         );
@@ -817,6 +818,7 @@ impl LlamaMetalSession {
                     &mut self.step,
                     &mut self.prefill,
                     LlamaMetalScoreboardProgram::FixedPrefill,
+                    LlamaMetalScoreboardPhase::PromptPrefill,
                     span,
                     &report,
                 );
@@ -854,6 +856,7 @@ impl LlamaMetalSession {
                 &mut self.step,
                 &mut self.prefill,
                 LlamaMetalScoreboardProgram::TokenStep,
+                LlamaMetalScoreboardPhase::PromptPrefill,
                 1,
                 &report,
             );
@@ -889,6 +892,7 @@ impl LlamaMetalSession {
             &mut self.step,
             &mut self.prefill,
             LlamaMetalScoreboardProgram::TokenStep,
+            LlamaMetalScoreboardPhase::PromptPrefill,
             1,
             &report,
         );
@@ -1008,6 +1012,7 @@ impl LlamaMetalSession {
                     &mut self.step,
                     &mut self.prefill,
                     LlamaMetalScoreboardProgram::TokenStep,
+                    LlamaMetalScoreboardPhase::SteadyDecode,
                     1,
                     &report,
                 );
@@ -1158,6 +1163,7 @@ fn observe_scoreboard_run(
     step: &mut LlamaMetalStepSession,
     prefill: &mut Option<LlamaMetalPrefillSession>,
     program: LlamaMetalScoreboardProgram,
+    phase: LlamaMetalScoreboardPhase,
     append_span_rows: usize,
     report: &MetalDeviceRunReport,
 ) {
@@ -1186,7 +1192,13 @@ fn observe_scoreboard_run(
     let invocation = program_successful_invocation
         .ok_or(MetalScoreboardError::Overflow)
         .and_then(|local| {
-            LlamaMetalScoreboardInvocation::from_report(program, local, append_span_rows, report)
+            LlamaMetalScoreboardInvocation::from_report(
+                program,
+                phase,
+                local,
+                append_span_rows,
+                report,
+            )
         });
     match invocation {
         Ok(invocation) => scoreboard_invocations

@@ -193,8 +193,9 @@ pub use models::transformer::{
     LlamaMetalGenerationStage, LlamaMetalGreedyPlan, LlamaMetalGreedySession, LlamaMetalGreedyStep,
     LlamaMetalGreedyStepPlan, LlamaMetalGreedyStepSession, LlamaMetalPlan, LlamaMetalPrefill,
     LlamaMetalProgress, LlamaMetalPromptOutput, LlamaMetalScoreboardInvocation,
-    LlamaMetalScoreboardProgram, LlamaMetalSession, LlamaMetalStep, LlamaMetalStepError,
-    LlamaMetalStepPlan, LlamaMetalStepSession, LlamaMetalTokenCommit, LlamaMetalWorkloadEvidence,
+    LlamaMetalScoreboardPhase, LlamaMetalScoreboardPhaseAggregate, LlamaMetalScoreboardProgram,
+    LlamaMetalSession, LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan,
+    LlamaMetalStepSession, LlamaMetalTokenCommit, LlamaMetalWorkloadEvidence,
     LlamaMetalWorkloadEvidenceArtifact, LlamaMetalWorkloadEvidenceContext,
     LlamaMetalWorkloadEvidenceError, LlamaMetalWorkloadPhase, LlamaPromptWorkflow, LlamaSampling,
 };

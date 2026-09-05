@@ -72,14 +72,17 @@ time, and append-position/row-commit records, checked aggregates, successful cac
 schedule/peak-live facts, and distinct physical Metal slot/state-bank facts.
 Failed attempts cannot enter that prefix or advance recorder-owned counters.
 The Llama facade binds one recorder to each real token-step or fixed-prefill
-physical session before preparation. Its Llama execution scoreboard v1 keeps
+physical session before preparation. Its Llama execution scoreboard v2 keeps
 their local identities and first-run attribution intact while linking exact
-spans, positions, bytes, and work items in one global success order. Failed
+spans, positions, bytes, and work items in one global success order. Closed
+standalone, prompt-prefill, and steady-decode labels join back to those physical
+runs and produce checked row, duration, launch/command, and host API transfer
+totals plus explicitly scoped host-run and compute-command token-rate helpers. Failed
 attempts and the first latched recorder error cannot extend that prefix. The
-records deliberately do not classify tokenization, chat, or sampling work. It
+records deliberately exclude tokenization, chat, and sampling work. It
 remains host-observed execution
 measurement plumbing, not live workload evidence, allocator peak memory, bus
-traffic, copy timing, end-to-end GPU latency, or tokens-per-second evidence.
+traffic, copy timing, end-to-end GPU latency, or cross-runtime speedup evidence.
 
 `ResNetMetalPlan::eval_f32` is the concise public entry point for this vertical:
 it freezes the model, binds capability admission and preparation to one explicit
@@ -152,10 +155,11 @@ while preserving scalar T=1 identity. Integrated packed embedding capture
 accepts the same fixed geometry for Q4_0/Q8_0/Q4_K/Q6_K without host
 dequantization or repeated packed upload. The chunk-prefill Llama graph and
 facade bind separate authenticated recorders to the shared fixed-prefill and
-T=1 programs, then publish one ordered Llama execution scoreboard v1 without
-inventing a shared physical-session identity. Remaining work proves live-device
-output agreement and adds measured prompt/decode performance evidence; the
-current scoreboard is host-observed execution accounting, not a speedup claim.
+T=1 programs, then publish one ordered Llama execution scoreboard v2 without
+inventing a shared physical-session identity. Its checked prompt/decode phase
+accounting is ready for evidence capture, but remaining work still proves
+live-device output agreement and publishes measured prompt/decode performance;
+the current scoreboard is host-observed execution accounting, not a speedup claim.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
 serving path.
 

@@ -51,7 +51,8 @@ pub use metal_generation::{
 pub use metal_greedy_generation::{LlamaMetalGreedyPlan, LlamaMetalGreedySession};
 pub use metal_scoreboard::{
     LLAMA_METAL_EXECUTION_SCOREBOARD_FORMAT_VERSION, LlamaMetalExecutionScoreboardReport,
-    LlamaMetalScoreboardInvocation, LlamaMetalScoreboardProgram,
+    LlamaMetalScoreboardInvocation, LlamaMetalScoreboardPhase, LlamaMetalScoreboardPhaseAggregate,
+    LlamaMetalScoreboardProgram,
 };
 pub use metal_step::{
     LlamaMetalGreedyStep, LlamaMetalGreedyStepPlan, LlamaMetalGreedyStepSession, LlamaMetalStep,
