@@ -25,6 +25,7 @@ jobs:
       EXPECTED_SHA: ${{ inputs.expected_sha }}
       RUSTGRAD_METAL_EXPECTED_SHA: ${{ inputs.expected_sha }}
       RUSTGRAD_METAL_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-linear-scoreboard.json
+      RUSTGRAD_METAL_TRAINING_EVIDENCE_PATH: ${{ github.workspace }}/metal-live-compiled-training-v1.json
       RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-resnet18-scoreboard.json
       RUSTGRAD_METAL_RESNET_OBSERVATION_PATH: ${{ github.workspace }}/metal-live-resnet18-observation-v1.json
       RUSTGRAD_METAL_RESNET_RUNS: "10"
@@ -57,6 +58,7 @@ jobs:
           fi
           for output_path in \
             "$RUSTGRAD_METAL_SCOREBOARD_PATH" \
+            "$RUSTGRAD_METAL_TRAINING_EVIDENCE_PATH" \
             "$RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH" \
             "$RUSTGRAD_METAL_RESNET_OBSERVATION_PATH"; do
             if [[ -e "$output_path" || -L "$output_path" ]]; then
@@ -80,6 +82,12 @@ jobs:
           cargo test --release --test metal_live
           live_metal_linear_persistent_session_emits_scoreboard --
           --ignored --nocapture --test-threads=1
+      - name: Train and resume the compiled causal Transformer on Metal
+        shell: bash
+        run: >-
+          cargo test --release --test compiled_transformer_training
+          live_metal_compiled_causal_transformer_training_resumes_exactly --
+          --ignored --nocapture --test-threads=1
       - name: Benchmark exact live Metal ResNet-18
         shell: bash
         run: cargo run --release --example metal_resnet_benchmark
@@ -87,6 +95,7 @@ jobs:
         shell: bash
         run: |
           cat "$RUSTGRAD_METAL_SCOREBOARD_PATH"
+          cat "$RUSTGRAD_METAL_TRAINING_EVIDENCE_PATH"
           cat "$RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH"
           cat "$RUSTGRAD_METAL_RESNET_OBSERVATION_PATH"
       - name: Upload live Metal evidence
@@ -95,6 +104,7 @@ jobs:
           name: metal-live-${{ inputs.expected_sha }}
           path: |
             ${{ env.RUSTGRAD_METAL_SCOREBOARD_PATH }}
+            ${{ env.RUSTGRAD_METAL_TRAINING_EVIDENCE_PATH }}
             ${{ env.RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH }}
             ${{ env.RUSTGRAD_METAL_RESNET_OBSERVATION_PATH }}
           if-no-files-found: error
