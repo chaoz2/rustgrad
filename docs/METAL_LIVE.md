@@ -4,7 +4,7 @@ RustGrad's live Metal workflow is a manual conformance lane, not part of normal
 CI. The workflow definition, ignored acceptance test, and examples are not
 live-hardware evidence by themselves. Evidence exists only after an exact-SHA
 workflow run succeeds and publishes the Linear/ResNet scoreboards plus the
-Llama workload evidence, attestation, and checksum manifest.
+device-greedy Llama execution scoreboard v2, attestation, and checksum manifest.
 
 ## Provisioning contract
 
@@ -44,6 +44,10 @@ Provision these external resources before dispatching
 
 The repository never downloads or uploads the GGUF. Do not place credentials,
 private model locations, or model bytes in commits or workflow inputs.
+
+The current external audit found zero runners, no `live-metal`
+environment, and none of the required protected variables. These are external
+provisioning blockers, not evidence produced by the repository.
 
 ## Remote preflight
 
@@ -102,15 +106,16 @@ of silently testing the newer revision.
 
 ## Evidence boundary
 
-A successful Linear/ResNet job uploads two v6 scoreboards. A successful Llama
-job uploads versioned workload evidence for its token-step and fixed-span
-programs, a typed provenance attestation, and `SHA256SUMS`. Preserve the
-workflow run URL and ID with any release record.
+A successful Linear/ResNet job uploads two v7 scoreboards. A successful Llama
+job uploads its device-greedy execution scoreboard v2, whose token-step and
+fixed-span components are authenticated v7 reports, plus a typed provenance
+attestation and `SHA256SUMS`. Preserve the workflow run URL and ID with any
+release record.
 
 Host-wall durations and optional completed-compute-command GPU execution time
-are reported separately, and copy counts are host API calls. Host-observed
-tokens per second is derived only from workload wall-clock durations. Command
-time does not establish end-to-end GPU latency or throughput, copy time, energy
-use, allocator RSS, or physical bus traffic. Pinned token IDs demonstrate only
-the configured model, prompt, and oracle contract; they are not broad
-cross-runtime parity.
+are reported separately, and copy counts are host API calls. Host-run and
+compute-command token rates are derived only from their explicitly scoped
+scoreboard phase durations. Command time does not establish end-to-end GPU
+latency or throughput, copy time, energy use, allocator RSS, physical bus
+traffic, or a speedup. Pinned token IDs demonstrate only the configured model,
+prompt, and oracle contract; they are not broad cross-runtime parity.

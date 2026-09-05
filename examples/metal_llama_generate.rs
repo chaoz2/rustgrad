@@ -1429,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn live_workflow_pairs_fixed_span_workload_attestation_and_checksums() {
+    fn live_workflow_pairs_device_greedy_scoreboard_attestation_and_checksums() {
         let workflow = include_str!("../.github/workflows/metal-live.yml");
         for required in [
             "RUSTGRAD_METAL_LLAMA_MODEL_SOURCE",
@@ -1440,7 +1440,7 @@ mod tests {
             "RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND",
             "--attestation",
             "--prefill-span",
-            "--workload-evidence",
+            "--scoreboard",
             "--workflow-run-url",
             "SHA256SUMS",
         ] {
@@ -1471,9 +1471,20 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(llama_job.matches("--scoreboard").count(), 1);
+        assert_eq!(llama_job.matches("--attestation").count(), 1);
         assert!(llama_job.contains("RUSTGRAD_METAL_LLAMA_PREFILL_SPAN"));
-        assert!(llama_job.contains("RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH"));
-        assert!(!llama_job.contains("RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH"));
+        assert!(llama_job.contains(r#"--scoreboard "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH""#));
+        assert!(llama_job.contains(r#"--attestation "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH""#));
+        assert!(llama_job.contains(
+            r#"scoreboard_name="$(basename -- "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH")""#
+        ));
+        assert!(llama_job.contains(r#"shasum -a 256 "$scoreboard_name" "$attestation_name""#));
+        assert!(llama_job.contains("${{ env.RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH }}"));
+        assert!(llama_job.contains("${{ env.RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH }}"));
+        assert!(llama_job.contains("${{ env.RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH }}"));
+        assert!(!llama_job.contains("--workload-evidence"));
+        assert!(!llama_job.contains("RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH"));
         assert!(
             workflow.contains("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
         );
