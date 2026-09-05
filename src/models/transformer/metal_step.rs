@@ -76,6 +76,7 @@ pub struct LlamaMetalGreedyStepSession {
     inner: MetalDeviceSession,
     max_context: usize,
     vocab_size: usize,
+    scoreboard: Option<LlamaMetalScoreboardObserver>,
 }
 
 struct LlamaMetalScoreboardObserver {
@@ -83,6 +84,53 @@ struct LlamaMetalScoreboardObserver {
     first_error: Option<MetalScoreboardError>,
     #[cfg(test)]
     record_attempts: usize,
+}
+
+impl LlamaMetalScoreboardObserver {
+    fn bind(
+        mut recorder: MetalSessionScoreboard,
+        session: &MetalDeviceSession,
+    ) -> Result<Self, MetalScoreboardError> {
+        recorder.bind(session)?;
+        Ok(Self {
+            recorder,
+            first_error: None,
+            #[cfg(test)]
+            record_attempts: 0,
+        })
+    }
+
+    fn recorder(&self) -> &MetalSessionScoreboard {
+        &self.recorder
+    }
+
+    fn first_error(&self) -> Option<&MetalScoreboardError> {
+        self.first_error.as_ref()
+    }
+
+    fn freeze(&mut self, error: MetalScoreboardError) {
+        if self.first_error.is_none() {
+            self.first_error = Some(error);
+        }
+    }
+
+    fn observe(&mut self, run: &crate::runtime::metal::MetalDeviceRun, position: usize) {
+        if self.first_error.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.record_attempts += 1;
+        }
+        if let Err(error) = self.recorder.record_from_position(run, position) {
+            self.first_error = Some(error);
+        }
+    }
+
+    #[cfg(test)]
+    fn record_attempts(&self) -> usize {
+        self.record_attempts
+    }
 }
 
 /// One successfully committed token invocation.
@@ -373,6 +421,7 @@ impl LlamaMetalGreedyStepPlan {
             inner: self.inner.prepare(device)?,
             max_context: self.max_context,
             vocab_size: self.vocab_size,
+            scoreboard: None,
         })
     }
 
@@ -577,39 +626,35 @@ impl LlamaMetalStepSession {
 
     pub(crate) fn bind_execution_scoreboard(
         &mut self,
-        mut recorder: MetalSessionScoreboard,
+        recorder: MetalSessionScoreboard,
     ) -> Result<(), MetalScoreboardError> {
-        recorder.bind(&self.inner)?;
-        self.scoreboard = Some(LlamaMetalScoreboardObserver {
-            recorder,
-            first_error: None,
-            #[cfg(test)]
-            record_attempts: 0,
-        });
+        self.scoreboard = Some(LlamaMetalScoreboardObserver::bind(recorder, &self.inner)?);
         Ok(())
     }
 
     pub(crate) fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
-        self.scoreboard.as_ref().map(|state| &state.recorder)
+        self.scoreboard
+            .as_ref()
+            .map(LlamaMetalScoreboardObserver::recorder)
     }
 
     pub(crate) fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
         self.scoreboard
             .as_ref()
-            .and_then(|state| state.first_error.as_ref())
+            .and_then(LlamaMetalScoreboardObserver::first_error)
     }
 
     pub(crate) fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError) {
-        if let Some(state) = &mut self.scoreboard
-            && state.first_error.is_none()
-        {
-            state.first_error = Some(error);
+        if let Some(state) = &mut self.scoreboard {
+            state.freeze(error);
         }
     }
 
     #[cfg(test)]
     pub(crate) fn scoreboard_record_attempts(&self) -> Option<usize> {
-        self.scoreboard.as_ref().map(|state| state.record_attempts)
+        self.scoreboard
+            .as_ref()
+            .map(LlamaMetalScoreboardObserver::record_attempts)
     }
 
     /// Runs exactly one token. Invalid tokens, a full context, and failed
@@ -700,18 +745,8 @@ impl LlamaMetalStepSession {
     }
 
     fn observe_run(&mut self, run: &crate::runtime::metal::MetalDeviceRun, position: usize) {
-        let Some(state) = &mut self.scoreboard else {
-            return;
-        };
-        if state.first_error.is_some() {
-            return;
-        }
-        #[cfg(test)]
-        {
-            state.record_attempts += 1;
-        }
-        if let Err(error) = state.recorder.record_from_position(run, position) {
-            state.first_error = Some(error);
+        if let Some(state) = &mut self.scoreboard {
+            state.observe(run, position);
         }
     }
 }
@@ -739,6 +774,39 @@ impl LlamaMetalGreedyStepSession {
         &self.inner
     }
 
+    pub(crate) fn bind_execution_scoreboard(
+        &mut self,
+        recorder: MetalSessionScoreboard,
+    ) -> Result<(), MetalScoreboardError> {
+        self.scoreboard = Some(LlamaMetalScoreboardObserver::bind(recorder, &self.inner)?);
+        Ok(())
+    }
+
+    pub(crate) fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
+        self.scoreboard
+            .as_ref()
+            .map(LlamaMetalScoreboardObserver::recorder)
+    }
+
+    pub(crate) fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
+        self.scoreboard
+            .as_ref()
+            .and_then(LlamaMetalScoreboardObserver::first_error)
+    }
+
+    pub(crate) fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError) {
+        if let Some(state) = &mut self.scoreboard {
+            state.freeze(error);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scoreboard_record_attempts(&self) -> Option<usize> {
+        self.scoreboard
+            .as_ref()
+            .map(LlamaMetalScoreboardObserver::record_attempts)
+    }
+
     /// Runs one token, downloads only the guarded I32 greedy token, and commits
     /// position only after the result is nonnegative.
     pub fn run_token(&mut self, token: u32) -> Result<LlamaMetalGreedyStep, LlamaMetalStepError> {
@@ -763,6 +831,7 @@ impl LlamaMetalGreedyStepSession {
                 MetalError::InvalidDeviceProof(_) => LlamaMetalStepError::NonFiniteLogits,
                 error => LlamaMetalStepError::Metal(error),
             })?;
+        self.observe_run(&run, position);
         let (outputs, mut report) = run.into_parts();
         report.successful_invocation = invocation;
         report.first_successful_run = invocation == 1;
@@ -809,6 +878,7 @@ impl LlamaMetalGreedyStepSession {
     ) -> Result<LlamaMetalTokenCommit, LlamaMetalStepError> {
         let inputs = self.token_inputs_at(token, position)?;
         let run = self.inner.run_without_host_outputs_at(&inputs, position)?;
+        self.observe_run(&run, position);
         debug_assert!(run.outputs().is_empty());
         let (_, mut report) = run.into_parts();
         report.successful_invocation = invocation;
@@ -837,6 +907,12 @@ impl LlamaMetalGreedyStepSession {
             TOKEN_INPUT.to_owned(),
             TensorData::from_scalars([1, 1], DType::I32, [Scalar::I(i64::from(token))])?,
         )]))
+    }
+
+    fn observe_run(&mut self, run: &crate::runtime::metal::MetalDeviceRun, position: usize) {
+        if let Some(state) = &mut self.scoreboard {
+            state.observe(run, position);
+        }
     }
 }
 

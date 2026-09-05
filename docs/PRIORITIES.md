@@ -71,15 +71,17 @@ per-run host-wall/copy/kernel/compute-command, optional GPU command execution
 time, and append-position/row-commit records, checked aggregates, successful cache-miss pipeline-build time, logical
 schedule/peak-live facts, and distinct physical Metal slot/state-bank facts.
 Failed attempts cannot enter that prefix or advance recorder-owned counters.
-The Llama facade binds one recorder to each real token-step or fixed-prefill
-physical session before preparation. Its Llama execution scoreboard v2 keeps
+The host-logits and device-greedy Llama facades bind one recorder to each real
+token-step or fixed-prefill physical session before preparation. One shared
+token-step observer owns bind, record, fail-soft freeze, error, and test
+instrumentation for both paths. Their Llama execution scoreboard v2 keeps
 their local identities and first-run attribution intact while linking exact
 spans, positions, bytes, and work items in one global success order. Closed
 standalone, prompt-prefill, and steady-decode labels join back to those physical
 runs and produce checked row, duration, launch/command, and host API transfer
-totals plus explicitly scoped host-run and compute-command token-rate helpers. Failed
-attempts and the first latched recorder error cannot extend that prefix. The
-records deliberately exclude tokenization, chat, and sampling work. It
+totals plus explicitly scoped host-run and compute-command token-rate helpers.
+Failed attempts and the first latched recorder error cannot extend that prefix.
+The records deliberately exclude tokenization, chat, and sampling work. It
 remains host-observed execution
 measurement plumbing, not live workload evidence, allocator peak memory, bus
 traffic, copy timing, end-to-end GPU latency, or cross-runtime speedup evidence.
@@ -156,10 +158,13 @@ accepts the same fixed geometry for Q4_0/Q8_0/Q4_K/Q6_K without host
 dequantization or repeated packed upload. The chunk-prefill Llama graph and
 facade bind separate authenticated recorders to the shared fixed-prefill and
 T=1 programs, then publish one ordered Llama execution scoreboard v2 without
-inventing a shared physical-session identity. Its checked prompt/decode phase
-accounting is ready for evidence capture, but remaining work still proves
-live-device output agreement and publishes measured prompt/decode performance;
-the current scoreboard is host-observed execution accounting, not a speedup claim.
+inventing a shared physical-session identity. The public greedy CLI now records
+that same envelope while retaining only one checked I32 token per selecting
+invocation; the host-logits/Gumbel API remains separate. Its checked
+prompt/decode phase accounting is ready for evidence capture, but remaining
+work still proves live-device output agreement and publishes measured
+prompt/decode performance; the current scoreboard is host-observed execution
+accounting, not a speedup claim.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
 serving path.
 
