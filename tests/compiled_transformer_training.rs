@@ -1,4 +1,5 @@
 use rustgrad::nn::{Embedding, LayerNorm, StateKind};
+use rustgrad::runtime::metal::{MetalCapabilities, MetalRenderer};
 use rustgrad::{
     CompiledAdamWConfig, CpuCompiledAdamW, DType, Graph, LossOptions, Mode, ModeModuleForward,
     Module, NodeId, Parameter, Reduction, Result, Scalar, Shape, TensorData, TransformerBlock,
@@ -59,9 +60,9 @@ impl Module for TinyCausalTransformer {
 fn config() -> CompiledAdamWConfig {
     CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
         .unwrap()
-        .with_input("tokens", [1, TIME], DType::I64)
+        .with_input("tokens", [1, TIME], DType::I32)
         .unwrap()
-        .with_input("targets", [1, TIME], DType::I64)
+        .with_input("targets", [1, TIME], DType::I32)
         .unwrap()
 }
 
@@ -86,11 +87,11 @@ fn build(
 }
 
 fn batch() -> BTreeMap<String, TensorData> {
-    let tensor = |values: [i64; TIME]| {
+    let tensor = |values: [i32; TIME]| {
         TensorData::from_scalars(
             Shape::new([1, TIME]),
-            DType::I64,
-            values.into_iter().map(Scalar::I),
+            DType::I32,
+            values.into_iter().map(|value| Scalar::I(i64::from(value))),
         )
         .unwrap()
     };
@@ -102,6 +103,18 @@ fn batch() -> BTreeMap<String, TensorData> {
 
 fn learning_rate() -> TensorData {
     TensorData::scalar(0.05)
+}
+
+fn metal_renderer() -> MetalRenderer {
+    MetalRenderer::new(
+        8,
+        MetalCapabilities {
+            max_buffer_length: 1 << 30,
+            unified_memory: true,
+            family: "Apple9".into(),
+        },
+    )
+    .unwrap()
 }
 
 #[test]
@@ -173,5 +186,25 @@ fn compiled_causal_transformer_training_decreases_loss_and_resumes_exactly() {
     assert_eq!(
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
+    );
+}
+
+#[test]
+fn causal_transformer_training_capture_is_strictly_renderable_for_metal() {
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let compiled = CpuCompiledAdamW::compile_module(config(), &model, build).unwrap();
+    let parameter_count = compiled.parameter_snapshots().unwrap().len();
+    let plan = compiled.metal_plan(metal_renderer()).unwrap();
+
+    assert_eq!(plan.capture_identity(), compiled.capture_identity());
+    assert_eq!(plan.step_count(), 0);
+    assert_eq!(plan.summary().fallback_count, 0);
+    assert_eq!(plan.summary().state_pair_count, parameter_count * 3 + 1);
+    assert_eq!(plan.summary().state_bank_count, 2);
+    assert_eq!(plan.summary().requested_output_count, 2);
+    assert!(plan.summary().nonzero_item_count > 0);
+    assert_eq!(
+        plan.rendered_items().len(),
+        plan.summary().nonzero_item_count
     );
 }

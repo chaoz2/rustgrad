@@ -3672,6 +3672,41 @@ impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
         )
     }
 
+    /// Downloads the currently active side of every fixed-state pair without
+    /// executing the schedule or changing the selected epoch.
+    pub(crate) fn snapshot_state(
+        &self,
+        alternate_state_bank: bool,
+    ) -> Result<BTreeMap<u64, TensorData>, A::Error> {
+        let mut values = BTreeMap::new();
+        for link in &self.prepared.state_links {
+            let plan =
+                self.prepared.buffer_plans.get(&link.input).ok_or_else(|| {
+                    A::invalid_binding("state snapshot descriptor is absent".into())
+                })?;
+            let mut bytes = vec![0; plan.bytes];
+            if !bytes.is_empty() {
+                let queue =
+                    self.prepared.queue.as_ref().ok_or_else(|| {
+                        A::invalid_binding("state snapshot queue is absent".into())
+                    })?;
+                let buffer = self
+                    .prepared
+                    .buffer_for_epoch(link.input, alternate_state_bank)
+                    .ok_or_else(|| A::invalid_binding("state snapshot buffer is absent".into()))?;
+                self.prepared.adapter.read(queue, buffer, &mut bytes)?;
+            }
+            let value = TensorData::from_le_bytes(plan.source_shape.clone(), plan.dtype, &bytes)
+                .map_err(|_| A::invalid_binding("state snapshot bytes are invalid".into()))?;
+            if values.insert(link.input, value).is_some() {
+                return Err(A::invalid_binding(
+                    "state snapshot input identity repeats".into(),
+                ));
+            }
+        }
+        Ok(values)
+    }
+
     pub(crate) fn execute_append_state(
         &self,
         values: &mut BTreeMap<u64, TensorData>,

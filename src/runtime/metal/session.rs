@@ -1447,6 +1447,36 @@ impl MetalDeviceSession {
         self.state_epoch
     }
 
+    /// Downloads detached snapshots of the currently committed fixed state.
+    /// This is an explicit diagnostic/checkpoint transfer: it executes no
+    /// kernels, advances no epoch, and is unavailable for stateless or
+    /// append-only sessions.
+    pub fn state_snapshots(&self) -> Result<BTreeMap<String, TensorData>, MetalError> {
+        if !matches!(self.state_policy, MetalSessionStatePolicy::Epoch { .. }) {
+            return Err(MetalError::InvalidBinding(
+                "Metal state snapshots require fixed epoch state".into(),
+            ));
+        }
+        let mut values = self.prepared.snapshot_state(self.state_epoch)?;
+        let mut snapshots = BTreeMap::new();
+        for input in self.lifetime.state_inputs() {
+            let value = values.remove(&input.desc.id).ok_or_else(|| {
+                MetalError::InvalidBinding(format!("Metal state snapshot {} is absent", input.name))
+            })?;
+            if snapshots.insert(input.name.clone(), value).is_some() {
+                return Err(MetalError::InvalidBinding(
+                    "Metal state snapshot name repeats".into(),
+                ));
+            }
+        }
+        if !values.is_empty() {
+            return Err(MetalError::InvalidBinding(
+                "Metal state snapshot inventory has unknown values".into(),
+            ));
+        }
+        Ok(snapshots)
+    }
+
     /// Returns the next append row for append-state sessions. Other session
     /// policies return `None`.
     pub const fn committed_state_position(&self) -> Option<usize> {
