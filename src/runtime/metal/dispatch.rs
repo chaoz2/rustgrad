@@ -55,6 +55,13 @@ pub(super) struct LaunchGeometry {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct BatchLaunch {
+    pub pipeline: RawPipeline,
+    pub buffers: Vec<RawBuffer>,
+    pub geometry: LaunchGeometry,
+}
+
+#[derive(Clone, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct KernelSemantics {
     pub buffers: Vec<MetalBufferAbi>,
@@ -138,6 +145,12 @@ pub(super) trait Dispatch: Send + Sync + 'static {
         pipeline: RawPipeline,
         buffers: &[RawBuffer],
         geometry: LaunchGeometry,
+        owner: u64,
+    ) -> Result<RawCommand, MetalError>;
+    fn launch_batch(
+        &self,
+        queue: RawQueue,
+        launches: &[BatchLaunch],
         owner: u64,
     ) -> Result<RawCommand, MetalError>;
 

@@ -591,6 +591,7 @@ fn portable_threefry_metal_renders_and_executes_broadcast_bits() {
         expected.to_le_bytes().unwrap()
     );
 }
+use super::resource::MetalBatchItem;
 use super::*;
 use crate::engine::capture::QuantizedCaptureBinding;
 use crate::kernel::execute_lowered_elementwise;
@@ -857,6 +858,8 @@ fn metal_device_session_reuses_residents_and_reports_exact_driver_activity() {
             report.kernel_launch_count,
             session.summary().nonzero_item_count
         );
+        assert_eq!(report.command_submission_count, 1);
+        assert_eq!(report.command_wait_count, 1);
         assert_eq!(report.output_count, 3);
         assert_eq!(
             calls
@@ -872,6 +875,37 @@ fn metal_device_session_reuses_residents_and_reports_exact_driver_activity() {
                 .count(),
             1
         );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("batch_submit:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("wait:"))
+                .count(),
+            1
+        );
+        let write = calls
+            .iter()
+            .position(|call| call.starts_with("write:"))
+            .unwrap();
+        let submit = calls
+            .iter()
+            .position(|call| call.starts_with("batch_submit:"))
+            .unwrap();
+        let wait = calls
+            .iter()
+            .position(|call| call.starts_with("wait:"))
+            .unwrap();
+        let read = calls
+            .iter()
+            .position(|call| call.starts_with("read:"))
+            .unwrap();
+        assert!(write < submit && submit < wait && wait < read);
     }
     assert_eq!(session.successful_run_count(), 2);
 }
@@ -1162,7 +1196,7 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert_eq!(second.report().committed_state_position, Some(2));
     scoreboard.record(&second).unwrap();
     let report = scoreboard.report().unwrap();
-    assert_eq!(report.format_version, 4);
+    assert_eq!(report.format_version, 5);
     assert_eq!(report.successful_run_count, 2);
     assert_eq!(report.committed_state_position, Some(2));
     assert_eq!(report.state_pair_count, 1);
@@ -1485,10 +1519,17 @@ fn metal_append_state_fixed_span_commits_consecutive_rows_and_retries_tail() {
 
     let context =
         || MetalScoreboardContext::new("append-span", "test-revision", "semantic mock").unwrap();
-    assert!(matches!(
-        MetalSessionScoreboard::try_new_append_state_v4(context(), &plan),
-        Err(MetalScoreboardError::UnsupportedAppendSpan { span_rows: 3 })
-    ));
+    let error = MetalSessionScoreboard::try_new_append_state_v4(context(), &plan)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error,
+        MetalScoreboardError::UnsupportedAppendSpan { span_rows: 3 }
+    );
+    assert_eq!(
+        error.to_string(),
+        "Metal token-step scoreboard requires one appended row per successful invocation; got a span of 3 rows"
+    );
     let mut legacy_scoreboard = MetalSessionScoreboard::new_append_state(context(), &plan);
     let mock = Arc::new(MockDispatch::default());
     let mut session = plan.prepare(test_device(mock.clone())).unwrap();
@@ -1705,6 +1746,8 @@ fn metal_append_state_empty_fixed_span_is_addressless_but_advances_rows() {
     assert_eq!(run.outputs(), &[TensorData::zeros([6, 0]).unwrap()]);
     assert_eq!(run.report().committed_state_position, Some(3));
     assert_eq!(run.report().kernel_launch_count, 0);
+    assert_eq!(run.report().command_submission_count, 0);
+    assert_eq!(run.report().command_wait_count, 0);
     assert_eq!(run.report().transient_h2d_calls, 0);
     assert_eq!(run.report().runtime_control_h2d_calls, 0);
     assert_eq!(run.report().retained_d2h_calls, 0);
@@ -2524,6 +2567,8 @@ fn llama_metal_workload_phase_uses_measured_time_and_saturating_counters() {
             retained_d2h_calls: counter,
             retained_d2h_bytes: counter,
             kernel_launch_count: counter,
+            command_submission_count: counter,
+            command_wait_count: counter,
             zero_item_count: 0,
             output_count: 0,
             committed_state_pair_count: 0,
@@ -2573,6 +2618,8 @@ fn llama_metal_workload_phase_uses_measured_time_and_saturating_counters() {
     );
     assert_eq!(measured.host_tokens_per_second(), Some(2.0));
     assert_eq!(measured.kernel_launch_count, usize::MAX);
+    assert_eq!(measured.command_submission_count, usize::MAX);
+    assert_eq!(measured.command_wait_count, usize::MAX);
     assert_eq!(measured.transient_h2d_calls, usize::MAX);
     assert_eq!(measured.transient_h2d_bytes, usize::MAX);
     assert_eq!(measured.runtime_control_h2d_calls, usize::MAX);
@@ -2910,7 +2957,7 @@ fn llama_metal_scoreboard_records_exact_token_execution_prefix_fail_soft() {
         )
         .unwrap();
     let empty = session.execution_scoreboard().unwrap().report().unwrap();
-    assert_eq!(empty.format_version, 4);
+    assert_eq!(empty.format_version, 5);
     assert_eq!(empty.successful_run_count, 0);
     assert_eq!(empty.committed_state_position, Some(0));
     assert!(session.scoreboard_recording_error().is_none());
@@ -3492,6 +3539,8 @@ fn metal_device_session_rejects_malformed_calls_before_driver_and_retries_failur
         mock.clear_failures();
         let run = session.run(&input).unwrap();
         assert_eq!(run.report().successful_invocation, install as u64 + 1);
+        assert_eq!(run.report().command_submission_count, 1);
+        assert_eq!(run.report().command_wait_count, 1);
         assert_eq!(session.successful_run_count(), install as u64 + 1);
     }
 }
@@ -3630,6 +3679,8 @@ fn metal_device_session_zero_work_is_resource_free_and_projects_duplicates() {
         run.outputs()[1].to_le_bytes().unwrap()
     );
     assert_eq!(run.report().kernel_launch_count, 0);
+    assert_eq!(run.report().command_submission_count, 0);
+    assert_eq!(run.report().command_wait_count, 0);
     assert_eq!(run.report().transient_h2d_calls, 0);
     assert_eq!(run.report().retained_d2h_calls, 0);
 }
@@ -3764,6 +3815,7 @@ fn default_resnet18_is_one_boundary_free_resident_metal_session() {
     assert_eq!(plan.summary().capture_identity, capture_identity);
     assert_eq!(plan.summary().fallback_count, 0);
     assert_eq!(plan.summary().zero_item_count, 0);
+    assert!(plan.summary().nonzero_item_count > 1);
     assert_eq!(plan.rendered_items().count(), scheduled.items.len());
     assert_eq!(
         plan.summary().rendered_cache_keys.len(),
@@ -3855,6 +3907,8 @@ fn default_resnet18_is_one_boundary_free_resident_metal_session() {
             run.report().kernel_launch_count,
             session.metal_session().summary().nonzero_item_count
         );
+        assert_eq!(run.report().command_submission_count, 1);
+        assert_eq!(run.report().command_wait_count, 1);
         assert_eq!(run.report().transient_h2d_calls, 1);
         assert_eq!(run.report().retained_d2h_calls, 1);
         assert_eq!(session.metal_session().device_owner_id(), prepared_owner);
@@ -3867,6 +3921,20 @@ fn default_resnet18_is_one_boundary_free_resident_metal_session() {
         assert_eq!(
             session.metal_session().summary().planned_slot_count,
             planned_slots
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| call.starts_with("batch_submit:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .filter(|call| call.starts_with("wait:"))
+                .count(),
+            1
         );
         assert!(!mock.calls().iter().any(|call| {
             call.starts_with("buffer_create:")
@@ -5760,6 +5828,45 @@ impl Dispatch for MockDispatch {
         Ok(Self::command(&mut state, owner))
     }
 
+    fn launch_batch(
+        &self,
+        queue: RawQueue,
+        launches: &[dispatch::BatchLaunch],
+        owner: u64,
+    ) -> Result<RawCommand, MetalError> {
+        if launches.is_empty() {
+            return Err(MetalError::InvalidArgument("empty mock Metal launch batch"));
+        }
+        let mut encoded = Vec::with_capacity(launches.len());
+        for launch in launches {
+            match self.launch(
+                queue,
+                launch.pipeline,
+                &launch.buffers,
+                launch.geometry,
+                owner,
+            ) {
+                Ok(command) => encoded.push(command),
+                Err(error) => {
+                    let mut state = self.state.lock().unwrap();
+                    for command in encoded {
+                        state.commands.remove(&(owner, command.0));
+                    }
+                    state.calls.push(format!("batch_abort:{owner}"));
+                    return Err(error);
+                }
+            }
+        }
+        let mut state = self.state.lock().unwrap();
+        for command in encoded {
+            state.commands.remove(&(owner, command.0));
+        }
+        state
+            .calls
+            .push(format!("batch_submit:{owner}:{}", launches.len()));
+        Ok(Self::command(&mut state, owner))
+    }
+
     fn command_query(&self, command: RawCommand, owner: u64) -> Result<bool, MetalError> {
         let mut state = self.state.lock().unwrap();
         if let Some(detail) = state.failures.query.take() {
@@ -6501,7 +6608,9 @@ fn captured_indexed_movement_metal_is_atomic_and_projects_duplicate_outputs() {
             .any(|rendered| rendered.indexed_movement().is_some())
     );
     let mock = Arc::new(MockDispatch::default());
-    let mut session = plan.prepare(test_device(mock), BTreeMap::new()).unwrap();
+    let mut session = plan
+        .prepare(test_device(mock.clone()), BTreeMap::new())
+        .unwrap();
     let input_value = TensorData::new([3], vec![4.0, 5.0, 6.0]).unwrap();
     let bad = BTreeMap::from([
         ("source".into(), input_value.clone()),
@@ -6537,6 +6646,14 @@ fn captured_indexed_movement_metal_is_atomic_and_projects_duplicate_outputs() {
     );
     assert_eq!(run.outputs()[0], run.outputs()[1]);
     assert_eq!(run.report().kernel_launch_count, 2);
+    assert_eq!(run.report().command_submission_count, 2);
+    assert_eq!(run.report().command_wait_count, 2);
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("batch_submit:"))
+    );
 }
 
 #[test]
@@ -6732,6 +6849,91 @@ fn captured_metal_random_rejects_unsupported_storage_and_empty_launch_is_safe() 
     let pipeline = device.cache().load(&rendered).unwrap();
     assert!(pipeline.launch(&queue, &[&output], 8).unwrap().is_none());
     assert!(!mock.calls().iter().any(|call| call.starts_with("launch:")));
+}
+
+#[test]
+fn metal_batch_validates_every_launch_before_one_ordered_submission_and_retains_resources() {
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let mut graph = Graph::new();
+    let first = graph.uniform([2], -1.0, 1.0, DType::F32, 41).unwrap();
+    let second = graph.randint([3], -4, 7, DType::I32, 42).unwrap();
+    let first_root = crate::kernel::lower_graph_random(&graph, first).unwrap();
+    let second_root = crate::kernel::lower_graph_random(&graph, second).unwrap();
+    let first_rendered = renderer.render(&first_root).unwrap();
+    let second_rendered = renderer.render(&second_root).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock.clone());
+    let first_pipeline = device.cache().load(&first_rendered).unwrap();
+    let second_pipeline = device.cache().load(&second_rendered).unwrap();
+    let first_output = device.allocate_typed(2, DType::F32).unwrap();
+    let second_output = device.allocate_typed(3, DType::I32).unwrap();
+    let first_bindings = [&first_output];
+    let second_bindings = [&second_output];
+
+    mock.clear_calls();
+    let command = queue
+        .launch_batch(&[
+            MetalBatchItem {
+                pipeline: first_pipeline.as_ref(),
+                bindings: &first_bindings,
+                local_size: 8,
+                capture_initialized: false,
+            },
+            MetalBatchItem {
+                pipeline: second_pipeline.as_ref(),
+                bindings: &second_bindings,
+                local_size: 8,
+                capture_initialized: false,
+            },
+        ])
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("launch:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("batch_submit:"))
+            .count(),
+        1
+    );
+    assert!(!mock.calls().iter().any(|call| call.starts_with("wait:")));
+    let completion = command.collect().unwrap();
+    assert_eq!(completion.extent, 5);
+    assert_eq!(completion.retained_resources, 2);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("wait:"))
+            .count(),
+        1
+    );
+
+    let empty_bindings: [&MetalBuffer; 0] = [];
+    mock.clear_calls();
+    assert!(matches!(
+        queue.launch_batch(&[
+            MetalBatchItem {
+                pipeline: first_pipeline.as_ref(),
+                bindings: &first_bindings,
+                local_size: 8,
+                capture_initialized: false,
+            },
+            MetalBatchItem {
+                pipeline: second_pipeline.as_ref(),
+                bindings: &empty_bindings,
+                local_size: 8,
+                capture_initialized: false,
+            },
+        ]),
+        Err(MetalError::InvalidBinding(_))
+    ));
+    assert!(mock.calls().is_empty());
 }
 
 #[test]

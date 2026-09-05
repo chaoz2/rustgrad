@@ -13,10 +13,10 @@ use std::{
 
 use crate::runtime::static_schedule::{
     InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticAppendStateLink,
-    StaticBufferAllocation, StaticDeviceAdapter, StaticExecutionReport, StaticHostGather,
-    StaticHostOutputSelection, StaticPlanAdapter, StaticQuantizedBufferPlan, StaticRendered,
-    StaticRenderedBuffer, StaticRenderedQuantizedBuffer, StaticSchedulePlan, StaticSharedResources,
-    StaticStateLink, bind_rendered_buffers,
+    StaticBufferAllocation, StaticCommandReport, StaticDeviceAdapter, StaticExecutionReport,
+    StaticHostGather, StaticHostOutputSelection, StaticPlanAdapter, StaticPreparedLaunch,
+    StaticQuantizedBufferPlan, StaticRendered, StaticRenderedBuffer, StaticRenderedQuantizedBuffer,
+    StaticSchedulePlan, StaticSharedResources, StaticStateLink, bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
@@ -289,7 +289,7 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
         kernel: &Self::Kernel,
         buffers: &[&Self::Buffer],
     ) -> Result<(), Self::Error> {
-        if kernel.rendered().indexed_movement.is_some() {
+        if kernel.rendered().transaction.is_some() || kernel.rendered().indexed_movement.is_some() {
             return kernel
                 .launch_transactional(queue, buffers, self.renderer.local_size)?
                 .wait();
@@ -303,6 +303,42 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
             command.collect()?;
         }
         Ok(())
+    }
+    fn launch_batch_and_wait(
+        &self,
+        queue: &Self::Queue,
+        launches: &[StaticPreparedLaunch<'_, Self::Kernel, Self::Buffer>],
+    ) -> Result<StaticCommandReport, Self::Error> {
+        if launches.iter().any(|launch| {
+            launch.kernel.rendered().transaction.is_some()
+                || launch.kernel.rendered().indexed_movement.is_some()
+        }) {
+            for launch in launches {
+                self.launch_and_wait(queue, launch.kernel, &launch.buffers)?;
+            }
+            return Ok(StaticCommandReport {
+                submissions: launches.len(),
+                waits: launches.len(),
+            });
+        }
+        let batch = launches
+            .iter()
+            .map(|launch| super::resource::MetalBatchItem {
+                pipeline: launch.kernel.as_ref(),
+                bindings: launch.buffers.as_slice(),
+                local_size: self.renderer.local_size,
+                capture_initialized: !launch.kernel.rendered().quantized_buffers.is_empty(),
+            })
+            .collect::<Vec<_>>();
+        let submitted = queue.launch_batch(&batch)?;
+        let count = usize::from(submitted.is_some());
+        if let Some(command) = submitted {
+            command.collect()?;
+        }
+        Ok(StaticCommandReport {
+            submissions: count,
+            waits: count,
+        })
     }
     fn read(
         &self,

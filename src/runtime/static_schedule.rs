@@ -2093,6 +2093,19 @@ pub(crate) trait StaticDeviceAdapter: StaticPlanAdapter {
         kernel: &Self::Kernel,
         buffers: &[&Self::Buffer],
     ) -> Result<(), Self::Error>;
+    fn launch_batch_and_wait(
+        &self,
+        queue: &Self::Queue,
+        launches: &[StaticPreparedLaunch<'_, Self::Kernel, Self::Buffer>],
+    ) -> Result<StaticCommandReport, Self::Error> {
+        for launch in launches {
+            self.launch_and_wait(queue, launch.kernel, &launch.buffers)?;
+        }
+        Ok(StaticCommandReport {
+            submissions: launches.len(),
+            waits: launches.len(),
+        })
+    }
     fn read(
         &self,
         queue: &Self::Queue,
@@ -2946,8 +2959,20 @@ struct PreparedStaticItem<K> {
     buffer_ids: Vec<u64>,
 }
 
+pub(crate) struct StaticPreparedLaunch<'a, K, B> {
+    pub(crate) kernel: &'a K,
+    pub(crate) buffers: Vec<&'a B>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StaticCommandReport {
+    pub(crate) submissions: usize,
+    pub(crate) waits: usize,
+}
+
 /// Exact successful host/device activity for one prepared static transaction.
-/// Counts describe host API copies and launches, not PCIe traffic or GPU time.
+/// Counts describe host API copies, kernel encodes, submissions, and waits,
+/// not PCIe traffic or GPU time.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StaticExecutionReport {
     pub(crate) h2d_calls: usize,
@@ -2955,6 +2980,8 @@ pub(crate) struct StaticExecutionReport {
     pub(crate) d2h_calls: usize,
     pub(crate) d2h_bytes: usize,
     pub(crate) kernel_launches: usize,
+    pub(crate) command_submissions: usize,
+    pub(crate) command_waits: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3474,7 +3501,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         .iter()
         .map(|id| (*id, vec![0; self.buffer_plans[id].bytes]))
         .collect::<Vec<_>>();
-        let report = if self.queue.is_some() {
+        let mut report = if self.queue.is_some() {
             StaticExecutionReport {
                 h2d_calls: uploads.len(),
                 h2d_bytes: uploads.iter().try_fold(0usize, |total, (_, bytes)| {
@@ -3488,6 +3515,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                     total.checked_add(bytes.len()).ok_or_else(A::overflow)
                 })?,
                 kernel_launches: self.items.iter().filter(|item| item.extent != 0).count(),
+                ..StaticExecutionReport::default()
             }
         } else {
             StaticExecutionReport::default()
@@ -3504,6 +3532,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                     bytes,
                 )?;
             }
+            let mut launches = Vec::with_capacity(self.items.len());
             for item in &self.items {
                 if item.extent == 0 {
                     continue;
@@ -3523,8 +3552,14 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                self.adapter.launch_and_wait(queue, kernel, &bindings)?;
+                launches.push(StaticPreparedLaunch {
+                    kernel,
+                    buffers: bindings,
+                });
             }
+            let commands = self.adapter.launch_batch_and_wait(queue, &launches)?;
+            report.command_submissions = commands.submissions;
+            report.command_waits = commands.waits;
             for (id, bytes) in &mut downloads {
                 if !bytes.is_empty() {
                     let buffer = self

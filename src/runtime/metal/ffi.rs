@@ -6,8 +6,8 @@
 use super::{
     MetalDeviceInfo, MetalError,
     dispatch::{
-        CopyRegion, Dispatch, LaunchGeometry, RawBuffer, RawCommand, RawDevice, RawLibrary,
-        RawPipeline, RawQueue,
+        BatchLaunch, CopyRegion, Dispatch, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
+        RawLibrary, RawPipeline, RawQueue,
     },
 };
 
@@ -379,6 +379,111 @@ mod platform {
             // SAFETY: command is a live MTLCommandBuffer.
             unsafe { self.objc.msg0_void(command, "commit") };
         }
+
+        fn encode_launch_batch(
+            &self,
+            queue: RawQueue,
+            launches: &[BatchLaunch],
+        ) -> Result<RawCommand, MetalError> {
+            if launches.is_empty() {
+                return Err(MetalError::InvalidArgument("empty Metal launch batch"));
+            }
+            let command = self.command_buffer(queue)?;
+            // SAFETY: command buffer implements -computeCommandEncoder.
+            let encoder = unsafe { self.objc.msg0_obj(command, "computeCommandEncoder") };
+            if encoder.is_null() {
+                self.objc.release(command);
+                return Err(MetalError::Driver {
+                    operation: "computeCommandEncoder",
+                    detail: "returned nil".into(),
+                });
+            }
+            let encoder = self.objc.retain(encoder);
+            // SAFETY: selector takes one MTLComputePipelineState object.
+            let set_pipeline: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+                unsafe { std::mem::transmute(self.objc.msg_send) };
+            // SAFETY: selector ABI is (MTLBuffer, NSUInteger, NSUInteger).
+            let set_buffer: unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                usize,
+                usize,
+            ) = unsafe { std::mem::transmute(self.objc.msg_send) };
+            // SAFETY: selector ABI is (const void*, NSUInteger, NSUInteger) and
+            // Metal copies setBytes contents before this call returns.
+            let set_bytes: unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *const c_void,
+                usize,
+                usize,
+            ) = unsafe { std::mem::transmute(self.objc.msg_send) };
+            // SAFETY: selector takes two MTLSize values by value.
+            let dispatch: unsafe extern "C" fn(*mut c_void, *mut c_void, MtlSize, MtlSize) =
+                unsafe { std::mem::transmute(self.objc.msg_send) };
+            // Metal executes dispatches in one compute encoder serially, so
+            // earlier kernel results feed later dispatches in this batch.
+            for launch in launches {
+                // SAFETY: the safe resource layer validated every pipeline,
+                // buffer, ABI position, and launch geometry before submission.
+                unsafe {
+                    set_pipeline(
+                        encoder,
+                        self.objc.selector("setComputePipelineState:"),
+                        launch.pipeline.0 as *mut c_void,
+                    );
+                }
+                for (index, buffer) in launch.buffers.iter().enumerate() {
+                    // Transactional kernels reserve the ordinary ABI terminator
+                    // for extent. Batches reject them, while the mapping keeps
+                    // the single-launch contract exact.
+                    let abi_index = if index >= launch.geometry.extent_index {
+                        index + 1
+                    } else {
+                        index
+                    };
+                    unsafe {
+                        set_buffer(
+                            encoder,
+                            self.objc.selector("setBuffer:offset:atIndex:"),
+                            buffer.0 as *mut c_void,
+                            0,
+                            abi_index,
+                        );
+                    }
+                }
+                unsafe {
+                    set_bytes(
+                        encoder,
+                        self.objc.selector("setBytes:length:atIndex:"),
+                        (&launch.geometry.extent as *const u64).cast(),
+                        std::mem::size_of::<u64>(),
+                        launch.geometry.extent_index,
+                    );
+                    dispatch(
+                        encoder,
+                        self.objc
+                            .selector("dispatchThreadgroups:threadsPerThreadgroup:"),
+                        MtlSize {
+                            width: launch.geometry.global / launch.geometry.local,
+                            height: 1,
+                            depth: 1,
+                        },
+                        MtlSize {
+                            width: launch.geometry.local,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                }
+            }
+            // SAFETY: every encoded dispatch is complete.
+            unsafe { self.objc.msg0_void(encoder, "endEncoding") };
+            self.objc.release(encoder);
+            self.commit(command);
+            Ok(RawCommand(command as usize))
+        }
     }
 
     impl Dispatch for NativeDispatch {
@@ -747,101 +852,23 @@ mod platform {
             geometry: LaunchGeometry,
             _owner: u64,
         ) -> Result<RawCommand, MetalError> {
-            let command = self.command_buffer(queue)?;
-            // SAFETY: command buffer implements -computeCommandEncoder.
-            let encoder = unsafe { self.objc.msg0_obj(command, "computeCommandEncoder") };
-            if encoder.is_null() {
-                self.objc.release(command);
-                return Err(MetalError::Driver {
-                    operation: "computeCommandEncoder",
-                    detail: "returned nil".into(),
-                });
-            }
-            let encoder = self.objc.retain(encoder);
-            // SAFETY: selector takes one MTLComputePipelineState object.
-            let set_pipeline: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
-                unsafe { std::mem::transmute(self.objc.msg_send) };
-            // SAFETY: encoder and pipeline are live.
-            unsafe {
-                set_pipeline(
-                    encoder,
-                    self.objc.selector("setComputePipelineState:"),
-                    pipeline.0 as *mut c_void,
-                )
-            };
-            // SAFETY: selector ABI is (MTLBuffer, NSUInteger, NSUInteger).
-            let set_buffer: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                usize,
-                usize,
-            ) = unsafe { std::mem::transmute(self.objc.msg_send) };
-            for (index, buffer) in buffers.iter().enumerate() {
-                // Transactional kernels reserve the ordinary ABI terminator for
-                // the scalar extent, so appended status buffers start one slot
-                // later. Standard launches have no buffer after extent_index.
-                let abi_index = if index >= geometry.extent_index {
-                    index + 1
-                } else {
-                    index
-                };
-                // SAFETY: safe layer validated each live buffer and index.
-                unsafe {
-                    set_buffer(
-                        encoder,
-                        self.objc.selector("setBuffer:offset:atIndex:"),
-                        buffer.0 as *mut c_void,
-                        0,
-                        abi_index,
-                    )
-                };
-            }
-            // SAFETY: selector ABI is (const void*, NSUInteger, NSUInteger) and
-            // Metal copies setBytes contents before this call returns.
-            let set_bytes: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *const c_void,
-                usize,
-                usize,
-            ) = unsafe { std::mem::transmute(self.objc.msg_send) };
-            // SAFETY: extent pointer is valid for the synchronous selector call.
-            unsafe {
-                set_bytes(
-                    encoder,
-                    self.objc.selector("setBytes:length:atIndex:"),
-                    (&geometry.extent as *const u64).cast(),
-                    std::mem::size_of::<u64>(),
-                    geometry.extent_index,
-                )
-            };
-            // SAFETY: selector takes two MTLSize values by value.
-            let dispatch: unsafe extern "C" fn(*mut c_void, *mut c_void, MtlSize, MtlSize) =
-                unsafe { std::mem::transmute(self.objc.msg_send) };
-            let groups = geometry.global / geometry.local;
-            // SAFETY: geometry was completely validated by the safe layer.
-            unsafe {
-                dispatch(
-                    encoder,
-                    self.objc
-                        .selector("dispatchThreadgroups:threadsPerThreadgroup:"),
-                    MtlSize {
-                        width: groups,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MtlSize {
-                        width: geometry.local,
-                        height: 1,
-                        depth: 1,
-                    },
-                );
-                self.objc.msg0_void(encoder, "endEncoding");
-            }
-            self.objc.release(encoder);
-            self.commit(command);
-            Ok(RawCommand(command as usize))
+            self.encode_launch_batch(
+                queue,
+                &[BatchLaunch {
+                    pipeline,
+                    buffers: buffers.to_vec(),
+                    geometry,
+                }],
+            )
+        }
+
+        fn launch_batch(
+            &self,
+            queue: RawQueue,
+            launches: &[BatchLaunch],
+            _owner: u64,
+        ) -> Result<RawCommand, MetalError> {
+            self.encode_launch_batch(queue, launches)
         }
 
         fn command_query(&self, command: RawCommand, _owner: u64) -> Result<bool, MetalError> {
@@ -947,6 +974,14 @@ impl Dispatch for NativeDispatch {
         _: RawPipeline,
         _: &[RawBuffer],
         _: LaunchGeometry,
+        _: u64,
+    ) -> Result<RawCommand, MetalError> {
+        Err(MetalError::PlatformUnsupported)
+    }
+    fn launch_batch(
+        &self,
+        _: RawQueue,
+        _: &[BatchLaunch],
         _: u64,
     ) -> Result<RawCommand, MetalError> {
         Err(MetalError::PlatformUnsupported)
