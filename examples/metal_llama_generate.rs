@@ -29,8 +29,8 @@ const SCOREBOARD_WORKLOAD: &str = "gguf-llama-metal-generate";
 const SCOREBOARD_EVIDENCE: &str = "live self-hosted Apple GPU prompt-to-tokens harness";
 const WORKLOAD_EVIDENCE: &str =
     "host-observed fixed-span prefill and steady-decode Metal workload evidence";
-const SCOREBOARD_EVIDENCE_KIND: &str = "metal_session_scoreboard_v5";
-const LLAMA_WORKLOAD_EVIDENCE_KIND: &str = "llama_metal_workload_evidence_v2";
+const SCOREBOARD_EVIDENCE_KIND: &str = "metal_session_scoreboard_v6";
+const LLAMA_WORKLOAD_EVIDENCE_KIND: &str = "llama_metal_workload_evidence_v3";
 
 #[derive(Debug, Eq, PartialEq)]
 struct Args {
@@ -1391,11 +1391,11 @@ mod tests {
             serde_json::json!([3, 4])
         );
         assert_eq!(value["evidence"]["fallback_count"], 0);
-        assert_eq!(SCOREBOARD_EVIDENCE_KIND, "metal_session_scoreboard_v5");
+        assert_eq!(SCOREBOARD_EVIDENCE_KIND, "metal_session_scoreboard_v6");
         assert_eq!(value["evidence"]["evidence_kind"], SCOREBOARD_EVIDENCE_KIND);
         assert_eq!(
             LLAMA_WORKLOAD_EVIDENCE_KIND,
-            "llama_metal_workload_evidence_v2"
+            "llama_metal_workload_evidence_v3"
         );
         assert!(!std::str::from_utf8(&bytes).unwrap().contains("/runner/"));
         assert_eq!(bytes.last(), Some(&b'\n'));

@@ -783,6 +783,7 @@ fn metal_device_session_reuses_residents_and_reports_exact_driver_activity() {
     );
 
     let mock = Arc::new(MockDispatch::default());
+    mock.set_gpu_command_execution_time(Some(std::time::Duration::from_nanos(37)));
     let device = test_device(mock.clone());
     mock.clear_calls();
     let mut session = plan.prepare(device, residual_residents()).unwrap();
@@ -860,6 +861,10 @@ fn metal_device_session_reuses_residents_and_reports_exact_driver_activity() {
         );
         assert_eq!(report.command_submission_count, 1);
         assert_eq!(report.command_wait_count, 1);
+        assert_eq!(
+            report.gpu_command_execution_time,
+            Some(std::time::Duration::from_nanos(37))
+        );
         assert_eq!(report.output_count, 3);
         assert_eq!(
             calls
@@ -1102,6 +1107,7 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
 
     let expected_kernel_launches = plan.summary().nonzero_item_count;
     let mock = Arc::new(MockDispatch::default());
+    mock.set_gpu_command_execution_time(Some(std::time::Duration::from_nanos(11)));
     let mut session = plan.prepare(test_device(mock.clone())).unwrap();
     let calls_after_prepare = mock.calls();
     scoreboard.bind(&session).unwrap();
@@ -1170,6 +1176,10 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert_eq!(first.report().retained_d2h_calls, 1);
     assert_eq!(first.report().retained_d2h_bytes, 24);
     assert_eq!(first.report().kernel_launch_count, expected_kernel_launches);
+    assert_eq!(
+        first.report().gpu_command_execution_time,
+        Some(std::time::Duration::from_nanos(11))
+    );
     assert_eq!(first.report().committed_state_position, Some(1));
     assert_eq!(session.committed_state_position(), Some(1));
     scoreboard.record(&first).unwrap();
@@ -1196,8 +1206,16 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert_eq!(second.report().committed_state_position, Some(2));
     scoreboard.record(&second).unwrap();
     let report = scoreboard.report().unwrap();
-    assert_eq!(report.format_version, 5);
+    assert_eq!(report.format_version, 6);
     assert_eq!(report.successful_run_count, 2);
+    assert_eq!(
+        report.gpu_command_execution_time,
+        Some(std::time::Duration::from_nanos(22))
+    );
+    assert_eq!(
+        report.successful_runs[0].gpu_command_execution_time,
+        first.report().gpu_command_execution_time
+    );
     assert_eq!(report.committed_state_position, Some(2));
     assert_eq!(report.state_pair_count, 1);
     assert_eq!(report.logical_state_bytes, 24);
@@ -1748,6 +1766,7 @@ fn metal_append_state_empty_fixed_span_is_addressless_but_advances_rows() {
     assert_eq!(run.report().kernel_launch_count, 0);
     assert_eq!(run.report().command_submission_count, 0);
     assert_eq!(run.report().command_wait_count, 0);
+    assert_eq!(run.report().gpu_command_execution_time, None);
     assert_eq!(run.report().transient_h2d_calls, 0);
     assert_eq!(run.report().runtime_control_h2d_calls, 0);
     assert_eq!(run.report().retained_d2h_calls, 0);
@@ -2292,6 +2311,7 @@ fn llama_metal_fixed_span_prefill_shares_state_and_preserves_t1_tail() {
     .unwrap();
 
     let mock = Arc::new(MockDispatch::default());
+    mock.set_gpu_command_execution_time(Some(std::time::Duration::from_nanos(5)));
     let device = test_device(mock.clone());
     let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
     let plan = crate::models::transformer::LlamaMetalPlan::from_workflow_with_prefill_span(
@@ -2357,6 +2377,18 @@ fn llama_metal_fixed_span_prefill_shares_state_and_preserves_t1_tail() {
     );
     assert_eq!(evidence.prompt_prefill.token_count, prompt.len());
     assert_eq!(evidence.prompt_prefill.successful_invocation_count, 2);
+    assert_eq!(
+        evidence.prompt_prefill.gpu_command_execution_time,
+        Some(std::time::Duration::from_nanos(10))
+    );
+    assert_eq!(
+        evidence
+            .first_successful_run
+            .as_ref()
+            .unwrap()
+            .gpu_command_execution_time,
+        Some(std::time::Duration::from_nanos(5))
+    );
     assert_eq!(evidence.prompt_prefill.retained_d2h_calls, 1);
     assert_eq!(
         evidence.prompt_prefill.retained_d2h_bytes,
@@ -2569,6 +2601,7 @@ fn llama_metal_workload_phase_uses_measured_time_and_saturating_counters() {
             kernel_launch_count: counter,
             command_submission_count: counter,
             command_wait_count: counter,
+            gpu_command_execution_time: (counter != 0).then_some(run_wall_time),
             zero_item_count: 0,
             output_count: 0,
             committed_state_pair_count: 0,
@@ -2589,6 +2622,7 @@ fn llama_metal_workload_phase_uses_measured_time_and_saturating_counters() {
         )],
     );
     assert_eq!(no_elapsed.host_tokens_per_second(), None);
+    assert_eq!(no_elapsed.gpu_command_execution_time, None);
 
     let reports = [
         report(
@@ -2620,12 +2654,32 @@ fn llama_metal_workload_phase_uses_measured_time_and_saturating_counters() {
     assert_eq!(measured.kernel_launch_count, usize::MAX);
     assert_eq!(measured.command_submission_count, usize::MAX);
     assert_eq!(measured.command_wait_count, usize::MAX);
+    assert_eq!(
+        measured.gpu_command_execution_time,
+        Some(std::time::Duration::from_secs(2))
+    );
     assert_eq!(measured.transient_h2d_calls, usize::MAX);
     assert_eq!(measured.transient_h2d_bytes, usize::MAX);
     assert_eq!(measured.runtime_control_h2d_calls, usize::MAX);
     assert_eq!(measured.runtime_control_h2d_bytes, usize::MAX);
     assert_eq!(measured.retained_d2h_calls, usize::MAX);
     assert_eq!(measured.retained_d2h_bytes, usize::MAX);
+
+    let mut unavailable = reports.clone();
+    unavailable[1].gpu_command_execution_time = None;
+    assert_eq!(
+        crate::models::transformer::LlamaMetalWorkloadPhase::from_reports(4, &unavailable)
+            .gpu_command_execution_time,
+        None
+    );
+    let mut overflowing = reports.clone();
+    overflowing[0].gpu_command_execution_time = Some(std::time::Duration::MAX);
+    overflowing[1].gpu_command_execution_time = Some(std::time::Duration::from_nanos(1));
+    assert_eq!(
+        crate::models::transformer::LlamaMetalWorkloadPhase::from_reports(4, &overflowing)
+            .gpu_command_execution_time,
+        None
+    );
 }
 
 #[test]
@@ -2957,7 +3011,7 @@ fn llama_metal_scoreboard_records_exact_token_execution_prefix_fail_soft() {
         )
         .unwrap();
     let empty = session.execution_scoreboard().unwrap().report().unwrap();
-    assert_eq!(empty.format_version, 5);
+    assert_eq!(empty.format_version, 6);
     assert_eq!(empty.successful_run_count, 0);
     assert_eq!(empty.committed_state_position, Some(0));
     assert!(session.scoreboard_recording_error().is_none());
@@ -5182,6 +5236,7 @@ struct State {
     libraries: BTreeMap<(u64, usize), String>,
     semantics: BTreeMap<(u64, usize), Arc<KernelSemantics>>,
     commands: BTreeMap<(u64, usize), bool>,
+    gpu_command_execution_time: Option<std::time::Duration>,
     failures: Failures,
     fault_order: Vec<usize>,
     launch_bindings: Vec<Vec<usize>>,
@@ -5225,6 +5280,10 @@ impl MockDispatch {
 
     fn clear_failures(&self) {
         self.state.lock().unwrap().failures = Failures::default();
+    }
+
+    fn set_gpu_command_execution_time(&self, value: Option<std::time::Duration>) {
+        self.state.lock().unwrap().gpu_command_execution_time = value;
     }
 
     fn command(state: &mut State, owner: u64) -> RawCommand {
@@ -5890,6 +5949,15 @@ impl Dispatch for MockDispatch {
             .ok_or(MetalError::OwnerMismatch)? = true;
         state.calls.push(format!("wait:{owner}"));
         Ok(())
+    }
+
+    fn command_gpu_duration(&self, command: RawCommand, owner: u64) -> Option<std::time::Duration> {
+        let mut state = self.state.lock().unwrap();
+        if state.commands.get(&(owner, command.0)) != Some(&true) {
+            return None;
+        }
+        state.calls.push(format!("gpu_time:{owner}"));
+        state.gpu_command_execution_time
     }
 
     fn command_release(&self, command: RawCommand, owner: u64) {
@@ -6608,6 +6676,7 @@ fn captured_indexed_movement_metal_is_atomic_and_projects_duplicate_outputs() {
             .any(|rendered| rendered.indexed_movement().is_some())
     );
     let mock = Arc::new(MockDispatch::default());
+    mock.set_gpu_command_execution_time(Some(std::time::Duration::from_nanos(7)));
     let mut session = plan
         .prepare(test_device(mock.clone()), BTreeMap::new())
         .unwrap();
@@ -6648,6 +6717,10 @@ fn captured_indexed_movement_metal_is_atomic_and_projects_duplicate_outputs() {
     assert_eq!(run.report().kernel_launch_count, 2);
     assert_eq!(run.report().command_submission_count, 2);
     assert_eq!(run.report().command_wait_count, 2);
+    assert_eq!(
+        run.report().gpu_command_execution_time,
+        Some(std::time::Duration::from_nanos(14))
+    );
     assert!(
         !mock
             .calls()
@@ -6691,6 +6764,7 @@ fn indexed_movement_metal_zero_domain_is_resource_free_and_dtypes_fail_closed() 
     assert_eq!(run.outputs().len(), 2);
     assert!(run.outputs()[0].is_empty());
     assert_eq!(run.report().kernel_launch_count, 0);
+    assert_eq!(run.report().gpu_command_execution_time, None);
 
     let mut i64_indexed = Graph::new();
     let input = i64_indexed.input_dtype("input", [1], DType::F32);
@@ -6862,6 +6936,7 @@ fn metal_batch_validates_every_launch_before_one_ordered_submission_and_retains_
     let first_rendered = renderer.render(&first_root).unwrap();
     let second_rendered = renderer.render(&second_root).unwrap();
     let mock = Arc::new(MockDispatch::default());
+    mock.set_gpu_command_execution_time(Some(std::time::Duration::from_nanos(19)));
     let (device, queue) = setup(mock.clone());
     let first_pipeline = device.cache().load(&first_rendered).unwrap();
     let second_pipeline = device.cache().load(&second_rendered).unwrap();
@@ -6907,12 +6982,44 @@ fn metal_batch_validates_every_launch_before_one_ordered_submission_and_retains_
     assert_eq!(completion.extent, 5);
     assert_eq!(completion.retained_resources, 2);
     assert_eq!(
+        completion.gpu_command_execution_time,
+        Some(std::time::Duration::from_nanos(19))
+    );
+    assert_eq!(
         mock.calls()
             .iter()
             .filter(|call| call.starts_with("wait:"))
             .count(),
         1
     );
+    let calls = mock.calls();
+    let wait = calls
+        .iter()
+        .position(|call| call.starts_with("wait:"))
+        .unwrap();
+    let gpu_time = calls
+        .iter()
+        .position(|call| call.starts_with("gpu_time:"))
+        .unwrap();
+    let release = calls
+        .iter()
+        .position(|call| call.starts_with("command_release:"))
+        .unwrap();
+    assert!(wait < gpu_time && gpu_time < release);
+
+    mock.set_gpu_command_execution_time(None);
+    let unavailable = queue
+        .launch_batch(&[MetalBatchItem {
+            pipeline: first_pipeline.as_ref(),
+            bindings: &first_bindings,
+            local_size: 8,
+            capture_initialized: false,
+        }])
+        .unwrap()
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(unavailable.gpu_command_execution_time, None);
 
     let empty_bindings: [&MetalBuffer; 0] = [];
     mock.clear_calls();
@@ -6934,6 +7041,21 @@ fn metal_batch_validates_every_launch_before_one_ordered_submission_and_retains_
         Err(MetalError::InvalidBinding(_))
     ));
     assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn metal_gpu_timestamp_intervals_reject_unavailable_and_invalid_values() {
+    use super::dispatch::gpu_duration_from_seconds;
+
+    assert_eq!(
+        gpu_duration_from_seconds(1.25, 1.5),
+        Some(std::time::Duration::from_millis(250))
+    );
+    assert_eq!(gpu_duration_from_seconds(0.0, 1.0), None);
+    assert_eq!(gpu_duration_from_seconds(-1.0, 1.0), None);
+    assert_eq!(gpu_duration_from_seconds(2.0, 1.0), None);
+    assert_eq!(gpu_duration_from_seconds(f64::NAN, 1.0), None);
+    assert_eq!(gpu_duration_from_seconds(1.0, f64::INFINITY), None);
 }
 
 #[test]
@@ -7471,6 +7593,7 @@ fn shared_scalar_lane_intrinsics_division_and_bitwise_render_structurally() {
 #[test]
 fn checked_copies_and_command_retention_preserve_resources() {
     let mock = Arc::new(MockDispatch::default());
+    mock.set_gpu_command_execution_time(Some(std::time::Duration::from_nanos(29)));
     let (device, queue) = setup(mock.clone());
     let src = device.allocate_typed(4, DType::F32).unwrap();
     let dst = device.allocate_typed(4, DType::F32).unwrap();
@@ -7490,7 +7613,14 @@ fn checked_copies_and_command_retention_preserve_resources() {
             .count(),
         0
     );
-    command.collect().unwrap();
+    let completion = command.collect().unwrap();
+    assert_eq!(completion.gpu_command_execution_time, None);
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|call| call.starts_with("gpu_time:"))
+    );
     assert_eq!(
         mock.calls()
             .iter()
@@ -7652,6 +7782,12 @@ fn resource_copy_build_launch_and_event_failures_are_distinct() {
             ..
         })
     ));
+    mock.set_gpu_command_execution_time(Some(std::time::Duration::from_nanos(23)));
+    let gpu_queries_before = mock
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("gpu_time:"))
+        .count();
     mock.state.lock().unwrap().failures.wait = Some("gpu fault");
     assert!(matches!(
         command.collect(),
@@ -7660,6 +7796,13 @@ fn resource_copy_build_launch_and_event_failures_are_distinct() {
             ..
         })
     ));
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("gpu_time:"))
+            .count(),
+        gpu_queries_before
+    );
     mock.state.lock().unwrap().failures.read = Some("mapping");
     assert!(matches!(
         queue.read(launch_buffers.last().unwrap(), 0, &mut [0; 4]),

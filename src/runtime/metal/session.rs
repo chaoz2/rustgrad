@@ -164,6 +164,10 @@ pub struct MetalDeviceRunReport {
     /// Metal compute command buffers synchronously waited by this invocation;
     /// host API H2D/D2H copy calls are counted separately and excluded.
     pub command_wait_count: usize,
+    /// Exact summed GPU execution time for this invocation's compute command
+    /// buffers. `None` means no compute command ran or at least one completed
+    /// command returned unavailable, invalid, or unrepresentable timestamps.
+    pub gpu_command_execution_time: Option<Duration>,
     /// Addressless schedule items skipped during this invocation.
     pub zero_item_count: usize,
     /// Logical outputs after ordered duplicate/alias projection.
@@ -1760,6 +1764,7 @@ fn run_report(input: RunReportInput) -> MetalDeviceRunReport {
         kernel_launch_count: transfer.kernel_launches,
         command_submission_count: transfer.command_submissions,
         command_wait_count: transfer.command_waits,
+        gpu_command_execution_time: transfer.gpu_command_execution_time,
         zero_item_count,
         output_count,
         committed_state_pair_count: committed_state.pair_count,

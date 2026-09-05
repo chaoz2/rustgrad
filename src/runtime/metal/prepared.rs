@@ -1,7 +1,7 @@
 //! Retained, nonexecuting Metal preparation for a pure schedule prefix.
 use super::{
-    MetalBuffer, MetalCache, MetalCommandQueue, MetalDevice, MetalError, MetalPipeline,
-    MetalRenderer,
+    MetalBuffer, MetalCache, MetalCommand, MetalCommandQueue, MetalCompletion, MetalDevice,
+    MetalError, MetalPipeline, MetalRenderer,
 };
 use crate::{ScheduleItem, TensorData};
 use std::{
@@ -88,6 +88,32 @@ impl MetalStaticAdapter {
         self.device
             .as_ref()
             .ok_or_else(|| MetalError::InvalidBinding("Metal plan has no device".into()))
+    }
+
+    fn launch_and_collect(
+        &self,
+        queue: &MetalCommandQueue,
+        kernel: &MetalPipeline,
+        buffers: &[&MetalBuffer],
+    ) -> Result<Option<MetalCompletion>, MetalError> {
+        if kernel.rendered().transaction.is_some() || kernel.rendered().indexed_movement.is_some() {
+            return kernel
+                .launch_transactional(queue, buffers, self.renderer.local_size)?
+                .collect()
+                .map(Some);
+        }
+        let command = if !kernel.rendered().quantized_buffers.is_empty() {
+            kernel.launch_capture_owned_quantized(queue, buffers, self.renderer.local_size)?
+        } else {
+            kernel.launch(queue, buffers, self.renderer.local_size)?
+        };
+        command.map(MetalCommand::collect).transpose()
+    }
+}
+
+fn add_exact_gpu_command_time(total: &mut Option<Duration>, next: Option<Duration>) {
+    if let Some(current) = *total {
+        *total = next.and_then(|next| current.checked_add(next));
     }
 }
 
@@ -289,19 +315,7 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
         kernel: &Self::Kernel,
         buffers: &[&Self::Buffer],
     ) -> Result<(), Self::Error> {
-        if kernel.rendered().transaction.is_some() || kernel.rendered().indexed_movement.is_some() {
-            return kernel
-                .launch_transactional(queue, buffers, self.renderer.local_size)?
-                .wait();
-        }
-        let command = if !kernel.rendered().quantized_buffers.is_empty() {
-            kernel.launch_capture_owned_quantized(queue, buffers, self.renderer.local_size)?
-        } else {
-            kernel.launch(queue, buffers, self.renderer.local_size)?
-        };
-        if let Some(command) = command {
-            command.collect()?;
-        }
+        self.launch_and_collect(queue, kernel, buffers)?;
         Ok(())
     }
     fn launch_batch_and_wait(
@@ -313,12 +327,18 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
             launch.kernel.rendered().transaction.is_some()
                 || launch.kernel.rendered().indexed_movement.is_some()
         }) {
+            let mut gpu_command_execution_time = (!launches.is_empty()).then_some(Duration::ZERO);
             for launch in launches {
-                self.launch_and_wait(queue, launch.kernel, &launch.buffers)?;
+                let completion = self.launch_and_collect(queue, launch.kernel, &launch.buffers)?;
+                add_exact_gpu_command_time(
+                    &mut gpu_command_execution_time,
+                    completion.and_then(|completion| completion.gpu_command_execution_time),
+                );
             }
             return Ok(StaticCommandReport {
                 submissions: launches.len(),
                 waits: launches.len(),
+                gpu_command_execution_time,
             });
         }
         let batch = launches
@@ -332,12 +352,14 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
             .collect::<Vec<_>>();
         let submitted = queue.launch_batch(&batch)?;
         let count = usize::from(submitted.is_some());
-        if let Some(command) = submitted {
-            command.collect()?;
-        }
+        let gpu_command_execution_time = submitted
+            .map(MetalCommand::collect)
+            .transpose()?
+            .and_then(|completion| completion.gpu_command_execution_time);
         Ok(StaticCommandReport {
             submissions: count,
             waits: count,
+            gpu_command_execution_time,
         })
     }
     fn read(

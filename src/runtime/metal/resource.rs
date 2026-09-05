@@ -828,12 +828,13 @@ impl MetalTransaction<'_> {
     /// Waits, reconstructs any bounded fault, and atomically commits only success.
     pub fn collect(mut self) -> Result<MetalCompletion, MetalError> {
         let extent = self.pipeline.rendered().extent;
+        let mut gpu_command_execution_time = None;
         let retained_resources = self
             .command
             .as_ref()
             .map_or(self.snapshots.len() + 1, |command| command.retained.len());
         if let Some(command) = self.command.take() {
-            command.collect()?;
+            gpu_command_execution_time = command.collect()?.gpu_command_execution_time;
             let mut bytes = [0u8; 4];
             self.queue.read(
                 self.status
@@ -877,6 +878,7 @@ impl MetalTransaction<'_> {
         Ok(MetalCompletion {
             extent,
             retained_resources,
+            gpu_command_execution_time,
         })
     }
 
@@ -1016,6 +1018,15 @@ impl MetalCommand {
     pub fn collect(mut self) -> Result<MetalCompletion, MetalError> {
         let raw = self.raw.take().ok_or(MetalError::Closed("command"))?;
         let result = self.device.dispatch.command_wait(raw, self.device.owner);
+        let gpu_command_execution_time = result
+            .as_ref()
+            .ok()
+            .filter(|_| self.extent != 0)
+            .and_then(|_| {
+                self.device
+                    .dispatch
+                    .command_gpu_duration(raw, self.device.owner)
+            });
         self.device.dispatch.command_release(raw, self.device.owner);
         result?;
         for snapshot in &self.snapshots {
@@ -1024,6 +1035,7 @@ impl MetalCommand {
         Ok(MetalCompletion {
             extent: self.extent,
             retained_resources: self.retained.len(),
+            gpu_command_execution_time,
         })
     }
 }
@@ -1047,6 +1059,10 @@ pub struct MetalCompletion {
     pub extent: usize,
     /// Number of physical resources retained through completion.
     pub retained_resources: usize,
+    /// GPU execution interval reported by this completed compute command buffer.
+    /// `None` means this was not a compute command or its timestamps were
+    /// unavailable or invalid.
+    pub gpu_command_execution_time: Option<Duration>,
 }
 
 /// Thread-confined process-local content-addressed pipeline cache.

@@ -9,7 +9,7 @@ use serde::{Serialize, Serializer};
 use std::{collections::BTreeSet, fmt, fs, io, path::Path, rc::Rc, time::Duration};
 
 /// Current deterministic JSON schema emitted by [`MetalSessionScoreboardReport`].
-pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 5;
+pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 6;
 const MAX_METADATA_BYTES: usize = 1_024;
 
 /// Caller-supplied labels attached to one measurement series.
@@ -141,6 +141,9 @@ pub struct MetalScoreboardRun {
     /// Metal compute command buffers synchronously waited by this invocation;
     /// host API H2D/D2H copy calls are counted separately and excluded.
     pub command_wait_count: usize,
+    /// Exact GPU execution interval summed across this invocation's compute
+    /// command buffers, or `None` when complete valid timing is unavailable.
+    pub gpu_command_execution_time: Option<Duration>,
     /// Addressless schedule items skipped by this invocation.
     pub zero_item_count: usize,
     /// Logical outputs published after ordered projection.
@@ -171,6 +174,7 @@ impl MetalScoreboardRun {
             kernel_launch_count: report.kernel_launch_count,
             command_submission_count: report.command_submission_count,
             command_wait_count: report.command_wait_count,
+            gpu_command_execution_time: report.gpu_command_execution_time,
             zero_item_count: report.zero_item_count,
             output_count: report.output_count,
             committed_state_pair_count: report.committed_state_pair_count,
@@ -310,6 +314,10 @@ pub struct MetalSessionScoreboardReport {
     /// Exact synchronous Metal compute command waits across the successful-run
     /// prefix; host API H2D/D2H copy calls are excluded.
     pub command_wait_count: usize,
+    /// Exact GPU execution interval summed across all recorded compute command
+    /// buffers, or `None` when the prefix has no commands or any command lacks
+    /// a valid representable timestamp interval.
+    pub gpu_command_execution_time: Option<Duration>,
     /// Addressless item skips across the recorded successful-run prefix.
     pub zero_item_count: usize,
     /// Recurrent pair commits across the recorded successful-run prefix.
@@ -691,6 +699,7 @@ impl MetalSessionScoreboard {
                     .unwrap_or(0),
             ),
         };
+        let gpu_command_execution_time = exact_gpu_command_execution_time(&self.runs);
         Ok(MetalSessionScoreboardReport {
             format_version: METAL_SESSION_SCOREBOARD_FORMAT_VERSION,
             context: self.context.clone(),
@@ -755,6 +764,7 @@ impl MetalSessionScoreboard {
             kernel_launch_count: totals.kernel_launch_count,
             command_submission_count: totals.command_submission_count,
             command_wait_count: totals.command_wait_count,
+            gpu_command_execution_time,
             zero_item_count: totals.zero_item_count,
             committed_state_pair_count: totals.committed_state_pair_count,
             committed_state_bytes: totals.committed_state_bytes,
@@ -766,6 +776,16 @@ impl MetalSessionScoreboard {
             fallback_count: self.plan_summary.fallback_count,
         })
     }
+}
+
+fn exact_gpu_command_execution_time(runs: &[MetalScoreboardRun]) -> Option<Duration> {
+    (!runs.is_empty())
+        .then_some(Duration::ZERO)
+        .and_then(|initial| {
+            runs.iter().try_fold(initial, |total, run| {
+                total.checked_add(run.gpu_command_execution_time?)
+            })
+        })
 }
 
 #[derive(Clone, Default)]
@@ -1020,6 +1040,7 @@ mod tests {
             kernel_launch_count: 4,
             command_submission_count: 4,
             command_wait_count: 4,
+            gpu_command_execution_time: Some(Duration::new(0, 14)),
             zero_item_count: 0,
             committed_state_pair_count: 0,
             committed_state_bytes: 0,
@@ -1042,6 +1063,10 @@ mod tests {
                         kernel_launch_count: 1,
                         command_submission_count: 1,
                         command_wait_count: 1,
+                        gpu_command_execution_time: Some(Duration::new(
+                            0,
+                            successful_invocation as u32 + 1,
+                        )),
                         zero_item_count: 0,
                         output_count: 1,
                         committed_state_pair_count: 0,
@@ -1071,7 +1096,7 @@ mod tests {
         let first = report.to_json_bytes().unwrap();
         assert_eq!(first, report.to_json_bytes().unwrap());
         let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(value["format_version"], 5);
+        assert_eq!(value["format_version"], 6);
         assert_eq!(value["workload"], "linear");
         assert_eq!(value["implementation_revision"], "abc123");
         assert_eq!(value["evidence"], "semantic mock");
@@ -1083,6 +1108,7 @@ mod tests {
         assert_eq!(value["runtime_control_host_api_h2d_calls"], 4);
         assert_eq!(value["command_submission_count"], 4);
         assert_eq!(value["command_wait_count"], 4);
+        assert_eq!(value["gpu_command_execution_time"]["nanos"], 14);
         assert_eq!(
             value["successful_runs"][0]["runtime_control_host_api_h2d_bytes"],
             4
@@ -1096,6 +1122,20 @@ mod tests {
         report.write_json(&path).unwrap();
         assert_eq!(fs::read(&path).unwrap(), first);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn gpu_command_time_requires_complete_overflow_safe_run_timing() {
+        let mut runs = fixed_report().successful_runs;
+        assert_eq!(
+            exact_gpu_command_execution_time(&runs),
+            Some(Duration::new(0, 14))
+        );
+        runs[1].gpu_command_execution_time = None;
+        assert_eq!(exact_gpu_command_execution_time(&runs), None);
+        runs[1].gpu_command_execution_time = Some(Duration::MAX);
+        assert_eq!(exact_gpu_command_execution_time(&runs), None);
+        assert_eq!(exact_gpu_command_execution_time(&[]), None);
     }
 
     #[test]
