@@ -53,8 +53,10 @@ Compile `forward → loss → backward → optimizer update → recurrent state`
 then replay it with new batches without reconstructing a Graph or materializing
 gradients through host `TensorData`. Generalize the existing graph-free
 momentum-SGD vertical behind optimizer-program and persistent-state contracts;
-AdamW is the first required implementation, including first/second moments and
-a step counter in the same atomic state frontier as parameters.
+AdamW is the first implementation, including first/second moments and a step
+counter in the same atomic state frontier as parameters. Deterministic
+capture-authenticated checkpoint bytes restore values and their exact logical
+versions into that same runtime rather than creating a host optimizer path.
 
 ### 2. P0 — tiny Transformer training and exact resume
 

@@ -134,34 +134,66 @@ impl EffectRuntime {
         &mut self,
         values: Vec<(u64, TensorData)>,
     ) -> Result<Vec<BufferState>, RuntimeError> {
-        let mut seen = std::collections::BTreeSet::new();
-        for (buffer, _) in &values {
-            if !seen.insert(*buffer) || self.slots.contains_key(buffer) {
-                return Err(RuntimeError::DuplicateBuffer(*buffer));
-            }
-        }
-        let mut staged = Vec::with_capacity(values.len());
-        for (buffer, value) in values {
+        let values = values
+            .into_iter()
+            .map(|(buffer, value)| {
+                let bytes = value
+                    .len()
+                    .checked_mul(value.dtype().itemsize())
+                    .ok_or(HostBufferError::Overflow)?;
+                Ok((
+                    BufferState {
+                        buffer,
+                        version: 0,
+                        shape: value.shape().clone(),
+                        dtype: value.dtype(),
+                        bytes,
+                    },
+                    value,
+                ))
+            })
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
+        self.register_initial_snapshots(values)
+    }
+
+    /// Atomically registers detached persistent values at their exact logical
+    /// versions. This is the restore counterpart to `register_initial_states`:
+    /// descriptors and bytes are validated before any slot becomes visible.
+    pub(crate) fn register_initial_snapshots(
+        &mut self,
+        values: Vec<(BufferState, TensorData)>,
+    ) -> Result<Vec<BufferState>, RuntimeError> {
+        let mut seen = BTreeSet::new();
+        for (state, value) in &values {
+            super::validate_buffer_state(state)?;
             let bytes = value
                 .len()
                 .checked_mul(value.dtype().itemsize())
                 .ok_or(HostBufferError::Overflow)?;
-            let state = BufferState {
-                buffer,
-                version: 0,
-                shape: value.shape().clone(),
-                dtype: value.dtype(),
-                bytes,
-            };
+            if value.shape() != &state.shape || value.dtype() != state.dtype || bytes != state.bytes
+            {
+                return Err(RuntimeError::Effect(EffectError::DescriptorMismatch {
+                    buffer: state.buffer,
+                    version: state.version,
+                }));
+            }
+            if !seen.insert(state.buffer) || self.slots.contains_key(&state.buffer) {
+                return Err(RuntimeError::DuplicateBuffer(state.buffer));
+            }
+        }
+        let mut staged = Vec::with_capacity(values.len());
+        for (state, value) in values {
             let desc = HostBufferDesc {
-                buffer_id: buffer,
+                buffer_id: state.buffer,
                 dtype: state.dtype,
                 shape: state.shape.clone(),
-                bytes,
+                bytes: state.bytes,
                 alignment: state.dtype.itemsize().max(1),
                 lanes: 1,
             };
-            let lease = self.pool.lease((bytes != 0).then_some(buffer), desc)?;
+            let lease = self
+                .pool
+                .lease((state.bytes != 0).then_some(state.buffer), desc)?;
             lease.write(value)?;
             staged.push((state.clone(), PersistentStateSlot { state, lease }));
         }
@@ -513,6 +545,48 @@ mod tests {
         assert!(exact_storage(
             runtime.snapshot(next.state()).unwrap().tensor().storage(),
             detached.values[&10].storage(),
+        ));
+    }
+
+    #[test]
+    fn versioned_initial_snapshots_publish_atomically() {
+        let value = data([2], Storage::F32(vec![-0.0, f32::NAN]));
+        let state = BufferState {
+            buffer: 41,
+            version: 7,
+            shape: Shape::from([2]),
+            dtype: DType::F32,
+            bytes: 8,
+        };
+        let mut runtime = EffectRuntime::new();
+        assert_eq!(
+            runtime
+                .register_initial_snapshots(vec![(state.clone(), value.clone())])
+                .unwrap(),
+            vec![state.clone()]
+        );
+        assert!(exact_storage(
+            runtime.snapshot(&state).unwrap().tensor().storage(),
+            value.storage()
+        ));
+
+        let mut malformed = state.clone();
+        malformed.buffer = 42;
+        malformed.bytes = 4;
+        assert!(
+            runtime
+                .register_initial_snapshots(vec![(malformed, value)])
+                .is_err()
+        );
+        assert!(matches!(
+            runtime.snapshot(&BufferState {
+                buffer: 42,
+                version: 7,
+                shape: Shape::from([2]),
+                dtype: DType::F32,
+                bytes: 8,
+            }),
+            Err(RuntimeError::MissingBuffer(42))
         ));
     }
 

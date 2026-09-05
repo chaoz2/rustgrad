@@ -15,9 +15,9 @@ pub use classification::{
     summarize_classification,
 };
 pub use compiled_training::{
-    CompiledAdamWConfig, CompiledAdamWStepResult, CompiledMomentumSgdConfig,
-    CompiledMomentumSgdStepResult, CompiledTrainingStepResult, CpuCompiledAdamW,
-    CpuCompiledMomentumSgd, TrainingParameterInit,
+    CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWStepResult,
+    CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult, CompiledTrainingStepResult,
+    CpuCompiledAdamW, CpuCompiledMomentumSgd, TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,
