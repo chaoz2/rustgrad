@@ -6,6 +6,7 @@ use super::{
     LlamaPromptWorkflow, LlamaSampling,
     generation::{select_last, validate_sampling},
     metal_step::LlamaMetalPrefillPlan,
+    metal_workload_evidence::{LlamaMetalWorkloadEvidence, LlamaMetalWorkloadPhase},
 };
 use crate::{
     CapturedSchedule, DType, ExecutionPlanSummary, ReplayInput, Scalar, TensorData,
@@ -16,7 +17,7 @@ use crate::{
     },
     tokenizer::{SimpleTokenizer, TokenizerError},
 };
-use std::{collections::BTreeMap, error, fmt, num::NonZeroUsize, time::Duration};
+use std::{collections::BTreeMap, error, fmt, num::NonZeroUsize};
 
 /// Resource-free, GGUF-bound deployment plan for one selected Metal device.
 ///
@@ -34,6 +35,8 @@ pub struct LlamaMetalPlan {
 pub struct LlamaMetalSession {
     step: LlamaMetalStepSession,
     prefill: Option<LlamaMetalPrefillSession>,
+    token_step_deployment_identity: u64,
+    fixed_prefill_deployment_identity: Option<u64>,
     committed_position: usize,
     successful_invocations: u64,
     tokenizer: SimpleTokenizer,
@@ -63,117 +66,6 @@ pub struct LlamaMetalGeneration {
     generation: LlamaGeneration,
     reports: Vec<MetalDeviceRunReport>,
     workload_evidence: LlamaMetalWorkloadEvidence,
-}
-
-/// Host-observed performance evidence for one completed Llama workload.
-///
-/// The plan and preparation reports retain their existing precise meanings:
-/// `planned_device_bytes` is a physical static-plan allocation total, while
-/// `resident_input_bytes` is the declared payload of inputs retained by the
-/// device session. Transfer counts and bytes are host API calls, not a claim
-/// about a bus. All durations are host wall times; this type contains no GPU
-/// timestamp or device-throughput measurement.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LlamaMetalWorkloadEvidence {
-    /// Deterministic planned allocation, kernel, and fallback facts.
-    pub plan: MetalDeviceSessionSummary,
-    /// One-time token-step planning, native preparation, and host API writes.
-    pub token_step_preparation: MetalDevicePreparationReport,
-    /// One-time fixed-span prefill preparation when that program is enabled.
-    pub fixed_prefill_preparation: Option<MetalDevicePreparationReport>,
-    /// The first successful device invocation, if the workload executed one.
-    pub first_successful_run: Option<LlamaMetalWorkloadPhase>,
-    /// All successful device work that ingested prompt tokens.
-    pub prompt_prefill: LlamaMetalWorkloadPhase,
-    /// Successful generated tokens fed back through token-step device work
-    /// after prompt ingestion. A final sampled output with no following device
-    /// invocation is deliberately not counted here.
-    pub steady_decode: LlamaMetalWorkloadPhase,
-}
-
-/// Aggregate host-observed evidence for one workload phase.
-///
-/// Counter totals saturate at [`usize::MAX`] rather than panicking or wrapping
-/// if evidence from an unrepresentably large workload is combined.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LlamaMetalWorkloadPhase {
-    /// Tokens represented by the successful invocations in this phase.
-    pub token_count: usize,
-    /// Successful device invocations contributing to this phase.
-    pub successful_invocation_count: usize,
-    /// Sum of host wall time reported for these invocations.
-    pub host_run_wall_time: Duration,
-    /// Sum of host API transaction wall time reported for these invocations.
-    pub host_synchronous_transaction_wall_time: Duration,
-    /// Nonzero schedule items launched by these invocations.
-    pub kernel_launch_count: usize,
-    /// Host API transient-input write calls, not claimed bus transfers.
-    pub transient_h2d_calls: usize,
-    /// Bytes passed to transient-input host API writes.
-    pub transient_h2d_bytes: usize,
-    /// Host API runtime-control write calls, not claimed bus transfers.
-    pub runtime_control_h2d_calls: usize,
-    /// Bytes passed to runtime-control host API writes.
-    pub runtime_control_h2d_bytes: usize,
-    /// Host API retained-output read calls, not claimed bus transfers.
-    pub retained_d2h_calls: usize,
-    /// Bytes passed to retained-output host API reads.
-    pub retained_d2h_bytes: usize,
-}
-
-impl LlamaMetalWorkloadPhase {
-    pub(crate) fn from_reports(token_count: usize, reports: &[MetalDeviceRunReport]) -> Self {
-        let mut phase = Self {
-            token_count,
-            successful_invocation_count: reports.len(),
-            host_run_wall_time: Duration::ZERO,
-            host_synchronous_transaction_wall_time: Duration::ZERO,
-            kernel_launch_count: 0,
-            transient_h2d_calls: 0,
-            transient_h2d_bytes: 0,
-            runtime_control_h2d_calls: 0,
-            runtime_control_h2d_bytes: 0,
-            retained_d2h_calls: 0,
-            retained_d2h_bytes: 0,
-        };
-        for report in reports {
-            phase.host_run_wall_time = phase
-                .host_run_wall_time
-                .saturating_add(report.run_wall_time);
-            phase.host_synchronous_transaction_wall_time = phase
-                .host_synchronous_transaction_wall_time
-                .saturating_add(report.synchronous_transaction_wall_time);
-            phase.kernel_launch_count = phase
-                .kernel_launch_count
-                .saturating_add(report.kernel_launch_count);
-            phase.transient_h2d_calls = phase
-                .transient_h2d_calls
-                .saturating_add(report.transient_h2d_calls);
-            phase.transient_h2d_bytes = phase
-                .transient_h2d_bytes
-                .saturating_add(report.transient_h2d_bytes);
-            phase.runtime_control_h2d_calls = phase
-                .runtime_control_h2d_calls
-                .saturating_add(report.runtime_control_h2d_calls);
-            phase.runtime_control_h2d_bytes = phase
-                .runtime_control_h2d_bytes
-                .saturating_add(report.runtime_control_h2d_bytes);
-            phase.retained_d2h_calls = phase
-                .retained_d2h_calls
-                .saturating_add(report.retained_d2h_calls);
-            phase.retained_d2h_bytes = phase
-                .retained_d2h_bytes
-                .saturating_add(report.retained_d2h_bytes);
-        }
-        phase
-    }
-
-    /// Returns host-observed tokens per second when this phase executed at
-    /// least one token and measured a nonzero host workload duration.
-    pub fn host_tokens_per_second(&self) -> Option<f64> {
-        (!self.host_run_wall_time.is_zero() && self.token_count != 0)
-            .then(|| self.token_count as f64 / self.host_run_wall_time.as_secs_f64())
-    }
 }
 
 /// Rendered prompt plus its successful generation.
@@ -342,6 +234,13 @@ impl LlamaMetalPlan {
         self.prefill.as_ref().map(LlamaMetalPrefillPlan::summary)
     }
 
+    /// Returns the fixed-span program's deployment identity when enabled.
+    pub fn prefill_deployment_identity(&self) -> Option<u64> {
+        self.prefill
+            .as_ref()
+            .map(LlamaMetalPrefillPlan::deployment_identity)
+    }
+
     /// Returns backend-neutral schedule and memory facts for the state-only
     /// fixed-span program.
     pub fn prefill_execution_plan(&self) -> Option<&ExecutionPlanSummary> {
@@ -426,6 +325,11 @@ impl LlamaMetalPlan {
     /// Creates the persistent device session. No host model or weight object is
     /// retained after this transition.
     pub fn prepare(self) -> Result<LlamaMetalSession, LlamaMetalGenerationError> {
+        let token_step_deployment_identity = self.step.deployment_identity();
+        let fixed_prefill_deployment_identity = self
+            .prefill
+            .as_ref()
+            .map(LlamaMetalPrefillPlan::deployment_identity);
         let shared = self
             .prefill
             .as_ref()
@@ -459,6 +363,8 @@ impl LlamaMetalPlan {
         Ok(LlamaMetalSession {
             step,
             prefill,
+            token_step_deployment_identity,
+            fixed_prefill_deployment_identity,
             committed_position: 0,
             successful_invocations: 0,
             tokenizer: self.tokenizer,
@@ -482,11 +388,14 @@ impl LlamaMetalPlan {
             context,
             self.step.append_state_plan(),
         )?;
+        let token_step_deployment_identity = self.step.deployment_identity();
         let mut step = self.step.prepare(self.selected_device)?;
         step.bind_execution_scoreboard(recorder)?;
         Ok(LlamaMetalSession {
             step,
             prefill: None,
+            token_step_deployment_identity,
+            fixed_prefill_deployment_identity: None,
             committed_position: 0,
             successful_invocations: 0,
             tokenizer: self.tokenizer,
@@ -658,6 +567,21 @@ impl LlamaMetalSession {
         self.prefill
             .as_ref()
             .map(|prefill| prefill.inner.preparation_report())
+    }
+
+    /// Returns the prepared fixed-span program's deterministic plan facts.
+    pub fn prefill_summary(&self) -> Option<&MetalDeviceSessionSummary> {
+        self.prefill.as_ref().map(|prefill| prefill.inner.summary())
+    }
+
+    /// Returns the authenticated token-step deployment identity.
+    pub const fn token_step_deployment_identity(&self) -> u64 {
+        self.token_step_deployment_identity
+    }
+
+    /// Returns the authenticated fixed-span deployment identity when enabled.
+    pub const fn fixed_prefill_deployment_identity(&self) -> Option<u64> {
+        self.fixed_prefill_deployment_identity
     }
 
     /// Returns the configured fixed prompt span.
@@ -1047,7 +971,10 @@ impl LlamaMetalSession {
                 )
             });
         LlamaMetalWorkloadEvidence {
+            token_step_deployment_identity: self.token_step_deployment_identity,
+            fixed_prefill_deployment_identity: self.fixed_prefill_deployment_identity,
             plan: self.summary().clone(),
+            fixed_prefill_plan: self.prefill_summary().cloned(),
             token_step_preparation: self.preparation_report().clone(),
             fixed_prefill_preparation: self.prefill_preparation_report().cloned(),
             first_successful_run,

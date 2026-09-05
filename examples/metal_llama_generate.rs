@@ -7,7 +7,8 @@ use rustgrad::runtime::metal::{
 };
 use rustgrad::{
     LlamaMetalGeneration, LlamaMetalGenerationError, LlamaMetalGenerationStage, LlamaMetalPlan,
-    LlamaPromptWorkflow, LlamaSampling, ReplayInput,
+    LlamaMetalWorkloadEvidenceArtifact, LlamaMetalWorkloadEvidenceContext, LlamaPromptWorkflow,
+    LlamaSampling, ReplayInput,
 };
 use serde::Serialize;
 use std::{
@@ -21,11 +22,13 @@ use std::{
     process::ExitCode,
 };
 
-const USAGE: &str = "usage: metal_llama_generate [--device INDEX] [--expected-registry-id ID] [--max-new-tokens N] [--prefill-span N] [--chat] [--scoreboard PATH --revision LABEL] [--expected-ids ID,ID,...] [--attestation PATH --model-sha256 HEX --model-source LOCATOR --model-license LICENSE --model-conversion PROVENANCE --oracle-name NAME --oracle-revision REVISION --oracle-command COMMAND --workflow-run-url URL --workflow-run-id ID] [--] <model.gguf> <prompt>";
+const USAGE: &str = "usage: metal_llama_generate [--device INDEX] [--expected-registry-id ID] [--max-new-tokens N] [--prefill-span N] [--chat] [--scoreboard PATH | --workload-evidence PATH] [--revision LABEL] [--expected-ids ID,ID,...] [--attestation PATH --model-sha256 HEX --model-source LOCATOR --model-license LICENSE --model-conversion PROVENANCE --oracle-name NAME --oracle-revision REVISION --oracle-command COMMAND --workflow-run-url URL --workflow-run-id ID] [--] <model.gguf> <prompt>";
 const DEFAULT_MAX_NEW_TOKENS: usize = 16;
 const MAX_NEW_TOKENS: usize = 4_096;
 const SCOREBOARD_WORKLOAD: &str = "gguf-llama-metal-generate";
 const SCOREBOARD_EVIDENCE: &str = "live self-hosted Apple GPU prompt-to-tokens harness";
+const WORKLOAD_EVIDENCE: &str =
+    "host-observed fixed-span prefill and steady-decode Metal workload evidence";
 
 #[derive(Debug, Eq, PartialEq)]
 struct Args {
@@ -35,6 +38,7 @@ struct Args {
     prefill_span: Option<NonZeroUsize>,
     chat: bool,
     scoreboard_path: Option<PathBuf>,
+    workload_evidence_path: Option<PathBuf>,
     revision: Option<String>,
     expected_ids: Option<Vec<u32>>,
     attestation: Option<AttestationArgs>,
@@ -68,9 +72,10 @@ struct AttestationRecordContext<'a> {
     model: &'a AttestedModelFile,
     stable: &'a StablePlanFacts,
     generation: &'a LlamaMetalGeneration,
-    report: &'a MetalSessionScoreboardReport,
+    report: Option<&'a MetalSessionScoreboardReport>,
+    workload_artifact: Option<&'a LlamaMetalWorkloadEvidenceArtifact>,
     final_position: usize,
-    scoreboard_path: &'a Path,
+    evidence_path: &'a Path,
 }
 
 #[derive(Serialize)]
@@ -120,10 +125,12 @@ struct AttestedOracle<'a> {
 struct AttestedEvidence<'a> {
     workflow_run_url: &'a str,
     workflow_run_id: &'a str,
-    scoreboard_filename: &'a str,
-    deployment_identity: u64,
-    capture_identity: u64,
-    execution_plan_identity: u64,
+    evidence_kind: &'static str,
+    evidence_filename: &'a str,
+    token_step_deployment_identity: u64,
+    fixed_prefill_deployment_identity: Option<u64>,
+    token_step_capture_identity: u64,
+    execution_plan_identity: Option<u64>,
     successful_run_count: u64,
     final_committed_position: usize,
     fallback_count: usize,
@@ -145,6 +152,7 @@ struct StablePlanFacts {
     device_info: MetalDeviceInfo,
     device_owner_id: u64,
     step_deployment_identity: u64,
+    fixed_prefill_deployment_identity: Option<u64>,
     capture_identity: u64,
     summary: MetalDeviceSessionSummary,
     resident_inputs: Vec<ReplayInput>,
@@ -181,7 +189,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             revision,
             SCOREBOARD_EVIDENCE,
         )?),
-        (None, None) => None,
+        (None, _) => None,
         _ => unreachable!("paired scoreboard arguments are validated by parse_args"),
     };
     let runtime = MetalRuntime::load()?;
@@ -218,6 +226,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         device_info: plan.selected_device_info().clone(),
         device_owner_id: plan.selected_device_owner_id(),
         step_deployment_identity: plan.step_deployment_identity(),
+        fixed_prefill_deployment_identity: plan.prefill_deployment_identity(),
         capture_identity: plan.capture().identity,
         summary: plan.summary().clone(),
         resident_inputs: plan.resident_inputs().to_vec(),
@@ -286,6 +295,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         session.position(),
         session.vocab_size(),
     )?;
+    validate_workload_evidence(generation, session.position(), &stable)?;
     validate_stable_session(&session, &stable)?;
     if cache.len() != cache_entries_after_prepare {
         return Err(io::Error::other("Metal pipeline cache changed during generation").into());
@@ -298,7 +308,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         ))
         .into());
     }
-    if let Some(path) = &args.scoreboard_path {
+    let scoreboard_report = if let Some(path) = &args.scoreboard_path {
         let report = session
             .execution_scoreboard()
             .ok_or_else(|| io::Error::other("scoreboard was requested but is not bound"))?
@@ -324,25 +334,64 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             return Err(io::Error::other("Metal Llama scoreboard evidence is inconsistent").into());
         }
-        let scoreboard_bytes = report.to_json_bytes()?;
-        let attestation_bytes = match (&args.attestation, &attested_model) {
-            (Some(attestation), Some(model)) => Some(attestation_json(AttestationRecordContext {
+        Some((path, report))
+    } else {
+        None
+    };
+    let workload_artifact = args
+        .workload_evidence_path
+        .as_ref()
+        .map(|_| {
+            let revision = args
+                .revision
+                .as_deref()
+                .ok_or_else(|| io::Error::other("workload evidence has no code revision"))?;
+            let context = LlamaMetalWorkloadEvidenceContext::new(
+                SCOREBOARD_WORKLOAD,
+                revision,
+                WORKLOAD_EVIDENCE,
+            )?;
+            Ok::<_, Box<dyn Error>>(LlamaMetalWorkloadEvidenceArtifact::new(
+                context,
+                session.device_info().clone(),
+                generation.workload_evidence().clone(),
+            )?)
+        })
+        .transpose()?;
+    let attestation_bytes = match (&args.attestation, &attested_model) {
+        (Some(provenance), Some(model)) => {
+            let (report, artifact, evidence_path) = match (
+                scoreboard_report.as_ref(),
+                workload_artifact.as_ref(),
+                args.workload_evidence_path.as_deref(),
+            ) {
+                (Some((path, report)), None, None) => (Some(report), None, path.as_path()),
+                (None, Some(artifact), Some(path)) => (None, Some(artifact), path),
+                _ => unreachable!("exactly one attested evidence source is validated"),
+            };
+            Some(attestation_json(AttestationRecordContext {
                 args: &args,
-                provenance: attestation,
+                provenance,
                 model,
                 stable: &stable,
                 generation,
-                report: &report,
+                report,
+                workload_artifact: artifact,
                 final_position: session.position(),
-                scoreboard_path: path,
-            })?),
-            (None, None) => None,
-            _ => unreachable!("attested model metadata is paired with attestation arguments"),
-        };
-        write_new_evidence(path, &scoreboard_bytes)?;
-        if let (Some(attestation), Some(bytes)) = (&args.attestation, attestation_bytes) {
-            write_new_evidence(&attestation.path, &bytes)?;
+                evidence_path,
+            })?)
         }
+        (None, None) => None,
+        _ => unreachable!("attested model metadata is paired with attestation arguments"),
+    };
+    if let Some((path, report)) = scoreboard_report {
+        write_new_evidence(path, &report.to_json_bytes()?)?;
+    }
+    if let (Some(path), Some(artifact)) = (&args.workload_evidence_path, &workload_artifact) {
+        artifact.write_json_create_new(path)?;
+    }
+    if let (Some(attestation), Some(bytes)) = (&args.attestation, attestation_bytes) {
+        write_new_evidence(&attestation.path, &bytes)?;
     }
     eprintln!(
         "completed prompt_tokens={} generated_tokens={} committed_position={} invocations={}",
@@ -361,6 +410,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
     let mut prefill_span = None;
     let mut chat = false;
     let mut scoreboard_path = None;
+    let mut workload_evidence_path = None;
     let mut revision = None;
     let mut expected_ids = None;
     let mut attestation_path = None;
@@ -414,6 +464,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
                 &mut scoreboard_path,
                 PathBuf::from(required_value(args.next(), "--scoreboard")?),
                 "--scoreboard",
+            )?,
+            "--workload-evidence" => set_once(
+                &mut workload_evidence_path,
+                PathBuf::from(required_value(args.next(), "--workload-evidence")?),
+                "--workload-evidence",
             )?,
             "--revision" => set_once(
                 &mut revision,
@@ -484,8 +539,15 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
     if positional.len() != 2 {
         return Err(cli(USAGE));
     }
-    if scoreboard_path.is_some() != revision.is_some() {
-        return Err(cli("--scoreboard and --revision must be supplied together"));
+    if scoreboard_path.is_some() && workload_evidence_path.is_some() {
+        return Err(cli(
+            "--scoreboard and --workload-evidence are mutually exclusive",
+        ));
+    }
+    if (scoreboard_path.is_some() || workload_evidence_path.is_some()) != revision.is_some() {
+        return Err(cli(
+            "an evidence output and --revision must be supplied together",
+        ));
     }
     if prefill_span.is_some() && scoreboard_path.is_some() {
         return Err(cli(
@@ -515,9 +577,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
         || workflow_run_url.is_some()
         || workflow_run_id.is_some();
     let attestation = if attestation_requested {
-        if scoreboard_path.is_none() || revision.is_none() || expected_ids.is_none() {
+        if (scoreboard_path.is_none() && workload_evidence_path.is_none())
+            || revision.is_none()
+            || expected_ids.is_none()
+        {
             return Err(cli(
-                "attestation requires --scoreboard, --revision, and --expected-ids",
+                "attestation requires one evidence output, --revision, and --expected-ids",
             ));
         }
         let model_sha256 = attestation_value(model_sha256, "--model-sha256")?;
@@ -556,6 +621,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
         prefill_span,
         chat,
         scoreboard_path,
+        workload_evidence_path,
         revision,
         expected_ids,
         attestation,
@@ -652,23 +718,29 @@ fn cli(message: impl Into<String>) -> CliError {
 }
 
 fn validate_evidence_paths(args: &Args) -> Result<(), io::Error> {
-    if let Some(scoreboard) = &args.scoreboard_path {
-        let scoreboard_destination = resolved_new_destination(scoreboard, "scoreboard")?;
-        if scoreboard.try_exists()? {
-            return Err(io::Error::other("scoreboard path already exists"));
+    let mut destinations = Vec::new();
+    for (path, label) in [
+        args.scoreboard_path
+            .as_deref()
+            .map(|path| (path, "scoreboard")),
+        args.workload_evidence_path
+            .as_deref()
+            .map(|path| (path, "workload evidence")),
+        args.attestation
+            .as_ref()
+            .map(|attestation| (attestation.path.as_path(), "attestation")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if path.try_exists()? {
+            return Err(io::Error::other(format!("{label} path already exists")));
         }
-        if let Some(attestation) = &args.attestation {
-            let attestation_destination =
-                resolved_new_destination(&attestation.path, "attestation")?;
-            if attestation.path.try_exists()? {
-                return Err(io::Error::other("attestation path already exists"));
-            }
-            if scoreboard_destination == attestation_destination {
-                return Err(io::Error::other(
-                    "scoreboard and attestation paths must be distinct",
-                ));
-            }
+        let destination = resolved_new_destination(path, label)?;
+        if destinations.iter().any(|prior| prior == &destination) {
+            return Err(io::Error::other("evidence output paths must be distinct"));
         }
+        destinations.push(destination);
     }
     Ok(())
 }
@@ -716,8 +788,9 @@ fn attestation_json(context: AttestationRecordContext<'_>) -> Result<Vec<u8>, io
         stable,
         generation,
         report,
+        workload_artifact,
         final_position,
-        scoreboard_path,
+        evidence_path,
     } = context;
     let revision = args
         .revision
@@ -727,8 +800,26 @@ fn attestation_json(context: AttestationRecordContext<'_>) -> Result<Vec<u8>, io
         .expected_ids
         .as_deref()
         .ok_or_else(|| io::Error::other("attestation has no expected token IDs"))?;
+    let (evidence_kind, execution_plan_identity, fallback_count) = match (report, workload_artifact)
+    {
+        (Some(report), None) => (
+            "metal_session_scoreboard_v4",
+            Some(report.execution_plan_identity),
+            report.fallback_count,
+        ),
+        (None, Some(artifact)) => (
+            "llama_metal_workload_evidence_v1",
+            None,
+            artifact.fallback_count(),
+        ),
+        _ => {
+            return Err(io::Error::other(
+                "attestation requires exactly one evidence source",
+            ));
+        }
+    };
     let attestation = MetalLlamaAttestation {
-        format_version: 1,
+        format_version: 2,
         code_revision_sha: revision,
         model: AttestedModel {
             filename: model.filename.as_str(),
@@ -761,13 +852,16 @@ fn attestation_json(context: AttestationRecordContext<'_>) -> Result<Vec<u8>, io
         evidence: AttestedEvidence {
             workflow_run_url: provenance.workflow_run_url.as_str(),
             workflow_run_id: provenance.workflow_run_id.as_str(),
-            scoreboard_filename: evidence_filename(scoreboard_path, "scoreboard")?,
-            deployment_identity: report.deployment_identity,
-            capture_identity: report.capture_identity,
-            execution_plan_identity: report.execution_plan_identity,
-            successful_run_count: report.successful_run_count,
+            evidence_kind,
+            evidence_filename: evidence_filename(evidence_path, "evidence")?,
+            token_step_deployment_identity: stable.step_deployment_identity,
+            fixed_prefill_deployment_identity: stable.fixed_prefill_deployment_identity,
+            token_step_capture_identity: stable.capture_identity,
+            execution_plan_identity,
+            successful_run_count: u64::try_from(generation.reports().len())
+                .map_err(|_| io::Error::other("successful run count overflow"))?,
             final_committed_position: final_position,
-            fallback_count: report.fallback_count,
+            fallback_count,
         },
     };
     serialize_attestation(&attestation)
@@ -831,7 +925,7 @@ fn validate_generation(
     if generation.generated_ids().len() > max_new_tokens {
         return Err(io::Error::other("generation exceeded its token bound"));
     }
-    let expected_reports = if max_new_tokens == 0 {
+    let expected_committed_tokens = if max_new_tokens == 0 {
         0
     } else {
         generation
@@ -841,38 +935,108 @@ fn validate_generation(
             .and_then(|value| value.checked_sub(1))
             .ok_or_else(|| io::Error::other("generation report count overflow"))?
     };
-    if generation.reports().len() != expected_reports || committed_position != expected_reports {
+    if committed_position != expected_committed_tokens {
         return Err(io::Error::other(
-            "generation omitted or invented a token invocation report",
+            "generation committed an inconsistent token count",
+        ));
+    }
+    let evidence = generation.workload_evidence();
+    let expected_reports = evidence
+        .prompt_prefill
+        .successful_invocation_count
+        .checked_add(evidence.steady_decode.successful_invocation_count)
+        .ok_or_else(|| io::Error::other("generation report count overflow"))?;
+    if generation.reports().len() != expected_reports {
+        return Err(io::Error::other(
+            "generation omitted or invented a device report",
+        ));
+    }
+    for (index, report) in generation.reports().iter().enumerate() {
+        let ordinal = u64::try_from(index + 1)
+            .map_err(|_| io::Error::other("generation invocation ordinal overflow"))?;
+        if report.successful_invocation != ordinal
+            || report.committed_state_position.is_none()
+            || (index != 0
+                && report.committed_state_position
+                    <= generation.reports()[index - 1].committed_state_position)
+        {
+            return Err(io::Error::other(format!(
+                "device invocation {} violates the ordered Metal report contract",
+                index + 1
+            )));
+        }
+    }
+    if generation
+        .reports()
+        .last()
+        .and_then(|report| report.committed_state_position)
+        != (expected_committed_tokens != 0).then_some(expected_committed_tokens)
+    {
+        return Err(io::Error::other(
+            "final device report does not match the committed token position",
         ));
     }
     let retained_bytes = vocab_size
         .checked_mul(4)
         .ok_or_else(|| io::Error::other("retained logits byte count overflow"))?;
-    for (index, report) in generation.reports().iter().enumerate() {
-        let ordinal = u64::try_from(index + 1)
-            .map_err(|_| io::Error::other("generation invocation ordinal overflow"))?;
-        let retained = if index + 1 >= generation.prompt_ids().len() {
-            1
-        } else {
-            0
-        };
-        if report.successful_invocation != ordinal
-            || report.committed_state_position != Some(index + 1)
-            || report.transient_h2d_calls != 1
-            || report.transient_h2d_bytes != 4
-            || report.runtime_control_h2d_calls != 1
-            || report.runtime_control_h2d_bytes != 4
-            || report.retained_d2h_calls != retained
-            || (retained == 0 && report.retained_d2h_bytes != 0)
-            || report.retained_d2h_bytes != retained * retained_bytes
-            || report.output_count != retained
-        {
-            return Err(io::Error::other(format!(
-                "token invocation {} violates the persistent Metal report contract",
-                index + 1
-            )));
-        }
+    let prompt_retained_calls: usize = if expected_committed_tokens == 0 { 0 } else { 1 };
+    let retained_calls = prompt_retained_calls
+        .checked_add(evidence.steady_decode.successful_invocation_count)
+        .ok_or_else(|| io::Error::other("retained logits call count overflow"))?;
+    let (actual_calls, actual_bytes, actual_outputs) = generation.reports().iter().fold(
+        (0usize, 0usize, 0usize),
+        |(calls, bytes, outputs), report| {
+            (
+                calls.saturating_add(report.retained_d2h_calls),
+                bytes.saturating_add(report.retained_d2h_bytes),
+                outputs.saturating_add(report.output_count),
+            )
+        },
+    );
+    if actual_calls != retained_calls
+        || actual_outputs != retained_calls
+        || actual_bytes != retained_calls.saturating_mul(retained_bytes)
+    {
+        return Err(io::Error::other(
+            "generation retained an inconsistent logits projection",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workload_evidence(
+    generation: &LlamaMetalGeneration,
+    committed_position: usize,
+    stable: &StablePlanFacts,
+) -> Result<(), io::Error> {
+    let evidence = generation.workload_evidence();
+    let expected_decode_tokens = generation.generated_ids().len().saturating_sub(1);
+    let expected_reports = evidence
+        .prompt_prefill
+        .successful_invocation_count
+        .checked_add(evidence.steady_decode.successful_invocation_count)
+        .ok_or_else(|| io::Error::other("workload invocation count overflow"))?;
+    if evidence.token_step_deployment_identity != stable.step_deployment_identity
+        || evidence.fixed_prefill_deployment_identity != stable.fixed_prefill_deployment_identity
+        || evidence.plan.fallback_count != 0
+        || evidence
+            .fixed_prefill_plan
+            .as_ref()
+            .is_some_and(|plan| plan.fallback_count != 0)
+        || evidence.fixed_prefill_plan.is_some() != evidence.fixed_prefill_preparation.is_some()
+        || evidence.prompt_prefill.token_count != generation.prompt_ids().len()
+        || evidence.steady_decode.token_count != expected_decode_tokens
+        || expected_reports != generation.reports().len()
+        || evidence.first_successful_run.is_some() == generation.reports().is_empty()
+        || committed_position
+            != evidence
+                .prompt_prefill
+                .token_count
+                .saturating_add(evidence.steady_decode.token_count)
+    {
+        return Err(io::Error::other(
+            "Metal Llama workload evidence is inconsistent with generation",
+        ));
     }
     Ok(())
 }
@@ -952,6 +1116,7 @@ mod tests {
                 prefill_span: None,
                 chat: false,
                 scoreboard_path: None,
+                workload_evidence_path: None,
                 revision: None,
                 expected_ids: None,
                 attestation: None,
@@ -985,6 +1150,21 @@ mod tests {
                 .unwrap()
                 .prefill_span,
             NonZeroUsize::new(3)
+        );
+        let fixed_evidence = parse(&[
+            "--prefill-span",
+            "3",
+            "--workload-evidence",
+            "workload.json",
+            "--revision",
+            "reviewed-sha",
+            "model.gguf",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(
+            fixed_evidence.workload_evidence_path,
+            Some(PathBuf::from("workload.json"))
         );
         assert!(evidence.chat);
         assert_eq!(evidence.expected_ids, Some(vec![4, 5, 6]));
@@ -1106,6 +1286,7 @@ mod tests {
             prefill_span: None,
             chat: false,
             scoreboard_path: Some(scoreboard.clone()),
+            workload_evidence_path: None,
             revision: Some("0123456789abcdef0123456789abcdef01234567".into()),
             expected_ids: Some(vec![1]),
             attestation: Some(AttestationArgs {
@@ -1137,12 +1318,18 @@ mod tests {
         same.attestation.as_mut().unwrap().path = root.join("nested/../same.json");
         assert!(validate_evidence_paths(&same).is_err());
 
+        same.workload_evidence_path = same.scoreboard_path.take();
+        assert!(validate_evidence_paths(&same).is_err());
+
         #[cfg(unix)]
         {
             let alias = root.join("alias");
             std::os::unix::fs::symlink(&root, &alias).unwrap();
             same.scoreboard_path = Some(root.join("symlinked.json"));
+            same.workload_evidence_path = None;
             same.attestation.as_mut().unwrap().path = alias.join("symlinked.json");
+            assert!(validate_evidence_paths(&same).is_err());
+            same.workload_evidence_path = same.scoreboard_path.take();
             assert!(validate_evidence_paths(&same).is_err());
             fs::remove_file(alias).unwrap();
         }
@@ -1152,7 +1339,7 @@ mod tests {
     #[test]
     fn attestation_json_is_typed_deterministic_and_path_free() {
         let attestation = MetalLlamaAttestation {
-            format_version: 1,
+            format_version: 2,
             code_revision_sha: "0123456789abcdef0123456789abcdef01234567",
             model: AttestedModel {
                 filename: "model.gguf",
@@ -1181,10 +1368,12 @@ mod tests {
             evidence: AttestedEvidence {
                 workflow_run_url: "https://example.invalid/actions/runs/9",
                 workflow_run_id: "9",
-                scoreboard_filename: "scoreboard.json",
-                deployment_identity: 10,
-                capture_identity: 11,
-                execution_plan_identity: 12,
+                evidence_kind: "metal_session_scoreboard_v4",
+                evidence_filename: "scoreboard.json",
+                token_step_deployment_identity: 10,
+                fixed_prefill_deployment_identity: None,
+                token_step_capture_identity: 11,
+                execution_plan_identity: Some(12),
                 successful_run_count: 3,
                 final_committed_position: 3,
                 fallback_count: 0,
@@ -1192,7 +1381,7 @@ mod tests {
         };
         let bytes = serialize_attestation(&attestation).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["format_version"], 1);
+        assert_eq!(value["format_version"], 2);
         assert_eq!(value["model"]["filename"], "model.gguf");
         assert_eq!(
             value["invocation"]["actual_token_ids"],
@@ -1205,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn live_workflow_pairs_attestation_and_scoreboard_checksums() {
+    fn live_workflow_pairs_fixed_span_workload_attestation_and_checksums() {
         let workflow = include_str!("../.github/workflows/metal-live.yml");
         for required in [
             "RUSTGRAD_METAL_LLAMA_MODEL_SOURCE",
@@ -1215,6 +1404,8 @@ mod tests {
             "RUSTGRAD_METAL_LLAMA_ORACLE_REVISION",
             "RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND",
             "--attestation",
+            "--prefill-span",
+            "--workload-evidence",
             "--workflow-run-url",
             "SHA256SUMS",
         ] {
@@ -1245,6 +1436,9 @@ mod tests {
                 .count(),
             1
         );
+        assert!(llama_job.contains("RUSTGRAD_METAL_LLAMA_PREFILL_SPAN"));
+        assert!(llama_job.contains("RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH"));
+        assert!(!llama_job.contains("RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH"));
         assert!(
             workflow.contains("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
         );

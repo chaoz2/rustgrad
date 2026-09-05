@@ -188,11 +188,12 @@ pub use memory_space::{
     plan_tiled_matmul_promotion,
 };
 pub use models::transformer::{
-    LlamaMetalGeneration, LlamaMetalGenerationError, LlamaMetalGenerationStage, LlamaMetalPlan,
-    LlamaMetalPrefill, LlamaMetalProgress, LlamaMetalPromptOutput, LlamaMetalSession,
-    LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
-    LlamaMetalTokenCommit, LlamaMetalWorkloadEvidence, LlamaMetalWorkloadPhase,
-    LlamaPromptWorkflow, LlamaSampling,
+    LLAMA_METAL_WORKLOAD_EVIDENCE_FORMAT_VERSION, LlamaMetalGeneration, LlamaMetalGenerationError,
+    LlamaMetalGenerationStage, LlamaMetalPlan, LlamaMetalPrefill, LlamaMetalProgress,
+    LlamaMetalPromptOutput, LlamaMetalSession, LlamaMetalStep, LlamaMetalStepError,
+    LlamaMetalStepPlan, LlamaMetalStepSession, LlamaMetalTokenCommit, LlamaMetalWorkloadEvidence,
+    LlamaMetalWorkloadEvidenceArtifact, LlamaMetalWorkloadEvidenceContext,
+    LlamaMetalWorkloadEvidenceError, LlamaMetalWorkloadPhase, LlamaPromptWorkflow, LlamaSampling,
 };
 pub use movement_plan::{
     MovementExecutionError, MovementKernelKind, MovementKernelPlan, MovementOperand,

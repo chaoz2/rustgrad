@@ -94,6 +94,7 @@ jobs:
       RUSTGRAD_METAL_LLAMA_REGISTRY_ID: ${{ vars.RUSTGRAD_METAL_LLAMA_REGISTRY_ID }}
       RUSTGRAD_METAL_LLAMA_PROMPT: ${{ vars.RUSTGRAD_METAL_LLAMA_PROMPT }}
       RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS: ${{ vars.RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS }}
+      RUSTGRAD_METAL_LLAMA_PREFILL_SPAN: ${{ vars.RUSTGRAD_METAL_LLAMA_PREFILL_SPAN }}
       RUSTGRAD_METAL_LLAMA_EXPECTED_IDS: ${{ vars.RUSTGRAD_METAL_LLAMA_EXPECTED_IDS }}
       RUSTGRAD_METAL_LLAMA_MODEL_SOURCE: ${{ vars.RUSTGRAD_METAL_LLAMA_MODEL_SOURCE }}
       RUSTGRAD_METAL_LLAMA_MODEL_LICENSE: ${{ vars.RUSTGRAD_METAL_LLAMA_MODEL_LICENSE }}
@@ -101,7 +102,7 @@ jobs:
       RUSTGRAD_METAL_LLAMA_ORACLE_NAME: ${{ vars.RUSTGRAD_METAL_LLAMA_ORACLE_NAME }}
       RUSTGRAD_METAL_LLAMA_ORACLE_REVISION: ${{ vars.RUSTGRAD_METAL_LLAMA_ORACLE_REVISION }}
       RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND: ${{ vars.RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND }}
-      RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-llama-scoreboard.json
+      RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH: ${{ github.workspace }}/metal-live-llama-workload-evidence.json
       RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH: ${{ github.workspace }}/metal-live-llama-attestation.json
       RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH: ${{ github.workspace }}/SHA256SUMS
       RUSTGRAD_METAL_LLAMA_WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -138,6 +139,11 @@ jobs:
           if [[ ! "$RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS" =~ ^[1-9][0-9]{0,3}$ ]] ||
              (( RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS > 4096 )); then
             echo "protected max-new-tokens must be between 1 and 4096" >&2
+            exit 1
+          fi
+          if [[ ! "$RUSTGRAD_METAL_LLAMA_PREFILL_SPAN" =~ ^[0-9]{1,4}$ ]] ||
+             (( RUSTGRAD_METAL_LLAMA_PREFILL_SPAN < 2 || RUSTGRAD_METAL_LLAMA_PREFILL_SPAN > 4096 )); then
+            echo "protected prefill span must be between 2 and 4096" >&2
             exit 1
           fi
           if [[ ! "$RUSTGRAD_METAL_LLAMA_EXPECTED_IDS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
@@ -178,7 +184,7 @@ jobs:
             exit 1
           fi
           for output_path in \
-            "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH" \
+            "$RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH" \
             "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH" \
             "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"; do
             if [[ -e "$output_path" || -L "$output_path" ]]; then
@@ -198,7 +204,8 @@ jobs:
             --device 0 \
             --expected-registry-id "$RUSTGRAD_METAL_LLAMA_REGISTRY_ID" \
             --max-new-tokens "$RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS" \
-            --scoreboard "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH" \
+            --prefill-span "$RUSTGRAD_METAL_LLAMA_PREFILL_SPAN" \
+            --workload-evidence "$RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH" \
             --revision "$EXPECTED_SHA" \
             --expected-ids "$RUSTGRAD_METAL_LLAMA_EXPECTED_IDS" \
             --attestation "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH" \
@@ -218,16 +225,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          scoreboard_name="$(basename -- "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH")"
+          workload_evidence_name="$(basename -- "$RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH")"
           attestation_name="$(basename -- "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH")"
           (
             cd "$GITHUB_WORKSPACE"
             set -o noclobber
-            shasum -a 256 "$scoreboard_name" "$attestation_name" \
+            shasum -a 256 "$workload_evidence_name" "$attestation_name" \
               > "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"
             shasum -a 256 -c "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"
           )
-          cat "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH"
+          cat "$RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH"
           cat "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH"
           cat "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"
       - name: Upload live GGUF Llama evidence
@@ -235,7 +242,7 @@ jobs:
         with:
           name: metal-live-llama-${{ inputs.expected_sha }}-${{ env.RUSTGRAD_METAL_LLAMA_GGUF_SHA256 }}
           path: |
-            ${{ env.RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH }}
+            ${{ env.RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH }}
             ${{ env.RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH }}
             ${{ env.RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH }}
           if-no-files-found: error

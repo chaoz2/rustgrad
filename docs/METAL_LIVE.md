@@ -3,8 +3,8 @@
 RustGrad's live Metal workflow is a manual conformance lane, not part of normal
 CI. The workflow definition, ignored acceptance test, and examples are not
 live-hardware evidence by themselves. Evidence exists only after an exact-SHA
-workflow run succeeds and publishes its scoreboards and, for Llama, its
-attestation and checksum manifest.
+workflow run succeeds and publishes the Linear/ResNet scoreboards plus the
+Llama workload evidence, attestation, and checksum manifest.
 
 ## Provisioning contract
 
@@ -29,6 +29,8 @@ Provision these external resources before dispatching
      Metal device;
    - `RUSTGRAD_METAL_LLAMA_PROMPT`: the exact nonempty conformance prompt;
    - `RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS`: an integer from 1 through 4096;
+   - `RUSTGRAD_METAL_LLAMA_PREFILL_SPAN`: an integer from 2 through 4096 for
+     the fixed-span device-resident prompt program;
    - `RUSTGRAD_METAL_LLAMA_EXPECTED_IDS`: independently established greedy
      token IDs as a nonempty comma-separated decimal list;
    - `RUSTGRAD_METAL_LLAMA_MODEL_SOURCE`,
@@ -101,10 +103,12 @@ of silently testing the newer revision.
 ## Evidence boundary
 
 A successful Linear/ResNet job uploads two v4 scoreboards. A successful Llama
-job uploads its distinct v4 scoreboard, typed provenance attestation, and
-`SHA256SUMS`. Preserve the workflow run URL and ID with any release record.
+job uploads versioned workload evidence for its token-step and fixed-span
+programs, a typed provenance attestation, and `SHA256SUMS`. Preserve the
+workflow run URL and ID with any release record.
 
 The reported durations are host wall time, and copy counts are host API calls.
-They do not establish GPU timing, tokens per second, energy use, allocator RSS,
-or physical bus traffic. Pinned token IDs demonstrate only the configured
-model, prompt, and oracle contract; they are not broad cross-runtime parity.
+Host-observed tokens per second is derived only from those workload wall-clock
+durations. It does not establish GPU timing, energy use, allocator RSS, or
+physical bus traffic. Pinned token IDs demonstrate only the configured model,
+prompt, and oracle contract; they are not broad cross-runtime parity.
