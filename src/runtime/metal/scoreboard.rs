@@ -9,7 +9,7 @@ use serde::{Serialize, Serializer};
 use std::{collections::BTreeSet, fmt, fs, io, path::Path, rc::Rc, time::Duration};
 
 /// Current deterministic JSON schema emitted by [`MetalSessionScoreboardReport`].
-pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 6;
+pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 7;
 const MAX_METADATA_BYTES: usize = 1_024;
 
 /// Caller-supplied labels attached to one measurement series.
@@ -75,7 +75,7 @@ pub enum MetalScoreboardInputKind {
 pub enum MetalScoreboardStatePolicy {
     /// No recurrent state is owned by the session.
     Stateless,
-    /// One fixed-capacity state bank receives one complete row per success.
+    /// One fixed-capacity state bank receives one authenticated span per success.
     Append,
 }
 
@@ -206,6 +206,9 @@ pub struct MetalSessionScoreboardReport {
     pub inputs: Vec<MetalScoreboardInput>,
     /// Stateless or authenticated append-only execution policy.
     pub state_policy: MetalScoreboardStatePolicy,
+    /// Rows atomically committed by each successful append invocation. This is
+    /// zero for stateless sessions.
+    pub append_span_rows: usize,
     /// Number of authenticated recurrent input/output pairs.
     pub state_pair_count: usize,
     /// Bytes in one logical recurrent-state bank.
@@ -214,9 +217,9 @@ pub struct MetalSessionScoreboardReport {
     pub state_bank_count: usize,
     /// Logical bytes represented by the selected recurrent-bank policy.
     pub state_device_bytes: usize,
-    /// Logical recurrent bytes committed by each successful append.
+    /// Logical recurrent bytes committed by each successful append span.
     pub append_state_row_bytes: usize,
-    /// Sparse recurrent elements committed by each successful append.
+    /// Sparse recurrent elements committed by each successful append span.
     pub append_state_work_items: usize,
     /// Ordered cache identities of the plan's nonzero rendered kernels.
     pub rendered_cache_keys: Vec<String>,
@@ -366,7 +369,7 @@ pub enum MetalScoreboardError {
     NotBound,
     /// The session is not a fresh preparation of the snapshotted deployment.
     PlanMismatch,
-    /// Token-step evidence requires one committed row per successful invocation.
+    /// The legacy token-step constructor requires one committed row per success.
     UnsupportedAppendSpan { span_rows: usize },
     /// The successful run belongs to another prepared session.
     WrongSession,
@@ -482,13 +485,13 @@ impl MetalSessionScoreboard {
         )
     }
 
-    /// Snapshots one authenticated append-state deployment without creating a
-    /// Metal resource. Generation/model orchestration remains caller-owned.
+    /// Snapshots one authenticated fixed-span append-state deployment without
+    /// creating a Metal resource. Generation/model orchestration remains
+    /// caller-owned.
     ///
     /// Token-step callers should use [`Self::try_new_append_state_v4`] so a
-    /// multirow plan rejects before preparation. This source-compatible legacy
-    /// constructor permits inspection, but its recorder rejects a multirow
-    /// session with [`MetalScoreboardError::UnsupportedAppendSpan`] at bind.
+    /// multirow plan rejects before preparation. This source-compatible
+    /// constructor records the plan's exact authenticated span.
     pub fn new_append_state(
         context: MetalScoreboardContext,
         plan: &MetalAppendStateInferencePlan,
@@ -567,11 +570,6 @@ impl MetalSessionScoreboard {
     /// Binds this recorder once to the session prepared from its exact inference
     /// deployment. No measurement is recorded by binding.
     pub fn bind(&mut self, session: &MetalDeviceSession) -> Result<(), MetalScoreboardError> {
-        if self.state_policy == MetalScoreboardStatePolicy::Append && self.append_span_rows != 1 {
-            return Err(MetalScoreboardError::UnsupportedAppendSpan {
-                span_rows: self.append_span_rows,
-            });
-        }
         if self.binding.is_some() {
             return Err(MetalScoreboardError::AlreadyBound);
         }
@@ -598,6 +596,25 @@ impl MetalSessionScoreboard {
     /// Records one successful run. The run must be the next unrecorded success
     /// from the exact bound session; failed calls produce no run and no change.
     pub fn record(&mut self, run: &MetalDeviceRun) -> Result<(), MetalScoreboardError> {
+        let expected_start = match self.state_policy {
+            MetalScoreboardStatePolicy::Stateless => 0,
+            MetalScoreboardStatePolicy::Append => self
+                .runs
+                .last()
+                .and_then(|run| run.committed_state_position)
+                .unwrap_or(0),
+        };
+        self.record_from_position(run, expected_start)
+    }
+
+    /// Records one component of an authenticated multi-program append
+    /// workload. The caller owns the shared logical position and supplies the
+    /// exact start for this physical session's next local success.
+    pub(crate) fn record_from_position(
+        &mut self,
+        run: &MetalDeviceRun,
+        expected_start: usize,
+    ) -> Result<(), MetalScoreboardError> {
         let binding = self
             .binding
             .as_ref()
@@ -616,9 +633,11 @@ impl MetalSessionScoreboard {
         let recorded = MetalScoreboardRun::from_report(run.report());
         let expected_position = match self.state_policy {
             MetalScoreboardStatePolicy::Stateless => None,
-            MetalScoreboardStatePolicy::Append => {
-                Some(usize::try_from(expected).map_err(|_| MetalScoreboardError::Overflow)?)
-            }
+            MetalScoreboardStatePolicy::Append => Some(
+                expected_start
+                    .checked_add(self.append_span_rows)
+                    .ok_or(MetalScoreboardError::Overflow)?,
+            ),
         };
         if recorded.committed_state_position != expected_position {
             return Err(MetalScoreboardError::StateOutOfOrder {
@@ -709,6 +728,7 @@ impl MetalSessionScoreboard {
             device: binding.device.clone(),
             inputs: self.inputs.clone(),
             state_policy: self.state_policy,
+            append_span_rows: self.append_span_rows,
             state_pair_count: self.plan_summary.state_pair_count,
             logical_state_bytes: self.plan_summary.logical_state_bytes,
             state_bank_count: self.plan_summary.state_bank_count,
@@ -979,6 +999,7 @@ mod tests {
                 },
             ],
             state_policy: MetalScoreboardStatePolicy::Stateless,
+            append_span_rows: 0,
             state_pair_count: 0,
             logical_state_bytes: 0,
             state_bank_count: 0,
@@ -1096,7 +1117,8 @@ mod tests {
         let first = report.to_json_bytes().unwrap();
         assert_eq!(first, report.to_json_bytes().unwrap());
         let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(value["format_version"], 6);
+        assert_eq!(value["format_version"], 7);
+        assert_eq!(value["append_span_rows"], 0);
         assert_eq!(value["workload"], "linear");
         assert_eq!(value["implementation_revision"], "abc123");
         assert_eq!(value["evidence"], "semantic mock");

@@ -1352,6 +1352,10 @@ pub(crate) struct MetalSharedAppendSession {
 }
 
 impl MetalSharedAppendSession {
+    pub(crate) const fn metal_session(&self) -> &MetalDeviceSession {
+        &self.inner
+    }
+
     pub(crate) fn summary(&self) -> &MetalDeviceSessionSummary {
         self.inner.summary()
     }

@@ -599,8 +599,7 @@ impl LlamaMetalStepSession {
             .and_then(|state| state.first_error.as_ref())
     }
 
-    #[cfg(test)]
-    pub(crate) fn inject_scoreboard_recording_error(&mut self, error: MetalScoreboardError) {
+    pub(crate) fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError) {
         if let Some(state) = &mut self.scoreboard
             && state.first_error.is_none()
         {
@@ -631,7 +630,7 @@ impl LlamaMetalStepSession {
     ) -> Result<LlamaMetalStep, LlamaMetalStepError> {
         let inputs = self.token_inputs_at(token, position)?;
         let run = self.inner.run_at(&inputs, position)?;
-        self.observe_run(&run);
+        self.observe_run(&run, position);
         let (mut outputs, mut report) = run.into_parts();
         report.successful_invocation = invocation;
         report.first_successful_run = invocation == 1;
@@ -669,7 +668,7 @@ impl LlamaMetalStepSession {
     ) -> Result<LlamaMetalTokenCommit, LlamaMetalStepError> {
         let inputs = self.token_inputs_at(token, position)?;
         let run = self.inner.run_without_host_outputs_at(&inputs, position)?;
-        self.observe_run(&run);
+        self.observe_run(&run, position);
         debug_assert!(run.outputs().is_empty());
         let (_, mut report) = run.into_parts();
         report.successful_invocation = invocation;
@@ -700,7 +699,7 @@ impl LlamaMetalStepSession {
         )]))
     }
 
-    fn observe_run(&mut self, run: &crate::runtime::metal::MetalDeviceRun) {
+    fn observe_run(&mut self, run: &crate::runtime::metal::MetalDeviceRun, position: usize) {
         let Some(state) = &mut self.scoreboard else {
             return;
         };
@@ -711,7 +710,7 @@ impl LlamaMetalStepSession {
         {
             state.record_attempts += 1;
         }
-        if let Err(error) = state.recorder.record(run) {
+        if let Err(error) = state.recorder.record_from_position(run, position) {
             state.first_error = Some(error);
         }
     }

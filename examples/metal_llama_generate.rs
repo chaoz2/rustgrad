@@ -3,12 +3,12 @@
 use rustgrad::models::transformer::{LlamaChatMessage, LlamaChatRole};
 use rustgrad::runtime::metal::{
     MetalDeviceInfo, MetalDeviceSessionSummary, MetalDiscovery, MetalPlanOptions, MetalRuntime,
-    MetalScoreboardContext, MetalSessionScoreboardReport,
+    MetalScoreboardContext,
 };
 use rustgrad::{
-    LlamaMetalGeneration, LlamaMetalGenerationError, LlamaMetalGenerationStage, LlamaMetalPlan,
-    LlamaMetalWorkloadEvidenceArtifact, LlamaMetalWorkloadEvidenceContext, LlamaPromptWorkflow,
-    LlamaSampling, ReplayInput,
+    LlamaMetalExecutionScoreboardReport, LlamaMetalGeneration, LlamaMetalGenerationError,
+    LlamaMetalGenerationStage, LlamaMetalPlan, LlamaMetalWorkloadEvidenceArtifact,
+    LlamaMetalWorkloadEvidenceContext, LlamaPromptWorkflow, LlamaSampling, ReplayInput,
 };
 use serde::Serialize;
 use std::{
@@ -29,7 +29,7 @@ const SCOREBOARD_WORKLOAD: &str = "gguf-llama-metal-generate";
 const SCOREBOARD_EVIDENCE: &str = "live self-hosted Apple GPU prompt-to-tokens harness";
 const WORKLOAD_EVIDENCE: &str =
     "host-observed fixed-span prefill and steady-decode Metal workload evidence";
-const SCOREBOARD_EVIDENCE_KIND: &str = "metal_session_scoreboard_v6";
+const SCOREBOARD_EVIDENCE_KIND: &str = "llama_metal_execution_scoreboard_v1";
 const LLAMA_WORKLOAD_EVIDENCE_KIND: &str = "llama_metal_workload_evidence_v3";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -74,7 +74,7 @@ struct AttestationRecordContext<'a> {
     model: &'a AttestedModelFile,
     stable: &'a StablePlanFacts,
     generation: &'a LlamaMetalGeneration,
-    report: Option<&'a MetalSessionScoreboardReport>,
+    report: Option<&'a LlamaMetalExecutionScoreboardReport>,
     workload_artifact: Option<&'a LlamaMetalWorkloadEvidenceArtifact>,
     final_position: usize,
     evidence_path: &'a Path,
@@ -312,25 +312,30 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let scoreboard_report = if let Some(path) = &args.scoreboard_path {
         let report = session
-            .execution_scoreboard()
-            .ok_or_else(|| io::Error::other("scoreboard was requested but is not bound"))?
-            .report()?;
+            .execution_scoreboard_report()?
+            .ok_or_else(|| io::Error::other("scoreboard was requested but is not bound"))?;
         if report.fallback_count != 0
-            || report.deployment_identity != stable.step_deployment_identity
-            || report.capture_identity != stable.capture_identity
-            || report.rendered_cache_keys != stable.cache_keys
+            || report.token_step.deployment_identity != stable.step_deployment_identity
+            || report.token_step.capture_identity != stable.capture_identity
+            || report.token_step.rendered_cache_keys != stable.cache_keys
+            || report
+                .fixed_prefill
+                .as_ref()
+                .map(|component| component.deployment_identity)
+                != stable.fixed_prefill_deployment_identity
             || report.successful_run_count != u64::try_from(generation.reports().len())?
             || report.successful_runs.len() != generation.reports().len()
-            || report.committed_state_position != Some(generation.reports().len())
+            || report.committed_state_position != session.position()
             || report.successful_runs.iter().zip(generation.reports()).any(
                 |(recorded, executed)| {
                     recorded.successful_invocation != executed.successful_invocation
-                        || recorded.committed_state_position != executed.committed_state_position
-                        || recorded.transient_host_api_h2d_calls != executed.transient_h2d_calls
-                        || recorded.runtime_control_host_api_h2d_calls
-                            != executed.runtime_control_h2d_calls
-                        || recorded.retained_host_api_d2h_calls != executed.retained_d2h_calls
-                        || recorded.kernel_launch_count != executed.kernel_launch_count
+                        || Some(recorded.committed_state_position)
+                            != executed.committed_state_position
+                        || recorded.committed_state_pair_count
+                            != executed.committed_state_pair_count
+                        || recorded.committed_state_bytes != executed.committed_state_bytes
+                        || recorded.committed_state_work_items
+                            != executed.committed_state_work_items
                 },
             )
         {
@@ -549,11 +554,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
     if (scoreboard_path.is_some() || workload_evidence_path.is_some()) != revision.is_some() {
         return Err(cli(
             "an evidence output and --revision must be supplied together",
-        ));
-    }
-    if prefill_span.is_some() && scoreboard_path.is_some() {
-        return Err(cli(
-            "--prefill-span is not supported with scoreboard evidence; use the T1 plan for scored runs",
         ));
     }
     let max_new_tokens = max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS);
@@ -806,7 +806,7 @@ fn attestation_json(context: AttestationRecordContext<'_>) -> Result<Vec<u8>, io
     {
         (Some(report), None) => (
             SCOREBOARD_EVIDENCE_KIND,
-            Some(report.execution_plan_identity),
+            Some(report.token_step.execution_plan_identity),
             report.fallback_count,
         ),
         (None, Some(artifact)) => (
@@ -1169,6 +1169,22 @@ mod tests {
             fixed_evidence.workload_evidence_path,
             Some(PathBuf::from("workload.json"))
         );
+        let fixed_scoreboard = parse(&[
+            "--prefill-span",
+            "3",
+            "--scoreboard",
+            "scoreboard.json",
+            "--revision",
+            "reviewed-sha",
+            "model.gguf",
+            "hello",
+        ])
+        .unwrap();
+        assert_eq!(fixed_scoreboard.prefill_span, NonZeroUsize::new(3));
+        assert_eq!(
+            fixed_scoreboard.scoreboard_path,
+            Some(PathBuf::from("scoreboard.json"))
+        );
         assert!(evidence.chat);
         assert_eq!(evidence.expected_ids, Some(vec![4, 5, 6]));
         assert!(evidence.attestation.is_none());
@@ -1218,16 +1234,6 @@ mod tests {
             vec!["--max-new-tokens", "4097", "m", "p"],
             vec!["--prefill-span", "0", "m", "p"],
             vec!["--prefill-span", "1", "m", "p"],
-            vec![
-                "--prefill-span",
-                "2",
-                "--scoreboard",
-                "out.json",
-                "--revision",
-                "sha",
-                "m",
-                "p",
-            ],
             vec!["--expected-ids", "1,,2", "m", "p"],
             vec!["--max-new-tokens", "1", "--expected-ids", "1,2", "m", "p"],
             vec!["--scoreboard", "out.json", "m", "p"],
@@ -1391,7 +1397,10 @@ mod tests {
             serde_json::json!([3, 4])
         );
         assert_eq!(value["evidence"]["fallback_count"], 0);
-        assert_eq!(SCOREBOARD_EVIDENCE_KIND, "metal_session_scoreboard_v6");
+        assert_eq!(
+            SCOREBOARD_EVIDENCE_KIND,
+            "llama_metal_execution_scoreboard_v1"
+        );
         assert_eq!(value["evidence"]["evidence_kind"], SCOREBOARD_EVIDENCE_KIND);
         assert_eq!(
             LLAMA_WORKLOAD_EVIDENCE_KIND,
