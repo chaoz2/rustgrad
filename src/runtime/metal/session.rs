@@ -235,6 +235,7 @@ pub struct MetalAppendStateInferencePlan {
     inner: MetalDeviceSessionPlan,
     execution_plan: ExecutionPlanSummary,
     resident_bindings: BTreeMap<String, TensorData>,
+    quantized_input_names: BTreeMap<u64, String>,
     initial_state: BTreeMap<String, TensorData>,
     deployment_identity: u64,
 }
@@ -314,17 +315,22 @@ fn exact_input_by_name<'a>(
     Ok(input)
 }
 
-fn quantized_input(capture: &CapturedSchedule, id: u64) -> Result<&ReplayInput, MetalError> {
-    let mut matching = capture.inputs.iter().filter(|input| input.desc.id == id);
-    let input = matching
-        .next()
-        .ok_or_else(|| MetalError::InvalidBinding(format!("packed Metal input {id} is absent")))?;
+fn exact_quantized_id_by_name(
+    inputs: &BTreeMap<u64, String>,
+    name: &str,
+) -> Result<u64, MetalError> {
+    let mut matching = inputs
+        .iter()
+        .filter_map(|(id, candidate)| (candidate == name).then_some(*id));
+    let id = matching.next().ok_or_else(|| {
+        MetalError::InvalidBinding(format!("shared packed Metal input {name} is absent"))
+    })?;
     if matching.next().is_some() {
         return Err(MetalError::InvalidBinding(format!(
-            "packed Metal input {id} is ambiguous"
+            "shared packed Metal input {name} is ambiguous"
         )));
     }
-    Ok(input)
+    Ok(id)
 }
 
 fn static_host_gathers(links: &[crate::session::CapturedHostGather]) -> Vec<StaticHostGather> {
@@ -355,6 +361,7 @@ impl MetalAppendStateInferencePlan {
             sealed_position,
             deployment_identity,
         ) = inference.into_parts();
+        let quantized_input_names = inference.quantized_input_names().clone();
         let (capture, execution_plan, resident_bindings, host_gathers, _) = inference.into_parts();
         let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
         let state_names = states
@@ -392,6 +399,7 @@ impl MetalAppendStateInferencePlan {
             inner,
             execution_plan,
             resident_bindings,
+            quantized_input_names,
             initial_state,
             deployment_identity,
         })
@@ -424,6 +432,11 @@ impl MetalAppendStateInferencePlan {
 
     pub fn resident_inputs(&self) -> &[ReplayInput] {
         self.inner.resident_inputs()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn quantized_input_names(&self) -> &BTreeMap<u64, String> {
+        &self.quantized_input_names
     }
 
     pub fn transient_inputs(&self) -> &[ReplayInput] {
@@ -554,31 +567,40 @@ impl MetalAppendStateInferencePlan {
             ));
         }
 
+        if self.quantized_input_names.len() != self.inner.lifetime.quantized_constants().len()
+            || source.quantized_input_names.len()
+                != source.inner.lifetime.quantized_constants().len()
+        {
+            return Err(MetalError::InvalidBinding(
+                "shared packed Metal input inventory differs".into(),
+            ));
+        }
         let mut quantized = BTreeMap::new();
         for (target_id, target_value) in self.inner.lifetime.quantized_constants() {
-            let target_input = quantized_input(self.capture(), *target_id)?;
-            let source_input =
-                exact_input_by_name(source.capture().inputs.as_slice(), &target_input.name)?;
+            let target_name = self.quantized_input_names.get(target_id).ok_or_else(|| {
+                MetalError::InvalidBinding(format!(
+                    "packed Metal input {target_id} has no semantic name"
+                ))
+            })?;
+            let source_id = exact_quantized_id_by_name(&source.quantized_input_names, target_name)?;
             let source_value = source
                 .inner
                 .lifetime
                 .quantized_constants()
-                .get(&source_input.desc.id)
+                .get(&source_id)
                 .ok_or_else(|| {
                     MetalError::InvalidBinding(format!(
                         "shared packed Metal input {} is not packed in the source",
-                        target_input.name
+                        target_name
                     ))
                 })?;
-            if !same_shared_storage_descriptor(&target_input.desc, &source_input.desc)
-                || target_value != source_value
-            {
+            if target_value != source_value {
                 return Err(MetalError::InvalidBinding(format!(
                     "shared packed Metal input {} descriptor or payload differs",
-                    target_input.name
+                    target_name
                 )));
             }
-            quantized.insert(*target_id, source_input.desc.id);
+            quantized.insert(*target_id, source_id);
         }
 
         Ok(MetalSharedAppendProof {

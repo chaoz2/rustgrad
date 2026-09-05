@@ -1219,7 +1219,8 @@ fn shared_append_preparation_rejects_a_source_after_state_advances() {
     let mut graph = Graph::new();
     let state = graph.input_dtype("cache", [2, 1], DType::F32);
     let (position, index) = append_position(&mut graph, "position", [1, 1]);
-    let updates = graph.input_dtype("updates", [1, 1], DType::F32);
+    let update_source = graph.input_dtype("updates", [1, 1], DType::F32);
+    let updates = graph.relu(update_source).unwrap();
     let next = graph.scatter(state, index, updates, 0).unwrap();
     let captured = CapturedAppendStateInference::from_module_graph(
         &IdentityModule,

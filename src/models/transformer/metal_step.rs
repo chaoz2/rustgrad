@@ -24,13 +24,14 @@ const POSITION_INPUT: &str = "llama.position";
 const PREFILL_TOKEN_INPUT: &str = "llama.tokens";
 const PREFILL_POSITIONS_INPUT: &str = "llama.positions";
 const ROPE_TABLE: &str = "llama.rope.table";
+const ATTENTION_POSITIONS: &str = "llama.attention.positions";
 
 /// Resource-free deployment of one dense F32, batch-one Llama token body.
 ///
 /// The graph owns fixed-capacity K/V state and is captured exactly once. Token
 /// is the only caller-supplied per-run input; the session seals and synthesizes
 /// its committed scalar position, from which the row-shaped append index is
-/// derived on device. All GGUF weights and the precomputed RoPE table are
+/// derived on device. All GGUF weights and precomputed position tables are
 /// immutable named residents.
 pub struct LlamaMetalStepPlan {
     inner: MetalAppendStateInferencePlan,
@@ -221,7 +222,7 @@ impl LlamaMetalStepPlan {
         self.inner.summary()
     }
 
-    /// Returns exact immutable weight and RoPE resident schemas.
+    /// Returns exact immutable model-weight and position-table schemas.
     pub fn resident_inputs(&self) -> &[ReplayInput] {
         self.inner.resident_inputs()
     }
@@ -377,6 +378,11 @@ impl LlamaMetalPrefillPlan {
     #[cfg(test)]
     pub(crate) fn state_inputs(&self) -> &[ReplayInput] {
         self.inner.state_inputs()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quantized_input_names(&self) -> &BTreeMap<u64, String> {
+        self.inner.quantized_input_names()
     }
 
     #[cfg(test)]
@@ -703,6 +709,16 @@ fn build_prefill_graph(
     }
     let rope = rope_table(config.max_context(), schema.rope_dim(), config.rope_theta())?;
     insert_resident(&mut graph, &mut residents, &mut nodes, ROPE_TABLE, &rope)?;
+    let attention_positions = attention_position_table(config.max_context())?;
+    insert_resident_with_dtype(
+        &mut graph,
+        &mut residents,
+        &mut nodes,
+        ATTENTION_POSITIONS,
+        &attention_positions,
+        DType::I32,
+        "attention position resident must be I32",
+    )?;
 
     let mut quantized = Vec::new();
     let mut x = lookup_prefill_embedding(
@@ -730,12 +746,7 @@ fn build_prefill_graph(
         config.max_context(),
         schema.rope_dim(),
     )?;
-    let absolute_positions = TensorData::from_scalars(
-        [config.max_context()],
-        DType::I32,
-        (0..config.max_context()).map(|value| Scalar::I(value as i64)),
-    )?;
-    let absolute_positions = graph.constant(absolute_positions);
+    let absolute_positions = nodes[ATTENTION_POSITIONS];
     let absolute_positions = graph.reshape(absolute_positions, [1, 1, 1, config.max_context()])?;
     let query_positions = graph.reshape(positions, [1, 1, rows, 1])?;
     let attention_mask = graph.le(absolute_positions, query_positions)?;
@@ -855,6 +866,16 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
     }
     let rope = rope_table(config.max_context(), schema.rope_dim(), config.rope_theta())?;
     insert_resident(&mut graph, &mut residents, &mut nodes, ROPE_TABLE, &rope)?;
+    let attention_positions = attention_position_table(config.max_context())?;
+    insert_resident_with_dtype(
+        &mut graph,
+        &mut residents,
+        &mut nodes,
+        ATTENTION_POSITIONS,
+        &attention_positions,
+        DType::I32,
+        "attention position resident must be I32",
+    )?;
 
     let mut quantized = Vec::new();
     let mut x = lookup_embedding(
@@ -874,12 +895,7 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
         });
     }
     let rope_row = lookup_rope_row(&mut graph, nodes[ROPE_TABLE], position, schema.rope_dim())?;
-    let positions = TensorData::from_scalars(
-        [config.max_context()],
-        DType::I32,
-        (0..config.max_context()).map(|value| Scalar::I(value as i64)),
-    )?;
-    let positions = graph.constant(positions);
+    let positions = nodes[ATTENTION_POSITIONS];
     let positions = graph.reshape(positions, [1, 1, 1, config.max_context()])?;
     let position_mask = graph.reshape(position, [1, 1, 1, 1])?;
     let attention_mask = graph.le(positions, position_mask)?;
@@ -1022,17 +1038,35 @@ fn insert_resident(
     name: &str,
     value: &TensorData,
 ) -> Result<(), LlamaMetalStepError> {
-    if value.dtype() != DType::F32 {
-        return Err(LlamaMetalStepError::Dimension(
-            "dense Llama residents must be F32",
-        ));
+    insert_resident_with_dtype(
+        graph,
+        residents,
+        nodes,
+        name,
+        value,
+        DType::F32,
+        "dense Llama residents must be F32",
+    )
+}
+
+fn insert_resident_with_dtype(
+    graph: &mut Graph,
+    residents: &mut BTreeMap<String, (NodeId, TensorData)>,
+    nodes: &mut BTreeMap<String, NodeId>,
+    name: &str,
+    value: &TensorData,
+    expected_dtype: DType,
+    dtype_error: &'static str,
+) -> Result<(), LlamaMetalStepError> {
+    if value.dtype() != expected_dtype {
+        return Err(LlamaMetalStepError::Dimension(dtype_error));
     }
     if residents.contains_key(name) {
         return Err(LlamaMetalStepError::Dimension(
             "duplicate Llama resident name",
         ));
     }
-    let node = graph.input_dtype_requires_grad(name, value.shape().clone(), DType::F32, false);
+    let node = graph.input_dtype_requires_grad(name, value.shape().clone(), expected_dtype, false);
     residents.insert(name.to_owned(), (node, value.clone()));
     nodes.insert(name.to_owned(), node);
     Ok(())
@@ -1144,6 +1178,14 @@ fn rope_table(
         values.extend(angles.iter().map(|angle| angle.sin() as f32));
     }
     Ok(TensorData::new([max_context, rope_dim], values)?)
+}
+
+fn attention_position_table(max_context: usize) -> Result<TensorData, LlamaMetalStepError> {
+    Ok(TensorData::from_scalars(
+        [max_context],
+        DType::I32,
+        (0..max_context).map(|value| Scalar::I(value as i64)),
+    )?)
 }
 
 struct StepLayerNodes {
@@ -2107,8 +2149,8 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             [
-                (PREFILL_TOKEN_INPUT, DType::I32, vec![1, 3]),
                 (PREFILL_POSITIONS_INPUT, DType::I32, vec![1, 3]),
+                (PREFILL_TOKEN_INPUT, DType::I32, vec![1, 3]),
             ]
         );
         assert_eq!(plan.token_input().desc.shape.dims(), [1, 3]);
@@ -2233,6 +2275,7 @@ mod tests {
         let plan =
             LlamaMetalPrefillPlan::new(&model, renderer(), NonZeroUsize::new(3).unwrap()).unwrap();
         let expected = BTreeSet::from([
+            ATTENTION_POSITIONS,
             TOKEN_EMBEDDING,
             ROPE_TABLE,
             "blk.0.attn_norm.weight",
@@ -2263,16 +2306,33 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(actual, expected);
         for input in plan.resident_inputs() {
-            assert_eq!(input.desc.dtype, DType::F32, "{}", input.name);
-            assert_eq!(input.desc.bytes, input.desc.shape.numel().unwrap() * 4);
+            let expected_dtype = if input.name == ATTENTION_POSITIONS {
+                DType::I32
+            } else {
+                DType::F32
+            };
+            assert_eq!(input.desc.dtype, expected_dtype, "{}", input.name);
+            assert_eq!(
+                input.desc.bytes,
+                input.desc.shape.numel().unwrap() * expected_dtype.itemsize()
+            );
         }
     }
 
     #[test]
     fn fixed_prefill_captures_every_supported_packed_format_without_logits() {
         let (packed, _, _, _) = super::super::packed_metal_fixture_models();
+        let step = LlamaMetalStepPlan::new(&packed, renderer()).unwrap();
         let plan =
             LlamaMetalPrefillPlan::new(&packed, renderer(), NonZeroUsize::new(3).unwrap()).unwrap();
+        assert!(
+            plan.quantized_input_names().len()
+                < step.append_state_plan().quantized_input_names().len(),
+            "state-only prefill must be allowed to share a strict subset of token-step weights"
+        );
+        plan.append_state_plan()
+            .authenticate_shared_from(step.append_state_plan())
+            .unwrap();
         let formats = plan
             .capture()
             .quantized_constants
@@ -2289,7 +2349,7 @@ mod tests {
         assert_eq!(plan.transient_inputs().len(), 2);
         assert_eq!(plan.runtime_control_inputs().len(), 1);
         assert!(plan.summary().quantized_constant_count > 0);
-        let expected_names = BTreeSet::from([
+        let expected_names = [
             TOKEN_EMBEDDING,
             "blk.0.attn_q.weight",
             "blk.0.attn_k.weight",
@@ -2300,44 +2360,44 @@ mod tests {
             "blk.0.ffn_down.weight",
             "blk.1.attn_k.weight",
             "blk.1.attn_v.weight",
-        ]);
-        let packed_inputs = plan
-            .capture()
-            .quantized_constants
-            .keys()
-            .map(|id| {
-                plan.capture()
-                    .inputs
-                    .iter()
-                    .find(|input| input.desc.id == *id)
-                    .expect("each packed owner is one named capture input")
-            })
-            .collect::<Vec<_>>();
+        ]
+        .into_iter()
+        .map(|name| format!("llama.packed.{name}"))
+        .collect::<BTreeSet<_>>();
         assert_eq!(
-            packed_inputs
-                .iter()
-                .map(|input| input.name.as_str())
+            plan.quantized_input_names()
+                .values()
+                .cloned()
                 .collect::<BTreeSet<_>>(),
             expected_names
         );
         assert_eq!(
-            packed_inputs
-                .iter()
-                .map(|input| input.desc.id)
-                .collect::<BTreeSet<_>>()
-                .len(),
-            packed_inputs.len()
+            plan.quantized_input_names().len(),
+            plan.capture().quantized_constants.len()
         );
-        for input in &packed_inputs {
-            let packed = &plan.capture().quantized_constants[&input.desc.id];
-            assert_eq!(input.desc.dtype, DType::F32, "{}", input.name);
-            assert_eq!(input.desc.shape, packed.descriptor().logical_shape);
-        }
-        assert!(packed_inputs.iter().all(|packed| {
-            plan.resident_inputs()
+        for (id, name) in plan.quantized_input_names() {
+            let packed = &plan.capture().quantized_constants[id];
+            let bindings = plan
+                .capture()
+                .items
                 .iter()
-                .all(|dense| dense.desc.id != packed.desc.id)
-        }));
+                .flat_map(|item| item.ordered_quantized_inputs())
+                .filter(|binding| binding.input_node.index() as u64 == *id)
+                .collect::<Vec<_>>();
+            assert!(!bindings.is_empty(), "{name}");
+            assert!(
+                bindings
+                    .iter()
+                    .all(|binding| &binding.desc == packed.descriptor()),
+                "{name}"
+            );
+            assert!(
+                plan.resident_inputs()
+                    .iter()
+                    .all(|dense| dense.desc.id != *id),
+                "{name}"
+            );
+        }
     }
 
     #[test]
