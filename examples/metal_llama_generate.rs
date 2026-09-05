@@ -16,11 +16,12 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     io::{self, Write},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process::ExitCode,
 };
 
-const USAGE: &str = "usage: metal_llama_generate [--device INDEX] [--expected-registry-id ID] [--max-new-tokens N] [--chat] [--scoreboard PATH --revision LABEL] [--expected-ids ID,ID,...] [--attestation PATH --model-sha256 HEX --model-source LOCATOR --model-license LICENSE --model-conversion PROVENANCE --oracle-name NAME --oracle-revision REVISION --oracle-command COMMAND --workflow-run-url URL --workflow-run-id ID] [--] <model.gguf> <prompt>";
+const USAGE: &str = "usage: metal_llama_generate [--device INDEX] [--expected-registry-id ID] [--max-new-tokens N] [--prefill-span N] [--chat] [--scoreboard PATH --revision LABEL] [--expected-ids ID,ID,...] [--attestation PATH --model-sha256 HEX --model-source LOCATOR --model-license LICENSE --model-conversion PROVENANCE --oracle-name NAME --oracle-revision REVISION --oracle-command COMMAND --workflow-run-url URL --workflow-run-id ID] [--] <model.gguf> <prompt>";
 const DEFAULT_MAX_NEW_TOKENS: usize = 16;
 const MAX_NEW_TOKENS: usize = 4_096;
 const SCOREBOARD_WORKLOAD: &str = "gguf-llama-metal-generate";
@@ -31,6 +32,7 @@ struct Args {
     device_index: usize,
     expected_registry_id: Option<u64>,
     max_new_tokens: usize,
+    prefill_span: Option<NonZeroUsize>,
     chat: bool,
     scoreboard_path: Option<PathBuf>,
     revision: Option<String>,
@@ -203,7 +205,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     let cache = device.cache();
     let cache_entries_before_prepare = cache.len();
     let workflow = LlamaPromptWorkflow::from_path(&args.model_path)?;
-    let plan = LlamaMetalPlan::from_workflow(workflow, &device, MetalPlanOptions::default())?;
+    let plan = match args.prefill_span {
+        Some(span_rows) => LlamaMetalPlan::from_workflow_with_prefill_span(
+            workflow,
+            &device,
+            MetalPlanOptions::default(),
+            span_rows,
+        )?,
+        None => LlamaMetalPlan::from_workflow(workflow, &device, MetalPlanOptions::default())?,
+    };
     let stable = StablePlanFacts {
         device_info: plan.selected_device_info().clone(),
         device_owner_id: plan.selected_device_owner_id(),
@@ -348,6 +358,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
     let mut device_index = None;
     let mut expected_registry_id = None;
     let mut max_new_tokens = None;
+    let mut prefill_span = None;
     let mut chat = false;
     let mut scoreboard_path = None;
     let mut revision = None;
@@ -387,6 +398,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
                 &mut max_new_tokens,
                 parse_usize(args.next(), "--max-new-tokens")?,
                 "--max-new-tokens",
+            )?,
+            "--prefill-span" => set_once(
+                &mut prefill_span,
+                parse_prefill_span(args.next())?,
+                "--prefill-span",
             )?,
             "--chat" => {
                 if chat {
@@ -471,6 +487,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
     if scoreboard_path.is_some() != revision.is_some() {
         return Err(cli("--scoreboard and --revision must be supplied together"));
     }
+    if prefill_span.is_some() && scoreboard_path.is_some() {
+        return Err(cli(
+            "--prefill-span is not supported with scoreboard evidence; use the T1 plan for scored runs",
+        ));
+    }
     let max_new_tokens = max_new_tokens.unwrap_or(DEFAULT_MAX_NEW_TOKENS);
     if max_new_tokens > MAX_NEW_TOKENS {
         return Err(cli(format!(
@@ -532,6 +553,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
         device_index: device_index.unwrap_or(0),
         expected_registry_id,
         max_new_tokens,
+        prefill_span,
         chat,
         scoreboard_path,
         revision,
@@ -589,6 +611,13 @@ fn parse_usize(value: Option<String>, flag: &'static str) -> Result<usize, CliEr
     required_value(value, flag)?
         .parse::<usize>()
         .map_err(|_| cli(format!("{flag} requires a nonnegative integer")))
+}
+
+fn parse_prefill_span(value: Option<String>) -> Result<NonZeroUsize, CliError> {
+    let span = parse_usize(value, "--prefill-span")?;
+    NonZeroUsize::new(span)
+        .filter(|span| span.get() > 1)
+        .ok_or_else(|| cli("--prefill-span must be at least 2"))
 }
 
 fn parse_u64(value: Option<String>, flag: &'static str) -> Result<u64, CliError> {
@@ -900,6 +929,7 @@ mod tests {
     };
     use std::{
         fs,
+        num::NonZeroUsize,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
@@ -919,6 +949,7 @@ mod tests {
                 device_index: 0,
                 expected_registry_id: None,
                 max_new_tokens: 16,
+                prefill_span: None,
                 chat: false,
                 scoreboard_path: None,
                 revision: None,
@@ -949,6 +980,12 @@ mod tests {
         assert_eq!(evidence.device_index, 2);
         assert_eq!(evidence.expected_registry_id, Some(1234));
         assert_eq!(evidence.max_new_tokens, 3);
+        assert_eq!(
+            parse(&["--prefill-span", "3", "model.gguf", "hello"])
+                .unwrap()
+                .prefill_span,
+            NonZeroUsize::new(3)
+        );
         assert!(evidence.chat);
         assert_eq!(evidence.expected_ids, Some(vec![4, 5, 6]));
         assert!(evidence.attestation.is_none());
@@ -996,6 +1033,18 @@ mod tests {
             vec!["--device", "x", "m", "p"],
             vec!["--expected-registry-id", "x", "m", "p"],
             vec!["--max-new-tokens", "4097", "m", "p"],
+            vec!["--prefill-span", "0", "m", "p"],
+            vec!["--prefill-span", "1", "m", "p"],
+            vec![
+                "--prefill-span",
+                "2",
+                "--scoreboard",
+                "out.json",
+                "--revision",
+                "sha",
+                "m",
+                "p",
+            ],
             vec!["--expected-ids", "1,,2", "m", "p"],
             vec!["--max-new-tokens", "1", "--expected-ids", "1,2", "m", "p"],
             vec!["--scoreboard", "out.json", "m", "p"],
@@ -1054,6 +1103,7 @@ mod tests {
             device_index: 0,
             expected_registry_id: Some(7),
             max_new_tokens: 1,
+            prefill_span: None,
             chat: false,
             scoreboard_path: Some(scoreboard.clone()),
             revision: Some("0123456789abcdef0123456789abcdef01234567".into()),
