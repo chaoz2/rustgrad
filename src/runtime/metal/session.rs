@@ -1151,20 +1151,19 @@ impl MetalDeviceSessionPlan {
                 "Metal session renderer/device capability identity mismatch".into(),
             ));
         }
-        if let Some((source, proof)) = &shared {
-            if proof.target_capture_identity != self.capture().identity
+        if let Some((source, proof)) = &shared
+            && (proof.target_capture_identity != self.capture().identity
                 || Some(proof.target_deployment_identity) != inference_deployment_identity
                 || proof.source_capture_identity != source.capture().identity
                 || source.inference_deployment_identity() != Some(proof.source_deployment_identity)
                 || source.device_owner_id() != device.owner_id()
                 || !matches!(source.state_policy, MetalSessionStatePolicy::Append { .. })
                 || source.successful_runs != 0
-                || source.committed_state_position != 0
-            {
-                return Err(MetalError::InvalidBinding(
-                    "shared Metal session proof does not belong to these deployments".into(),
-                ));
-            }
+                || source.committed_state_position != 0)
+        {
+            return Err(MetalError::InvalidBinding(
+                "shared Metal session proof does not belong to these deployments".into(),
+            ));
         }
         let device_info = device.info().clone();
         let device_owner_id = device.owner_id();
@@ -1416,6 +1415,7 @@ impl MetalDeviceSession {
         self.run_with_host_outputs(transient_inputs, StaticHostOutputSelection::All)
     }
 
+    #[cfg(test)]
     pub(crate) fn run_without_host_outputs(
         &mut self,
         transient_inputs: &BTreeMap<String, TensorData>,

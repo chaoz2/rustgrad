@@ -3340,23 +3340,6 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         Ok(())
     }
 
-    /// Validates and uploads the selected immutable external inputs once. A
-    /// failed upload leaves construction unpublished.
-    pub(crate) fn initialize_resident_with_quantized(
-        self,
-        values: &BTreeMap<u64, TensorData>,
-        resident_ids: &BTreeSet<u64>,
-        quantized: &BTreeMap<u64, QuantizedTensorData>,
-    ) -> Result<(InitializedStaticSchedule<A>, StaticExecutionReport), A::Error> {
-        self.initialize_resident_with_quantized_skipping(
-            values,
-            resident_ids,
-            quantized,
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-        )
-    }
-
     pub(crate) fn initialize_resident_with_quantized_skipping(
         self,
         values: &BTreeMap<u64, TensorData>,

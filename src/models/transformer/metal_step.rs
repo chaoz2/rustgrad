@@ -352,6 +352,7 @@ impl LlamaMetalPrefillPlan {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn deployment_identity(&self) -> u64 {
         self.inner.deployment_identity()
     }
@@ -368,14 +369,17 @@ impl LlamaMetalPrefillPlan {
         self.inner.summary()
     }
 
+    #[cfg(test)]
     pub(crate) fn resident_inputs(&self) -> &[ReplayInput] {
         self.inner.resident_inputs()
     }
 
+    #[cfg(test)]
     pub(crate) fn state_inputs(&self) -> &[ReplayInput] {
         self.inner.state_inputs()
     }
 
+    #[cfg(test)]
     pub(crate) fn transient_inputs(&self) -> &[ReplayInput] {
         self.inner.transient_inputs()
     }
@@ -396,6 +400,7 @@ impl LlamaMetalPrefillPlan {
             .expect("prefill capture authenticates its position vector")
     }
 
+    #[cfg(test)]
     pub(crate) fn runtime_control_inputs(&self) -> &[ReplayInput] {
         self.inner.runtime_control_inputs()
     }
