@@ -1,4 +1,4 @@
-//! Bounded graph-free CPU replay for static momentum-SGD training.
+//! Graph-free CPU replay for static training programs with recurrent state.
 
 use crate::{
     BufferState, CapturedMixedSchedule, CapturedSchedule, DType, EffectGraph, EffectRuntime, Error,
@@ -8,8 +8,8 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-const INTERNAL_PREFIX: &str = "__rustgrad_compiled_sgd_";
-const LEARNING_RATE_INPUT: &str = "__rustgrad_compiled_sgd_learning_rate";
+const INTERNAL_PREFIX: &str = "__rustgrad_compiled_training_";
+const LEARNING_RATE_INPUT: &str = "__rustgrad_compiled_training_learning_rate";
 const STATE_BUFFER_BASE: u64 = 1_u64 << 62;
 
 /// Detached initial value for one compiled training parameter.
@@ -28,7 +28,7 @@ impl TrainingParameterInit {
         let name = name.into();
         validate_user_name(&name, "parameter")?;
         if value.dtype() != DType::F32 {
-            return Err(training("compiled momentum-SGD parameters must be F32"));
+            return Err(training("compiled training parameters must be F32"));
         }
         checked_bytes(&value)?;
         Ok(Self { name, value })
@@ -96,16 +96,87 @@ impl CompiledMomentumSgdConfig {
     }
 }
 
+/// Static compilation policy for [`CpuCompiledAdamW`].
+#[derive(Clone, Debug)]
+pub struct CompiledAdamWConfig {
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    inputs: BTreeMap<String, (Shape, DType)>,
+}
+
+impl CompiledAdamWConfig {
+    pub fn new(beta1: f32, beta2: f32, eps: f32, weight_decay: f32) -> Result<Self> {
+        if !(0.0..1.0).contains(&beta1)
+            || !(0.0..1.0).contains(&beta2)
+            || !eps.is_finite()
+            || eps <= 0.0
+            || !weight_decay.is_finite()
+            || weight_decay < 0.0
+        {
+            return Err(training(
+                "compiled AdamW requires beta1/beta2 in [0,1), positive finite epsilon, and finite nonnegative weight decay",
+            ));
+        }
+        Ok(Self {
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            inputs: BTreeMap::new(),
+        })
+    }
+
+    pub fn with_input(
+        mut self,
+        name: impl Into<String>,
+        shape: impl Into<Shape>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let name = name.into();
+        validate_user_name(&name, "input")?;
+        let shape = shape.into();
+        checked_descriptor(&shape, dtype)?;
+        if self.inputs.insert(name, (shape, dtype)).is_some() {
+            return Err(training("duplicate compiled training input name"));
+        }
+        Ok(self)
+    }
+
+    pub fn beta1(&self) -> f32 {
+        self.beta1
+    }
+
+    pub fn beta2(&self) -> f32 {
+        self.beta2
+    }
+
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
+
+    pub fn weight_decay(&self) -> f32 {
+        self.weight_decay
+    }
+
+    pub fn inputs(&self) -> impl Iterator<Item = (&str, &Shape, DType)> {
+        self.inputs
+            .iter()
+            .map(|(name, (shape, dtype))| (name.as_str(), shape, *dtype))
+    }
+}
+
 /// Detached result of one successfully committed compiled training step.
 #[derive(Clone, Debug)]
-pub struct CompiledMomentumSgdStepResult {
+pub struct CompiledTrainingStepResult {
     loss: TensorData,
     outputs: BTreeMap<String, TensorData>,
     step: u64,
     capture_identity: u64,
 }
 
-impl CompiledMomentumSgdStepResult {
+impl CompiledTrainingStepResult {
     pub fn loss(&self) -> &TensorData {
         &self.loss
     }
@@ -127,36 +198,245 @@ impl CompiledMomentumSgdStepResult {
     }
 }
 
+pub type CompiledMomentumSgdStepResult = CompiledTrainingStepResult;
+pub type CompiledAdamWStepResult = CompiledTrainingStepResult;
+
+#[derive(Clone, Debug)]
+struct StateSpec {
+    key: String,
+    input_name: String,
+    value: TensorData,
+    requires_grad: bool,
+}
+
+trait CompiledOptimizerProgram {
+    fn name(&self) -> &'static str;
+    fn inputs(&self) -> &BTreeMap<String, (Shape, DType)>;
+    fn state_specs(&self, parameters: &BTreeMap<String, TensorData>) -> Result<Vec<StateSpec>>;
+    fn lower_updates(
+        &self,
+        graph: &mut Graph,
+        learning_rate: NodeId,
+        parameters: &BTreeMap<String, NodeId>,
+        gradients: &BTreeMap<String, NodeId>,
+        states: &BTreeMap<String, NodeId>,
+    ) -> Result<BTreeMap<String, NodeId>>;
+}
+
+struct MomentumProgram {
+    config: CompiledMomentumSgdConfig,
+}
+
+struct AdamWProgram {
+    config: CompiledAdamWConfig,
+}
+
+fn parameter_key(name: &str) -> String {
+    format!("parameter:{name}")
+}
+
+fn slot_key(name: &str, slot: &str) -> String {
+    format!("slot:{name}:{slot}")
+}
+
+impl CompiledOptimizerProgram for MomentumProgram {
+    fn name(&self) -> &'static str {
+        "momentum-SGD"
+    }
+
+    fn inputs(&self) -> &BTreeMap<String, (Shape, DType)> {
+        &self.config.inputs
+    }
+
+    fn state_specs(&self, parameters: &BTreeMap<String, TensorData>) -> Result<Vec<StateSpec>> {
+        let mut specs = Vec::with_capacity(parameters.len() * 2);
+        for (ordinal, (name, value)) in parameters.iter().enumerate() {
+            specs.push(StateSpec {
+                key: parameter_key(name),
+                input_name: format!("{INTERNAL_PREFIX}parameter_{ordinal}"),
+                value: value.clone(),
+                requires_grad: true,
+            });
+            specs.push(StateSpec {
+                key: slot_key(name, "momentum"),
+                input_name: format!("{INTERNAL_PREFIX}momentum_{ordinal}"),
+                value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
+                requires_grad: false,
+            });
+        }
+        Ok(specs)
+    }
+
+    fn lower_updates(
+        &self,
+        graph: &mut Graph,
+        learning_rate: NodeId,
+        parameters: &BTreeMap<String, NodeId>,
+        gradients: &BTreeMap<String, NodeId>,
+        states: &BTreeMap<String, NodeId>,
+    ) -> Result<BTreeMap<String, NodeId>> {
+        let momentum = scalar_f32(graph, self.config.momentum)?;
+        let mut updates = BTreeMap::new();
+        for (name, parameter) in parameters {
+            let slot = states[&slot_key(name, "momentum")];
+            let retained = graph.mul(momentum, slot)?;
+            let next_momentum = graph.add(retained, gradients[name])?;
+            let scaled = graph.mul(learning_rate, next_momentum)?;
+            let next_parameter = graph.sub(*parameter, scaled)?;
+            validate_parameter_update(graph, *parameter, next_momentum)?;
+            validate_parameter_update(graph, *parameter, next_parameter)?;
+            updates.insert(slot_key(name, "momentum"), next_momentum);
+            updates.insert(parameter_key(name), next_parameter);
+        }
+        Ok(updates)
+    }
+}
+
+impl CompiledOptimizerProgram for AdamWProgram {
+    fn name(&self) -> &'static str {
+        "AdamW"
+    }
+
+    fn inputs(&self) -> &BTreeMap<String, (Shape, DType)> {
+        &self.config.inputs
+    }
+
+    fn state_specs(&self, parameters: &BTreeMap<String, TensorData>) -> Result<Vec<StateSpec>> {
+        let mut specs = Vec::with_capacity(parameters.len() * 3 + 1);
+        for (ordinal, (name, value)) in parameters.iter().enumerate() {
+            specs.push(StateSpec {
+                key: parameter_key(name),
+                input_name: format!("{INTERNAL_PREFIX}parameter_{ordinal}"),
+                value: value.clone(),
+                requires_grad: true,
+            });
+            for slot in ["first_moment", "second_moment"] {
+                specs.push(StateSpec {
+                    key: slot_key(name, slot),
+                    input_name: format!("{INTERNAL_PREFIX}{slot}_{ordinal}"),
+                    value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
+                    requires_grad: false,
+                });
+            }
+        }
+        specs.push(StateSpec {
+            key: "global:step".into(),
+            input_name: format!("{INTERNAL_PREFIX}adamw_step"),
+            value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
+            requires_grad: false,
+        });
+        Ok(specs)
+    }
+
+    fn lower_updates(
+        &self,
+        graph: &mut Graph,
+        learning_rate: NodeId,
+        parameters: &BTreeMap<String, NodeId>,
+        gradients: &BTreeMap<String, NodeId>,
+        states: &BTreeMap<String, NodeId>,
+    ) -> Result<BTreeMap<String, NodeId>> {
+        let one_u64 = graph.full_with_dtype(Shape::from([]), Scalar::U(1), DType::U64)?;
+        let next_step = graph.add(states["global:step"], one_u64)?;
+        let step_f32 = graph.cast(next_step, DType::F32)?;
+        let one = scalar_f32(graph, 1.0)?;
+        let beta1 = scalar_f32(graph, self.config.beta1)?;
+        let beta2 = scalar_f32(graph, self.config.beta2)?;
+        let one_minus_beta1 = scalar_f32(graph, 1.0 - self.config.beta1)?;
+        let one_minus_beta2 = scalar_f32(graph, 1.0 - self.config.beta2)?;
+        let eps = scalar_f32(graph, self.config.eps)?;
+        let weight_decay = scalar_f32(graph, self.config.weight_decay)?;
+        let beta1_power = graph.pow(beta1, step_f32)?;
+        let beta2_power = graph.pow(beta2, step_f32)?;
+        let first_correction = graph.sub(one, beta1_power)?;
+        let second_correction = graph.sub(one, beta2_power)?;
+        let decay = graph.mul(learning_rate, weight_decay)?;
+        let decay_factor = graph.sub(one, decay)?;
+
+        let mut updates = BTreeMap::from([("global:step".into(), next_step)]);
+        for (name, parameter) in parameters {
+            let gradient = gradients[name];
+            let first_key = slot_key(name, "first_moment");
+            let second_key = slot_key(name, "second_moment");
+            let retained_first = graph.mul(beta1, states[&first_key])?;
+            let fresh_first = graph.mul(one_minus_beta1, gradient)?;
+            let next_first = graph.add(retained_first, fresh_first)?;
+            let retained_second = graph.mul(beta2, states[&second_key])?;
+            let gradient_squared = graph.mul(gradient, gradient)?;
+            let fresh_second = graph.mul(one_minus_beta2, gradient_squared)?;
+            let next_second = graph.add(retained_second, fresh_second)?;
+            let corrected_first = graph.div(next_first, first_correction)?;
+            let corrected_second = graph.div(next_second, second_correction)?;
+            let root = graph.sqrt(corrected_second)?;
+            let denominator = graph.add(root, eps)?;
+            let normalized = graph.div(corrected_first, denominator)?;
+            let decayed = graph.mul(*parameter, decay_factor)?;
+            let scaled = graph.mul(learning_rate, normalized)?;
+            let next_parameter = graph.sub(decayed, scaled)?;
+            validate_parameter_update(graph, *parameter, next_first)?;
+            validate_parameter_update(graph, *parameter, next_second)?;
+            validate_parameter_update(graph, *parameter, next_parameter)?;
+            updates.insert(first_key, next_first);
+            updates.insert(second_key, next_second);
+            updates.insert(parameter_key(name), next_parameter);
+        }
+        Ok(updates)
+    }
+}
+
+fn scalar_f32(graph: &mut Graph, value: f32) -> Result<NodeId> {
+    graph.full_with_dtype(Shape::from([]), Scalar::F(value as f64), DType::F32)
+}
+
+fn validate_parameter_update(graph: &Graph, parameter: NodeId, update: NodeId) -> Result<()> {
+    if graph.shape(update)? != graph.shape(parameter)? || graph.dtype(update)? != DType::F32 {
+        return Err(training("compiled optimizer update descriptor mismatch"));
+    }
+    Ok(())
+}
+
+/// One compiled momentum-SGD training program.
+pub struct CpuCompiledMomentumSgd {
+    inner: CpuCompiledTrainingProgram,
+}
+
+/// One compiled AdamW training program with recurrent first/second moments and
+/// a graph-owned step counter.
+pub struct CpuCompiledAdamW {
+    inner: CpuCompiledTrainingProgram,
+}
+
 /// One static CPU momentum-SGD program with runtime-owned recurrent state.
 ///
 /// Compilation builds one pure graph and one mixed capture. The graph is then
 /// dropped: every later step is graph-free interpreter replay through the
 /// capture, and [`EffectRuntime`] is the sole owner of parameter/momentum
 /// bytes. This type deliberately has no live-module synchronization surface.
-pub struct CpuCompiledMomentumSgd {
+struct CpuCompiledTrainingProgram {
     capture: CapturedMixedSchedule,
     runtime: EffectRuntime,
     cursor: MixedReplayCursor,
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
     parameter_buffers: BTreeMap<String, u64>,
-    momentum_buffers: BTreeMap<String, u64>,
+    optimizer_buffers: BTreeMap<String, u64>,
     step: u64,
 }
 
-impl CpuCompiledMomentumSgd {
+impl CpuCompiledTrainingProgram {
     /// Compiles one exact static training program.
     ///
     /// `build` receives the declared external inputs and detached parameter
     /// graph inputs. It returns one scalar F32 loss and deterministically named
     /// detached outputs. All parameter gradients are constructed by exactly
     /// one [`Graph::gradient_default`] traversal.
-    pub fn compile<F>(
-        config: CompiledMomentumSgdConfig,
+    fn compile<F, O>(
+        optimizer: O,
         parameters: impl IntoIterator<Item = TrainingParameterInit>,
         build: F,
     ) -> Result<Self>
     where
+        O: CompiledOptimizerProgram,
         F: FnOnce(
             &mut Graph,
             &BTreeMap<String, NodeId>,
@@ -165,13 +445,14 @@ impl CpuCompiledMomentumSgd {
     {
         let parameters = canonical_parameters(parameters)?;
         if parameters.is_empty() {
-            return Err(training(
-                "compiled momentum-SGD needs at least one parameter",
-            ));
+            return Err(training(format!(
+                "compiled {} needs at least one parameter",
+                optimizer.name()
+            )));
         }
         if parameters
             .keys()
-            .any(|name| config.inputs.contains_key(name))
+            .any(|name| optimizer.inputs().contains_key(name))
         {
             return Err(training(
                 "compiled parameter and input names must be globally unique",
@@ -179,8 +460,8 @@ impl CpuCompiledMomentumSgd {
         }
 
         let mut graph = Graph::new();
-        let inputs = config
-            .inputs
+        let inputs = optimizer
+            .inputs()
             .iter()
             .map(|(name, (shape, dtype))| {
                 (
@@ -196,49 +477,37 @@ impl CpuCompiledMomentumSgd {
             false,
         );
 
+        let specs = optimizer.state_specs(&parameters)?;
         let mut parameter_nodes = BTreeMap::new();
-        let mut momentum_nodes = BTreeMap::new();
-        let mut state_values = Vec::with_capacity(parameters.len() * 2);
+        let mut state_nodes = BTreeMap::new();
+        let mut state_values = Vec::with_capacity(specs.len());
         let mut state_by_input = BTreeMap::new();
         let mut parameter_buffers = BTreeMap::new();
-        let mut momentum_buffers = BTreeMap::new();
-        for (ordinal, (name, value)) in parameters.iter().enumerate() {
+        let mut optimizer_buffers = BTreeMap::new();
+        for (ordinal, spec) in specs.iter().enumerate() {
             let ordinal = u64::try_from(ordinal).map_err(|_| training("parameter overflow"))?;
             let parameter_buffer = STATE_BUFFER_BASE
-                .checked_add(
-                    ordinal
-                        .checked_mul(2)
-                        .ok_or_else(|| training("parameter buffer overflow"))?,
-                )
+                .checked_add(ordinal)
                 .ok_or_else(|| training("parameter buffer overflow"))?;
-            let momentum_buffer = parameter_buffer
-                .checked_add(1)
-                .ok_or_else(|| training("momentum buffer overflow"))?;
-            let parameter_input_name = format!("{INTERNAL_PREFIX}parameter_{ordinal}");
-            let momentum_input_name = format!("{INTERNAL_PREFIX}momentum_{ordinal}");
-            let parameter = graph.input_dtype_requires_grad(
-                parameter_input_name,
-                value.shape().clone(),
-                DType::F32,
-                true,
+            let node = graph.input_dtype_requires_grad(
+                spec.input_name.clone(),
+                spec.value.shape().clone(),
+                spec.value.dtype(),
+                spec.requires_grad,
             );
-            let momentum = graph.input_dtype_requires_grad(
-                momentum_input_name,
-                value.shape().clone(),
-                DType::F32,
-                false,
-            );
-            let zeros = TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?;
-            let parameter_state = state_for(parameter_buffer, value)?;
-            let momentum_state = state_for(momentum_buffer, &zeros)?;
-            parameter_nodes.insert(name.clone(), parameter);
-            momentum_nodes.insert(name.clone(), momentum);
-            parameter_buffers.insert(name.clone(), parameter_buffer);
-            momentum_buffers.insert(name.clone(), momentum_buffer);
-            state_by_input.insert(parameter, parameter_state.clone());
-            state_by_input.insert(momentum, momentum_state.clone());
-            state_values.push((parameter_buffer, value.clone()));
-            state_values.push((momentum_buffer, zeros));
+            let state = state_for(parameter_buffer, &spec.value)?;
+            state_nodes.insert(spec.key.clone(), node);
+            state_by_input.insert(node, state);
+            state_values.push((parameter_buffer, spec.value.clone()));
+            if let Some(name) = spec.key.strip_prefix("parameter:") {
+                parameter_nodes.insert(name.to_string(), node);
+                parameter_buffers.insert(name.to_string(), parameter_buffer);
+            } else {
+                optimizer_buffers.insert(spec.key.clone(), parameter_buffer);
+            }
+        }
+        if parameter_nodes.len() != parameters.len() {
+            return Err(training("compiled optimizer omitted parameter state"));
         }
 
         let (loss, outputs) = build(&mut graph, &inputs, &parameter_nodes)?;
@@ -246,7 +515,7 @@ impl CpuCompiledMomentumSgd {
         validate_outputs(
             loss,
             &outputs,
-            config.inputs.keys().chain(parameters.keys()),
+            optimizer.inputs().keys().chain(parameters.keys()),
         )?;
 
         let targets = parameter_nodes.values().copied().collect::<Vec<_>>();
@@ -254,33 +523,28 @@ impl CpuCompiledMomentumSgd {
         if gradients.len() != targets.len() {
             return Err(training("compiled gradient target count mismatch"));
         }
-        let momentum_constant = graph.full_with_dtype(
-            Shape::from([]),
-            Scalar::F(config.momentum as f64),
-            DType::F32,
+        let gradients = parameter_nodes
+            .keys()
+            .cloned()
+            .zip(gradients)
+            .collect::<BTreeMap<_, _>>();
+        let updates = optimizer.lower_updates(
+            &mut graph,
+            learning_rate,
+            &parameter_nodes,
+            &gradients,
+            &state_nodes,
         )?;
-        let mut updates = Vec::with_capacity(parameters.len());
-        for ((name, parameter), gradient) in parameter_nodes.iter().zip(gradients) {
-            let momentum = momentum_nodes[name];
-            let retained = graph.mul(momentum_constant, momentum)?;
-            let next_momentum = graph.add(retained, gradient)?;
-            let scaled = graph.mul(learning_rate, next_momentum)?;
-            let next_parameter = graph.sub(*parameter, scaled)?;
-            if graph.shape(next_momentum)? != graph.shape(*parameter)?
-                || graph.dtype(next_momentum)? != DType::F32
-                || graph.shape(next_parameter)? != graph.shape(*parameter)?
-                || graph.dtype(next_parameter)? != DType::F32
-            {
-                return Err(training("compiled momentum update descriptor mismatch"));
-            }
-            updates.push((name.clone(), next_momentum, next_parameter));
+        if updates.len() != specs.len() || specs.iter().any(|spec| !updates.contains_key(&spec.key))
+        {
+            return Err(training("compiled optimizer successor set mismatch"));
         }
 
-        let mut requested = Vec::with_capacity(1 + outputs.len() + updates.len() * 2);
+        let mut requested = Vec::with_capacity(1 + outputs.len() + updates.len());
         requested.push(loss);
         requested.extend(outputs.values().copied());
-        for (_, momentum, parameter) in &updates {
-            requested.extend([*momentum, *parameter]);
+        for spec in &specs {
+            requested.push(updates[&spec.key]);
         }
         for node in &requested {
             checked_descriptor(graph.shape(*node)?, graph.dtype(*node)?)?;
@@ -302,50 +566,30 @@ impl CpuCompiledMomentumSgd {
         let state_bindings = collect_state_bindings(&pure, &state_by_input)?;
         let pure = bind_schedule_states(pure, state_bindings).map_err(schedule_error)?;
         let mut effects = EffectGraph::default();
-        let mut effect_bindings = Vec::with_capacity(updates.len() * 2);
-        for (ordinal, (name, next_momentum, next_parameter)) in updates.iter().enumerate() {
-            if next_momentum.index() as u64 >= STATE_BUFFER_BASE
-                || next_parameter.index() as u64 >= STATE_BUFFER_BASE
-            {
+        let mut effect_bindings = Vec::with_capacity(updates.len());
+        for (ordinal, spec) in specs.iter().enumerate() {
+            let next = updates[&spec.key];
+            if next.index() as u64 >= STATE_BUFFER_BASE {
                 return Err(training(
                     "graph node identity overlaps persistent state namespace",
                 ));
             }
-            let parameter_value = &parameters[name];
-            let zeros = TensorData::zeros_with_dtype(parameter_value.shape().clone(), DType::F32)?;
-            let parameter = effects
-                .insert(parameter_buffers[name], parameter_value.clone())
+            let buffer = state_values[ordinal].0;
+            let destination = effects
+                .insert(buffer, spec.value.clone())
                 .map_err(effect_error)?;
-            let momentum = effects
-                .insert(momentum_buffers[name], zeros.clone())
-                .map_err(effect_error)?;
-            let momentum_source = effects
-                .insert(next_momentum.index() as u64, zeros)
-                .map_err(effect_error)?;
-            let parameter_source = effects
+            let source = effects
                 .insert(
-                    next_parameter.index() as u64,
-                    TensorData::zeros_with_dtype(parameter_value.shape().clone(), DType::F32)?,
+                    next.index() as u64,
+                    TensorData::zeros_with_dtype(spec.value.shape().clone(), spec.value.dtype())?,
                 )
                 .map_err(effect_error)?;
             effects
-                .assign(&momentum, &momentum_source)
+                .assign(&destination, &source)
                 .map_err(effect_error)?;
-            effects
-                .assign(&parameter, &parameter_source)
-                .map_err(effect_error)?;
-            let effect_index = u64::try_from(ordinal)
-                .map_err(|_| training("effect index overflow"))?
-                .checked_mul(2)
-                .ok_or_else(|| training("effect index overflow"))?;
-            effect_bindings.push(value_binding(&pure, *next_momentum, effect_index)?);
-            effect_bindings.push(value_binding(
-                &pure,
-                *next_parameter,
-                effect_index
-                    .checked_add(1)
-                    .ok_or_else(|| training("effect index overflow"))?,
-            )?);
+            let effect_index =
+                u64::try_from(ordinal).map_err(|_| training("effect index overflow"))?;
+            effect_bindings.push(value_binding(&pure, next, effect_index)?);
         }
         let mixed = combine_mixed_schedules(
             pure,
@@ -357,7 +601,7 @@ impl CpuCompiledMomentumSgd {
         let states = effect_states(&effects)?;
         let capture =
             CapturedMixedSchedule::from_parts(captured, &mixed, states).map_err(replay_error)?;
-        validate_external_binding_ownership(&capture, config.inputs.keys())?;
+        validate_external_binding_ownership(&capture, optimizer.inputs().keys())?;
 
         // Runtime ownership is published only after every graph, schedule,
         // effect, capture, and descriptor check above has succeeded.
@@ -371,21 +615,21 @@ impl CpuCompiledMomentumSgd {
             capture,
             runtime,
             cursor,
-            inputs: config.inputs,
+            inputs: optimizer.inputs().clone(),
             output_names,
             parameter_buffers,
-            momentum_buffers,
+            optimizer_buffers,
             step: 0,
         })
     }
 
-    /// Executes one graph-free replay and atomically publishes all parameter
-    /// and momentum successors. The LR is an explicit rank-zero F32 input.
-    pub fn step(
+    /// Executes one graph-free replay and atomically publishes every recurrent
+    /// successor. The learning rate is an explicit rank-zero F32 input.
+    fn step(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
-    ) -> Result<CompiledMomentumSgdStepResult> {
+    ) -> Result<CompiledTrainingStepResult> {
         self.step_inner(inputs, learning_rate, None)
     }
 
@@ -394,12 +638,12 @@ impl CpuCompiledMomentumSgd {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
         injected_failure: Option<u64>,
-    ) -> Result<CompiledMomentumSgdStepResult> {
+    ) -> Result<CompiledTrainingStepResult> {
         validate_step_inputs(&self.inputs, &inputs, &learning_rate)?;
         let next_step = self
             .step
             .checked_add(1)
-            .ok_or_else(|| training("compiled momentum-SGD step overflow"))?;
+            .ok_or_else(|| training("compiled training step overflow"))?;
         let mut provided = inputs;
         provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
         let replay = self
@@ -423,7 +667,7 @@ impl CpuCompiledMomentumSgd {
             .zip(outputs)
             .collect::<BTreeMap<_, _>>();
         self.step = next_step;
-        Ok(CompiledMomentumSgdStepResult {
+        Ok(CompiledTrainingStepResult {
             loss,
             outputs,
             step: self.step,
@@ -431,28 +675,65 @@ impl CpuCompiledMomentumSgd {
         })
     }
 
-    pub fn step_count(&self) -> u64 {
+    fn step_count(&self) -> u64 {
         self.step
     }
 
-    pub fn capture_identity(&self) -> u64 {
+    fn capture_identity(&self) -> u64 {
         self.cursor.capture_identity()
     }
 
     /// Returns independent owned parameter snapshots in canonical name order.
-    pub fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         self.snapshots(&self.parameter_buffers)
     }
 
-    /// Returns independent owned momentum snapshots in canonical name order.
-    pub fn momentum_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.snapshots(&self.momentum_buffers)
+    /// Current logical parameter versions. Every successful step advances all
+    /// parameter and optimizer-state buffers exactly once.
+    fn parameter_versions(&self) -> Result<BTreeMap<String, u64>> {
+        self.versions(&self.parameter_buffers)
     }
 
-    /// Current logical parameter versions. Every successful step advances all
-    /// parameter and momentum buffers exactly once.
-    pub fn parameter_versions(&self) -> Result<BTreeMap<String, u64>> {
-        self.versions(&self.parameter_buffers)
+    fn slot_snapshots(&self, slot: &str) -> Result<BTreeMap<String, TensorData>> {
+        let suffix = format!(":{slot}");
+        let buffers = self
+            .optimizer_buffers
+            .iter()
+            .filter_map(|(key, buffer)| {
+                key.strip_prefix("slot:")
+                    .and_then(|key| key.strip_suffix(&suffix))
+                    .map(|name| (name.to_string(), *buffer))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.snapshots(&buffers)
+    }
+
+    fn slot_versions(&self, slot: &str) -> Result<BTreeMap<String, u64>> {
+        let suffix = format!(":{slot}");
+        let buffers = self
+            .optimizer_buffers
+            .iter()
+            .filter_map(|(key, buffer)| {
+                key.strip_prefix("slot:")
+                    .and_then(|key| key.strip_suffix(&suffix))
+                    .map(|name| (name.to_string(), *buffer))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.versions(&buffers)
+    }
+
+    fn global_snapshot(&self, name: &str) -> Result<TensorData> {
+        let buffer = self
+            .optimizer_buffers
+            .get(&format!("global:{name}"))
+            .ok_or_else(|| training("compiled global optimizer state is absent"))?;
+        let state = self.current_state(*buffer)?;
+        Ok(self
+            .runtime
+            .snapshot(state)
+            .map_err(runtime_error)?
+            .tensor()
+            .clone())
     }
 
     fn snapshots(&self, buffers: &BTreeMap<String, u64>) -> Result<BTreeMap<String, TensorData>> {
@@ -487,6 +768,146 @@ impl CpuCompiledMomentumSgd {
     }
 }
 
+impl CpuCompiledMomentumSgd {
+    pub fn compile<F>(
+        config: CompiledMomentumSgdConfig,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        build: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Ok(Self {
+            inner: CpuCompiledTrainingProgram::compile(
+                MomentumProgram { config },
+                parameters,
+                build,
+            )?,
+        })
+    }
+
+    pub fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<CompiledMomentumSgdStepResult> {
+        self.inner.step(inputs, learning_rate)
+    }
+
+    pub fn step_count(&self) -> u64 {
+        self.inner.step_count()
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+
+    pub fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.parameter_snapshots()
+    }
+
+    pub fn momentum_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.slot_snapshots("momentum")
+    }
+
+    pub fn parameter_versions(&self) -> Result<BTreeMap<String, u64>> {
+        self.inner.parameter_versions()
+    }
+
+    pub fn momentum_versions(&self) -> Result<BTreeMap<String, u64>> {
+        self.inner.slot_versions("momentum")
+    }
+
+    #[cfg(test)]
+    fn step_inner(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledMomentumSgdStepResult> {
+        self.inner
+            .step_inner(inputs, learning_rate, injected_failure)
+    }
+}
+
+impl CpuCompiledAdamW {
+    pub fn compile<F>(
+        config: CompiledAdamWConfig,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        build: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Ok(Self {
+            inner: CpuCompiledTrainingProgram::compile(AdamWProgram { config }, parameters, build)?,
+        })
+    }
+
+    pub fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<CompiledAdamWStepResult> {
+        self.inner.step(inputs, learning_rate)
+    }
+
+    pub fn step_count(&self) -> u64 {
+        self.inner.step_count()
+    }
+
+    pub fn optimizer_step(&self) -> Result<u64> {
+        Ok(self.inner.global_snapshot("step")?.scalar_at(0).as_u64())
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+
+    pub fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.parameter_snapshots()
+    }
+
+    pub fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.slot_snapshots("first_moment")
+    }
+
+    pub fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.slot_snapshots("second_moment")
+    }
+
+    pub fn parameter_versions(&self) -> Result<BTreeMap<String, u64>> {
+        self.inner.parameter_versions()
+    }
+
+    pub fn first_moment_versions(&self) -> Result<BTreeMap<String, u64>> {
+        self.inner.slot_versions("first_moment")
+    }
+
+    pub fn second_moment_versions(&self) -> Result<BTreeMap<String, u64>> {
+        self.inner.slot_versions("second_moment")
+    }
+
+    #[cfg(test)]
+    fn step_inner(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledAdamWStepResult> {
+        self.inner
+            .step_inner(inputs, learning_rate, injected_failure)
+    }
+}
+
 fn canonical_parameters(
     parameters: impl IntoIterator<Item = TrainingParameterInit>,
 ) -> Result<BTreeMap<String, TensorData>> {
@@ -494,7 +915,7 @@ fn canonical_parameters(
     for parameter in parameters {
         validate_user_name(&parameter.name, "parameter")?;
         if parameter.value.dtype() != DType::F32 {
-            return Err(training("compiled momentum-SGD parameters must be F32"));
+            return Err(training("compiled training parameters must be F32"));
         }
         checked_bytes(&parameter.value)?;
         if values.insert(parameter.name, parameter.value).is_some() {
@@ -539,7 +960,7 @@ fn state_for(buffer: u64, value: &TensorData) -> Result<BufferState> {
 fn validate_loss(graph: &Graph, loss: NodeId) -> Result<()> {
     if graph.dtype(loss)? != DType::F32 || graph.shape(loss)? != &Shape::from([]) {
         return Err(training(
-            "compiled momentum-SGD loss must be a rank-zero F32 scalar",
+            "compiled training loss must be a rank-zero F32 scalar",
         ));
     }
     Ok(())
@@ -678,7 +1099,7 @@ fn validate_step_inputs(
     }
     if learning_rate.shape() != &Shape::from([]) || learning_rate.dtype() != DType::F32 {
         return Err(training(
-            "compiled momentum-SGD learning rate must be rank-zero F32",
+            "compiled training learning rate must be rank-zero F32",
         ));
     }
     checked_bytes(learning_rate)?;
@@ -759,6 +1180,19 @@ mod tests {
 
     fn compiled() -> CpuCompiledMomentumSgd {
         CpuCompiledMomentumSgd::compile(config(), initial_parameters(), build_tinybob).unwrap()
+    }
+
+    fn adamw_config() -> CompiledAdamWConfig {
+        CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)
+            .unwrap()
+            .with_input("x", [4, 2], DType::F32)
+            .unwrap()
+            .with_input("target", [4], DType::I64)
+            .unwrap()
+    }
+
+    fn compiled_adamw() -> CpuCompiledAdamW {
+        CpuCompiledAdamW::compile(adamw_config(), initial_parameters(), build_tinybob).unwrap()
     }
 
     fn batch() -> BTreeMap<String, TensorData> {
@@ -881,7 +1315,7 @@ mod tests {
                 BTreeMap::from([("w1".into(), step), ("w2".into(), step)])
             );
             assert_eq!(
-                compiled.versions(&compiled.momentum_buffers).unwrap(),
+                compiled.momentum_versions().unwrap(),
                 BTreeMap::from([("w1".into(), step), ("w2".into(), step)])
             );
             parameters = next_parameters;
@@ -913,6 +1347,7 @@ mod tests {
     fn step_inputs_exclude_every_persistent_state_binding() {
         let compiled = compiled();
         let external = compiled
+            .inner
             .inputs
             .keys()
             .map(String::as_str)
@@ -923,11 +1358,13 @@ mod tests {
             BTreeSet::from(["target", "x", LEARNING_RATE_INPUT])
         );
         let persistent = compiled
+            .inner
             .capture
             .state_bindings
             .iter()
             .map(|binding| {
                 compiled
+                    .inner
                     .capture
                     .schedule
                     .inputs
@@ -946,7 +1383,7 @@ mod tests {
         );
         assert!(external.is_disjoint(&persistent));
         let mut consumer_views = BTreeMap::<NodeId, BTreeSet<bool>>::new();
-        for binding in &compiled.capture.state_bindings {
+        for binding in &compiled.inner.capture.state_bindings {
             consumer_views
                 .entry(binding.input_node)
                 .or_default()
@@ -958,6 +1395,7 @@ mod tests {
                 .any(|views| views == &BTreeSet::from([false, true]))
         );
         let pure_items = compiled
+            .inner
             .capture
             .schedule
             .items
@@ -1040,20 +1478,109 @@ mod tests {
         let mut compiled = compiled();
         let initial_parameters = compiled.parameter_snapshots().unwrap();
         let initial_momentum = compiled.momentum_snapshots().unwrap();
-        let initial_cursor = compiled.cursor.clone();
+        let initial_cursor = compiled.inner.cursor.clone();
         assert!(compiled.step_inner(batch(), lr(), Some(0)).is_err());
         assert_eq!(compiled.step_count(), 0);
-        assert_eq!(compiled.cursor, initial_cursor);
+        assert_eq!(compiled.inner.cursor, initial_cursor);
         assert_eq!(compiled.parameter_snapshots().unwrap(), initial_parameters);
         assert_eq!(compiled.momentum_snapshots().unwrap(), initial_momentum);
 
         compiled.step(batch(), lr()).unwrap();
-        let advanced = compiled.cursor.clone();
+        let advanced = compiled.inner.cursor.clone();
         let advanced_parameters = compiled.parameter_snapshots().unwrap();
-        compiled.cursor = initial_cursor;
+        compiled.inner.cursor = initial_cursor;
         assert!(compiled.step(batch(), lr()).is_err());
         assert_eq!(compiled.step_count(), 1);
-        compiled.cursor = advanced;
+        compiled.inner.cursor = advanced;
         assert_eq!(compiled.parameter_snapshots().unwrap(), advanced_parameters);
+    }
+
+    #[test]
+    fn adamw_replays_one_capture_with_graph_owned_state() {
+        let mut compiled = compiled_adamw();
+        let identity = compiled.capture_identity();
+        let zeros = initial_parameters()
+            .into_iter()
+            .map(|parameter| {
+                (
+                    parameter.name().to_string(),
+                    TensorData::zeros_with_dtype(parameter.value().shape().clone(), DType::F32)
+                        .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(compiled.optimizer_step().unwrap(), 0);
+        assert_eq!(compiled.first_moment_snapshots().unwrap(), zeros);
+        assert_eq!(compiled.second_moment_snapshots().unwrap(), zeros);
+
+        let first = compiled.step(batch(), lr()).unwrap();
+        assert_eq!(first.step(), 1);
+        assert_eq!(first.capture_identity(), identity);
+        assert_eq!(compiled.optimizer_step().unwrap(), 1);
+        assert_eq!(
+            compiled
+                .parameter_versions()
+                .unwrap()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        assert_eq!(
+            compiled
+                .first_moment_versions()
+                .unwrap()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        assert_eq!(
+            compiled
+                .second_moment_versions()
+                .unwrap()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        assert_ne!(compiled.first_moment_snapshots().unwrap(), zeros);
+        assert_ne!(compiled.second_moment_snapshots().unwrap(), zeros);
+
+        let second = compiled.step(batch(), lr()).unwrap();
+        assert_eq!(second.step(), 2);
+        assert_eq!(second.capture_identity(), identity);
+        assert_eq!(compiled.optimizer_step().unwrap(), 2);
+    }
+
+    #[test]
+    fn adamw_failure_preserves_parameters_moments_step_and_cursor() {
+        let mut compiled = compiled_adamw();
+        let parameters = compiled.parameter_snapshots().unwrap();
+        let first = compiled.first_moment_snapshots().unwrap();
+        let second = compiled.second_moment_snapshots().unwrap();
+        let cursor = compiled.inner.cursor.clone();
+
+        assert!(compiled.step_inner(batch(), lr(), Some(0)).is_err());
+        assert_eq!(compiled.step_count(), 0);
+        assert_eq!(compiled.optimizer_step().unwrap(), 0);
+        assert_eq!(compiled.inner.cursor, cursor);
+        assert_eq!(compiled.parameter_snapshots().unwrap(), parameters);
+        assert_eq!(compiled.first_moment_snapshots().unwrap(), first);
+        assert_eq!(compiled.second_moment_snapshots().unwrap(), second);
+    }
+
+    #[test]
+    fn adamw_config_rejects_invalid_hyperparameters_before_build() {
+        for config in [
+            CompiledAdamWConfig::new(-0.1, 0.999, 1e-8, 0.0),
+            CompiledAdamWConfig::new(1.0, 0.999, 1e-8, 0.0),
+            CompiledAdamWConfig::new(0.9, 1.0, 1e-8, 0.0),
+            CompiledAdamWConfig::new(0.9, 0.999, 0.0, 0.0),
+            CompiledAdamWConfig::new(0.9, 0.999, f32::NAN, 0.0),
+            CompiledAdamWConfig::new(0.9, 0.999, 1e-8, -0.1),
+        ] {
+            assert!(config.is_err());
+        }
     }
 }

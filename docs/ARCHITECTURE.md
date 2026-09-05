@@ -913,19 +913,24 @@ module/optimizer-name contract, realizes output/loss/gradients before the
 existing optimizer update, then advances a metric-free scheduler. Checkpoint
 ownership remains solely with `PortableTrainingCheckpoint`; this bridge adds no
 trainer, optimizer, state format, device fallback, or persistent gradient map.
-`session/compiled_momentum.rs` is a separate bounded static-training seam.
-`CpuCompiledMomentumSgd` consumes detached named F32 parameter values, builds
-one private Graph with one batched reverse traversal, and captures the pure
-loss/output/update prefix together with ordered momentum and parameter stores.
+`session/compiled_training.rs` is the static recurrent-training seam.
+Its private optimizer-program interface separates optimizer state/update math
+from one shared compiler, capture, replay, and effect-commit engine.
+`CpuCompiledMomentumSgd` and `CpuCompiledAdamW` consume detached named F32
+parameter values, build one private Graph with one batched reverse traversal,
+and capture the pure loss/output/update prefix together with ordered parameter
+and optimizer-state stores. AdamW keeps first and second moments plus its U64
+step counter inside that same captured recurrent frontier.
 The Graph is discarded after compilation. `EffectRuntime` then solely owns the
-parameter and momentum bytes, while `MixedReplayCursor` proves and advances the
+parameter and optimizer-state bytes, while `MixedReplayCursor` proves and advances the
 exact recurrent state frontier only after the complete effect batch commits.
 Every step accepts exact declared inputs plus one rank-zero F32 learning rate;
 all user input order is canonicalized by name before graph-free interpreter
 replay. Owned snapshots are diagnostic copies, not mutable aliases or live
-`nn::Parameter` synchronization. This narrow CPU surface deliberately adds no
-generic optimizer, module binding, checkpoint, native/device execution, mixed
-precision, or dynamic-shape training ABI.
+`nn::Parameter` synchronization. This CPU foundation deliberately adds no
+module binding, checkpoint, native/device execution, mixed precision, or
+dynamic-shape training ABI yet; those extensions must preserve this single
+captured-program and atomic-state contract.
 `session/classification.rs` is a pure post-evaluation helper for rank-two F32
 logits and integer targets; it owns deterministic first-tie predictions and
 optional empty-batch accuracy without retaining a graph or mutating training state.

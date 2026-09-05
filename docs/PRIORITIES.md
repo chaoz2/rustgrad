@@ -42,11 +42,43 @@ slice over a broad subsystem checklist.
 
 ## Active queue
 
-The hardware-first queue is deliberately small and ordered. Compiler parity,
-dynamic-shape breadth, and additional backends are frozen unless one of these
-workloads demonstrates that they are the next concrete blocker.
+The training-first queue is deliberately small and ordered. Broad tinygrad
+parity, inference/serving expansion, generalized dynamic shapes, and additional
+backend breadth are frozen unless the compiled training workload demonstrates
+that they are the next concrete blocker.
 
-### 1. P0 — strict persistent Metal device session
+### 1. P0 — one compiled persistent-state training runtime
+
+Compile `forward → loss → backward → optimizer update → recurrent state` once,
+then replay it with new batches without reconstructing a Graph or materializing
+gradients through host `TensorData`. Generalize the existing graph-free
+momentum-SGD vertical behind optimizer-program and persistent-state contracts;
+AdamW is the first required implementation, including first/second moments and
+a step counter in the same atomic state frontier as parameters.
+
+### 2. P0 — tiny Transformer training and exact resume
+
+Train a small causal Transformer from random initialization through the public
+runtime. Use this workload to close only demonstrated autograd gaps in
+embedding, attention, normalization, reductions, broadcasting, views, and
+indexing. Add first-class parameter freezing, tied weights, gradient
+accumulation/zeroing, microbatches, and clipping as the workload requires. The
+acceptance must show decreasing loss and exact checkpoint/resume continuity.
+
+### 3. P1 — lower the identical training capture to Metal
+
+After CPU replay is correct and checkpointable, execute the same captured
+training program and recurrent-state ownership model on Apple Metal with no
+silent CPU fallback. Preserve inspectable schedules, kernels, state versions,
+memory plans, and failure-atomic commits rather than adding a parallel training
+API.
+
+## Deferred hardware inference queue
+
+The existing Metal inference work remains useful foundation, but it no longer
+drives near-term architecture unless it directly unblocks compiled training.
+
+### Strict persistent Metal device session
 
 **Status:** persistent runtime, a typed ResNet deployment facade, and full
 default ResNet-18 structural conformance delivered; exact ignored live
@@ -140,7 +172,7 @@ physical residency, driver overhead, or unified-memory pressure. Because the
 protected lane remains dormant, actual live Apple-GPU comparison measurements
 are still absent.
 
-### 2. P0 — ResNet-18 Metal conformance
+### ResNet-18 Metal conformance
 
 Provision the protected Apple-GPU lane and run the checked-in exact-SHA
 acceptance, closing only demonstrated live renderer/runtime gaps. Required
@@ -150,7 +182,7 @@ checked-in v7 compile/prepare/first-run/ordered-steady reporting with host-wall
 versus device evidence labeled exactly. Benchmark comparisons target the
 equivalent tinygrad and Candle workload.
 
-### 3. P0 — device-resident GGUF Llama prefill/KV/decode
+### Device-resident GGUF Llama prefill/KV/decode
 
 The dense F32 fixed-batch-one token body now binds exact immutable GGUF weights
 to the released append-state foundation: one exclusively owned physical KV
@@ -191,7 +223,7 @@ accounting, not a speedup claim.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
 serving path.
 
-### 4. Release hygiene
+### Release hygiene
 
 Keep protected Linux/macOS/ASan CI, compatibility fingerprints, live-device
 evidence labels, examples, and unsupported-boundary diagnostics synchronized
