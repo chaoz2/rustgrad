@@ -6700,6 +6700,243 @@ fn test_device(mock: Arc<MockDispatch>) -> MetalDevice {
 }
 
 #[test]
+fn physical_buffer_allocation_stats_track_ordinary_allocate_and_drop() {
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock);
+    assert_eq!(
+        device.buffer_allocation_stats(),
+        MetalBufferAllocationStats::default()
+    );
+
+    let buffer = device.allocate(12).unwrap();
+    assert_eq!(
+        device.buffer_allocation_stats(),
+        MetalBufferAllocationStats {
+            current_physical_buffer_count: 1,
+            current_physical_buffer_bytes: 12,
+            lifetime_high_water_physical_buffer_count: 1,
+            lifetime_high_water_physical_buffer_bytes: 12,
+        }
+    );
+
+    drop(buffer);
+    assert_eq!(
+        device.buffer_allocation_stats(),
+        MetalBufferAllocationStats {
+            current_physical_buffer_count: 0,
+            current_physical_buffer_bytes: 0,
+            lifetime_high_water_physical_buffer_count: 1,
+            lifetime_high_water_physical_buffer_bytes: 12,
+        }
+    );
+}
+
+#[test]
+fn physical_buffer_allocation_stats_do_not_double_count_handles_or_snapshots() {
+    let mock = Arc::new(MockDispatch::default());
+    let (device, queue) = setup(mock);
+    let clone = device.clone();
+    let buffer = device.allocate(8).unwrap();
+    let shared = buffer.share().unwrap();
+    let command = queue.copy(&buffer, &buffer, 0, 0, 8).unwrap().unwrap();
+    let one_physical = MetalBufferAllocationStats {
+        current_physical_buffer_count: 1,
+        current_physical_buffer_bytes: 8,
+        lifetime_high_water_physical_buffer_count: 1,
+        lifetime_high_water_physical_buffer_bytes: 8,
+    };
+    assert_eq!(device.buffer_allocation_stats(), one_physical);
+    assert_eq!(clone.buffer_allocation_stats(), one_physical);
+
+    drop(buffer);
+    drop(shared);
+    assert_eq!(device.buffer_allocation_stats(), one_physical);
+    drop(command);
+    assert_eq!(
+        clone.buffer_allocation_stats(),
+        MetalBufferAllocationStats {
+            current_physical_buffer_count: 0,
+            current_physical_buffer_bytes: 0,
+            ..one_physical
+        }
+    );
+}
+
+#[test]
+fn physical_buffer_allocation_stats_capture_candidate_overlap_and_commit() {
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock);
+    let buffer = device.allocate(16).unwrap();
+    let generation = buffer.generation();
+    let candidate = buffer.candidate().unwrap();
+    assert_eq!(
+        device.buffer_allocation_stats(),
+        MetalBufferAllocationStats {
+            current_physical_buffer_count: 2,
+            current_physical_buffer_bytes: 32,
+            lifetime_high_water_physical_buffer_count: 2,
+            lifetime_high_water_physical_buffer_bytes: 32,
+        }
+    );
+
+    assert_eq!(
+        buffer
+            .commit_candidate(generation, candidate.clone())
+            .unwrap(),
+        generation + 1
+    );
+    assert_eq!(
+        device.buffer_allocation_stats(),
+        MetalBufferAllocationStats {
+            current_physical_buffer_count: 1,
+            current_physical_buffer_bytes: 16,
+            lifetime_high_water_physical_buffer_count: 2,
+            lifetime_high_water_physical_buffer_bytes: 32,
+        }
+    );
+    drop(candidate);
+    assert_eq!(
+        device
+            .buffer_allocation_stats()
+            .current_physical_buffer_count,
+        1
+    );
+    drop(buffer);
+    assert_eq!(
+        device
+            .buffer_allocation_stats()
+            .current_physical_buffer_count,
+        0
+    );
+    assert_eq!(
+        device
+            .buffer_allocation_stats()
+            .current_physical_buffer_bytes,
+        0
+    );
+}
+
+#[test]
+fn physical_buffer_allocation_stats_distinguish_addressless_zero_from_sentinel() {
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock);
+    let addressless = device.allocate(0).unwrap();
+    assert_eq!(
+        device.buffer_allocation_stats(),
+        MetalBufferAllocationStats::default()
+    );
+
+    let sentinel = device
+        .allocate_static(crate::runtime::static_schedule::StaticBufferAllocation {
+            elements: 0,
+            bytes: 0,
+            dtype: DType::F32,
+            requires_native_handle: true,
+        })
+        .unwrap();
+    assert_eq!(
+        device.buffer_allocation_stats(),
+        MetalBufferAllocationStats {
+            current_physical_buffer_count: 1,
+            current_physical_buffer_bytes: 4,
+            lifetime_high_water_physical_buffer_count: 1,
+            lifetime_high_water_physical_buffer_bytes: 4,
+        }
+    );
+    drop(sentinel);
+    drop(addressless);
+    assert_eq!(
+        device
+            .buffer_allocation_stats()
+            .current_physical_buffer_count,
+        0
+    );
+    assert_eq!(
+        device
+            .buffer_allocation_stats()
+            .current_physical_buffer_bytes,
+        0
+    );
+}
+
+#[test]
+fn physical_buffer_allocation_stats_fail_closed_for_driver_and_accounting_errors() {
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    mock.state.lock().unwrap().failures.buffer_create = Some("oom");
+    assert!(device.allocate(8).is_err());
+    assert_eq!(
+        device.buffer_allocation_stats(),
+        MetalBufferAllocationStats::default()
+    );
+
+    mock.clear_calls();
+    let saturated = MetalBufferAllocationStats {
+        current_physical_buffer_count: usize::MAX,
+        current_physical_buffer_bytes: 7,
+        lifetime_high_water_physical_buffer_count: usize::MAX,
+        lifetime_high_water_physical_buffer_bytes: 7,
+    };
+    device.set_buffer_allocation_stats_for_test(saturated);
+    assert!(matches!(device.allocate(8), Err(MetalError::Overflow)));
+    assert_eq!(device.buffer_allocation_stats(), saturated);
+    let calls = mock.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("buffer_create:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("buffer_release:"))
+            .count(),
+        1
+    );
+    assert!(mock.state.lock().unwrap().buffers.is_empty());
+    device.set_buffer_allocation_stats_for_test(MetalBufferAllocationStats::default());
+}
+
+#[test]
+fn physical_buffer_allocation_stats_are_independent_per_discovered_device() {
+    let mock = Arc::new(MockDispatch::default());
+    let runtime = MetalRuntime::from_dispatch(mock);
+    let mut devices = runtime.devices().unwrap();
+    let first = devices.remove(0);
+    let second = devices.remove(0);
+    let buffer = first.allocate(5).unwrap();
+    assert_eq!(
+        first
+            .buffer_allocation_stats()
+            .current_physical_buffer_count,
+        1
+    );
+    assert_eq!(
+        first
+            .buffer_allocation_stats()
+            .current_physical_buffer_bytes,
+        5
+    );
+    assert_eq!(
+        second.buffer_allocation_stats(),
+        MetalBufferAllocationStats::default()
+    );
+    drop(buffer);
+    assert_eq!(
+        first
+            .buffer_allocation_stats()
+            .current_physical_buffer_count,
+        0
+    );
+    assert_eq!(
+        second.buffer_allocation_stats(),
+        MetalBufferAllocationStats::default()
+    );
+}
+
+#[test]
 fn typed_discovery_reports_devices_without_queue_creation() {
     let mock = Arc::new(MockDispatch::default());
     let runtime = MetalRuntime::from_dispatch(mock.clone());

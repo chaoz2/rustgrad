@@ -102,8 +102,9 @@ session runs by default without duplicating the full execution elsewhere in the
 workflow. It publishes both the authentic scoreboard v7 and a create-new
 normalized `BenchmarkObservation` v1 bound to the exact revision, deterministic
 model identity and checked-in raw little-endian F32 input-payload SHA-256,
-selected Metal device, runner OS, and command/configuration; unavailable metrics
-remain null. A separate job authenticates the selected
+selected Metal device, runner OS, command/configuration, planned static-slot
+memory, and a separately attached measured RustGrad-owned physical-buffer
+high-water. A separate job authenticates the selected
 Metal registry ID and
 runner-local GGUF bytes against protected values, uses an independently pinned
 prompt and greedy token IDs, checks the persistent token-step
@@ -128,9 +129,16 @@ The normalized comparison plumbing is delivered: `BenchmarkObservation` and
 the offline `benchmark_compare` CLI require exact workload/device identity and an
 explicit included baseline while preserving unavailable fields as null. They do
 not run workloads or derive speedups. The ResNet live harness now emits its
-normalized RustGrad observation directly from the validated in-memory scoreboard,
-but because the protected lane remains dormant, actual live Apple-GPU comparison
-measurements are still absent.
+normalized RustGrad observation directly from the validated in-memory scoreboard.
+The Llama harness now has the same create-new normalization boundary for its
+attested plain-prompt workload, with prompt and expected-ID hashes derived inside
+the maintained macOS command. Both harnesses require a fresh, exclusively used
+selected RustGrad device and attach its requested-`MTLBuffer`-length lifetime
+high-water as measured peak device memory through the typed attachment API,
+without changing raw reports or conflating it with planned memory, allocator RSS,
+physical residency, driver overhead, or unified-memory pressure. Because the
+protected lane remains dormant, actual live Apple-GPU comparison measurements
+are still absent.
 
 ### 2. P0 — ResNet-18 Metal conformance
 

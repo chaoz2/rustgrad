@@ -2840,7 +2840,15 @@ executed kernels, host-API payload, and fallback fields.
 component reports, including prompt-prefill and steady-decode phases, but leaves
 whole-workload planned memory, measured peak memory, planned kernels, and global
 steady-run latency unavailable. The adapters do not reinterpret host-API payload
-as physical traffic. `benchmark_compare` reads bounded observation files and
+as physical traffic. `RustGradDeviceBufferPeak` can then attach a separately
+measured peak without replacing adapter-provided planned memory. The maintained
+live harnesses admit that attachment only for a freshly discovered, exclusively
+used RustGrad `MetalDevice`; they checked-convert its post-workload
+`lifetime_high_water_physical_buffer_bytes` from `usize` to `u64`. That counter is
+the high-water sum of requested native `MTLBuffer` lengths simultaneously owned
+by RustGrad across clones of that selected device. It is not allocator RSS,
+physical residency, driver overhead, unified-memory pressure, or a device-global
+measurement. `benchmark_compare` reads bounded observation files and
 emits deterministic comparison JSON offline, allowing independently measured
 tinygrad, Candle, and llama.cpp evidence to enter without inferred values.
 
@@ -2865,7 +2873,9 @@ oracle. The typed ResNet benchmark constructs the complete default Eval/F32
 Metal session, and checks ten repeated session outputs by default under the
 documented F32 native-compilation tolerance. The workflow runs that complete
 benchmark exactly once rather than duplicating it through the ignored live
-test, and uploads its deterministic v7 scoreboard beside the Linear report.
+test, and uploads its deterministic v7 scoreboard and normalized observation v1
+beside the Linear report. The observation keeps planned static-slot memory and
+the measured RustGrad-owned physical-buffer high-water as separate fields.
 The separate Llama job accepts only the protected Metal registry identity and
 a runner-local GGUF whose SHA-256 matches protected configuration, plus a
 protected prompt, positive token bound, and independently pinned greedy token
@@ -2873,8 +2883,14 @@ IDs. It performs no model download, prepares
 one persistent dense-or-packed session, checks ordered token-step reports,
 resident/cache ownership, zero fallback, suppressed prompt downloads, and
 exactly one checked four-byte I32 download per selecting invocation, then
-uploads the device-greedy Llama execution scoreboard v2, typed provenance
-attestation, and basename-only `SHA256SUMS`. The create-new
+normalizes the validated in-memory scoreboard directly into a create-new
+`BenchmarkObservation` v1 and uploads it beside the device-greedy Llama execution
+scoreboard v2, typed provenance attestation, and basename-only `SHA256SUMS`. The
+workload identity uses the workflow-verified model hash, exact plain-prompt UTF-8
+hash, actual prompt token count, executed generation bound, and a SHA-256 of the
+compact JSON encoding of the parsed expected IDs. Its raw adapter leaves
+whole-workload planned memory unavailable, while the maintained harness attaches
+the independently measured RustGrad-owned physical-buffer high-water. The create-new
 attestation records the reviewed code SHA, supplied model SHA-256, filename and
 size (never the runner-local absolute path), immutable model locator/revision,
 license and conversion/quantization provenance, actual device identity, exact

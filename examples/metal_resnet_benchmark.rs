@@ -6,7 +6,8 @@ use rustgrad::runtime::metal::{
 };
 use rustgrad::{
     Backend, BenchmarkFramework, BenchmarkImplementation, BenchmarkObservation, BenchmarkWorkload,
-    CpuBackend, DType, Module, RUSTGRAD_METAL_RESNET18_WORKLOAD, Storage, TensorData,
+    CpuBackend, DType, MetalDeviceBufferMeasurement, Module, RUSTGRAD_METAL_RESNET18_WORKLOAD,
+    Storage, TensorData,
 };
 use std::{
     env,
@@ -48,6 +49,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             );
         }
     };
+    let device_buffer_measurement = MetalDeviceBufferMeasurement::begin(&device)?;
     let model = ResNet::new_static(ResNetConfig::default(), 19)?;
     let plan =
         ResNetMetalPlan::eval_f32(&model, &device, [1, 3, 224, 224], MetalPlanOptions::new(64))?;
@@ -112,12 +114,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err(io::Error::other("benchmark report is incomplete").into());
     }
+    let measured_device_buffer_peak = device_buffer_measurement.finish(&device)?;
     let observation = BenchmarkObservation::from_metal_session_scoreboard(
         benchmark_implementation(&evidence),
         benchmark_workload(),
         evidence.operating_system.clone(),
         &report,
     )?;
+    let planned_device_memory_bytes = observation
+        .metrics
+        .planned_device_memory_bytes
+        .ok_or_else(|| io::Error::other("normalized ResNet observation has no planned memory"))?;
+    let observation = observation
+        .with_rustgrad_device_buffer_peak(measured_device_buffer_peak)
+        .map_err(|error| io::Error::other(format!("benchmark observation: {error}")))?;
+    if observation.metrics.measured_peak_device_memory_bytes
+        != Some(measured_device_buffer_peak.bytes())
+        || observation.metrics.planned_device_memory_bytes != Some(planned_device_memory_bytes)
+    {
+        return Err(io::Error::other(
+            "normalized ResNet observation lost measured or planned memory",
+        )
+        .into());
+    }
     let scoreboard_json = report.to_json_bytes()?;
     let observation_json = deterministic_observation_json(&observation)?;
     write_new_evidence(&evidence.scoreboard_path, &scoreboard_json)?;
@@ -333,7 +352,7 @@ fn compare_logits(actual: &TensorData, expected: &TensorData) -> Result<(), io::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustgrad::{BenchmarkDevice, BenchmarkMetrics};
+    use rustgrad::{BenchmarkDevice, BenchmarkMetrics, RustGradDeviceBufferPeak};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temporary_root(label: &str) -> PathBuf {
@@ -430,7 +449,7 @@ mod tests {
                 steady_run_latency: None,
                 prompt_prefill: None,
                 steady_decode: None,
-                planned_device_memory_bytes: None,
+                planned_device_memory_bytes: Some(1_024),
                 measured_peak_device_memory_bytes: None,
                 planned_kernel_count: None,
                 executed_kernel_count: None,
@@ -439,7 +458,14 @@ mod tests {
                 fallback_count: Some(0),
             },
         )
+        .unwrap()
+        .with_rustgrad_device_buffer_peak(RustGradDeviceBufferPeak::new(2_048))
         .unwrap();
+        assert_eq!(
+            observation.metrics.measured_peak_device_memory_bytes,
+            Some(2_048)
+        );
+        assert_eq!(observation.metrics.planned_device_memory_bytes, Some(1_024));
         let json = deterministic_observation_json(&observation).unwrap();
         assert_eq!(json, deterministic_observation_json(&observation).unwrap());
         assert_eq!(
@@ -472,19 +498,48 @@ mod tests {
         let source = include_str!("metal_resnet_benchmark.rs");
         let production = source.split_once("#[cfg(test)]").unwrap().0;
         let report = production.find("scoreboard.report()").unwrap();
+        let peak = production
+            .find("let measured_device_buffer_peak = device_buffer_measurement.finish(&device)?;")
+            .unwrap();
         let normalize = production
             .find("BenchmarkObservation::from_metal_session_scoreboard(")
+            .unwrap();
+        let attach = production
+            .find(".with_rustgrad_device_buffer_peak(measured_device_buffer_peak)")
+            .unwrap();
+        let require_measured = production
+            .find("observation.metrics.measured_peak_device_memory_bytes")
             .unwrap();
         let write = production
             .find("write_new_evidence(&evidence.scoreboard_path")
             .unwrap();
-        assert!(report < normalize && normalize < write);
+        assert!(report < peak && peak < normalize && normalize < attach);
+        assert!(attach < require_measured && require_measured < write);
+        assert!(
+            production
+                .find("MetalDeviceBufferMeasurement::begin(&device)?;")
+                .unwrap()
+                < peak
+        );
         assert_eq!(
             production
                 .matches("BenchmarkObservation::from_metal_session_scoreboard(")
                 .count(),
             1
         );
+        assert_eq!(
+            production
+                .matches(".with_rustgrad_device_buffer_peak(measured_device_buffer_peak)")
+                .count(),
+            1
+        );
+        for required in [
+            "MetalDeviceBufferMeasurement::begin(&device)?;",
+            "device_buffer_measurement.finish(&device)?;",
+            "observation.metrics.planned_device_memory_bytes",
+        ] {
+            assert!(production.contains(required), "production omits {required}");
+        }
 
         let workflow = include_str!("../.github/workflows/metal-live.yml");
         let resnet_job = workflow

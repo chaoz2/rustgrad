@@ -10,8 +10,8 @@ use crate::{
         LlamaMetalScoreboardPhaseAggregate, LlamaMetalScoreboardProgram,
     },
     runtime::metal::{
-        METAL_SESSION_SCOREBOARD_FORMAT_VERSION, MetalDeviceInfo, MetalHostWallTimeSummary,
-        MetalSessionScoreboardReport,
+        METAL_SESSION_SCOREBOARD_FORMAT_VERSION, MetalBufferAllocationStats, MetalDevice,
+        MetalDeviceInfo, MetalHostWallTimeSummary, MetalSessionScoreboardReport,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -205,6 +205,85 @@ impl BenchmarkTransfer {
     }
 }
 
+/// Peak simultaneously live physical bytes of device buffers owned by one
+/// measured RustGrad workload.
+///
+/// This value is intentionally distinct from logical tensor payload, planned
+/// allocation bytes, process RSS, and device-global allocator observations.
+/// The runtime producing it remains responsible for proving an exclusive
+/// measurement interval before constructing this value.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RustGradDeviceBufferPeak {
+    bytes: u64,
+}
+
+impl RustGradDeviceBufferPeak {
+    /// Records the measured peak of simultaneously live physical device-buffer
+    /// bytes. A measured zero is valid and remains distinct from unavailable.
+    pub const fn new(bytes: u64) -> Self {
+        Self { bytes }
+    }
+
+    /// Returns the measured physical device-buffer byte peak.
+    pub const fn bytes(self) -> u64 {
+        self.bytes
+    }
+}
+
+/// A typed measurement interval for one freshly discovered RustGrad Metal device.
+///
+/// [`Self::begin`] rejects any prior RustGrad-owned native-buffer history and
+/// retains the selected device owner identity. [`Self::finish`] consumes the
+/// token, authenticates the same device, and returns its nonzero lifetime
+/// high-water requested `MTLBuffer` length total with checked `usize`-to-`u64`
+/// conversion. Callers remain responsible for ensuring that no unrelated work
+/// receives or uses a clone of the selected device during this interval.
+#[derive(Debug, Eq, PartialEq)]
+pub struct MetalDeviceBufferMeasurement {
+    owner_id: u64,
+}
+
+impl MetalDeviceBufferMeasurement {
+    /// Begins an exclusive measurement interval on a device with no prior
+    /// RustGrad-owned native physical-buffer allocation.
+    pub fn begin(device: &MetalDevice) -> Result<Self, BenchmarkError> {
+        Self::begin_from_snapshot(device.owner_id(), device.buffer_allocation_stats())
+    }
+
+    /// Finishes the interval against the same device and returns its measured
+    /// RustGrad-owned physical-buffer high-water.
+    pub fn finish(self, device: &MetalDevice) -> Result<RustGradDeviceBufferPeak, BenchmarkError> {
+        self.finish_from_snapshot(device.owner_id(), device.buffer_allocation_stats())
+    }
+
+    fn begin_from_snapshot(
+        owner_id: u64,
+        stats: MetalBufferAllocationStats,
+    ) -> Result<Self, BenchmarkError> {
+        if stats != MetalBufferAllocationStats::default() {
+            return Err(BenchmarkError::MetalDeviceBufferMeasurementNotFresh);
+        }
+        Ok(Self { owner_id })
+    }
+
+    fn finish_from_snapshot(
+        self,
+        owner_id: u64,
+        stats: MetalBufferAllocationStats,
+    ) -> Result<RustGradDeviceBufferPeak, BenchmarkError> {
+        if owner_id != self.owner_id {
+            return Err(BenchmarkError::MetalDeviceBufferMeasurementDeviceMismatch);
+        }
+        let bytes = stats.lifetime_high_water_physical_buffer_bytes;
+        if bytes == 0 {
+            return Err(BenchmarkError::MetalDeviceBufferMeasurementEmpty);
+        }
+        Ok(RustGradDeviceBufferPeak::new(
+            u64::try_from(bytes).map_err(|_| BenchmarkError::Overflow)?,
+        ))
+    }
+}
+
 /// Normalized metrics.  Optional fields are deliberately serialized as null.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -305,6 +384,26 @@ impl BenchmarkObservation {
         };
         value.validate()?;
         Ok(value)
+    }
+
+    /// Returns this validated RustGrad observation with one measured
+    /// device-buffer peak attached.
+    ///
+    /// The original normalized wire schema is unchanged. Existing measurements
+    /// cannot be replaced, and non-RustGrad observations cannot claim a
+    /// RustGrad-owned device-buffer measurement.
+    pub fn with_rustgrad_device_buffer_peak(
+        mut self,
+        peak: RustGradDeviceBufferPeak,
+    ) -> Result<Self, BenchmarkError> {
+        self.validate()?;
+        require_rustgrad(&self.implementation)?;
+        if self.metrics.measured_peak_device_memory_bytes.is_some() {
+            return Err(BenchmarkError::MeasuredPeakDeviceMemoryAlreadySet);
+        }
+        self.metrics.measured_peak_device_memory_bytes = Some(peak.bytes());
+        self.validate()?;
+        Ok(self)
     }
 
     /// Normalizes an in-memory single-session RustGrad Metal scoreboard.
@@ -540,6 +639,10 @@ pub enum BenchmarkError {
     MissingBaseline(BenchmarkFramework),
     NonCanonicalOrder,
     InvalidSourceReport(&'static str),
+    MeasuredPeakDeviceMemoryAlreadySet,
+    MetalDeviceBufferMeasurementNotFresh,
+    MetalDeviceBufferMeasurementDeviceMismatch,
+    MetalDeviceBufferMeasurementEmpty,
     Overflow,
     Json(String),
 }
@@ -577,6 +680,18 @@ impl fmt::Display for BenchmarkError {
             }
             Self::InvalidSourceReport(field) => {
                 write!(f, "invalid benchmark source report: {field}")
+            }
+            Self::MeasuredPeakDeviceMemoryAlreadySet => {
+                f.write_str("measured peak device memory is already present")
+            }
+            Self::MetalDeviceBufferMeasurementNotFresh => {
+                f.write_str("Metal device buffer measurement requires a fresh device")
+            }
+            Self::MetalDeviceBufferMeasurementDeviceMismatch => {
+                f.write_str("Metal device buffer measurement finished on a different device")
+            }
+            Self::MetalDeviceBufferMeasurementEmpty => {
+                f.write_str("Metal device buffer measurement observed no physical buffer")
             }
             Self::Overflow => f.write_str("benchmark source counter overflow"),
             Self::Json(error) => write!(f, "invalid benchmark JSON: {error}"),
@@ -1463,6 +1578,117 @@ mod tests {
             Err(BenchmarkError::InvalidSourceReport(
                 "workload or implementation revision"
             ))
+        );
+    }
+
+    #[test]
+    fn rustgrad_device_buffer_peak_attaches_to_resnet_and_llama_observations() {
+        let resnet = observation(BenchmarkFramework::RustGrad, resnet_workload())
+            .with_rustgrad_device_buffer_peak(RustGradDeviceBufferPeak::new(0))
+            .unwrap();
+        assert_eq!(resnet.metrics.measured_peak_device_memory_bytes, Some(0));
+        assert_eq!(resnet.metrics.planned_device_memory_bytes, Some(1_024));
+
+        let mut llama = observation(BenchmarkFramework::RustGrad, llama_workload());
+        llama.metrics.planned_device_memory_bytes = None;
+        llama.validate().unwrap();
+        let llama = llama
+            .with_rustgrad_device_buffer_peak(RustGradDeviceBufferPeak::new(u64::MAX))
+            .unwrap();
+        assert_eq!(
+            llama.metrics.measured_peak_device_memory_bytes,
+            Some(u64::MAX)
+        );
+        assert_eq!(llama.metrics.planned_device_memory_bytes, None);
+        assert_eq!(RustGradDeviceBufferPeak::new(u64::MAX).bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn metal_device_buffer_measurement_authenticates_fresh_same_device_nonzero_interval() {
+        let fresh = MetalBufferAllocationStats::default();
+        assert!(MetalDeviceBufferMeasurement::begin_from_snapshot(7, fresh).is_ok());
+
+        let nonfresh = MetalBufferAllocationStats {
+            lifetime_high_water_physical_buffer_count: 1,
+            lifetime_high_water_physical_buffer_bytes: 4,
+            ..MetalBufferAllocationStats::default()
+        };
+        assert_eq!(
+            MetalDeviceBufferMeasurement::begin_from_snapshot(7, nonfresh),
+            Err(BenchmarkError::MetalDeviceBufferMeasurementNotFresh)
+        );
+
+        let measured = MetalBufferAllocationStats {
+            current_physical_buffer_count: 1,
+            current_physical_buffer_bytes: 4_096,
+            lifetime_high_water_physical_buffer_count: 2,
+            lifetime_high_water_physical_buffer_bytes: 8_192,
+        };
+        assert_eq!(
+            MetalDeviceBufferMeasurement::begin_from_snapshot(7, fresh)
+                .unwrap()
+                .finish_from_snapshot(8, measured),
+            Err(BenchmarkError::MetalDeviceBufferMeasurementDeviceMismatch)
+        );
+        assert_eq!(
+            MetalDeviceBufferMeasurement::begin_from_snapshot(7, fresh)
+                .unwrap()
+                .finish_from_snapshot(7, fresh),
+            Err(BenchmarkError::MetalDeviceBufferMeasurementEmpty)
+        );
+        assert_eq!(
+            MetalDeviceBufferMeasurement::begin_from_snapshot(7, fresh)
+                .unwrap()
+                .finish_from_snapshot(7, measured)
+                .unwrap(),
+            RustGradDeviceBufferPeak::new(8_192)
+        );
+    }
+
+    #[test]
+    fn rustgrad_device_buffer_peak_preserves_wire_schema_and_round_trip() {
+        let unavailable = observation(BenchmarkFramework::RustGrad, llama_workload());
+        let mut expected_json: serde_json::Value =
+            serde_json::from_slice(&unavailable.to_json_bytes().unwrap()).unwrap();
+        expected_json["metrics"]["measured_peak_device_memory_bytes"] =
+            serde_json::Value::from(u64::MAX);
+
+        let measured = unavailable
+            .with_rustgrad_device_buffer_peak(RustGradDeviceBufferPeak::new(u64::MAX))
+            .unwrap();
+        assert_eq!(measured.format_version, BENCHMARK_FORMAT_VERSION);
+        let bytes = measured.to_json_bytes().unwrap();
+        assert_eq!(bytes, measured.to_json_bytes().unwrap());
+        assert_eq!(
+            BenchmarkObservation::from_json_bytes(&bytes).unwrap(),
+            measured
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            expected_json
+        );
+    }
+
+    #[test]
+    fn rustgrad_device_buffer_peak_rejects_overwrite_foreign_and_invalid_observations() {
+        let measured = observation(BenchmarkFramework::RustGrad, resnet_workload())
+            .with_rustgrad_device_buffer_peak(RustGradDeviceBufferPeak::new(1))
+            .unwrap();
+        assert_eq!(
+            measured.with_rustgrad_device_buffer_peak(RustGradDeviceBufferPeak::new(2)),
+            Err(BenchmarkError::MeasuredPeakDeviceMemoryAlreadySet)
+        );
+        assert_eq!(
+            observation(BenchmarkFramework::Candle, resnet_workload())
+                .with_rustgrad_device_buffer_peak(RustGradDeviceBufferPeak::new(1)),
+            Err(BenchmarkError::FrameworkMismatch)
+        );
+
+        let mut invalid = observation(BenchmarkFramework::RustGrad, llama_workload());
+        invalid.metrics.host_to_device = Some(BenchmarkTransfer { calls: 0, bytes: 1 });
+        assert_eq!(
+            invalid.with_rustgrad_device_buffer_peak(RustGradDeviceBufferPeak::new(1)),
+            Err(BenchmarkError::InvalidTransfer)
         );
     }
 

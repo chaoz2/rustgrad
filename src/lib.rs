@@ -73,7 +73,8 @@ pub use benchmark::{
     BENCHMARK_FORMAT_VERSION, BenchmarkComparison, BenchmarkDevice, BenchmarkDuration,
     BenchmarkError, BenchmarkFramework, BenchmarkImplementation, BenchmarkLatencySummary,
     BenchmarkMetrics, BenchmarkObservation, BenchmarkPhase, BenchmarkTransfer, BenchmarkWorkload,
-    RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD, RUSTGRAD_METAL_RESNET18_WORKLOAD,
+    MetalDeviceBufferMeasurement, RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD,
+    RUSTGRAD_METAL_RESNET18_WORKLOAD, RustGradDeviceBufferPeak,
 };
 pub use collective::{
     CollectiveAction, CollectiveExecutor, CollectiveKind, CollectivePlan, CollectivePlanner,
