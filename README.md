@@ -160,6 +160,8 @@ The protected harness pins model bytes and expected greedy IDs, then emits a
 create-new scoreboard, provenance attestation, and checksum manifest. It remains
 dormant until its external runner, environment, and model are provisioned;
 live-device correctness and performance evidence remain explicit follow-ups.
+Operators can use the [protected live Metal lane guide](docs/METAL_LIVE.md) for
+the fail-closed provisioning, exact-SHA dispatch, and evidence checklist.
 
 ## How the system fits together
 
