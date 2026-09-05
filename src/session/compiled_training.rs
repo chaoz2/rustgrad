@@ -2,9 +2,9 @@
 
 use crate::{
     BufferState, CapturedMixedSchedule, CapturedSchedule, DType, EffectGraph, EffectRuntime, Error,
-    Graph, MixedReplayCursor, NodeId, ReplayError, Result, Scalar, Schedule, ScheduleStateBinding,
-    ScheduleValueBinding, Shape, TensorData, bind_schedule_states, combine_mixed_schedules,
-    schedule_effects, schedule_many,
+    Graph, Metadata, MixedReplayCursor, NodeId, ReplayError, Result, Scalar, Schedule,
+    ScheduleStateBinding, ScheduleValueBinding, Shape, StateDict, TensorData, bind_schedule_states,
+    combine_mixed_schedules, load_safetensors, save_safetensors, schedule_effects, schedule_many,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -200,6 +200,44 @@ impl CompiledTrainingStepResult {
 
 pub type CompiledMomentumSgdStepResult = CompiledTrainingStepResult;
 pub type CompiledAdamWStepResult = CompiledTrainingStepResult;
+
+const ADAMW_CHECKPOINT_FORMAT: &str = "rustgrad-compiled-adamw-v1";
+
+/// Deterministic, portable state for one exact [`CpuCompiledAdamW`] program.
+///
+/// The safetensors payload contains parameter and moment tensors. String
+/// metadata authenticates the format, ordered parameter names, compiled
+/// capture identity, and logical step. It never serializes executable code,
+/// graphs, runtime slots, or host pointers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledAdamWCheckpoint {
+    bytes: Vec<u8>,
+}
+
+impl CompiledAdamWCheckpoint {
+    /// Validates and owns deterministic checkpoint bytes.
+    pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Result<Self> {
+        let bytes = bytes.into();
+        decode_adamw_checkpoint(&bytes)?;
+        Ok(Self { bytes })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+struct DecodedAdamWCheckpoint {
+    capture_identity: u64,
+    step: u64,
+    parameters: BTreeMap<String, TensorData>,
+    first_moments: BTreeMap<String, TensorData>,
+    second_moments: BTreeMap<String, TensorData>,
+}
 
 #[derive(Clone, Debug)]
 struct StateSpec {
@@ -736,6 +774,49 @@ impl CpuCompiledTrainingProgram {
             .clone())
     }
 
+    fn restore_frontier(&mut self, step: u64, values: &BTreeMap<String, TensorData>) -> Result<()> {
+        let buffers = self
+            .parameter_buffers
+            .iter()
+            .map(|(name, buffer)| (parameter_key(name), *buffer))
+            .chain(
+                self.optimizer_buffers
+                    .iter()
+                    .map(|(name, buffer)| (name.clone(), *buffer)),
+            )
+            .collect::<BTreeMap<_, _>>();
+        if values.len() != buffers.len() || values.keys().ne(buffers.keys()) {
+            return Err(training("compiled checkpoint state names mismatch"));
+        }
+
+        let mut snapshots = Vec::with_capacity(buffers.len());
+        for (name, buffer) in buffers {
+            let value = &values[&name];
+            let current = self.current_state(buffer)?;
+            if value.shape() != &current.shape || value.dtype() != current.dtype {
+                return Err(training("compiled checkpoint state descriptor mismatch"));
+            }
+            checked_bytes(value)?;
+            let mut state = current.clone();
+            state.version = step;
+            snapshots.push((state, value.clone()));
+        }
+
+        let frontier = snapshots
+            .iter()
+            .map(|(state, _)| state.clone())
+            .collect::<Vec<_>>();
+        let cursor = MixedReplayCursor::resume(&self.capture, frontier).map_err(replay_error)?;
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register_initial_snapshots(snapshots)
+            .map_err(runtime_error)?;
+        self.runtime = runtime;
+        self.cursor = cursor;
+        self.step = step;
+        Ok(())
+    }
+
     fn snapshots(&self, buffers: &BTreeMap<String, u64>) -> Result<BTreeMap<String, TensorData>> {
         buffers
             .iter()
@@ -852,6 +933,52 @@ impl CpuCompiledAdamW {
         })
     }
 
+    /// Recompiles an exact program and restores its saved recurrent frontier.
+    /// The build/configuration must reproduce the checkpoint's capture
+    /// identity; all state is validated before the fresh runtime is replaced.
+    pub fn compile_from_checkpoint<F>(
+        config: CompiledAdamWConfig,
+        checkpoint: &CompiledAdamWCheckpoint,
+        build: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
+        let parameters = decoded
+            .parameters
+            .iter()
+            .map(|(name, value)| TrainingParameterInit::new(name.clone(), value.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut compiled = Self::compile(config, parameters, build)?;
+        if compiled.capture_identity() != decoded.capture_identity {
+            return Err(training(
+                "compiled AdamW checkpoint capture identity mismatch",
+            ));
+        }
+        let mut values = decoded
+            .parameters
+            .into_iter()
+            .map(|(name, value)| (parameter_key(&name), value))
+            .collect::<BTreeMap<_, _>>();
+        for (name, value) in decoded.first_moments {
+            values.insert(slot_key(&name, "first_moment"), value);
+        }
+        for (name, value) in decoded.second_moments {
+            values.insert(slot_key(&name, "second_moment"), value);
+        }
+        values.insert(
+            "global:step".into(),
+            TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(decoded.step)])?,
+        );
+        compiled.inner.restore_frontier(decoded.step, &values)?;
+        Ok(compiled)
+    }
+
     pub fn step(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
@@ -896,6 +1023,23 @@ impl CpuCompiledAdamW {
         self.inner.slot_versions("second_moment")
     }
 
+    /// Captures parameter values, both moment sets, the graph-owned optimizer
+    /// step, and the exact compiled capture identity into deterministic bytes.
+    pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
+        let step = self.optimizer_step()?;
+        if step != self.step_count() {
+            return Err(training("compiled AdamW host and graph steps diverged"));
+        }
+        let bytes = encode_adamw_checkpoint(
+            self.capture_identity(),
+            step,
+            self.parameter_snapshots()?,
+            self.first_moment_snapshots()?,
+            self.second_moment_snapshots()?,
+        )?;
+        CompiledAdamWCheckpoint::from_bytes(bytes)
+    }
+
     #[cfg(test)]
     fn step_inner(
         &mut self,
@@ -906,6 +1050,130 @@ impl CpuCompiledAdamW {
         self.inner
             .step_inner(inputs, learning_rate, injected_failure)
     }
+}
+
+fn encode_adamw_checkpoint(
+    capture_identity: u64,
+    step: u64,
+    parameters: BTreeMap<String, TensorData>,
+    first_moments: BTreeMap<String, TensorData>,
+    second_moments: BTreeMap<String, TensorData>,
+) -> Result<Vec<u8>> {
+    validate_adamw_checkpoint_maps(&parameters, &first_moments, &second_moments)?;
+    let names = parameters.keys().cloned().collect::<Vec<_>>();
+    let mut tensors = StateDict::default();
+    for (ordinal, name) in names.iter().enumerate() {
+        tensors.insert(format!("parameter.{ordinal}"), parameters[name].clone());
+        tensors.insert(
+            format!("first_moment.{ordinal}"),
+            first_moments[name].clone(),
+        );
+        tensors.insert(
+            format!("second_moment.{ordinal}"),
+            second_moments[name].clone(),
+        );
+    }
+    let metadata = Metadata::from([
+        ("format".into(), ADAMW_CHECKPOINT_FORMAT.into()),
+        ("capture_identity".into(), capture_identity.to_string()),
+        ("step".into(), step.to_string()),
+        (
+            "parameter_names".into(),
+            serde_json::to_string(&names)
+                .map_err(|error| training(format!("checkpoint names: {error}")))?,
+        ),
+    ]);
+    save_safetensors(&tensors, &metadata)
+}
+
+fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
+    let (state, metadata) = load_safetensors(bytes)?;
+    let expected_metadata =
+        BTreeSet::from(["format", "capture_identity", "step", "parameter_names"]);
+    if metadata.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_metadata {
+        return Err(training("compiled AdamW checkpoint metadata mismatch"));
+    }
+    if metadata["format"] != ADAMW_CHECKPOINT_FORMAT {
+        return Err(training("compiled AdamW checkpoint format mismatch"));
+    }
+    let capture_identity = metadata["capture_identity"]
+        .parse::<u64>()
+        .map_err(|_| training("compiled AdamW checkpoint capture identity is invalid"))?;
+    let step = metadata["step"]
+        .parse::<u64>()
+        .map_err(|_| training("compiled AdamW checkpoint step is invalid"))?;
+    let names = serde_json::from_str::<Vec<String>>(&metadata["parameter_names"])
+        .map_err(|_| training("compiled AdamW checkpoint parameter names are invalid"))?;
+    if names.is_empty() {
+        return Err(training("compiled AdamW checkpoint has no parameters"));
+    }
+    let mut unique = BTreeSet::new();
+    for name in &names {
+        validate_user_name(name, "checkpoint parameter")?;
+        if !unique.insert(name.clone()) {
+            return Err(training("compiled AdamW checkpoint parameter names repeat"));
+        }
+    }
+
+    let mut tensors = state;
+    let mut parameters = BTreeMap::new();
+    let mut first_moments = BTreeMap::new();
+    let mut second_moments = BTreeMap::new();
+    for (ordinal, name) in names.into_iter().enumerate() {
+        let parameter = tensors
+            .remove(&format!("parameter.{ordinal}"))
+            .ok_or_else(|| training("compiled AdamW checkpoint parameter is absent"))?;
+        let first = tensors
+            .remove(&format!("first_moment.{ordinal}"))
+            .ok_or_else(|| training("compiled AdamW checkpoint first moment is absent"))?;
+        let second = tensors
+            .remove(&format!("second_moment.{ordinal}"))
+            .ok_or_else(|| training("compiled AdamW checkpoint second moment is absent"))?;
+        parameters.insert(name.clone(), parameter);
+        first_moments.insert(name.clone(), first);
+        second_moments.insert(name, second);
+    }
+    if !tensors.is_empty() {
+        return Err(training("compiled AdamW checkpoint tensor set mismatch"));
+    }
+    validate_adamw_checkpoint_maps(&parameters, &first_moments, &second_moments)?;
+    Ok(DecodedAdamWCheckpoint {
+        capture_identity,
+        step,
+        parameters,
+        first_moments,
+        second_moments,
+    })
+}
+
+fn validate_adamw_checkpoint_maps(
+    parameters: &BTreeMap<String, TensorData>,
+    first_moments: &BTreeMap<String, TensorData>,
+    second_moments: &BTreeMap<String, TensorData>,
+) -> Result<()> {
+    if parameters.is_empty()
+        || parameters.keys().ne(first_moments.keys())
+        || parameters.keys().ne(second_moments.keys())
+    {
+        return Err(training("compiled AdamW checkpoint state names mismatch"));
+    }
+    for (name, parameter) in parameters {
+        validate_user_name(name, "checkpoint parameter")?;
+        let first = &first_moments[name];
+        let second = &second_moments[name];
+        if parameter.dtype() != DType::F32
+            || first.dtype() != DType::F32
+            || second.dtype() != DType::F32
+            || first.shape() != parameter.shape()
+            || second.shape() != parameter.shape()
+        {
+            return Err(training("compiled AdamW checkpoint descriptor mismatch"));
+        }
+        checked_bytes(parameter)?;
+        checked_bytes(first)?;
+        checked_bytes(second)?;
+    }
+    Ok(())
 }
 
 fn canonical_parameters(
@@ -1582,5 +1850,92 @@ mod tests {
         ] {
             assert!(config.is_err());
         }
+    }
+
+    #[test]
+    fn adamw_checkpoint_resume_matches_uninterrupted_replay_exactly() {
+        let mut uninterrupted = compiled_adamw();
+        let mut saved = compiled_adamw();
+        for _ in 0..2 {
+            uninterrupted.step(batch(), lr()).unwrap();
+            saved.step(batch(), lr()).unwrap();
+        }
+        let checkpoint = saved.checkpoint().unwrap();
+        assert_eq!(checkpoint, saved.checkpoint().unwrap());
+        assert_eq!(
+            CompiledAdamWCheckpoint::from_bytes(checkpoint.as_bytes().to_vec()).unwrap(),
+            checkpoint
+        );
+
+        let mut resumed =
+            CpuCompiledAdamW::compile_from_checkpoint(adamw_config(), &checkpoint, build_tinybob)
+                .unwrap();
+        assert_eq!(resumed.step_count(), 2);
+        assert_eq!(resumed.optimizer_step().unwrap(), 2);
+        assert_eq!(resumed.capture_identity(), saved.capture_identity());
+        assert_eq!(
+            resumed.parameter_snapshots().unwrap(),
+            saved.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.first_moment_snapshots().unwrap(),
+            saved.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.second_moment_snapshots().unwrap(),
+            saved.second_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.parameter_versions().unwrap(),
+            saved.parameter_versions().unwrap()
+        );
+        assert_eq!(
+            resumed.first_moment_versions().unwrap(),
+            saved.first_moment_versions().unwrap()
+        );
+        assert_eq!(
+            resumed.second_moment_versions().unwrap(),
+            saved.second_moment_versions().unwrap()
+        );
+
+        let expected = uninterrupted.step(batch(), lr()).unwrap();
+        let actual = resumed.step(batch(), lr()).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(actual.step(), expected.step());
+        assert_eq!(
+            resumed.parameter_snapshots().unwrap(),
+            uninterrupted.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.first_moment_snapshots().unwrap(),
+            uninterrupted.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.second_moment_snapshots().unwrap(),
+            uninterrupted.second_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.parameter_versions().unwrap(),
+            uninterrupted.parameter_versions().unwrap()
+        );
+    }
+
+    #[test]
+    fn adamw_checkpoint_rejects_corruption_and_wrong_program_identity() {
+        let checkpoint = compiled_adamw().checkpoint().unwrap();
+        let mut corrupt = checkpoint.as_bytes().to_vec();
+        corrupt.pop();
+        assert!(CompiledAdamWCheckpoint::from_bytes(corrupt).is_err());
+
+        let wrong = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.02)
+            .unwrap()
+            .with_input("x", [4, 2], DType::F32)
+            .unwrap()
+            .with_input("target", [4], DType::I64)
+            .unwrap();
+        assert!(
+            CpuCompiledAdamW::compile_from_checkpoint(wrong, &checkpoint, build_tinybob).is_err()
+        );
     }
 }

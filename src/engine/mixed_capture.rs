@@ -83,6 +83,22 @@ impl MixedReplayCursor {
         })
     }
 
+    /// Restores a canonical recurrent frontier at its saved logical versions.
+    /// Every buffer and descriptor must match the capture's version-zero
+    /// schema; versions may advance but cannot precede that schema.
+    pub fn resume(
+        capture: &CapturedMixedSchedule,
+        frontier: impl IntoIterator<Item = BufferState>,
+    ) -> Result<Self, ReplayError> {
+        validate(capture, true)?;
+        let cursor = Self {
+            capture_identity: identity(capture)?,
+            frontier: canonical_frontier(frontier)?,
+        };
+        validate_recurrent_cursor(capture, &cursor)?;
+        Ok(cursor)
+    }
+
     /// Stable logical RGSM identity accepted by this cursor.
     pub fn capture_identity(&self) -> u64 {
         self.capture_identity
@@ -1691,6 +1707,12 @@ mod recurrent_tests {
     fn recurrent_cursor_rejects_wrong_incomplete_and_mismatched_frontiers() {
         let (capture, _) = fixture(310);
         let initial = capture.initial_recurrent_cursor().unwrap();
+        let mut resumed_state = initial.frontier()[0].clone();
+        resumed_state.version = 7;
+        let resumed = MixedReplayCursor::resume(&capture, [resumed_state]).unwrap();
+        assert_eq!(resumed.frontier()[0].version, 7);
+        assert_eq!(resumed.capture_identity(), initial.capture_identity());
+        assert!(MixedReplayCursor::new(&capture, resumed.frontier().to_vec()).is_err());
         assert!(MixedReplayCursor::new(&capture, Vec::new()).is_err());
         let mut wrong = initial.frontier()[0].clone();
         wrong.shape = crate::Shape::from([1]);
