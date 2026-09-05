@@ -206,6 +206,10 @@ foundation. Hardware comparisons target tinygrad and Candle, plus llama.cpp for
 GGUF, and distinguish compile, first-run, steady-state, planned device memory,
 kernel count, host API transfer count/bytes, and fallback count. GPU timing,
 allocator RSS, or physical bus traffic is reported only when measured directly.
+Typed observations can now be bundled into deterministic offline comparisons
+under one exact workload, device, and explicit baseline; see
+[Benchmarking](docs/BENCHMARKING.md). No live Apple-GPU comparison measurements
+are currently published.
 
 Tinygrad is the primary semantic reference for tensor and compiler behavior.
 Rust projects are design references for API ergonomics, ownership, backend

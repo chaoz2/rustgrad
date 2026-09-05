@@ -118,6 +118,13 @@ execution intervals. Derived phase rates are narrowly scoped host-run or
 compute-command observations, not physical transfer measurement, end-to-end
 latency, or evidence of a live-device speedup.
 
+The normalized comparison plumbing is delivered: `BenchmarkObservation` and
+`BenchmarkComparison` version 1, the two RustGrad Metal scoreboard adapters, and
+the offline `benchmark_compare` CLI require exact workload/device identity and an
+explicit included baseline while preserving unavailable fields as null. They do
+not run workloads or derive speedups. Because the protected lane remains dormant,
+actual live Apple-GPU comparison measurements are still absent.
+
 ### 2. P0 — ResNet-18 Metal conformance
 
 Provision the protected Apple-GPU lane and run the checked-in exact-SHA
