@@ -1948,6 +1948,20 @@ fn llama_metal_prompt_facade_prefills_with_one_read_and_matches_cpu() {
         .generate_ids(&prompt, 0, LlamaSampling::Greedy)
         .unwrap();
     assert!(zero.reports().is_empty());
+    let zero_evidence = zero.workload_evidence();
+    assert_eq!(zero_evidence.plan, *session.summary());
+    assert_eq!(
+        zero_evidence.token_step_preparation,
+        *session.preparation_report()
+    );
+    assert!(zero_evidence.fixed_prefill_preparation.is_none());
+    assert!(zero_evidence.first_successful_run.is_none());
+    assert_eq!(zero_evidence.prompt_prefill.token_count, 0);
+    assert_eq!(zero_evidence.prompt_prefill.successful_invocation_count, 0);
+    assert_eq!(zero_evidence.prompt_prefill.host_tokens_per_second(), None);
+    assert_eq!(zero_evidence.steady_decode.token_count, 0);
+    assert_eq!(zero_evidence.steady_decode.successful_invocation_count, 0);
+    assert_eq!(zero_evidence.steady_decode.host_tokens_per_second(), None);
     assert_eq!(session.position(), 0);
     assert_eq!(mock.calls(), calls_after_prepare);
 
@@ -1973,6 +1987,40 @@ fn llama_metal_prompt_facade_prefills_with_one_read_and_matches_cpu() {
     assert_eq!(prefill.reports()[0].retained_d2h_calls, 0);
     assert_eq!(prefill.reports()[1].retained_d2h_calls, 0);
     assert_eq!(prefill.reports()[2].retained_d2h_calls, 1);
+    let evidence = prefill.workload_evidence();
+    assert_eq!(evidence.plan, *session.summary());
+    assert_eq!(evidence.plan.fallback_count, 0);
+    assert_eq!(evidence.plan.nonzero_item_count, stable_kernels);
+    assert!(evidence.plan.planned_device_bytes > 0);
+    assert!(evidence.plan.resident_input_bytes > 0);
+    assert_eq!(
+        evidence.token_step_preparation,
+        *session.preparation_report()
+    );
+    assert!(evidence.fixed_prefill_preparation.is_none());
+    assert_eq!(evidence.prompt_prefill.token_count, prompt.len());
+    assert_eq!(evidence.prompt_prefill.successful_invocation_count, 3);
+    assert_eq!(evidence.prompt_prefill.transient_h2d_calls, 3);
+    assert_eq!(evidence.prompt_prefill.transient_h2d_bytes, 12);
+    assert_eq!(evidence.prompt_prefill.runtime_control_h2d_calls, 3);
+    assert_eq!(evidence.prompt_prefill.runtime_control_h2d_bytes, 12);
+    assert_eq!(evidence.prompt_prefill.retained_d2h_calls, 1);
+    assert_eq!(
+        evidence.prompt_prefill.kernel_launch_count,
+        prefill
+            .reports()
+            .iter()
+            .map(|report| report.kernel_launch_count)
+            .sum::<usize>()
+    );
+    let first = evidence.first_successful_run.as_ref().unwrap();
+    assert_eq!(first.token_count, 1);
+    assert_eq!(first.successful_invocation_count, 1);
+    assert_eq!(
+        first.kernel_launch_count,
+        prefill.reports()[0].kernel_launch_count
+    );
+    assert_eq!(evidence.steady_decode.successful_invocation_count, 0);
     assert!(
         prefill
             .reports()
@@ -2008,6 +2056,26 @@ fn llama_metal_prompt_facade_prefills_with_one_read_and_matches_cpu() {
         .generate_ids(&prompt, 2, LlamaSampling::Greedy)
         .unwrap();
     assert_eq!(generation.generation(), &expected_generation);
+    let evidence = generation.workload_evidence();
+    let decode_invocations = generation.reports().len() - prompt.len();
+    assert_eq!(evidence.prompt_prefill.token_count, prompt.len());
+    assert_eq!(
+        evidence.prompt_prefill.successful_invocation_count,
+        prompt.len()
+    );
+    assert_eq!(evidence.steady_decode.token_count, decode_invocations);
+    assert_eq!(
+        evidence.steady_decode.successful_invocation_count,
+        decode_invocations
+    );
+    assert_eq!(
+        decode_invocations,
+        generation.generated_ids().len().saturating_sub(1)
+    );
+    assert_ne!(
+        evidence.steady_decode.successful_invocation_count,
+        generation.generated_ids().len()
+    );
     assert_eq!(
         fresh.position(),
         prompt.len()
@@ -2087,6 +2155,31 @@ fn llama_metal_fixed_span_prefill_shares_state_and_preserves_t1_tail() {
     assert!(!prefill.reports()[1].first_successful_run);
     assert_eq!(prefill.reports()[1].committed_state_position, Some(4));
     assert_eq!(prefill.reports()[1].retained_d2h_calls, 1);
+    let evidence = prefill.workload_evidence();
+    assert_eq!(evidence.plan, *session.summary());
+    assert_eq!(evidence.plan.fallback_count, 0);
+    assert!(evidence.plan.planned_device_bytes > 0);
+    assert!(evidence.plan.resident_input_bytes > 0);
+    assert_eq!(
+        evidence.token_step_preparation,
+        *session.preparation_report()
+    );
+    assert_eq!(
+        evidence.fixed_prefill_preparation.as_ref(),
+        session.prefill_preparation_report()
+    );
+    assert_eq!(evidence.prompt_prefill.token_count, prompt.len());
+    assert_eq!(evidence.prompt_prefill.successful_invocation_count, 2);
+    assert_eq!(evidence.prompt_prefill.retained_d2h_calls, 1);
+    assert_eq!(
+        evidence.prompt_prefill.retained_d2h_bytes,
+        std::mem::size_of_val(prefill.logits().values())
+    );
+    assert_eq!(
+        evidence.first_successful_run.as_ref().unwrap().token_count,
+        3
+    );
+    assert_eq!(evidence.steady_decode.successful_invocation_count, 0);
     assert_eq!(session.position(), 4);
     assert_eq!(session.successful_invocation_count(), 2);
     assert!(
@@ -2105,6 +2198,84 @@ fn llama_metal_fixed_span_prefill_shares_state_and_preserves_t1_tail() {
     assert_eq!(next.report().successful_invocation, 3);
     assert_eq!(session.position(), 5);
     assert_eq!(session.successful_invocation_count(), 3);
+}
+
+#[test]
+fn llama_metal_workload_phase_uses_measured_time_and_saturating_counters() {
+    fn report(
+        successful_invocation: u64,
+        first_successful_run: bool,
+        run_wall_time: std::time::Duration,
+        transaction_wall_time: std::time::Duration,
+        counter: usize,
+    ) -> MetalDeviceRunReport {
+        MetalDeviceRunReport {
+            successful_invocation,
+            first_successful_run,
+            run_wall_time,
+            synchronous_transaction_wall_time: transaction_wall_time,
+            transient_h2d_calls: counter,
+            transient_h2d_bytes: counter,
+            runtime_control_h2d_calls: counter,
+            runtime_control_h2d_bytes: counter,
+            retained_d2h_calls: counter,
+            retained_d2h_bytes: counter,
+            kernel_launch_count: counter,
+            zero_item_count: 0,
+            output_count: 0,
+            committed_state_pair_count: 0,
+            committed_state_bytes: 0,
+            committed_state_work_items: 0,
+            committed_state_position: None,
+        }
+    }
+
+    let no_elapsed = crate::models::transformer::LlamaMetalWorkloadPhase::from_reports(
+        4,
+        &[report(
+            1,
+            true,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            0,
+        )],
+    );
+    assert_eq!(no_elapsed.host_tokens_per_second(), None);
+
+    let reports = [
+        report(
+            1,
+            true,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(500),
+            usize::MAX,
+        ),
+        report(
+            2,
+            false,
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_millis(500),
+            1,
+        ),
+    ];
+    let measured = crate::models::transformer::LlamaMetalWorkloadPhase::from_reports(4, &reports);
+    assert_eq!(measured.successful_invocation_count, 2);
+    assert_eq!(
+        measured.host_run_wall_time,
+        std::time::Duration::from_secs(2)
+    );
+    assert_eq!(
+        measured.host_synchronous_transaction_wall_time,
+        std::time::Duration::from_secs(1)
+    );
+    assert_eq!(measured.host_tokens_per_second(), Some(2.0));
+    assert_eq!(measured.kernel_launch_count, usize::MAX);
+    assert_eq!(measured.transient_h2d_calls, usize::MAX);
+    assert_eq!(measured.transient_h2d_bytes, usize::MAX);
+    assert_eq!(measured.runtime_control_h2d_calls, usize::MAX);
+    assert_eq!(measured.runtime_control_h2d_bytes, usize::MAX);
+    assert_eq!(measured.retained_d2h_calls, usize::MAX);
+    assert_eq!(measured.retained_d2h_bytes, usize::MAX);
 }
 
 #[test]

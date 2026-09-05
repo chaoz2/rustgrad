@@ -44,6 +44,7 @@ pub use generation::{LlamaGeneration, LlamaGenerationError, LlamaGenerator, Llam
 pub use metal_generation::{
     LlamaMetalGeneration, LlamaMetalGenerationError, LlamaMetalGenerationStage, LlamaMetalPlan,
     LlamaMetalPrefill, LlamaMetalProgress, LlamaMetalPromptOutput, LlamaMetalSession,
+    LlamaMetalWorkloadEvidence, LlamaMetalWorkloadPhase,
 };
 pub use metal_step::{
     LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,

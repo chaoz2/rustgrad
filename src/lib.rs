@@ -191,7 +191,8 @@ pub use models::transformer::{
     LlamaMetalGeneration, LlamaMetalGenerationError, LlamaMetalGenerationStage, LlamaMetalPlan,
     LlamaMetalPrefill, LlamaMetalProgress, LlamaMetalPromptOutput, LlamaMetalSession,
     LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
-    LlamaMetalTokenCommit, LlamaPromptWorkflow, LlamaSampling,
+    LlamaMetalTokenCommit, LlamaMetalWorkloadEvidence, LlamaMetalWorkloadPhase,
+    LlamaPromptWorkflow, LlamaSampling,
 };
 pub use movement_plan::{
     MovementExecutionError, MovementKernelKind, MovementKernelPlan, MovementOperand,
