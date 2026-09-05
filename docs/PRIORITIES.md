@@ -57,6 +57,9 @@ AdamW is the first implementation, including first/second moments and a step
 counter in the same atomic state frontier as parameters. Deterministic
 capture-authenticated checkpoint bytes restore values and their exact logical
 versions into that same runtime rather than creating a host optimizer path.
+The module-bound AdamW entry point maps canonical trainable identities directly
+onto that frontier, retains tied weights once, and captures frozen state as
+immutable program data; the tiny Transformer vertical is now the next proof.
 
 ### 2. P0 — tiny Transformer training and exact resume
 

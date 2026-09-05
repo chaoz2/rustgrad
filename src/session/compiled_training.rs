@@ -1,10 +1,12 @@
 //! Graph-free CPU replay for static training programs with recurrent state.
 
+use crate::nn::StateKind;
 use crate::{
     BufferState, CapturedMixedSchedule, CapturedSchedule, DType, EffectGraph, EffectRuntime, Error,
-    Graph, Metadata, MixedReplayCursor, NodeId, ReplayError, Result, Scalar, Schedule,
-    ScheduleStateBinding, ScheduleValueBinding, Shape, StateDict, TensorData, bind_schedule_states,
-    combine_mixed_schedules, load_safetensors, save_safetensors, schedule_effects, schedule_many,
+    Graph, Metadata, MixedReplayCursor, Module, NodeId, ParameterId, ReplayError, Result, Scalar,
+    Schedule, ScheduleStateBinding, ScheduleValueBinding, Shape, StateDict, TensorData,
+    bind_schedule_states, combine_mixed_schedules, load_safetensors, save_safetensors,
+    schedule_effects, schedule_many,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,6 +42,109 @@ impl TrainingParameterInit {
 
     pub fn value(&self) -> &TensorData {
         &self.value
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ModuleParameterEntry {
+    identity: ParameterId,
+    name: String,
+    value: TensorData,
+    trainable: bool,
+}
+
+/// Frozen snapshot of one module's parameter topology for compilation.
+///
+/// Trainable identities become recurrent optimizer-owned inputs. Frozen
+/// parameters and buffers become immutable capture constants. Tied traversal
+/// entries keep one identity and therefore resolve to exactly one graph node.
+#[derive(Clone, Debug)]
+struct ModuleParameterPlan {
+    entries: Vec<ModuleParameterEntry>,
+}
+
+impl ModuleParameterPlan {
+    fn new(module: &(impl Module + ?Sized)) -> Result<Self> {
+        let mut entries = Vec::<ModuleParameterEntry>::new();
+        let mut identities = BTreeMap::<ParameterId, usize>::new();
+        let mut names = BTreeSet::new();
+        let mut error = None;
+        module.visit("", &mut |name, parameter, kind| {
+            if error.is_some() {
+                return;
+            }
+            let identity = parameter.id();
+            if let Some(&index) = identities.get(&identity) {
+                let is_parameter = matches!(kind, StateKind::Parameter);
+                if entries[index].trainable != (parameter.is_trainable() && is_parameter) {
+                    error = Some(training(
+                        "tied compiled module state has inconsistent trainability",
+                    ));
+                }
+                return;
+            }
+            if !names.insert(name.clone()) {
+                error = Some(training("compiled module state names repeat"));
+                return;
+            }
+            match parameter.snapshot() {
+                Ok(snapshot) => {
+                    let trainable = snapshot.trainable && matches!(kind, StateKind::Parameter);
+                    identities.insert(identity, entries.len());
+                    entries.push(ModuleParameterEntry {
+                        identity,
+                        name,
+                        value: snapshot.data,
+                        trainable,
+                    });
+                }
+                Err(err) => error = Some(err),
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if entries.iter().all(|entry| !entry.trainable) {
+            return Err(training(
+                "compiled module needs at least one trainable parameter",
+            ));
+        }
+        Ok(Self { entries })
+    }
+
+    fn initial_parameters(&self) -> Result<Vec<TrainingParameterInit>> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.trainable)
+            .map(|entry| TrainingParameterInit::new(entry.name.clone(), entry.value.clone()))
+            .collect()
+    }
+
+    fn lower<T>(
+        &self,
+        graph: &mut Graph,
+        parameters: &BTreeMap<String, NodeId>,
+        build: impl FnOnce(&mut Graph) -> Result<T>,
+    ) -> Result<T> {
+        let mut overrides = BTreeMap::new();
+        for entry in &self.entries {
+            let node = if entry.trainable {
+                parameters
+                    .get(&entry.name)
+                    .copied()
+                    .ok_or_else(|| training("compiled module parameter set mismatch"))?
+            } else {
+                graph.constant(entry.value.clone())
+            };
+            if graph.shape(node)? != entry.value.shape()
+                || graph.dtype(node)? != entry.value.dtype()
+                || graph.requires_grad(node)? != entry.trainable
+            {
+                return Err(training("compiled module parameter descriptor mismatch"));
+            }
+            overrides.insert(entry.identity, node);
+        }
+        graph.with_parameter_overrides(overrides, build)
     }
 }
 
@@ -933,6 +1038,30 @@ impl CpuCompiledAdamW {
         })
     }
 
+    /// Compiles an ordinary module forward against optimizer-owned recurrent
+    /// parameter state.
+    ///
+    /// The builder receives only declared batch inputs: calls to
+    /// [`crate::nn::Parameter::bind`] inside `module` resolve automatically to
+    /// the compiled state frontier. Frozen parameters and buffers are captured
+    /// as immutable constants, while tied parameter handles share one graph
+    /// node and one AdamW state tuple.
+    pub fn compile_module<M, F>(config: CompiledAdamWConfig, module: &M, build: F) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let plan = ModuleParameterPlan::new(module)?;
+        let parameters = plan.initial_parameters()?;
+        Self::compile(config, parameters, move |graph, inputs, parameters| {
+            plan.lower(graph, parameters, |graph| build(module, graph, inputs))
+        })
+    }
+
     /// Recompiles an exact program and restores its saved recurrent frontier.
     /// The build/configuration must reproduce the checkpoint's capture
     /// identity; all state is validated before the fresh runtime is replaced.
@@ -977,6 +1106,30 @@ impl CpuCompiledAdamW {
         );
         compiled.inner.restore_frontier(decoded.step, &values)?;
         Ok(compiled)
+    }
+
+    /// Recompiles a module-bound program and restores its exact AdamW state.
+    /// The module topology, frozen values, builder, and input descriptors must
+    /// reproduce the authenticated capture identity before any restored state
+    /// becomes visible.
+    pub fn compile_module_from_checkpoint<M, F>(
+        config: CompiledAdamWConfig,
+        module: &M,
+        checkpoint: &CompiledAdamWCheckpoint,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let plan = ModuleParameterPlan::new(module)?;
+        Self::compile_from_checkpoint(config, checkpoint, move |graph, inputs, parameters| {
+            plan.lower(graph, parameters, |graph| build(module, graph, inputs))
+        })
     }
 
     pub fn step(
@@ -1399,8 +1552,56 @@ fn training(reason: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, LossOptions, cross_entropy};
+    use crate::{Backend, CpuBackend, LossOptions, Parameter, cross_entropy};
     use std::collections::HashMap;
+
+    struct TiedFrozenModule {
+        shared: Parameter,
+        frozen: Parameter,
+    }
+
+    impl TiedFrozenModule {
+        fn new(frozen: [f32; 2]) -> Self {
+            Self {
+                shared: Parameter::new(TensorData::new([2], vec![0.25, -0.5]).unwrap(), true),
+                frozen: Parameter::new(TensorData::new([2], frozen.to_vec()).unwrap(), false),
+            }
+        }
+    }
+
+    impl Module for TiedFrozenModule {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            assert!(prefix.is_empty());
+            visitor("shared".into(), &self.shared, StateKind::Parameter);
+            visitor("shared_alias".into(), &self.shared, StateKind::Parameter);
+            visitor("frozen".into(), &self.frozen, StateKind::Parameter);
+        }
+    }
+
+    fn module_config() -> CompiledAdamWConfig {
+        CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_input("x", [2], DType::F32)
+            .unwrap()
+    }
+
+    fn build_tied_frozen(
+        module: &TiedFrozenModule,
+        graph: &mut Graph,
+        inputs: &BTreeMap<String, NodeId>,
+    ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+        let shared = module.shared.bind(graph)?;
+        assert_eq!(module.shared.bind(graph)?, shared);
+        assert_eq!(module.shared.node(graph)?, shared);
+        let frozen = module.frozen.bind(graph)?;
+        assert!(!graph.requires_grad(frozen)?);
+        let scaled = graph.mul(inputs["x"], shared)?;
+        let tied = graph.add(scaled, shared)?;
+        let output = graph.add(tied, frozen)?;
+        let squared = graph.square(output)?;
+        let loss = graph.reduce(squared, crate::ReduceKind::Mean, None, false)?;
+        Ok((loss, BTreeMap::from([("output".into(), output)])))
+    }
 
     fn initial_parameters() -> Vec<TrainingParameterInit> {
         vec![
@@ -1836,6 +2037,77 @@ mod tests {
         assert_eq!(compiled.parameter_snapshots().unwrap(), parameters);
         assert_eq!(compiled.first_moment_snapshots().unwrap(), first);
         assert_eq!(compiled.second_moment_snapshots().unwrap(), second);
+    }
+
+    #[test]
+    fn adamw_module_binding_owns_trainable_state_and_preserves_ties_and_freezing() {
+        let module = TiedFrozenModule::new([1.0, -1.0]);
+        let mut compiled =
+            CpuCompiledAdamW::compile_module(module_config(), &module, build_tied_frozen).unwrap();
+        assert_eq!(
+            compiled
+                .parameter_snapshots()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["shared"]
+        );
+
+        // Host state is only an initialization source. Once compiled, the
+        // recurrent runtime is the sole owner of the trainable value.
+        module
+            .shared
+            .replace(TensorData::new([2], vec![9.0, 9.0]).unwrap())
+            .unwrap();
+        let input = BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]);
+        let first = compiled
+            .step(input.clone(), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(first.step(), 1);
+        assert_eq!(compiled.optimizer_step().unwrap(), 1);
+        assert_eq!(compiled.parameter_versions().unwrap()["shared"], 1);
+
+        let checkpoint = compiled.checkpoint().unwrap();
+        let resumed_module = TiedFrozenModule::new([1.0, -1.0]);
+        let mut resumed = CpuCompiledAdamW::compile_module_from_checkpoint(
+            module_config(),
+            &resumed_module,
+            &checkpoint,
+            build_tied_frozen,
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.parameter_snapshots().unwrap(),
+            compiled.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.first_moment_snapshots().unwrap(),
+            compiled.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.second_moment_snapshots().unwrap(),
+            compiled.second_moment_snapshots().unwrap()
+        );
+        assert_eq!(resumed.step_count(), 1);
+        assert_eq!(
+            resumed
+                .step(input, TensorData::scalar(0.01))
+                .unwrap()
+                .step(),
+            2
+        );
+
+        let changed_frozen = TiedFrozenModule::new([2.0, -1.0]);
+        assert!(
+            CpuCompiledAdamW::compile_module_from_checkpoint(
+                module_config(),
+                &changed_frozen,
+                &checkpoint,
+                build_tied_frozen,
+            )
+            .is_err()
+        );
     }
 
     #[test]

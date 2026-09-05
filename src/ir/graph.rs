@@ -143,6 +143,7 @@ pub struct Graph {
     id: u64,
     pub(crate) grad_enabled: bool,
     parameter_bindings: BTreeMap<(ParameterId, u64), ParameterBinding>,
+    parameter_overrides: BTreeMap<ParameterId, NodeId>,
 }
 
 /// One heterogeneous source `Tensor.sequential` transform.
@@ -2145,6 +2146,7 @@ impl Default for Graph {
             id: NEXT_GRAPH_ID.fetch_add(1, Ordering::Relaxed),
             grad_enabled: true,
             parameter_bindings: BTreeMap::new(),
+            parameter_overrides: BTreeMap::new(),
         }
     }
 }
@@ -2407,6 +2409,16 @@ impl Graph {
     }
 
     pub(crate) fn bind_parameter(&mut self, snapshot: ParameterSnapshot) -> Result<NodeId> {
+        if let Some(&node) = self.parameter_overrides.get(&snapshot.identity) {
+            let bound = self.node(node)?;
+            if bound.shape != snapshot.shape
+                || bound.dtype != snapshot.dtype
+                || bound.requires_grad != snapshot.trainable
+            {
+                return Err(Error::ParameterGraphMismatch);
+            }
+            return Ok(node);
+        }
         let key = (snapshot.identity, snapshot.version);
         if let Some(binding) = self.parameter_bindings.get(&key) {
             return Ok(binding.node);
@@ -2429,14 +2441,42 @@ impl Graph {
         Ok(node)
     }
 
+    /// Stages one module composition with explicit nodes for every parameter
+    /// identity. [`crate::nn::Parameter::bind`] resolves through this map while
+    /// the closure runs, so compiled sessions can reuse ordinary typed module
+    /// forwards without snapshotting trainable values into fresh graph inputs.
+    pub(crate) fn with_parameter_overrides<T>(
+        &mut self,
+        overrides: BTreeMap<ParameterId, NodeId>,
+        lower: impl FnOnce(&mut Graph) -> Result<T>,
+    ) -> Result<T> {
+        if !self.parameter_overrides.is_empty() {
+            return Err(Error::ParameterGraphMismatch);
+        }
+        for &node in overrides.values() {
+            self.node(node)?;
+        }
+        let mut candidate = self.clone();
+        candidate.parameter_overrides = overrides;
+        let output = lower(&mut candidate)?;
+        candidate.parameter_overrides.clear();
+        *self = candidate;
+        Ok(output)
+    }
+
     pub(crate) fn bound_parameter_node(
         &self,
         identity: ParameterId,
         version: u64,
     ) -> Option<NodeId> {
-        self.parameter_bindings
-            .get(&(identity, version))
-            .map(|binding| binding.node)
+        self.parameter_overrides
+            .get(&identity)
+            .copied()
+            .or_else(|| {
+                self.parameter_bindings
+                    .get(&(identity, version))
+                    .map(|binding| binding.node)
+            })
     }
 
     /// Returns every immutable parameter value captured by this graph.
