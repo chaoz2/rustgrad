@@ -72,10 +72,10 @@ impl Args {
         if inputs.len() < 2 {
             return Err(CliError::TooFewInputs);
         }
-        if let Some(path) = &output {
-            if inputs.contains(path) {
-                return Err(CliError::OutputIsInput(path.clone()));
-            }
+        if let Some(path) = &output
+            && inputs.contains(path)
+        {
+            return Err(CliError::OutputIsInput(path.clone()));
         }
         Ok(Self {
             baseline,
