@@ -89,6 +89,7 @@ pub struct TransformerBlock<A = ReLU> {
     head_size: usize,
     feed_forward_dim: usize,
     prenorm: bool,
+    is_causal: bool,
     dropout: f64,
     dropout_seeds: [u64; 2],
 }
@@ -157,6 +158,7 @@ impl<A: ModuleForward> TransformerBlock<A> {
             head_size: embedding_dim / num_heads,
             feed_forward_dim,
             prenorm,
+            is_causal: false,
             dropout,
             dropout_seeds: [seed.wrapping_add(6), seed.wrapping_add(7)],
         })
@@ -176,6 +178,21 @@ impl<A: ModuleForward> TransformerBlock<A> {
 
     pub const fn prenorm(&self) -> bool {
         self.prenorm
+    }
+
+    /// Selects causal attention for autoregressive training and decoding.
+    ///
+    /// The default remains bidirectional to preserve the existing reusable
+    /// block contract. Enabling this option feeds the same explicit causal
+    /// mask policy into every forward mode; it does not depend on ambient
+    /// process state.
+    pub fn with_causal_attention(mut self, is_causal: bool) -> Self {
+        self.is_causal = is_causal;
+        self
+    }
+
+    pub const fn is_causal(&self) -> bool {
+        self.is_causal
     }
 
     pub const fn dropout(&self) -> f64 {
@@ -219,7 +236,10 @@ impl<A: ModuleForward> TransformerBlock<A> {
             key,
             value,
             None,
-            AttentionOptions::default(),
+            AttentionOptions {
+                is_causal: self.is_causal,
+                ..AttentionOptions::default()
+            },
         )?;
         let attended = graph.permute(attended, vec![0, 2, 1, 3])?;
         // Flattening heads after the time/head transpose is not one affine
@@ -443,6 +463,7 @@ mod tests {
         assert_eq!(block.num_heads(), 2);
         assert_eq!(block.feed_forward_dim(), 8);
         assert!(!block.prenorm());
+        assert!(!block.is_causal());
         assert_eq!(block.dropout(), 0.1);
         let state = block.state_dict().unwrap();
         assert_eq!(state.tensors()["ff1.0"].shape(), &Shape::new([4, 8]));
@@ -507,6 +528,11 @@ mod tests {
                 .keys()
                 .all(|key| !key.starts_with("act"))
         );
+
+        let causal = TransformerBlock::new_static(4, 2, 8, true, 0.0, 4)
+            .unwrap()
+            .with_causal_attention(true);
+        assert!(causal.is_causal());
 
         let mut narrow_graph = Graph::new();
         let narrow = narrow_graph.input_dtype("narrow", [1, 1, 4], DType::F16);
