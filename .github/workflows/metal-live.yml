@@ -82,7 +82,7 @@ jobs:
           retention-days: 30
 
   live-metal-llama:
-    name: Live Metal GGUF Llama (Apple GPU)
+    name: Live Metal GGUF Llama scoreboard v2 (Apple GPU)
     runs-on: [self-hosted, macOS, ARM64, rustgrad-metal]
     environment: live-metal
     timeout-minutes: 60
@@ -102,7 +102,7 @@ jobs:
       RUSTGRAD_METAL_LLAMA_ORACLE_NAME: ${{ vars.RUSTGRAD_METAL_LLAMA_ORACLE_NAME }}
       RUSTGRAD_METAL_LLAMA_ORACLE_REVISION: ${{ vars.RUSTGRAD_METAL_LLAMA_ORACLE_REVISION }}
       RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND: ${{ vars.RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND }}
-      RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH: ${{ github.workspace }}/metal-live-llama-workload-evidence.json
+      RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-llama-scoreboard-v2.json
       RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH: ${{ github.workspace }}/metal-live-llama-attestation.json
       RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH: ${{ github.workspace }}/SHA256SUMS
       RUSTGRAD_METAL_LLAMA_WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -184,7 +184,7 @@ jobs:
             exit 1
           fi
           for output_path in \
-            "$RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH" \
+            "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH" \
             "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH" \
             "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"; do
             if [[ -e "$output_path" || -L "$output_path" ]]; then
@@ -196,7 +196,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05
         with:
           toolchain: 1.89.0
-      - name: Generate with exact live Metal GGUF Llama deployment
+      - name: Generate exact live Metal GGUF Llama scoreboard v2
         shell: bash
         run: |
           set -euo pipefail
@@ -205,7 +205,7 @@ jobs:
             --expected-registry-id "$RUSTGRAD_METAL_LLAMA_REGISTRY_ID" \
             --max-new-tokens "$RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS" \
             --prefill-span "$RUSTGRAD_METAL_LLAMA_PREFILL_SPAN" \
-            --workload-evidence "$RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH" \
+            --scoreboard "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH" \
             --revision "$EXPECTED_SHA" \
             --expected-ids "$RUSTGRAD_METAL_LLAMA_EXPECTED_IDS" \
             --attestation "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH" \
@@ -221,28 +221,28 @@ jobs:
             -- \
             "$RUSTGRAD_METAL_LLAMA_GGUF_PATH" \
             "$RUSTGRAD_METAL_LLAMA_PROMPT"
-      - name: Bind and print live GGUF Llama evidence
+      - name: Bind and print live GGUF Llama scoreboard v2 evidence
         shell: bash
         run: |
           set -euo pipefail
-          workload_evidence_name="$(basename -- "$RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH")"
+          scoreboard_name="$(basename -- "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH")"
           attestation_name="$(basename -- "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH")"
           (
             cd "$GITHUB_WORKSPACE"
             set -o noclobber
-            shasum -a 256 "$workload_evidence_name" "$attestation_name" \
+            shasum -a 256 "$scoreboard_name" "$attestation_name" \
               > "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"
             shasum -a 256 -c "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"
           )
-          cat "$RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH"
+          cat "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH"
           cat "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH"
           cat "$RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH"
-      - name: Upload live GGUF Llama evidence
+      - name: Upload live GGUF Llama scoreboard v2 evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: metal-live-llama-${{ inputs.expected_sha }}-${{ env.RUSTGRAD_METAL_LLAMA_GGUF_SHA256 }}
+          name: metal-live-llama-scoreboard-v2-${{ inputs.expected_sha }}-${{ env.RUSTGRAD_METAL_LLAMA_GGUF_SHA256 }}
           path: |
-            ${{ env.RUSTGRAD_METAL_LLAMA_WORKLOAD_EVIDENCE_PATH }}
+            ${{ env.RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH }}
             ${{ env.RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH }}
             ${{ env.RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH }}
           if-no-files-found: error

@@ -102,20 +102,21 @@ session runs by default without duplicating the full execution elsewhere in the
 workflow. A separate job authenticates the selected Metal registry ID and
 runner-local GGUF bytes against protected values, uses an independently pinned
 prompt and greedy token IDs, checks the persistent token-step
-ownership/transfer contract, and emits its own
-v3 workload evidence plus a typed provenance attestation and checksum manifest without
+ownership/transfer contract, and emits its own device-greedy Llama execution
+scoreboard v2 plus a typed provenance attestation and checksum manifest without
 downloading or uploading a model. The attestation preserves the protected
 model/oracle provenance and exact prompt/ID contract but records, rather than
 independently re-proves, the workflow's prior GGUF hash check. Those IDs are
 bounded conformance evidence, not a broad cross-runtime numerical oracle. The
-release-profile lane
-is dormant until the matching runner, protected environment, and authenticated
-model are provisioned; the repository workflow only references those external
-controls. Ordinary macOS CI remains mock-only and no live-device result is
+release-profile lane is dormant: the current external audit found zero
+runners, no `live-metal` environment, and none of the required protected
+variables. The repository workflow only references those external controls.
+Ordinary macOS CI remains mock-only and no live-device result is
 claimed by the workflow definition itself. Its host-wall/API-copy and compute-
 command observations remain distinct from the optional completed-command GPU
-execution intervals; none is tokens per second, physical transfer measurement,
-end-to-end latency, or evidence of a live-device speedup.
+execution intervals. Derived phase rates are narrowly scoped host-run or
+compute-command observations, not physical transfer measurement, end-to-end
+latency, or evidence of a live-device speedup.
 
 ### 2. P0 — ResNet-18 Metal conformance
 
@@ -161,7 +162,7 @@ T=1 programs, then publish one ordered Llama execution scoreboard v2 without
 inventing a shared physical-session identity. The public greedy CLI now records
 that same envelope while retaining only one checked I32 token per selecting
 invocation; the host-logits/Gumbel API remains separate. Its checked
-prompt/decode phase accounting is ready for evidence capture, but remaining
+prompt/decode phase accounting is ready for live evidence capture, but remaining
 work still proves live-device output agreement and publishes measured
 prompt/decode performance; the current scoreboard is host-observed execution
 accounting, not a speedup claim.

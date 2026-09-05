@@ -2847,8 +2847,9 @@ protected prompt, positive token bound, and independently pinned greedy token
 IDs. It performs no model download, prepares
 one persistent dense-or-packed session, checks ordered token-step reports,
 resident/cache ownership, zero fallback, suppressed prompt downloads, and
-retained logits downloads, then uploads distinct v3 workload evidence, typed
-provenance attestation, and basename-only `SHA256SUMS`. The create-new
+exactly one checked four-byte I32 download per selecting invocation, then
+uploads the device-greedy Llama execution scoreboard v2, typed provenance
+attestation, and basename-only `SHA256SUMS`. The create-new
 attestation records the reviewed code SHA, supplied model SHA-256, filename and
 size (never the runner-local absolute path), immutable model locator/revision,
 license and conversion/quantization provenance, actual device identity, exact
@@ -2862,13 +2863,14 @@ with another runtime.
 These paths prove stable resident schemas, compiled cache identities, device
 ownership, zero run-time resident upload, and zero fallback. The release profile
 keeps the one complete CPU oracle practical without weakening the device
-workload. Scoreboard v7 and Llama workload-evidence v3 keep host wall time,
-optional compute-command GPU execution time, host-API copy counters, and
-compute-command submission/wait counters distinct. GPU command time is not
+workload. Component scoreboard v7 and Llama execution scoreboard v2 keep host
+wall time, optional compute-command GPU execution time, host-API copy counters,
+and compute-command submission/wait counters distinct. GPU command time is not
 copy time, end-to-end latency, tokens per second, or a live-device speedup
-claim. The workflow has no push or pull-request trigger. No
-matching runner, environment, or authenticated GGUF is currently provisioned,
-so this lane is dormant and its presence is not live-device or performance evidence.
+claim. The workflow has no push or pull-request trigger. The current external
+audit found zero runners, no `live-metal` environment, and none of the
+required protected variables, so this lane is dormant and its presence is not
+live-device or performance evidence.
 Provisioning must attach the exact runner labels, restrict deployment refs and
 reviewers on `live-metal`, and define protected
 `RUSTGRAD_METAL_LLAMA_GGUF_PATH`, `RUSTGRAD_METAL_LLAMA_GGUF_SHA256`,
