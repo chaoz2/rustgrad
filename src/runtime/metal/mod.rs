@@ -34,6 +34,7 @@ pub use scoreboard::{
     MetalScoreboardError, MetalScoreboardInput, MetalScoreboardInputKind, MetalScoreboardRun,
     MetalScoreboardStatePolicy, MetalSessionScoreboard, MetalSessionScoreboardReport,
 };
+pub(crate) use session::MetalSharedAppendSession;
 pub use session::{
     MetalAppendStateInferencePlan, MetalDevicePreparationReport, MetalDeviceRun,
     MetalDeviceRunReport, MetalDeviceSession, MetalDeviceSessionPlan, MetalDeviceSessionSummary,

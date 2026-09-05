@@ -5,17 +5,18 @@ use super::{
     LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
     LlamaPromptWorkflow, LlamaSampling,
     generation::{select_last, validate_sampling},
+    metal_step::LlamaMetalPrefillPlan,
 };
 use crate::{
-    CapturedSchedule, ExecutionPlanSummary, ReplayInput, TensorData,
+    CapturedSchedule, DType, ExecutionPlanSummary, ReplayInput, Scalar, TensorData,
     runtime::metal::{
         MetalDevice, MetalDeviceInfo, MetalDevicePreparationReport, MetalDeviceRunReport,
         MetalDeviceSessionSummary, MetalPlanOptions, MetalScoreboardContext, MetalScoreboardError,
-        MetalSessionScoreboard, RenderedMetal,
+        MetalSessionScoreboard, MetalSharedAppendSession, RenderedMetal,
     },
     tokenizer::{SimpleTokenizer, TokenizerError},
 };
-use std::{error, fmt};
+use std::{collections::BTreeMap, error, fmt, num::NonZeroUsize};
 
 /// Resource-free, GGUF-bound deployment plan for one selected Metal device.
 ///
@@ -23,6 +24,7 @@ use std::{error, fmt};
 /// from one [`LlamaPromptWorkflow`]. The source host model is not retained.
 pub struct LlamaMetalPlan {
     step: LlamaMetalStepPlan,
+    prefill: Option<LlamaMetalPrefillPlan>,
     tokenizer: SimpleTokenizer,
     chat_template: LlamaChatTemplate,
     selected_device: MetalDevice,
@@ -31,8 +33,18 @@ pub struct LlamaMetalPlan {
 /// Persistent single-sequence Metal generation session.
 pub struct LlamaMetalSession {
     step: LlamaMetalStepSession,
+    prefill: Option<LlamaMetalPrefillSession>,
+    committed_position: usize,
+    successful_invocations: u64,
     tokenizer: SimpleTokenizer,
     chat_template: LlamaChatTemplate,
+}
+
+struct LlamaMetalPrefillSession {
+    inner: MetalSharedAppendSession,
+    span_rows: NonZeroUsize,
+    token_input_name: String,
+    position_input_name: String,
 }
 
 /// Successful prompt ingestion with only its final logits downloaded.
@@ -90,6 +102,12 @@ pub enum LlamaMetalGenerationError {
         stage: LlamaMetalGenerationStage,
         token_offset: usize,
         token: u32,
+        source: LlamaMetalStepError,
+    },
+    PrefillChunkExecution {
+        progress: Box<LlamaMetalProgress>,
+        token_offset: usize,
+        span_rows: usize,
         source: LlamaMetalStepError,
     },
     Decode {
@@ -160,10 +178,70 @@ impl LlamaMetalPlan {
         let step = LlamaMetalStepPlan::new(&model, renderer)?;
         Ok(Self {
             step,
+            prefill: None,
             tokenizer,
             chat_template,
             selected_device: device.clone(),
         })
+    }
+
+    /// Builds the exact token-step deployment plus one state-only fixed-span
+    /// prompt program. The latter is used only for complete chunks preceding
+    /// the prompt's final token.
+    pub fn from_workflow_with_prefill_span(
+        workflow: LlamaPromptWorkflow,
+        device: &MetalDevice,
+        options: MetalPlanOptions,
+        span_rows: NonZeroUsize,
+    ) -> Result<Self, LlamaMetalGenerationError> {
+        if span_rows.get() == 1 {
+            return Self::from_workflow(workflow, device, options);
+        }
+        let (model, tokenizer, chat_template) = workflow.into_parts();
+        let renderer = device
+            .renderer(options.local_size)
+            .map_err(LlamaMetalStepError::Metal)?;
+        let step = LlamaMetalStepPlan::new(&model, renderer.clone())?;
+        let prefill = LlamaMetalPrefillPlan::new(&model, renderer, span_rows)?;
+        authenticate_prefill_pair(&step, &prefill)?;
+        Ok(Self {
+            step,
+            prefill: Some(prefill),
+            tokenizer,
+            chat_template,
+            selected_device: device.clone(),
+        })
+    }
+
+    /// Returns the opt-in fixed prompt span. `None` retains the exact T1-only
+    /// deployment and execution path.
+    pub fn prefill_span_rows(&self) -> Option<NonZeroUsize> {
+        self.prefill.as_ref().map(LlamaMetalPrefillPlan::span_rows)
+    }
+
+    /// Returns the state-only prefill capture when fixed-span prefill is enabled.
+    pub fn prefill_capture(&self) -> Option<&CapturedSchedule> {
+        self.prefill.as_ref().map(LlamaMetalPrefillPlan::capture)
+    }
+
+    /// Returns the fixed-span program's resource and execution facts.
+    pub fn prefill_summary(&self) -> Option<&MetalDeviceSessionSummary> {
+        self.prefill.as_ref().map(LlamaMetalPrefillPlan::summary)
+    }
+
+    /// Returns backend-neutral schedule and memory facts for the state-only
+    /// fixed-span program.
+    pub fn prefill_execution_plan(&self) -> Option<&ExecutionPlanSummary> {
+        self.prefill
+            .as_ref()
+            .map(LlamaMetalPrefillPlan::execution_plan)
+    }
+
+    /// Returns rendered state-only prefill items when fixed-span prefill is enabled.
+    pub fn prefill_rendered_items(&self) -> Option<impl ExactSizeIterator<Item = &RenderedMetal>> {
+        self.prefill
+            .as_ref()
+            .map(LlamaMetalPrefillPlan::rendered_items)
     }
 
     /// Returns immutable selected-device information without a raw handle.
@@ -235,8 +313,41 @@ impl LlamaMetalPlan {
     /// Creates the persistent device session. No host model or weight object is
     /// retained after this transition.
     pub fn prepare(self) -> Result<LlamaMetalSession, LlamaMetalGenerationError> {
+        let shared = self
+            .prefill
+            .as_ref()
+            .map(|prefill| {
+                prefill
+                    .append_state_plan()
+                    .authenticate_shared_from(self.step.append_state_plan())
+            })
+            .transpose()
+            .map_err(LlamaMetalStepError::Metal)?;
+        let step = self.step.prepare(self.selected_device.clone())?;
+        let prefill = match (self.prefill, shared) {
+            (Some(prefill), Some(proof)) => {
+                let span_rows = prefill.span_rows();
+                let token_input_name = prefill.token_input().name.clone();
+                let position_input_name = prefill.position_vector_input().name.clone();
+                let inner = prefill
+                    .into_append_state_plan()
+                    .prepare_shared(self.selected_device, step.metal_session(), proof)
+                    .map_err(LlamaMetalStepError::Metal)?;
+                Some(LlamaMetalPrefillSession {
+                    inner,
+                    span_rows,
+                    token_input_name,
+                    position_input_name,
+                })
+            }
+            (None, None) => None,
+            _ => unreachable!("fixed prefill proof follows the optional plan"),
+        };
         Ok(LlamaMetalSession {
-            step: self.step.prepare(self.selected_device)?,
+            step,
+            prefill,
+            committed_position: 0,
+            successful_invocations: 0,
             tokenizer: self.tokenizer,
             chat_template: self.chat_template,
         })
@@ -248,6 +359,12 @@ impl LlamaMetalPlan {
         self,
         context: MetalScoreboardContext,
     ) -> Result<LlamaMetalSession, LlamaMetalGenerationError> {
+        if let Some(prefill) = &self.prefill {
+            return Err(MetalScoreboardError::UnsupportedAppendSpan {
+                span_rows: prefill.span_rows().get(),
+            }
+            .into());
+        }
         let recorder = MetalSessionScoreboard::try_new_append_state_v4(
             context,
             self.step.append_state_plan(),
@@ -256,6 +373,9 @@ impl LlamaMetalPlan {
         step.bind_execution_scoreboard(recorder)?;
         Ok(LlamaMetalSession {
             step,
+            prefill: None,
+            committed_position: 0,
+            successful_invocations: 0,
             tokenizer: self.tokenizer,
             chat_template: self.chat_template,
         })
@@ -268,7 +388,8 @@ impl LlamaMetalPrefill {
         &self.logits
     }
 
-    /// Returns one successful device report per ingested prompt token.
+    /// Returns one successful device report per device invocation. A fixed
+    /// prompt chunk contributes one report for all rows in that chunk.
     pub fn reports(&self) -> &[MetalDeviceRunReport] {
         &self.reports
     }
@@ -407,6 +528,25 @@ impl LlamaMetalSession {
         self.step.metal_session().preparation_report()
     }
 
+    /// Returns the fixed-span program's one-time preparation report.
+    pub fn prefill_preparation_report(&self) -> Option<&MetalDevicePreparationReport> {
+        self.prefill
+            .as_ref()
+            .map(|prefill| prefill.inner.preparation_report())
+    }
+
+    /// Returns the configured fixed prompt span.
+    pub fn prefill_span_rows(&self) -> Option<NonZeroUsize> {
+        self.prefill.as_ref().map(|prefill| prefill.span_rows)
+    }
+
+    /// Returns compiled state-only prefill kernels when fixed-span prefill is enabled.
+    pub fn compiled_prefill_kernels(&self) -> Option<impl Iterator<Item = &RenderedMetal>> {
+        self.prefill
+            .as_ref()
+            .map(|prefill| prefill.inner.compiled_kernels())
+    }
+
     /// Returns the nonzero compiled kernels retained by this session.
     pub fn compiled_kernels(&self) -> impl Iterator<Item = &RenderedMetal> {
         self.step.metal_session().compiled_kernels()
@@ -439,7 +579,13 @@ impl LlamaMetalSession {
 
     /// Returns the next K/V row to commit.
     pub fn position(&self) -> usize {
-        self.step.position()
+        self.committed_position
+    }
+
+    /// Returns the number of successful device invocations across both the
+    /// fixed-span prefill and token-step programs.
+    pub fn successful_invocation_count(&self) -> u64 {
+        self.successful_invocations
     }
 
     /// Returns the fixed K/V capacity.
@@ -454,12 +600,23 @@ impl LlamaMetalSession {
 
     /// Returns whether no further token can be committed.
     pub fn is_full(&self) -> bool {
-        self.step.is_full()
+        self.committed_position == self.step.max_context()
     }
 
     /// Executes and commits one token while retaining its logits.
     pub fn run_token(&mut self, token: u32) -> Result<LlamaMetalStep, LlamaMetalGenerationError> {
-        self.step.run_token(token).map_err(Into::into)
+        let invocation = self.next_invocation()?;
+        let step = self
+            .step
+            .run_token_at(token, self.committed_position, invocation)?;
+        self.committed_position =
+            step.position()
+                .checked_add(1)
+                .ok_or(LlamaMetalStepError::Dimension(
+                    "committed position overflow",
+                ))?;
+        self.successful_invocations = invocation;
+        Ok(step)
     }
 
     /// Validates the complete prefix before the first driver call, then retains
@@ -471,30 +628,47 @@ impl LlamaMetalSession {
         self.preflight_tokens(prompt_ids, 0)?;
         let start_position = self.position();
         let mut reports = Vec::with_capacity(prompt_ids.len());
-        for (offset, &token) in prompt_ids[..prompt_ids.len() - 1].iter().enumerate() {
-            let commit = self.step.commit_token(token).map_err(|source| {
-                LlamaMetalGenerationError::Execution {
-                    progress: Box::new(progress(
-                        prompt_ids,
-                        &[],
-                        &reports,
-                        start_position,
-                        self.position(),
-                    )),
-                    stage: LlamaMetalGenerationStage::Prompt,
-                    token_offset: offset,
-                    token,
-                    source,
-                }
-            })?;
-            let (_, report) = commit.into_parts();
-            reports.push(report);
+        let prefix_end = prompt_ids.len() - 1;
+        let mut offset = 0usize;
+        if let Some(span) = self.prefill.as_ref().map(|prefill| prefill.span_rows.get()) {
+            while offset
+                .checked_add(span)
+                .is_some_and(|end| end <= prefix_end)
+            {
+                let end = offset + span;
+                let start = self.committed_position;
+                let invocation = self.next_invocation()?;
+                let report = self
+                    .prefill
+                    .as_mut()
+                    .expect("fixed-span loop requires the configured prefill program")
+                    .run(&prompt_ids[offset..end], start, invocation)
+                    .map_err(|source| LlamaMetalGenerationError::PrefillChunkExecution {
+                        progress: Box::new(progress(
+                            prompt_ids,
+                            &[],
+                            &reports,
+                            start_position,
+                            self.committed_position,
+                        )),
+                        token_offset: offset,
+                        span_rows: span,
+                        source,
+                    })?;
+                self.committed_position = start
+                    .checked_add(span)
+                    .ok_or(LlamaGenerationError::ContextOverflow)?;
+                self.successful_invocations = invocation;
+                reports.push(report);
+                offset = end;
+            }
         }
-        let offset = prompt_ids.len() - 1;
-        let token = prompt_ids[offset];
-        let step =
-            self.step
-                .run_token(token)
+        for (tail_offset, &token) in prompt_ids[offset..prefix_end].iter().enumerate() {
+            let token_offset = offset + tail_offset;
+            let invocation = self.next_invocation()?;
+            let commit = self
+                .step
+                .commit_token_at(token, self.committed_position, invocation)
                 .map_err(|source| LlamaMetalGenerationError::Execution {
                     progress: Box::new(progress(
                         prompt_ids,
@@ -504,11 +678,43 @@ impl LlamaMetalSession {
                         self.position(),
                     )),
                     stage: LlamaMetalGenerationStage::Prompt,
-                    token_offset: offset,
+                    token_offset,
                     token,
                     source,
                 })?;
+            let (_, report) = commit.into_parts();
+            self.committed_position = self
+                .committed_position
+                .checked_add(1)
+                .ok_or(LlamaGenerationError::ContextOverflow)?;
+            self.successful_invocations = invocation;
+            reports.push(report);
+        }
+        let offset = prefix_end;
+        let token = prompt_ids[offset];
+        let invocation = self.next_invocation()?;
+        let step = self
+            .step
+            .run_token_at(token, self.committed_position, invocation)
+            .map_err(|source| LlamaMetalGenerationError::Execution {
+                progress: Box::new(progress(
+                    prompt_ids,
+                    &[],
+                    &reports,
+                    start_position,
+                    self.position(),
+                )),
+                stage: LlamaMetalGenerationStage::Prompt,
+                token_offset: offset,
+                token,
+                source,
+            })?;
         let (logits, report) = step.into_parts();
+        self.committed_position = self
+            .committed_position
+            .checked_add(1)
+            .ok_or(LlamaGenerationError::ContextOverflow)?;
+        self.successful_invocations = invocation;
         reports.push(report);
         Ok(LlamaMetalPrefill {
             logits,
@@ -584,8 +790,11 @@ impl LlamaMetalSession {
             }
             if step_index + 1 < max_new_tokens {
                 let offset = prompt_ids.len() + step_index;
-                let next = self.step.run_token(token).map_err(|source| {
-                    LlamaMetalGenerationError::Execution {
+                let invocation = self.next_invocation()?;
+                let next = self
+                    .step
+                    .run_token_at(token, self.committed_position, invocation)
+                    .map_err(|source| LlamaMetalGenerationError::Execution {
                         progress: Box::new(progress(
                             prompt_ids,
                             &generated,
@@ -597,9 +806,13 @@ impl LlamaMetalSession {
                         token_offset: offset,
                         token,
                         source,
-                    }
-                })?;
+                    })?;
                 let (next_logits, report) = next.into_parts();
+                self.committed_position = self
+                    .committed_position
+                    .checked_add(1)
+                    .ok_or(LlamaGenerationError::ContextOverflow)?;
+                self.successful_invocations = invocation;
                 logits = next_logits;
                 reports.push(report);
             }
@@ -664,6 +877,12 @@ impl LlamaMetalSession {
         Ok(())
     }
 
+    fn next_invocation(&self) -> Result<u64, LlamaMetalGenerationError> {
+        self.successful_invocations
+            .checked_add(1)
+            .ok_or_else(|| LlamaMetalStepError::Dimension("invocation counter overflow").into())
+    }
+
     fn preflight_tokens(
         &self,
         prompt_ids: &[u32],
@@ -695,6 +914,82 @@ impl LlamaMetalSession {
             .into());
         }
         Ok(())
+    }
+}
+
+fn authenticate_prefill_pair(
+    step: &LlamaMetalStepPlan,
+    prefill: &LlamaMetalPrefillPlan,
+) -> Result<(), LlamaMetalStepError> {
+    let [step_position] = step.runtime_control_inputs() else {
+        return Err(LlamaMetalStepError::Metal(
+            crate::runtime::metal::MetalError::InvalidBinding(
+                "token-step Llama position control is not an exact singleton".into(),
+            ),
+        ));
+    };
+    if prefill.max_context() != step.max_context()
+        || prefill.vocab_size() != step.vocab_size()
+        || prefill.layer_count() != step.layer_count()
+        || prefill.output_binding() != step.output_binding()
+        || prefill.summary().requested_output_count != 0
+        || prefill.scalar_position_input().name != step_position.name
+    {
+        return Err(LlamaMetalStepError::Metal(
+            crate::runtime::metal::MetalError::InvalidBinding(
+                "fixed-span and token-step Llama deployments differ".into(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
+impl LlamaMetalPrefillSession {
+    fn run(
+        &mut self,
+        tokens: &[u32],
+        start_position: usize,
+        invocation: u64,
+    ) -> Result<MetalDeviceRunReport, LlamaMetalStepError> {
+        let span = self.span_rows.get();
+        if tokens.len() != span {
+            return Err(LlamaMetalStepError::Dimension(
+                "fixed prefill token span differs from its plan",
+            ));
+        }
+        let token_values = tokens
+            .iter()
+            .map(|token| Scalar::I(i64::from(*token)))
+            .collect::<Vec<_>>();
+        let position_values = (0..span)
+            .map(|offset| {
+                start_position
+                    .checked_add(offset)
+                    .and_then(|position| i32::try_from(position).ok())
+                    .map(|position| Scalar::I(i64::from(position)))
+                    .ok_or(LlamaMetalStepError::Dimension(
+                        "fixed prefill position exceeds I32",
+                    ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let inputs = BTreeMap::from([
+            (
+                self.token_input_name.clone(),
+                TensorData::from_scalars([1, span], DType::I32, token_values)?,
+            ),
+            (
+                self.position_input_name.clone(),
+                TensorData::from_scalars([1, span], DType::I32, position_values)?,
+            ),
+        ]);
+        let run = self
+            .inner
+            .run_without_host_outputs_at(&inputs, start_position)?;
+        debug_assert!(run.outputs().is_empty());
+        let (_, mut report) = run.into_parts();
+        report.successful_invocation = invocation;
+        report.first_successful_run = invocation == 1;
+        Ok(report)
     }
 }
 

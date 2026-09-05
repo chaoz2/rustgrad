@@ -654,6 +654,7 @@ use dispatch::{
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     hash::{Hash, Hasher},
+    num::NonZeroUsize,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -1211,6 +1212,50 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert_eq!(session.successful_run_count(), 2);
     assert_eq!(scoreboard.report().unwrap(), report);
     assert!(!mock.calls().iter().any(|call| call.starts_with("copy:")));
+}
+
+#[test]
+fn shared_append_preparation_rejects_a_source_after_state_advances() {
+    let mut graph = Graph::new();
+    let state = graph.input_dtype("cache", [2, 1], DType::F32);
+    let (position, index) = append_position(&mut graph, "position", [1, 1]);
+    let update_source = graph.input_dtype("updates", [1, 1], DType::F32);
+    let updates = graph.relu(update_source).unwrap();
+    let next = graph.scatter(state, index, updates, 0).unwrap();
+    let captured = CapturedAppendStateInference::from_module_graph(
+        &IdentityModule,
+        &graph,
+        &[],
+        &[InferenceAppendStateLink::new(
+            state, next, position, index, updates, 0,
+        )],
+        BTreeMap::from([("cache".into(), TensorData::zeros([2, 1]).unwrap())]),
+    )
+    .unwrap()
+    .seal_committed_position()
+    .unwrap();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let source_plan =
+        MetalAppendStateInferencePlan::new(captured.clone(), renderer.clone()).unwrap();
+    let target_plan = MetalAppendStateInferencePlan::new(captured, renderer).unwrap();
+    let proof = target_plan.authenticate_shared_from(&source_plan).unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let mut source = source_plan.prepare(device.clone()).unwrap();
+    source
+        .run(&BTreeMap::from([(
+            "updates".into(),
+            TensorData::new([1, 1], vec![4.0]).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(source.committed_state_position(), Some(1));
+    mock.clear_calls();
+    assert!(matches!(
+        target_plan.prepare_shared(device, &source, proof),
+        Err(MetalError::InvalidBinding(reason))
+            if reason == "shared Metal session proof does not belong to these deployments"
+    ));
+    assert!(mock.calls().is_empty());
 }
 
 #[test]
@@ -1972,6 +2017,161 @@ fn llama_metal_prompt_facade_prefills_with_one_read_and_matches_cpu() {
                 .len()
                 .saturating_sub(1)
     );
+}
+
+#[test]
+fn llama_metal_fixed_span_prefill_shares_state_and_preserves_t1_tail() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        16,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let file = crate::gguf::read_gguf(&bytes).unwrap();
+    let (cpu_model, _) = crate::models::transformer::LlamaModel::from_gguf(&file).unwrap();
+    let prompt = [3, 4, 5, 6];
+    let expected = cpu_model.forward(&prompt).unwrap();
+    let vocab = cpu_model.config().schema().vocab_size();
+    let expected_last = TensorData::new(
+        [1, vocab],
+        expected.values()[expected.values().len() - vocab..].to_vec(),
+    )
+    .unwrap();
+
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
+    let plan = crate::models::transformer::LlamaMetalPlan::from_workflow_with_prefill_span(
+        workflow,
+        &device,
+        MetalPlanOptions::new(8),
+        NonZeroUsize::new(3).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.prefill_span_rows().unwrap().get(), 3);
+    assert_eq!(plan.prefill_summary().unwrap().requested_output_count, 0);
+    assert_eq!(
+        plan.prefill_capture().unwrap().requested.len(),
+        plan.prefill_summary().unwrap().state_pair_count
+    );
+    assert!(!plan.prefill_execution_plan().unwrap().items.is_empty());
+    assert!(plan.prefill_rendered_items().unwrap().len() > 0);
+
+    let mut session = plan.prepare().unwrap();
+    assert_eq!(session.prefill_span_rows().unwrap().get(), 3);
+    assert!(session.compiled_prefill_kernels().unwrap().count() > 0);
+    let prefill_preparation = session.prefill_preparation_report().unwrap();
+    assert_eq!(prefill_preparation.resident_h2d_calls, 0);
+    assert_eq!(prefill_preparation.resident_h2d_bytes, 0);
+    assert_eq!(prefill_preparation.initial_state_h2d_calls, 0);
+    assert_eq!(prefill_preparation.initial_state_h2d_bytes, 0);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("queue_create:"))
+            .count(),
+        1
+    );
+    let calls_after_prepare = mock.calls();
+
+    let prefill = session.prefill_ids(&prompt).unwrap();
+    assert_eq!(prefill.logits().shape(), expected_last.shape());
+    for (actual, expected) in prefill.logits().values().iter().zip(expected_last.values()) {
+        assert!(actual.is_finite() && (actual - expected).abs() <= 1e-3);
+    }
+    assert_eq!(prefill.reports().len(), 2);
+    assert_eq!(prefill.reports()[0].successful_invocation, 1);
+    assert!(prefill.reports()[0].first_successful_run);
+    assert_eq!(prefill.reports()[0].committed_state_position, Some(3));
+    assert_eq!(prefill.reports()[0].retained_d2h_calls, 0);
+    assert_eq!(prefill.reports()[0].output_count, 0);
+    assert_eq!(prefill.reports()[1].successful_invocation, 2);
+    assert!(!prefill.reports()[1].first_successful_run);
+    assert_eq!(prefill.reports()[1].committed_state_position, Some(4));
+    assert_eq!(prefill.reports()[1].retained_d2h_calls, 1);
+    assert_eq!(session.position(), 4);
+    assert_eq!(session.successful_invocation_count(), 2);
+    assert!(
+        !mock.calls()[calls_after_prepare.len()..]
+            .iter()
+            .any(|call| {
+                call.starts_with("buffer_create:")
+                    || call.starts_with("library_compile:")
+                    || call.starts_with("pipeline_create:")
+                    || call.starts_with("queue_create:")
+            })
+    );
+
+    let next = session.run_token(7).unwrap();
+    assert_eq!(next.position(), 4);
+    assert_eq!(next.report().successful_invocation, 3);
+    assert_eq!(session.position(), 5);
+    assert_eq!(session.successful_invocation_count(), 3);
+}
+
+#[test]
+fn llama_metal_prefill_span_one_is_the_exact_t1_plan() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        8,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let device = test_device(Arc::new(MockDispatch::default()));
+    let ordinary = crate::models::transformer::LlamaMetalPlan::from_workflow(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+    )
+    .unwrap();
+    let span_one = crate::models::transformer::LlamaMetalPlan::from_workflow_with_prefill_span(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    assert!(span_one.prefill_span_rows().is_none());
+    assert!(span_one.prefill_capture().is_none());
+    assert_eq!(span_one.capture().identity, ordinary.capture().identity);
+    assert_eq!(
+        span_one.step_deployment_identity(),
+        ordinary.step_deployment_identity()
+    );
+    assert_eq!(span_one.summary(), ordinary.summary());
+}
+
+#[test]
+fn llama_metal_prefill_chunk_failure_is_typed_atomic_and_retryable() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        8,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let mut session = crate::models::transformer::LlamaMetalPlan::from_workflow_with_prefill_span(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+        NonZeroUsize::new(3).unwrap(),
+    )
+    .unwrap()
+    .prepare()
+    .unwrap();
+    mock.state.lock().unwrap().failures.launch = Some("fixed prefill launch");
+    let failure = session.prefill_ids(&[3, 4, 5, 6]).unwrap_err();
+    assert!(matches!(
+        failure,
+        crate::models::transformer::LlamaMetalGenerationError::PrefillChunkExecution {
+            progress,
+            token_offset: 0,
+            span_rows: 3,
+            ..
+        } if progress.committed_position() == 0 && progress.reports().is_empty()
+    ));
+    assert_eq!(session.position(), 0);
+    assert_eq!(session.successful_invocation_count(), 0);
+    mock.clear_failures();
+    let retry = session.prefill_ids(&[3, 4, 5, 6]).unwrap();
+    assert_eq!(retry.reports().len(), 2);
+    assert_eq!(retry.reports()[0].successful_invocation, 1);
+    assert_eq!(session.position(), 4);
 }
 
 #[test]

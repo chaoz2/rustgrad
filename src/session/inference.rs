@@ -20,6 +20,7 @@ pub struct CapturedInference {
     capture: CapturedSchedule,
     execution_plan: ExecutionPlanSummary,
     resident_bindings: BTreeMap<String, TensorData>,
+    quantized_input_names: BTreeMap<u64, String>,
     transient_inputs: Vec<ReplayInput>,
     host_gathers: Vec<CapturedHostGather>,
     identity: u64,
@@ -231,6 +232,8 @@ impl CapturedInference {
         .map_err(CapturedInferenceError::Capture)?;
         let execution_plan = ExecutionPlanSummary::from_capture(&capture, true)
             .map_err(CapturedInferenceError::Summary)?;
+        let quantized_input_names =
+            capture_quantized_input_names(graph, quantized, &capture.quantized_constants)?;
 
         let mut resident_bindings = BTreeMap::new();
         let mut transient_inputs = Vec::new();
@@ -261,11 +264,13 @@ impl CapturedInference {
                 "resident input {name} is absent from captured ownership"
             )));
         }
-        let identity = captured_inference_identity(&capture, &resident_bindings)?;
+        let identity =
+            captured_inference_identity(&capture, &resident_bindings, &quantized_input_names)?;
         Ok(Self {
             capture,
             execution_plan,
             resident_bindings,
+            quantized_input_names,
             transient_inputs,
             host_gathers: Vec::new(),
             identity,
@@ -446,6 +451,13 @@ impl CapturedInference {
     /// state. Mutating the module later cannot alter these values.
     pub const fn resident_bindings(&self) -> &BTreeMap<String, TensorData> {
         &self.resident_bindings
+    }
+
+    /// Returns the semantic names retained for capture-owned packed inputs.
+    /// Packed bindings are not dense replay inputs, so their names must be
+    /// authenticated separately from `capture.inputs`.
+    pub(crate) const fn quantized_input_names(&self) -> &BTreeMap<u64, String> {
+        &self.quantized_input_names
     }
 
     /// Returns named input schemas that remain caller-supplied per run.
@@ -746,6 +758,23 @@ fn authenticate_append_expansion(
     {
         return Ok(());
     }
+    let scalar_shape = Shape::from(vec![1; expanded_shape.rank()]);
+    if expanded_shape == &scalar_shape
+        && matches!(
+            graph
+                .op(expanded)
+                .map_err(CapturedInferenceError::State)?,
+            Op::Reshape { input, shape } if *input == source && shape == expanded_shape
+        )
+        && graph
+            .shape(source)
+            .map_err(CapturedInferenceError::State)?
+            .dims()
+            == [1]
+        && graph.dtype(source).map_err(CapturedInferenceError::State)? == DType::I32
+    {
+        return Ok(());
+    }
     let Op::Expand {
         input: reshaped,
         shape: actual_expanded_shape,
@@ -755,7 +784,6 @@ fn authenticate_append_expansion(
             "append index must be one scalar expansion".into(),
         ));
     };
-    let scalar_shape = Shape::from(vec![1; expanded_shape.rank()]);
     let reshaped_source = match graph.op(*reshaped).map_err(CapturedInferenceError::State)? {
         Op::Reshape { input, shape } if shape == &scalar_shape => *input,
         _ if *reshaped == source
@@ -1449,12 +1477,73 @@ fn validate_captured_inference_binding(
     Ok(())
 }
 
+fn capture_quantized_input_names(
+    graph: &Graph,
+    bindings: &[crate::engine::capture::QuantizedCaptureBinding],
+    captured: &BTreeMap<u64, crate::QuantizedTensorData>,
+) -> std::result::Result<BTreeMap<u64, String>, CapturedInferenceError> {
+    let mut by_id = BTreeMap::new();
+    let mut by_name = BTreeMap::new();
+    for binding in bindings {
+        let weight = match binding {
+            crate::engine::capture::QuantizedCaptureBinding::RowGather { weight, .. }
+            | crate::engine::capture::QuantizedCaptureBinding::Matmul { weight, .. } => *weight,
+        };
+        let id = weight.index() as u64;
+        let Op::Input { name } = graph.op(weight).map_err(CapturedInferenceError::State)? else {
+            return Err(CapturedInferenceError::Binding(
+                "packed inference input must be a named graph Input".into(),
+            ));
+        };
+        if !captured.contains_key(&id) {
+            return Err(CapturedInferenceError::Binding(
+                "packed inference input is absent from captured ownership".into(),
+            ));
+        }
+        match by_id.entry(id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(name.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == name => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(CapturedInferenceError::Binding(
+                    "one packed inference input has conflicting names".into(),
+                ));
+            }
+        }
+        match by_name.entry(name.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(id);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if *entry.get() == id => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(CapturedInferenceError::Binding(
+                    "packed inference input names must be unique".into(),
+                ));
+            }
+        }
+    }
+    if by_id.keys().copied().collect::<BTreeSet<_>>()
+        != captured.keys().copied().collect::<BTreeSet<_>>()
+    {
+        return Err(CapturedInferenceError::Binding(
+            "packed inference input inventory is incomplete".into(),
+        ));
+    }
+    Ok(by_id)
+}
+
 fn captured_inference_identity(
     capture: &CapturedSchedule,
     residents: &BTreeMap<String, TensorData>,
+    quantized_input_names: &BTreeMap<u64, String>,
 ) -> std::result::Result<u64, CapturedInferenceError> {
     let mut hasher = DefaultHasher::new();
-    "rustgrad-captured-inference-v1".hash(&mut hasher);
+    if quantized_input_names.is_empty() {
+        "rustgrad-captured-inference-v1".hash(&mut hasher);
+    } else {
+        "rustgrad-captured-inference-v2".hash(&mut hasher);
+    }
     capture.identity.hash(&mut hasher);
     for input in &capture.inputs {
         let Some(value) = residents.get(&input.name) else {
@@ -1465,6 +1554,10 @@ fn captured_inference_identity(
             .to_le_bytes()
             .map_err(CapturedInferenceError::State)?
             .hash(&mut hasher);
+    }
+    for (id, name) in quantized_input_names {
+        id.hash(&mut hasher);
+        name.hash(&mut hasher);
     }
     Ok(hasher.finish())
 }
@@ -2055,7 +2148,12 @@ mod tests {
         let mut alternate_residents = inference.resident_bindings().clone();
         alternate_residents.insert(output_name, TensorData::new([1, 2], vec![9., 10.]).unwrap());
         assert_ne!(
-            captured_inference_identity(inference.capture(), &alternate_residents).unwrap(),
+            captured_inference_identity(
+                inference.capture(),
+                &alternate_residents,
+                inference.quantized_input_names(),
+            )
+            .unwrap(),
             deployment_identity
         );
 
