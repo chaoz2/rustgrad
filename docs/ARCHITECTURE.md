@@ -2513,11 +2513,17 @@ path: it authenticates the complete pure capture, renderer ABI, static memory
 plan, and an exhaustive resident/transient named-input partition before Metal
 resource work. `prepare` uploads buffer-backed constants and selected immutable
 resident inputs once, then type-states the prepared prefix with that exact
-resident set. Each `run` stages only transient tensors, preserves physical
-intermediates across schedule items, waits once per nonzero item, downloads only
-deduplicated materialized requested owners, and reconstructs ordered duplicate
-or affine passthrough outputs through the shared captured projection. There is
-no CPU fallback branch.
+resident set. Each `run` stages only transient tensors and prevalidates its
+complete launch set. An unguarded invocation encodes the ordered nonzero kernels
+into one compute command buffer, commits once, waits once, and retains every
+pipeline and physical buffer through completion before downloading deduplicated
+materialized requested owners. Kernel count remains the number of encoded
+nonzero schedule items, distinct from compute-command submission and wait
+counts; copy command buffers are excluded from those counters. Zero-work
+invocations submit nothing. If any item is guarded or indexed, the complete
+invocation retains the existing per-item command, status/candidate, wait, and
+atomic-publication path. Ordered duplicate or affine passthrough outputs still
+use the shared captured projection, and there is no CPU fallback branch.
 
 `CapturedInference` is the backend-neutral model admission layer above that
 runtime. From one already-composed graph plus `Module` traversal it owns the
@@ -2589,7 +2595,7 @@ uncommitted rows provisional; retry uses the same start and overwrites the
 complete span, while the successful-run count, committed position, outputs,
 and metrics advance only after all launches, waits, public downloads, decoding,
 and projection succeed. A zero non-axis payload remains addressless but advances
-by the authenticated span. Scoreboard v4 remains one-row-only: maintained paths
+by the authenticated span. Scoreboard v5 remains one-row-only: maintained paths
 can reject larger spans before preparation and legacy construction rejects them
 at bind without changing its JSON semantics.
 This is not generic in-place Scatter, dynamic state, or alias permission.
@@ -2630,28 +2636,30 @@ deterministic counts from host wall-clock durations and host API copy bytes;
 initialization upload time includes immutable resident and initial-state writes;
 they make no claim about allocator RSS, PCIe traffic, cache residency, or GPU
 timestamps. Runs are synchronous host transactions and currently submit and
-wait per schedule item rather than batching one command buffer. Invalid calls
+wait once for a complete unguarded compute batch; guarded or indexed invocations
+retain their per-item transactional commands and waits. Invalid calls
 reach no driver work; a failed execution publishes neither outputs nor a
 successful-run metric and the settled prefix remains retryable. Zero-work
 captures allocate, compile, upload, launch, wait, and read nothing.
 
-`MetalSessionScoreboard` v4 is an opt-in observation layer over that existing
+`MetalSessionScoreboard` v5 is an opt-in observation layer over that existing
 evidence. It snapshots either a stateless `MetalInferencePlan` or an
 append-only `MetalAppendStateInferencePlan`, binds once to the exact prepared
 deployment/session identity, and accepts only its consecutive successful
 `MetalDeviceRun` prefix. The immutable report preserves every run's ordinal,
-first-run bit, host-wall times, transfers, launches, zero-item skips, output
-count, and authenticated append position/row commit in invocation order. It
-derives checked aggregate transfer, launch, and state-commit totals from those
-same records, separates the first sample, and reports integer-duration
+first-run bit, host-wall times, transfers, kernel encodes, compute-command
+submissions/waits, zero-item skips, output count, and authenticated append
+position/row commit in invocation order. It derives checked aggregate transfer,
+kernel, compute-command, and state-commit totals from those same records,
+separates the first sample, and reports integer-duration
 nearest-rank percentiles over the remaining samples. Versioned deterministic
 JSON includes caller-labelled workload, implementation revision, evidence
 provenance, selected handle-free device, captured resident/state/transient
 and runtime-control descriptors, distinct dense-tensor and packed-GGUF captured
 constant counts and raw bytes, one-time initial-state writes, logical
-schedule/peak-live facts, and physical Metal slot/state-bank facts. Version 4
-also gives runtime-control writes distinct fields without reclassifying them as
-caller transients.
+schedule/peak-live facts, and physical Metal slot/state-bank facts. Version 5
+adds compute-only command submission/wait counters while retaining version 4's
+distinct runtime-control fields; copy command buffers are not counted.
 `planning_wall_time` is planning and rendering; `native_prepare_wall_time`
 includes compilation, allocation, and queue setup; and
 `cache_miss_pipeline_build_wall_time` times only successful native
@@ -2665,7 +2673,7 @@ append session; it does not build a token generator, choose samples, or advance
 state independently. Fixed epoch-swapped state remains an explicit follow-up.
 
 `LlamaMetalPlan::prepare_with_scoreboard` snapshots that exact append-state
-step plan before preparation, then binds the v4 recorder to the fresh prepared
+step plan before preparation, then binds the v5 recorder to the fresh prepared
 session before returning it. Both retained-logit and host-output-suppressed
 token invocations pass their authenticated `MetalDeviceRun` to the recorder
 before detaching the public report. Recording is fail-soft: the first recorder
@@ -2798,14 +2806,14 @@ oracle. The typed ResNet benchmark constructs the complete default Eval/F32
 Metal session, and checks ten repeated session outputs by default under the
 documented F32 native-compilation tolerance. The workflow runs that complete
 benchmark exactly once rather than duplicating it through the ignored live
-test, and uploads its deterministic v4 scoreboard beside the Linear report.
+test, and uploads its deterministic v5 scoreboard beside the Linear report.
 The separate Llama job accepts only the protected Metal registry identity and
 a runner-local GGUF whose SHA-256 matches protected configuration, plus a
 protected prompt, positive token bound, and independently pinned greedy token
 IDs. It performs no model download, prepares
 one persistent dense-or-packed session, checks ordered token-step reports,
 resident/cache ownership, zero fallback, suppressed prompt downloads, and
-retained logits downloads, then uploads a distinct v4 scoreboard, typed
+retained logits downloads, then uploads distinct v2 workload evidence, typed
 provenance attestation, and basename-only `SHA256SUMS`. The create-new
 attestation records the reviewed code SHA, supplied model SHA-256, filename and
 size (never the runner-local absolute path), immutable model locator/revision,
@@ -2820,11 +2828,12 @@ with another runtime.
 These paths prove stable resident schemas, compiled cache identities, device
 ownership, zero run-time resident upload, and zero fallback. The release profile
 keeps the one complete CPU oracle practical without weakening the device
-workload. Scoreboard durations are host wall time and copy counters are host API
-calls; neither is a GPU timestamp, tokens-per-second result, nor physical-bus
-traffic. The workflow has no push or pull-request trigger. No matching runner,
-environment, or authenticated GGUF is currently provisioned, so this lane is
-dormant and its presence is not live-device or performance evidence.
+workload. Scoreboard durations are host wall time; copy counters are host API
+calls; and command submission/wait counters cover compute command buffers only.
+None is a GPU timestamp, tokens-per-second result, physical-bus measurement, or
+live-device speedup claim. The workflow has no push or pull-request trigger. No
+matching runner, environment, or authenticated GGUF is currently provisioned,
+so this lane is dormant and its presence is not live-device or performance evidence.
 Provisioning must attach the exact runner labels, restrict deployment refs and
 reviewers on `live-metal`, and define protected
 `RUSTGRAD_METAL_LLAMA_GGUF_PATH`, `RUSTGRAD_METAL_LLAMA_GGUF_SHA256`,

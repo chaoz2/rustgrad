@@ -60,14 +60,19 @@ expose truthful host-API/planned metrics, and have no CPU fallback. Protected
 acceptance now takes the complete default Eval/F32 ResNet-18 `[1,3,224,224]`
 graph through boundary-free scheduling and capture, renders every scheduled
 item to MSL, then performs persistent resident preparation and repeated
-ABI-validating virtual-resource runs. The opt-in Metal scoreboard v4 records
+ABI-validating virtual-resource runs. Complete unguarded persistent invocations,
+including that protected semantic ResNet-18 path, prevalidate their launches,
+encode ordered kernels into one compute command buffer, commit once, wait once,
+and retain resources through completion; zero-work invocations submit nothing.
+Any guarded or indexed item keeps the existing per-item transactional path. The
+opt-in Metal scoreboard v5 records
 one exact stateless or append-only session's successful prefix with ordered
-per-run host-wall/copy/launch and append-position/row-commit records, checked
-aggregates, successful cache-miss pipeline-build time, logical schedule/peak-live
-facts, and distinct physical Metal slot/state-bank facts. Failed attempts cannot
-enter that prefix or advance recorder-owned counters. The Llama facade can bind
-this recorder before preparation and observe retained or suppressed token-step
-runs fail-soft, but the records deliberately do not classify tokenization,
+per-run host-wall/copy/kernel/compute-command and append-position/row-commit
+records, checked aggregates, successful cache-miss pipeline-build time, logical
+schedule/peak-live facts, and distinct physical Metal slot/state-bank facts.
+Failed attempts cannot enter that prefix or advance recorder-owned counters.
+The Llama facade can bind this recorder before preparation and observe retained
+or suppressed token-step runs fail-soft, but the records deliberately do not classify tokenization,
 prompt, decode, chat, or sampling work. It remains host-observed execution
 measurement plumbing, not live workload evidence, allocator peak memory, bus
 traffic, GPU timing, or tokens-per-second evidence.
@@ -89,7 +94,7 @@ workflow. A separate job authenticates the selected Metal registry ID and
 runner-local GGUF bytes against protected values, uses an independently pinned
 prompt and greedy token IDs, checks the persistent token-step
 ownership/transfer contract, and emits its own
-v4 scoreboard plus a typed provenance attestation and checksum manifest without
+v2 workload evidence plus a typed provenance attestation and checksum manifest without
 downloading or uploading a model. The attestation preserves the protected
 model/oracle provenance and exact prompt/ID contract but records, rather than
 independently re-proves, the workflow's prior GGUF hash check. Those IDs are
@@ -98,8 +103,9 @@ release-profile lane
 is dormant until the matching runner, protected environment, and authenticated
 model are provisioned; the repository workflow only references those external
 controls. Ordinary macOS CI remains mock-only and no live-device result is
-claimed by the workflow definition itself. Its host-wall/API-copy observations
-are not GPU time, tokens per second, or physical transfer measurements.
+claimed by the workflow definition itself. Its host-wall/API-copy and compute-
+command observations are not GPU time, tokens per second, physical transfer
+measurements, or evidence of a live-device speedup.
 
 ### 2. P0 — ResNet-18 Metal conformance
 
@@ -132,7 +138,7 @@ chat template, prepares one persistent Metal session, suppresses intermediate
 prefill logits, and provides sequential T=1 ID/text/chat generation with host
 sampling. The generic Metal append runtime now authenticates fixed nonzero row
 spans and commits their checked position atomically; this is a prerequisite,
-not model chunk-prefill, and scoreboard v4 remains one-row-only. Private Metal
+not model chunk-prefill, and scoreboard v5 remains one-row-only. Private Metal
 admission now also accepts exact dense batch-one `[1,T]` I32 token or position
 vectors only through canonical reshape/expand Gather lineage, checks all lanes
 before driver work, and uses a distinct status-free direct-render cache domain

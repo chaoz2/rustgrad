@@ -29,6 +29,8 @@ const SCOREBOARD_WORKLOAD: &str = "gguf-llama-metal-generate";
 const SCOREBOARD_EVIDENCE: &str = "live self-hosted Apple GPU prompt-to-tokens harness";
 const WORKLOAD_EVIDENCE: &str =
     "host-observed fixed-span prefill and steady-decode Metal workload evidence";
+const SCOREBOARD_EVIDENCE_KIND: &str = "metal_session_scoreboard_v5";
+const LLAMA_WORKLOAD_EVIDENCE_KIND: &str = "llama_metal_workload_evidence_v2";
 
 #[derive(Debug, Eq, PartialEq)]
 struct Args {
@@ -803,12 +805,12 @@ fn attestation_json(context: AttestationRecordContext<'_>) -> Result<Vec<u8>, io
     let (evidence_kind, execution_plan_identity, fallback_count) = match (report, workload_artifact)
     {
         (Some(report), None) => (
-            "metal_session_scoreboard_v4",
+            SCOREBOARD_EVIDENCE_KIND,
             Some(report.execution_plan_identity),
             report.fallback_count,
         ),
         (None, Some(artifact)) => (
-            "llama_metal_workload_evidence_v1",
+            LLAMA_WORKLOAD_EVIDENCE_KIND,
             None,
             artifact.fallback_count(),
         ),
@@ -1088,8 +1090,9 @@ fn partial_message(
 mod tests {
     use super::{
         Args, AttestationArgs, AttestedDevice, AttestedEvidence, AttestedInvocation, AttestedModel,
-        AttestedOracle, MetalLlamaAttestation, parse_args, serialize_attestation,
-        validate_evidence_paths, write_new_evidence,
+        AttestedOracle, LLAMA_WORKLOAD_EVIDENCE_KIND, MetalLlamaAttestation,
+        SCOREBOARD_EVIDENCE_KIND, parse_args, serialize_attestation, validate_evidence_paths,
+        write_new_evidence,
     };
     use std::{
         fs,
@@ -1368,7 +1371,7 @@ mod tests {
             evidence: AttestedEvidence {
                 workflow_run_url: "https://example.invalid/actions/runs/9",
                 workflow_run_id: "9",
-                evidence_kind: "metal_session_scoreboard_v4",
+                evidence_kind: SCOREBOARD_EVIDENCE_KIND,
                 evidence_filename: "scoreboard.json",
                 token_step_deployment_identity: 10,
                 fixed_prefill_deployment_identity: None,
@@ -1388,6 +1391,12 @@ mod tests {
             serde_json::json!([3, 4])
         );
         assert_eq!(value["evidence"]["fallback_count"], 0);
+        assert_eq!(SCOREBOARD_EVIDENCE_KIND, "metal_session_scoreboard_v5");
+        assert_eq!(value["evidence"]["evidence_kind"], SCOREBOARD_EVIDENCE_KIND);
+        assert_eq!(
+            LLAMA_WORKLOAD_EVIDENCE_KIND,
+            "llama_metal_workload_evidence_v2"
+        );
         assert!(!std::str::from_utf8(&bytes).unwrap().contains("/runner/"));
         assert_eq!(bytes.last(), Some(&b'\n'));
         assert_eq!(bytes, serialize_attestation(&attestation).unwrap());

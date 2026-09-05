@@ -115,9 +115,10 @@ println!("steady run: {:?}", second.report());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The lower-level session and opt-in scoreboard remain available for detailed
-deployment evidence. Their host wall-clock and host API copy counts do not
-claim GPU time, physical bus traffic, allocator RSS, energy, or throughput.
+The lower-level session and opt-in v5 scoreboard distinguish kernel encodes
+from compute-command submissions and waits. These host-observed counts exclude
+copy command buffers and do not claim GPU time, live speedup, physical bus
+traffic, allocator RSS, energy, or throughput.
 
 Dense-or-packed F32 GGUF Llama models also have a typed persistent Metal
 prompt-to-tokens facade. One GGUF parse owns the matching model, tokenizer, and
@@ -146,7 +147,7 @@ The greedy facade reduces finite logits on device and downloads one checked I32
 token per selecting invocation. An opt-in fixed span executes complete prompt
 chunks while sharing the same resident weights, K/V cache, and command queue.
 `LlamaMetalPlan` remains the explicit host-logits facade for Gumbel sampling and
-the v4 token-step scoreboard. Commits are atomic per device invocation, but a
+the v5 token-step scoreboard. Commits are atomic per device invocation, but a
 later failure does not roll back an already committed prefix.
 Current protected evidence is semantic-mock only; the maintained
 `metal_llama_generate` example is the manual live-lane entry point:

@@ -142,7 +142,7 @@ pub struct MetalDeviceRunReport {
     pub first_successful_run: bool,
     /// Host wall-clock duration of validation, device execution, and projection.
     pub run_wall_time: Duration,
-    /// Host wall-clock duration of host API copies and per-item launch/wait calls.
+    /// Host wall-clock duration of host API copies, command submission, and waits.
     pub synchronous_transaction_wall_time: Duration,
     /// Host API writes for transient inputs only.
     pub transient_h2d_calls: usize,
@@ -156,8 +156,14 @@ pub struct MetalDeviceRunReport {
     pub retained_d2h_calls: usize,
     /// Bytes passed to retained-output host API reads.
     pub retained_d2h_bytes: usize,
-    /// Nonzero schedule items launched, each followed by its own wait.
+    /// Nonzero schedule items encoded across submitted command buffers.
     pub kernel_launch_count: usize,
+    /// Metal compute command buffers committed by this invocation; host API
+    /// H2D/D2H copy calls are counted separately and excluded.
+    pub command_submission_count: usize,
+    /// Metal compute command buffers synchronously waited by this invocation;
+    /// host API H2D/D2H copy calls are counted separately and excluded.
+    pub command_wait_count: usize,
     /// Addressless schedule items skipped during this invocation.
     pub zero_item_count: usize,
     /// Logical outputs after ordered duplicate/alias projection.
@@ -1752,6 +1758,8 @@ fn run_report(input: RunReportInput) -> MetalDeviceRunReport {
         retained_d2h_calls: transfer.d2h_calls,
         retained_d2h_bytes: transfer.d2h_bytes,
         kernel_launch_count: transfer.kernel_launches,
+        command_submission_count: transfer.command_submissions,
+        command_wait_count: transfer.command_waits,
         zero_item_count,
         output_count,
         committed_state_pair_count: committed_state.pair_count,

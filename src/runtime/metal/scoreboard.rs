@@ -9,7 +9,7 @@ use serde::{Serialize, Serializer};
 use std::{collections::BTreeSet, fmt, fs, io, path::Path, rc::Rc, time::Duration};
 
 /// Current deterministic JSON schema emitted by [`MetalSessionScoreboardReport`].
-pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 4;
+pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 5;
 const MAX_METADATA_BYTES: usize = 1_024;
 
 /// Caller-supplied labels attached to one measurement series.
@@ -119,7 +119,7 @@ pub struct MetalScoreboardRun {
     pub first_successful_run: bool,
     /// Host wall time covering validation, execution, and output projection.
     pub run_wall_time: Duration,
-    /// Host wall time covering copies plus launch/wait calls.
+    /// Host wall time covering copies plus command submission and waits.
     pub synchronous_transaction_wall_time: Duration,
     /// Per-invocation transient host API writes.
     pub transient_host_api_h2d_calls: usize,
@@ -135,6 +135,12 @@ pub struct MetalScoreboardRun {
     pub retained_host_api_d2h_bytes: usize,
     /// Nonzero schedule items launched by this invocation.
     pub kernel_launch_count: usize,
+    /// Metal compute command buffers committed by this invocation; host API
+    /// H2D/D2H copy calls are counted separately and excluded.
+    pub command_submission_count: usize,
+    /// Metal compute command buffers synchronously waited by this invocation;
+    /// host API H2D/D2H copy calls are counted separately and excluded.
+    pub command_wait_count: usize,
     /// Addressless schedule items skipped by this invocation.
     pub zero_item_count: usize,
     /// Logical outputs published after ordered projection.
@@ -163,6 +169,8 @@ impl MetalScoreboardRun {
             retained_host_api_d2h_calls: report.retained_d2h_calls,
             retained_host_api_d2h_bytes: report.retained_d2h_bytes,
             kernel_launch_count: report.kernel_launch_count,
+            command_submission_count: report.command_submission_count,
+            command_wait_count: report.command_wait_count,
             zero_item_count: report.zero_item_count,
             output_count: report.output_count,
             committed_state_pair_count: report.committed_state_pair_count,
@@ -296,6 +304,12 @@ pub struct MetalSessionScoreboardReport {
     pub host_api_d2h_bytes: usize,
     /// Exact launches across the recorded successful-run prefix.
     pub kernel_launch_count: usize,
+    /// Exact Metal compute command-buffer submissions across the successful-run
+    /// prefix; host API H2D/D2H copy calls are excluded.
+    pub command_submission_count: usize,
+    /// Exact synchronous Metal compute command waits across the successful-run
+    /// prefix; host API H2D/D2H copy calls are excluded.
+    pub command_wait_count: usize,
     /// Addressless item skips across the recorded successful-run prefix.
     pub zero_item_count: usize,
     /// Recurrent pair commits across the recorded successful-run prefix.
@@ -344,7 +358,7 @@ pub enum MetalScoreboardError {
     NotBound,
     /// The session is not a fresh preparation of the snapshotted deployment.
     PlanMismatch,
-    /// Scoreboard v4 defines one committed row per successful invocation.
+    /// Token-step evidence requires one committed row per successful invocation.
     UnsupportedAppendSpan { span_rows: usize },
     /// The successful run belongs to another prepared session.
     WrongSession,
@@ -380,7 +394,7 @@ impl fmt::Display for MetalScoreboardError {
             ),
             Self::UnsupportedAppendSpan { span_rows } => write!(
                 formatter,
-                "Metal scoreboard v4 does not support append spans of {span_rows} rows"
+                "Metal token-step scoreboard requires one appended row per successful invocation; got a span of {span_rows} rows"
             ),
             Self::WrongSession => write!(formatter, "Metal run belongs to another session"),
             Self::OutOfOrder { expected, actual } => write!(
@@ -463,7 +477,7 @@ impl MetalSessionScoreboard {
     /// Snapshots one authenticated append-state deployment without creating a
     /// Metal resource. Generation/model orchestration remains caller-owned.
     ///
-    /// Version-4 callers should use [`Self::try_new_append_state_v4`] so a
+    /// Token-step callers should use [`Self::try_new_append_state_v4`] so a
     /// multirow plan rejects before preparation. This source-compatible legacy
     /// constructor permits inspection, but its recorder rejects a multirow
     /// session with [`MetalScoreboardError::UnsupportedAppendSpan`] at bind.
@@ -487,7 +501,7 @@ impl MetalSessionScoreboard {
         scoreboard
     }
 
-    /// Creates a v4 recorder only when one success commits exactly one row.
+    /// Creates a token-step recorder only when one success commits exactly one row.
     pub fn try_new_append_state_v4(
         context: MetalScoreboardContext,
         plan: &MetalAppendStateInferencePlan,
@@ -739,6 +753,8 @@ impl MetalSessionScoreboard {
             host_api_d2h_calls: totals.retained_d2h_calls,
             host_api_d2h_bytes: totals.retained_d2h_bytes,
             kernel_launch_count: totals.kernel_launch_count,
+            command_submission_count: totals.command_submission_count,
+            command_wait_count: totals.command_wait_count,
             zero_item_count: totals.zero_item_count,
             committed_state_pair_count: totals.committed_state_pair_count,
             committed_state_bytes: totals.committed_state_bytes,
@@ -761,6 +777,8 @@ struct RunTotals {
     retained_d2h_calls: usize,
     retained_d2h_bytes: usize,
     kernel_launch_count: usize,
+    command_submission_count: usize,
+    command_wait_count: usize,
     zero_item_count: usize,
     committed_state_pair_count: usize,
     committed_state_bytes: usize,
@@ -798,6 +816,8 @@ impl RunTotals {
         checked_add!(retained_d2h_calls, report.retained_host_api_d2h_calls);
         checked_add!(retained_d2h_bytes, report.retained_host_api_d2h_bytes);
         checked_add!(kernel_launch_count, report.kernel_launch_count);
+        checked_add!(command_submission_count, report.command_submission_count);
+        checked_add!(command_wait_count, report.command_wait_count);
         checked_add!(zero_item_count, report.zero_item_count);
         checked_add!(
             committed_state_pair_count,
@@ -998,6 +1018,8 @@ mod tests {
             host_api_d2h_calls: 4,
             host_api_d2h_bytes: 32,
             kernel_launch_count: 4,
+            command_submission_count: 4,
+            command_wait_count: 4,
             zero_item_count: 0,
             committed_state_pair_count: 0,
             committed_state_bytes: 0,
@@ -1018,6 +1040,8 @@ mod tests {
                         retained_host_api_d2h_calls: 1,
                         retained_host_api_d2h_bytes: 8,
                         kernel_launch_count: 1,
+                        command_submission_count: 1,
+                        command_wait_count: 1,
                         zero_item_count: 0,
                         output_count: 1,
                         committed_state_pair_count: 0,
@@ -1047,7 +1071,7 @@ mod tests {
         let first = report.to_json_bytes().unwrap();
         assert_eq!(first, report.to_json_bytes().unwrap());
         let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(value["format_version"], 4);
+        assert_eq!(value["format_version"], 5);
         assert_eq!(value["workload"], "linear");
         assert_eq!(value["implementation_revision"], "abc123");
         assert_eq!(value["evidence"], "semantic mock");
@@ -1057,6 +1081,8 @@ mod tests {
         assert_eq!(value["inputs"][1]["kind"], "runtime_control");
         assert_eq!(value["deployment_identity"], 1);
         assert_eq!(value["runtime_control_host_api_h2d_calls"], 4);
+        assert_eq!(value["command_submission_count"], 4);
+        assert_eq!(value["command_wait_count"], 4);
         assert_eq!(
             value["successful_runs"][0]["runtime_control_host_api_h2d_bytes"],
             4

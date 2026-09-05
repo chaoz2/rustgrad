@@ -3,8 +3,8 @@ use super::{
     MetalBuffer, MetalDeviceInfo, MetalError, MetalRenderer, RenderedMetal,
     buffer::{BufferSnapshot, PhysicalBuffer},
     dispatch::{
-        CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawCommand, RawDevice, RawLibrary,
-        RawPipeline, RawQueue,
+        BatchLaunch, CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawCommand, RawDevice,
+        RawLibrary, RawPipeline, RawQueue,
     },
     ffi::NativeDispatch,
     transaction::{CLEAN_STATUS, detail_rhs_at, logical_offset},
@@ -362,8 +362,56 @@ impl MetalCommandQueue {
         Ok(Some(MetalCommand::new(
             self.device.clone(),
             raw,
+            Vec::new(),
             vec![src, dst],
             0,
+        )))
+    }
+
+    pub(super) fn launch_batch(
+        &self,
+        launches: &[MetalBatchItem<'_>],
+    ) -> Result<Option<MetalCommand>, MetalError> {
+        self.live()?;
+        let mut validated = Vec::with_capacity(launches.len());
+        for launch in launches {
+            if let Some(launch) = launch.pipeline.validate_launch(
+                self,
+                launch.bindings,
+                launch.local_size,
+                launch.capture_initialized,
+            )? {
+                validated.push(launch);
+            }
+        }
+        if validated.is_empty() {
+            return Ok(None);
+        }
+        let extent = validated.iter().try_fold(0usize, |total, launch| {
+            total.checked_add(launch.extent).ok_or(MetalError::Overflow)
+        })?;
+        let raw_launches = validated
+            .iter()
+            .map(|launch| launch.raw.clone())
+            .collect::<Vec<_>>();
+        let raw = self
+            .device
+            .dispatch
+            .launch_batch(self.raw, &raw_launches, self.device.owner)?;
+        let pipelines = validated
+            .iter()
+            .map(|launch| launch.pipeline.clone())
+            .collect();
+        let snapshots = validated
+            .into_iter()
+            .flat_map(|launch| launch.snapshots)
+            .collect();
+        Ok(Some(MetalCommand::new(
+            self.device.clone(),
+            raw,
+            pipelines,
+            snapshots,
+            extent,
         )))
     }
 }
@@ -462,6 +510,20 @@ pub struct MetalPipeline {
     inner: Rc<PipelineInner>,
 }
 
+pub(super) struct MetalBatchItem<'a> {
+    pub(super) pipeline: &'a MetalPipeline,
+    pub(super) bindings: &'a [&'a MetalBuffer],
+    pub(super) local_size: usize,
+    pub(super) capture_initialized: bool,
+}
+
+struct ValidatedMetalLaunch {
+    pipeline: Rc<PipelineInner>,
+    snapshots: Vec<BufferSnapshot>,
+    raw: BatchLaunch,
+    extent: usize,
+}
+
 impl MetalPipeline {
     /// Returns the native per-threadgroup thread limit.
     pub fn max_total_threads(&self) -> usize {
@@ -499,6 +561,35 @@ impl MetalPipeline {
         local_size: usize,
         capture_initialized: bool,
     ) -> Result<Option<MetalCommand>, MetalError> {
+        let Some(validated) =
+            self.validate_launch(queue, bindings, local_size, capture_initialized)?
+        else {
+            return Ok(None);
+        };
+        let device = &self.inner.library.device;
+        let raw = device.dispatch.launch(
+            queue.raw,
+            validated.raw.pipeline,
+            &validated.raw.buffers,
+            validated.raw.geometry,
+            device.owner,
+        )?;
+        Ok(Some(MetalCommand::new(
+            device.clone(),
+            raw,
+            vec![validated.pipeline],
+            validated.snapshots,
+            validated.extent,
+        )))
+    }
+
+    fn validate_launch<'a>(
+        &'a self,
+        queue: &'a MetalCommandQueue,
+        bindings: &[&'a MetalBuffer],
+        local_size: usize,
+        capture_initialized: bool,
+    ) -> Result<Option<ValidatedMetalLaunch>, MetalError> {
         queue.live()?;
         let device = &self.inner.library.device;
         if !Rc::ptr_eq(device, &queue.device) {
@@ -567,24 +658,22 @@ impl MetalPipeline {
             .iter()
             .map(|snapshot| snapshot.raw().ok_or(MetalError::Bounds))
             .collect::<Result<Vec<_>, _>>()?;
-        let raw = device.dispatch.launch(
-            queue.raw,
-            self.inner.raw,
-            &raws,
-            LaunchGeometry {
-                extent: u64::try_from(rendered.extent).map_err(|_| MetalError::Overflow)?,
-                extent_index: raws.len(),
-                global,
-                local: local_size,
-            },
-            device.owner,
-        )?;
-        Ok(Some(MetalCommand::new(
-            device.clone(),
-            raw,
+        let extent_index = raws.len();
+        Ok(Some(ValidatedMetalLaunch {
+            pipeline: self.inner.clone(),
             snapshots,
-            rendered.extent,
-        )))
+            raw: BatchLaunch {
+                pipeline: self.inner.raw,
+                buffers: raws,
+                geometry: LaunchGeometry {
+                    extent: u64::try_from(rendered.extent).map_err(|_| MetalError::Overflow)?,
+                    extent_index,
+                    global,
+                    local: local_size,
+                },
+            },
+            extent: rendered.extent,
+        }))
     }
 
     /// Submits a guarded kernel into a provisional physical output.
@@ -706,6 +795,7 @@ impl MetalPipeline {
             command: Some(MetalCommand {
                 device: device.clone(),
                 raw: Some(raw),
+                _pipelines: vec![self.inner.clone()],
                 snapshots: Vec::new(),
                 retained,
                 extent: rendered.extent,
@@ -884,6 +974,7 @@ fn decode_detail_scalar(dtype: DType, bytes: &[u8]) -> Result<crate::Scalar, Met
 pub struct MetalCommand {
     device: Rc<DeviceInner>,
     raw: Option<RawCommand>,
+    _pipelines: Vec<Rc<PipelineInner>>,
     snapshots: Vec<BufferSnapshot>,
     retained: Vec<Rc<PhysicalBuffer>>,
     extent: usize,
@@ -893,6 +984,7 @@ impl MetalCommand {
     fn new(
         device: Rc<DeviceInner>,
         raw: RawCommand,
+        pipelines: Vec<Rc<PipelineInner>>,
         snapshots: Vec<BufferSnapshot>,
         extent: usize,
     ) -> Self {
@@ -903,6 +995,7 @@ impl MetalCommand {
         Self {
             device,
             raw: Some(raw),
+            _pipelines: pipelines,
             snapshots,
             retained,
             extent,

@@ -13,7 +13,7 @@ use std::{
 };
 
 /// Current deterministic Metal Llama workload-evidence JSON format.
-pub const LLAMA_METAL_WORKLOAD_EVIDENCE_FORMAT_VERSION: u32 = 1;
+pub const LLAMA_METAL_WORKLOAD_EVIDENCE_FORMAT_VERSION: u32 = 2;
 
 const MAX_CONTEXT_FIELD_BYTES: usize = 1_024;
 
@@ -52,6 +52,12 @@ pub struct LlamaMetalWorkloadPhase {
     pub host_run_wall_time: Duration,
     pub host_synchronous_transaction_wall_time: Duration,
     pub kernel_launch_count: usize,
+    /// Metal compute command buffers committed in this phase; host API H2D/D2H
+    /// copy calls are counted separately and excluded.
+    pub command_submission_count: usize,
+    /// Metal compute command buffers synchronously waited in this phase; host
+    /// API H2D/D2H copy calls are counted separately and excluded.
+    pub command_wait_count: usize,
     pub transient_h2d_calls: usize,
     pub transient_h2d_bytes: usize,
     pub runtime_control_h2d_calls: usize,
@@ -68,6 +74,8 @@ impl LlamaMetalWorkloadPhase {
             host_run_wall_time: Duration::ZERO,
             host_synchronous_transaction_wall_time: Duration::ZERO,
             kernel_launch_count: 0,
+            command_submission_count: 0,
+            command_wait_count: 0,
             transient_h2d_calls: 0,
             transient_h2d_bytes: 0,
             runtime_control_h2d_calls: 0,
@@ -85,6 +93,12 @@ impl LlamaMetalWorkloadPhase {
             phase.kernel_launch_count = phase
                 .kernel_launch_count
                 .saturating_add(report.kernel_launch_count);
+            phase.command_submission_count = phase
+                .command_submission_count
+                .saturating_add(report.command_submission_count);
+            phase.command_wait_count = phase
+                .command_wait_count
+                .saturating_add(report.command_wait_count);
             phase.transient_h2d_calls = phase
                 .transient_h2d_calls
                 .saturating_add(report.transient_h2d_calls);
@@ -465,6 +479,8 @@ struct PhaseJson {
     host_run_wall_time: DurationJson,
     host_synchronous_transaction_wall_time: DurationJson,
     kernel_launch_count: usize,
+    command_submission_count: usize,
+    command_wait_count: usize,
     transient_h2d_calls: usize,
     transient_h2d_bytes: usize,
     runtime_control_h2d_calls: usize,
@@ -483,6 +499,8 @@ impl From<&LlamaMetalWorkloadPhase> for PhaseJson {
                 .host_synchronous_transaction_wall_time
                 .into(),
             kernel_launch_count: value.kernel_launch_count,
+            command_submission_count: value.command_submission_count,
+            command_wait_count: value.command_wait_count,
             transient_h2d_calls: value.transient_h2d_calls,
             transient_h2d_bytes: value.transient_h2d_bytes,
             runtime_control_h2d_calls: value.runtime_control_h2d_calls,
@@ -569,6 +587,8 @@ mod tests {
             host_run_wall_time: Duration::new(9, 10),
             host_synchronous_transaction_wall_time: Duration::new(11, 12),
             kernel_launch_count: 1,
+            command_submission_count: 1,
+            command_wait_count: 1,
             transient_h2d_calls: 1,
             transient_h2d_bytes: tokens * 4,
             runtime_control_h2d_calls: 1,
@@ -613,7 +633,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&first).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.last(), Some(&b'\n'));
-        assert_eq!(json["format_version"], 1);
+        assert_eq!(json["format_version"], 2);
         assert_eq!(json["device"]["registry_id"], 7);
         assert_eq!(json["evidence"]["token_step_deployment_identity"], 13);
         assert_eq!(
@@ -621,6 +641,11 @@ mod tests {
             1
         );
         assert_eq!(json["evidence"]["fallback_count"], 0);
+        assert_eq!(
+            json["evidence"]["prompt_prefill"]["command_submission_count"],
+            1
+        );
+        assert_eq!(json["evidence"]["prompt_prefill"]["command_wait_count"], 1);
     }
 
     #[test]
