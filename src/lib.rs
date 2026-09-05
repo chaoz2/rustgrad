@@ -257,14 +257,15 @@ pub use schedule::{
 };
 pub use session::{
     BinaryClassificationSummary, CapturedAppendStateInference, CapturedInference,
-    CapturedInferenceError, CapturedStatefulInference, ClassificationSummary,
-    CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult, CpuBinaryModuleTrainer,
-    CpuCompiledMomentumSgd, CpuGradientStore, CpuModeModuleTrainer, CpuModuleTrainer, CpuSession,
-    DynamicTensor, InferenceAppendStateLink, InferenceStateLink, MaskedSelectOutput,
-    MetalSessionResult, MetalSessionTrace, ModuleBinaryCrossEntropy, ModuleCrossEntropy,
-    ModuleInferenceResult, ModuleStepResult, NativeModuleExecutionReport,
-    NativeModuleInferenceResult, NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult,
-    SessionDevice, Tensor, TrainingParameterInit, infer_module_cpu, infer_module_native_cpu,
+    CapturedInferenceError, CapturedStatefulInference, ClassificationSummary, CompiledAdamWConfig,
+    CompiledAdamWStepResult, CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult,
+    CompiledTrainingStepResult, CpuBinaryModuleTrainer, CpuCompiledAdamW, CpuCompiledMomentumSgd,
+    CpuGradientStore, CpuModeModuleTrainer, CpuModuleTrainer, CpuSession, DynamicTensor,
+    InferenceAppendStateLink, InferenceStateLink, MaskedSelectOutput, MetalSessionResult,
+    MetalSessionTrace, ModuleBinaryCrossEntropy, ModuleCrossEntropy, ModuleInferenceResult,
+    ModuleStepResult, NativeModuleExecutionReport, NativeModuleInferenceResult,
+    NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult, SessionDevice, Tensor,
+    TrainingParameterInit, infer_module_cpu, infer_module_native_cpu,
     infer_module_native_cpu_with_report, summarize_binary_classification, summarize_classification,
 };
 pub use sharded_cuda_execute::{

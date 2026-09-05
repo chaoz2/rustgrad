@@ -5,7 +5,7 @@
 //! [`Tensor`] handle carries that session identity and is rejected elsewhere.
 
 mod classification;
-mod compiled_momentum;
+mod compiled_training;
 mod cpu;
 mod inference;
 mod train;
@@ -14,9 +14,10 @@ pub use classification::{
     BinaryClassificationSummary, ClassificationSummary, summarize_binary_classification,
     summarize_classification,
 };
-pub use compiled_momentum::{
-    CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult, CpuCompiledMomentumSgd,
-    TrainingParameterInit,
+pub use compiled_training::{
+    CompiledAdamWConfig, CompiledAdamWStepResult, CompiledMomentumSgdConfig,
+    CompiledMomentumSgdStepResult, CompiledTrainingStepResult, CpuCompiledAdamW,
+    CpuCompiledMomentumSgd, TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,
