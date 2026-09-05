@@ -16,7 +16,7 @@ use crate::{
     },
     tokenizer::{SimpleTokenizer, TokenizerError},
 };
-use std::{collections::BTreeMap, error, fmt, num::NonZeroUsize};
+use std::{collections::BTreeMap, error, fmt, num::NonZeroUsize, time::Duration};
 
 /// Resource-free, GGUF-bound deployment plan for one selected Metal device.
 ///
@@ -53,6 +53,7 @@ pub struct LlamaMetalPrefill {
     logits: TensorData,
     reports: Vec<MetalDeviceRunReport>,
     start_position: usize,
+    workload_evidence: LlamaMetalWorkloadEvidence,
 }
 
 /// Successful Metal generation plus an inspectable report for every committed
@@ -61,6 +62,118 @@ pub struct LlamaMetalPrefill {
 pub struct LlamaMetalGeneration {
     generation: LlamaGeneration,
     reports: Vec<MetalDeviceRunReport>,
+    workload_evidence: LlamaMetalWorkloadEvidence,
+}
+
+/// Host-observed performance evidence for one completed Llama workload.
+///
+/// The plan and preparation reports retain their existing precise meanings:
+/// `planned_device_bytes` is a physical static-plan allocation total, while
+/// `resident_input_bytes` is the declared payload of inputs retained by the
+/// device session. Transfer counts and bytes are host API calls, not a claim
+/// about a bus. All durations are host wall times; this type contains no GPU
+/// timestamp or device-throughput measurement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LlamaMetalWorkloadEvidence {
+    /// Deterministic planned allocation, kernel, and fallback facts.
+    pub plan: MetalDeviceSessionSummary,
+    /// One-time token-step planning, native preparation, and host API writes.
+    pub token_step_preparation: MetalDevicePreparationReport,
+    /// One-time fixed-span prefill preparation when that program is enabled.
+    pub fixed_prefill_preparation: Option<MetalDevicePreparationReport>,
+    /// The first successful device invocation, if the workload executed one.
+    pub first_successful_run: Option<LlamaMetalWorkloadPhase>,
+    /// All successful device work that ingested prompt tokens.
+    pub prompt_prefill: LlamaMetalWorkloadPhase,
+    /// Successful generated tokens fed back through token-step device work
+    /// after prompt ingestion. A final sampled output with no following device
+    /// invocation is deliberately not counted here.
+    pub steady_decode: LlamaMetalWorkloadPhase,
+}
+
+/// Aggregate host-observed evidence for one workload phase.
+///
+/// Counter totals saturate at [`usize::MAX`] rather than panicking or wrapping
+/// if evidence from an unrepresentably large workload is combined.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LlamaMetalWorkloadPhase {
+    /// Tokens represented by the successful invocations in this phase.
+    pub token_count: usize,
+    /// Successful device invocations contributing to this phase.
+    pub successful_invocation_count: usize,
+    /// Sum of host wall time reported for these invocations.
+    pub host_run_wall_time: Duration,
+    /// Sum of host API transaction wall time reported for these invocations.
+    pub host_synchronous_transaction_wall_time: Duration,
+    /// Nonzero schedule items launched by these invocations.
+    pub kernel_launch_count: usize,
+    /// Host API transient-input write calls, not claimed bus transfers.
+    pub transient_h2d_calls: usize,
+    /// Bytes passed to transient-input host API writes.
+    pub transient_h2d_bytes: usize,
+    /// Host API runtime-control write calls, not claimed bus transfers.
+    pub runtime_control_h2d_calls: usize,
+    /// Bytes passed to runtime-control host API writes.
+    pub runtime_control_h2d_bytes: usize,
+    /// Host API retained-output read calls, not claimed bus transfers.
+    pub retained_d2h_calls: usize,
+    /// Bytes passed to retained-output host API reads.
+    pub retained_d2h_bytes: usize,
+}
+
+impl LlamaMetalWorkloadPhase {
+    pub(crate) fn from_reports(token_count: usize, reports: &[MetalDeviceRunReport]) -> Self {
+        let mut phase = Self {
+            token_count,
+            successful_invocation_count: reports.len(),
+            host_run_wall_time: Duration::ZERO,
+            host_synchronous_transaction_wall_time: Duration::ZERO,
+            kernel_launch_count: 0,
+            transient_h2d_calls: 0,
+            transient_h2d_bytes: 0,
+            runtime_control_h2d_calls: 0,
+            runtime_control_h2d_bytes: 0,
+            retained_d2h_calls: 0,
+            retained_d2h_bytes: 0,
+        };
+        for report in reports {
+            phase.host_run_wall_time = phase
+                .host_run_wall_time
+                .saturating_add(report.run_wall_time);
+            phase.host_synchronous_transaction_wall_time = phase
+                .host_synchronous_transaction_wall_time
+                .saturating_add(report.synchronous_transaction_wall_time);
+            phase.kernel_launch_count = phase
+                .kernel_launch_count
+                .saturating_add(report.kernel_launch_count);
+            phase.transient_h2d_calls = phase
+                .transient_h2d_calls
+                .saturating_add(report.transient_h2d_calls);
+            phase.transient_h2d_bytes = phase
+                .transient_h2d_bytes
+                .saturating_add(report.transient_h2d_bytes);
+            phase.runtime_control_h2d_calls = phase
+                .runtime_control_h2d_calls
+                .saturating_add(report.runtime_control_h2d_calls);
+            phase.runtime_control_h2d_bytes = phase
+                .runtime_control_h2d_bytes
+                .saturating_add(report.runtime_control_h2d_bytes);
+            phase.retained_d2h_calls = phase
+                .retained_d2h_calls
+                .saturating_add(report.retained_d2h_calls);
+            phase.retained_d2h_bytes = phase
+                .retained_d2h_bytes
+                .saturating_add(report.retained_d2h_bytes);
+        }
+        phase
+    }
+
+    /// Returns host-observed tokens per second when this phase executed at
+    /// least one token and measured a nonzero host workload duration.
+    pub fn host_tokens_per_second(&self) -> Option<f64> {
+        (!self.host_run_wall_time.is_zero() && self.token_count != 0)
+            .then(|| self.token_count as f64 / self.host_run_wall_time.as_secs_f64())
+    }
 }
 
 /// Rendered prompt plus its successful generation.
@@ -399,6 +512,12 @@ impl LlamaMetalPrefill {
         self.start_position
     }
 
+    /// Returns host-observed plan, preparation, prompt-prefill, and first-run
+    /// evidence for this completed prompt ingestion.
+    pub fn workload_evidence(&self) -> &LlamaMetalWorkloadEvidence {
+        &self.workload_evidence
+    }
+
     /// Consumes the result into final logits and ordered reports.
     pub fn into_parts(self) -> (TensorData, Vec<MetalDeviceRunReport>) {
         (self.logits, self.reports)
@@ -434,6 +553,12 @@ impl LlamaMetalGeneration {
     /// Returns reports for successful token invocations only.
     pub fn reports(&self) -> &[MetalDeviceRunReport] {
         &self.reports
+    }
+
+    /// Returns host-observed plan, preparation, prompt-prefill, first-run,
+    /// and steady-decode evidence for this completed generation.
+    pub fn workload_evidence(&self) -> &LlamaMetalWorkloadEvidence {
+        &self.workload_evidence
     }
 
     /// Consumes the result into generation and ordered reports.
@@ -718,6 +843,13 @@ impl LlamaMetalSession {
         reports.push(report);
         Ok(LlamaMetalPrefill {
             logits,
+            workload_evidence: self.workload_evidence(
+                self.first_prompt_invocation_token_count(prompt_ids.len()),
+                prompt_ids.len(),
+                &reports,
+                0,
+                &[],
+            ),
             reports,
             start_position,
         })
@@ -744,12 +876,18 @@ impl LlamaMetalSession {
                     false,
                 ),
                 reports: Vec::new(),
+                workload_evidence: self.workload_evidence(0, 0, &[], 0, &[]),
             });
         }
 
         let prefill = self.prefill_ids(prompt_ids)?;
         let start_position = prefill.start_position();
-        let (mut logits, mut reports) = prefill.into_parts();
+        let LlamaMetalPrefill {
+            mut logits,
+            mut reports,
+            ..
+        } = prefill;
+        let prompt_report_count = reports.len();
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut decoded = String::new();
         let mut decoder = self.tokenizer.stream_decoder();
@@ -825,6 +963,13 @@ impl LlamaMetalSession {
                 decoded,
                 stopped,
             ),
+            workload_evidence: self.workload_evidence(
+                self.first_prompt_invocation_token_count(prompt_ids.len()),
+                prompt_ids.len(),
+                &reports[..prompt_report_count],
+                reports.len() - prompt_report_count,
+                &reports[prompt_report_count..],
+            ),
             reports,
         })
     }
@@ -881,6 +1026,48 @@ impl LlamaMetalSession {
         self.successful_invocations
             .checked_add(1)
             .ok_or_else(|| LlamaMetalStepError::Dimension("invocation counter overflow").into())
+    }
+
+    fn workload_evidence(
+        &self,
+        first_successful_run_token_count: usize,
+        prompt_token_count: usize,
+        prompt_reports: &[MetalDeviceRunReport],
+        decode_token_count: usize,
+        decode_reports: &[MetalDeviceRunReport],
+    ) -> LlamaMetalWorkloadEvidence {
+        let first_successful_run = prompt_reports
+            .iter()
+            .chain(decode_reports)
+            .find(|report| report.first_successful_run)
+            .map(|report| {
+                LlamaMetalWorkloadPhase::from_reports(
+                    first_successful_run_token_count,
+                    std::slice::from_ref(report),
+                )
+            });
+        LlamaMetalWorkloadEvidence {
+            plan: self.summary().clone(),
+            token_step_preparation: self.preparation_report().clone(),
+            fixed_prefill_preparation: self.prefill_preparation_report().cloned(),
+            first_successful_run,
+            prompt_prefill: LlamaMetalWorkloadPhase::from_reports(
+                prompt_token_count,
+                prompt_reports,
+            ),
+            steady_decode: LlamaMetalWorkloadPhase::from_reports(
+                decode_token_count,
+                decode_reports,
+            ),
+        }
+    }
+
+    fn first_prompt_invocation_token_count(&self, prompt_token_count: usize) -> usize {
+        let prefix_token_count = prompt_token_count.saturating_sub(1);
+        self.prefill_span_rows()
+            .map(NonZeroUsize::get)
+            .filter(|span_rows| *span_rows <= prefix_token_count)
+            .unwrap_or(1)
     }
 
     fn preflight_tokens(
