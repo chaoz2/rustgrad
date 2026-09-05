@@ -492,6 +492,39 @@ impl CapturedStatefulInference {
         state_links: &[InferenceStateLink],
         initial_state: BTreeMap<String, TensorData>,
     ) -> std::result::Result<Self, CapturedInferenceError> {
+        let residents = module_input_node_bindings(module, graph)
+            .map_err(CapturedInferenceError::State)?
+            .into_iter()
+            .collect();
+        Self::from_graph_impl(graph, requested, state_links, initial_state, residents)
+    }
+
+    /// Captures a fixed-shape recurrent graph without assigning immutable
+    /// module residents. This is the backend-neutral seam used by compiled
+    /// training: parameters and optimizer slots are recurrent state inputs,
+    /// while frozen values are already graph constants.
+    pub(crate) fn from_graph(
+        graph: &Graph,
+        requested: &[NodeId],
+        state_links: &[InferenceStateLink],
+        initial_state: BTreeMap<String, TensorData>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        Self::from_graph_impl(
+            graph,
+            requested,
+            state_links,
+            initial_state,
+            BTreeMap::new(),
+        )
+    }
+
+    fn from_graph_impl(
+        graph: &Graph,
+        requested: &[NodeId],
+        state_links: &[InferenceStateLink],
+        initial_state: BTreeMap<String, TensorData>,
+        residents: BTreeMap<String, (NodeId, TensorData)>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
         if state_links.is_empty() {
             return Err(CapturedInferenceError::Binding(
                 "stateful inference requires at least one state link".into(),
@@ -519,7 +552,8 @@ impl CapturedStatefulInference {
             }
             combined.push(link.output);
         }
-        let mut inference = CapturedInference::from_module_graph(module, graph, &combined)?;
+        let mut inference =
+            CapturedInference::from_graph_residents_impl(graph, &combined, residents, false, &[])?;
         let mut states = Vec::with_capacity(state_links.len());
         let mut names = BTreeSet::new();
         for link in state_links {
@@ -561,20 +595,12 @@ impl CapturedStatefulInference {
             .transient_inputs
             .retain(|input| !state_nodes.contains(&input.node));
 
-        let mut hasher = DefaultHasher::new();
-        "rustgrad-captured-stateful-inference-v1".hash(&mut hasher);
-        inference.identity.hash(&mut hasher);
-        requested.len().hash(&mut hasher);
-        for state in &states {
-            state.link.hash(&mut hasher);
-            state.input.hash(&mut hasher);
-            state.output.hash(&mut hasher);
-            initial_state[&state.input.name]
-                .to_le_bytes()
-                .map_err(CapturedInferenceError::State)?
-                .hash(&mut hasher);
-        }
-        let identity = hasher.finish();
+        let identity = captured_stateful_identity(
+            inference.identity,
+            requested.len(),
+            &states,
+            &initial_state,
+        )?;
         Ok(Self {
             inference,
             public_output_count: requested.len(),
@@ -582,6 +608,39 @@ impl CapturedStatefulInference {
             initial_state,
             identity,
         })
+    }
+
+    pub(crate) fn with_initial_state(
+        mut self,
+        initial_state: BTreeMap<String, TensorData>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        let expected = self
+            .states
+            .iter()
+            .map(|state| state.input.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if initial_state
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != expected
+        {
+            return Err(CapturedInferenceError::Binding(
+                "replacement initial state names mismatch".into(),
+            ));
+        }
+        for state in &self.states {
+            let value = &initial_state[&state.input.name];
+            validate_captured_inference_binding(&state.input, state.link.input, value)?;
+        }
+        self.identity = captured_stateful_identity(
+            self.inference.identity,
+            self.public_output_count,
+            &self.states,
+            &initial_state,
+        )?;
+        self.initial_state = initial_state;
+        Ok(self)
     }
 
     pub const fn deployment_identity(&self) -> u64 {
@@ -635,6 +694,28 @@ impl CapturedStatefulInference {
             self.identity,
         )
     }
+}
+
+fn captured_stateful_identity(
+    inference_identity: u64,
+    public_output_count: usize,
+    states: &[CapturedInferenceState],
+    initial_state: &BTreeMap<String, TensorData>,
+) -> std::result::Result<u64, CapturedInferenceError> {
+    let mut hasher = DefaultHasher::new();
+    "rustgrad-captured-stateful-inference-v1".hash(&mut hasher);
+    inference_identity.hash(&mut hasher);
+    public_output_count.hash(&mut hasher);
+    for state in states {
+        state.link.hash(&mut hasher);
+        state.input.hash(&mut hasher);
+        state.output.hash(&mut hasher);
+        initial_state[&state.input.name]
+            .to_le_bytes()
+            .map_err(CapturedInferenceError::State)?
+            .hash(&mut hasher);
+    }
+    Ok(hasher.finish())
 }
 
 fn authenticate_append_index_graph(
@@ -1437,9 +1518,12 @@ fn validate_state_descriptors(
     output: &crate::BufferDesc,
     label: &str,
 ) -> std::result::Result<(), CapturedInferenceError> {
+    // ReplayInput retains the first consumer's authenticated affine view, but
+    // recurrent state owns the complete physical graph-input buffer. Compare
+    // only physical storage facts here; the capture has already validated the
+    // optional read view against that source descriptor.
     if output.view.is_some()
         || output.read_only
-        || input.desc.view.is_some()
         || input.desc.shape != output.shape
         || input.desc.dtype != output.dtype
         || input.desc.bytes != output.bytes

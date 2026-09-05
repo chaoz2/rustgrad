@@ -402,7 +402,7 @@ fn captured_scalar_host_gather_zero_domain_is_addressless() {
 
 #[test]
 fn predicated_projected_metal_preserves_raw_lanes_and_guards_addressless_reads() {
-    assert_eq!(METAL_RENDERER_VERSION, "rustgrad-metal-static-v9");
+    assert_eq!(METAL_RENDERER_VERSION, "rustgrad-metal-static-v10");
     for (shape, values, expected) in [
         (
             Shape::from([2]),
@@ -439,6 +439,39 @@ fn predicated_projected_metal_preserves_raw_lanes_and_guards_addressless_reads()
             expected
         );
     }
+}
+
+#[test]
+fn metal_u64_scalar_step_storage_wrap_and_f32_projection_are_exact() {
+    let mut graph = Graph::new();
+    let step = graph.input_dtype("step", [], DType::U64);
+    let one = graph.full_with_dtype([], Scalar::U(1), DType::U64).unwrap();
+    let next = graph.add(step, one).unwrap();
+    let projected = graph.cast(next, DType::F32).unwrap();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+
+    let next_item = schedule(&graph, next).unwrap().items.pop().unwrap();
+    let next_rendered = renderer.render(&next_item.kernel).unwrap();
+    assert!(next_rendered.source.contains("device const ulong* b0"));
+    assert!(next_rendered.source.contains("device ulong* b1"));
+    assert!(next_rendered.source.contains("(ulong)0x0000000000000001ul"));
+    assert!(next_rendered.source.contains(" + "));
+
+    let projected_item = schedule(&graph, projected).unwrap().items.pop().unwrap();
+    let projected_rendered = renderer.render(&projected_item.kernel).unwrap();
+    assert!(projected_rendered.source.contains("device const ulong* b0"));
+    assert!(projected_rendered.source.contains("device float* b1"));
+    assert!(projected_rendered.source.contains("(float)("));
+
+    let (wrapped, _) = execute_mock(
+        &graph,
+        next,
+        &HashMap::from([(
+            "step".into(),
+            TensorData::from_scalars([], DType::U64, [Scalar::U(u64::MAX)]).unwrap(),
+        )]),
+    );
+    assert_eq!(wrapped.scalar_at(0), Scalar::U(0));
 }
 
 #[test]
@@ -605,11 +638,12 @@ use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     Backend, BinaryOp, BufferRole, CapturedAppendStateInference, CapturedInference,
     CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
-    CompareOp, CpuBackend, CpuSession, DType, EffectBatchStep, EffectRuntime, GgmlType, Graph,
-    IndexValue, InferenceAppendStateLink, InferenceStateLink, KernelBindings, KernelBufferDesc,
-    LaneInstruction, MovementKernelKind, MovementValue, NodeId, Operation, QuantizedTensorData,
-    ReduceKind, ResNet, ResNetConfig, ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice,
-    Storage, TensorData, TypedValue, UOp, UType, schedule,
+    CompareOp, CompiledAdamWConfig, CpuBackend, CpuCompiledAdamW, CpuSession, DType,
+    EffectBatchStep, EffectRuntime, GgmlType, Graph, IndexValue, InferenceAppendStateLink,
+    InferenceStateLink, KernelBindings, KernelBufferDesc, LaneInstruction, MovementKernelKind,
+    MovementValue, NodeId, Operation, QuantizedTensorData, ReduceKind, ResNet, ResNetConfig,
+    ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
+    TrainingParameterInit, TypedValue, UOp, UType, schedule,
 };
 
 fn packed_ones(kind: GgmlType, rows: usize) -> QuantizedTensorData {
@@ -958,6 +992,13 @@ fn metal_stateful_inference_commits_only_after_public_projection_and_retries() {
     assert_eq!(session.preparation_report().initial_state_h2d_calls, 1);
     assert_eq!(session.preparation_report().initial_state_h2d_bytes, 8);
     assert!(!session.state_epoch());
+    assert_eq!(
+        session.state_snapshots().unwrap(),
+        BTreeMap::from([(
+            "cache".into(),
+            TensorData::new([2], vec![1.0, 2.0]).unwrap(),
+        )])
+    );
 
     let token = BTreeMap::from([(
         "token".into(),
@@ -968,6 +1009,10 @@ fn metal_stateful_inference_commits_only_after_public_projection_and_retries() {
     assert_eq!(session.successful_run_count(), 0);
     assert!(!session.state_epoch());
     mock.clear_failures();
+    assert_eq!(
+        session.state_snapshots().unwrap()["cache"],
+        TensorData::new([2], vec![1.0, 2.0]).unwrap()
+    );
 
     let first = session.run(&token).unwrap();
     assert_eq!(
@@ -981,6 +1026,10 @@ fn metal_stateful_inference_commits_only_after_public_projection_and_retries() {
     assert_eq!(first.report().committed_state_pair_count, 1);
     assert_eq!(first.report().committed_state_bytes, 8);
     assert!(session.state_epoch());
+    assert_eq!(
+        session.state_snapshots().unwrap()["cache"],
+        TensorData::new([2], vec![3.0, 5.0]).unwrap()
+    );
 
     let second = session
         .run(&BTreeMap::from([(
@@ -994,6 +1043,10 @@ fn metal_stateful_inference_commits_only_after_public_projection_and_retries() {
     );
     assert_eq!(session.successful_run_count(), 2);
     assert!(!session.state_epoch());
+    assert_eq!(
+        session.state_snapshots().unwrap()["cache"],
+        TensorData::new([2], vec![4.0, 6.0]).unwrap()
+    );
 }
 
 #[test]
@@ -1041,7 +1094,105 @@ fn metal_stateful_inference_zero_work_owns_no_native_resources() {
     assert_eq!(run.report().committed_state_pair_count, 1);
     assert_eq!(run.report().committed_state_bytes, 0);
     assert!(session.state_epoch());
+    assert_eq!(
+        session.state_snapshots().unwrap()["empty_cache"],
+        TensorData::new([0], Vec::new()).unwrap()
+    );
     assert!(mock.calls().is_empty());
+}
+
+fn compiled_scalar_adamw() -> CpuCompiledAdamW {
+    let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_input("target", [], DType::F32)
+        .unwrap();
+    let parameter = TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap();
+    CpuCompiledAdamW::compile(config, [parameter], |graph, inputs, parameters| {
+        let delta = graph.sub(parameters["weight"], inputs["target"])?;
+        let loss = graph.square(delta)?;
+        Ok((loss, BTreeMap::from([("delta".into(), delta)])))
+    })
+    .unwrap()
+}
+
+#[test]
+fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_checkpoint() {
+    let mut cpu = compiled_scalar_adamw();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let plan = cpu.metal_plan(renderer).unwrap();
+    assert_eq!(plan.capture_identity(), cpu.capture_identity());
+    assert_eq!(plan.step_count(), 0);
+    assert_eq!(plan.summary().state_pair_count, 4);
+    assert_eq!(plan.summary().state_bank_count, 2);
+    assert_eq!(plan.summary().fallback_count, 0);
+    assert_eq!(plan.summary().requested_output_count, 2);
+    assert!(plan.rendered_items().len() > 1);
+
+    let mock = Arc::new(MockDispatch::default());
+    let mut metal = plan.prepare(test_device(mock)).unwrap();
+    assert_eq!(metal.step_count(), 0);
+    assert_eq!(metal.optimizer_step().unwrap(), 0);
+    assert_eq!(
+        metal.parameter_snapshots().unwrap(),
+        BTreeMap::from([("weight".into(), TensorData::scalar(1.0))])
+    );
+
+    let inputs = || BTreeMap::from([("target".into(), TensorData::scalar(0.0))]);
+    let learning_rate = || TensorData::scalar(0.1);
+    let expected = cpu.step(inputs(), learning_rate()).unwrap();
+    let actual = metal.step(inputs(), learning_rate()).unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(actual.step(), 1);
+    assert_eq!(actual.capture_identity(), cpu.capture_identity());
+    assert_eq!(actual.report().committed_state_pair_count, 4);
+    assert_eq!(actual.report().retained_d2h_calls, 2);
+    assert_eq!(actual.report().transient_h2d_calls, 2);
+    assert_eq!(metal.optimizer_step().unwrap(), 1);
+    assert_eq!(
+        metal.parameter_snapshots().unwrap(),
+        cpu.parameter_snapshots().unwrap()
+    );
+    assert_eq!(
+        metal.first_moment_snapshots().unwrap(),
+        cpu.first_moment_snapshots().unwrap()
+    );
+    assert_eq!(
+        metal.second_moment_snapshots().unwrap(),
+        cpu.second_moment_snapshots().unwrap()
+    );
+
+    let checkpoint = metal.checkpoint().unwrap();
+    let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_input("target", [], DType::F32)
+        .unwrap();
+    let mut resumed = CpuCompiledAdamW::compile_from_checkpoint(
+        config,
+        &checkpoint,
+        |graph, inputs, parameters| {
+            let delta = graph.sub(parameters["weight"], inputs["target"])?;
+            let loss = graph.square(delta)?;
+            Ok((loss, BTreeMap::from([("delta".into(), delta)])))
+        },
+    )
+    .unwrap();
+    assert_eq!(resumed.step_count(), 1);
+    assert_eq!(
+        resumed.parameter_snapshots().unwrap(),
+        metal.parameter_snapshots().unwrap()
+    );
+
+    let expected = cpu.step(inputs(), learning_rate()).unwrap();
+    let actual = metal.step(inputs(), learning_rate()).unwrap();
+    let resumed_step = resumed.step(inputs(), learning_rate()).unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(resumed_step.loss(), expected.loss());
+    assert_eq!(resumed_step.outputs(), expected.outputs());
+    assert_eq!(metal.step_count(), 2);
+    assert_eq!(resumed.step_count(), 2);
+    assert_eq!(metal.checkpoint().unwrap(), resumed.checkpoint().unwrap());
 }
 
 #[test]
@@ -9075,17 +9226,27 @@ fn transaction_failures_lazy_branches_zero_domain_and_cleanup_preserve_visibilit
     token.wait().unwrap();
     assert_eq!(empty_buffers.last().unwrap().generation(), before + 1);
 
-    for dtype in [DType::I64, DType::U64] {
-        let mut unsupported = Graph::new();
-        let lhs = unsupported.input_dtype("lhs", [1], dtype);
-        let rhs = unsupported.input_dtype("rhs", [1], dtype);
-        let output = unsupported.div(lhs, rhs).unwrap();
-        let item = &schedule(&unsupported, output).unwrap().items[0];
-        assert!(matches!(
-            MetalRenderer::new(1, capabilities()).unwrap().render(&item.kernel),
-            Err(MetalError::Unsupported(reason)) if reason.contains("I64") || reason.contains("U64")
-        ));
-    }
+    let mut unsupported = Graph::new();
+    let lhs = unsupported.input_dtype("lhs", [1], DType::I64);
+    let rhs = unsupported.input_dtype("rhs", [1], DType::I64);
+    let output = unsupported.div(lhs, rhs).unwrap();
+    let item = &schedule(&unsupported, output).unwrap().items[0];
+    assert!(matches!(
+        MetalRenderer::new(1, capabilities()).unwrap().render(&item.kernel),
+        Err(MetalError::Unsupported(reason)) if reason.contains("I64")
+    ));
+
+    let mut supported = Graph::new();
+    let lhs = supported.input_dtype("lhs", [1], DType::U64);
+    let rhs = supported.input_dtype("rhs", [1], DType::U64);
+    let output = supported.div(lhs, rhs).unwrap();
+    let item = &schedule(&supported, output).unwrap().items[0];
+    let rendered = MetalRenderer::new(1, capabilities())
+        .unwrap()
+        .render(&item.kernel)
+        .unwrap();
+    assert!(rendered.source.contains("device const ulong*"));
+    assert!(rendered.source.contains("(float)("));
 }
 
 #[test]

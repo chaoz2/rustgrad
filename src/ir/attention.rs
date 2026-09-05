@@ -904,12 +904,20 @@ impl Graph {
             ));
             return self.select(condition, input, zero);
         }
-        (rows_i64 - 1)
+        let last_shifted_row = (rows_i64 - 1)
             .checked_add(diagonal)
             .ok_or_else(|| Error::ShapeOverflow(shape.clone()))?;
-
-        let row_indices = self.arange(0, rows_i64, 1)?;
-        let column_indices = self.arange(0, columns_i64, 1)?;
+        let index_dtype = if i32::try_from(rows_i64).is_ok()
+            && i32::try_from(columns_i64).is_ok()
+            && i32::try_from(diagonal).is_ok()
+            && i32::try_from(last_shifted_row).is_ok()
+        {
+            DType::I32
+        } else {
+            DType::I64
+        };
+        let row_indices = self.lazy_arange_with_dtype(0, rows_i64, 1, index_dtype)?;
+        let column_indices = self.lazy_arange_with_dtype(0, columns_i64, 1, index_dtype)?;
         let mut row_shape = vec![1; rank];
         row_shape[rank - 2] = rows;
         let mut column_shape = vec![1; rank];
@@ -918,7 +926,7 @@ impl Graph {
         let column_indices = self.reshape(column_indices, Shape::new(column_shape))?;
         let boundary = self.constant(TensorData::scalar_with_dtype(
             Scalar::I(diagonal),
-            DType::I64,
+            index_dtype,
         ));
         let boundary = self.add(row_indices, boundary)?;
         let keep = if lower {
@@ -1125,7 +1133,7 @@ impl Graph {
             let l = plan.query_shape.dims()[plan.query_shape.rank() - 2];
             let s = plan.key_shape.dims()[plan.key_shape.rank() - 2];
             let causal = self.ones_with_dtype([l, s], DType::Bool)?;
-            let causal = self.tril(causal, 0)?;
+            let causal = self.tril_static(causal, 0)?;
             scores = self.apply_attention_mask(scores, causal)?;
         } else if let Some(mask) = attn_mask {
             scores = self.apply_attention_mask(scores, mask)?;

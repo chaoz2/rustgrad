@@ -698,6 +698,13 @@ impl InitializedMetalPrefix {
         self.inner.execute_stateful(values, alternate_state_bank)
     }
 
+    pub(super) fn snapshot_state(
+        &self,
+        alternate_state_bank: bool,
+    ) -> Result<BTreeMap<u64, TensorData>, MetalError> {
+        self.inner.snapshot_state(alternate_state_bank)
+    }
+
     pub(super) fn execute_append_state(
         &self,
         values: &mut BTreeMap<u64, TensorData>,

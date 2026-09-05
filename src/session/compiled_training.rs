@@ -1,12 +1,16 @@
 //! Graph-free CPU replay for static training programs with recurrent state.
 
 use crate::nn::StateKind;
+use crate::runtime::metal::{
+    MetalDevice, MetalDeviceRunReport, MetalDeviceSession, MetalDeviceSessionSummary, MetalError,
+    MetalRenderer, MetalStatefulInferencePlan, RenderedMetal,
+};
 use crate::{
-    BufferState, CapturedMixedSchedule, CapturedSchedule, DType, EffectGraph, EffectRuntime, Error,
-    Graph, Metadata, MixedReplayCursor, Module, NodeId, ParameterId, ReplayError, Result, Scalar,
-    Schedule, ScheduleStateBinding, ScheduleValueBinding, Shape, StateDict, TensorData,
-    bind_schedule_states, combine_mixed_schedules, load_safetensors, save_safetensors,
-    schedule_effects, schedule_many,
+    BufferState, CapturedMixedSchedule, CapturedSchedule, CapturedStatefulInference, DType,
+    EffectGraph, EffectRuntime, Error, Graph, InferenceStateLink, Metadata, MixedReplayCursor,
+    Module, NodeId, ParameterId, ReplayError, Result, Scalar, Schedule, ScheduleStateBinding,
+    ScheduleValueBinding, Shape, StateDict, TensorData, bind_schedule_states,
+    combine_mixed_schedules, load_safetensors, save_safetensors, schedule_effects, schedule_many,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -549,6 +553,64 @@ pub struct CpuCompiledAdamW {
     inner: CpuCompiledTrainingProgram,
 }
 
+/// Resource-free Metal rendering of the same recurrent program owned by a
+/// [`CpuCompiledAdamW`] session. Preparing it uploads the session's current
+/// parameter, moment, and optimizer-step frontier into the existing
+/// epoch-swapped Metal runtime.
+pub struct MetalCompiledAdamWPlan {
+    inner: MetalStatefulInferencePlan,
+    inputs: BTreeMap<String, (Shape, DType)>,
+    output_names: Vec<String>,
+    state_input_keys: BTreeMap<String, String>,
+    program_identity: u64,
+    step: u64,
+}
+
+/// Device-resident AdamW training session backed by one fixed Metal capture.
+/// Parameters and optimizer slots remain in the double-buffered device state
+/// frontier between calls; only batch inputs, learning rate, and requested
+/// outputs cross the host boundary on each step.
+pub struct MetalCompiledAdamW {
+    session: MetalDeviceSession,
+    inputs: BTreeMap<String, (Shape, DType)>,
+    output_names: Vec<String>,
+    state_input_keys: BTreeMap<String, String>,
+    program_identity: u64,
+    step: u64,
+}
+
+/// One committed Metal AdamW step plus its exact device execution report.
+pub struct MetalCompiledAdamWStepResult {
+    inner: CompiledTrainingStepResult,
+    report: MetalDeviceRunReport,
+}
+
+impl MetalCompiledAdamWStepResult {
+    pub fn loss(&self) -> &TensorData {
+        self.inner.loss()
+    }
+
+    pub fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        self.inner.outputs()
+    }
+
+    pub fn output(&self, name: &str) -> Option<&TensorData> {
+        self.inner.output(name)
+    }
+
+    pub fn step(&self) -> u64 {
+        self.inner.step()
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+
+    pub fn report(&self) -> &MetalDeviceRunReport {
+        &self.report
+    }
+}
+
 /// One static CPU momentum-SGD program with runtime-owned recurrent state.
 ///
 /// Compilation builds one pure graph and one mixed capture. The graph is then
@@ -557,12 +619,15 @@ pub struct CpuCompiledAdamW {
 /// bytes. This type deliberately has no live-module synchronization surface.
 struct CpuCompiledTrainingProgram {
     capture: CapturedMixedSchedule,
+    recurrent_capture: CapturedStatefulInference,
     runtime: EffectRuntime,
     cursor: MixedReplayCursor,
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
     parameter_buffers: BTreeMap<String, u64>,
     optimizer_buffers: BTreeMap<String, u64>,
+    state_input_buffers: BTreeMap<String, u64>,
+    state_input_keys: BTreeMap<String, String>,
     step: u64,
 }
 
@@ -627,6 +692,8 @@ impl CpuCompiledTrainingProgram {
         let mut state_by_input = BTreeMap::new();
         let mut parameter_buffers = BTreeMap::new();
         let mut optimizer_buffers = BTreeMap::new();
+        let mut state_input_buffers = BTreeMap::new();
+        let mut state_input_keys = BTreeMap::new();
         for (ordinal, spec) in specs.iter().enumerate() {
             let ordinal = u64::try_from(ordinal).map_err(|_| training("parameter overflow"))?;
             let parameter_buffer = STATE_BUFFER_BASE
@@ -642,6 +709,8 @@ impl CpuCompiledTrainingProgram {
             state_nodes.insert(spec.key.clone(), node);
             state_by_input.insert(node, state);
             state_values.push((parameter_buffer, spec.value.clone()));
+            state_input_buffers.insert(spec.input_name.clone(), parameter_buffer);
+            state_input_keys.insert(spec.input_name.clone(), spec.key.clone());
             if let Some(name) = spec.key.strip_prefix("parameter:") {
                 parameter_nodes.insert(name.to_string(), node);
                 parameter_buffers.insert(name.to_string(), parameter_buffer);
@@ -683,9 +752,27 @@ impl CpuCompiledTrainingProgram {
             return Err(training("compiled optimizer successor set mismatch"));
         }
 
+        let public_requested = std::iter::once(loss)
+            .chain(outputs.values().copied())
+            .collect::<Vec<_>>();
+        let state_links = specs
+            .iter()
+            .map(|spec| InferenceStateLink::new(state_nodes[&spec.key], updates[&spec.key]))
+            .collect::<Vec<_>>();
+        let initial_state = specs
+            .iter()
+            .map(|spec| (spec.input_name.clone(), spec.value.clone()))
+            .collect();
+        let recurrent_capture = CapturedStatefulInference::from_graph(
+            &graph,
+            &public_requested,
+            &state_links,
+            initial_state,
+        )
+        .map_err(captured_inference_error)?;
+
         let mut requested = Vec::with_capacity(1 + outputs.len() + updates.len());
-        requested.push(loss);
-        requested.extend(outputs.values().copied());
+        requested.extend(public_requested);
         for spec in &specs {
             requested.push(updates[&spec.key]);
         }
@@ -756,12 +843,15 @@ impl CpuCompiledTrainingProgram {
         let output_names = outputs.keys().cloned().collect();
         Ok(Self {
             capture,
+            recurrent_capture,
             runtime,
             cursor,
             inputs: optimizer.inputs().clone(),
             output_names,
             parameter_buffers,
             optimizer_buffers,
+            state_input_buffers,
+            state_input_keys,
             step: 0,
         })
     }
@@ -824,6 +914,27 @@ impl CpuCompiledTrainingProgram {
 
     fn capture_identity(&self) -> u64 {
         self.cursor.capture_identity()
+    }
+
+    fn recurrent_capture(&self) -> Result<CapturedStatefulInference> {
+        let initial_state = self
+            .state_input_buffers
+            .iter()
+            .map(|(name, buffer)| {
+                let state = self.current_state(*buffer)?;
+                let value = self
+                    .runtime
+                    .snapshot(state)
+                    .map_err(runtime_error)?
+                    .tensor()
+                    .clone();
+                Ok((name.clone(), value))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        self.recurrent_capture
+            .clone()
+            .with_initial_state(initial_state)
+            .map_err(captured_inference_error)
     }
 
     /// Returns independent owned parameter snapshots in canonical name order.
@@ -1176,6 +1287,45 @@ impl CpuCompiledAdamW {
         self.inner.slot_versions("second_moment")
     }
 
+    /// Renders the identical loss/backward/AdamW capture for Metal, seeded
+    /// from this session's currently committed recurrent state. Planning is
+    /// resource-free; unsupported kernels fail before a device is touched.
+    pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
+        let recurrent = self.inner.recurrent_capture()?;
+        let inner = MetalStatefulInferencePlan::new(recurrent.clone(), renderer.clone()).map_err(
+            |error| {
+                let detail = if matches!(&error, MetalError::Unsupported(_)) {
+                    recurrent
+                        .capture()
+                        .items
+                        .iter()
+                        .find_map(|item| {
+                            renderer.render(&item.kernel).err().map(|item_error| {
+                                format!(
+                                    " at schedule item {} (node {}, {:?}): {item_error}",
+                                    item.id,
+                                    item.node.index(),
+                                    item.kernel.operation()
+                                )
+                            })
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                training(format!("compiled Metal runtime: {error:?}{detail}"))
+            },
+        )?;
+        Ok(MetalCompiledAdamWPlan {
+            inner,
+            inputs: self.inner.inputs.clone(),
+            output_names: self.inner.output_names.clone(),
+            state_input_keys: self.inner.state_input_keys.clone(),
+            program_identity: self.capture_identity(),
+            step: self.step_count(),
+        })
+    }
+
     /// Captures parameter values, both moment sets, the graph-owned optimizer
     /// step, and the exact compiled capture identity into deterministic bytes.
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
@@ -1203,6 +1353,191 @@ impl CpuCompiledAdamW {
         self.inner
             .step_inner(inputs, learning_rate, injected_failure)
     }
+}
+
+impl MetalCompiledAdamWPlan {
+    pub fn deployment_identity(&self) -> u64 {
+        self.inner.deployment_identity()
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.program_identity
+    }
+
+    pub fn step_count(&self) -> u64 {
+        self.step
+    }
+
+    pub fn summary(&self) -> &MetalDeviceSessionSummary {
+        self.inner.summary()
+    }
+
+    pub fn rendered_items(&self) -> impl ExactSizeIterator<Item = &RenderedMetal> {
+        self.inner.rendered_items()
+    }
+
+    /// Creates all native resources and uploads the captured recurrent
+    /// frontier once. No training step is executed during preparation.
+    pub fn prepare(self, device: MetalDevice) -> Result<MetalCompiledAdamW> {
+        let session = self.inner.prepare(device).map_err(metal_training_error)?;
+        Ok(MetalCompiledAdamW {
+            session,
+            inputs: self.inputs,
+            output_names: self.output_names,
+            state_input_keys: self.state_input_keys,
+            program_identity: self.program_identity,
+            step: self.step,
+        })
+    }
+}
+
+impl MetalCompiledAdamW {
+    pub fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<MetalCompiledAdamWStepResult> {
+        validate_step_inputs(&self.inputs, &inputs, &learning_rate)?;
+        let next_step = self
+            .step
+            .checked_add(1)
+            .ok_or_else(|| training("compiled training step overflow"))?;
+        let mut provided = inputs;
+        provided.insert(LEARNING_RATE_INPUT.into(), learning_rate);
+        let run = self.session.run(&provided).map_err(metal_training_error)?;
+        let (outputs, report) = run.into_parts();
+        debug_assert_eq!(outputs.len(), 1 + self.output_names.len());
+        let mut outputs = outputs.into_iter();
+        let loss = outputs
+            .next()
+            .expect("compiled Metal output cardinality was authenticated before preparation");
+        let outputs = self.output_names.iter().cloned().zip(outputs).collect();
+        self.step = next_step;
+        Ok(MetalCompiledAdamWStepResult {
+            inner: CompiledTrainingStepResult {
+                loss,
+                outputs,
+                step: self.step,
+                capture_identity: self.program_identity,
+            },
+            report,
+        })
+    }
+
+    pub fn step_count(&self) -> u64 {
+        self.step
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.program_identity
+    }
+
+    pub fn metal_session(&self) -> &MetalDeviceSession {
+        &self.session
+    }
+
+    /// Downloads every currently committed recurrent value once and returns
+    /// it under the optimizer's semantic state keys.
+    fn state_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        let snapshots = self
+            .session
+            .state_snapshots()
+            .map_err(metal_training_error)?;
+        if snapshots.len() != self.state_input_keys.len()
+            || snapshots.keys().ne(self.state_input_keys.keys())
+        {
+            return Err(training("compiled Metal state inventory mismatch"));
+        }
+        snapshots
+            .into_iter()
+            .map(|(input, value)| {
+                let key = self
+                    .state_input_keys
+                    .get(&input)
+                    .cloned()
+                    .ok_or_else(|| training("compiled Metal state key is absent"))?;
+                Ok((key, value))
+            })
+            .collect()
+    }
+
+    pub fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        Ok(self
+            .state_snapshots()?
+            .into_iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix("parameter:")
+                    .map(|name| (name.to_owned(), value))
+            })
+            .collect())
+    }
+
+    pub fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        metal_slot_snapshots(self.state_snapshots()?, "first_moment")
+    }
+
+    pub fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        metal_slot_snapshots(self.state_snapshots()?, "second_moment")
+    }
+
+    pub fn optimizer_step(&self) -> Result<u64> {
+        let states = self.state_snapshots()?;
+        let step = states
+            .get("global:step")
+            .ok_or_else(|| training("compiled Metal optimizer step is absent"))?;
+        Ok(step.scalar_at(0).as_u64())
+    }
+
+    /// Downloads one coherent active state bank and encodes the same portable
+    /// checkpoint format accepted by [`CpuCompiledAdamW::compile_from_checkpoint`].
+    pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
+        let states = self.state_snapshots()?;
+        let optimizer_step = states
+            .get("global:step")
+            .ok_or_else(|| training("compiled Metal optimizer step is absent"))?
+            .scalar_at(0)
+            .as_u64();
+        if optimizer_step != self.step {
+            return Err(training("compiled Metal host and graph steps diverged"));
+        }
+        let parameters = metal_parameter_snapshots(&states);
+        let first_moments = metal_slot_snapshots(states.clone(), "first_moment")?;
+        let second_moments = metal_slot_snapshots(states, "second_moment")?;
+        CompiledAdamWCheckpoint::from_bytes(encode_adamw_checkpoint(
+            self.program_identity,
+            optimizer_step,
+            parameters,
+            first_moments,
+            second_moments,
+        )?)
+    }
+}
+
+fn metal_parameter_snapshots(
+    states: &BTreeMap<String, TensorData>,
+) -> BTreeMap<String, TensorData> {
+    states
+        .iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("parameter:")
+                .map(|name| (name.to_owned(), value.clone()))
+        })
+        .collect()
+}
+
+fn metal_slot_snapshots(
+    states: BTreeMap<String, TensorData>,
+    slot: &str,
+) -> Result<BTreeMap<String, TensorData>> {
+    let suffix = format!(":{slot}");
+    Ok(states
+        .into_iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix("slot:")
+                .and_then(|key| key.strip_suffix(&suffix))
+                .map(|name| (name.to_owned(), value))
+        })
+        .collect())
 }
 
 fn encode_adamw_checkpoint(
@@ -1533,6 +1868,14 @@ fn schedule_error(error: impl std::fmt::Display) -> Error {
 
 fn replay_error(error: ReplayError) -> Error {
     training(format!("compiled replay: {error:?}"))
+}
+
+fn captured_inference_error(error: impl std::fmt::Debug) -> Error {
+    training(format!("compiled recurrent capture: {error:?}"))
+}
+
+fn metal_training_error(error: impl std::fmt::Debug) -> Error {
+    training(format!("compiled Metal runtime: {error:?}"))
 }
 
 fn runtime_error(error: impl std::fmt::Debug) -> Error {

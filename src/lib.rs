@@ -262,12 +262,12 @@ pub use session::{
     CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult, CompiledTrainingStepResult,
     CpuBinaryModuleTrainer, CpuCompiledAdamW, CpuCompiledMomentumSgd, CpuGradientStore,
     CpuModeModuleTrainer, CpuModuleTrainer, CpuSession, DynamicTensor, InferenceAppendStateLink,
-    InferenceStateLink, MaskedSelectOutput, MetalSessionResult, MetalSessionTrace,
-    ModuleBinaryCrossEntropy, ModuleCrossEntropy, ModuleInferenceResult, ModuleStepResult,
-    NativeModuleExecutionReport, NativeModuleInferenceResult, NativeModuleInferenceTrace,
-    ReportedNativeModuleInferenceResult, SessionDevice, Tensor, TrainingParameterInit,
-    infer_module_cpu, infer_module_native_cpu, infer_module_native_cpu_with_report,
-    summarize_binary_classification, summarize_classification,
+    InferenceStateLink, MaskedSelectOutput, MetalCompiledAdamW, MetalCompiledAdamWPlan,
+    MetalCompiledAdamWStepResult, MetalSessionResult, MetalSessionTrace, ModuleBinaryCrossEntropy,
+    ModuleCrossEntropy, ModuleInferenceResult, ModuleStepResult, NativeModuleExecutionReport,
+    NativeModuleInferenceResult, NativeModuleInferenceTrace, ReportedNativeModuleInferenceResult,
+    SessionDevice, Tensor, TrainingParameterInit, infer_module_cpu, infer_module_native_cpu,
+    infer_module_native_cpu_with_report, summarize_binary_classification, summarize_classification,
 };
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,

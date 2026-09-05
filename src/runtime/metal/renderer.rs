@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 
-pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v9";
+pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v10";
 pub const METAL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-metal-raw-copy-v1";
 pub const METAL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-metal-portable-bitcast-v1";
 pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
@@ -2878,7 +2878,8 @@ fn metal_reduction_literal(dtype: DType, value: crate::Scalar) -> Result<String,
         crate::Scalar::I(value) if dtype == DType::I32 => {
             format!("as_type<int>(0x{:08x}u)", value as u32)
         }
-        crate::Scalar::U(value) => format!("(uint){value}u"),
+        crate::Scalar::U(value) if dtype == DType::U32 => format!("(uint){value}u"),
+        crate::Scalar::U(value) if dtype == DType::U64 => format!("(ulong){value}ul"),
         crate::Scalar::F(value) => {
             format!("as_type<float>(0x{:08x}u)", (value as f32).to_bits())
         }
@@ -2901,7 +2902,7 @@ fn metal_reduction_arithmetic(dtype: DType, lhs: &str, rhs: &str, product: bool)
 
 fn supported_storage(dtype: DType) -> Result<(), MetalError> {
     match dtype {
-        DType::F32 | DType::Bool | DType::I32 | DType::U32 => Ok(()),
+        DType::F32 | DType::Bool | DType::I32 | DType::U32 | DType::U64 => Ok(()),
         _ => Err(MetalError::Unsupported(format!(
             "dtype {dtype:?} is outside the exact Metal static subset"
         ))),
@@ -2914,6 +2915,7 @@ pub(super) fn metal_storage_type(dtype: DType) -> &'static str {
         DType::Bool => "uchar",
         DType::I32 => "int",
         DType::U32 => "uint",
+        DType::U64 => "ulong",
         _ => unreachable!("validated Metal storage"),
     }
 }
@@ -2936,7 +2938,8 @@ impl ScalarLaneDialect for MetalScalarDialect {
             (DType::F32, DType::F32)
             | (DType::Bool, DType::Bool)
             | (DType::I32, DType::I32)
-            | (DType::U32, DType::U32) => value.into(),
+            | (DType::U32, DType::U32)
+            | (DType::U64, DType::U64) => value.into(),
             (DType::Bool, DType::F32) => format!("(float)({value} != 0)"),
             (DType::F32, DType::Bool) => format!("(uchar)({value} != 0.0f)"),
             (DType::Bool, DType::I32) => format!("(int)({value})"),
@@ -2947,6 +2950,7 @@ impl ScalarLaneDialect for MetalScalarDialect {
             (DType::I32, DType::U32) => format!("as_type<uint>({value})"),
             (DType::U32, DType::I32) => format!("as_type<int>({value})"),
             (DType::I32 | DType::U32, DType::F32) => format!("(float)({value})"),
+            (DType::U64, DType::F32) => format!("(float)({value})"),
             _ => return Err("cast is outside the exact Metal subset".into()),
         })
     }
@@ -3011,6 +3015,10 @@ impl ScalarLaneDialect for MetalScalarDialect {
 
     fn select(&self, condition: &str, on_true: &str, on_false: &str) -> String {
         format!("(({condition}) ? ({on_true}) : ({on_false}))")
+    }
+
+    fn float_pow(&self, lhs: &str, rhs: &str) -> Result<String, String> {
+        Ok(format!("pow(({lhs}), ({rhs}))"))
     }
 
     fn call_intrinsic(&self, canonical_name: &'static str, value: &str) -> String {
@@ -3088,6 +3096,10 @@ fn emit_expr_with_substitution(
                 dtype: DType::U32,
                 bits,
             } => Ok(format!("(uint)0x{:08x}u", *bits as u32)),
+            LiteralValue::Scalar {
+                dtype: DType::U64,
+                bits,
+            } => Ok(format!("(ulong)0x{bits:016x}ul")),
             _ => Err(MetalError::Unsupported(
                 "invalid Metal scalar literal".into(),
             )),
@@ -3133,6 +3145,7 @@ fn emit_expr_with_substitution(
                                 DType::F32 => "0.0f",
                                 DType::I32 => "((int)0)",
                                 DType::U32 => "((uint)0u)",
+                                DType::U64 => "((ulong)0ul)",
                                 _ => unreachable!("validated Metal storage"),
                             };
                             format!("(({predicate}) ? ({value}) : ({zero}))")

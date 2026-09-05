@@ -31,6 +31,12 @@ pub(crate) trait ScalarLaneDialect: dialect_seal::Sealed {
         let _ = dtype;
         value.into()
     }
+    fn float_pow(&self, _lhs: &str, _rhs: &str) -> Result<String, String> {
+        Err(format!(
+            "floating power is outside the exact {} scalar-lane subset",
+            self.name()
+        ))
+    }
     fn call_intrinsic(&self, canonical_name: &'static str, value: &str) -> String;
     fn float_one(&self, dtype: DType) -> Result<&'static str, String>;
 }
@@ -240,6 +246,10 @@ fn graph_binary(
         promoted_operands(dialect, "binary dtype", lhs, rhs, Some(output_dtype))?;
     if dtype == DType::Bool {
         return bool_binary(dialect, op, &lhs, &rhs);
+    }
+    if op == BinaryOp::Pow && matches!(dtype, DType::F16 | DType::BF16 | DType::F32 | DType::F64) {
+        let expression = dialect.float_pow(&lhs, &rhs)?;
+        return dialect.finish_float(dtype, expression);
     }
     let operator = match op {
         BinaryOp::Add => "+",
