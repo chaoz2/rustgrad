@@ -2086,8 +2086,8 @@ mod tests {
         assert_eq!(plan.layer_count(), model.config().layer_count());
         assert_eq!(plan.output_binding(), model.output_binding());
         assert_eq!(plan.append_state_plan().append_span_rows(), 3);
-        assert!(plan.capture().requested.is_empty());
         assert_eq!(plan.summary().requested_output_count, 0);
+        assert_eq!(plan.capture().requested.len(), plan.state_inputs().len());
         assert_eq!(plan.summary().fallback_count, 0);
         assert_eq!(
             plan.summary().append_state_work_items,
@@ -2283,8 +2283,8 @@ mod tests {
             formats,
             BTreeSet::from([GgmlType::Q4_0, GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q6K])
         );
-        assert!(plan.capture().requested.is_empty());
         assert_eq!(plan.summary().requested_output_count, 0);
+        assert_eq!(plan.capture().requested.len(), plan.state_inputs().len());
         assert_eq!(plan.summary().fallback_count, 0);
         assert_eq!(plan.transient_inputs().len(), 2);
         assert_eq!(plan.runtime_control_inputs().len(), 1);

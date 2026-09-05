@@ -278,13 +278,15 @@ pub(crate) struct MetalSharedAppendProof {
     quantized: BTreeMap<u64, u64>,
 }
 
-fn same_storage_descriptor(left: &crate::BufferDesc, right: &crate::BufferDesc) -> bool {
+/// Compares the physical contract for storage shared by two captured programs.
+/// `view` is deliberately excluded: it describes each program's use-site
+/// indexing and may differ even when both inputs name the same allocation.
+fn same_shared_storage_descriptor(left: &crate::BufferDesc, right: &crate::BufferDesc) -> bool {
     left.shape == right.shape
         && left.dtype == right.dtype
         && left.bytes == right.bytes
         && left.alignment == right.alignment
         && left.read_only == right.read_only
-        && left.view == right.view
 }
 
 fn same_tensor_payload(left: &TensorData, right: &TensorData) -> Result<bool, MetalError> {
@@ -507,7 +509,7 @@ impl MetalAppendStateInferencePlan {
                 .inner
                 .device_resident_ids
                 .contains(&source_input.desc.id)
-                || !same_storage_descriptor(&target.desc, &source_input.desc)
+                || !same_shared_storage_descriptor(&target.desc, &source_input.desc)
             {
                 return Err(MetalError::InvalidBinding(format!(
                     "shared Metal input {} descriptor or role differs",
@@ -568,7 +570,7 @@ impl MetalAppendStateInferencePlan {
                         target_input.name
                     ))
                 })?;
-            if !same_storage_descriptor(&target_input.desc, &source_input.desc)
+            if !same_shared_storage_descriptor(&target_input.desc, &source_input.desc)
                 || target_value != source_value
             {
                 return Err(MetalError::InvalidBinding(format!(
@@ -1695,8 +1697,34 @@ fn metal_quantized_gather_error(
 
 #[cfg(test)]
 mod tests {
-    use super::same_tensor_payload;
-    use crate::{Storage, TensorData};
+    use super::{same_shared_storage_descriptor, same_tensor_payload};
+    use crate::{AffineView, BufferDesc, DType, Shape, Storage, TensorData};
+
+    #[test]
+    fn shared_storage_authentication_ignores_program_local_views() {
+        let physical = BufferDesc {
+            id: 7,
+            shape: Shape::from([2, 3]),
+            dtype: DType::F32,
+            bytes: 24,
+            alignment: 4,
+            read_only: true,
+            view: None,
+        };
+        let mut differently_viewed = physical.clone();
+        differently_viewed.id = 19;
+        differently_viewed.view = Some(AffineView::identity(Shape::from([2, 3])));
+        assert!(same_shared_storage_descriptor(
+            &physical,
+            &differently_viewed
+        ));
+
+        differently_viewed.bytes = 20;
+        assert!(!same_shared_storage_descriptor(
+            &physical,
+            &differently_viewed
+        ));
+    }
 
     #[test]
     fn shared_dense_payload_authentication_uses_exact_storage_bits() {

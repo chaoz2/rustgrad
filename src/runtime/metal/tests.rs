@@ -1224,7 +1224,7 @@ fn shared_append_preparation_rejects_a_source_after_state_advances() {
     let captured = CapturedAppendStateInference::from_module_graph(
         &IdentityModule,
         &graph,
-        &[next],
+        &[],
         &[InferenceAppendStateLink::new(
             state, next, position, index, updates, 0,
         )],
@@ -2046,8 +2046,11 @@ fn llama_metal_fixed_span_prefill_shares_state_and_preserves_t1_tail() {
     )
     .unwrap();
     assert_eq!(plan.prefill_span_rows().unwrap().get(), 3);
-    assert!(plan.prefill_capture().unwrap().requested.is_empty());
     assert_eq!(plan.prefill_summary().unwrap().requested_output_count, 0);
+    assert_eq!(
+        plan.prefill_capture().unwrap().requested.len(),
+        plan.prefill_summary().unwrap().state_pair_count
+    );
     assert!(!plan.prefill_execution_plan().unwrap().items.is_empty());
     assert!(plan.prefill_rendered_items().unwrap().len() > 0);
 
