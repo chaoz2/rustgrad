@@ -6,9 +6,11 @@ use rustgrad::runtime::metal::{
     MetalScoreboardContext,
 };
 use rustgrad::{
+    BenchmarkFramework, BenchmarkImplementation, BenchmarkObservation, BenchmarkWorkload,
     LlamaMetalExecutionScoreboardReport, LlamaMetalGeneration, LlamaMetalGenerationError,
     LlamaMetalGenerationStage, LlamaMetalGreedyPlan, LlamaMetalWorkloadEvidenceArtifact,
-    LlamaMetalWorkloadEvidenceContext, LlamaPromptWorkflow, ReplayInput,
+    LlamaMetalWorkloadEvidenceContext, LlamaPromptWorkflow, MetalDeviceBufferMeasurement,
+    RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD, ReplayInput,
 };
 use serde::Serialize;
 use std::{
@@ -19,18 +21,21 @@ use std::{
     io::{self, Write},
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode, Stdio},
 };
 
-const USAGE: &str = "usage: metal_llama_generate [--device INDEX] [--expected-registry-id ID] [--max-new-tokens N] [--prefill-span N] [--chat] [--scoreboard PATH | --workload-evidence PATH] [--revision LABEL] [--expected-ids ID,ID,...] [--attestation PATH --model-sha256 HEX --model-source LOCATOR --model-license LICENSE --model-conversion PROVENANCE --oracle-name NAME --oracle-revision REVISION --oracle-command COMMAND --workflow-run-url URL --workflow-run-id ID] [--] <model.gguf> <prompt>";
+const USAGE: &str = "usage: metal_llama_generate [--device INDEX] [--expected-registry-id ID] [--max-new-tokens N] [--prefill-span N] [--chat] [--scoreboard PATH [--benchmark-observation PATH] | --workload-evidence PATH] [--revision LABEL] [--expected-ids ID,ID,...] [--attestation PATH --model-sha256 HEX --model-source LOCATOR --model-license LICENSE --model-conversion PROVENANCE --oracle-name NAME --oracle-revision REVISION --oracle-command COMMAND --workflow-run-url URL --workflow-run-id ID] [--] <model.gguf> <prompt>";
 const DEFAULT_MAX_NEW_TOKENS: usize = 16;
 const MAX_NEW_TOKENS: usize = 4_096;
-const SCOREBOARD_WORKLOAD: &str = "gguf-llama-metal-generate";
+const SCOREBOARD_WORKLOAD: &str = RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD;
 const SCOREBOARD_EVIDENCE: &str = "live self-hosted Apple GPU prompt-to-tokens harness";
 const WORKLOAD_EVIDENCE: &str =
     "host-observed fixed-span prefill and steady-decode Metal workload evidence";
 const SCOREBOARD_EVIDENCE_KIND: &str = "llama_metal_execution_scoreboard_v2";
 const LLAMA_WORKLOAD_EVIDENCE_KIND: &str = "llama_metal_workload_evidence_v3";
+const BENCHMARK_COMMAND: &str = "cargo run --release --example metal_llama_generate";
+const BENCHMARK_OPERATING_SYSTEM_ENV: &str = "RUSTGRAD_METAL_LLAMA_OPERATING_SYSTEM";
+const MAX_OPERATING_SYSTEM_BYTES: usize = 1_024;
 
 #[derive(Debug, Eq, PartialEq)]
 struct Args {
@@ -40,6 +45,7 @@ struct Args {
     prefill_span: Option<NonZeroUsize>,
     chat: bool,
     scoreboard_path: Option<PathBuf>,
+    benchmark_observation_path: Option<PathBuf>,
     workload_evidence_path: Option<PathBuf>,
     revision: Option<String>,
     expected_ids: Option<Vec<u32>>,
@@ -180,6 +186,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
     validate_evidence_paths(&args)?;
+    let benchmark_operating_system = args
+        .benchmark_observation_path
+        .as_ref()
+        .map(|_| benchmark_operating_system())
+        .transpose()?;
     let attested_model = args
         .attestation
         .as_ref()
@@ -212,6 +223,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     {
         return Err(io::Error::other("selected Metal device registry ID does not match").into());
     }
+    let device_buffer_measurement = args
+        .benchmark_observation_path
+        .as_ref()
+        .map(|_| MetalDeviceBufferMeasurement::begin(&device))
+        .transpose()?;
     let cache = device.cache();
     let cache_entries_before_prepare = cache.len();
     let workflow = LlamaPromptWorkflow::from_path(&args.model_path)?;
@@ -355,6 +371,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+    let scoreboard_json = scoreboard_report
+        .as_ref()
+        .map(|(_, report)| report.to_json_bytes())
+        .transpose()?;
     let workload_artifact = args
         .workload_evidence_path
         .as_ref()
@@ -375,6 +395,46 @@ fn run() -> Result<(), Box<dyn Error>> {
             )?)
         })
         .transpose()?;
+    let benchmark_observation_json = match (
+        &args.benchmark_observation_path,
+        scoreboard_report.as_ref(),
+        args.attestation.as_ref(),
+        benchmark_operating_system.as_deref(),
+        device_buffer_measurement,
+    ) {
+        (
+            Some(_),
+            Some((_, report)),
+            Some(provenance),
+            Some(operating_system),
+            Some(measurement),
+        ) => {
+            let measured_device_buffer_peak = measurement.finish(&device)?;
+            let observation = BenchmarkObservation::from_llama_metal_scoreboard(
+                benchmark_implementation(&args)?,
+                benchmark_workload(&args, provenance, generation)?,
+                operating_system,
+                report,
+            )?;
+            let planned_device_memory_bytes = observation.metrics.planned_device_memory_bytes;
+            let observation = observation
+                .with_rustgrad_device_buffer_peak(measured_device_buffer_peak)
+                .map_err(|error| io::Error::other(format!("benchmark observation: {error}")))?;
+            if observation.metrics.fallback_count != Some(0)
+                || observation.metrics.measured_peak_device_memory_bytes
+                    != Some(measured_device_buffer_peak.bytes())
+                || observation.metrics.planned_device_memory_bytes != planned_device_memory_bytes
+            {
+                return Err(io::Error::other(
+                    "normalized Metal Llama observation lost memory evidence or admitted fallback",
+                )
+                .into());
+            }
+            Some(deterministic_observation_json(&observation)?)
+        }
+        (None, _, _, None, None) => None,
+        _ => unreachable!("benchmark observation arguments are validated by parse_args"),
+    };
     let attestation_bytes = match (&args.attestation, &attested_model) {
         (Some(provenance), Some(model)) => {
             let (report, artifact, evidence_path) = match (
@@ -401,8 +461,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         (None, None) => None,
         _ => unreachable!("attested model metadata is paired with attestation arguments"),
     };
-    if let Some((path, report)) = scoreboard_report {
-        write_new_evidence(path, &report.to_json_bytes()?)?;
+    if let (Some((path, _)), Some(bytes)) = (scoreboard_report.as_ref(), scoreboard_json.as_ref()) {
+        write_new_evidence(path, bytes)?;
+    }
+    if let (Some(path), Some(bytes)) = (
+        args.benchmark_observation_path.as_deref(),
+        benchmark_observation_json.as_deref(),
+    ) {
+        write_new_evidence(path, bytes)?;
     }
     if let (Some(path), Some(artifact)) = (&args.workload_evidence_path, &workload_artifact) {
         artifact.write_json_create_new(path)?;
@@ -427,6 +493,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
     let mut prefill_span = None;
     let mut chat = false;
     let mut scoreboard_path = None;
+    let mut benchmark_observation_path = None;
     let mut workload_evidence_path = None;
     let mut revision = None;
     let mut expected_ids = None;
@@ -481,6 +548,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
                 &mut scoreboard_path,
                 PathBuf::from(required_value(args.next(), "--scoreboard")?),
                 "--scoreboard",
+            )?,
+            "--benchmark-observation" => set_once(
+                &mut benchmark_observation_path,
+                PathBuf::from(required_value(args.next(), "--benchmark-observation")?),
+                "--benchmark-observation",
             )?,
             "--workload-evidence" => set_once(
                 &mut workload_evidence_path,
@@ -579,6 +651,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
         return Err(cli("--expected-ids is longer than --max-new-tokens"));
     }
     let attestation_requested = attestation_path.is_some()
+        || benchmark_observation_path.is_some()
         || model_sha256.is_some()
         || model_source.is_some()
         || model_license.is_some()
@@ -624,6 +697,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
     } else {
         None
     };
+    if benchmark_observation_path.is_some()
+        && (scoreboard_path.is_none() || attestation.is_none() || chat)
+    {
+        return Err(cli(
+            "--benchmark-observation requires --scoreboard, full attestation provenance, expected token IDs, and plain prompt mode",
+        ));
+    }
     let prompt = positional.pop().expect("length checked");
     let model_path = PathBuf::from(positional.pop().expect("length checked"));
     Ok(Some(Args {
@@ -633,6 +713,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
         prefill_span,
         chat,
         scoreboard_path,
+        benchmark_observation_path,
         workload_evidence_path,
         revision,
         expected_ids,
@@ -651,6 +732,141 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn benchmark_operating_system() -> Result<String, io::Error> {
+    let value = env::var(BENCHMARK_OPERATING_SYSTEM_ENV).map_err(|error| match error {
+        env::VarError::NotPresent => io::Error::other(format!(
+            "benchmark observation requires {BENCHMARK_OPERATING_SYSTEM_ENV}"
+        )),
+        env::VarError::NotUnicode(_) => {
+            io::Error::other(format!("{BENCHMARK_OPERATING_SYSTEM_ENV} must be UTF-8"))
+        }
+    })?;
+    validate_benchmark_operating_system(value)
+}
+
+fn validate_benchmark_operating_system(value: String) -> Result<String, io::Error> {
+    if value.is_empty()
+        || value.len() > MAX_OPERATING_SYSTEM_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(io::Error::other(format!(
+            "{BENCHMARK_OPERATING_SYSTEM_ENV} must be a bounded single-line label"
+        )));
+    }
+    Ok(value)
+}
+
+fn benchmark_implementation(args: &Args) -> Result<BenchmarkImplementation, io::Error> {
+    let revision = args
+        .revision
+        .clone()
+        .ok_or_else(|| io::Error::other("benchmark observation has no code revision"))?;
+    let prefill_span = args
+        .prefill_span
+        .map(|span| span.get().to_string())
+        .unwrap_or_else(|| "none".into());
+    Ok(BenchmarkImplementation {
+        framework: BenchmarkFramework::RustGrad,
+        version: env!("CARGO_PKG_VERSION").into(),
+        revision,
+        configuration: format!("release;device_greedy;mode=plain;prefill_span={prefill_span}"),
+        command: BENCHMARK_COMMAND.into(),
+    })
+}
+
+fn benchmark_workload(
+    args: &Args,
+    provenance: &AttestationArgs,
+    generation: &LlamaMetalGeneration,
+) -> Result<BenchmarkWorkload, io::Error> {
+    let expected_ids = args
+        .expected_ids
+        .as_deref()
+        .ok_or_else(|| io::Error::other("benchmark observation has no expected token IDs"))?;
+    if generation.generated_ids() != expected_ids {
+        return Err(io::Error::other(
+            "benchmark observation expected token IDs are not authenticated by generation",
+        ));
+    }
+    let expected_ids_json = canonical_expected_ids_json(expected_ids)?;
+    Ok(BenchmarkWorkload::GgufLlama {
+        model_sha256: provenance.model_sha256.clone(),
+        prompt_sha256: sha256_with_shasum("prompt", args.prompt.as_bytes())?,
+        prompt_token_count: u64::try_from(generation.prompt_ids().len())
+            .map_err(|_| io::Error::other("prompt token count overflow"))?,
+        max_new_tokens: u64::try_from(args.max_new_tokens)
+            .map_err(|_| io::Error::other("maximum new-token count overflow"))?,
+        expected_token_ids_sha256: sha256_with_shasum(
+            "canonical expected-token JSON",
+            &expected_ids_json,
+        )?,
+    })
+}
+
+fn canonical_expected_ids_json(expected_ids: &[u32]) -> Result<Vec<u8>, io::Error> {
+    serde_json::to_vec(expected_ids).map_err(|error| {
+        io::Error::other(format!(
+            "canonical expected-token JSON encoding failed: {error}"
+        ))
+    })
+}
+
+/// Hashes bytes through the macOS live-lane `shasum` tool. Expected token IDs
+/// use the compact UTF-8 JSON array emitted by `serde_json::to_vec(&[u32])`.
+fn sha256_with_shasum(label: &str, bytes: &[u8]) -> Result<String, io::Error> {
+    let mut child = Command::new("shasum")
+        .args(["-a", "256"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| io::Error::new(error.kind(), format!("cannot hash {label}: {error}")))?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("shasum stdin is unavailable"))?
+        .write_all(bytes);
+    let output = child.wait_with_output()?;
+    write_result?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "shasum failed while hashing {label}"
+        )));
+    }
+    parse_shasum_stdout(label, &output.stdout)
+}
+
+fn parse_shasum_stdout(label: &str, stdout: &[u8]) -> Result<String, io::Error> {
+    let value = std::str::from_utf8(stdout)
+        .map_err(|_| io::Error::other(format!("shasum emitted non-UTF-8 output for {label}")))?;
+    let mut fields = value.split_ascii_whitespace();
+    let digest = fields.next().unwrap_or_default();
+    if !is_lower_hex(digest, 64) || fields.next() != Some("-") || fields.next().is_some() {
+        return Err(io::Error::other(format!(
+            "shasum emitted malformed SHA-256 output for {label}"
+        )));
+    }
+    Ok(digest.into())
+}
+
+fn deterministic_observation_json(
+    observation: &BenchmarkObservation,
+) -> Result<Vec<u8>, io::Error> {
+    let json = observation
+        .to_json_bytes()
+        .map_err(|error| io::Error::other(format!("benchmark observation: {error}")))?;
+    if observation
+        .to_json_bytes()
+        .map_err(|error| io::Error::other(format!("benchmark observation: {error}")))?
+        != json
+    {
+        return Err(io::Error::other(
+            "benchmark observation serialization is not deterministic",
+        ));
+    }
+    Ok(json)
 }
 
 fn validate_attestation_strings(attestation: &AttestationArgs) -> Result<(), CliError> {
@@ -735,6 +951,9 @@ fn validate_evidence_paths(args: &Args) -> Result<(), io::Error> {
         args.scoreboard_path
             .as_deref()
             .map(|path| (path, "scoreboard")),
+        args.benchmark_observation_path
+            .as_deref()
+            .map(|path| (path, "benchmark observation")),
         args.workload_evidence_path
             .as_deref()
             .map(|path| (path, "workload evidence")),
@@ -745,8 +964,10 @@ fn validate_evidence_paths(args: &Args) -> Result<(), io::Error> {
     .into_iter()
     .flatten()
     {
-        if path.try_exists()? {
-            return Err(io::Error::other(format!("{label} path already exists")));
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Err(io::Error::other(format!("{label} path already exists"))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         let destination = resolved_new_destination(path, label)?;
         if destinations.iter().any(|prior| prior == &destination) {
@@ -1107,9 +1328,14 @@ fn partial_message(
 mod tests {
     use super::{
         Args, AttestationArgs, AttestedDevice, AttestedEvidence, AttestedInvocation, AttestedModel,
-        AttestedOracle, LLAMA_WORKLOAD_EVIDENCE_KIND, MetalLlamaAttestation,
-        SCOREBOARD_EVIDENCE_KIND, parse_args, serialize_attestation, validate_evidence_paths,
-        write_new_evidence,
+        AttestedOracle, BENCHMARK_COMMAND, LLAMA_WORKLOAD_EVIDENCE_KIND, MetalLlamaAttestation,
+        SCOREBOARD_EVIDENCE_KIND, benchmark_implementation, canonical_expected_ids_json,
+        deterministic_observation_json, parse_args, parse_shasum_stdout, serialize_attestation,
+        validate_benchmark_operating_system, validate_evidence_paths, write_new_evidence,
+    };
+    use rustgrad::{
+        BenchmarkDevice, BenchmarkFramework, BenchmarkImplementation, BenchmarkMetrics,
+        BenchmarkObservation, BenchmarkWorkload, RustGradDeviceBufferPeak,
     };
     use std::{
         fs,
@@ -1125,6 +1351,41 @@ mod tests {
             .ok_or_else(|| super::cli("unexpected help action"))
     }
 
+    fn observation_args() -> Vec<&'static str> {
+        vec![
+            "--scoreboard",
+            "scoreboard.json",
+            "--benchmark-observation",
+            "observation.json",
+            "--revision",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--expected-ids",
+            "4,5,6",
+            "--attestation",
+            "attestation.json",
+            "--model-sha256",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--model-source",
+            "https://example.invalid/model@revision",
+            "--model-license",
+            "License-Id",
+            "--model-conversion",
+            "converter@revision --quantize q4_k",
+            "--oracle-name",
+            "reference-runtime",
+            "--oracle-revision",
+            "oracle-revision",
+            "--oracle-command",
+            "reference --seed 0",
+            "--workflow-run-url",
+            "https://example.invalid/actions/runs/7",
+            "--workflow-run-id",
+            "7",
+            "model.gguf",
+            "hello",
+        ]
+    }
+
     #[test]
     fn parser_accepts_plain_chat_and_complete_evidence_modes() {
         assert_eq!(
@@ -1136,6 +1397,7 @@ mod tests {
                 prefill_span: None,
                 chat: false,
                 scoreboard_path: None,
+                benchmark_observation_path: None,
                 workload_evidence_path: None,
                 revision: None,
                 expected_ids: None,
@@ -1206,37 +1468,18 @@ mod tests {
         assert_eq!(evidence.expected_ids, Some(vec![4, 5, 6]));
         assert!(evidence.attestation.is_none());
 
-        let attested = parse(&[
-            "--scoreboard",
-            "scoreboard.json",
-            "--revision",
-            "0123456789abcdef0123456789abcdef01234567",
-            "--expected-ids",
-            "4,5,6",
-            "--attestation",
-            "attestation.json",
-            "--model-sha256",
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "--model-source",
-            "https://example.invalid/model@revision",
-            "--model-license",
-            "License-Id",
-            "--model-conversion",
-            "converter@revision --quantize q4_k",
-            "--oracle-name",
-            "reference-runtime",
-            "--oracle-revision",
-            "oracle-revision",
-            "--oracle-command",
-            "reference --seed 0",
-            "--workflow-run-url",
-            "https://example.invalid/actions/runs/7",
-            "--workflow-run-id",
-            "7",
-            "model.gguf",
-            "hello",
-        ])
-        .unwrap();
+        let attested = parse(&observation_args()).unwrap();
+        assert_eq!(
+            attested.benchmark_observation_path,
+            Some(PathBuf::from("observation.json"))
+        );
+        let implementation = benchmark_implementation(&attested).unwrap();
+        assert_eq!(implementation.framework, BenchmarkFramework::RustGrad);
+        assert_eq!(implementation.command, BENCHMARK_COMMAND);
+        assert_eq!(
+            implementation.configuration,
+            "release;device_greedy;mode=plain;prefill_span=none"
+        );
         assert_eq!(attested.attestation.unwrap().model_license, "License-Id");
         assert!(parse_args(["--help".to_owned()]).unwrap().is_none());
         assert!(parse_args(["-h".to_owned()]).unwrap().is_none());
@@ -1254,6 +1497,19 @@ mod tests {
             vec!["--expected-ids", "1,,2", "m", "p"],
             vec!["--max-new-tokens", "1", "--expected-ids", "1,2", "m", "p"],
             vec!["--scoreboard", "out.json", "m", "p"],
+            vec!["--benchmark-observation", "out.json", "m", "p"],
+            vec![
+                "--scoreboard",
+                "scoreboard.json",
+                "--benchmark-observation",
+                "observation.json",
+                "--revision",
+                "0123456789abcdef0123456789abcdef01234567",
+                "--expected-ids",
+                "1",
+                "m",
+                "p",
+            ],
             vec!["--revision", "sha", "m", "p"],
             vec!["--attestation", "attestation.json", "m", "p"],
             vec![
@@ -1277,6 +1533,89 @@ mod tests {
         let terminated = parse(&["--", "-model.gguf", "-prompt"]).unwrap();
         assert_eq!(terminated.model_path, PathBuf::from("-model.gguf"));
         assert_eq!(terminated.prompt, "-prompt");
+        let mut chat_observation = observation_args();
+        chat_observation.insert(0, "--chat");
+        assert!(parse(&chat_observation).is_err());
+    }
+
+    #[test]
+    fn benchmark_hash_inputs_and_json_are_canonical() {
+        assert_eq!(
+            validate_benchmark_operating_system("macOS 15.0 (24A335); arm64".into()).unwrap(),
+            "macOS 15.0 (24A335); arm64"
+        );
+        assert!(validate_benchmark_operating_system("macOS\n15".into()).is_err());
+        assert!(validate_benchmark_operating_system("x".repeat(1_025)).is_err());
+        assert_eq!(
+            canonical_expected_ids_json(&[3, 4, 4_294_967_295]).unwrap(),
+            br#"[3,4,4294967295]"#
+        );
+        let digest = "a".repeat(64);
+        assert_eq!(
+            parse_shasum_stdout("fixture", format!("{digest}  -\n").as_bytes()).unwrap(),
+            digest
+        );
+        assert!(parse_shasum_stdout("fixture", b"not-a-digest  -\n").is_err());
+        assert!(
+            parse_shasum_stdout("fixture", format!("{}  -\n", "A".repeat(64)).as_bytes()).is_err()
+        );
+        assert!(
+            parse_shasum_stdout("fixture", format!("{}  file\n", "a".repeat(64)).as_bytes())
+                .is_err()
+        );
+
+        let observation = BenchmarkObservation::new(
+            BenchmarkImplementation {
+                framework: BenchmarkFramework::RustGrad,
+                version: "0.1.0".into(),
+                revision: "a".repeat(40),
+                configuration: "release;device_greedy;mode=plain;prefill_span=4".into(),
+                command: BENCHMARK_COMMAND.into(),
+            },
+            BenchmarkWorkload::GgufLlama {
+                model_sha256: "b".repeat(64),
+                prompt_sha256: "c".repeat(64),
+                prompt_token_count: 3,
+                max_new_tokens: 2,
+                expected_token_ids_sha256: "d".repeat(64),
+            },
+            BenchmarkDevice {
+                backend: "metal".into(),
+                name: "Apple fixture GPU".into(),
+                hardware_identity: "registry_id=42;fixture".into(),
+                operating_system: "macOS fixture; arm64".into(),
+            },
+            BenchmarkMetrics {
+                planning_time: None,
+                pipeline_compile_time: None,
+                native_prepare_time: None,
+                first_run_latency: None,
+                steady_run_latency: None,
+                prompt_prefill: None,
+                steady_decode: None,
+                planned_device_memory_bytes: None,
+                measured_peak_device_memory_bytes: None,
+                planned_kernel_count: None,
+                executed_kernel_count: None,
+                host_to_device: None,
+                device_to_host: None,
+                fallback_count: Some(0),
+            },
+        )
+        .unwrap()
+        .with_rustgrad_device_buffer_peak(RustGradDeviceBufferPeak::new(4_096))
+        .unwrap();
+        assert_eq!(
+            observation.metrics.measured_peak_device_memory_bytes,
+            Some(4_096)
+        );
+        assert_eq!(observation.metrics.planned_device_memory_bytes, None);
+        let json = deterministic_observation_json(&observation).unwrap();
+        assert_eq!(json, deterministic_observation_json(&observation).unwrap());
+        assert_eq!(
+            BenchmarkObservation::from_json_bytes(&json).unwrap(),
+            observation
+        );
     }
 
     #[test]
@@ -1304,6 +1643,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("nested")).unwrap();
         let scoreboard = root.join("scoreboard.json");
+        let observation = root.join("observation.json");
         let attestation = root.join("attestation.json");
         let args = Args {
             device_index: 0,
@@ -1312,6 +1652,7 @@ mod tests {
             prefill_span: None,
             chat: false,
             scoreboard_path: Some(scoreboard.clone()),
+            benchmark_observation_path: Some(observation.clone()),
             workload_evidence_path: None,
             revision: Some("0123456789abcdef0123456789abcdef01234567".into()),
             expected_ids: Some(vec![1]),
@@ -1338,8 +1679,15 @@ mod tests {
         assert!(write_new_evidence(&attestation, b"replacement").is_err());
         fs::remove_file(scoreboard).unwrap();
         fs::remove_file(attestation).unwrap();
+        write_new_evidence(&observation, b"observation").unwrap();
+        assert!(write_new_evidence(&observation, b"replacement").is_err());
+        assert!(validate_evidence_paths(&args).is_err());
+        fs::remove_file(observation).unwrap();
 
         let mut same = args;
+        same.benchmark_observation_path = same.scoreboard_path.clone();
+        assert!(validate_evidence_paths(&same).is_err());
+        same.benchmark_observation_path = Some(root.join("observation.json"));
         same.scoreboard_path = Some(root.join("same.json"));
         same.attestation.as_mut().unwrap().path = root.join("nested/../same.json");
         assert!(validate_evidence_paths(&same).is_err());
@@ -1429,7 +1777,71 @@ mod tests {
     }
 
     #[test]
-    fn live_workflow_pairs_device_greedy_scoreboard_attestation_and_checksums() {
+    fn live_workflow_publishes_raw_attested_and_normalized_llama_evidence() {
+        let source = include_str!("metal_llama_generate.rs");
+        let production = source.split_once("#[cfg(test)]").unwrap().0;
+        let output_validation = production.find("validate_evidence_paths(&args)?;").unwrap();
+        let os_validation = production.find("let benchmark_operating_system =").unwrap();
+        let model_loading = production.find("let attested_model =").unwrap();
+        let runtime_loading = production
+            .find("let runtime = MetalRuntime::load()?")
+            .unwrap();
+        let report = production.find("let scoreboard_report =").unwrap();
+        let raw_serialization = production.find("let scoreboard_json =").unwrap();
+        let peak = production
+            .find("let measured_device_buffer_peak = measurement.finish(&device)?;")
+            .unwrap();
+        let normalization = production
+            .find("BenchmarkObservation::from_llama_metal_scoreboard(")
+            .unwrap();
+        let attachment = production
+            .find(".with_rustgrad_device_buffer_peak(measured_device_buffer_peak)")
+            .unwrap();
+        let attestation_serialization = production.find("let attestation_bytes =").unwrap();
+        let first_write = production
+            .find("write_new_evidence(path, bytes)?;")
+            .unwrap();
+        assert!(output_validation < os_validation);
+        assert!(os_validation < model_loading);
+        assert!(model_loading < runtime_loading);
+        assert!(report < raw_serialization);
+        assert!(raw_serialization < peak);
+        assert!(peak < normalization);
+        assert!(normalization < attachment);
+        assert!(attachment < attestation_serialization);
+        assert!(attestation_serialization < first_write);
+        assert_eq!(
+            production
+                .matches("BenchmarkObservation::from_llama_metal_scoreboard(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production
+                .matches(".with_rustgrad_device_buffer_peak(measured_device_buffer_peak)")
+                .count(),
+            1
+        );
+        let hash_documentation = production.find("use the compact UTF-8 JSON array").unwrap();
+        let hash_wrapper = production.find("fn sha256_with_shasum(").unwrap();
+        assert!(hash_documentation < hash_wrapper);
+        assert!(production.contains("Command::new(\"shasum\")"));
+        assert!(production.contains(".args([\"-a\", \"256\"])"));
+        assert!(production.contains(".stdin(Stdio::piped())"));
+        for required in [
+            "model_sha256: provenance.model_sha256.clone()",
+            "args.prompt.as_bytes()",
+            "generation.prompt_ids().len()",
+            "u64::try_from(args.max_new_tokens)",
+            "canonical_expected_ids_json(expected_ids)",
+            "MetalDeviceBufferMeasurement::begin(&device)",
+            "measurement.finish(&device)?;",
+            "observation.metrics.measured_peak_device_memory_bytes",
+            "observation.metrics.planned_device_memory_bytes",
+        ] {
+            assert!(production.contains(required), "production omits {required}");
+        }
+
         let workflow = include_str!("../.github/workflows/metal-live.yml");
         for required in [
             "RUSTGRAD_METAL_LLAMA_MODEL_SOURCE",
@@ -1439,9 +1851,13 @@ mod tests {
             "RUSTGRAD_METAL_LLAMA_ORACLE_REVISION",
             "RUSTGRAD_METAL_LLAMA_ORACLE_COMMAND",
             "--attestation",
+            "--benchmark-observation",
             "--prefill-span",
             "--scoreboard",
             "--workflow-run-url",
+            "RUSTGRAD_METAL_LLAMA_OBSERVATION_PATH",
+            "RUSTGRAD_METAL_LLAMA_OPERATING_SYSTEM",
+            "sw_vers -productVersion",
             "SHA256SUMS",
         ] {
             assert!(workflow.contains(required), "workflow omits {required}");
@@ -1472,15 +1888,23 @@ mod tests {
             1
         );
         assert_eq!(llama_job.matches("--scoreboard").count(), 1);
+        assert_eq!(llama_job.matches("--benchmark-observation").count(), 1);
         assert_eq!(llama_job.matches("--attestation").count(), 1);
         assert!(llama_job.contains("RUSTGRAD_METAL_LLAMA_PREFILL_SPAN"));
         assert!(llama_job.contains(r#"--scoreboard "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH""#));
+        assert!(
+            llama_job
+                .contains(r#"--benchmark-observation "$RUSTGRAD_METAL_LLAMA_OBSERVATION_PATH""#)
+        );
         assert!(llama_job.contains(r#"--attestation "$RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH""#));
         assert!(llama_job.contains(
             r#"scoreboard_name="$(basename -- "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH")""#
         ));
-        assert!(llama_job.contains(r#"shasum -a 256 "$scoreboard_name" "$attestation_name""#));
+        assert!(llama_job.contains(
+            r#"shasum -a 256 "$scoreboard_name" "$observation_name" "$attestation_name""#
+        ));
         assert!(llama_job.contains("${{ env.RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH }}"));
+        assert!(llama_job.contains("${{ env.RUSTGRAD_METAL_LLAMA_OBSERVATION_PATH }}"));
         assert!(llama_job.contains("${{ env.RUSTGRAD_METAL_LLAMA_ATTESTATION_PATH }}"));
         assert!(llama_job.contains("${{ env.RUSTGRAD_METAL_LLAMA_SHA256SUMS_PATH }}"));
         assert!(!llama_job.contains("--workload-evidence"));

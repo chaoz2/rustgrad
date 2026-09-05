@@ -50,13 +50,35 @@ optional fixed-prefill components with checked sums. It records component
 planning/preparation, the first physical invocation, prompt-prefill and
 steady-decode phases, executed kernels, host-API transfers, and fallback count.
 Shared component ownership and the absence of a comparable global sample series
-mean that `planned_device_memory_bytes`, `measured_peak_device_memory_bytes`,
-`planned_kernel_count`, and `steady_run_latency` remain `null`.
+mean that the raw adapter leaves `planned_device_memory_bytes`,
+`measured_peak_device_memory_bytes`, `planned_kernel_count`, and
+`steady_run_latency` `null`.
 
 The maintained RustGrad adapters accept only the exact scoreboard workload labels
 `RUSTGRAD_METAL_RESNET18_WORKLOAD` and
 `RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD`. Callers still supply immutable workload,
 implementation, and operating-system provenance.
+
+The maintained live Llama command constructs that provenance only in its plain
+prompt, fully attested scoreboard mode. It hashes the exact UTF-8 prompt bytes and
+the compact UTF-8 JSON encoding of the parsed expected `u32` IDs (for example,
+`[3,4]`) through the macOS `shasum -a 256` implementation. The model hash is the
+workflow-verified attestation value, the prompt token count comes from the actual
+generation, and the generation bound comes from the executed arguments. The
+normalized observation is created directly from the validated in-memory v2
+scoreboard before any evidence file is published. Both maintained live Metal
+harnesses begin one `MetalDeviceBufferMeasurement` on a freshly discovered,
+exclusively used RustGrad `MetalDevice` and carry that token across the workload.
+Finishing the token authenticates the same device, samples its
+`lifetime_high_water_physical_buffer_bytes`, checked-converts `usize` to `u64`,
+and returns the `RustGradDeviceBufferPeak` to attach. Consequently their
+normalized hardware observations
+require `measured_peak_device_memory_bytes` to be present. This is the high-water
+sum of requested native `MTLBuffer` lengths simultaneously owned by RustGrad on
+that device lifetime—not allocator RSS, physical residency, driver overhead, or
+unified-memory pressure. It remains separate from planned memory: ResNet retains
+its adapter-derived planned static-slot bytes, while Llama planning remains
+unavailable. Raw scoreboard reports are unchanged.
 
 ## External observations
 
@@ -68,5 +90,6 @@ uncollected optional fields `null`. The comparison CLI validates and bundles
 those documents; it never fabricates parity, memory, traffic, latency, or speedup
 values.
 
-The checked-in Apple-GPU lane remains dormant, so the repository currently
-publishes no live Apple-GPU comparison measurements.
+The checked-in Apple-GPU lane remains dormant. Its Llama path is prepared to emit
+the create-new normalized observation beside the raw scoreboard and attestation,
+but the repository currently publishes no live Apple-GPU comparison measurements.

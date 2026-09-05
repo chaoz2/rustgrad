@@ -3,8 +3,9 @@
 RustGrad's live Metal workflow is a manual conformance lane, not part of normal
 CI. The workflow definition, ignored acceptance test, and examples are not
 live-hardware evidence by themselves. Evidence exists only after an exact-SHA
-workflow run succeeds and publishes the Linear/ResNet scoreboards plus the
-device-greedy Llama execution scoreboard v2, attestation, and checksum manifest.
+workflow run succeeds and publishes the Linear/ResNet scoreboards, normalized
+ResNet observation v1, device-greedy Llama execution scoreboard v2, normalized
+Llama observation v1, attestation, and checksum manifest.
 
 ## Provisioning contract
 
@@ -106,11 +107,24 @@ of silently testing the newer revision.
 
 ## Evidence boundary
 
-A successful Linear/ResNet job uploads two v7 scoreboards. A successful Llama
-job uploads its device-greedy execution scoreboard v2, whose token-step and
-fixed-span components are authenticated v7 reports, plus a typed provenance
-attestation and `SHA256SUMS`. Preserve the workflow run URL and ID with any
-release record.
+A successful Linear/ResNet job uploads two v7 scoreboards plus the normalized
+ResNet `BenchmarkObservation` v1. A successful Llama job uploads its
+device-greedy execution scoreboard v2, whose token-step and
+fixed-span components are authenticated v7 reports, plus a normalized
+`BenchmarkObservation` v1, typed provenance attestation, and `SHA256SUMS`. The
+observation binds the workflow-verified model hash, exact plain-prompt byte hash,
+actual prompt token count, executed generation bound, canonical expected-ID hash,
+selected device, runner OS, validated scoreboard metrics, and a required
+`measured_peak_device_memory_bytes`. Both normalized observations carry one
+`MetalDeviceBufferMeasurement` token across the workload on the freshly
+discovered, exclusively used selected device. Finishing it authenticates the
+same `MetalDevice`, checked-converts its
+`lifetime_high_water_physical_buffer_bytes` to `u64`, and yields the attached
+`RustGradDeviceBufferPeak`. It is the high-water sum of requested native
+`MTLBuffer` lengths simultaneously owned by RustGrad—not allocator RSS, physical
+residency, driver overhead, or unified-memory pressure. Planned memory remains a
+separate metric: ResNet retains it and Llama leaves it unavailable. Raw reports
+are unchanged. Preserve the workflow run URL and ID with any release record.
 
 Host-wall durations and optional completed-compute-command GPU execution time
 are reported separately, and copy counts are host API calls. Host-run and

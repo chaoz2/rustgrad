@@ -13,15 +13,111 @@ struct BufferDesc {
     dtype: Option<DType>,
 }
 
+/// Immutable accounting for native Metal buffers owned by one discovered device.
+///
+/// Byte totals are the requested `MTLBuffer` lengths for successful, nonzero
+/// RustGrad-owned allocations. They are not allocator RSS, physical residency,
+/// driver overhead, unified-memory pressure, or a per-session metric. The
+/// lifetime high-water values span all clones of this discovered device.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MetalBufferAllocationStats {
+    /// Native physical buffers currently owned by RustGrad.
+    pub current_physical_buffer_count: usize,
+    /// Sum of the requested lengths of current native physical buffers.
+    pub current_physical_buffer_bytes: usize,
+    /// Largest current physical-buffer count observed during this device lifetime.
+    pub lifetime_high_water_physical_buffer_count: usize,
+    /// Largest current physical-buffer byte total observed during this device lifetime.
+    pub lifetime_high_water_physical_buffer_bytes: usize,
+}
+
+impl MetalBufferAllocationStats {
+    pub(super) fn checked_allocate(self, bytes: usize) -> Result<Self, MetalError> {
+        if bytes == 0 {
+            return Err(MetalError::InvalidArgument(
+                "physical buffer accounting requires a nonzero length",
+            ));
+        }
+        let current_physical_buffer_count = self
+            .current_physical_buffer_count
+            .checked_add(1)
+            .ok_or(MetalError::Overflow)?;
+        let current_physical_buffer_bytes = self
+            .current_physical_buffer_bytes
+            .checked_add(bytes)
+            .ok_or(MetalError::Overflow)?;
+        Ok(Self {
+            current_physical_buffer_count,
+            current_physical_buffer_bytes,
+            lifetime_high_water_physical_buffer_count: self
+                .lifetime_high_water_physical_buffer_count
+                .max(current_physical_buffer_count),
+            lifetime_high_water_physical_buffer_bytes: self
+                .lifetime_high_water_physical_buffer_bytes
+                .max(current_physical_buffer_bytes),
+        })
+    }
+
+    pub(super) fn checked_release(self, bytes: usize) -> Result<Self, MetalError> {
+        if bytes == 0 {
+            return Err(MetalError::InvalidArgument(
+                "physical buffer accounting requires a nonzero length",
+            ));
+        }
+        let current_physical_buffer_count = self
+            .current_physical_buffer_count
+            .checked_sub(1)
+            .ok_or(MetalError::Overflow)?;
+        let current_physical_buffer_bytes = self
+            .current_physical_buffer_bytes
+            .checked_sub(bytes)
+            .ok_or(MetalError::Overflow)?;
+        Ok(Self {
+            current_physical_buffer_count,
+            current_physical_buffer_bytes,
+            ..self
+        })
+    }
+}
+
 pub(super) struct PhysicalBuffer {
     pub(super) device: Rc<DeviceInner>,
     pub(super) raw: Option<RawBuffer>,
+    accounted_bytes: usize,
+}
+
+impl PhysicalBuffer {
+    fn allocate(device: Rc<DeviceInner>, bytes: usize) -> Result<Rc<Self>, MetalError> {
+        if bytes == 0 {
+            return Ok(Rc::new(Self {
+                device,
+                raw: None,
+                accounted_bytes: 0,
+            }));
+        }
+        let raw = device
+            .dispatch
+            .buffer_create(device.raw, bytes, device.owner)?;
+        if let Err(error) = device.record_physical_buffer_allocation(bytes) {
+            device.dispatch.buffer_release(raw, device.owner);
+            return Err(error);
+        }
+        Ok(Rc::new(Self {
+            device,
+            raw: Some(raw),
+            accounted_bytes: bytes,
+        }))
+    }
 }
 
 impl Drop for PhysicalBuffer {
     fn drop(&mut self) {
         if let Some(raw) = self.raw {
             self.device.dispatch.buffer_release(raw, self.device.owner);
+            let accounting = self
+                .device
+                .record_physical_buffer_release(self.accounted_bytes);
+            debug_assert!(accounting.is_ok(), "physical-buffer accounting underflow");
         }
     }
 }
@@ -99,19 +195,7 @@ impl MetalBuffer {
                 "buffer exceeds device maximum length",
             ));
         }
-        let raw = if physical_bytes == 0 {
-            None
-        } else {
-            Some(
-                device
-                    .dispatch
-                    .buffer_create(device.raw, physical_bytes, device.owner)?,
-            )
-        };
-        let physical = Rc::new(PhysicalBuffer {
-            device: device.clone(),
-            raw,
-        });
+        let physical = PhysicalBuffer::allocate(device.clone(), physical_bytes)?;
         Ok(Self {
             inner: Rc::new(LogicalBuffer {
                 device,
@@ -221,19 +305,7 @@ impl MetalBuffer {
 
     pub(super) fn candidate(&self) -> Result<Rc<PhysicalBuffer>, MetalError> {
         self.inner.device.live()?;
-        let raw = if self.inner.desc.physical_bytes == 0 {
-            None
-        } else {
-            Some(self.inner.device.dispatch.buffer_create(
-                self.inner.device.raw,
-                self.inner.desc.physical_bytes,
-                self.inner.device.owner,
-            )?)
-        };
-        Ok(Rc::new(PhysicalBuffer {
-            device: self.inner.device.clone(),
-            raw,
-        }))
+        PhysicalBuffer::allocate(self.inner.device.clone(), self.inner.desc.physical_bytes)
     }
 
     pub(super) fn commit_candidate(
@@ -273,5 +345,50 @@ impl Drop for MetalBuffer {
         if remaining == 0 {
             self.inner.closed.set(true);
         }
+    }
+}
+
+#[cfg(test)]
+mod allocation_stats_tests {
+    use super::*;
+
+    #[test]
+    fn checked_accounting_overflow_and_underflow_leave_snapshots_unchanged() {
+        let empty = MetalBufferAllocationStats::default();
+        assert_eq!(empty.checked_release(1), Err(MetalError::Overflow));
+        assert_eq!(empty, MetalBufferAllocationStats::default());
+
+        let too_few_bytes = MetalBufferAllocationStats {
+            current_physical_buffer_count: 1,
+            current_physical_buffer_bytes: 0,
+            lifetime_high_water_physical_buffer_count: 1,
+            lifetime_high_water_physical_buffer_bytes: 0,
+        };
+        assert_eq!(too_few_bytes.checked_release(1), Err(MetalError::Overflow));
+
+        let full = MetalBufferAllocationStats {
+            current_physical_buffer_count: usize::MAX,
+            current_physical_buffer_bytes: 7,
+            lifetime_high_water_physical_buffer_count: usize::MAX,
+            lifetime_high_water_physical_buffer_bytes: 7,
+        };
+        assert_eq!(full.checked_allocate(1), Err(MetalError::Overflow));
+        assert_eq!(
+            full,
+            MetalBufferAllocationStats {
+                current_physical_buffer_count: usize::MAX,
+                current_physical_buffer_bytes: 7,
+                lifetime_high_water_physical_buffer_count: usize::MAX,
+                lifetime_high_water_physical_buffer_bytes: 7,
+            }
+        );
+
+        let full_bytes = MetalBufferAllocationStats {
+            current_physical_buffer_count: 7,
+            current_physical_buffer_bytes: usize::MAX,
+            lifetime_high_water_physical_buffer_count: 7,
+            lifetime_high_water_physical_buffer_bytes: usize::MAX,
+        };
+        assert_eq!(full_bytes.checked_allocate(1), Err(MetalError::Overflow));
     }
 }

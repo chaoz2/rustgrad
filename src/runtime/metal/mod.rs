@@ -16,7 +16,7 @@ mod scoreboard;
 mod session;
 mod transaction;
 
-pub use buffer::MetalBuffer;
+pub use buffer::{MetalBuffer, MetalBufferAllocationStats};
 pub use dispatch::{MetalCapabilities, MetalDeviceInfo};
 pub use prepared::{CapturedMetalPrefix, MetalPrefixPlan, PreparedMetalPrefix};
 pub use renderer::{

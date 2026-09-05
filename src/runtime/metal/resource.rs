@@ -1,6 +1,7 @@
 //! Thread-confined safe Metal resources, caches, launch preflight, and events.
 use super::{
-    MetalBuffer, MetalDeviceInfo, MetalError, MetalRenderer, RenderedMetal,
+    MetalBuffer, MetalBufferAllocationStats, MetalDeviceInfo, MetalError, MetalRenderer,
+    RenderedMetal,
     buffer::{BufferSnapshot, PhysicalBuffer},
     dispatch::{
         BatchLaunch, CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawCommand, RawDevice,
@@ -80,6 +81,7 @@ impl MetalRuntime {
                     raw,
                     info,
                     owner,
+                    buffer_allocations: Cell::new(MetalBufferAllocationStats::default()),
                     closed: Cell::new(false),
                     thread_confined: PhantomData,
                 }),
@@ -121,6 +123,7 @@ pub(super) struct DeviceInner {
     pub(super) raw: RawDevice,
     pub(super) info: MetalDeviceInfo,
     pub(super) owner: u64,
+    buffer_allocations: Cell<MetalBufferAllocationStats>,
     closed: Cell<bool>,
     thread_confined: PhantomData<Rc<()>>,
 }
@@ -132,6 +135,22 @@ impl DeviceInner {
         } else {
             Ok(())
         }
+    }
+
+    pub(super) fn record_physical_buffer_allocation(&self, bytes: usize) -> Result<(), MetalError> {
+        let next = self.buffer_allocations.get().checked_allocate(bytes)?;
+        self.buffer_allocations.set(next);
+        Ok(())
+    }
+
+    pub(super) fn record_physical_buffer_release(&self, bytes: usize) -> Result<(), MetalError> {
+        let next = self.buffer_allocations.get().checked_release(bytes)?;
+        self.buffer_allocations.set(next);
+        Ok(())
+    }
+
+    fn buffer_allocation_stats(&self) -> MetalBufferAllocationStats {
+        self.buffer_allocations.get()
     }
 }
 
@@ -162,6 +181,20 @@ impl MetalDevice {
     /// Returns the stable Rust owner identity.
     pub fn owner_id(&self) -> u64 {
         self.inner.owner
+    }
+
+    /// Returns RustGrad-owned native `MTLBuffer` length accounting for this
+    /// discovered device and all of its clones.
+    ///
+    /// This device-lifetime snapshot is not allocator RSS, physical residency,
+    /// driver overhead, unified-memory pressure, or per-session attribution.
+    pub fn buffer_allocation_stats(&self) -> MetalBufferAllocationStats {
+        self.inner.buffer_allocation_stats()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_buffer_allocation_stats_for_test(&self, stats: MetalBufferAllocationStats) {
+        self.inner.buffer_allocations.set(stats);
     }
 
     /// Creates a resource-free renderer for this device's exact capabilities.
