@@ -12,6 +12,9 @@ use super::{
 };
 
 #[cfg(target_os = "macos")]
+use super::dispatch::gpu_duration_from_seconds;
+
+#[cfg(target_os = "macos")]
 use super::MetalCapabilities;
 
 #[cfg(target_os = "macos")]
@@ -203,6 +206,14 @@ mod platform {
             unsafe { function(object, self.selector(selector)) }
         }
 
+        unsafe fn msg0_f64(&self, object: *mut c_void, selector: &'static str) -> f64 {
+            // SAFETY: signature matches this selector family.
+            let function: unsafe extern "C" fn(*mut c_void, *mut c_void) -> f64 =
+                unsafe { std::mem::transmute(self.msg_send) };
+            // SAFETY: Objective-C receiver and selector are valid.
+            unsafe { function(object, self.selector(selector)) }
+        }
+
         unsafe fn msg0_bool(&self, object: *mut c_void, selector: &'static str) -> bool {
             // Objective-C BOOL is a signed byte on modern macOS.
             // SAFETY: signature matches this selector family.
@@ -223,6 +234,20 @@ mod platform {
             let function: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> i8 =
                 unsafe { std::mem::transmute(self.msg_send) };
             // SAFETY: Objective-C receiver and selector are valid.
+            unsafe { function(object, self.selector(selector), argument) != 0 }
+        }
+
+        unsafe fn msg1_bool_ptr(
+            &self,
+            object: *mut c_void,
+            selector: &'static str,
+            argument: *mut c_void,
+        ) -> bool {
+            // Objective-C BOOL is a signed byte on modern macOS.
+            // SAFETY: signature matches this selector family.
+            let function: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i8 =
+                unsafe { std::mem::transmute(self.msg_send) };
+            // SAFETY: receiver, selector, and selector argument are valid.
             unsafe { function(object, self.selector(selector), argument) != 0 }
         }
 
@@ -902,6 +927,33 @@ mod platform {
             }
         }
 
+        fn command_gpu_duration(
+            &self,
+            command: RawCommand,
+            _owner: u64,
+        ) -> Option<std::time::Duration> {
+            let command = Self::object(command.0, "GPU command timestamps").ok()?;
+            let start_selector = self.objc.selector("GPUStartTime");
+            let end_selector = self.objc.selector("GPUEndTime");
+            // SAFETY: command is a live Objective-C object and both arguments
+            // are registered selectors. Older Metal implementations may not
+            // expose these optional timestamp selectors.
+            if !unsafe {
+                self.objc
+                    .msg1_bool_ptr(command, "respondsToSelector:", start_selector)
+            } || !unsafe {
+                self.objc
+                    .msg1_bool_ptr(command, "respondsToSelector:", end_selector)
+            } {
+                return None;
+            }
+            // SAFETY: selector support was checked above and both properties
+            // return CFTimeInterval (`double`).
+            let start = unsafe { self.objc.msg0_f64(command, "GPUStartTime") };
+            let end = unsafe { self.objc.msg0_f64(command, "GPUEndTime") };
+            gpu_duration_from_seconds(start, end)
+        }
+
         fn command_release(&self, command: RawCommand, _owner: u64) {
             self.objc.release(command.0 as *mut c_void);
         }
@@ -991,6 +1043,9 @@ impl Dispatch for NativeDispatch {
     }
     fn command_wait(&self, _: RawCommand, _: u64) -> Result<(), MetalError> {
         Err(MetalError::PlatformUnsupported)
+    }
+    fn command_gpu_duration(&self, _: RawCommand, _: u64) -> Option<std::time::Duration> {
+        None
     }
     fn command_release(&self, _: RawCommand, _: u64) {}
 }

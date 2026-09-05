@@ -13,15 +13,16 @@ use std::{
 };
 
 /// Current deterministic Metal Llama workload-evidence JSON format.
-pub const LLAMA_METAL_WORKLOAD_EVIDENCE_FORMAT_VERSION: u32 = 2;
+pub const LLAMA_METAL_WORKLOAD_EVIDENCE_FORMAT_VERSION: u32 = 3;
 
 const MAX_CONTEXT_FIELD_BYTES: usize = 1_024;
 
 /// Host-observed performance evidence for one completed Llama workload.
 ///
 /// Planned bytes are static Metal allocation facts. Transfer counts and bytes
-/// are host API calls, not physical-bus measurements. Durations are host wall
-/// time; no field claims GPU time, peak memory, or GPU throughput.
+/// are host API calls, not physical-bus measurements. Host durations remain
+/// distinct from optional command-buffer GPU execution time; neither is a
+/// physical-copy, end-to-end throughput, or peak-memory measurement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LlamaMetalWorkloadEvidence {
     /// Exact token-step capture plus resident/state payload identity.
@@ -58,6 +59,10 @@ pub struct LlamaMetalWorkloadPhase {
     /// Metal compute command buffers synchronously waited in this phase; host
     /// API H2D/D2H copy calls are counted separately and excluded.
     pub command_wait_count: usize,
+    /// Exact sum of valid Metal command-buffer GPU timestamp intervals for the
+    /// phase. `None` means no compute command ran or at least one interval was
+    /// unavailable, invalid, or unrepresentable.
+    pub gpu_command_execution_time: Option<Duration>,
     pub transient_h2d_calls: usize,
     pub transient_h2d_bytes: usize,
     pub runtime_control_h2d_calls: usize,
@@ -68,6 +73,14 @@ pub struct LlamaMetalWorkloadPhase {
 
 impl LlamaMetalWorkloadPhase {
     pub(crate) fn from_reports(token_count: usize, reports: &[MetalDeviceRunReport]) -> Self {
+        let gpu_command_execution_time =
+            (!reports.is_empty())
+                .then_some(Duration::ZERO)
+                .and_then(|initial| {
+                    reports.iter().try_fold(initial, |total, report| {
+                        total.checked_add(report.gpu_command_execution_time?)
+                    })
+                });
         let mut phase = Self {
             token_count,
             successful_invocation_count: reports.len(),
@@ -76,6 +89,7 @@ impl LlamaMetalWorkloadPhase {
             kernel_launch_count: 0,
             command_submission_count: 0,
             command_wait_count: 0,
+            gpu_command_execution_time,
             transient_h2d_calls: 0,
             transient_h2d_bytes: 0,
             runtime_control_h2d_calls: 0,
@@ -481,6 +495,7 @@ struct PhaseJson {
     kernel_launch_count: usize,
     command_submission_count: usize,
     command_wait_count: usize,
+    gpu_command_execution_time: Option<DurationJson>,
     transient_h2d_calls: usize,
     transient_h2d_bytes: usize,
     runtime_control_h2d_calls: usize,
@@ -501,6 +516,7 @@ impl From<&LlamaMetalWorkloadPhase> for PhaseJson {
             kernel_launch_count: value.kernel_launch_count,
             command_submission_count: value.command_submission_count,
             command_wait_count: value.command_wait_count,
+            gpu_command_execution_time: value.gpu_command_execution_time.map(Into::into),
             transient_h2d_calls: value.transient_h2d_calls,
             transient_h2d_bytes: value.transient_h2d_bytes,
             runtime_control_h2d_calls: value.runtime_control_h2d_calls,
@@ -589,6 +605,7 @@ mod tests {
             kernel_launch_count: 1,
             command_submission_count: 1,
             command_wait_count: 1,
+            gpu_command_execution_time: Some(Duration::new(0, 13)),
             transient_h2d_calls: 1,
             transient_h2d_bytes: tokens * 4,
             runtime_control_h2d_calls: 1,
@@ -633,7 +650,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&first).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.last(), Some(&b'\n'));
-        assert_eq!(json["format_version"], 2);
+        assert_eq!(json["format_version"], 3);
         assert_eq!(json["device"]["registry_id"], 7);
         assert_eq!(json["evidence"]["token_step_deployment_identity"], 13);
         assert_eq!(
@@ -646,6 +663,10 @@ mod tests {
             1
         );
         assert_eq!(json["evidence"]["prompt_prefill"]["command_wait_count"], 1);
+        assert_eq!(
+            json["evidence"]["prompt_prefill"]["gpu_command_execution_time"]["nanoseconds"],
+            13
+        );
     }
 
     #[test]

@@ -156,6 +156,9 @@ pub(super) trait Dispatch: Send + Sync + 'static {
 
     fn command_query(&self, command: RawCommand, owner: u64) -> Result<bool, MetalError>;
     fn command_wait(&self, command: RawCommand, owner: u64) -> Result<(), MetalError>;
+    /// Returns a completed command buffer's valid GPU execution interval.
+    /// Implementations return `None` when timestamps are unavailable or invalid.
+    fn command_gpu_duration(&self, command: RawCommand, owner: u64) -> Option<std::time::Duration>;
     fn command_release(&self, command: RawCommand, owner: u64);
 
     fn register_kernel_semantics(
@@ -167,4 +170,12 @@ pub(super) trait Dispatch: Send + Sync + 'static {
         Ok(())
     }
     fn unregister_kernel_semantics(&self, _owner: u64, _pipeline: RawPipeline) {}
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn gpu_duration_from_seconds(start: f64, end: f64) -> Option<std::time::Duration> {
+    if !start.is_finite() || !end.is_finite() || start <= 0.0 || end < start {
+        return None;
+    }
+    std::time::Duration::try_from_secs_f64(end - start).ok()
 }

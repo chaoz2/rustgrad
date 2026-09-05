@@ -13,6 +13,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 mod sealed {
     pub trait Sealed {}
@@ -2104,6 +2105,7 @@ pub(crate) trait StaticDeviceAdapter: StaticPlanAdapter {
         Ok(StaticCommandReport {
             submissions: launches.len(),
             waits: launches.len(),
+            gpu_command_execution_time: None,
         })
     }
     fn read(
@@ -2968,11 +2970,13 @@ pub(crate) struct StaticPreparedLaunch<'a, K, B> {
 pub(crate) struct StaticCommandReport {
     pub(crate) submissions: usize,
     pub(crate) waits: usize,
+    pub(crate) gpu_command_execution_time: Option<Duration>,
 }
 
 /// Exact successful host/device activity for one prepared static transaction.
 /// Counts describe host API copies, kernel encodes, submissions, and waits,
-/// not PCIe traffic or GPU time.
+/// not PCIe traffic. GPU command time is available only when every submitted
+/// compute command reports a valid timestamp interval.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StaticExecutionReport {
     pub(crate) h2d_calls: usize,
@@ -2982,6 +2986,7 @@ pub(crate) struct StaticExecutionReport {
     pub(crate) kernel_launches: usize,
     pub(crate) command_submissions: usize,
     pub(crate) command_waits: usize,
+    pub(crate) gpu_command_execution_time: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3560,6 +3565,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             let commands = self.adapter.launch_batch_and_wait(queue, &launches)?;
             report.command_submissions = commands.submissions;
             report.command_waits = commands.waits;
+            report.gpu_command_execution_time = commands.gpu_command_execution_time;
             for (id, bytes) in &mut downloads {
                 if !bytes.is_empty() {
                     let buffer = self
