@@ -73,6 +73,7 @@ src/
     shape.rs             pure checked shape/dtype validation helpers
     elementwise.rs        elementwise graph construction and validation
   autograd.rs            reverse-mode graph transform
+  benchmark.rs           normalized observations and offline comparisons
   uop/                   tinygrad-style universal operation IR
     mod.rs               typed operations, values, validation and rewrites
     artifact.rs          bounded typed UOp DAG node-table codec
@@ -118,6 +119,7 @@ src/
   viz/                   graph, schedule and kernel inspection
   compatibility_manifest/ deterministic compatibility-ledger projection
   bin/compatibility_manifest.rs manifest generation and drift-check command
+  bin/benchmark_compare.rs bounded offline observation bundling CLI
   trace.rs               inspectable and replayable compiler decisions
 tests/
   differential/          RustGrad vs tinygrad/NumPy/PyTorch
@@ -2822,6 +2824,29 @@ usable device to the current process; live smokes are evidence only when this
 discovery step returns a device. `MetalRuntime::device(index)` is the concise
 selection seam over that same ordered inventory; an absent inventory remains
 `NoDevices`, while an out-of-range nonempty selection is an invalid argument.
+
+`benchmark.rs` owns the public version-1 `BenchmarkObservation` and
+`BenchmarkComparison` evidence schema. A comparison has one exact
+`BenchmarkWorkload`, one exact `BenchmarkDevice`, distinct framework observations,
+and a caller-selected baseline that must be present. Construction validates and
+orders the observations canonically; it neither executes a workload nor derives a
+speedup. Optional null metrics are unavailable, whereas a present zero is a
+measured zero.
+
+`BenchmarkObservation::from_metal_session_scoreboard` maps the ResNet-18 v7
+scoreboard into normalized host-observed timing, planned static-slot/kernel facts,
+executed kernels, host-API payload, and fallback fields.
+`BenchmarkObservation::from_llama_metal_scoreboard` combines the Llama v2
+component reports, including prompt-prefill and steady-decode phases, but leaves
+whole-workload planned memory, measured peak memory, planned kernels, and global
+steady-run latency unavailable. The adapters do not reinterpret host-API payload
+as physical traffic. `benchmark_compare` reads bounded observation files and
+emits deterministic comparison JSON offline, allowing independently measured
+tinygrad, Candle, and llama.cpp evidence to enter without inferred values.
+
+This comparison plumbing is delivered, but the dormant protected lane has not
+produced live Apple-GPU observations. No current speedup, measured peak device
+memory, or physical transfer result follows from these types.
 
 `tests/metal_live.rs`, `examples/metal_resnet_benchmark.rs`, and
 `examples/metal_llama_generate.rs` contain the public-API hardware acceptance,
