@@ -60,7 +60,7 @@ pub enum BenchmarkWorkload {
     /// Fixed-shape ResNet-18 inference conformance workload.
     ResNet18 {
         model_identity: String,
-        input_shape: [usize; 4],
+        input_shape: [u64; 4],
         input_dtype: String,
         input_sha256: String,
         correctness_contract: String,
@@ -69,8 +69,8 @@ pub enum BenchmarkWorkload {
     GgufLlama {
         model_sha256: String,
         prompt_sha256: String,
-        prompt_token_count: usize,
-        max_new_tokens: usize,
+        prompt_token_count: u64,
+        max_new_tokens: u64,
         expected_token_ids_sha256: String,
     },
 }
@@ -129,7 +129,7 @@ impl BenchmarkDuration {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkLatencySummary {
-    pub sample_count: usize,
+    pub sample_count: u64,
     pub min: BenchmarkDuration,
     pub nearest_rank_p50: BenchmarkDuration,
     pub nearest_rank_p95: BenchmarkDuration,
@@ -157,7 +157,7 @@ impl BenchmarkLatencySummary {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkPhase {
-    pub unit_count: usize,
+    pub unit_count: u64,
     pub host_wall_time: Option<BenchmarkDuration>,
     pub device_execution_time: Option<BenchmarkDuration>,
 }
@@ -191,8 +191,8 @@ impl BenchmarkPhase {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkTransfer {
-    pub calls: usize,
-    pub bytes: usize,
+    pub calls: u64,
+    pub bytes: u64,
 }
 
 impl BenchmarkTransfer {
@@ -216,13 +216,13 @@ pub struct BenchmarkMetrics {
     pub steady_run_latency: Option<BenchmarkLatencySummary>,
     pub prompt_prefill: Option<BenchmarkPhase>,
     pub steady_decode: Option<BenchmarkPhase>,
-    pub planned_device_memory_bytes: Option<usize>,
-    pub measured_peak_device_memory_bytes: Option<usize>,
-    pub planned_kernel_count: Option<usize>,
-    pub executed_kernel_count: Option<usize>,
+    pub planned_device_memory_bytes: Option<u64>,
+    pub measured_peak_device_memory_bytes: Option<u64>,
+    pub planned_kernel_count: Option<u64>,
+    pub executed_kernel_count: Option<u64>,
     pub host_to_device: Option<BenchmarkTransfer>,
     pub device_to_host: Option<BenchmarkTransfer>,
-    pub fallback_count: Option<usize>,
+    pub fallback_count: Option<u64>,
 }
 
 impl BenchmarkMetrics {
@@ -337,19 +337,21 @@ impl BenchmarkObservation {
             steady_run_latency: metal_steady_latency(report)?,
             prompt_prefill: None,
             steady_decode: None,
-            planned_device_memory_bytes: Some(report.planned_physical_static_tensor_slot_bytes),
+            planned_device_memory_bytes: Some(count_to_u64(
+                report.planned_physical_static_tensor_slot_bytes,
+            )?),
             measured_peak_device_memory_bytes: None,
-            planned_kernel_count: Some(report.planned_kernel_count),
-            executed_kernel_count: Some(report.kernel_launch_count),
+            planned_kernel_count: Some(count_to_u64(report.planned_kernel_count)?),
+            executed_kernel_count: Some(count_to_u64(report.kernel_launch_count)?),
             host_to_device: Some(BenchmarkTransfer {
-                calls: report.host_api_h2d_calls,
-                bytes: report.host_api_h2d_bytes,
+                calls: count_to_u64(report.host_api_h2d_calls)?,
+                bytes: count_to_u64(report.host_api_h2d_bytes)?,
             }),
             device_to_host: Some(BenchmarkTransfer {
-                calls: report.host_api_d2h_calls,
-                bytes: report.host_api_d2h_bytes,
+                calls: count_to_u64(report.host_api_d2h_calls)?,
+                bytes: count_to_u64(report.host_api_d2h_bytes)?,
             }),
-            fallback_count: Some(report.fallback_count),
+            fallback_count: Some(count_to_u64(report.fallback_count)?),
         };
         Self::new(
             implementation,
@@ -392,23 +394,23 @@ impl BenchmarkObservation {
             )?)),
             first_run_latency: llama_first_run_latency(report)?,
             steady_run_latency: None,
-            prompt_prefill: phase_from_llama(&report.prompt_prefill),
-            steady_decode: phase_from_llama(&report.steady_decode),
+            prompt_prefill: phase_from_llama(&report.prompt_prefill)?,
+            steady_decode: phase_from_llama(&report.steady_decode)?,
             planned_device_memory_bytes: None,
             measured_peak_device_memory_bytes: None,
             planned_kernel_count: None,
-            executed_kernel_count: Some(sum_component_usize(report, |component| {
+            executed_kernel_count: Some(sum_component_count(report, |component| {
                 component.kernel_launch_count
             })?),
             host_to_device: Some(BenchmarkTransfer {
-                calls: sum_component_usize(report, |component| component.host_api_h2d_calls)?,
-                bytes: sum_component_usize(report, |component| component.host_api_h2d_bytes)?,
+                calls: sum_component_count(report, |component| component.host_api_h2d_calls)?,
+                bytes: sum_component_count(report, |component| component.host_api_h2d_bytes)?,
             }),
             device_to_host: Some(BenchmarkTransfer {
-                calls: sum_component_usize(report, |component| component.host_api_d2h_calls)?,
-                bytes: sum_component_usize(report, |component| component.host_api_d2h_bytes)?,
+                calls: sum_component_count(report, |component| component.host_api_d2h_calls)?,
+                bytes: sum_component_count(report, |component| component.host_api_d2h_bytes)?,
             }),
-            fallback_count: Some(report.fallback_count),
+            fallback_count: Some(count_to_u64(report.fallback_count)?),
         };
         Self::new(
             implementation,
@@ -683,7 +685,7 @@ fn validate_sha256(field: &'static str, value: &str) -> Result<(), BenchmarkErro
     }
 }
 
-fn units_per_second(count: usize, elapsed: BenchmarkDuration) -> Option<f64> {
+fn units_per_second(count: u64, elapsed: BenchmarkDuration) -> Option<f64> {
     let nanos = elapsed.as_nanos().ok()?;
     (count != 0 && nanos != 0).then(|| count as f64 * 1_000_000_000.0 / nanos as f64)
 }
@@ -828,7 +830,7 @@ fn metal_steady_latency(
         (true, None) => Ok(None),
         (false, Some(summary)) => {
             let actual =
-                latency_summary_from_metal(report.steady_run_host_wall_times.len(), summary);
+                latency_summary_from_metal(report.steady_run_host_wall_times.len(), summary)?;
             if Some(actual.clone()) != summarize_durations(&report.steady_run_host_wall_times) {
                 return Err(BenchmarkError::InvalidSourceReport(
                     "steady run latency summary",
@@ -854,7 +856,7 @@ fn summarize_durations(samples: &[Duration]) -> Option<BenchmarkLatencySummary> 
         ordered[rank.max(1) - 1]
     };
     Some(BenchmarkLatencySummary {
-        sample_count: samples.len(),
+        sample_count: u64::try_from(samples.len()).ok()?,
         min: BenchmarkDuration::from_duration(ordered[0]),
         nearest_rank_p50: BenchmarkDuration::from_duration(nearest_rank(50)),
         nearest_rank_p95: BenchmarkDuration::from_duration(nearest_rank(95)),
@@ -865,24 +867,29 @@ fn summarize_durations(samples: &[Duration]) -> Option<BenchmarkLatencySummary> 
 fn latency_summary_from_metal(
     sample_count: usize,
     summary: &MetalHostWallTimeSummary,
-) -> BenchmarkLatencySummary {
-    BenchmarkLatencySummary {
-        sample_count,
+) -> Result<BenchmarkLatencySummary, BenchmarkError> {
+    Ok(BenchmarkLatencySummary {
+        sample_count: count_to_u64(sample_count)?,
         min: BenchmarkDuration::from_duration(summary.min),
         nearest_rank_p50: BenchmarkDuration::from_duration(summary.nearest_rank_p50),
         nearest_rank_p95: BenchmarkDuration::from_duration(summary.nearest_rank_p95),
         max: BenchmarkDuration::from_duration(summary.max),
-    }
+    })
 }
 
-fn phase_from_llama(phase: &LlamaMetalScoreboardPhaseAggregate) -> Option<BenchmarkPhase> {
-    (phase.committed_token_count != 0).then(|| BenchmarkPhase {
-        unit_count: phase.committed_token_count,
+fn phase_from_llama(
+    phase: &LlamaMetalScoreboardPhaseAggregate,
+) -> Result<Option<BenchmarkPhase>, BenchmarkError> {
+    if phase.committed_token_count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(BenchmarkPhase {
+        unit_count: count_to_u64(phase.committed_token_count)?,
         host_wall_time: Some(BenchmarkDuration::from_duration(phase.host_run_wall_time)),
         device_execution_time: phase
             .gpu_command_execution_time
             .map(BenchmarkDuration::from_duration),
-    })
+    }))
 }
 
 fn llama_first_run_latency(
@@ -940,16 +947,20 @@ fn sum_component_duration(
     }
 }
 
-fn sum_component_usize(
+fn sum_component_count(
     report: &LlamaMetalExecutionScoreboardReport,
     field: impl Fn(&MetalSessionScoreboardReport) -> usize,
-) -> Result<usize, BenchmarkError> {
+) -> Result<u64, BenchmarkError> {
     match &report.fixed_prefill {
-        Some(fixed_prefill) => field(&report.token_step)
-            .checked_add(field(fixed_prefill))
+        Some(fixed_prefill) => count_to_u64(field(&report.token_step))?
+            .checked_add(count_to_u64(field(fixed_prefill))?)
             .ok_or(BenchmarkError::Overflow),
-        None => Ok(field(&report.token_step)),
+        None => count_to_u64(field(&report.token_step)),
     }
+}
+
+fn count_to_u64(value: usize) -> Result<u64, BenchmarkError> {
+    u64::try_from(value).map_err(|_| BenchmarkError::Overflow)
 }
 
 fn encode_json(value: &impl Serialize) -> Result<Vec<u8>, BenchmarkError> {
