@@ -3,6 +3,7 @@
 
 pub mod autograd;
 pub mod backend;
+pub mod benchmark;
 pub mod collective;
 mod collective_inspection;
 pub mod conv2d_plan;
@@ -68,6 +69,11 @@ pub mod vector_ir;
 pub mod viz;
 
 pub use backend::{Backend, CpuBackend, CpuJitBackend, JitFallback};
+pub use benchmark::{
+    BENCHMARK_FORMAT_VERSION, BenchmarkComparison, BenchmarkDevice, BenchmarkDuration,
+    BenchmarkError, BenchmarkFramework, BenchmarkImplementation, BenchmarkLatencySummary,
+    BenchmarkMetrics, BenchmarkObservation, BenchmarkPhase, BenchmarkTransfer, BenchmarkWorkload,
+};
 pub use collective::{
     CollectiveAction, CollectiveExecutor, CollectiveKind, CollectivePlan, CollectivePlanner,
     CollectiveRequest, CudaCollectiveGroup, CudaCollectiveTrace, DeviceGroup,
