@@ -1121,6 +1121,59 @@ fn compiled_scalar_adamw_with_accumulation(steps: u64) -> CpuCompiledAdamW {
     .unwrap()
 }
 
+fn compiled_vector_adamw_with_gradient_clipping(max_norm: f32) -> CpuCompiledAdamW {
+    let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_max_gradient_norm(max_norm)
+        .unwrap()
+        .with_input("target", [2], DType::F32)
+        .unwrap();
+    let parameter =
+        TrainingParameterInit::new("weight", TensorData::new([2], vec![1.0, -1.0]).unwrap())
+            .unwrap();
+    CpuCompiledAdamW::compile(config, [parameter], |graph, inputs, parameters| {
+        let delta = graph.sub(parameters["weight"], inputs["target"])?;
+        let squared = graph.square(delta)?;
+        let loss = graph.sum_all(squared)?;
+        Ok((loss, BTreeMap::from([("delta".into(), delta)])))
+    })
+    .unwrap()
+}
+
+#[test]
+fn compiled_adamw_gradient_clipping_uses_the_same_recurrent_capture_on_metal() {
+    let mut cpu = compiled_vector_adamw_with_gradient_clipping(0.25);
+    let plan = cpu
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap();
+    assert_eq!(plan.max_gradient_norm(), Some(0.25));
+    assert_eq!(plan.summary().fallback_count, 0);
+
+    let mock = Arc::new(MockDispatch::default());
+    let mut metal = plan.prepare(test_device(mock)).unwrap();
+    assert_eq!(metal.max_gradient_norm(), Some(0.25));
+    let inputs = || {
+        BTreeMap::from([(
+            "target".into(),
+            TensorData::new([2], vec![0.0, 0.0]).unwrap(),
+        )])
+    };
+    let expected = cpu.step(inputs(), TensorData::scalar(0.1)).unwrap();
+    let actual = metal.step(inputs(), TensorData::scalar(0.1)).unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+    assert_eq!(
+        metal.parameter_snapshots().unwrap(),
+        cpu.parameter_snapshots().unwrap()
+    );
+    assert_eq!(
+        metal.first_moment_snapshots().unwrap(),
+        cpu.first_moment_snapshots().unwrap()
+    );
+    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+}
+
 #[test]
 fn compiled_adamw_accumulation_uses_the_same_recurrent_capture_on_metal() {
     let mut cpu = compiled_scalar_adamw_with_accumulation(2);
@@ -1162,6 +1215,7 @@ fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_check
     let plan = cpu.metal_plan(renderer).unwrap();
     assert_eq!(plan.capture_identity(), cpu.capture_identity());
     assert_eq!(plan.step_count(), 0);
+    assert_eq!(plan.max_gradient_norm(), None);
     assert_eq!(plan.summary().state_pair_count, 4);
     assert_eq!(plan.summary().state_bank_count, 2);
     assert_eq!(plan.summary().fallback_count, 0);
@@ -1171,6 +1225,7 @@ fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_check
     let mock = Arc::new(MockDispatch::default());
     let mut metal = plan.prepare(test_device(mock)).unwrap();
     assert_eq!(metal.step_count(), 0);
+    assert_eq!(metal.max_gradient_norm(), None);
     assert_eq!(metal.optimizer_step().unwrap(), 0);
     assert_eq!(
         metal.parameter_snapshots().unwrap(),

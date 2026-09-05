@@ -73,9 +73,10 @@ continues with exact outputs and recurrent parameter/moment state. Compiled
 AdamW now optionally retains F32 gradient sums and an accumulation cursor in
 that same frontier, commits one averaged update at each fixed microbatch
 window, resets the sums in-capture, and checkpoints partial windows exactly.
-The identical recurrent program remains strict-Metal renderable with zero
-fallback. Explicit cancellation, clipping, loss scaling, and broader freezing
-semantics remain workload-driven follow-ups.
+An optional global L2 limit clips the complete ordered gradient set once after
+window averaging, inside the same capture; the identical recurrent program
+remains strict-Metal renderable with zero fallback. Explicit cancellation,
+loss scaling, and broader freezing semantics remain workload-driven follow-ups.
 
 ### 3. P1 — lower the identical training capture to Metal
 
