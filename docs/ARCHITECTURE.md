@@ -927,9 +927,16 @@ exact recurrent state frontier only after the complete effect batch commits.
 Every step accepts exact declared inputs plus one rank-zero F32 learning rate;
 all user input order is canonicalized by name before graph-free interpreter
 replay. Owned snapshots are diagnostic copies, not mutable aliases or live
-`nn::Parameter` synchronization. This CPU foundation deliberately adds no
-module binding, native/device execution, mixed precision, or dynamic-shape
-training ABI yet. `CompiledAdamWCheckpoint` is the narrow portable restore
+`nn::Parameter` synchronization. `CpuCompiledAdamW::compile_module` reuses the
+ordinary `Module` traversal and `Parameter::bind` forward seam without making
+the host module live state: unique trainable identities resolve to the
+optimizer-owned recurrent inputs, tied handles share that one node/state tuple,
+and frozen parameters or buffers become immutable capture constants.
+`compile_module_from_checkpoint` rebuilds the same module topology and requires
+its frozen values and graph to reproduce the authenticated capture identity.
+This CPU foundation deliberately adds no native/device execution, mixed
+precision, or dynamic-shape training ABI yet. `CompiledAdamWCheckpoint` is the
+narrow portable restore
 boundary: deterministic safetensors bytes retain ordered parameter/moment
 values, step, and capture identity, while `EffectRuntime` and
 `MixedReplayCursor` restore the exact logical versions only after full schema

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:390b27a4d2ef9339",
+  "source_fingerprint": "fnv1a64:81dc94650b7d73a5",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -550,6 +550,15 @@
       "status": "not_started",
       "fields": {
         "Acceptance requirement": "Interop and lifetime tests"
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "Compiled module training state binding",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`CpuCompiledAdamW::compile_module` and `compile_module_from_checkpoint` reuse ordinary `Module` traversal and `Parameter::bind` without synchronizing live host state. Unique trainable identities become recurrent AdamW-owned inputs, tied handles share one graph node and optimizer-state tuple, and frozen parameters or buffers become immutable capture constants. Checkpoint restore must reproduce the module topology, frozen values, input descriptors, and authenticated capture identity before restored values or logical versions become visible. Acceptance covers tied aliases, frozen-state exclusion from AdamW updates, runtime ownership after host mutation, and exact checkpoint/resume. Stateful pending module effects, live-module writeback, gradient accumulation/clipping, native/device execution, mixed precision, and dynamic shapes remain outside this boundary."
       }
     },
     {
