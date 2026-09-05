@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     AffineView, DType, GgmlType, IndexValue, LiteralValue, MovementValue, Operation,
-    QuantizedBufferDesc, QuantizedScheduleInputBinding, ScheduleInputBinding, Shape, UOp, UType,
+    QuantizedBufferDesc, QuantizedScheduleInputBinding, ScheduleInputBinding, Shape, UOp,
     runtime::scalar_lane::{
         ScalarLaneDialect, dialect_seal, emit_scalar_lane, project_scalar_lane,
     },
@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
 };
 
-pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v8";
+pub const METAL_RENDERER_VERSION: &str = "rustgrad-metal-static-v9";
 pub const METAL_RAW_COPY_RENDERER_VERSION: &str = "rustgrad-metal-raw-copy-v1";
 pub const METAL_PORTABLE_BITCAST_RENDERER_VERSION: &str = "rustgrad-metal-portable-bitcast-v1";
 pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
@@ -388,6 +388,8 @@ impl MetalRenderer {
             .ok_or_else(|| MetalError::Unsupported("untyped output index".into()))?
             .scalar;
         supported_storage(output_dtype)?;
+        let authenticated_i32_iteration =
+            crate::kernel::is_authenticated_i32_store_iteration(root, store, output_index, *extent);
 
         let common_views = crate::schedule::common_buffer_views(&nodes);
         let mut inventory = BTreeMap::<u64, MetalBufferAbi>::new();
@@ -547,6 +549,7 @@ impl MetalRenderer {
         lines.push("    uint gid [[thread_position_in_grid]]) {".into());
         lines.push("  if ((ulong)gid >= extent) return;".into());
         let mut source_map = BTreeMap::new();
+        let linear = "(ulong)gid";
         let expression = if let Some(reduction) = &reduction {
             if transaction.is_some() {
                 return Err(MetalError::Unsupported(
@@ -561,6 +564,8 @@ impl MetalRenderer {
                 &mut lines,
             )?;
             None
+        } else if authenticated_i32_iteration {
+            Some(format!("((int)({linear}))"))
         } else if let Some(transaction) = &transaction {
             Some(emit_transactional(
                 value,
@@ -570,13 +575,7 @@ impl MetalRenderer {
                 &mut lines,
             )?)
         } else {
-            Some(emit_expr(
-                value,
-                &ids,
-                &mut source_map,
-                &mut lines,
-                "(ulong)gid",
-            )?)
+            Some(emit_expr(value, &ids, &mut source_map, &mut lines, linear)?)
         };
         if let Some(expression) = expression {
             let stored = if output_dtype == DType::Bool {
@@ -809,7 +808,7 @@ impl MetalRenderer {
                 "authenticated append span ShapeIota is malformed".into(),
             ));
         };
-        let [_, value] = store.sources() else {
+        let [store_index, _] = store.sources() else {
             return Err(MetalError::InvalidBinding(
                 "authenticated append span ShapeIota store is malformed".into(),
             ));
@@ -818,7 +817,25 @@ impl MetalRenderer {
         if !matches!(root.operation(), Operation::Sink)
             || !matches!(store.operation(), Operation::Store)
             || root.ty().is_some()
-            || value.ty() != Some(UType::scalar(DType::I32))
+            || !matches!(
+                store_index.operation(),
+                Operation::Index(IndexValue::Buffer {
+                    buffer,
+                    elements,
+                    input_shape,
+                    output_shape: store_shape,
+                    addressing: crate::IndexAddressing::Broadcast,
+                }) if *buffer == iota
+                    && *elements == link.span.rows
+                    && input_shape == &output_shape
+                    && store_shape == &output_shape
+            )
+            || !crate::kernel::is_authenticated_i32_store_iteration(
+                root,
+                store,
+                store_index,
+                link.span.rows,
+            )
             || link.span.rows <= 1
             || link.span.total_elements == 0
         {

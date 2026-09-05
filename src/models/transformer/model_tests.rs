@@ -315,6 +315,24 @@ pub(crate) fn serialized_model_with_template(context: u32, template: Option<&str
     fixture(&state, &metadata)
 }
 
+pub(crate) fn serialized_model_with_template_and_eos(
+    context: u32,
+    template: Option<&str>,
+    eos: u32,
+) -> Vec<u8> {
+    let state = fixed_state();
+    let mut metadata = metadata(context);
+    metadata
+        .iter_mut()
+        .find(|(key, _)| *key == "tokenizer.ggml.eos_token_id")
+        .unwrap()
+        .1 = Metadata::U32(eos);
+    if let Some(template) = template {
+        metadata.push(("tokenizer.chat_template", Metadata::String(template)));
+    }
+    fixture(&state, &metadata)
+}
+
 pub(super) fn serialized_model_with_numeric_template(context: u32) -> Vec<u8> {
     let state = fixed_state();
     let mut metadata = metadata(context);

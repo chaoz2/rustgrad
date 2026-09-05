@@ -12,8 +12,8 @@ use crate::runtime::metal::{
 };
 use crate::{
     AttentionOptions, CapturedAppendStateInference, CapturedInferenceError, CapturedSchedule,
-    DType, Error, ExecutionPlanSummary, Graph, InferenceAppendStateLink, NodeId, ReplayInput,
-    Scalar, Shape, TensorData,
+    CompareOp, DType, Error, ExecutionPlanSummary, Graph, InferenceAppendStateLink, NodeId,
+    ReplayInput, Scalar, Shape, TensorData,
     engine::capture::QuantizedCaptureBinding,
     gguf::{GgmlType, QuantizedTensorData},
 };
@@ -41,6 +41,16 @@ pub struct LlamaMetalStepPlan {
     output_binding: LlamaOutputBinding,
 }
 
+/// Resource-free token-step plan whose sole public output is a greedy I32 token
+/// or the impossible negative sentinel when any logit is nonfinite.
+pub struct LlamaMetalGreedyStepPlan {
+    inner: MetalAppendStateInferencePlan,
+    max_context: usize,
+    vocab_size: usize,
+    layer_count: usize,
+    output_binding: LlamaOutputBinding,
+}
+
 /// Resource-free, state-only fixed-span Llama program used by the private
 /// multi-program Metal session coordinator.
 pub(crate) struct LlamaMetalPrefillPlan {
@@ -61,6 +71,13 @@ pub struct LlamaMetalStepSession {
     scoreboard: Option<LlamaMetalScoreboardObserver>,
 }
 
+/// Persistent device-resident token session with typed greedy-only output.
+pub struct LlamaMetalGreedyStepSession {
+    inner: MetalDeviceSession,
+    max_context: usize,
+    vocab_size: usize,
+}
+
 struct LlamaMetalScoreboardObserver {
     recorder: MetalSessionScoreboard,
     first_error: Option<MetalScoreboardError>,
@@ -73,6 +90,31 @@ pub struct LlamaMetalStep {
     logits: TensorData,
     position: usize,
     report: MetalDeviceRunReport,
+}
+
+/// One committed device-greedy token.
+pub struct LlamaMetalGreedyStep {
+    token: u32,
+    position: usize,
+    report: MetalDeviceRunReport,
+}
+
+impl LlamaMetalGreedyStep {
+    pub const fn token(&self) -> u32 {
+        self.token
+    }
+
+    pub const fn position(&self) -> usize {
+        self.position
+    }
+
+    pub const fn report(&self) -> &MetalDeviceRunReport {
+        &self.report
+    }
+
+    pub fn into_parts(self) -> (u32, MetalDeviceRunReport) {
+        (self.token, self.report)
+    }
 }
 
 /// One successfully committed token whose logits remained device-local.
@@ -130,6 +172,7 @@ pub enum LlamaMetalStepError {
     Dimension(&'static str),
     TokenOutOfRange { token: u32, vocab_size: usize },
     ContextExhausted { position: usize, maximum: usize },
+    NonFiniteLogits,
 }
 
 impl fmt::Display for LlamaMetalStepError {
@@ -163,42 +206,13 @@ impl LlamaMetalStepPlan {
     /// Packed GGUF tensors and dimensions that cannot be represented by the
     /// I32 runtime ABI reject before any Metal resource is created.
     pub fn new(model: &LlamaModel, renderer: MetalRenderer) -> Result<Self, LlamaMetalStepError> {
-        let config = model.config();
-        let schema = config.schema();
-        if schema.vocab_size() > i32::MAX as usize {
-            return Err(LlamaMetalStepError::Dimension("vocabulary exceeds I32"));
-        }
-        if config.max_context() > i32::MAX as usize {
-            return Err(LlamaMetalStepError::Dimension("context exceeds I32"));
-        }
-        let built = build_step_graph(model)?;
-        let host_gathers = if built.packed_embedding {
-            &[POSITION_INPUT][..]
-        } else {
-            &[TOKEN_INPUT, POSITION_INPUT][..]
-        };
-        let captured = CapturedAppendStateInference::from_graph_residents(
-            &built.graph,
-            &[built.logits],
-            &built.state_links,
-            built.initial_state,
-            built.residents,
-            &built.quantized,
-            host_gathers,
-        )?
-        .seal_committed_position()?;
-        let inner = MetalAppendStateInferencePlan::new(captured, renderer)?;
-        if inner.summary().fallback_count != 0 {
-            return Err(LlamaMetalStepError::Metal(MetalError::Unsupported(
-                "Llama token plan admitted a fallback".into(),
-            )));
-        }
+        let parts = build_step_plan(model, renderer, StepOutputContract::HostLogits)?;
         Ok(Self {
-            inner,
-            max_context: config.max_context(),
-            vocab_size: schema.vocab_size(),
-            layer_count: config.layer_count(),
-            output_binding: model.output_binding(),
+            inner: parts.inner,
+            max_context: parts.max_context,
+            vocab_size: parts.vocab_size,
+            layer_count: parts.layer_count,
+            output_binding: parts.output_binding,
         })
     }
 
@@ -278,6 +292,87 @@ impl LlamaMetalStepPlan {
             max_context: self.max_context,
             vocab_size: self.vocab_size,
             scoreboard: None,
+        })
+    }
+
+    pub(crate) const fn append_state_plan(&self) -> &MetalAppendStateInferencePlan {
+        &self.inner
+    }
+}
+
+impl LlamaMetalGreedyStepPlan {
+    /// Builds and captures one strict device-greedy token body.
+    pub fn new(model: &LlamaModel, renderer: MetalRenderer) -> Result<Self, LlamaMetalStepError> {
+        let parts = build_step_plan(model, renderer, StepOutputContract::DeviceGreedy)?;
+        Ok(Self {
+            inner: parts.inner,
+            max_context: parts.max_context,
+            vocab_size: parts.vocab_size,
+            layer_count: parts.layer_count,
+            output_binding: parts.output_binding,
+        })
+    }
+
+    pub const fn deployment_identity(&self) -> u64 {
+        self.inner.deployment_identity()
+    }
+
+    pub fn capture(&self) -> &CapturedSchedule {
+        self.inner.capture()
+    }
+
+    pub const fn execution_plan(&self) -> &ExecutionPlanSummary {
+        self.inner.execution_plan()
+    }
+
+    pub fn summary(&self) -> &MetalDeviceSessionSummary {
+        self.inner.summary()
+    }
+
+    pub fn resident_inputs(&self) -> &[ReplayInput] {
+        self.inner.resident_inputs()
+    }
+
+    pub fn state_inputs(&self) -> &[ReplayInput] {
+        self.inner.state_inputs()
+    }
+
+    pub fn transient_inputs(&self) -> &[ReplayInput] {
+        self.inner.transient_inputs()
+    }
+
+    pub fn runtime_control_inputs(&self) -> &[ReplayInput] {
+        self.inner.runtime_control_inputs()
+    }
+
+    pub fn rendered_items(&self) -> impl ExactSizeIterator<Item = &RenderedMetal> {
+        self.inner.rendered_items()
+    }
+
+    pub const fn max_context(&self) -> usize {
+        self.max_context
+    }
+
+    pub const fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub const fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+
+    pub const fn output_binding(&self) -> LlamaOutputBinding {
+        self.output_binding
+    }
+
+    pub fn prepare(
+        self,
+        device: MetalDevice,
+    ) -> Result<LlamaMetalGreedyStepSession, LlamaMetalStepError> {
+        Ok(LlamaMetalGreedyStepSession {
+            inner: self.inner.prepare(device)?,
+            max_context: self.max_context,
+            vocab_size: self.vocab_size,
         })
     }
 
@@ -622,6 +717,130 @@ impl LlamaMetalStepSession {
     }
 }
 
+impl LlamaMetalGreedyStepSession {
+    pub fn position(&self) -> usize {
+        self.inner
+            .committed_state_position()
+            .expect("Llama plans always use append-state sessions")
+    }
+
+    pub const fn max_context(&self) -> usize {
+        self.max_context
+    }
+
+    pub const fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.position() == self.max_context
+    }
+
+    pub const fn metal_session(&self) -> &MetalDeviceSession {
+        &self.inner
+    }
+
+    /// Runs one token, downloads only the guarded I32 greedy token, and commits
+    /// position only after the result is nonnegative.
+    pub fn run_token(&mut self, token: u32) -> Result<LlamaMetalGreedyStep, LlamaMetalStepError> {
+        let position = self.position();
+        let invocation = self.inner.successful_run_count().checked_add(1).ok_or(
+            LlamaMetalStepError::Dimension("invocation counter overflow"),
+        )?;
+        self.run_token_at(token, position, invocation)
+    }
+
+    pub(crate) fn run_token_at(
+        &mut self,
+        token: u32,
+        position: usize,
+        invocation: u64,
+    ) -> Result<LlamaMetalGreedyStep, LlamaMetalStepError> {
+        let inputs = self.token_inputs_at(token, position)?;
+        let run = self
+            .inner
+            .run_at_requiring_bounded_i32(&inputs, position, 0, self.vocab_size)
+            .map_err(|error| match error {
+                MetalError::InvalidDeviceProof(_) => LlamaMetalStepError::NonFiniteLogits,
+                error => LlamaMetalStepError::Metal(error),
+            })?;
+        let (outputs, mut report) = run.into_parts();
+        report.successful_invocation = invocation;
+        report.first_successful_run = invocation == 1;
+        let [token_output] = outputs.as_slice() else {
+            return Err(LlamaMetalStepError::Dimension(
+                "device-greedy output count changed",
+            ));
+        };
+        if token_output.dtype() != DType::I32 || token_output.len() != 1 {
+            return Err(LlamaMetalStepError::Dimension(
+                "device-greedy output schema changed",
+            ));
+        }
+        let selected = token_output.scalar_at(0).as_i64();
+        let token = u32::try_from(selected)
+            .ok()
+            .filter(|token| (*token as usize) < self.vocab_size)
+            .ok_or(LlamaMetalStepError::Dimension(
+                "device-greedy token is outside the vocabulary",
+            ))?;
+        Ok(LlamaMetalGreedyStep {
+            token,
+            position,
+            report,
+        })
+    }
+
+    pub fn commit_token(
+        &mut self,
+        token: u32,
+    ) -> Result<LlamaMetalTokenCommit, LlamaMetalStepError> {
+        let position = self.position();
+        let invocation = self.inner.successful_run_count().checked_add(1).ok_or(
+            LlamaMetalStepError::Dimension("invocation counter overflow"),
+        )?;
+        self.commit_token_at(token, position, invocation)
+    }
+
+    pub(crate) fn commit_token_at(
+        &mut self,
+        token: u32,
+        position: usize,
+        invocation: u64,
+    ) -> Result<LlamaMetalTokenCommit, LlamaMetalStepError> {
+        let inputs = self.token_inputs_at(token, position)?;
+        let run = self.inner.run_without_host_outputs_at(&inputs, position)?;
+        debug_assert!(run.outputs().is_empty());
+        let (_, mut report) = run.into_parts();
+        report.successful_invocation = invocation;
+        report.first_successful_run = invocation == 1;
+        Ok(LlamaMetalTokenCommit { position, report })
+    }
+
+    fn token_inputs_at(
+        &self,
+        token: u32,
+        position: usize,
+    ) -> Result<BTreeMap<String, TensorData>, LlamaMetalStepError> {
+        if token > i32::MAX as u32 || token as usize >= self.vocab_size {
+            return Err(LlamaMetalStepError::TokenOutOfRange {
+                token,
+                vocab_size: self.vocab_size,
+            });
+        }
+        if position >= self.max_context {
+            return Err(LlamaMetalStepError::ContextExhausted {
+                position,
+                maximum: self.max_context,
+            });
+        }
+        Ok(BTreeMap::from([(
+            TOKEN_INPUT.to_owned(),
+            TensorData::from_scalars([1, 1], DType::I32, [Scalar::I(i64::from(token))])?,
+        )]))
+    }
+}
+
 struct BuiltStepGraph {
     graph: Graph,
     residents: BTreeMap<String, (NodeId, TensorData)>,
@@ -630,6 +849,100 @@ struct BuiltStepGraph {
     state_links: Vec<InferenceAppendStateLink>,
     packed_embedding: bool,
     logits: NodeId,
+}
+
+#[derive(Clone, Copy)]
+enum StepOutputContract {
+    HostLogits,
+    DeviceGreedy,
+}
+
+struct BuiltStepPlan {
+    inner: MetalAppendStateInferencePlan,
+    max_context: usize,
+    vocab_size: usize,
+    layer_count: usize,
+    output_binding: LlamaOutputBinding,
+}
+
+fn build_step_plan(
+    model: &LlamaModel,
+    renderer: MetalRenderer,
+    output: StepOutputContract,
+) -> Result<BuiltStepPlan, LlamaMetalStepError> {
+    let config = model.config();
+    let schema = config.schema();
+    if schema.vocab_size() > i32::MAX as usize {
+        return Err(LlamaMetalStepError::Dimension("vocabulary exceeds I32"));
+    }
+    if config.max_context() > i32::MAX as usize {
+        return Err(LlamaMetalStepError::Dimension("context exceeds I32"));
+    }
+    let mut built = build_step_graph(model)?;
+    let requested = match output {
+        StepOutputContract::HostLogits => vec![built.logits],
+        StepOutputContract::DeviceGreedy => {
+            vec![guarded_greedy_token(&mut built.graph, built.logits)?]
+        }
+    };
+    let host_gathers = if built.packed_embedding {
+        &[POSITION_INPUT][..]
+    } else {
+        &[TOKEN_INPUT, POSITION_INPUT][..]
+    };
+    let captured = CapturedAppendStateInference::from_graph_residents(
+        &built.graph,
+        &requested,
+        &built.state_links,
+        built.initial_state,
+        built.residents,
+        &built.quantized,
+        host_gathers,
+    )?
+    .seal_committed_position()?;
+    let inner = MetalAppendStateInferencePlan::new(captured, renderer)?;
+    if inner.summary().fallback_count != 0 {
+        return Err(LlamaMetalStepError::Metal(MetalError::Unsupported(
+            "Llama token plan admitted a fallback".into(),
+        )));
+    }
+    if inner.summary().requested_output_count != 1 {
+        return Err(LlamaMetalStepError::Metal(MetalError::InvalidBinding(
+            "Llama token plan changed its typed output contract".into(),
+        )));
+    }
+    Ok(BuiltStepPlan {
+        inner,
+        max_context: config.max_context(),
+        vocab_size: schema.vocab_size(),
+        layer_count: config.layer_count(),
+        output_binding: model.output_binding(),
+    })
+}
+
+fn guarded_greedy_token(graph: &mut Graph, logits: NodeId) -> Result<NodeId, Error> {
+    let finite = finite_logit_lanes(graph, logits)?;
+    let finite = graph.all_default(finite)?;
+    let token = graph.argmax_with_axis(logits, Some(-1), false)?;
+    let invalid = graph.constant(TensorData::scalar_with_dtype(Scalar::I(-1), DType::I32));
+    graph.select(finite, token, invalid)
+}
+
+fn finite_logit_lanes(graph: &mut Graph, logits: NodeId) -> Result<NodeId, Error> {
+    // Keep the predicate inside the exact Metal scalar-lane subset. Direct
+    // ordered comparisons are false for NaN; the conjunction excludes both
+    // infinities while accepting every finite F32, including both extrema.
+    let minimum = graph.constant(TensorData::scalar_with_dtype(
+        Scalar::F(-f64::from(f32::MAX)),
+        DType::F32,
+    ));
+    let maximum = graph.constant(TensorData::scalar_with_dtype(
+        Scalar::F(f64::from(f32::MAX)),
+        DType::F32,
+    ));
+    let at_least_minimum = graph.compare(CompareOp::Ge, logits, minimum)?;
+    let at_most_maximum = graph.compare(CompareOp::Le, logits, maximum)?;
+    graph.logical_and(at_least_minimum, at_most_maximum)
 }
 
 struct BuiltPrefillGraph {
@@ -1751,7 +2064,7 @@ fn rotate(
 mod tests {
     use super::*;
     use crate::runtime::metal::MetalCapabilities;
-    use crate::{Backend, CpuBackend, Op};
+    use crate::{Backend, CpuBackend, LogicalOp, Op, UnaryOp};
     use std::collections::{BTreeSet, HashMap};
 
     fn renderer() -> MetalRenderer {
@@ -1889,6 +2202,138 @@ mod tests {
         );
         for (name, actual) in actual {
             assert_close(actual, &expected[name]);
+        }
+    }
+
+    #[test]
+    fn guarded_greedy_token_uses_first_tie_and_rejects_nonfinite_logits() {
+        let mut predicate = Graph::new();
+        let predicate_logits = predicate.input_dtype("predicate_logits", [1, 4], DType::F32);
+        let finite = finite_logit_lanes(&mut predicate, predicate_logits).unwrap();
+        let Op::Logical {
+            op: LogicalOp::And,
+            lhs: lower,
+            rhs: Some(upper),
+        } = predicate.op(finite).unwrap()
+        else {
+            panic!("finite lanes must join two ordered bounds")
+        };
+        assert!(matches!(
+            predicate.op(*lower).unwrap(),
+            Op::Compare {
+                op: CompareOp::Ge,
+                lhs,
+                ..
+            } if *lhs == predicate_logits
+        ));
+        assert!(matches!(
+            predicate.op(*upper).unwrap(),
+            Op::Compare {
+                op: CompareOp::Le,
+                lhs,
+                ..
+            } if *lhs == predicate_logits
+        ));
+        assert_eq!(
+            (0..predicate.node_count())
+                .filter(|&index| matches!(
+                    predicate.op(NodeId::from_index(index)).unwrap(),
+                    Op::Compare { .. }
+                ))
+                .count(),
+            2
+        );
+        assert!((0..predicate.node_count()).all(|index| !matches!(
+            predicate.op(NodeId::from_index(index)).unwrap(),
+            Op::Unary {
+                op: UnaryOp::Abs
+                    | UnaryOp::Sign
+                    | UnaryOp::IsInf
+                    | UnaryOp::IsNan
+                    | UnaryOp::IsFinite,
+                ..
+            }
+        )));
+        assert!((0..predicate.node_count()).all(|index| matches!(
+            predicate.dtype(NodeId::from_index(index)).unwrap(),
+            DType::F32 | DType::Bool
+        )));
+
+        let mut graph = Graph::new();
+        let logits = graph.input_dtype("logits", [1, 4], DType::F32);
+        let token = guarded_greedy_token(&mut graph, logits).unwrap();
+        assert!((0..graph.node_count()).all(|index| !matches!(
+            graph.op(NodeId::from_index(index)).unwrap(),
+            Op::Unary {
+                op: UnaryOp::Abs
+                    | UnaryOp::Sign
+                    | UnaryOp::IsInf
+                    | UnaryOp::IsNan
+                    | UnaryOp::IsFinite,
+                ..
+            }
+        )));
+        assert!((0..graph.node_count()).all(|index| matches!(
+            graph.dtype(NodeId::from_index(index)).unwrap(),
+            DType::F32 | DType::Bool | DType::I32
+        )));
+        for (values, expected) in [
+            (vec![1.0, 7.0, 7.0, 2.0], 1),
+            (vec![1.0, f32::MAX, 3.0, 2.0], 1),
+            (vec![1.0, 3.0, -f32::MAX, 2.0], 1),
+            (vec![1.0, f32::NAN, 3.0, 2.0], -1),
+            (vec![1.0, f32::INFINITY, 3.0, 2.0], -1),
+            (vec![1.0, f32::NEG_INFINITY, 3.0, 2.0], -1),
+        ] {
+            let actual = CpuBackend
+                .execute(
+                    &graph,
+                    token,
+                    &HashMap::from([(
+                        "logits".to_owned(),
+                        TensorData::new([1, 4], values).unwrap(),
+                    )]),
+                )
+                .unwrap();
+            assert_eq!(actual.dtype(), DType::I32);
+            assert_eq!(actual.len(), 1);
+            assert_eq!(actual.scalar_at(0).as_i64(), expected);
+        }
+    }
+
+    #[test]
+    fn greedy_step_plans_publish_one_bounded_token_without_fallback() {
+        let (dense, _, _) = super::super::model_tests::make_variant_model(4);
+        let (packed, _, _, _) = super::super::packed_metal_fixture_models();
+        for plan in [
+            LlamaMetalGreedyStepPlan::new(&dense, renderer()).unwrap(),
+            LlamaMetalGreedyStepPlan::new(&packed, renderer()).unwrap(),
+        ] {
+            assert_eq!(plan.summary().requested_output_count, 1);
+            assert_eq!(plan.summary().fallback_count, 0);
+            assert_eq!(
+                plan.capture().requested.len(),
+                plan.state_inputs().len() + 1
+            );
+            assert!(
+                plan.capture()
+                    .items
+                    .iter()
+                    .all(|item| item.boundary.is_none())
+            );
+            let iotas = plan
+                .rendered_items()
+                .filter(|item| item.source.contains("b0[gid] = ((int)((ulong)gid));"))
+                .collect::<Vec<_>>();
+            assert!(
+                iotas.iter().any(|item| item.extent == plan.vocab_size()),
+                "greedy plan renders its vocabulary-width I32 ShapeIota"
+            );
+            for iota in iotas {
+                assert_eq!(iota.buffers.len(), 1);
+                assert_eq!(iota.buffers[0].dtype, DType::I32);
+                assert!(!iota.source.contains("device long*"));
+            }
         }
     }
 

@@ -181,6 +181,14 @@ pub struct MetalDeviceRun {
     session_token: Rc<()>,
 }
 
+#[derive(Clone, Copy)]
+enum MetalOutputProof {
+    BoundedI32 {
+        output: usize,
+        upper_exclusive: usize,
+    },
+}
+
 impl MetalDeviceRun {
     /// Returns detached outputs in the capture's requested order.
     pub fn outputs(&self) -> &[TensorData] {
@@ -1440,7 +1448,7 @@ impl MetalDeviceSession {
         &mut self,
         transient_inputs: &BTreeMap<String, TensorData>,
     ) -> Result<MetalDeviceRun, MetalError> {
-        self.run_with_host_outputs(transient_inputs, StaticHostOutputSelection::All)
+        self.run_with_host_outputs(transient_inputs, StaticHostOutputSelection::All, None)
     }
 
     #[cfg(test)]
@@ -1448,18 +1456,20 @@ impl MetalDeviceSession {
         &mut self,
         transient_inputs: &BTreeMap<String, TensorData>,
     ) -> Result<MetalDeviceRun, MetalError> {
-        self.run_with_host_outputs(transient_inputs, StaticHostOutputSelection::None)
+        self.run_with_host_outputs(transient_inputs, StaticHostOutputSelection::None, None)
     }
 
     fn run_with_host_outputs(
         &mut self,
         transient_inputs: &BTreeMap<String, TensorData>,
         host_outputs: StaticHostOutputSelection,
+        output_proof: Option<MetalOutputProof>,
     ) -> Result<MetalDeviceRun, MetalError> {
         self.run_with_host_outputs_at(
             transient_inputs,
             host_outputs,
             self.committed_state_position,
+            output_proof,
         )
     }
 
@@ -1472,6 +1482,35 @@ impl MetalDeviceSession {
             transient_inputs,
             StaticHostOutputSelection::All,
             committed_position,
+            None,
+        )
+    }
+
+    pub(crate) fn run_at_requiring_bounded_i32(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+        committed_position: usize,
+        output: usize,
+        upper_exclusive: usize,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        if upper_exclusive == 0 {
+            return Err(MetalError::InvalidDeviceProof(
+                "bounded I32 proof requires a nonempty range",
+            ));
+        }
+        if output >= self.public_output_count {
+            return Err(MetalError::InvalidDeviceProof(
+                "proof output is outside the public output schema",
+            ));
+        }
+        self.run_append_at(
+            transient_inputs,
+            StaticHostOutputSelection::All,
+            committed_position,
+            Some(MetalOutputProof::BoundedI32 {
+                output,
+                upper_exclusive,
+            }),
         )
     }
 
@@ -1484,6 +1523,7 @@ impl MetalDeviceSession {
             transient_inputs,
             StaticHostOutputSelection::None,
             committed_position,
+            None,
         )
     }
 
@@ -1492,13 +1532,19 @@ impl MetalDeviceSession {
         transient_inputs: &BTreeMap<String, TensorData>,
         host_outputs: StaticHostOutputSelection,
         committed_position: usize,
+        output_proof: Option<MetalOutputProof>,
     ) -> Result<MetalDeviceRun, MetalError> {
         if !matches!(self.state_policy, MetalSessionStatePolicy::Append { .. }) {
             return Err(MetalError::InvalidBinding(
                 "explicit Metal position requires append-state inference".into(),
             ));
         }
-        self.run_with_host_outputs_at(transient_inputs, host_outputs, committed_position)
+        self.run_with_host_outputs_at(
+            transient_inputs,
+            host_outputs,
+            committed_position,
+            output_proof,
+        )
     }
 
     fn run_with_host_outputs_at(
@@ -1506,6 +1552,7 @@ impl MetalDeviceSession {
         transient_inputs: &BTreeMap<String, TensorData>,
         host_outputs: StaticHostOutputSelection,
         committed_position: usize,
+        output_proof: Option<MetalOutputProof>,
     ) -> Result<MetalDeviceRun, MetalError> {
         if host_outputs == StaticHostOutputSelection::None
             && (!matches!(self.state_policy, MetalSessionStatePolicy::Append { .. })
@@ -1591,6 +1638,26 @@ impl MetalDeviceSession {
             }
             .map_err(MetalError::InvalidBinding)?,
         };
+        if let Some(MetalOutputProof::BoundedI32 {
+            output,
+            upper_exclusive,
+        }) = output_proof
+        {
+            let proof = outputs
+                .get(output)
+                .ok_or(MetalError::InvalidDeviceProof("proof output is absent"))?;
+            let value = (proof.dtype() == crate::DType::I32 && proof.len() == 1)
+                .then(|| proof.scalar_at(0).as_i64())
+                .and_then(|value| usize::try_from(value).ok());
+            if proof.dtype() != crate::DType::I32
+                || proof.len() != 1
+                || value.is_none_or(|value| value >= upper_exclusive)
+            {
+                return Err(MetalError::InvalidDeviceProof(
+                    "required I32 output is outside its authenticated range",
+                ));
+            }
+        }
         let report = run_report(RunReportInput {
             successful_invocation,
             run_wall_time: run_start.elapsed(),

@@ -43,7 +43,7 @@ pub struct LlamaMetalSession {
     chat_template: LlamaChatTemplate,
 }
 
-struct LlamaMetalPrefillSession {
+pub(super) struct LlamaMetalPrefillSession {
     inner: MetalSharedAppendSession,
     span_rows: NonZeroUsize,
     token_input_name: String,
@@ -350,12 +350,12 @@ impl LlamaMetalPlan {
                     .into_append_state_plan()
                     .prepare_shared(self.selected_device, step.metal_session(), proof)
                     .map_err(LlamaMetalStepError::Metal)?;
-                Some(LlamaMetalPrefillSession {
+                Some(LlamaMetalPrefillSession::new(
                     inner,
                     span_rows,
                     token_input_name,
                     position_input_name,
-                })
+                ))
             }
             (None, None) => None,
             _ => unreachable!("fixed prefill proof follows the optional plan"),
@@ -434,6 +434,18 @@ impl LlamaMetalPrefill {
 }
 
 impl LlamaMetalGeneration {
+    pub(super) fn from_parts_with_evidence(
+        generation: LlamaGeneration,
+        reports: Vec<MetalDeviceRunReport>,
+        workload_evidence: LlamaMetalWorkloadEvidence,
+    ) -> Self {
+        Self {
+            generation,
+            reports,
+            workload_evidence,
+        }
+    }
+
     /// Returns the backend-independent generation result.
     pub fn generation(&self) -> &LlamaGeneration {
         &self.generation
@@ -477,6 +489,13 @@ impl LlamaMetalGeneration {
 }
 
 impl LlamaMetalPromptOutput {
+    pub(super) fn from_parts(rendered_prompt: String, generation: LlamaMetalGeneration) -> Self {
+        Self {
+            rendered_prompt,
+            generation,
+        }
+    }
+
     /// Returns the plain or chat-rendered prompt submitted for tokenization.
     pub fn rendered_prompt(&self) -> &str {
         &self.rendered_prompt
@@ -960,33 +979,19 @@ impl LlamaMetalSession {
         decode_token_count: usize,
         decode_reports: &[MetalDeviceRunReport],
     ) -> LlamaMetalWorkloadEvidence {
-        let first_successful_run = prompt_reports
-            .iter()
-            .chain(decode_reports)
-            .find(|report| report.first_successful_run)
-            .map(|report| {
-                LlamaMetalWorkloadPhase::from_reports(
-                    first_successful_run_token_count,
-                    std::slice::from_ref(report),
-                )
-            });
-        LlamaMetalWorkloadEvidence {
+        build_workload_evidence(LlamaMetalEvidenceInputs {
             token_step_deployment_identity: self.token_step_deployment_identity,
             fixed_prefill_deployment_identity: self.fixed_prefill_deployment_identity,
-            plan: self.summary().clone(),
-            fixed_prefill_plan: self.prefill_summary().cloned(),
-            token_step_preparation: self.preparation_report().clone(),
-            fixed_prefill_preparation: self.prefill_preparation_report().cloned(),
-            first_successful_run,
-            prompt_prefill: LlamaMetalWorkloadPhase::from_reports(
-                prompt_token_count,
-                prompt_reports,
-            ),
-            steady_decode: LlamaMetalWorkloadPhase::from_reports(
-                decode_token_count,
-                decode_reports,
-            ),
-        }
+            plan: self.summary(),
+            fixed_prefill_plan: self.prefill_summary(),
+            token_step_preparation: self.preparation_report(),
+            fixed_prefill_preparation: self.prefill_preparation_report(),
+            first_successful_run_token_count,
+            prompt_token_count,
+            prompt_reports,
+            decode_token_count,
+            decode_reports,
+        })
     }
 
     fn first_prompt_invocation_token_count(&self, prompt_token_count: usize) -> usize {
@@ -1059,7 +1064,37 @@ fn authenticate_prefill_pair(
 }
 
 impl LlamaMetalPrefillSession {
-    fn run(
+    pub(super) fn new(
+        inner: MetalSharedAppendSession,
+        span_rows: NonZeroUsize,
+        token_input_name: String,
+        position_input_name: String,
+    ) -> Self {
+        Self {
+            inner,
+            span_rows,
+            token_input_name,
+            position_input_name,
+        }
+    }
+
+    pub(super) const fn span_rows(&self) -> NonZeroUsize {
+        self.span_rows
+    }
+
+    pub(super) fn summary(&self) -> &MetalDeviceSessionSummary {
+        self.inner.summary()
+    }
+
+    pub(super) fn preparation_report(&self) -> &MetalDevicePreparationReport {
+        self.inner.preparation_report()
+    }
+
+    pub(super) fn compiled_kernels(&self) -> impl Iterator<Item = &RenderedMetal> {
+        self.inner.compiled_kernels()
+    }
+
+    pub(super) fn run(
         &mut self,
         tokens: &[u32],
         start_position: usize,
@@ -1107,7 +1142,7 @@ impl LlamaMetalPrefillSession {
     }
 }
 
-fn progress(
+pub(super) fn progress(
     prompt_ids: &[u32],
     generated_ids: &[u32],
     reports: &[MetalDeviceRunReport],
@@ -1120,5 +1155,52 @@ fn progress(
         reports: reports.to_vec(),
         start_position,
         committed_position,
+    }
+}
+
+pub(super) struct LlamaMetalEvidenceInputs<'a> {
+    pub token_step_deployment_identity: u64,
+    pub fixed_prefill_deployment_identity: Option<u64>,
+    pub plan: &'a MetalDeviceSessionSummary,
+    pub fixed_prefill_plan: Option<&'a MetalDeviceSessionSummary>,
+    pub token_step_preparation: &'a MetalDevicePreparationReport,
+    pub fixed_prefill_preparation: Option<&'a MetalDevicePreparationReport>,
+    pub first_successful_run_token_count: usize,
+    pub prompt_token_count: usize,
+    pub prompt_reports: &'a [MetalDeviceRunReport],
+    pub decode_token_count: usize,
+    pub decode_reports: &'a [MetalDeviceRunReport],
+}
+
+pub(super) fn build_workload_evidence(
+    input: LlamaMetalEvidenceInputs<'_>,
+) -> LlamaMetalWorkloadEvidence {
+    let first_successful_run = input
+        .prompt_reports
+        .iter()
+        .chain(input.decode_reports)
+        .find(|report| report.first_successful_run)
+        .map(|report| {
+            LlamaMetalWorkloadPhase::from_reports(
+                input.first_successful_run_token_count,
+                std::slice::from_ref(report),
+            )
+        });
+    LlamaMetalWorkloadEvidence {
+        token_step_deployment_identity: input.token_step_deployment_identity,
+        fixed_prefill_deployment_identity: input.fixed_prefill_deployment_identity,
+        plan: input.plan.clone(),
+        fixed_prefill_plan: input.fixed_prefill_plan.cloned(),
+        token_step_preparation: input.token_step_preparation.clone(),
+        fixed_prefill_preparation: input.fixed_prefill_preparation.cloned(),
+        first_successful_run,
+        prompt_prefill: LlamaMetalWorkloadPhase::from_reports(
+            input.prompt_token_count,
+            input.prompt_reports,
+        ),
+        steady_decode: LlamaMetalWorkloadPhase::from_reports(
+            input.decode_token_count,
+            input.decode_reports,
+        ),
     }
 }

@@ -55,6 +55,7 @@ src/
       model.rs           GGUF config/state binding and N-layer graph/cache path
       generation.rs      greedy and explicit-uniform Gumbel-max generation
       metal_generation.rs typed persistent Metal prompt/chat generation
+      metal_greedy_generation.rs finite-guarded device-greedy Metal generation
       batch.rs           padded batched Graph planning and transactional KV caches
       batch_generation.rs deterministic per-row stopping and sampling
       chat.rs            checked Llama fallback/chat-template formatting
@@ -2724,6 +2725,21 @@ back only when another logits row is required. EOS/EOT and the final selected
 token are returned without another K/V append. A zero generation bound performs
 all source-compatible validation but no Metal work.
 
+`LlamaMetalGreedyPlan` and `LlamaMetalGreedySession` are the parallel public
+prompt-to-tokens/text/chat facade for deterministic greedy selection without a
+host logits transfer. Their T=1 step appends a finite guard and last-axis
+`ArgMax` to the same dense-or-packed Llama body. The graph returns the
+first-occurrence greedy index only when every logits lane is finite; otherwise
+it returns a negative sentinel. Before logical state, position, metrics, or the
+selected token commit, the Metal session proves that the single downloaded I32
+is in `[0, vocab_size)`. Thus every selecting invocation transfers exactly one
+four-byte token, while state-only prompt commits transfer no output. The
+optional fixed-span prefill plan shares the same authenticated residents, K/V
+buffers, and command queue, and complete prefix chunks remain output-free.
+Dense and supported packed GGUF weights both retain zero fallback. The existing
+`LlamaMetalPlan` remains the host-logits facade for greedy and explicit-tape
+Gumbel selection, its continuation seams, and the v4 token-step scoreboard.
+
 Each successfully executed token invocation is a durable append-state commit.
 Therefore a later launch, wait, read, selection, or decode failure cannot
 promise whole-call rollback. Typed errors instead retain the prompt/decode
@@ -2741,8 +2757,8 @@ unique packed owner once even when tied bindings reference it more than once.
 
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, mutable training state, dynamically
-shaped/capacity-growing state, general output chaining across calls, chunk
-prefill, orchestration-aware generation scoring, multi-device execution, and
+shaped/capacity-growing state, general output chaining across calls,
+orchestration-aware generation scoring, multi-device execution, and
 live Metal numerical/performance evidence remain explicit follow-ons.
 The semantic mock covers fixed-shape state ping-pong and a bounded
 residual-style multi-layer graph. Protected acceptance exercises that typed
@@ -2865,9 +2881,11 @@ every q/k/v/o and gated-FFN projection, and explicit or tied output projection.
 Sequential callers may reuse that one T=1 session for prefill and decode. The
 typed prompt facade now suppresses intermediate prefill outputs, retains the
 final prompt logits, and composes tokenizer/chat rendering plus host sampling
-over that persistent session. Chunk prefill, device-side sampling, a
-prompt/decode-aware performance scoreboard, and live-device-performance
-evidence remain outside this slice.
+over that persistent session. The sibling finite-guarded greedy facade instead
+downloads one range-proven four-byte I32 token per selecting invocation and can
+share fixed-span state-only prefill with the same resident weights, K/V buffers,
+and command queue. Other device-side sampling, a prompt/decode-aware performance
+scoreboard, and live-device-performance evidence remain outside this slice.
 
 Devices are returned in deterministic registry-ID/name order with capability
 metadata in renderer and pipeline cache identities. Resources are deliberately
