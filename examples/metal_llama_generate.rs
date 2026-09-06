@@ -8,7 +8,8 @@ use rustgrad::runtime::metal::{
 use rustgrad::{
     BenchmarkFramework, BenchmarkImplementation, BenchmarkObservation, BenchmarkWorkload,
     LlamaMetalExecutionScoreboardReport, LlamaMetalGeneration, LlamaMetalGenerationError,
-    LlamaMetalGenerationStage, LlamaMetalGreedyPlan, LlamaMetalWorkloadEvidenceArtifact,
+    LlamaMetalGenerationStage, LlamaMetalGreedyPlan, LlamaMetalScoreboardPhase,
+    LlamaMetalScoreboardProgram, LlamaMetalWorkloadEvidenceArtifact,
     LlamaMetalWorkloadEvidenceContext, LlamaPromptWorkflow, MetalDeviceBufferMeasurement,
     MetalSessionTarget, RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD, ReplayInput,
 };
@@ -170,6 +171,29 @@ struct StablePlanFacts {
     cache_keys: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompleteLiveCoverage {
+    configured_prefill_span: usize,
+    prompt_token_count: usize,
+    fixed_prefill_component_run_count: u64,
+    fixed_prefill_ordered_run_count: usize,
+    fixed_prefill_append_span_rows: Option<usize>,
+    fixed_prefill_has_output_or_download: bool,
+    fixed_prefill_kernel_launch_count: usize,
+    fixed_prefill_command_submission_count: usize,
+    fixed_prefill_command_wait_count: usize,
+    prompt_retained_d2h_calls: usize,
+    prompt_retained_d2h_bytes: usize,
+    steady_decode_token_count: usize,
+    steady_decode_run_count: u64,
+    steady_decode_ordered_run_count: usize,
+    steady_decode_kernel_launch_count: usize,
+    steady_decode_command_submission_count: usize,
+    steady_decode_command_wait_count: usize,
+    steady_decode_retained_d2h_calls: usize,
+    steady_decode_retained_d2h_bytes: usize,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -236,6 +260,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         None => target,
     };
     let workflow = LlamaPromptWorkflow::from_path(&args.model_path)?;
+    let complete_live_prompt_token_count = complete_live_prompt_token_count(&args, &workflow)?;
     let mut builder = LlamaMetalGreedyPlan::builder_on(workflow, &target);
     if let Some(span_rows) = args.prefill_span {
         builder = builder.with_prefill_span(span_rows);
@@ -363,6 +388,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             return Err(io::Error::other("Metal Llama scoreboard evidence is inconsistent").into());
         }
+        if let Some(prompt_token_count) = complete_live_prompt_token_count {
+            if generation.prompt_ids().len() != prompt_token_count {
+                return Err(io::Error::other(
+                    "attested live Llama prompt tokenization changed during generation",
+                )
+                .into());
+            }
+            validate_complete_live_coverage(CompleteLiveCoverage::from_report(
+                &args, generation, &report,
+            )?)?;
+        }
         Some((path, report))
     } else {
         None
@@ -420,9 +456,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 || observation.metrics.measured_peak_device_memory_bytes
                     != Some(measured_device_buffer_peak.bytes())
                 || observation.metrics.planned_device_memory_bytes != planned_device_memory_bytes
+                || observation.metrics.prompt_prefill.is_none()
+                || observation.metrics.steady_decode.is_none()
             {
                 return Err(io::Error::other(
-                    "normalized Metal Llama observation lost memory evidence or admitted fallback",
+                    "normalized Metal Llama observation lost complete phase or memory evidence or admitted fallback",
                 )
                 .into());
             }
@@ -479,6 +517,140 @@ fn run() -> Result<(), Box<dyn Error>> {
         session.position(),
         generation.reports().len(),
     );
+    Ok(())
+}
+
+fn complete_live_prompt_token_count(
+    args: &Args,
+    workflow: &LlamaPromptWorkflow,
+) -> Result<Option<usize>, Box<dyn Error>> {
+    if args.attestation.is_none() {
+        return Ok(None);
+    }
+    let span = args
+        .prefill_span
+        .ok_or_else(|| io::Error::other("attested live evidence requires a prefill span"))?
+        .get();
+    let prompt_ids = workflow.tokenizer().encode(&args.prompt)?;
+    let prompt_token_count = prompt_ids
+        .len()
+        .checked_add(usize::from(workflow.tokenizer().bos_id().is_some()))
+        .ok_or_else(|| io::Error::other("attested live Llama prompt token count overflow"))?;
+    validate_complete_live_prompt_geometry(prompt_token_count, span)?;
+    Ok(Some(prompt_token_count))
+}
+
+fn validate_complete_live_prompt_geometry(
+    prompt_token_count: usize,
+    configured_prefill_span: usize,
+) -> Result<(), io::Error> {
+    if prompt_token_count <= configured_prefill_span {
+        return Err(io::Error::other(format!(
+            "attested live Llama prompt has {prompt_token_count} tokens; fixed-span prefill requires at least {}",
+            configured_prefill_span.saturating_add(1)
+        )));
+    }
+    Ok(())
+}
+
+impl CompleteLiveCoverage {
+    fn from_report(
+        args: &Args,
+        generation: &LlamaMetalGeneration,
+        report: &LlamaMetalExecutionScoreboardReport,
+    ) -> Result<Self, io::Error> {
+        let configured_prefill_span = args
+            .prefill_span
+            .ok_or_else(|| io::Error::other("attested live Llama evidence has no prefill span"))?
+            .get();
+        let fixed_prefill = report.fixed_prefill.as_ref();
+        Ok(Self {
+            configured_prefill_span,
+            prompt_token_count: generation.prompt_ids().len(),
+            fixed_prefill_component_run_count: fixed_prefill
+                .map_or(0, |component| component.successful_run_count),
+            fixed_prefill_ordered_run_count: report
+                .successful_runs
+                .iter()
+                .filter(|run| {
+                    run.program == LlamaMetalScoreboardProgram::FixedPrefill
+                        && run.phase == LlamaMetalScoreboardPhase::PromptPrefill
+                        && run.append_span_rows == configured_prefill_span
+                })
+                .count(),
+            fixed_prefill_append_span_rows: fixed_prefill
+                .map(|component| component.append_span_rows),
+            fixed_prefill_has_output_or_download: fixed_prefill.is_none_or(|component| {
+                component.retained_host_api_d2h_calls != 0
+                    || component.retained_host_api_d2h_bytes != 0
+                    || component.successful_runs.iter().any(|run| {
+                        run.output_count != 0
+                            || run.retained_host_api_d2h_calls != 0
+                            || run.retained_host_api_d2h_bytes != 0
+                    })
+            }),
+            fixed_prefill_kernel_launch_count: fixed_prefill
+                .map_or(0, |component| component.kernel_launch_count),
+            fixed_prefill_command_submission_count: fixed_prefill
+                .map_or(0, |component| component.command_submission_count),
+            fixed_prefill_command_wait_count: fixed_prefill
+                .map_or(0, |component| component.command_wait_count),
+            prompt_retained_d2h_calls: report.prompt_prefill.retained_host_api_d2h_calls,
+            prompt_retained_d2h_bytes: report.prompt_prefill.retained_host_api_d2h_bytes,
+            steady_decode_token_count: report.steady_decode.committed_token_count,
+            steady_decode_run_count: report.steady_decode.successful_invocation_count,
+            steady_decode_ordered_run_count: report
+                .successful_runs
+                .iter()
+                .filter(|run| {
+                    run.program == LlamaMetalScoreboardProgram::TokenStep
+                        && run.phase == LlamaMetalScoreboardPhase::SteadyDecode
+                        && run.append_span_rows == 1
+                })
+                .count(),
+            steady_decode_kernel_launch_count: report.steady_decode.kernel_launch_count,
+            steady_decode_command_submission_count: report.steady_decode.command_submission_count,
+            steady_decode_command_wait_count: report.steady_decode.command_wait_count,
+            steady_decode_retained_d2h_calls: report.steady_decode.retained_host_api_d2h_calls,
+            steady_decode_retained_d2h_bytes: report.steady_decode.retained_host_api_d2h_bytes,
+        })
+    }
+}
+
+fn validate_complete_live_coverage(coverage: CompleteLiveCoverage) -> Result<(), io::Error> {
+    validate_complete_live_prompt_geometry(
+        coverage.prompt_token_count,
+        coverage.configured_prefill_span,
+    )?;
+    let fixed_prefill_run_count = usize::try_from(coverage.fixed_prefill_component_run_count)
+        .map_err(|_| io::Error::other("fixed-prefill live run count overflow"))?;
+    let steady_decode_run_count = usize::try_from(coverage.steady_decode_run_count)
+        .map_err(|_| io::Error::other("steady-decode live run count overflow"))?;
+    let steady_decode_bytes = steady_decode_run_count
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or_else(|| io::Error::other("steady-decode retained byte count overflow"))?;
+    if fixed_prefill_run_count == 0
+        || coverage.fixed_prefill_ordered_run_count != fixed_prefill_run_count
+        || coverage.fixed_prefill_append_span_rows != Some(coverage.configured_prefill_span)
+        || coverage.fixed_prefill_has_output_or_download
+        || coverage.fixed_prefill_kernel_launch_count == 0
+        || coverage.fixed_prefill_command_submission_count == 0
+        || coverage.fixed_prefill_command_wait_count == 0
+        || coverage.prompt_retained_d2h_calls != 1
+        || coverage.prompt_retained_d2h_bytes != std::mem::size_of::<i32>()
+        || steady_decode_run_count == 0
+        || coverage.steady_decode_token_count != steady_decode_run_count
+        || coverage.steady_decode_ordered_run_count != steady_decode_run_count
+        || coverage.steady_decode_kernel_launch_count == 0
+        || coverage.steady_decode_command_submission_count == 0
+        || coverage.steady_decode_command_wait_count == 0
+        || coverage.steady_decode_retained_d2h_calls != steady_decode_run_count
+        || coverage.steady_decode_retained_d2h_bytes != steady_decode_bytes
+    {
+        return Err(io::Error::other(
+            "attested live Llama evidence did not execute complete fixed-span prefill and steady decode",
+        ));
+    }
     Ok(())
 }
 
@@ -693,11 +865,25 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Args>, Cl
     } else {
         None
     };
+    if attestation.is_some() && benchmark_observation_path.is_none() {
+        return Err(cli(
+            "attestation requires --benchmark-observation and complete fixed-prefill/decode evidence",
+        ));
+    }
     if benchmark_observation_path.is_some()
         && (scoreboard_path.is_none() || attestation.is_none() || chat)
     {
         return Err(cli(
             "--benchmark-observation requires --scoreboard, full attestation provenance, expected token IDs, and plain prompt mode",
+        ));
+    }
+    if benchmark_observation_path.is_some()
+        && (prefill_span.is_none()
+            || max_new_tokens < 2
+            || expected_ids.as_ref().is_none_or(|ids| ids.len() < 2))
+    {
+        return Err(cli(
+            "--benchmark-observation requires a fixed prefill span, at least two requested tokens, and at least two expected token IDs",
         ));
     }
     let prompt = positional.pop().expect("length checked");
@@ -1324,10 +1510,11 @@ fn partial_message(
 mod tests {
     use super::{
         Args, AttestationArgs, AttestedDevice, AttestedEvidence, AttestedInvocation, AttestedModel,
-        AttestedOracle, BENCHMARK_COMMAND, LLAMA_WORKLOAD_EVIDENCE_KIND, MetalLlamaAttestation,
-        SCOREBOARD_EVIDENCE_KIND, benchmark_implementation, canonical_expected_ids_json,
-        deterministic_observation_json, parse_args, parse_shasum_stdout, serialize_attestation,
-        validate_benchmark_operating_system, validate_evidence_paths, write_new_evidence,
+        AttestedOracle, BENCHMARK_COMMAND, CompleteLiveCoverage, LLAMA_WORKLOAD_EVIDENCE_KIND,
+        MetalLlamaAttestation, SCOREBOARD_EVIDENCE_KIND, benchmark_implementation,
+        canonical_expected_ids_json, deterministic_observation_json, parse_args,
+        parse_shasum_stdout, serialize_attestation, validate_benchmark_operating_system,
+        validate_complete_live_coverage, validate_evidence_paths, write_new_evidence,
     };
     use rustgrad::{
         BenchmarkDevice, BenchmarkFramework, BenchmarkImplementation, BenchmarkMetrics,
@@ -1349,6 +1536,8 @@ mod tests {
 
     fn observation_args() -> Vec<&'static str> {
         vec![
+            "--prefill-span",
+            "2",
             "--scoreboard",
             "scoreboard.json",
             "--benchmark-observation",
@@ -1474,9 +1663,25 @@ mod tests {
         assert_eq!(implementation.command, BENCHMARK_COMMAND);
         assert_eq!(
             implementation.configuration,
-            "release;device_greedy;mode=plain;prefill_span=none"
+            "release;device_greedy;mode=plain;prefill_span=2"
         );
         assert_eq!(attested.attestation.unwrap().model_license, "License-Id");
+        assert!(
+            parse(&[
+                "--max-new-tokens",
+                "1",
+                "--scoreboard",
+                "scoreboard.json",
+                "--revision",
+                "reviewed-sha",
+                "--expected-ids",
+                "4",
+                "model.gguf",
+                "hello",
+            ])
+            .is_ok(),
+            "ordinary scoreboard mode must retain bounded single-token evidence"
+        );
         assert!(parse_args(["--help".to_owned()]).unwrap().is_none());
         assert!(parse_args(["-h".to_owned()]).unwrap().is_none());
     }
@@ -1532,6 +1737,103 @@ mod tests {
         let mut chat_observation = observation_args();
         chat_observation.insert(0, "--chat");
         assert!(parse(&chat_observation).is_err());
+        let mut missing_prefill = observation_args();
+        let prefill = missing_prefill
+            .iter()
+            .position(|value| *value == "--prefill-span")
+            .unwrap();
+        missing_prefill.drain(prefill..prefill + 2);
+        assert!(parse(&missing_prefill).is_err());
+        let mut one_expected_id = observation_args();
+        let expected = one_expected_id
+            .iter()
+            .position(|value| *value == "--expected-ids")
+            .unwrap();
+        one_expected_id[expected + 1] = "4";
+        assert!(parse(&one_expected_id).is_err());
+        let mut attestation_without_observation = observation_args();
+        let observation = attestation_without_observation
+            .iter()
+            .position(|value| *value == "--benchmark-observation")
+            .unwrap();
+        attestation_without_observation.drain(observation..observation + 2);
+        assert!(parse(&attestation_without_observation).is_err());
+    }
+
+    #[test]
+    fn complete_live_coverage_requires_fixed_prefill_decode_and_exact_downloads() {
+        let complete = CompleteLiveCoverage {
+            configured_prefill_span: 4,
+            prompt_token_count: 7,
+            fixed_prefill_component_run_count: 1,
+            fixed_prefill_ordered_run_count: 1,
+            fixed_prefill_append_span_rows: Some(4),
+            fixed_prefill_has_output_or_download: false,
+            fixed_prefill_kernel_launch_count: 9,
+            fixed_prefill_command_submission_count: 1,
+            fixed_prefill_command_wait_count: 1,
+            prompt_retained_d2h_calls: 1,
+            prompt_retained_d2h_bytes: 4,
+            steady_decode_token_count: 2,
+            steady_decode_run_count: 2,
+            steady_decode_ordered_run_count: 2,
+            steady_decode_kernel_launch_count: 18,
+            steady_decode_command_submission_count: 2,
+            steady_decode_command_wait_count: 2,
+            steady_decode_retained_d2h_calls: 2,
+            steady_decode_retained_d2h_bytes: 8,
+        };
+        assert!(validate_complete_live_coverage(complete).is_ok());
+        for (case, incomplete) in [
+            (
+                "short prompt",
+                CompleteLiveCoverage {
+                    prompt_token_count: 4,
+                    ..complete
+                },
+            ),
+            (
+                "no fixed prefill",
+                CompleteLiveCoverage {
+                    fixed_prefill_component_run_count: 0,
+                    fixed_prefill_ordered_run_count: 0,
+                    ..complete
+                },
+            ),
+            (
+                "fixed prefill downloaded output",
+                CompleteLiveCoverage {
+                    fixed_prefill_has_output_or_download: true,
+                    ..complete
+                },
+            ),
+            (
+                "no steady decode",
+                CompleteLiveCoverage {
+                    steady_decode_token_count: 0,
+                    steady_decode_run_count: 0,
+                    steady_decode_ordered_run_count: 0,
+                    steady_decode_kernel_launch_count: 0,
+                    steady_decode_command_submission_count: 0,
+                    steady_decode_command_wait_count: 0,
+                    steady_decode_retained_d2h_calls: 0,
+                    steady_decode_retained_d2h_bytes: 0,
+                    ..complete
+                },
+            ),
+            (
+                "wrong decode projection",
+                CompleteLiveCoverage {
+                    steady_decode_retained_d2h_bytes: 4,
+                    ..complete
+                },
+            ),
+        ] {
+            assert!(
+                validate_complete_live_coverage(incomplete).is_err(),
+                "accepted {case}"
+            );
+        }
     }
 
     #[test]
@@ -1783,6 +2085,9 @@ mod tests {
             .find("let runtime = MetalRuntime::load()?")
             .unwrap();
         let report = production.find("let scoreboard_report =").unwrap();
+        let complete_coverage = production
+            .find("validate_complete_live_coverage(CompleteLiveCoverage::from_report(")
+            .unwrap();
         let raw_serialization = production.find("let scoreboard_json =").unwrap();
         let peak = production
             .find("let measured_device_buffer_peak = measurement.finish(&device)?;")
@@ -1801,6 +2106,8 @@ mod tests {
         assert!(os_validation < model_loading);
         assert!(model_loading < runtime_loading);
         assert!(report < raw_serialization);
+        assert!(report < complete_coverage);
+        assert!(complete_coverage < raw_serialization);
         assert!(raw_serialization < peak);
         assert!(peak < normalization);
         assert!(normalization < attachment);
@@ -1834,6 +2141,8 @@ mod tests {
             "measurement.finish(&device)?;",
             "observation.metrics.measured_peak_device_memory_bytes",
             "observation.metrics.planned_device_memory_bytes",
+            "observation.metrics.prompt_prefill.is_none()",
+            "observation.metrics.steady_decode.is_none()",
         ] {
             assert!(production.contains(required), "production omits {required}");
         }
@@ -1887,6 +2196,11 @@ mod tests {
         assert_eq!(llama_job.matches("--benchmark-observation").count(), 1);
         assert_eq!(llama_job.matches("--attestation").count(), 1);
         assert!(llama_job.contains("RUSTGRAD_METAL_LLAMA_PREFILL_SPAN"));
+        assert!(llama_job.contains("RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS < 2"));
+        assert!(
+            llama_job
+                .contains(r#"RUSTGRAD_METAL_LLAMA_EXPECTED_IDS" =~ ^[0-9]+,[0-9]+(,[0-9]+)*$"#)
+        );
         assert!(llama_job.contains(r#"--scoreboard "$RUSTGRAD_METAL_LLAMA_SCOREBOARD_PATH""#));
         assert!(
             llama_job
