@@ -96,7 +96,11 @@ and one device-resident U64 block counter committed atomically with AdamW.
 Checkpoint v4 continues the exact next mask on CPU or strict Metal while
 v1--v3 and no-dropout bytes remain accepted unchanged. This is a bounded
 Transformer workload stream, not general random-operation parity or
-attention-weight dropout.
+attention-weight dropout. The same runtime seam now explicitly publishes its
+canonical trainable snapshot into any fresh or existing `Module` with the exact
+schema. One atomic host transaction preserves ties, frozen parameters, and
+buffers while advancing every unique published `Parameter` version once;
+publication changes no runtime progress or checkpoint state.
 
 ### 3. P1 — lower the identical training capture to Metal
 
@@ -120,7 +124,10 @@ optimizer or backend enum. `CompiledCheckpointRuntime` isolates portable
 persistence, while the AdamW extension traits retain accumulation, clipping,
 loss-scaling, moment, and optimizer-step inspection. Backend-specific reports
 and scoreboards remain available on the concrete Metal types rather than being
-erased into a lowest-common-denominator result.
+erased into a lowest-common-denominator result. Metal publication prevalidates
+and reads only the parameter fixed-state subset, including zero-read empty
+tensors; optimizer moments, accumulators, the optimizer step, and dropout
+counter remain device-resident and unread.
 `CompiledAdamWPlan` now makes compilation and checkpoint restoration themselves
 backend-neutral: callers choose CPU replay or strict Metal rendering only after
 the complete graph, gradient, optimizer, capture, and recurrent frontier have

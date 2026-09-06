@@ -12,13 +12,13 @@
 //! cargo run --release --example compiled_transformer_train_resume -- metal
 //! ```
 
-use rustgrad::nn::{Embedding, LayerNorm, StateKind};
+use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
-    CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuSessionTarget, DType,
-    Graph, LossOptions, MetalSessionTarget, Module, NodeId, Parameter, Reduction, Result, Scalar,
-    Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
+    Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuBackend, CpuSessionTarget,
+    DType, Graph, LossOptions, MetalSessionTarget, Module, NodeId, Parameter, Reduction, Result,
+    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
 };
 use std::{collections::BTreeMap, env, error::Error};
 
@@ -32,6 +32,7 @@ struct TinyCausalTransformer {
     tokens: Embedding,
     block: TransformerBlock,
     norm: LayerNorm,
+    frozen_scale: Parameter,
 }
 
 impl TinyCausalTransformer {
@@ -41,6 +42,7 @@ impl TinyCausalTransformer {
             block: TransformerBlock::new_static(EMBEDDING, 1, 4, true, 0.25, seed.wrapping_add(1))?
                 .with_causal_attention(true),
             norm: LayerNorm::new_static([EMBEDDING], 1e-5, true)?,
+            frozen_scale: Parameter::new(TensorData::scalar(1.0), false),
         })
     }
 
@@ -54,10 +56,22 @@ impl TinyCausalTransformer {
         let hidden = self
             .block
             .forward_training_with_dropout(graph, hidden, dropout)?;
+        self.project_logits(graph, hidden)
+    }
+
+    fn forward_eval(&self, graph: &mut Graph, tokens: NodeId) -> Result<NodeId> {
+        let hidden = self.tokens.forward(graph, tokens)?;
+        let hidden = self.block.forward_mode(graph, hidden, Mode::Eval)?.output;
+        self.project_logits(graph, hidden)
+    }
+
+    fn project_logits(&self, graph: &mut Graph, hidden: NodeId) -> Result<NodeId> {
         let hidden = self.norm.forward(graph, hidden)?;
         let tied_weight = self.tokens.weight.bind(graph)?;
         let tied_weight = graph.permute(tied_weight, [1, 0])?;
-        graph.matmul(hidden, tied_weight)
+        let logits = graph.matmul(hidden, tied_weight)?;
+        let frozen_scale = self.frozen_scale.bind(graph)?;
+        graph.mul(logits, frozen_scale)
     }
 }
 
@@ -73,6 +87,11 @@ impl Module for TinyCausalTransformer {
         self.tokens.visit(&child("tokens"), visitor);
         self.block.visit(&child("block"), visitor);
         self.norm.visit(&child("norm"), visitor);
+        visitor(
+            child("frozen_scale"),
+            &self.frozen_scale,
+            StateKind::Parameter,
+        );
         visitor(
             child("lm_head.weight"),
             &self.tokens.weight,
@@ -129,6 +148,15 @@ fn batch() -> Result<BTreeMap<String, TensorData>> {
         ("tokens".into(), tensor([0, 1, 2])?),
         ("targets".into(), tensor([1, 2, 0])?),
     ]))
+}
+
+fn evaluate(model: &TinyCausalTransformer) -> Result<TensorData> {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [1, TIME], DType::I32);
+    let logits = model.forward_eval(&mut graph, tokens)?;
+    let mut bindings = model.input_bindings(&graph)?;
+    bindings.insert("tokens".into(), batch()?.remove("tokens").unwrap());
+    CpuBackend.execute(&graph, logits, &bindings)
 }
 
 fn run_exact_resume<R, P>(target_name: &str, mut prepare: P) -> Result<()>
@@ -193,8 +221,45 @@ where
         uninterrupted.second_moment_snapshots()?
     );
     assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
+    let published = resumed.parameter_snapshots()?;
+    let tied_version = restored_model.tokens.weight.version()?;
+    let frozen_before = restored_model.frozen_scale.snapshot()?;
+    let runtime_checkpoint = resumed.checkpoint()?;
+    let runtime_step = resumed.step_count();
+    assert!(resumed.publish_parameters(&restored_model)?.is_clean());
+    let live = restored_model.state_dict()?;
+    for (name, value) in &published {
+        assert_eq!(&live.tensors()[name], value);
+    }
+    assert_eq!(
+        restored_model.tokens.weight.value()?,
+        live.tensors()["tokens.weight"]
+    );
+    assert!(!live.tensors().contains_key("lm_head.weight"));
+    assert!(!published.contains_key("lm_head.weight"));
+    assert_eq!(restored_model.tokens.weight.version()?, tied_version + 1);
+    let frozen_after = restored_model.frozen_scale.snapshot()?;
+    assert_eq!(frozen_after.data, frozen_before.data);
+    assert_eq!(frozen_after.version, frozen_before.version);
+    assert_eq!(resumed.step_count(), runtime_step);
+    assert_eq!(resumed.checkpoint()?, runtime_checkpoint);
+    let versions_before_eval = restored_model
+        .trainable_parameters()?
+        .into_iter()
+        .map(|(name, parameter)| Ok((name, parameter.version()?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let first_eval = evaluate(&restored_model)?;
+    let second_eval = evaluate(&restored_model)?;
+    assert_eq!(first_eval, second_eval);
+    assert!(
+        (0..first_eval.shape().numel()?)
+            .all(|index| first_eval.scalar_at(index).as_f64().is_finite())
+    );
+    for (name, parameter) in restored_model.trainable_parameters()? {
+        assert_eq!(parameter.version()?, versions_before_eval[&name]);
+    }
     println!(
-        "{target_name}: capture={capture_identity:016x}, steps={}, loss={:.6} -> {:.6}, exact_resume=true",
+        "{target_name}: capture={capture_identity:016x}, steps={}, loss={:.6} -> {:.6}, exact_resume=true, published=true",
         resumed.step_count(),
         losses[0],
         losses.last().expect("eight losses were recorded")

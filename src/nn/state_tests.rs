@@ -566,6 +566,253 @@ fn strict_loading_lock_failure_leaves_other_parameters_unchanged() {
     assert_eq!(first.value().unwrap(), first_before);
 }
 
+struct PublicationFixture {
+    tied: Parameter,
+    frozen: Parameter,
+    buffer: Parameter,
+}
+
+impl PublicationFixture {
+    fn new() -> Self {
+        Self {
+            tied: Parameter::new(TensorData::new([2], vec![1.0, 2.0]).unwrap(), true),
+            frozen: Parameter::new(TensorData::new([1], vec![3.0]).unwrap(), false),
+            buffer: Parameter::new(TensorData::new([1], vec![4.0]).unwrap(), false),
+        }
+    }
+}
+
+impl Module for PublicationFixture {
+    fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        visitor(join(prefix, "weight"), &self.tied, StateKind::Parameter);
+        visitor(
+            join(prefix, "weight_alias"),
+            &self.tied,
+            StateKind::Parameter,
+        );
+        visitor(join(prefix, "frozen"), &self.frozen, StateKind::Parameter);
+        visitor(join(prefix, "running"), &self.buffer, StateKind::Buffer);
+    }
+}
+
+#[test]
+fn exact_trainable_publication_is_tied_atomic_and_versioned_once_per_call() {
+    let module = PublicationFixture::new();
+    let frozen = module.frozen.snapshot().unwrap();
+    let buffer = module.buffer.snapshot().unwrap();
+    let initial_version = module.tied.version().unwrap();
+    let parameters = BTreeMap::from([(
+        "weight".into(),
+        TensorData::new([2], vec![7.0, 8.0]).unwrap(),
+    )]);
+
+    let first = module.load_trainable_parameters_exact(&parameters).unwrap();
+    assert!(first.is_clean());
+    assert_eq!(first.loaded_keys, vec!["weight"]);
+    assert_eq!(module.tied.value().unwrap(), parameters["weight"]);
+    assert_eq!(module.tied.version().unwrap(), initial_version + 1);
+    assert_eq!(module.frozen.snapshot().unwrap().data, frozen.data);
+    assert_eq!(module.frozen.version().unwrap(), frozen.version);
+    assert_eq!(module.buffer.snapshot().unwrap().data, buffer.data);
+    assert_eq!(module.buffer.version().unwrap(), buffer.version);
+
+    module.load_trainable_parameters_exact(&parameters).unwrap();
+    assert_eq!(module.tied.value().unwrap(), parameters["weight"]);
+    assert_eq!(module.tied.version().unwrap(), initial_version + 2);
+}
+
+#[test]
+fn exact_trainable_publication_accepts_a_fresh_matching_module() {
+    let source = PublicationFixture::new();
+    source
+        .tied
+        .replace(TensorData::new([2], vec![5.0, 6.0]).unwrap())
+        .unwrap();
+    let target = PublicationFixture::new();
+    let state = BTreeMap::from([("weight".into(), source.tied.value().unwrap())]);
+    target.load_trainable_parameters_exact(&state).unwrap();
+    assert_eq!(target.tied.value().unwrap(), source.tied.value().unwrap());
+    assert_ne!(target.tied.id(), source.tied.id());
+}
+
+#[test]
+fn exact_trainable_publication_rejects_ambiguous_traversals_without_writes() {
+    struct MixedAlias(Parameter);
+    impl Module for MixedAlias {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            visitor(join(prefix, "weight"), &self.0, StateKind::Parameter);
+            visitor(join(prefix, "running"), &self.0, StateKind::Buffer);
+        }
+    }
+    struct Duplicate(Parameter, Parameter);
+    impl Module for Duplicate {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            visitor(join(prefix, "weight"), &self.0, StateKind::Parameter);
+            visitor(join(prefix, "weight"), &self.1, StateKind::Parameter);
+        }
+    }
+
+    let alias = MixedAlias(Parameter::new(
+        TensorData::new([1], vec![1.0]).unwrap(),
+        true,
+    ));
+    let alias_before = alias.0.snapshot().unwrap();
+    assert!(
+        alias
+            .load_trainable_parameters_exact(&BTreeMap::from([(
+                "weight".into(),
+                TensorData::new([1], vec![9.0]).unwrap(),
+            )]))
+            .is_err()
+    );
+    assert_eq!(alias.0.snapshot().unwrap().data, alias_before.data);
+    assert_eq!(alias.0.version().unwrap(), alias_before.version);
+
+    let duplicate = Duplicate(
+        Parameter::new(TensorData::new([1], vec![1.0]).unwrap(), true),
+        Parameter::new(TensorData::new([1], vec![2.0]).unwrap(), true),
+    );
+    let first = duplicate.0.snapshot().unwrap();
+    let second = duplicate.1.snapshot().unwrap();
+    assert!(
+        duplicate
+            .load_trainable_parameters_exact(&BTreeMap::from([(
+                "weight".into(),
+                TensorData::new([1], vec![9.0]).unwrap(),
+            )]))
+            .is_err()
+    );
+    assert_eq!(duplicate.0.snapshot().unwrap().data, first.data);
+    assert_eq!(duplicate.1.snapshot().unwrap().data, second.data);
+}
+
+#[test]
+fn exact_trainable_publication_rejects_every_schema_mismatch_before_commit() {
+    let cases = [
+        BTreeMap::new(),
+        BTreeMap::from([
+            (
+                "weight".into(),
+                TensorData::new([2], vec![7.0, 8.0]).unwrap(),
+            ),
+            ("extra".into(), TensorData::scalar(1.0)),
+        ]),
+        BTreeMap::from([("weight".into(), TensorData::new([1], vec![7.0]).unwrap())]),
+        BTreeMap::from([(
+            "weight".into(),
+            TensorData::from_scalars(
+                [2],
+                crate::DType::I32,
+                [crate::Scalar::I(7), crate::Scalar::I(8)],
+            )
+            .unwrap(),
+        )]),
+    ];
+    for parameters in cases {
+        let module = PublicationFixture::new();
+        let before = module.tied.snapshot().unwrap();
+        assert!(module.load_trainable_parameters_exact(&parameters).is_err());
+        assert_eq!(module.tied.snapshot().unwrap().data, before.data);
+        assert_eq!(module.tied.version().unwrap(), before.version);
+    }
+}
+
+#[test]
+fn exact_trainable_publication_rejects_scalar_and_singleton_vector_interchange() {
+    struct Single(Parameter);
+    impl Module for Single {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            visitor(join(prefix, "weight"), &self.0, StateKind::Parameter);
+        }
+    }
+
+    for (target, source) in [
+        (
+            TensorData::scalar(1.0),
+            TensorData::new([1], vec![7.0]).unwrap(),
+        ),
+        (
+            TensorData::new([1], vec![1.0]).unwrap(),
+            TensorData::scalar(7.0),
+        ),
+    ] {
+        let module = Single(Parameter::new(target, true));
+        let before = module.0.snapshot().unwrap();
+        assert!(
+            module
+                .load_trainable_parameters_exact(&BTreeMap::from([("weight".into(), source)]))
+                .is_err()
+        );
+        assert_eq!(module.0.snapshot().unwrap().data, before.data);
+        assert_eq!(module.0.version().unwrap(), before.version);
+    }
+}
+
+#[test]
+fn exact_trainable_publication_lock_overflow_and_race_fail_atomically() {
+    struct Pair(Parameter, Parameter);
+    impl Module for Pair {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            visitor(join(prefix, "first"), &self.0, StateKind::Parameter);
+            visitor(join(prefix, "second"), &self.1, StateKind::Parameter);
+        }
+    }
+    let values = || {
+        BTreeMap::from([
+            ("first".into(), TensorData::new([1], vec![7.0]).unwrap()),
+            ("second".into(), TensorData::new([1], vec![8.0]).unwrap()),
+        ])
+    };
+
+    let poisoned = Pair(
+        Parameter::new(TensorData::new([1], vec![1.0]).unwrap(), true),
+        Parameter::new(TensorData::new([1], vec![2.0]).unwrap(), true),
+    );
+    let first_before = poisoned.0.snapshot().unwrap();
+    poisoned.1.poison_for_test();
+    assert!(poisoned.load_trainable_parameters_exact(&values()).is_err());
+    assert_eq!(poisoned.0.snapshot().unwrap().data, first_before.data);
+    assert_eq!(poisoned.0.version().unwrap(), first_before.version);
+
+    let overflow = Pair(
+        Parameter::new(TensorData::new([1], vec![1.0]).unwrap(), true),
+        Parameter::new(TensorData::new([1], vec![2.0]).unwrap(), true),
+    );
+    overflow.1.set_version_for_test(u64::MAX).unwrap();
+    let first_before = overflow.0.snapshot().unwrap();
+    assert!(overflow.load_trainable_parameters_exact(&values()).is_err());
+    assert_eq!(overflow.0.snapshot().unwrap().data, first_before.data);
+    assert_eq!(overflow.0.version().unwrap(), first_before.version);
+
+    let racing = Pair(
+        Parameter::new(TensorData::new([1], vec![1.0]).unwrap(), true),
+        Parameter::new(TensorData::new([1], vec![2.0]).unwrap(), true),
+    );
+    let first = racing.0.snapshot().unwrap();
+    let second = racing.1.snapshot().unwrap();
+    let restores = vec![
+        ParameterRestore {
+            parameter: racing.0.clone(),
+            data: TensorData::new([1], vec![7.0]).unwrap(),
+            expected_version: first.version,
+            restored_version: first.version + 1,
+        },
+        ParameterRestore {
+            parameter: racing.1.clone(),
+            data: TensorData::new([1], vec![8.0]).unwrap(),
+            expected_version: second.version,
+            restored_version: second.version + 1,
+        },
+    ];
+    racing
+        .1
+        .replace(TensorData::new([1], vec![6.0]).unwrap())
+        .unwrap();
+    assert!(restore_parameters(restores).is_err());
+    assert_eq!(racing.0.snapshot().unwrap().data, first.data);
+    assert_eq!(racing.0.version().unwrap(), first.version);
+}
+
 #[test]
 fn strict_state_load_preflights_every_container_parameter_before_replacement() {
     let mut graph = Graph::new();
