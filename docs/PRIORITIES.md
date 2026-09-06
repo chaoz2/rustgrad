@@ -95,6 +95,10 @@ manual exact-SHA lane on provisioned Apple hardware is the remaining proof;
 the shared scoreboard now records this epoch-swapped training session directly,
 and `MetalCompiledAdamWPlan::prepare_with_scoreboard` binds fail-soft observation
 before the first step rather than introducing a parallel training API.
+`CompiledAdamWRuntime` and `CompiledAdamWStep` now expose that CPU/Metal seam as
+one generic public training-loop contract. Backend-specific reports and
+scoreboards remain available on the concrete Metal types rather than being
+erased into a lowest-common-denominator result.
 
 ## Deferred hardware inference queue
 

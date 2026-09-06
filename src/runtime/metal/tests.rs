@@ -638,12 +638,12 @@ use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     Backend, BinaryOp, BufferRole, CapturedAppendStateInference, CapturedInference,
     CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
-    CompareOp, CompiledAdamWConfig, CpuBackend, CpuCompiledAdamW, CpuSession, DType,
-    EffectBatchStep, EffectRuntime, GgmlType, Graph, IndexValue, InferenceAppendStateLink,
-    InferenceStateLink, KernelBindings, KernelBufferDesc, LaneInstruction, MovementKernelKind,
-    MovementValue, NodeId, Operation, QuantizedTensorData, ReduceKind, ResNet, ResNetConfig,
-    ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
-    TrainingParameterInit, TypedValue, UOp, UType, schedule,
+    CompareOp, CompiledAdamWConfig, CompiledAdamWRuntime, CompiledAdamWStep, CpuBackend,
+    CpuCompiledAdamW, CpuSession, DType, EffectBatchStep, EffectRuntime, GgmlType, Graph,
+    IndexValue, InferenceAppendStateLink, InferenceStateLink, KernelBindings, KernelBufferDesc,
+    LaneInstruction, MovementKernelKind, MovementValue, NodeId, Operation, QuantizedTensorData,
+    ReduceKind, ResNet, ResNetConfig, ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice,
+    Storage, TensorData, TrainingParameterInit, TypedValue, UOp, UType, schedule,
 };
 
 fn packed_ones(kind: GgmlType, rows: usize) -> QuantizedTensorData {
@@ -1138,6 +1138,76 @@ fn compiled_vector_adamw_with_gradient_clipping(max_norm: f32) -> CpuCompiledAda
         Ok((loss, BTreeMap::from([("delta".into(), delta)])))
     })
     .unwrap()
+}
+
+#[derive(Debug, PartialEq)]
+struct CompiledAdamWObservation {
+    loss: TensorData,
+    outputs: BTreeMap<String, TensorData>,
+    step: u64,
+    optimizer_step: u64,
+    accumulation_index: u64,
+    did_update: bool,
+    capture_identity: u64,
+    checkpoint: crate::CompiledAdamWCheckpoint,
+}
+
+fn run_one_compiled_adamw_step<R: CompiledAdamWRuntime>(
+    runtime: &mut R,
+) -> CompiledAdamWObservation {
+    assert_eq!(runtime.step_count(), 0);
+    assert_eq!(runtime.gradient_accumulation_steps(), 1);
+    assert_eq!(runtime.max_gradient_norm(), None);
+    assert_eq!(runtime.loss_scale(), 1.0);
+    assert_eq!(runtime.optimizer_step().unwrap(), 0);
+    assert_eq!(runtime.accumulation_index().unwrap(), 0);
+
+    let result = runtime
+        .step(
+            BTreeMap::from([("target".into(), TensorData::scalar(0.0))]),
+            TensorData::scalar(0.1),
+        )
+        .unwrap();
+    assert_eq!(result.output("delta"), result.outputs().get("delta"));
+    let loss = result.loss().clone();
+    let outputs = result.outputs().clone();
+    let step = result.step();
+    let optimizer_step = result.optimizer_step();
+    let accumulation_index = result.accumulation_index();
+    let did_update = result.did_update();
+    let capture_identity = result.capture_identity();
+    assert_eq!(runtime.step_count(), 1);
+    assert_eq!(runtime.optimizer_step().unwrap(), 1);
+    assert_eq!(runtime.accumulation_index().unwrap(), 0);
+    assert_eq!(runtime.parameter_snapshots().unwrap().len(), 1);
+    assert_eq!(runtime.first_moment_snapshots().unwrap().len(), 1);
+    assert_eq!(runtime.second_moment_snapshots().unwrap().len(), 1);
+    assert!(runtime.gradient_accumulator_snapshots().unwrap().is_empty());
+    CompiledAdamWObservation {
+        loss,
+        outputs,
+        step,
+        optimizer_step,
+        accumulation_index,
+        did_update,
+        capture_identity,
+        checkpoint: runtime.checkpoint().unwrap(),
+    }
+}
+
+#[test]
+fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops() {
+    let mut cpu = compiled_scalar_adamw();
+    let seed = compiled_scalar_adamw();
+    let plan = seed
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let mut metal = plan.prepare(test_device(mock)).unwrap();
+
+    let expected = run_one_compiled_adamw_step(&mut cpu);
+    let actual = run_one_compiled_adamw_step(&mut metal);
+    assert_eq!(actual, expected);
 }
 
 #[test]
