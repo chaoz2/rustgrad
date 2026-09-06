@@ -1507,6 +1507,55 @@ impl MetalDeviceSession {
         Ok(snapshots)
     }
 
+    /// Internal selective fixed-state download. Semantic owners provide only
+    /// capture-authenticated state ids; the complete request is validated
+    /// before the prepared prefix performs its first device read.
+    pub(crate) fn state_snapshot_subset(
+        &self,
+        requested: &BTreeSet<u64>,
+    ) -> Result<BTreeMap<String, TensorData>, MetalError> {
+        if !matches!(self.state_policy, MetalSessionStatePolicy::Epoch { .. }) {
+            return Err(MetalError::InvalidBinding(
+                "Metal state snapshots require fixed epoch state".into(),
+            ));
+        }
+        let mut inputs = BTreeMap::new();
+        let mut names = BTreeSet::new();
+        for input in self.lifetime.state_inputs() {
+            if inputs.insert(input.desc.id, input).is_some() || !names.insert(input.name.as_str()) {
+                return Err(MetalError::InvalidBinding(
+                    "Metal state snapshot input inventory repeats".into(),
+                ));
+            }
+        }
+        if !requested.iter().all(|id| inputs.contains_key(id)) {
+            return Err(MetalError::InvalidBinding(
+                "Metal state snapshot request is outside the state inventory".into(),
+            ));
+        }
+        let mut values = self
+            .prepared
+            .snapshot_state_subset(self.state_epoch, requested)?;
+        let mut snapshots = BTreeMap::new();
+        for id in requested {
+            let input = inputs[id];
+            let value = values.remove(&input.desc.id).ok_or_else(|| {
+                MetalError::InvalidBinding(format!("Metal state snapshot {} is absent", input.name))
+            })?;
+            if snapshots.insert(input.name.clone(), value).is_some() {
+                return Err(MetalError::InvalidBinding(
+                    "Metal state snapshot name repeats".into(),
+                ));
+            }
+        }
+        if !values.is_empty() {
+            return Err(MetalError::InvalidBinding(
+                "Metal state snapshot inventory has unknown values".into(),
+            ));
+        }
+        Ok(snapshots)
+    }
+
     /// Typed internal fixed-state mutation used by owners that can prove the
     /// semantic replacement set. The inactive epoch is populated completely
     /// before it becomes visible, and ordinary run numbering is unchanged.

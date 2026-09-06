@@ -639,13 +639,13 @@ use crate::{
     Backend, BinaryOp, BufferRole, CapturedAppendStateInference, CapturedInference,
     CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
     CompareOp, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
-    CpuSession, CpuSessionTarget, DType, EffectBatchStep, EffectRuntime, GgmlType, Graph,
-    IndexValue, InferenceAppendStateLink, InferenceStateLink, KernelBindings, KernelBufferDesc,
-    LaneInstruction, MetalSessionTarget, MovementKernelKind, MovementValue, NodeId, Operation,
-    QuantizedTensorData, ReduceKind, ResNet, ResNetConfig, ResNetMetalError, ResNetMetalPlan,
-    Scalar, Shape, Slice, Storage, TensorData, TrainingDropoutProvider, TrainingParameterInit,
-    TypedValue, UOp, UType, schedule,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingRuntime, CompiledTrainingStep,
+    CpuBackend, CpuCompiledAdamW, CpuSession, CpuSessionTarget, DType, EffectBatchStep,
+    EffectRuntime, GgmlType, Graph, IndexValue, InferenceAppendStateLink, InferenceStateLink,
+    KernelBindings, KernelBufferDesc, LaneInstruction, MetalSessionTarget, MovementKernelKind,
+    MovementValue, NodeId, Operation, QuantizedTensorData, ReduceKind, ResNet, ResNetConfig,
+    ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
+    TrainingDropoutProvider, TrainingParameterInit, TypedValue, UOp, UType, schedule,
 };
 
 fn packed_ones(kind: GgmlType, rows: usize) -> QuantizedTensorData {
@@ -1158,6 +1158,55 @@ fn compiled_dropout_adamw_plan() -> CompiledAdamWPlan {
     .unwrap()
 }
 
+struct CompiledPublicationFixture {
+    first: Parameter,
+    second: Parameter,
+    empty: Parameter,
+}
+
+impl CompiledPublicationFixture {
+    fn new(first: [f32; 2], second: f32) -> Self {
+        Self {
+            first: Parameter::new(TensorData::new([2], first.to_vec()).unwrap(), true),
+            second: Parameter::new(TensorData::scalar(second), true),
+            empty: Parameter::new(TensorData::new([0], Vec::<f32>::new()).unwrap(), true),
+        }
+    }
+}
+
+impl Module for CompiledPublicationFixture {
+    fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        assert!(prefix.is_empty());
+        visitor("first".into(), &self.first, StateKind::Parameter);
+        visitor("second".into(), &self.second, StateKind::Parameter);
+        visitor("empty".into(), &self.empty, StateKind::Parameter);
+    }
+}
+
+fn compiled_publication_adamw_plan(module: &CompiledPublicationFixture) -> CompiledAdamWPlan {
+    let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_input("target", [2], DType::F32)
+        .unwrap();
+    CompiledAdamWPlan::compile_module(config, module, |module, graph, inputs| {
+        let first = module.first.bind(graph)?;
+        let second = module.second.bind(graph)?;
+        let empty = module.empty.bind(graph)?;
+        let first_delta = graph.sub(first, inputs["target"])?;
+        let first_squared = graph.square(first_delta)?;
+        let first_loss = graph.sum_all(first_squared)?;
+        let target_sum = graph.sum_all(inputs["target"])?;
+        let second_delta = graph.sub(second, target_sum)?;
+        let second_loss = graph.square(second_delta)?;
+        let empty_squared = graph.square(empty)?;
+        let empty_loss = graph.sum_all(empty_squared)?;
+        let nonempty_loss = graph.add(first_loss, second_loss)?;
+        let loss = graph.add(nonempty_loss, empty_loss)?;
+        Ok((loss, BTreeMap::new()))
+    })
+    .unwrap()
+}
+
 fn compiled_scalar_adamw_with_accumulation(steps: u64) -> CpuCompiledAdamW {
     compiled_scalar_adamw_plan_with_accumulation(steps)
         .prepare_cpu()
@@ -1269,6 +1318,95 @@ fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops()
             .successful_run_count,
         1
     );
+}
+
+#[test]
+fn compiled_adamw_parameter_publication_reads_only_parameters_and_retries_atomically() {
+    let source = CompiledPublicationFixture::new([1.0, -1.0], 0.5);
+    let program = compiled_publication_adamw_plan(&source);
+    let mut cpu = program.prepare_cpu().unwrap();
+    let plan = program
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap();
+    assert_eq!(plan.summary().fallback_count, 0);
+    let mock = Arc::new(MockDispatch::default());
+    let mut metal = plan.prepare(test_device(mock.clone())).unwrap();
+    let inputs = BTreeMap::from([(
+        "target".into(),
+        TensorData::new([2], vec![0.0, 0.0]).unwrap(),
+    )]);
+    cpu.step(inputs.clone(), TensorData::scalar(0.01)).unwrap();
+    metal.step(inputs, TensorData::scalar(0.01)).unwrap();
+    let expected = cpu.parameter_snapshots().unwrap();
+    assert_ne!(
+        expected,
+        cpu.first_moment_snapshots().unwrap(),
+        "the independent CPU oracle must distinguish parameters from moments"
+    );
+
+    let target = CompiledPublicationFixture::new([9.0, 8.0], 7.0);
+    let before = target.state_dict().unwrap();
+    let before_versions = [
+        target.first.version().unwrap(),
+        target.second.version().unwrap(),
+        target.empty.version().unwrap(),
+    ];
+    let step_count = metal.step_count();
+    let successful_runs = metal.metal_session().successful_run_count();
+    let state_epoch = metal.metal_session().state_epoch();
+
+    mock.clear_calls();
+    mock.state.lock().unwrap().failures.read_after = Some((1, "parameter publication"));
+    assert!(metal.publish_parameters(&target).is_err());
+    assert_eq!(target.state_dict().unwrap(), before);
+    assert_eq!(target.first.version().unwrap(), before_versions[0]);
+    assert_eq!(target.second.version().unwrap(), before_versions[1]);
+    assert_eq!(target.empty.version().unwrap(), before_versions[2]);
+    assert_eq!(metal.step_count(), step_count);
+    assert_eq!(
+        metal.metal_session().successful_run_count(),
+        successful_runs
+    );
+    assert_eq!(metal.metal_session().state_epoch(), state_epoch);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1
+    );
+
+    mock.clear_failures();
+    mock.clear_calls();
+    assert!(metal.publish_parameters(&target).unwrap().is_clean());
+    let calls = mock.calls();
+    let reads = calls
+        .iter()
+        .filter(|call| call.starts_with("read:"))
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 2, "the zero-byte parameter must not be read");
+    assert_eq!(
+        reads
+            .iter()
+            .map(|call| call.rsplit(':').next().unwrap().parse::<usize>().unwrap())
+            .sum::<usize>(),
+        12
+    );
+    assert!(calls.iter().all(|call| call.starts_with("read:")));
+    let published = target.state_dict().unwrap();
+    assert_eq!(published.tensors().len(), 3);
+    for (name, value) in expected {
+        assert_eq!(&published.tensors()[&name], &value);
+    }
+    assert_eq!(target.first.version().unwrap(), before_versions[0] + 1);
+    assert_eq!(target.second.version().unwrap(), before_versions[1] + 1);
+    assert_eq!(target.empty.version().unwrap(), before_versions[2] + 1);
+    assert_eq!(metal.step_count(), step_count);
+    assert_eq!(
+        metal.metal_session().successful_run_count(),
+        successful_runs
+    );
+    assert_eq!(metal.metal_session().state_epoch(), state_epoch);
 }
 
 #[test]
@@ -7249,7 +7387,9 @@ impl Dispatch for MockDispatch {
                 return Err(MetalError::Bounds);
             }
             bytes.fill(0);
-            state.calls.push(format!("read:{owner}:{}", buffer.0));
+            state
+                .calls
+                .push(format!("read:{owner}:{}:{}", buffer.0, bytes.len()));
             return Ok(());
         }
         let storage = state
@@ -7257,7 +7397,9 @@ impl Dispatch for MockDispatch {
             .get(&(owner, buffer.0))
             .ok_or(MetalError::OwnerMismatch)?;
         bytes.copy_from_slice(&storage[offset..offset + bytes.len()]);
-        state.calls.push(format!("read:{owner}:{}", buffer.0));
+        state
+            .calls
+            .push(format!("read:{owner}:{}:{}", buffer.0, bytes.len()));
         Ok(())
     }
 

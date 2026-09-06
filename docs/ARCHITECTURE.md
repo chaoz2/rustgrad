@@ -935,8 +935,19 @@ parameter and optimizer-state bytes, while `MixedReplayCursor` proves and advanc
 exact recurrent state frontier only after the complete effect batch commits.
 Every step accepts exact declared inputs plus one rank-zero F32 learning rate;
 all user input order is canonicalized by name before graph-free interpreter
-replay. Owned snapshots are diagnostic copies, not mutable aliases or live
-`nn::Parameter` synchronization. `CpuCompiledAdamW::compile_module` reuses the
+replay. Owned snapshots remain detached copies. The explicit, optimizer-neutral
+`CompiledTrainingRuntime::publish_parameters` composition takes only the
+canonical trainable snapshot and calls
+`Module::load_trainable_parameters_exact`: one complete traversal rejects
+duplicate names or identities whose kind/effective trainability is ambiguous,
+requires an exact canonical key/shape/dtype schema, precomputes every successor
+host version, and commits all unique identities once through the existing
+sorted restoration transaction. Tied handles therefore publish once under
+their first traversal name; frozen parameters and buffers remain unchanged.
+Each successful publication advances every unique host version once even when
+the bytes are unchanged. This is explicit trainable-only publication, not a
+retained live-module binding or synchronization of frozen state, buffers,
+optimizer state, progress, capture, or checkpoints. `CpuCompiledAdamW::compile_module` reuses the
 ordinary `Module` traversal and `Parameter::bind` forward seam without making
 the host module live state: unique trainable identities resolve to the
 optimizer-owned recurrent inputs, tied handles share that one node/state tuple,
@@ -952,11 +963,19 @@ keeps its original constructors as compatibility delegates through this plan.
 `CompiledTrainingRuntime` and `CompiledTrainingStep` are the shared public
 execution contract implemented by CPU momentum-SGD, CPU AdamW, and Metal AdamW:
 one generic loop observes loss, named outputs, capture identity, replay progress,
-and parameter snapshots without selecting an optimizer or backend enum.
+and parameter snapshots or explicitly publishes those snapshots into an exact
+live-module schema without selecting an optimizer or backend enum.
 `CompiledCheckpointRuntime` is the separate persistence capability;
 `CompiledAdamWRuntime` and `CompiledAdamWStep` extend those smaller contracts
 with accumulation, clipping, loss-scaling, moment, and optimizer-step
 inspection. Concrete Metal results retain their exact device reports.
+Metal parameter publication prevalidates the exact fixed-state parameter ID,
+descriptor, active-bank buffer, and queue inventory before its first read, then
+downloads only that subset in one unchanged active epoch. Zero-byte parameters
+are synthesized without a read. AdamW moments, gradient accumulators, the U64
+optimizer step, and the dropout counter are not downloaded; any partial read
+failure reaches no module transaction and is retryable. The established
+all-state snapshot and checkpoint paths remain unchanged.
 `SessionTarget<P>` is the preparation seam: implementations retain
 the plan-specific concrete session, error, and borrowed-versus-consumed
 ownership without a central backend switch. `CpuSessionTarget` prepares

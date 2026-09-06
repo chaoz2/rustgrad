@@ -10,7 +10,7 @@ use crate::runtime::metal::{
 };
 use crate::{
     BufferState, CapturedMixedSchedule, CapturedSchedule, CapturedStatefulInference, CompareOp,
-    DType, EffectGraph, EffectRuntime, Error, Graph, InferenceStateLink, Metadata,
+    DType, EffectGraph, EffectRuntime, Error, Graph, InferenceStateLink, LoadReport, Metadata,
     MixedReplayCursor, Module, NodeId, ParameterId, ReplayError, Result, Scalar, Schedule,
     ScheduleStateBinding, ScheduleValueBinding, Shape, StateDict, TensorData, bind_schedule_states,
     combine_mixed_schedules, load_safetensors, save_safetensors, schedule_effects, schedule_many,
@@ -1317,6 +1317,17 @@ pub trait CompiledTrainingRuntime {
     fn capture_identity(&self) -> u64;
 
     fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
+
+    /// Explicitly publishes the current detached trainable-parameter frontier
+    /// into any live module with the exact same canonical trainable schema.
+    ///
+    /// This does not synchronize frozen state, buffers, optimizer state, replay
+    /// progress, or checkpoints. The source runtime remains unchanged if the
+    /// snapshot or the module's one atomic replacement transaction fails.
+    fn publish_parameters(&self, module: &dyn Module) -> Result<LoadReport> {
+        let parameters = self.parameter_snapshots()?;
+        module.load_trainable_parameters_exact(&parameters)
+    }
 }
 
 /// Portable checkpoint capability for a compiled training runtime.
@@ -3140,14 +3151,57 @@ impl MetalCompiledAdamW {
     }
 
     pub fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        Ok(self
-            .state_snapshots()?
-            .into_iter()
-            .filter_map(|(key, value)| {
+        let state_inputs = self
+            .session
+            .state_inputs()
+            .iter()
+            .map(|input| (input.name.as_str(), input))
+            .collect::<BTreeMap<_, _>>();
+        if state_inputs.len() != self.state_input_keys.len()
+            || state_inputs
+                .keys()
+                .copied()
+                .ne(self.state_input_keys.keys().map(String::as_str))
+        {
+            return Err(training("compiled Metal state inventory mismatch"));
+        }
+        let expected = self
+            .state_input_keys
+            .iter()
+            .filter_map(|(input, key)| {
                 key.strip_prefix("parameter:")
-                    .map(|name| (name.to_owned(), value))
+                    .map(|name| (input.clone(), name.to_owned()))
             })
-            .collect())
+            .collect::<BTreeMap<_, _>>();
+        if expected.is_empty() {
+            return Err(training("compiled Metal parameter inventory is empty"));
+        }
+        let requested = expected
+            .keys()
+            .map(|name| state_inputs[name.as_str()].desc.id)
+            .collect::<BTreeSet<_>>();
+        if requested.len() != expected.len() {
+            return Err(training("compiled Metal parameter state identities repeat"));
+        }
+        let snapshots = self
+            .session
+            .state_snapshot_subset(&requested)
+            .map_err(metal_training_error)?;
+        if snapshots.len() != expected.len() || snapshots.keys().ne(expected.keys()) {
+            return Err(training(
+                "compiled Metal parameter snapshot inventory mismatch",
+            ));
+        }
+        snapshots
+            .into_iter()
+            .map(|(input, value)| {
+                let name = expected
+                    .get(&input)
+                    .cloned()
+                    .ok_or_else(|| training("compiled Metal parameter snapshot is unknown"))?;
+                Ok((name, value))
+            })
+            .collect()
     }
 
     pub fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
@@ -5353,6 +5407,22 @@ mod tests {
         assert_eq!(first.step(), 1);
         assert_eq!(compiled.optimizer_step().unwrap(), 1);
         assert_eq!(compiled.parameter_versions().unwrap()["shared"], 1);
+
+        let runtime_checkpoint = compiled.checkpoint().unwrap();
+        let runtime_progress = (compiled.step_count(), compiled.optimizer_step().unwrap());
+        let published = compiled.parameter_snapshots().unwrap();
+        let host_version = module.shared.version().unwrap();
+        let frozen = module.frozen.snapshot().unwrap();
+        assert!(compiled.publish_parameters(&module).unwrap().is_clean());
+        assert_eq!(module.shared.value().unwrap(), published["shared"]);
+        assert_eq!(module.shared.version().unwrap(), host_version + 1);
+        assert_eq!(module.frozen.snapshot().unwrap().data, frozen.data);
+        assert_eq!(module.frozen.version().unwrap(), frozen.version);
+        assert_eq!(compiled.checkpoint().unwrap(), runtime_checkpoint);
+        assert_eq!(
+            (compiled.step_count(), compiled.optimizer_step().unwrap()),
+            runtime_progress
+        );
 
         let checkpoint = compiled.checkpoint().unwrap();
         let resumed_module = TiedFrozenModule::new([1.0, -1.0]);

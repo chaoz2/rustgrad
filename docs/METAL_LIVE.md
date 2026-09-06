@@ -4,8 +4,9 @@ RustGrad's live Metal workflow is a manual conformance lane, not part of normal
 CI. The workflow definition, ignored acceptance test, and examples are not
 live-hardware evidence by themselves. Evidence exists only after an exact-SHA
 workflow run succeeds and publishes the Linear/ResNet scoreboards, normalized
-ResNet observation v1, device-greedy Llama execution scoreboard v2, normalized
-Llama observation v1, attestation, and checksum manifest.
+ResNet observation v1, compiled-Transformer training evidence, device-greedy
+Llama execution scoreboard v2, normalized Llama observation v1, attestation,
+and checksum manifest.
 
 ## Provisioning contract
 
@@ -111,6 +112,19 @@ advances between preflight and dispatch, the expected-SHA check fails instead
 of silently testing the newer revision.
 
 ## Evidence boundary
+
+A successful compiled-Transformer job trains through step eight, resumes the
+same Metal capture exactly from step four, and explicitly publishes the final
+resumed trainable frontier into the fresh reconstruction module. It checks 19
+canonical tensors totaling 256 logical bytes, tied-head canonicalization,
+one host-version advance per unique parameter, and unchanged runtime
+progress/checkpoint state. The current public Metal scoreboard observes
+training invocations but does not meter standalone state-snapshot reads, so the
+live artifact records the 19-tensor/256-byte logical payload and leaves native
+read count null rather than claiming 19 measured driver reads. The semantic
+mock separately proves one read per nonempty requested parameter, no read for a
+zero-byte parameter, no non-parameter state reads, and retry after a partial
+read failure.
 
 A successful Linear/ResNet job uploads two v8 scoreboards plus the normalized
 ResNet `BenchmarkObservation` v1. A successful Llama job uploads its

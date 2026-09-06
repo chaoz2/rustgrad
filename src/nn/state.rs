@@ -14,6 +14,7 @@ use std::{
     path::Path,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateKind {
     Parameter,
     Buffer,
@@ -491,6 +492,99 @@ pub trait Module {
     /// parameter update is permitted.
     fn load_state_dict_strict(&self, state: &StateDict) -> Result<LoadReport> {
         self.load_state_dict(state, true, CastPolicy::Exact)
+    }
+
+    /// Atomically replaces the complete canonical trainable-parameter set.
+    ///
+    /// Tied handles are named once at their first traversal position. Frozen
+    /// parameters and buffers are outside this boundary and remain unchanged.
+    /// Shapes and dtypes must match exactly; this method performs no casts,
+    /// singleton reshaping, or partial load. Each successful call advances each
+    /// unique target's host version exactly once, even when its bytes are equal.
+    fn load_trainable_parameters_exact(
+        &self,
+        parameters: &BTreeMap<String, TensorData>,
+    ) -> Result<LoadReport> {
+        let mut entries = BTreeMap::<String, (Parameter, ParameterSnapshot)>::new();
+        let mut identities = BTreeMap::<ParameterId, (StateKind, bool)>::new();
+        let mut names = BTreeSet::new();
+        let mut error = None;
+        self.visit("", &mut |name, parameter, kind| {
+            if error.is_some() {
+                return;
+            }
+            if !names.insert(name.clone()) {
+                error = Some(Error::Serialization {
+                    reason: format!("module traversal contains duplicate state key {name:?}"),
+                });
+                return;
+            }
+            let snapshot = match parameter.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    error = Some(err);
+                    return;
+                }
+            };
+            let effective_trainable = snapshot.trainable && matches!(kind, StateKind::Parameter);
+            if let Some((first_kind, first_trainable)) = identities.get(&snapshot.identity) {
+                if *first_kind != kind || *first_trainable != effective_trainable {
+                    error = Some(Error::Serialization {
+                        reason: "tied module state has inconsistent kind or trainability".into(),
+                    });
+                }
+                return;
+            }
+            identities.insert(snapshot.identity, (kind, effective_trainable));
+            if effective_trainable {
+                entries.insert(name, (parameter.clone(), snapshot));
+            }
+        });
+        if let Some(err) = error {
+            return Err(err);
+        }
+
+        let mut report = LoadReport::default();
+        let mut restores = Vec::with_capacity(entries.len());
+        for (name, (parameter, snapshot)) in &entries {
+            let Some(value) = parameters.get(name) else {
+                report.missing_keys.push(name.clone());
+                continue;
+            };
+            if value.shape() != &snapshot.shape {
+                report.shape_mismatches.push(name.clone());
+                continue;
+            }
+            if value.dtype() != snapshot.dtype {
+                report.dtype_mismatches.push(name.clone());
+                continue;
+            }
+            restores.push(ParameterRestore {
+                parameter: parameter.clone(),
+                data: value.clone(),
+                expected_version: snapshot.version,
+                restored_version: next_version(snapshot.version)?,
+            });
+            report.loaded_keys.push(name.clone());
+        }
+        report.unexpected_keys = parameters
+            .keys()
+            .filter(|name| !entries.contains_key(*name))
+            .cloned()
+            .collect();
+        if !report.is_clean() {
+            return Err(Error::Serialization {
+                reason: format!(
+                    "trainable parameter mismatch: missing={:?}, unexpected={:?}, shape={:?}, dtype={:?}",
+                    report.missing_keys,
+                    report.unexpected_keys,
+                    report.shape_mismatches,
+                    report.dtype_mismatches
+                ),
+            });
+        }
+        restore_parameters(restores)?;
+        Ok(report)
     }
 
     /// Decodes and strictly loads a bounded safetensors byte stream.

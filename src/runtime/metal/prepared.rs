@@ -718,6 +718,15 @@ impl InitializedMetalPrefix {
         self.inner.snapshot_state(alternate_state_bank)
     }
 
+    pub(super) fn snapshot_state_subset(
+        &self,
+        alternate_state_bank: bool,
+        requested: &BTreeSet<u64>,
+    ) -> Result<BTreeMap<u64, TensorData>, MetalError> {
+        self.inner
+            .snapshot_state_subset(alternate_state_bank, requested)
+    }
+
     pub(super) fn replace_state(
         &self,
         alternate_state_bank: bool,

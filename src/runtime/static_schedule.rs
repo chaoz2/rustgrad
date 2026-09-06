@@ -4058,33 +4058,106 @@ impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
         &self,
         alternate_state_bank: bool,
     ) -> Result<BTreeMap<u64, TensorData>, A::Error> {
-        let mut values = BTreeMap::new();
+        let requested = self
+            .prepared
+            .state_links
+            .iter()
+            .map(|link| link.input)
+            .collect();
+        self.snapshot_state_subset(alternate_state_bank, &requested)
+    }
+
+    /// Downloads an exact subset of the active fixed-state bank. Every logical
+    /// id, descriptor, buffer, and required queue is validated before the first
+    /// device read; zero-byte values are reconstructed without a native read.
+    pub(crate) fn snapshot_state_subset(
+        &self,
+        alternate_state_bank: bool,
+        requested: &BTreeSet<u64>,
+    ) -> Result<BTreeMap<u64, TensorData>, A::Error> {
+        let mut state_ids = BTreeSet::new();
         for link in &self.prepared.state_links {
-            let plan =
-                self.prepared.buffer_plans.get(&link.input).ok_or_else(|| {
-                    A::invalid_binding("state snapshot descriptor is absent".into())
-                })?;
-            let mut bytes = vec![0; plan.bytes];
-            if !bytes.is_empty() {
-                let queue =
-                    self.prepared.queue.as_ref().ok_or_else(|| {
-                        A::invalid_binding("state snapshot queue is absent".into())
-                    })?;
-                let buffer = self
-                    .prepared
-                    .buffer_for_epoch(link.input, alternate_state_bank)
-                    .ok_or_else(|| A::invalid_binding("state snapshot buffer is absent".into()))?;
-                self.prepared.adapter.read(queue, buffer, &mut bytes)?;
-            }
-            let value = TensorData::from_le_bytes(plan.source_shape.clone(), plan.dtype, &bytes)
-                .map_err(|_| A::invalid_binding("state snapshot bytes are invalid".into()))?;
-            if values.insert(link.input, value).is_some() {
+            if !state_ids.insert(link.input) {
                 return Err(A::invalid_binding(
                     "state snapshot input identity repeats".into(),
                 ));
             }
         }
-        Ok(values)
+        if !requested.is_subset(&state_ids) {
+            return Err(A::invalid_binding(
+                "state snapshot request is outside the state inventory".into(),
+            ));
+        }
+
+        let mut reads = Vec::with_capacity(requested.len());
+        let mut needs_queue = false;
+        for id in requested {
+            let plan =
+                self.prepared.buffer_plans.get(id).ok_or_else(|| {
+                    A::invalid_binding("state snapshot descriptor is absent".into())
+                })?;
+            let expected_bytes = plan
+                .source_shape
+                .numel()
+                .map_err(|_| A::invalid_binding("state snapshot shape is invalid".into()))?
+                .checked_mul(plan.dtype.itemsize())
+                .ok_or_else(A::overflow)?;
+            if expected_bytes != plan.bytes {
+                return Err(A::invalid_binding(
+                    "state snapshot descriptor byte length mismatch".into(),
+                ));
+            }
+            let buffer = if plan.bytes == 0 {
+                None
+            } else {
+                needs_queue = true;
+                Some(
+                    self.prepared
+                        .buffer_for_epoch(*id, alternate_state_bank)
+                        .ok_or_else(|| {
+                            A::invalid_binding("state snapshot buffer is absent".into())
+                        })?,
+                )
+            };
+            reads.push((
+                *id,
+                plan.source_shape.clone(),
+                plan.dtype,
+                plan.bytes,
+                buffer,
+            ));
+        }
+        let queue = if needs_queue {
+            Some(
+                self.prepared
+                    .queue
+                    .as_ref()
+                    .ok_or_else(|| A::invalid_binding("state snapshot queue is absent".into()))?,
+            )
+        } else {
+            None
+        };
+
+        let mut downloaded = Vec::with_capacity(reads.len());
+        for (id, shape, dtype, byte_len, buffer) in reads {
+            let mut bytes = vec![0; byte_len];
+            if let Some(buffer) = buffer {
+                self.prepared.adapter.read(
+                    queue.expect("nonempty state snapshot has a queue"),
+                    buffer,
+                    &mut bytes,
+                )?;
+            }
+            downloaded.push((id, shape, dtype, bytes));
+        }
+        downloaded
+            .into_iter()
+            .map(|(id, shape, dtype, bytes)| {
+                TensorData::from_le_bytes(shape, dtype, &bytes)
+                    .map(|value| (id, value))
+                    .map_err(|_| A::invalid_binding("state snapshot bytes are invalid".into()))
+            })
+            .collect()
     }
 
     /// Replaces a subset of one fixed-state frontier without exposing a
@@ -5266,6 +5339,105 @@ mod tests {
                 &[],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn selective_state_snapshot_validates_before_reads_and_skips_zero_bytes() {
+        let mut graph = Graph::new();
+        let first = graph.input_dtype("first", [2], DType::F32);
+        let first_delta = graph.input_dtype("first_delta", [2], DType::F32);
+        let first_next = graph.add(first, first_delta).unwrap();
+        let empty = graph.input_dtype("empty", [0], DType::F32);
+        let empty_delta = graph.input_dtype("empty_delta", [0], DType::F32);
+        let empty_next = graph.add(empty, empty_delta).unwrap();
+        let schedule = schedule_many(&graph, &[first_next, empty_next]).unwrap();
+        let capture =
+            crate::CapturedSchedule::capture(&graph, &schedule, &[first_next, empty_next]).unwrap();
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        let adapter = FakeAdapter(calls.clone());
+        let state_links = [
+            StaticStateLink {
+                input: first.index() as u64,
+                output: first_next.index() as u64,
+            },
+            StaticStateLink {
+                input: empty.index() as u64,
+                output: empty_next.index() as u64,
+            },
+        ];
+        let protected = [first_next.index() as u64, empty_next.index() as u64];
+        let plan = StaticSchedulePlan::build_with_output_policy(
+            &adapter,
+            &capture.items,
+            &[],
+            &protected,
+            &state_links,
+            &[],
+        )
+        .unwrap();
+        let prepared = PreparedStaticSchedule::from_plan(adapter, plan).unwrap();
+        let residents = BTreeSet::from([first.index() as u64, empty.index() as u64]);
+        let values = BTreeMap::from([
+            (
+                first.index() as u64,
+                TensorData::new([2], vec![3.0, 4.0]).unwrap(),
+            ),
+            (
+                empty.index() as u64,
+                TensorData::new([0], Vec::<f32>::new()).unwrap(),
+            ),
+        ]);
+        let (initialized, _) = prepared
+            .initialize_resident_with_quantized_skipping(
+                &values,
+                &residents,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        calls.borrow_mut().read = 0;
+
+        assert!(
+            initialized
+                .snapshot_state_subset(false, &BTreeSet::from([u64::MAX]))
+                .is_err()
+        );
+        assert_eq!(calls.borrow().read, 0);
+        assert_eq!(
+            initialized
+                .snapshot_state_subset(false, &BTreeSet::new())
+                .unwrap(),
+            BTreeMap::new()
+        );
+        assert_eq!(calls.borrow().read, 0);
+
+        let snapshots = initialized
+            .snapshot_state_subset(false, &residents)
+            .unwrap();
+        assert_eq!(
+            snapshots[&(first.index() as u64)],
+            values[&(first.index() as u64)]
+        );
+        assert_eq!(
+            snapshots[&(empty.index() as u64)],
+            values[&(empty.index() as u64)]
+        );
+        assert_eq!(calls.borrow().read, 1);
+
+        calls.borrow_mut().fail_read_after = Some(0);
+        assert!(
+            initialized
+                .snapshot_state_subset(false, &residents)
+                .is_err()
+        );
+        assert_eq!(calls.borrow().read, 2);
+        assert_eq!(
+            initialized
+                .snapshot_state_subset(false, &residents)
+                .unwrap(),
+            snapshots
         );
     }
 

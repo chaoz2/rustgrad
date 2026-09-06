@@ -1,14 +1,16 @@
 #[cfg(target_os = "macos")]
+use rustgrad::CompiledTrainingRuntime;
+#[cfg(target_os = "macos")]
 use rustgrad::MetalSessionTarget;
-use rustgrad::nn::{Embedding, LayerNorm, StateKind};
+use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::{MetalCapabilities, MetalRenderer};
 #[cfg(target_os = "macos")]
 use rustgrad::runtime::metal::{MetalDiscovery, MetalRuntime, MetalScoreboardContext};
 use rustgrad::{
-    CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuSessionTarget, DType,
-    Graph, LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Parameter, Reduction, Result,
-    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
+    Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuBackend, CpuSessionTarget,
+    DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Parameter, Reduction,
+    Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
 };
 use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
@@ -22,6 +24,7 @@ struct TinyCausalTransformer {
     tokens: Embedding,
     block: TransformerBlock,
     norm: LayerNorm,
+    frozen_scale: Parameter,
 }
 
 impl TinyCausalTransformer {
@@ -31,6 +34,7 @@ impl TinyCausalTransformer {
             block: TransformerBlock::new_static(EMBEDDING, 1, 4, true, 0.25, seed.wrapping_add(1))?
                 .with_causal_attention(true),
             norm: LayerNorm::new_static([EMBEDDING], 1e-5, true)?,
+            frozen_scale: Parameter::new(TensorData::scalar(1.0), false),
         })
     }
 
@@ -44,10 +48,22 @@ impl TinyCausalTransformer {
         let hidden = self
             .block
             .forward_training_with_dropout(graph, hidden, dropout)?;
+        self.project_logits(graph, hidden)
+    }
+
+    fn forward_eval(&self, graph: &mut Graph, tokens: NodeId) -> Result<NodeId> {
+        let hidden = self.tokens.forward(graph, tokens)?;
+        let hidden = self.block.forward_mode(graph, hidden, Mode::Eval)?.output;
+        self.project_logits(graph, hidden)
+    }
+
+    fn project_logits(&self, graph: &mut Graph, hidden: NodeId) -> Result<NodeId> {
         let hidden = self.norm.forward(graph, hidden)?;
         let tied_weight = self.tokens.weight.bind(graph)?;
         let tied_weight = graph.permute(tied_weight, [1, 0])?;
-        graph.matmul(hidden, tied_weight)
+        let logits = graph.matmul(hidden, tied_weight)?;
+        let frozen_scale = self.frozen_scale.bind(graph)?;
+        graph.mul(logits, frozen_scale)
     }
 }
 
@@ -63,6 +79,11 @@ impl Module for TinyCausalTransformer {
         self.tokens.visit(&child("tokens"), visitor);
         self.block.visit(&child("block"), visitor);
         self.norm.visit(&child("norm"), visitor);
+        visitor(
+            child("frozen_scale"),
+            &self.frozen_scale,
+            StateKind::Parameter,
+        );
         visitor(
             child("lm_head.weight"),
             &self.tokens.weight,
@@ -124,6 +145,15 @@ fn batch() -> BTreeMap<String, TensorData> {
 
 fn learning_rate() -> TensorData {
     TensorData::scalar(0.05)
+}
+
+fn evaluate(model: &TinyCausalTransformer) -> TensorData {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [1, TIME], DType::I32);
+    let logits = model.forward_eval(&mut graph, tokens).unwrap();
+    let mut bindings = model.input_bindings(&graph).unwrap();
+    bindings.insert("tokens".into(), batch().remove("tokens").unwrap());
+    CpuBackend.execute(&graph, logits, &bindings).unwrap()
 }
 
 fn compiled_transformer(model: &TinyCausalTransformer) -> CompiledAdamWPlan {
@@ -207,6 +237,62 @@ where
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
     );
+    let runtime_checkpoint = resumed.checkpoint().unwrap();
+    let runtime_progress = (
+        resumed.step_count(),
+        resumed.optimizer_step().unwrap(),
+        resumed.accumulation_index().unwrap(),
+    );
+    let published = resumed.parameter_snapshots().unwrap();
+    let frozen_before = resumed_model.frozen_scale.snapshot().unwrap();
+    let before_versions = resumed_model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.version().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    assert!(
+        resumed
+            .publish_parameters(&resumed_model)
+            .unwrap()
+            .is_clean()
+    );
+    let live = resumed_model.state_dict().unwrap();
+    for (name, value) in &published {
+        assert_eq!(&live.tensors()[name], value);
+    }
+    assert!(!live.tensors().contains_key("lm_head.weight"));
+    for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
+        assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
+    }
+    let frozen_after = resumed_model.frozen_scale.snapshot().unwrap();
+    assert_eq!(frozen_after.data, frozen_before.data);
+    assert_eq!(frozen_after.version, frozen_before.version);
+    assert_eq!(resumed.checkpoint().unwrap(), runtime_checkpoint);
+    assert_eq!(
+        (
+            resumed.step_count(),
+            resumed.optimizer_step().unwrap(),
+            resumed.accumulation_index().unwrap(),
+        ),
+        runtime_progress
+    );
+    let versions_before_eval = resumed_model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.version().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    let first_eval = evaluate(&resumed_model);
+    let second_eval = evaluate(&resumed_model);
+    assert_eq!(first_eval, second_eval);
+    assert!(
+        (0..first_eval.shape().numel().unwrap())
+            .all(|index| first_eval.scalar_at(index).as_f64().is_finite())
+    );
+    for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
+        assert_eq!(parameter.version().unwrap(), versions_before_eval[&name]);
+    }
     losses
 }
 
@@ -497,6 +583,62 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
     );
+    let runtime_checkpoint = resumed.checkpoint().unwrap();
+    let runtime_progress = (
+        resumed.step_count(),
+        resumed.optimizer_step().unwrap(),
+        resumed.accumulation_index().unwrap(),
+    );
+    let published = resumed.parameter_snapshots().unwrap();
+    let published_bytes = published
+        .values()
+        .map(|value| value.shape().numel().unwrap() * value.dtype().itemsize())
+        .sum::<usize>();
+    assert_eq!(published.len(), 19);
+    assert_eq!(published_bytes, 256);
+    let frozen_before = resumed_model.frozen_scale.snapshot().unwrap();
+    let before_versions = resumed_model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.version().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    assert!(
+        resumed
+            .publish_parameters(&resumed_model)
+            .unwrap()
+            .is_clean()
+    );
+    let live = resumed_model.state_dict().unwrap();
+    for (name, value) in &published {
+        assert_eq!(&live.tensors()[name], value);
+    }
+    assert!(!live.tensors().contains_key("lm_head.weight"));
+    for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
+        assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
+    }
+    let frozen_after = resumed_model.frozen_scale.snapshot().unwrap();
+    assert_eq!(frozen_after.data, frozen_before.data);
+    assert_eq!(frozen_after.version, frozen_before.version);
+    assert_eq!(resumed.checkpoint().unwrap(), runtime_checkpoint);
+    assert_eq!(
+        (
+            resumed.step_count(),
+            resumed.optimizer_step().unwrap(),
+            resumed.accumulation_index().unwrap(),
+        ),
+        runtime_progress
+    );
+    let first_eval = evaluate(&resumed_model);
+    let second_eval = evaluate(&resumed_model);
+    assert_eq!(first_eval, second_eval);
+    assert!(
+        (0..first_eval.shape().numel().unwrap())
+            .all(|index| first_eval.scalar_at(index).as_f64().is_finite())
+    );
+    for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
+        assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
+    }
     let initial_scoreboard = uninterrupted
         .execution_scoreboard_report()
         .unwrap()
@@ -513,7 +655,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert!(resumed.scoreboard_recording_error().is_none());
 
     let evidence = serde_json::json!({
-        "format_version": 1,
+        "format_version": 2,
         "workload": "tiny-causal-transformer-compiled-adamw",
         "implementation_revision": expected_sha,
         "device": {
@@ -534,6 +676,9 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "total_device_invocations": 12,
         "checkpoint_resume_step": 4,
         "checkpoint_resume_exact": true,
+        "published_parameter_count": published.len(),
+        "published_parameter_bytes": published_bytes,
+        "publication_native_read_count": serde_json::Value::Null,
         "initial_loss": losses.first().unwrap(),
         "final_loss": losses.last().unwrap(),
         "kernel_launch_count": kernel_launch_count,
