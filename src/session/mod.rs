@@ -8,6 +8,7 @@ mod classification;
 mod compiled_training;
 mod cpu;
 mod inference;
+mod target;
 mod train;
 
 pub use classification::{
@@ -33,6 +34,7 @@ pub use inference::{
     ReportedNativeModuleInferenceResult, infer_module_cpu, infer_module_native_cpu,
     infer_module_native_cpu_with_report,
 };
+pub use target::{CompiledSessionTarget, CpuSessionTarget, MetalSessionTarget};
 pub use train::{
     CpuBinaryModuleTrainer, CpuModeModuleTrainer, CpuModuleTrainer, ModuleBinaryCrossEntropy,
     ModuleCrossEntropy, ModuleStepResult,

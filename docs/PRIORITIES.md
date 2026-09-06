@@ -102,7 +102,10 @@ erased into a lowest-common-denominator result.
 `CompiledAdamWPlan` now makes compilation and checkpoint restoration themselves
 backend-neutral: callers choose CPU replay or strict Metal rendering only after
 the complete graph, gradient, optimizer, capture, and recurrent frontier have
-been authenticated.
+been authenticated. `CompiledSessionTarget<P>` makes that choice polymorphic:
+the CPU and selected-device Metal implementations produce their concrete session
+types without a backend enum, and the Metal target derives renderer capabilities
+from the same retained device used for preparation.
 
 ## Deferred hardware inference queue
 

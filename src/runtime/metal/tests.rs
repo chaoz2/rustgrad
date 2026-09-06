@@ -639,12 +639,12 @@ use crate::{
     Backend, BinaryOp, BufferRole, CapturedAppendStateInference, CapturedInference,
     CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
     CompareOp, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
-    CpuBackend, CpuCompiledAdamW, CpuSession, DType, EffectBatchStep, EffectRuntime, GgmlType,
-    Graph, IndexValue, InferenceAppendStateLink, InferenceStateLink, KernelBindings,
-    KernelBufferDesc, LaneInstruction, MovementKernelKind, MovementValue, NodeId, Operation,
-    QuantizedTensorData, ReduceKind, ResNet, ResNetConfig, ResNetMetalError, ResNetMetalPlan,
-    Scalar, Shape, Slice, Storage, TensorData, TrainingParameterInit, TypedValue, UOp, UType,
-    schedule,
+    CpuBackend, CpuCompiledAdamW, CpuSession, CpuSessionTarget, DType, EffectBatchStep,
+    EffectRuntime, GgmlType, Graph, IndexValue, InferenceAppendStateLink, InferenceStateLink,
+    KernelBindings, KernelBufferDesc, LaneInstruction, MetalSessionTarget, MovementKernelKind,
+    MovementValue, NodeId, Operation, QuantizedTensorData, ReduceKind, ResNet, ResNetConfig,
+    ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
+    TrainingParameterInit, TypedValue, UOp, UType, schedule,
 };
 
 fn packed_ones(kind: GgmlType, rows: usize) -> QuantizedTensorData {
@@ -1205,16 +1205,29 @@ fn run_one_compiled_adamw_step<R: CompiledAdamWRuntime>(
 #[test]
 fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops() {
     let program = compiled_scalar_adamw_plan();
-    let mut cpu = program.prepare_cpu().unwrap();
-    let plan = program
-        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
-        .unwrap();
+    let mut cpu = program.prepare(&CpuSessionTarget::new()).unwrap();
     let mock = Arc::new(MockDispatch::default());
-    let mut metal = plan.prepare(test_device(mock)).unwrap();
+    let context =
+        MetalScoreboardContext::new("compiled-target", "test-revision", "semantic mock").unwrap();
+    let target = MetalSessionTarget::new(test_device(mock), 8)
+        .unwrap()
+        .with_scoreboard(context.clone());
+    assert_eq!(target.device().info().capabilities, capabilities());
+    let _renderer = target.renderer();
+    assert_eq!(target.scoreboard_context(), Some(&context));
+    let mut metal = program.prepare(&target).unwrap();
 
     let expected = run_one_compiled_adamw_step(&mut cpu);
     let actual = run_one_compiled_adamw_step(&mut metal);
     assert_eq!(actual, expected);
+    assert_eq!(
+        metal
+            .execution_scoreboard_report()
+            .unwrap()
+            .unwrap()
+            .successful_run_count,
+        1
+    );
 }
 
 #[test]

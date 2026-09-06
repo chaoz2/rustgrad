@@ -944,9 +944,15 @@ keeps its original constructors as compatibility delegates through this plan.
 contract implemented by both prepared sessions: one generic training loop
 observes the same capture identity, recurrent optimizer policy, step progress,
 snapshots, and checkpoint, while concrete runtimes retain their backend-specific
-diagnostics. This keeps backend selection out of graph construction, optimizer,
-and persistence logic without introducing a dispatcher enum or hiding device
-evidence. Mixed-precision and dynamic-shape training remain outside the contract.
+diagnostics. `CompiledSessionTarget<P>` is the preparation seam: implementations
+select the associated concrete session without a central backend switch.
+`CpuSessionTarget` prepares independent host runtimes, while
+`MetalSessionTarget` owns one explicitly selected device, derives its renderer
+from that device's capabilities, and optionally binds the existing scoreboard
+before resources are created. This keeps backend selection out of graph
+construction, optimizer, and persistence logic without introducing a dispatcher
+enum or hiding device evidence. Mixed-precision and dynamic-shape training remain
+outside the contract.
 `CompiledAdamWCheckpoint` is the narrow portable restore
 boundary: deterministic safetensors bytes retain ordered parameter/moment
 values, step, and capture identity, while `EffectRuntime` and
