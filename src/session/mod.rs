@@ -30,13 +30,15 @@ pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,
     MetalSessionTrace, SessionDevice, Tensor,
 };
-pub(crate) use inference::CapturedHostGather;
 pub use inference::{
     CapturedAppendStateInference, CapturedInference, CapturedInferenceError,
     CapturedStatefulInference, InferenceAppendStateLink, InferenceStateLink, ModuleInferenceResult,
     NativeModuleExecutionReport, NativeModuleInferenceResult, NativeModuleInferenceTrace,
     ReportedNativeModuleInferenceResult, infer_module_cpu, infer_module_native_cpu,
     infer_module_native_cpu_with_report,
+};
+pub(crate) use inference::{
+    CapturedHostGather, CapturedHostIndexedMovement, CapturedHostIndexedMovementKind,
 };
 pub use target::{CpuSessionTarget, MetalSessionTarget, SessionTarget};
 pub use train::{

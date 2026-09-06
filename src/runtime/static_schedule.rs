@@ -1667,6 +1667,7 @@ pub(crate) struct StaticSchedulePlan<R> {
     state_links: Vec<StaticStateLink>,
     append_state_links: Vec<StaticAppendStateLink>,
     host_gathers: Vec<StaticHostGather>,
+    host_indexed_movements: Vec<StaticHostIndexedMovement>,
     allocations: StaticAllocationPlan,
 }
 
@@ -1692,6 +1693,39 @@ impl StaticHostGather {
     }
 }
 
+/// Exact raw indexed movement kind admitted only after its complete host-index
+/// lineage has been reauthenticated from the captured schedule.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum StaticHostIndexedMovementKind {
+    Gather,
+    ScatterAdd,
+}
+
+/// Runtime-only proof for one member of a host-token-driven embedding
+/// Gather/ScatterAdd pair. Both members retain the same physical host source,
+/// materialized index, axis, and index domain.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct StaticHostIndexedMovement {
+    pub(crate) input: u64,
+    pub(crate) input_desc: BufferDesc,
+    pub(crate) index: u64,
+    pub(crate) output: u64,
+    pub(crate) axis: usize,
+    pub(crate) axis_extent: usize,
+    pub(crate) index_elements: usize,
+    pub(crate) kind: StaticHostIndexedMovementKind,
+    pub(crate) provenance: crate::ir::GatherVjpProvenance,
+}
+
+impl StaticHostIndexedMovement {
+    pub(crate) fn input_elements(&self) -> Result<usize, String> {
+        self.input_desc
+            .shape
+            .numel()
+            .map_err(|error| error.to_string())
+    }
+}
+
 fn authenticate_host_index_producer(
     index_item: &ScheduleItem,
     input: u64,
@@ -1699,6 +1733,7 @@ fn authenticate_host_index_producer(
     index: u64,
     index_shape: &Shape,
     consumers: &[&ScheduleItem],
+    allow_flattened_batch_one: bool,
 ) -> Result<(), String> {
     index_item
         .kernel
@@ -1819,6 +1854,15 @@ fn authenticate_host_index_producer(
         && !normalized.axes[1].reversed
         && normalized.axes[2].stride == 0
         && !normalized.axes[2].reversed;
+    let canonical_flattened_fixed_axes = input_elements > 1
+        && input_desc.shape.dims() == [1, input_elements]
+        && index_shape.rank() == 2
+        && index_shape.dims()[0] == input_elements
+        && normalized.axes.len() == 2
+        && normalized.axes[0].stride == 1
+        && !normalized.axes[0].reversed
+        && normalized.axes[1].stride == 0
+        && !normalized.axes[1].reversed;
     let canonical_scalar_axes = input_elements == 1
         && normalized
             .axes
@@ -1876,7 +1920,9 @@ fn authenticate_host_index_producer(
             .iter()
             .any(|item| !item.dependencies.contains(&index_item.id))
         || normalized.offset != 0
-        || !(canonical_scalar_axes || canonical_fixed_axes)
+        || !(canonical_scalar_axes
+            || canonical_fixed_axes
+            || allow_flattened_batch_one && canonical_flattened_fixed_axes)
     {
         return Err("host Gather index affine provenance is inconsistent".into());
     }
@@ -1958,6 +2004,178 @@ pub(crate) fn authenticate_host_gather_lineage(
         link.index,
         &index_output.shape,
         &[gather_item],
+        false,
+    )
+}
+
+/// Reauthenticates the exact pair of raw embedding movements driven by one
+/// flattened-and-expanded host I32 token input. The forward Gather and its
+/// additive VJP Scatter must be the complete consumer set of one materialized
+/// index; no arbitrary indexed movement is made status-free by this proof.
+pub(crate) fn authenticate_host_indexed_movement_lineage(
+    items: &[ScheduleItem],
+    links: &[StaticHostIndexedMovement],
+) -> Result<(), String> {
+    let [first, second] = links else {
+        return Err(
+            "host indexed movement policy must contain one Gather and one ScatterAdd".into(),
+        );
+    };
+    if first.input != second.input
+        || first.input_desc != second.input_desc
+        || first.index != second.index
+        || first.axis != second.axis
+        || first.axis_extent != second.axis_extent
+        || first.index_elements != second.index_elements
+        || first.provenance != second.provenance
+        || !matches!(
+            (first.kind, second.kind),
+            (
+                StaticHostIndexedMovementKind::Gather,
+                StaticHostIndexedMovementKind::ScatterAdd
+            ) | (
+                StaticHostIndexedMovementKind::ScatterAdd,
+                StaticHostIndexedMovementKind::Gather
+            )
+        )
+    {
+        return Err("host indexed movement pair is inconsistent".into());
+    }
+
+    let mut owners = Vec::with_capacity(links.len());
+    for link in links {
+        let matching = items
+            .iter()
+            .filter(|item| item.outputs.iter().any(|output| output.id == link.output))
+            .collect::<Vec<_>>();
+        let [owner] = matching.as_slice() else {
+            return Err("host indexed movement output must have one captured owner".into());
+        };
+        let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = owner.kernel.operation()
+        else {
+            return Err("host indexed movement owner is not a movement plan".into());
+        };
+        let portable = crate::movement_plan::PortableIndexedMovement::new(plan)
+            .and_then(|portable| {
+                portable.validate_schedule_bindings(owner.ordered_inputs())?;
+                Ok(portable)
+            })
+            .map_err(|error| error.to_string())?;
+        let (index, axis, kind_matches) = match &plan.kind {
+            crate::MovementKernelKind::Gather { input, index, axis } => (
+                index,
+                axis,
+                link.kind == StaticHostIndexedMovementKind::Gather
+                    && plan.output == link.provenance.gather
+                    && input.node == link.provenance.data
+                    && input.shape == link.provenance.data_shape
+                    && input.dtype == DType::F32
+                    && plan.output_shape == link.provenance.gather_shape,
+            ),
+            crate::MovementKernelKind::Scatter {
+                base,
+                index,
+                updates,
+                axis,
+                add,
+            } => (
+                index,
+                axis,
+                *add && link.kind == StaticHostIndexedMovementKind::ScatterAdd
+                    && plan.output == link.provenance.scatter_add
+                    && base.node == link.provenance.zero_base
+                    && base.shape == link.provenance.data_shape
+                    && base.dtype == DType::F32
+                    && updates.node == link.provenance.update
+                    && updates.shape == link.provenance.gather_shape
+                    && updates.dtype == DType::F32
+                    && plan.output_shape == link.provenance.data_shape,
+            ),
+            _ => return Err("host indexed movement owner kind is unsupported".into()),
+        };
+        let output = owner.outputs.primary();
+        let bytes = plan
+            .output_shape
+            .numel()
+            .map_err(|error| error.to_string())?
+            .checked_mul(plan.dtype.itemsize())
+            .ok_or_else(|| "host indexed movement output byte extent overflow".to_owned())?;
+        if !kind_matches
+            || owner.outputs.len() != 1
+            || owner.node != plan.output
+            || plan.dtype != DType::F32
+            || output.id != plan.output.index() as u64
+            || output.shape != plan.output_shape
+            || output.dtype != plan.dtype
+            || output.bytes != bytes
+            || output.alignment != plan.dtype.itemsize().max(1)
+            || output.view.is_some()
+            || output.read_only
+            || index.node.index() as u64 != link.index
+            || index.node != link.provenance.index
+            || index.shape != link.provenance.index_shape
+            || *axis != link.axis
+            || portable.axis() != link.axis
+            || portable.axis_extent() != link.axis_extent
+            || portable.index_elements() != link.index_elements
+        {
+            return Err("host indexed movement geometry is inconsistent".into());
+        }
+        owners.push(*owner);
+    }
+
+    let index_items = items
+        .iter()
+        .filter(|item| item.outputs.iter().any(|output| output.id == first.index))
+        .collect::<Vec<_>>();
+    let [index_item] = index_items.as_slice() else {
+        return Err("host indexed movement index must have one captured producer".into());
+    };
+    let index_output = index_item.outputs.primary();
+    if index_output.id != first.index || index_output.dtype != DType::I32 {
+        return Err("host indexed movement affine provenance is inconsistent".into());
+    }
+    if first.provenance.gather.index() as u64
+        != links
+            .iter()
+            .find(|link| link.kind == StaticHostIndexedMovementKind::Gather)
+            .expect("checked Gather member")
+            .output
+        || first.provenance.scatter_add.index() as u64
+            != links
+                .iter()
+                .find(|link| link.kind == StaticHostIndexedMovementKind::ScatterAdd)
+                .expect("checked ScatterAdd member")
+                .output
+        || first.provenance.axis != first.axis
+    {
+        return Err("host indexed movement VJP provenance is inconsistent".into());
+    }
+    let owner_by_id = owners
+        .iter()
+        .map(|owner| (owner.id, *owner))
+        .collect::<BTreeMap<_, _>>();
+    let ordered_owners = index_item
+        .consumers
+        .iter()
+        .map(|id| {
+            owner_by_id
+                .get(id)
+                .copied()
+                .ok_or_else(|| "host index has an unauthenticated consumer".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if ordered_owners.len() != links.len() || owner_by_id.len() != links.len() {
+        return Err("host index consumer inventory is inconsistent".into());
+    }
+    authenticate_host_index_producer(
+        index_item,
+        first.input,
+        Some(&first.input_desc),
+        first.index,
+        &index_output.shape,
+        &ordered_owners,
+        true,
     )
 }
 
@@ -2010,6 +2228,7 @@ pub(crate) fn authenticate_append_state_index_lineage(
             first.index,
             &index_output.shape,
             &consumers,
+            false,
         );
     }
     authenticate_append_span_producer(items, index_item, first, &consumers)
@@ -2381,6 +2600,7 @@ struct StaticOutputPolicy<'a> {
     state_links: &'a [StaticStateLink],
     append_state_links: &'a [StaticAppendStateLink],
     host_gathers: &'a [StaticHostGather],
+    host_indexed_movements: &'a [StaticHostIndexedMovement],
 }
 
 /// Pure renderer/planner seam shared by ordinary device execution and CUDA
@@ -2556,6 +2776,7 @@ impl<R> StaticSchedulePlan<R> {
             state_links: &[],
             append_state_links: &[],
             host_gathers: &[],
+            host_indexed_movements: &[],
         });
         Self::build_with_outputs(adapter, items, outputs)
     }
@@ -2567,6 +2788,7 @@ impl<R> StaticSchedulePlan<R> {
         protected_outputs: &[u64],
         state_links: &[StaticStateLink],
         host_gathers: &[StaticHostGather],
+        host_indexed_movements: &[StaticHostIndexedMovement],
     ) -> Result<Self, A::Error>
     where
         A: StaticPlanAdapter<Rendered = R>,
@@ -2580,6 +2802,7 @@ impl<R> StaticSchedulePlan<R> {
                 state_links,
                 append_state_links: &[],
                 host_gathers,
+                host_indexed_movements,
             }),
         )
     }
@@ -2591,6 +2814,7 @@ impl<R> StaticSchedulePlan<R> {
         protected_outputs: &[u64],
         append_state_links: &[StaticAppendStateLink],
         host_gathers: &[StaticHostGather],
+        host_indexed_movements: &[StaticHostIndexedMovement],
     ) -> Result<Self, A::Error>
     where
         A: StaticPlanAdapter<Rendered = R>,
@@ -2604,6 +2828,7 @@ impl<R> StaticSchedulePlan<R> {
                 state_links: &[],
                 append_state_links,
                 host_gathers,
+                host_indexed_movements,
             }),
         )
     }
@@ -2877,36 +3102,50 @@ impl<R> StaticSchedulePlan<R> {
             }
             Ok(ids.to_vec())
         };
-        let (host_outputs, protected_outputs, state_links, append_state_links, host_gathers) =
-            match outputs {
-                Some(policy) => {
-                    let host = validate_outputs(policy.host_outputs, "host")?;
-                    let protected = validate_outputs(policy.protected_outputs, "protected")?;
-                    let protected_set = protected.iter().copied().collect::<BTreeSet<_>>();
-                    if let Some(id) = host.iter().find(|id| !protected_set.contains(id)) {
-                        return Err(A::invalid_binding(format!(
-                            "host logical output {id} is not protected"
-                        )));
-                    }
-                    (
-                        host,
-                        protected,
-                        policy.state_links.to_vec(),
-                        policy.append_state_links.to_vec(),
-                        policy.host_gathers.to_vec(),
-                    )
+        let (
+            host_outputs,
+            protected_outputs,
+            state_links,
+            append_state_links,
+            host_gathers,
+            host_indexed_movements,
+        ) = match outputs {
+            Some(policy) => {
+                let host = validate_outputs(policy.host_outputs, "host")?;
+                let protected = validate_outputs(policy.protected_outputs, "protected")?;
+                let protected_set = protected.iter().copied().collect::<BTreeSet<_>>();
+                if let Some(id) = host.iter().find(|id| !protected_set.contains(id)) {
+                    return Err(A::invalid_binding(format!(
+                        "host logical output {id} is not protected"
+                    )));
                 }
-                // Public prepared-prefix APIs historically materialize every item
-                // output into the caller map. Exact internal consumers pass an
-                // explicit retained set through `prepare_for_outputs` instead.
-                None => {
-                    let all = items
-                        .iter()
-                        .flat_map(|item| item.outputs.iter().map(|output| output.id))
-                        .collect::<Vec<_>>();
-                    (all.clone(), all, Vec::new(), Vec::new(), Vec::new())
-                }
-            };
+                (
+                    host,
+                    protected,
+                    policy.state_links.to_vec(),
+                    policy.append_state_links.to_vec(),
+                    policy.host_gathers.to_vec(),
+                    policy.host_indexed_movements.to_vec(),
+                )
+            }
+            // Public prepared-prefix APIs historically materialize every item
+            // output into the caller map. Exact internal consumers pass an
+            // explicit retained set through `prepare_for_outputs` instead.
+            None => {
+                let all = items
+                    .iter()
+                    .flat_map(|item| item.outputs.iter().map(|output| output.id))
+                    .collect::<Vec<_>>();
+                (
+                    all.clone(),
+                    all,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            }
+        };
         if !items.is_empty() && protected_outputs.is_empty() {
             return Err(A::invalid_binding(
                 "static prefix has no protected output".into(),
@@ -3149,6 +3388,96 @@ impl<R> StaticSchedulePlan<R> {
             }
         }
 
+        let mut indexed_outputs = BTreeSet::new();
+        let mut indexed_groups = BTreeMap::<(u64, u64), Vec<StaticHostIndexedMovement>>::new();
+        for link in &host_indexed_movements {
+            if link.axis_extent == 0 && link.index_elements != 0
+                || !indexed_outputs.insert(link.output)
+                || gather_outputs.contains(&link.output)
+                || link.input == link.index
+                || host_outputs.contains(&link.output)
+                || protected_outputs.contains(&link.output)
+                || state_ids.contains(&link.input)
+                || state_ids.contains(&link.output)
+            {
+                return Err(A::invalid_binding(
+                    "static host indexed movement declaration is inconsistent".into(),
+                ));
+            }
+            let source = buffers.get(&link.input).ok_or_else(|| {
+                A::invalid_binding(format!(
+                    "host indexed movement input {} is absent",
+                    link.input
+                ))
+            })?;
+            let index = buffers.get(&link.index).ok_or_else(|| {
+                A::invalid_binding(format!(
+                    "host indexed movement index {} is absent",
+                    link.index
+                ))
+            })?;
+            let output = buffers.get(&link.output).ok_or_else(|| {
+                A::invalid_binding(format!(
+                    "host indexed movement output {} is absent",
+                    link.output
+                ))
+            })?;
+            let index_producer = index.producer.ok_or_else(|| {
+                A::invalid_binding("host indexed movement index has no physical producer".into())
+            })?;
+            let producer = output.producer.ok_or_else(|| {
+                A::invalid_binding("host indexed movement output has no producer".into())
+            })?;
+            let input_elements = link.input_elements().map_err(A::invalid_binding)?;
+            let input_bytes = input_elements
+                .checked_mul(DType::I32.itemsize())
+                .ok_or_else(A::overflow)?;
+            let slots_are_distinct = index.bytes == 0
+                || match (
+                    allocations.logical_slots.get(&link.input),
+                    allocations.logical_slots.get(&link.index),
+                    allocations.logical_slots.get(&link.output),
+                ) {
+                    (Some(input), Some(index), Some(output)) => input != index && index != output,
+                    _ => false,
+                };
+            if source.producer.is_some()
+                || !external_inputs.contains(&link.input)
+                || source.dtype != DType::I32
+                || source.elements != input_elements
+                || source.bytes != input_bytes
+                || index.dtype != DType::I32
+                || index.elements != link.index_elements
+                || index_producer >= producer
+                || !items[producer]
+                    .dependencies
+                    .contains(&items[index_producer].id)
+                || !planned[producer].input_ids.contains(&link.index)
+                || items[producer].outputs.len() != 1
+                || items[producer].outputs.primary().id != link.output
+                || !slots_are_distinct
+            {
+                return Err(A::invalid_binding(
+                    "static host indexed movement ownership or geometry is invalid".into(),
+                ));
+            }
+            indexed_groups
+                .entry((link.input, link.index))
+                .or_default()
+                .push(link.clone());
+        }
+        let mut indexed_inputs = BTreeSet::new();
+        for ((input, _), mut links) in indexed_groups {
+            if !indexed_inputs.insert(input) {
+                return Err(A::invalid_binding(
+                    "host token input has multiple materialized index groups".into(),
+                ));
+            }
+            links.sort_by_key(|link| link.output);
+            authenticate_host_indexed_movement_lineage(items, &links)
+                .map_err(A::invalid_binding)?;
+        }
+
         Ok(Self {
             items: planned,
             buffers,
@@ -3159,6 +3488,7 @@ impl<R> StaticSchedulePlan<R> {
             state_links,
             append_state_links,
             host_gathers,
+            host_indexed_movements,
             allocations,
         })
     }
@@ -3390,6 +3720,7 @@ pub(crate) struct PreparedStaticSchedule<A: StaticDeviceAdapter> {
     state_links: Vec<StaticStateLink>,
     append_state_links: Vec<StaticAppendStateLink>,
     host_gathers: Vec<StaticHostGather>,
+    host_indexed_movements: Vec<StaticHostIndexedMovement>,
     compiled_cache_keys: Vec<String>,
 }
 
@@ -3533,6 +3864,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             state_links,
             append_state_links,
             host_gathers,
+            host_indexed_movements,
             allocations,
         } = plan;
         if host_outputs
@@ -3626,6 +3958,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             state_links,
             append_state_links,
             host_gathers,
+            host_indexed_movements,
             compiled_cache_keys,
         })
     }
@@ -3743,6 +4076,48 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
             .map_err(|error| match error {
                 CheckedI32IndexError::Descriptor => {
                     A::invalid_binding("host Gather input descriptor mismatch".into())
+                }
+                CheckedI32IndexError::IndexOutOfBounds { position, value } => {
+                    A::index_out_of_bounds(link.axis, position, value, link.axis_extent)
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn validate_host_indexed_movements(
+        &self,
+        values: &BTreeMap<u64, TensorData>,
+    ) -> Result<(), A::Error> {
+        let mut validated = BTreeSet::new();
+        for link in &self.host_indexed_movements {
+            if !validated.insert(link.input) {
+                continue;
+            }
+            let value = values.get(&link.input).ok_or_else(|| {
+                A::invalid_binding(format!("host token input {} is absent", link.input))
+            })?;
+            let input_elements = link.input_elements().map_err(A::invalid_binding)?;
+            let expected_bytes = input_elements
+                .checked_mul(DType::I32.itemsize())
+                .ok_or_else(A::overflow)?;
+            if value.dtype() != DType::I32
+                || value.shape() != &self.buffer_plans[&link.input].source_shape
+                || value.len() != input_elements
+                || self.buffer_plans[&link.input].bytes != expected_bytes
+            {
+                return Err(A::invalid_binding(
+                    "host token input descriptor mismatch".into(),
+                ));
+            }
+            validate_i32_index_domain(
+                value,
+                &self.buffer_plans[&link.input].source_shape,
+                link.axis_extent,
+            )
+            .map_err(|error| match error {
+                CheckedI32IndexError::Descriptor => {
+                    A::invalid_binding("host token input descriptor mismatch".into())
                 }
                 CheckedI32IndexError::IndexOutOfBounds { position, value } => {
                     A::index_out_of_bounds(link.axis, position, value, link.axis_extent)
@@ -3878,6 +4253,7 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
     ) -> Result<StaticExecutionReport, A::Error> {
         // Complete all host validation before the first driver call.
         self.validate_host_gathers(values)?;
+        self.validate_host_indexed_movements(values)?;
         let uploads = self.validated_uploads(values, |id| !resident_ids.contains(&id))?;
         let mut downloads = match host_outputs {
             StaticHostOutputSelection::All => self.host_outputs.as_slice(),
@@ -5319,6 +5695,7 @@ mod tests {
             &[output.index() as u64, next.index() as u64],
             &[link],
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(plan.host_outputs(), &[output.index() as u64]);
@@ -5337,6 +5714,7 @@ mod tests {
                 &[next.index() as u64],
                 &[output.index() as u64, next.index() as u64],
                 &[link],
+                &[],
                 &[],
             )
             .is_err()
@@ -5374,6 +5752,7 @@ mod tests {
             &[],
             &protected,
             &state_links,
+            &[],
             &[],
         )
         .unwrap();

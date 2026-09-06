@@ -16,8 +16,8 @@ use std::{
 
 use crate::runtime::static_schedule::{
     CapturedStaticExecution, PreparedStaticLifetimePlan, StaticAppendStateLink,
-    StaticExecutionReport, StaticHostGather, StaticHostOutputSelection, StaticLifetimePlan,
-    StaticStateLink,
+    StaticExecutionReport, StaticHostGather, StaticHostIndexedMovement,
+    StaticHostIndexedMovementKind, StaticHostOutputSelection, StaticLifetimePlan, StaticStateLink,
 };
 
 pub use crate::runtime::static_schedule::{
@@ -293,6 +293,7 @@ struct MetalCapturePolicy {
     state_links: Vec<StaticStateLink>,
     append_state_links: Vec<StaticAppendStateLink>,
     host_gathers: Vec<StaticHostGather>,
+    host_indexed_movements: Vec<StaticHostIndexedMovement>,
     runtime_controls: Vec<ReplayInput>,
 }
 
@@ -377,6 +378,32 @@ fn static_host_gathers(links: &[crate::session::CapturedHostGather]) -> Vec<Stat
         .collect()
 }
 
+fn static_host_indexed_movements(
+    links: &[crate::session::CapturedHostIndexedMovement],
+) -> Vec<StaticHostIndexedMovement> {
+    links
+        .iter()
+        .map(|link| StaticHostIndexedMovement {
+            input: link.input.desc.id,
+            input_desc: link.input.desc.clone(),
+            index: link.index,
+            output: link.output,
+            axis: link.axis,
+            axis_extent: link.axis_extent,
+            index_elements: link.index_elements,
+            kind: match link.kind {
+                crate::session::CapturedHostIndexedMovementKind::Gather => {
+                    StaticHostIndexedMovementKind::Gather
+                }
+                crate::session::CapturedHostIndexedMovementKind::ScatterAdd => {
+                    StaticHostIndexedMovementKind::ScatterAdd
+                }
+            },
+            provenance: link.provenance.clone(),
+        })
+        .collect()
+}
+
 impl MetalAppendStateInferencePlan {
     pub fn new(
         inference: CapturedAppendStateInference,
@@ -391,7 +418,8 @@ impl MetalAppendStateInferencePlan {
             deployment_identity,
         ) = inference.into_parts();
         let quantized_input_names = inference.quantized_input_names().clone();
-        let (capture, execution_plan, resident_bindings, host_gathers, _) = inference.into_parts();
+        let (capture, execution_plan, resident_bindings, host_gathers, host_indexed_movements, _) =
+            inference.into_parts();
         let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
         let state_names = states
             .iter()
@@ -420,6 +448,7 @@ impl MetalAppendStateInferencePlan {
                 state_links: Vec::new(),
                 append_state_links: append_links,
                 host_gathers: static_host_gathers(&host_gathers),
+                host_indexed_movements: static_host_indexed_movements(&host_indexed_movements),
                 runtime_controls: sealed_position.into_iter().collect(),
             },
             renderer,
@@ -650,7 +679,8 @@ impl MetalStatefulInferencePlan {
     ) -> Result<Self, MetalError> {
         let (inference, public_output_count, states, initial_state, deployment_identity) =
             inference.into_parts();
-        let (capture, execution_plan, resident_bindings, host_gathers, _) = inference.into_parts();
+        let (capture, execution_plan, resident_bindings, host_gathers, host_indexed_movements, _) =
+            inference.into_parts();
         let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
         let state_names = states
             .iter()
@@ -672,6 +702,7 @@ impl MetalStatefulInferencePlan {
                 state_links,
                 append_state_links: Vec::new(),
                 host_gathers: static_host_gathers(&host_gathers),
+                host_indexed_movements: static_host_indexed_movements(&host_indexed_movements),
                 runtime_controls: Vec::new(),
             },
             renderer,
@@ -731,8 +762,14 @@ impl MetalStatefulInferencePlan {
 impl MetalInferencePlan {
     /// Renders an owned inference capture without creating a Metal resource.
     pub fn new(inference: CapturedInference, renderer: MetalRenderer) -> Result<Self, MetalError> {
-        let (capture, execution_plan, resident_bindings, host_gathers, deployment_identity) =
-            inference.into_parts();
+        let (
+            capture,
+            execution_plan,
+            resident_bindings,
+            host_gathers,
+            host_indexed_movements,
+            deployment_identity,
+        ) = inference.into_parts();
         let resident_names = resident_bindings.keys().cloned().collect::<Vec<_>>();
         let inner = MetalDeviceSessionPlan::from_capture_policy(
             capture,
@@ -743,6 +780,7 @@ impl MetalInferencePlan {
                 state_links: Vec::new(),
                 append_state_links: Vec::new(),
                 host_gathers: static_host_gathers(&host_gathers),
+                host_indexed_movements: static_host_indexed_movements(&host_indexed_movements),
                 runtime_controls: Vec::new(),
             },
             renderer,
@@ -832,6 +870,7 @@ impl MetalDeviceSessionPlan {
                 state_links: Vec::new(),
                 append_state_links: Vec::new(),
                 host_gathers: Vec::new(),
+                host_indexed_movements: Vec::new(),
                 runtime_controls: Vec::new(),
             },
             renderer,
@@ -850,6 +889,7 @@ impl MetalDeviceSessionPlan {
             state_links,
             append_state_links,
             host_gathers,
+            host_indexed_movements,
             runtime_controls,
         } = policy;
         let planning_start = Instant::now();
@@ -896,6 +936,14 @@ impl MetalDeviceSessionPlan {
                 "Metal host Gather input is not an exact transient or runtime control".into(),
             ));
         }
+        if host_indexed_movements
+            .iter()
+            .any(|link| !transient_ids.contains(&link.input))
+        {
+            return Err(MetalError::InvalidBinding(
+                "Metal host indexed movement input is not an exact transient".into(),
+            ));
+        }
         if !state_links.is_empty() && !append_state_links.is_empty() {
             return Err(MetalError::InvalidBinding(
                 "Metal session cannot mix epoch and append state".into(),
@@ -908,6 +956,7 @@ impl MetalDeviceSessionPlan {
                 &protected_outputs,
                 &state_links,
                 &host_gathers,
+                &host_indexed_movements,
                 renderer.clone(),
             )?
         } else {
@@ -917,6 +966,7 @@ impl MetalDeviceSessionPlan {
                 &protected_outputs,
                 &append_state_links,
                 &host_gathers,
+                &host_indexed_movements,
                 renderer.clone(),
             )?
         };

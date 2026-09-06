@@ -1299,6 +1299,22 @@ impl Graph {
                     let dtype = self.node(input)?.dtype;
                     let zeros = self.constant(filled(shape, 0.0, dtype)?);
                     let grad = self.scatter_add(zeros, index, upstream, axis)?;
+                    let data_shape = self.shape(input)?.clone();
+                    let index_shape = self.shape(index)?.clone();
+                    let gather_shape = self.shape(node)?.clone();
+                    self.gather_vjp_provenance
+                        .push(crate::ir::GatherVjpProvenance {
+                            gather: node,
+                            data: input,
+                            index,
+                            axis,
+                            zero_base: zeros,
+                            update: upstream,
+                            scatter_add: grad,
+                            data_shape,
+                            index_shape,
+                            gather_shape,
+                        });
                     self.accumulate(&mut grads, input, grad)?;
                 }
                 Op::StaticIndex { input, plan } => {

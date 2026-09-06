@@ -38,7 +38,7 @@ pub(crate) use dynamic::{
     DynamicMeanVjpRule, DynamicNode, DynamicOperation, dynamic_reduction_dtypes,
 };
 pub(crate) use elementwise::{logsigmoid_plan, source_lub, source_weak_scalar_dtype};
-pub(crate) use graph::Node;
+pub(crate) use graph::{GatherVjpProvenance, Node};
 pub use graph::{
     Graph, GraphSequentialTransform, PadMode, ScatterMode, ScatterReduceKind, ScatterSource,
 };

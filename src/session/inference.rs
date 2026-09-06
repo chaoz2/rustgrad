@@ -23,6 +23,8 @@ pub struct CapturedInference {
     quantized_input_names: BTreeMap<u64, String>,
     transient_inputs: Vec<ReplayInput>,
     host_gathers: Vec<CapturedHostGather>,
+    host_indexed_movements: Vec<CapturedHostIndexedMovement>,
+    gather_vjp_provenance: Vec<crate::ir::GatherVjpProvenance>,
     identity: u64,
 }
 
@@ -37,6 +39,45 @@ pub(crate) struct CapturedHostGather {
     pub(crate) axis: usize,
     pub(crate) axis_extent: usize,
     pub(crate) index_elements: usize,
+}
+
+/// One status-free raw movement owner whose complete I32 index materialization
+/// is capture-authenticated back to a fixed host transient.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum CapturedHostIndexedMovementKind {
+    Gather,
+    ScatterAdd,
+}
+
+/// Capture-authenticated permission for the exact embedding Gather/ScatterAdd
+/// pair driven by one host-validated token input. Ordinary indexed movement
+/// remains guarded and is never admitted through this policy.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CapturedHostIndexedMovement {
+    pub(crate) input: ReplayInput,
+    pub(crate) index: u64,
+    pub(crate) output: u64,
+    pub(crate) axis: usize,
+    pub(crate) axis_extent: usize,
+    pub(crate) index_elements: usize,
+    pub(crate) kind: CapturedHostIndexedMovementKind,
+    pub(crate) provenance: crate::ir::GatherVjpProvenance,
+}
+
+fn captured_vjp_zero_is_exact(
+    capture: &CapturedSchedule,
+    provenance: &crate::ir::GatherVjpProvenance,
+) -> bool {
+    capture
+        .constants
+        .get(&(provenance.zero_base.index() as u64))
+        .is_some_and(|zero| {
+            zero.dtype() == DType::F32
+                && zero.shape() == &provenance.data_shape
+                && zero
+                    .to_le_bytes()
+                    .is_ok_and(|bytes| bytes.iter().all(|byte| *byte == 0))
+        })
 }
 
 /// One fixed-shape recurrent value whose produced output becomes the input of
@@ -266,6 +307,22 @@ impl CapturedInference {
         }
         let identity =
             captured_inference_identity(&capture, &resident_bindings, &quantized_input_names)?;
+        let captured_outputs = capture
+            .items
+            .iter()
+            .flat_map(|item| item.outputs.iter().map(|output| output.id))
+            .collect::<BTreeSet<_>>();
+        let mut gather_vjp_provenance = graph
+            .gather_vjp_provenance()
+            .iter()
+            .filter(|provenance| {
+                captured_outputs.contains(&(provenance.gather.index() as u64))
+                    && captured_outputs.contains(&(provenance.scatter_add.index() as u64))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        gather_vjp_provenance
+            .sort_by_key(|provenance| (provenance.gather.index(), provenance.scatter_add.index()));
         Ok(Self {
             capture,
             execution_plan,
@@ -273,6 +330,8 @@ impl CapturedInference {
             quantized_input_names,
             transient_inputs,
             host_gathers: Vec::new(),
+            host_indexed_movements: Vec::new(),
+            gather_vjp_provenance,
             identity,
         })
     }
@@ -432,6 +491,191 @@ impl CapturedInference {
         Ok(self)
     }
 
+    /// Adds a private, capture-derived status-free policy for the exact raw
+    /// embedding Gather and its additive VJP Scatter driven by each named host
+    /// token input. Each input must own one complete value-preserving
+    /// flatten/expand index lineage and exactly those two movement consumers.
+    pub(crate) fn with_authenticated_host_indexed_movements(
+        mut self,
+        declarations: &BTreeMap<String, Shape>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        if declarations.is_empty() {
+            return Ok(self);
+        }
+        if !self.host_indexed_movements.is_empty() {
+            return Err(CapturedInferenceError::Binding(
+                "host indexed movement policy is already authenticated".into(),
+            ));
+        }
+        let mut requested_names = declarations
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let protected = self
+            .capture
+            .requested
+            .iter()
+            .copied()
+            .chain(
+                self.capture
+                    .requested_passthroughs
+                    .iter()
+                    .map(|alias| alias.requested.index() as u64),
+            )
+            .collect::<BTreeSet<_>>();
+        let mut matches = BTreeMap::<String, Vec<Vec<CapturedHostIndexedMovement>>>::new();
+        for captured in self
+            .transient_inputs
+            .iter()
+            .filter(|input| requested_names.contains(input.name.as_str()))
+        {
+            let name = &captured.name;
+            let declared_shape = &declarations[name];
+            let input_elements = captured
+                .desc
+                .shape
+                .numel()
+                .map_err(CapturedInferenceError::State)?;
+            if protected.contains(&(captured.node.index() as u64))
+                || captured.desc.id != captured.node.index() as u64
+                || captured.desc.dtype != DType::I32
+                || captured.desc.shape != *declared_shape
+                || input_elements == 0
+                || captured.desc.shape.dims() != [1, input_elements]
+                || captured.desc.bytes
+                    != input_elements
+                        .checked_mul(DType::I32.itemsize())
+                        .ok_or_else(|| {
+                            CapturedInferenceError::Binding(
+                                "host indexed movement input byte extent overflow".into(),
+                            )
+                        })?
+                || !captured.desc.read_only
+            {
+                return Err(CapturedInferenceError::Binding(format!(
+                    "host indexed movement input {name} must be one dense nonempty batch-one I32 transient"
+                )));
+            }
+
+            let mut groups = BTreeMap::<u64, Vec<CapturedHostIndexedMovement>>::new();
+            for item in &self.capture.items {
+                let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+                    item.kernel.operation()
+                else {
+                    continue;
+                };
+                let (index, axis, kind) = match &plan.kind {
+                    crate::MovementKernelKind::Gather { index, axis, .. } => {
+                        (index, axis, CapturedHostIndexedMovementKind::Gather)
+                    }
+                    crate::MovementKernelKind::Scatter {
+                        index,
+                        axis,
+                        add: true,
+                        ..
+                    } => (index, axis, CapturedHostIndexedMovementKind::ScatterAdd),
+                    _ => continue,
+                };
+                let provenances = self
+                    .gather_vjp_provenance
+                    .iter()
+                    .filter(|provenance| {
+                        provenance.index == index.node
+                            && provenance.axis == *axis
+                            && captured_vjp_zero_is_exact(&self.capture, provenance)
+                            && match kind {
+                                CapturedHostIndexedMovementKind::Gather => {
+                                    provenance.gather == plan.output
+                                }
+                                CapturedHostIndexedMovementKind::ScatterAdd => {
+                                    provenance.scatter_add == plan.output
+                                }
+                            }
+                    })
+                    .collect::<Vec<_>>();
+                let [provenance] = provenances.as_slice() else {
+                    continue;
+                };
+                if item.outputs.len() != 1 || protected.contains(&item.outputs.primary().id) {
+                    continue;
+                }
+                let portable =
+                    crate::movement_plan::PortableIndexedMovement::new(plan).and_then(|portable| {
+                        portable.validate_schedule_bindings(item.ordered_inputs())?;
+                        Ok(portable)
+                    });
+                let Ok(portable) = portable else {
+                    continue;
+                };
+                groups.entry(index.node.index() as u64).or_default().push(
+                    CapturedHostIndexedMovement {
+                        input: captured.clone(),
+                        index: index.node.index() as u64,
+                        output: item.outputs.primary().id,
+                        axis: *axis,
+                        axis_extent: portable.axis_extent(),
+                        index_elements: portable.index_elements(),
+                        kind,
+                        provenance: (*provenance).clone(),
+                    },
+                );
+            }
+            for mut group in groups.into_values() {
+                group.sort_by_key(|link| link.output);
+                let static_links = group
+                    .iter()
+                    .map(|link| crate::runtime::static_schedule::StaticHostIndexedMovement {
+                        input: link.input.desc.id,
+                        input_desc: link.input.desc.clone(),
+                        index: link.index,
+                        output: link.output,
+                        axis: link.axis,
+                        axis_extent: link.axis_extent,
+                        index_elements: link.index_elements,
+                        kind: match link.kind {
+                            CapturedHostIndexedMovementKind::Gather => crate::runtime::static_schedule::StaticHostIndexedMovementKind::Gather,
+                            CapturedHostIndexedMovementKind::ScatterAdd => crate::runtime::static_schedule::StaticHostIndexedMovementKind::ScatterAdd,
+                        },
+                        provenance: link.provenance.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                if crate::runtime::static_schedule::authenticate_host_indexed_movement_lineage(
+                    &self.capture.items,
+                    &static_links,
+                )
+                .is_ok()
+                {
+                    matches.entry(name.clone()).or_default().push(group);
+                }
+            }
+        }
+
+        let mut host_indexed_movements = Vec::new();
+        while let Some(name) = requested_names.pop_first() {
+            let candidates = matches.remove(name).unwrap_or_default();
+            if candidates.len() != 1 {
+                return Err(CapturedInferenceError::Binding(format!(
+                    "host indexed movement input {name} has {} authenticated owner pairs",
+                    candidates.len()
+                )));
+            }
+            host_indexed_movements.extend(
+                candidates
+                    .into_iter()
+                    .next()
+                    .expect("one authenticated owner pair"),
+            );
+        }
+        host_indexed_movements.sort_by_key(|link| link.output);
+        let mut hasher = DefaultHasher::new();
+        "rustgrad-captured-host-indexed-movement-v1".hash(&mut hasher);
+        self.identity.hash(&mut hasher);
+        host_indexed_movements.hash(&mut hasher);
+        self.identity = hasher.finish();
+        self.host_indexed_movements = host_indexed_movements;
+        Ok(self)
+    }
+
     /// Returns the deterministic capture plus resident-payload identity.
     pub const fn deployment_identity(&self) -> u64 {
         self.identity
@@ -472,6 +716,7 @@ impl CapturedInference {
         ExecutionPlanSummary,
         BTreeMap<String, TensorData>,
         Vec<CapturedHostGather>,
+        Vec<CapturedHostIndexedMovement>,
         u64,
     ) {
         (
@@ -479,6 +724,7 @@ impl CapturedInference {
             self.execution_plan,
             self.resident_bindings,
             self.host_gathers,
+            self.host_indexed_movements,
             self.identity,
         )
     }
@@ -640,6 +886,22 @@ impl CapturedStatefulInference {
             &initial_state,
         )?;
         self.initial_state = initial_state;
+        Ok(self)
+    }
+
+    pub(crate) fn with_authenticated_host_indexed_movements(
+        mut self,
+        declarations: &BTreeMap<String, Shape>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        self.inference = self
+            .inference
+            .with_authenticated_host_indexed_movements(declarations)?;
+        self.identity = captured_stateful_identity(
+            self.inference.identity,
+            self.public_output_count,
+            &self.states,
+            &self.initial_state,
+        )?;
         Ok(self)
     }
 

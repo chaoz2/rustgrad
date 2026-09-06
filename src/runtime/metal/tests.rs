@@ -34,7 +34,7 @@ fn captured_scalar_host_gather_is_direct_atomic_and_fail_closed() {
         .unwrap();
     assert_eq!(inference.capture().to_bytes().unwrap(), frozen_capture);
     assert_ne!(inference.deployment_identity(), ordinary_identity);
-    let (_, _, _, scalar_links, _) = inference.clone().into_parts();
+    let (_, _, _, scalar_links, _, _) = inference.clone().into_parts();
     let mut legacy_identity = std::collections::hash_map::DefaultHasher::new();
     "rustgrad-captured-host-gather-v1".hash(&mut legacy_identity);
     ordinary_identity.hash(&mut legacy_identity);
@@ -67,7 +67,7 @@ fn captured_scalar_host_gather_is_direct_atomic_and_fail_closed() {
         Err(MetalError::InvalidBinding(_))
     ));
 
-    let (captured, _, _, links, _) = inference.clone().into_parts();
+    let (captured, _, _, links, _, _) = inference.clone().into_parts();
     let mut forged = crate::runtime::static_schedule::StaticHostGather {
         input: links[0].input.desc.id,
         input_desc: links[0].input.desc.clone(),
@@ -85,6 +85,7 @@ fn captured_scalar_host_gather_is_direct_atomic_and_fail_closed() {
             &[output.index() as u64],
             &[],
             &[forged],
+            &[],
             renderer.clone(),
         ),
         Err(MetalError::InvalidBinding(_))
@@ -1121,6 +1122,291 @@ fn compiled_scalar_adamw_plan_with_accumulation(steps: u64) -> CompiledAdamWPlan
         Ok((loss, BTreeMap::from([("delta".into(), delta)])))
     })
     .unwrap()
+}
+
+fn compiled_host_token_adamw_plan(authenticated: bool) -> CompiledAdamWPlan {
+    let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0).unwrap();
+    let config = if authenticated {
+        config.with_host_token_input("tokens", [1, 3]).unwrap()
+    } else {
+        config.with_input("tokens", [1, 3], DType::I32).unwrap()
+    };
+    let table = TrainingParameterInit::new(
+        "table",
+        TensorData::new([4, 2], vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]).unwrap(),
+    )
+    .unwrap();
+    CompiledAdamWPlan::compile(config, [table], |graph, inputs, parameters| {
+        let token_rows = graph.reshape(inputs["tokens"], [3, 1])?;
+        let indices = graph.expand(token_rows, [3, 2])?;
+        let gathered = graph.gather(parameters["table"], indices, 0)?;
+        Ok((graph.sum_all(gathered)?, BTreeMap::new()))
+    })
+    .unwrap()
+}
+
+fn host_token_batch(values: [i32; 3]) -> BTreeMap<String, TensorData> {
+    BTreeMap::from([(
+        "tokens".into(),
+        TensorData::from_scalars(
+            [1, 3],
+            DType::I32,
+            values.into_iter().map(|value| Scalar::I(i64::from(value))),
+        )
+        .unwrap(),
+    )])
+}
+
+fn host_token_declarations() -> BTreeMap<String, Shape> {
+    BTreeMap::from([("tokens".into(), Shape::new([1, 3]))])
+}
+
+#[test]
+fn host_token_authentication_rejects_compatible_independent_index_pair() {
+    let mut graph = Graph::new();
+    let table = graph.input_dtype("table", [4, 2], DType::F32);
+    let tokens = graph.input_dtype("tokens", [1, 3], DType::I32);
+    let updates = graph.input_dtype("updates", [3, 2], DType::F32);
+    let token_rows = graph.reshape(tokens, [3, 1]).unwrap();
+    let indices = graph.expand(token_rows, [3, 2]).unwrap();
+    let gather = graph.gather(table, indices, 0).unwrap();
+    let zero = graph.constant(TensorData::new([4, 2], vec![0.0; 8]).unwrap());
+    let scatter = graph.scatter_add(zero, indices, updates, 0).unwrap();
+    let gather_sum = graph.sum_all(gather).unwrap();
+    let scatter_sum = graph.sum_all(scatter).unwrap();
+    let output = graph.add(gather_sum, scatter_sum).unwrap();
+    let capture = CapturedInference::from_module_graph(&IdentityModule, &graph, &[output]).unwrap();
+    assert!(
+        capture
+            .with_authenticated_host_indexed_movements(&host_token_declarations())
+            .is_err()
+    );
+}
+
+fn assert_tampered_vjp_rejects_authentication(nonzero_base: bool) {
+    let mut graph = Graph::new();
+    let table = graph.input_dtype_requires_grad("table", [4, 2], DType::F32, true);
+    let tokens = graph.input_dtype("tokens", [1, 3], DType::I32);
+    let unrelated = graph.input_dtype("unrelated", [3, 2], DType::F32);
+    let token_rows = graph.reshape(tokens, [3, 1]).unwrap();
+    let indices = graph.expand(token_rows, [3, 2]).unwrap();
+    let gathered = graph.gather(table, indices, 0).unwrap();
+    let loss = graph.sum_all(gathered).unwrap();
+    let vjp = graph.grad(loss, table).unwrap();
+    let nonzero = graph.constant(TensorData::new([4, 2], vec![1.0; 8]).unwrap());
+    let crate::Op::Scatter { base, updates, .. } = &mut graph.nodes[vjp.index()].op else {
+        panic!("Gather VJP must be an additive Scatter")
+    };
+    if nonzero_base {
+        *base = nonzero;
+    } else {
+        *updates = unrelated;
+    }
+    let vjp_sum = graph.sum_all(vjp).unwrap();
+    let combined = graph.add(loss, vjp_sum).unwrap();
+    let output = graph.sum_all(combined).unwrap();
+    let capture = CapturedInference::from_module_graph(&IdentityModule, &graph, &[output]).unwrap();
+    assert!(
+        capture
+            .with_authenticated_host_indexed_movements(&host_token_declarations())
+            .is_err()
+    );
+}
+
+#[test]
+fn host_token_authentication_rejects_nonzero_scatter_base() {
+    assert_tampered_vjp_rejects_authentication(true);
+}
+
+#[test]
+fn host_token_authentication_rejects_unrelated_scatter_update() {
+    assert_tampered_vjp_rejects_authentication(false);
+}
+
+#[test]
+fn compiled_host_token_indexing_is_status_free_prevalidated_and_retryable() {
+    let unused_config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_host_token_input("tokens", [1, 3])
+        .unwrap();
+    let unused_parameter = TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap();
+    let unused =
+        CompiledAdamWPlan::compile(unused_config, [unused_parameter], |graph, _, parameters| {
+            Ok((graph.square(parameters["weight"])?, BTreeMap::new()))
+        })
+        .unwrap();
+    assert!(
+        unused
+            .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+            .is_err(),
+        "a declared token schema without the exact embedding owner pair must reject"
+    );
+
+    let ordinary = compiled_host_token_adamw_plan(false);
+    let authenticated = compiled_host_token_adamw_plan(true);
+    assert_eq!(
+        ordinary.capture_identity(),
+        authenticated.capture_identity()
+    );
+    let ordinary_checkpoint = ordinary.prepare_cpu().unwrap().checkpoint().unwrap();
+    let authenticated_checkpoint = authenticated.prepare_cpu().unwrap().checkpoint().unwrap();
+    assert_eq!(
+        ordinary_checkpoint.as_bytes(),
+        authenticated_checkpoint.as_bytes()
+    );
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let ordinary_plan = ordinary.metal_plan(renderer.clone()).unwrap();
+    let plan = authenticated.metal_plan(renderer).unwrap();
+    assert_ne!(
+        ordinary_plan.deployment_identity(),
+        plan.deployment_identity()
+    );
+    assert!(
+        ordinary_plan
+            .rendered_items()
+            .filter(|item| item.indexed_movement().is_some())
+            .count()
+            >= 2
+    );
+    let trusted = plan
+        .rendered_items()
+        .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
+        .collect::<Vec<_>>();
+    assert_eq!(trusted.len(), 2);
+    assert!(trusted.iter().all(|item| {
+        item.transaction.is_none()
+            && item.indexed_movement().is_none()
+            && !item.source.contains("rg_status")
+    }));
+    assert!(
+        plan.rendered_items()
+            .all(|item| item.transaction.is_none() && item.indexed_movement().is_none())
+    );
+
+    let mock = Arc::new(MockDispatch::default());
+    let context =
+        MetalScoreboardContext::new("compiled-host-token", "test-revision", "semantic mock")
+            .unwrap();
+    let mut runtime = plan
+        .prepare_with_scoreboard(test_device(mock.clone()), context)
+        .unwrap();
+    mock.clear_calls();
+    for position in 0..3 {
+        for invalid in [-1, 4] {
+            let mut values = [0, 1, 2];
+            values[position] = invalid;
+            let error = match runtime.step(host_token_batch(values), TensorData::scalar(0.01)) {
+                Ok(_) => panic!("invalid host token lane must reject"),
+                Err(error) => error,
+            };
+            let detail = format!("{error:?}");
+            assert!(detail.contains("IndexOutOfBounds"));
+            assert!(detail.contains(&format!("index: {position}")));
+            assert!(detail.contains(&format!("value: {invalid}")));
+            assert!(detail.contains("dim: 4"));
+            assert!(mock.calls().is_empty());
+            assert_eq!(runtime.step_count(), 0);
+            assert!(!runtime.metal_session().state_epoch());
+        }
+    }
+
+    let initial_checkpoint = runtime.checkpoint().unwrap();
+    let initial_scoreboard = runtime.execution_scoreboard_report().unwrap();
+    assert_eq!(
+        initial_scoreboard
+            .as_ref()
+            .expect("scoreboard is bound")
+            .successful_run_count,
+        0
+    );
+
+    for failure in ["write", "launch", "mid-batch", "wait", "read"] {
+        mock.clear_calls();
+        {
+            let mut state = mock.state.lock().unwrap();
+            match failure {
+                "write" => state.failures.write = Some("host token upload"),
+                "launch" => state.failures.launch = Some("host token batch encode"),
+                "mid-batch" => {
+                    state.failures.launch_after = Some((1, "host token mid-batch encode"))
+                }
+                "wait" => state.failures.wait = Some("host token batch wait"),
+                "read" => state.failures.read = Some("host token loss read"),
+                _ => unreachable!(),
+            }
+        }
+        assert!(
+            runtime
+                .step(host_token_batch([0, 1, 2]), TensorData::scalar(0.01))
+                .is_err()
+        );
+        assert_eq!(runtime.step_count(), 0);
+        assert_eq!(runtime.optimizer_step().unwrap(), 0);
+        assert_eq!(runtime.accumulation_index().unwrap(), 0);
+        assert_eq!(runtime.metal_session().successful_run_count(), 0);
+        assert!(!runtime.metal_session().state_epoch());
+        mock.clear_failures();
+        assert_eq!(runtime.checkpoint().unwrap(), initial_checkpoint);
+        assert_eq!(
+            runtime.execution_scoreboard_report().unwrap(),
+            initial_scoreboard
+        );
+    }
+
+    mock.clear_calls();
+    let committed = runtime
+        .step(host_token_batch([1, 1, 1]), TensorData::scalar(0.01))
+        .unwrap();
+    let committed_calls = mock.calls();
+    let reference_plan = compiled_host_token_adamw_plan(true)
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap();
+    let mut reference = reference_plan
+        .prepare(test_device(Arc::new(MockDispatch::default())))
+        .unwrap();
+    let expected = reference
+        .step(host_token_batch([1, 1, 1]), TensorData::scalar(0.01))
+        .unwrap();
+    assert_eq!(committed.loss(), expected.loss());
+    assert_eq!(
+        runtime.checkpoint().unwrap(),
+        reference.checkpoint().unwrap()
+    );
+    assert_eq!(committed.step(), 1);
+    assert_eq!(committed.report().command_submission_count, 1);
+    assert_eq!(committed.report().command_wait_count, 1);
+    assert_eq!(committed.report().retained_d2h_calls, 1);
+    assert!(runtime.metal_session().state_epoch());
+    assert_eq!(
+        runtime
+            .execution_scoreboard_report()
+            .unwrap()
+            .expect("scoreboard is bound")
+            .successful_run_count,
+        1
+    );
+    assert_eq!(
+        committed_calls
+            .iter()
+            .filter(|call| call.starts_with("batch_submit:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        committed_calls
+            .iter()
+            .filter(|call| call.starts_with("wait:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        committed_calls
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1
+    );
+    assert!(committed_calls.iter().all(|call| !call.contains("status")));
 }
 
 fn compiled_decay_exclusion_adamw_plan(exclude_bias: bool) -> CompiledAdamWPlan {

@@ -1009,6 +1009,18 @@ pretend to implement `CompiledTrainingStep`. The report records zero outputs
 and zero retained D2H calls/bytes; ordinary `step` and every generic runtime
 contract remain unchanged. This is periodic-observation plumbing, not an
 asynchronous training API or a throughput claim.
+`CompiledAdamWConfig::with_host_token_input` atomically declares one nonempty
+batch-one I32 transient and opts only that schema into compiled-training index
+authentication. The autograd rule records a private proof binding the exact
+Gather data target to its F32-zero-base first-order ScatterAdd, shared
+index/axis/domain, and update cotangent. Metal planning rederives the
+value-preserving reshape/expand materialization and reauthenticates those facts
+plus the complete two-owner consumer inventory. Both owners
+then use versioned status-free kernels, allowing the otherwise unchanged static
+schedule to submit one command buffer. Every token lane is checked before any
+driver call or epoch/progress/scoreboard mutation. The policy changes Metal
+deployment identity but is neither recurrent state nor checkpoint/capture
+identity; ordinary Gather/Scatter rendering remains status-bearing.
 Metal parameter publication prevalidates the exact fixed-state parameter ID,
 descriptor, active-bank buffer, and queue inventory before its first read, then
 downloads only that subset in one unchanged active epoch. Zero-byte parameters
