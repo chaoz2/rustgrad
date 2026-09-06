@@ -891,6 +891,20 @@ pub struct CpuCompiledMomentumSgd {
     inner: CpuCompiledTrainingProgram,
 }
 
+/// Resource-free compiled AdamW program ready for a concrete runtime.
+///
+/// Compilation owns graph construction, differentiation, scheduling, capture,
+/// recurrent-state admission, and optional checkpoint restoration. Preparing
+/// the plan then chooses CPU replay or strict Metal rendering without changing
+/// the authenticated program or optimizer frontier.
+pub struct CompiledAdamWPlan {
+    inner: CompiledTrainingPlan,
+    program_identity: u64,
+    gradient_accumulation_steps: u64,
+    max_gradient_norm: Option<f32>,
+    loss_scale: f32,
+}
+
 /// One compiled AdamW training program with recurrent first/second moments, a
 /// graph-owned step counter, and capture-authenticated gradient policies.
 pub struct CpuCompiledAdamW {
@@ -900,10 +914,9 @@ pub struct CpuCompiledAdamW {
     loss_scale: f32,
 }
 
-/// Resource-free Metal rendering of the same recurrent program owned by a
-/// [`CpuCompiledAdamW`] session. Preparing it uploads the session's current
-/// parameter, moment, and optimizer-step frontier into the existing
-/// epoch-swapped Metal runtime.
+/// Resource-free Metal rendering of one compiled AdamW plan. Preparing it
+/// uploads the plan's parameter, moment, and optimizer-step frontier into the
+/// existing epoch-swapped Metal runtime.
 pub struct MetalCompiledAdamWPlan {
     inner: MetalStatefulInferencePlan,
     inputs: BTreeMap<String, (Shape, DType)>,
@@ -1044,12 +1057,22 @@ pub trait CompiledAdamWRuntime {
     fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint>;
 }
 
-/// One static CPU momentum-SGD program with runtime-owned recurrent state.
-///
-/// Compilation builds one pure graph and one mixed capture. The graph is then
-/// dropped: every later step is graph-free interpreter replay through the
-/// capture, and [`EffectRuntime`] is the sole owner of parameter/momentum
-/// bytes. This type deliberately has no live-module synchronization surface.
+/// Resource-free output of compiled training graph construction.
+#[derive(Clone)]
+struct CompiledTrainingPlan {
+    capture: CapturedMixedSchedule,
+    recurrent_capture: CapturedStatefulInference,
+    inputs: BTreeMap<String, (Shape, DType)>,
+    output_names: Vec<String>,
+    parameter_buffers: BTreeMap<String, u64>,
+    optimizer_buffers: BTreeMap<String, u64>,
+    state_input_buffers: BTreeMap<String, u64>,
+    state_input_keys: BTreeMap<String, String>,
+    state_values: BTreeMap<String, TensorData>,
+    step: u64,
+}
+
+/// One static CPU training program with runtime-owned recurrent state.
 struct CpuCompiledTrainingProgram {
     capture: CapturedMixedSchedule,
     recurrent_capture: CapturedStatefulInference,
@@ -1064,7 +1087,7 @@ struct CpuCompiledTrainingProgram {
     step: u64,
 }
 
-impl CpuCompiledTrainingProgram {
+impl CompiledTrainingPlan {
     /// Compiles one exact static training program.
     ///
     /// `build` receives the declared external inputs and detached parameter
@@ -1266,29 +1289,135 @@ impl CpuCompiledTrainingProgram {
             CapturedMixedSchedule::from_parts(captured, &mixed, states).map_err(replay_error)?;
         validate_external_binding_ownership(&capture, optimizer.inputs().keys())?;
 
-        // Runtime ownership is published only after every graph, schedule,
-        // effect, capture, and descriptor check above has succeeded.
-        let mut runtime = EffectRuntime::new();
-        runtime
-            .register_initial_states(state_values)
-            .map_err(runtime_error)?;
-        let cursor = capture.initial_recurrent_cursor().map_err(replay_error)?;
         let output_names = outputs.keys().cloned().collect();
         Ok(Self {
             capture,
             recurrent_capture,
-            runtime,
-            cursor,
             inputs: optimizer.inputs().clone(),
             output_names,
             parameter_buffers,
             optimizer_buffers,
             state_input_buffers,
             state_input_keys,
+            state_values: specs
+                .iter()
+                .map(|spec| (spec.key.clone(), spec.value.clone()))
+                .collect(),
             step: 0,
         })
     }
 
+    fn capture_identity(&self) -> Result<u64> {
+        Ok(self
+            .capture
+            .initial_recurrent_cursor()
+            .map_err(replay_error)?
+            .capture_identity())
+    }
+
+    fn recurrent_capture(&self) -> Result<CapturedStatefulInference> {
+        let initial_state = self
+            .state_input_keys
+            .iter()
+            .map(|(input, key)| {
+                let value = self
+                    .state_values
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| training("compiled plan state value is absent"))?;
+                Ok((input.clone(), value))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        self.recurrent_capture
+            .clone()
+            .with_initial_state(initial_state)
+            .map_err(captured_inference_error)
+    }
+
+    fn restore_frontier(mut self, step: u64, values: BTreeMap<String, TensorData>) -> Result<Self> {
+        let expected = self
+            .parameter_buffers
+            .keys()
+            .map(|name| parameter_key(name))
+            .chain(self.optimizer_buffers.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        if values.keys().cloned().collect::<BTreeSet<_>>() != expected {
+            return Err(training("compiled checkpoint state names mismatch"));
+        }
+        for (key, value) in &values {
+            let current = self
+                .state_values
+                .get(key)
+                .ok_or_else(|| training("compiled checkpoint state is absent"))?;
+            if value.shape() != current.shape() || value.dtype() != current.dtype() {
+                return Err(training("compiled checkpoint state descriptor mismatch"));
+            }
+            checked_bytes(value)?;
+        }
+        self.state_values = values;
+        self.step = step;
+        let frontier = self
+            .capture
+            .initial_recurrent_cursor()
+            .map_err(replay_error)?
+            .frontier()
+            .iter()
+            .cloned()
+            .map(|mut state| {
+                state.version = step;
+                state
+            })
+            .collect::<Vec<_>>();
+        MixedReplayCursor::resume(&self.capture, frontier).map_err(replay_error)?;
+        Ok(self)
+    }
+
+    fn prepare_cpu(&self) -> Result<CpuCompiledTrainingProgram> {
+        let initial_states = self
+            .state_input_buffers
+            .iter()
+            .map(|(input, buffer)| {
+                let key = self
+                    .state_input_keys
+                    .get(input)
+                    .ok_or_else(|| training("compiled plan state key is absent"))?;
+                let value = self
+                    .state_values
+                    .get(key)
+                    .cloned()
+                    .ok_or_else(|| training("compiled plan state value is absent"))?;
+                Ok((*buffer, value))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut runtime = EffectRuntime::new();
+        runtime
+            .register_initial_states(initial_states)
+            .map_err(runtime_error)?;
+        let cursor = self
+            .capture
+            .initial_recurrent_cursor()
+            .map_err(replay_error)?;
+        let mut program = CpuCompiledTrainingProgram {
+            capture: self.capture.clone(),
+            recurrent_capture: self.recurrent_capture.clone(),
+            runtime,
+            cursor,
+            inputs: self.inputs.clone(),
+            output_names: self.output_names.clone(),
+            parameter_buffers: self.parameter_buffers.clone(),
+            optimizer_buffers: self.optimizer_buffers.clone(),
+            state_input_buffers: self.state_input_buffers.clone(),
+            state_input_keys: self.state_input_keys.clone(),
+            step: 0,
+        };
+        if self.step != 0 {
+            program.restore_frontier(self.step, &self.state_values)?;
+        }
+        Ok(program)
+    }
+}
+
+impl CpuCompiledTrainingProgram {
     /// Executes one graph-free replay and atomically publishes every recurrent
     /// successor. The learning rate is an explicit rank-zero F32 input.
     fn step(
@@ -1349,11 +1478,15 @@ impl CpuCompiledTrainingProgram {
         self.cursor.capture_identity()
     }
 
-    fn recurrent_capture(&self) -> Result<CapturedStatefulInference> {
-        let initial_state = self
-            .state_input_buffers
+    fn plan(&self) -> Result<CompiledTrainingPlan> {
+        let state_values = self
+            .state_input_keys
             .iter()
-            .map(|(name, buffer)| {
+            .map(|(input, key)| {
+                let buffer = self
+                    .state_input_buffers
+                    .get(input)
+                    .ok_or_else(|| training("compiled runtime state buffer is absent"))?;
                 let state = self.current_state(*buffer)?;
                 let value = self
                     .runtime
@@ -1361,13 +1494,21 @@ impl CpuCompiledTrainingProgram {
                     .map_err(runtime_error)?
                     .tensor()
                     .clone();
-                Ok((name.clone(), value))
+                Ok((key.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        self.recurrent_capture
-            .clone()
-            .with_initial_state(initial_state)
-            .map_err(captured_inference_error)
+        Ok(CompiledTrainingPlan {
+            capture: self.capture.clone(),
+            recurrent_capture: self.recurrent_capture.clone(),
+            inputs: self.inputs.clone(),
+            output_names: self.output_names.clone(),
+            parameter_buffers: self.parameter_buffers.clone(),
+            optimizer_buffers: self.optimizer_buffers.clone(),
+            state_input_buffers: self.state_input_buffers.clone(),
+            state_input_keys: self.state_input_keys.clone(),
+            state_values,
+            step: self.step,
+        })
     }
 
     /// Returns independent owned parameter snapshots in canonical name order.
@@ -1511,12 +1652,9 @@ impl CpuCompiledMomentumSgd {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
+        let plan = CompiledTrainingPlan::compile(MomentumProgram { config }, parameters, build)?;
         Ok(Self {
-            inner: CpuCompiledTrainingProgram::compile(
-                MomentumProgram { config },
-                parameters,
-                build,
-            )?,
+            inner: plan.prepare_cpu()?,
         })
     }
 
@@ -1564,7 +1702,7 @@ impl CpuCompiledMomentumSgd {
     }
 }
 
-impl CpuCompiledAdamW {
+impl CompiledAdamWPlan {
     pub fn compile<F>(
         config: CompiledAdamWConfig,
         parameters: impl IntoIterator<Item = TrainingParameterInit>,
@@ -1580,22 +1718,18 @@ impl CpuCompiledAdamW {
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let max_gradient_norm = config.max_gradient_norm;
         let loss_scale = config.loss_scale;
+        let inner = CompiledTrainingPlan::compile(AdamWProgram { config }, parameters, build)?;
+        let program_identity = inner.capture_identity()?;
         Ok(Self {
-            inner: CpuCompiledTrainingProgram::compile(AdamWProgram { config }, parameters, build)?,
+            inner,
+            program_identity,
             gradient_accumulation_steps,
             max_gradient_norm,
             loss_scale,
         })
     }
 
-    /// Compiles an ordinary module forward against optimizer-owned recurrent
-    /// parameter state.
-    ///
-    /// The builder receives only declared batch inputs: calls to
-    /// [`crate::nn::Parameter::bind`] inside `module` resolve automatically to
-    /// the compiled state frontier. Frozen parameters and buffers are captured
-    /// as immutable constants, while tied parameter handles share one graph
-    /// node and one AdamW state tuple.
+    /// Compiles an ordinary module forward without preparing a runtime.
     pub fn compile_module<M, F>(config: CompiledAdamWConfig, module: &M, build: F) -> Result<Self>
     where
         M: Module + ?Sized,
@@ -1605,16 +1739,15 @@ impl CpuCompiledAdamW {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let plan = ModuleParameterPlan::new(module)?;
-        let parameters = plan.initial_parameters()?;
+        let parameter_plan = ModuleParameterPlan::new(module)?;
+        let parameters = parameter_plan.initial_parameters()?;
         Self::compile(config, parameters, move |graph, inputs, parameters| {
-            plan.lower(graph, parameters, |graph| build(module, graph, inputs))
+            parameter_plan.lower(graph, parameters, |graph| build(module, graph, inputs))
         })
     }
 
-    /// Recompiles an exact program and restores its saved recurrent frontier.
-    /// The build/configuration must reproduce the checkpoint's capture
-    /// identity; all state is validated before the fresh runtime is replaced.
+    /// Recompiles an exact program and restores its portable AdamW frontier
+    /// before any concrete runtime is prepared.
     pub fn compile_from_checkpoint<F>(
         config: CompiledAdamWConfig,
         checkpoint: &CompiledAdamWCheckpoint,
@@ -1638,8 +1771,8 @@ impl CpuCompiledAdamW {
             .iter()
             .map(|(name, value)| TrainingParameterInit::new(name.clone(), value.clone()))
             .collect::<Result<Vec<_>>>()?;
-        let mut compiled = Self::compile(config, parameters, build)?;
-        if compiled.capture_identity() != decoded.capture_identity {
+        let mut plan = Self::compile(config, parameters, build)?;
+        if plan.capture_identity() != decoded.capture_identity {
             return Err(training(
                 "compiled AdamW checkpoint capture identity mismatch",
             ));
@@ -1676,10 +1809,156 @@ impl CpuCompiledAdamW {
                 )?,
             );
         }
-        compiled
-            .inner
-            .restore_frontier(decoded.replay_step, &values)?;
-        Ok(compiled)
+        plan.inner = plan.inner.restore_frontier(decoded.replay_step, values)?;
+        Ok(plan)
+    }
+
+    /// Recompiles a module-bound program and restores its portable frontier
+    /// without creating a CPU or Metal runtime.
+    pub fn compile_module_from_checkpoint<M, F>(
+        config: CompiledAdamWConfig,
+        module: &M,
+        checkpoint: &CompiledAdamWCheckpoint,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let parameter_plan = ModuleParameterPlan::new(module)?;
+        Self::compile_from_checkpoint(config, checkpoint, move |graph, inputs, parameters| {
+            parameter_plan.lower(graph, parameters, |graph| build(module, graph, inputs))
+        })
+    }
+
+    /// Prepares graph-free CPU replay from this plan's exact frontier.
+    pub fn prepare_cpu(&self) -> Result<CpuCompiledAdamW> {
+        Ok(CpuCompiledAdamW {
+            inner: self.inner.prepare_cpu()?,
+            gradient_accumulation_steps: self.gradient_accumulation_steps,
+            max_gradient_norm: self.max_gradient_norm,
+            loss_scale: self.loss_scale,
+        })
+    }
+
+    /// Renders the compiled program for strict Metal admission without
+    /// creating device resources.
+    pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
+        let recurrent = self.inner.recurrent_capture()?;
+        let inner = MetalStatefulInferencePlan::new(recurrent.clone(), renderer.clone()).map_err(
+            |error| {
+                let detail = if matches!(&error, MetalError::Unsupported(_)) {
+                    recurrent
+                        .capture()
+                        .items
+                        .iter()
+                        .find_map(|item| {
+                            renderer.render(&item.kernel).err().map(|item_error| {
+                                format!(
+                                    " at schedule item {} (node {}, {:?}): {item_error}",
+                                    item.id,
+                                    item.node.index(),
+                                    item.kernel.operation()
+                                )
+                            })
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                training(format!("compiled Metal runtime: {error:?}{detail}"))
+            },
+        )?;
+        Ok(MetalCompiledAdamWPlan {
+            inner,
+            inputs: self.inner.inputs.clone(),
+            output_names: self.inner.output_names.clone(),
+            state_input_keys: self.inner.state_input_keys.clone(),
+            program_identity: self.program_identity,
+            step: self.inner.step,
+            gradient_accumulation_steps: self.gradient_accumulation_steps,
+            max_gradient_norm: self.max_gradient_norm,
+            loss_scale: self.loss_scale,
+        })
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.program_identity
+    }
+
+    pub fn step_count(&self) -> u64 {
+        self.inner.step
+    }
+
+    pub fn gradient_accumulation_steps(&self) -> u64 {
+        self.gradient_accumulation_steps
+    }
+
+    pub fn max_gradient_norm(&self) -> Option<f32> {
+        self.max_gradient_norm
+    }
+
+    pub fn loss_scale(&self) -> f32 {
+        self.loss_scale
+    }
+}
+
+impl CpuCompiledAdamW {
+    pub fn compile<F>(
+        config: CompiledAdamWConfig,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        build: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        CompiledAdamWPlan::compile(config, parameters, build)?.prepare_cpu()
+    }
+
+    /// Compiles an ordinary module forward against optimizer-owned recurrent
+    /// parameter state.
+    ///
+    /// The builder receives only declared batch inputs: calls to
+    /// [`crate::nn::Parameter::bind`] inside `module` resolve automatically to
+    /// the compiled state frontier. Frozen parameters and buffers are captured
+    /// as immutable constants, while tied parameter handles share one graph
+    /// node and one AdamW state tuple.
+    pub fn compile_module<M, F>(config: CompiledAdamWConfig, module: &M, build: F) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        CompiledAdamWPlan::compile_module(config, module, build)?.prepare_cpu()
+    }
+
+    /// Recompiles an exact program and restores its saved recurrent frontier.
+    /// The build/configuration must reproduce the checkpoint's capture
+    /// identity; all state is validated before the fresh runtime is replaced.
+    pub fn compile_from_checkpoint<F>(
+        config: CompiledAdamWConfig,
+        checkpoint: &CompiledAdamWCheckpoint,
+        build: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        CompiledAdamWPlan::compile_from_checkpoint(config, checkpoint, build)?.prepare_cpu()
     }
 
     /// Recompiles a module-bound program and restores its exact AdamW state.
@@ -1700,10 +1979,8 @@ impl CpuCompiledAdamW {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let plan = ModuleParameterPlan::new(module)?;
-        Self::compile_from_checkpoint(config, checkpoint, move |graph, inputs, parameters| {
-            plan.lower(graph, parameters, |graph| build(module, graph, inputs))
-        })
+        CompiledAdamWPlan::compile_module_from_checkpoint(config, module, checkpoint, build)?
+            .prepare_cpu()
     }
 
     pub fn step(
@@ -1785,42 +2062,14 @@ impl CpuCompiledAdamW {
     /// from this session's currently committed recurrent state. Planning is
     /// resource-free; unsupported kernels fail before a device is touched.
     pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
-        let recurrent = self.inner.recurrent_capture()?;
-        let inner = MetalStatefulInferencePlan::new(recurrent.clone(), renderer.clone()).map_err(
-            |error| {
-                let detail = if matches!(&error, MetalError::Unsupported(_)) {
-                    recurrent
-                        .capture()
-                        .items
-                        .iter()
-                        .find_map(|item| {
-                            renderer.render(&item.kernel).err().map(|item_error| {
-                                format!(
-                                    " at schedule item {} (node {}, {:?}): {item_error}",
-                                    item.id,
-                                    item.node.index(),
-                                    item.kernel.operation()
-                                )
-                            })
-                        })
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                training(format!("compiled Metal runtime: {error:?}{detail}"))
-            },
-        )?;
-        Ok(MetalCompiledAdamWPlan {
-            inner,
-            inputs: self.inner.inputs.clone(),
-            output_names: self.inner.output_names.clone(),
-            state_input_keys: self.inner.state_input_keys.clone(),
+        CompiledAdamWPlan {
+            inner: self.inner.plan()?,
             program_identity: self.capture_identity(),
-            step: self.step_count(),
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
-        })
+        }
+        .metal_plan(renderer)
     }
 
     /// Captures parameter values, both moment sets, the graph-owned optimizer
@@ -2920,6 +3169,31 @@ mod tests {
 
     fn compiled_adamw() -> CpuCompiledAdamW {
         CpuCompiledAdamW::compile(adamw_config(), initial_parameters(), build_tinybob).unwrap()
+    }
+
+    #[test]
+    fn adamw_plan_prepares_independent_cpu_runtimes() {
+        let plan = CompiledAdamWPlan::compile(adamw_config(), initial_parameters(), build_tinybob)
+            .unwrap();
+        let identity = plan.capture_identity();
+        assert_eq!(plan.step_count(), 0);
+
+        let mut first = plan.prepare_cpu().unwrap();
+        let second = plan.prepare_cpu().unwrap();
+        assert_eq!(first.capture_identity(), identity);
+        assert_eq!(second.capture_identity(), identity);
+        assert_eq!(
+            first.parameter_snapshots().unwrap(),
+            second.parameter_snapshots().unwrap()
+        );
+
+        first.step(batch(), lr()).unwrap();
+        assert_eq!(first.step_count(), 1);
+        assert_eq!(second.step_count(), 0);
+        assert_ne!(
+            first.parameter_snapshots().unwrap(),
+            second.parameter_snapshots().unwrap()
+        );
     }
 
     fn build_two_parameter_linear_loss(

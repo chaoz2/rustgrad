@@ -99,6 +99,10 @@ before the first step rather than introducing a parallel training API.
 one generic public training-loop contract. Backend-specific reports and
 scoreboards remain available on the concrete Metal types rather than being
 erased into a lowest-common-denominator result.
+`CompiledAdamWPlan` now makes compilation and checkpoint restoration themselves
+backend-neutral: callers choose CPU replay or strict Metal rendering only after
+the complete graph, gradient, optimizer, capture, and recurrent frontier have
+been authenticated.
 
 ## Deferred hardware inference queue
 

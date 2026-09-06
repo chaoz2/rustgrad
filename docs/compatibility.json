@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:6e91fa64aaa57afe",
+  "source_fingerprint": "fnv1a64:9518ee160aef0afa",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -415,6 +415,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "Smooth unary/binary expressions, broadcasting, ordinary movement, sum/mean/product/max/min, gather/scatter-add, select value branches, generalized matmul/einsum, convolution, transpose convolution, compositional pooling, and fixed-size masked-select seed routing support graph-on-graph second derivatives. Third-order dedicated contractions/reductions/movement/convolution, broader masked-select differentiation, and replacement scatter remain explicit boundaries."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "Compiled persistent-state training runtime",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Public `CompiledAdamWPlan` compiles graph construction, one batched reverse traversal, AdamW state/update math, mixed scheduling/capture, recurrent-state admission, and optional portable checkpoint restoration before a concrete runtime is chosen. The same immutable plan prepares independent graph-free CPU replay or strict resource-free Metal rendering with one capture identity, optimizer policy, restored step, and initial frontier; Metal preparation no longer depends on first constructing a CPU session. Existing `CpuCompiledAdamW` constructors remain compatibility delegates through the plan. Public `CompiledAdamWRuntime` and `CompiledAdamWStep` let one generic loop drive either prepared runtime while concrete Metal results retain exact device reports and scoreboard access. This does not introduce a backend dispatcher enum, CPU fallback, live-module synchronization, mixed-precision parameter state, dynamic shapes, or a generic optimizer interface."
       }
     },
     {

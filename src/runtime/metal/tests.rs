@@ -638,12 +638,13 @@ use crate::runtime::scalar_lane::emit_scalar_lane;
 use crate::{
     Backend, BinaryOp, BufferRole, CapturedAppendStateInference, CapturedInference,
     CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
-    CompareOp, CompiledAdamWConfig, CompiledAdamWRuntime, CompiledAdamWStep, CpuBackend,
-    CpuCompiledAdamW, CpuSession, DType, EffectBatchStep, EffectRuntime, GgmlType, Graph,
-    IndexValue, InferenceAppendStateLink, InferenceStateLink, KernelBindings, KernelBufferDesc,
-    LaneInstruction, MovementKernelKind, MovementValue, NodeId, Operation, QuantizedTensorData,
-    ReduceKind, ResNet, ResNetConfig, ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice,
-    Storage, TensorData, TrainingParameterInit, TypedValue, UOp, UType, schedule,
+    CompareOp, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
+    CpuBackend, CpuCompiledAdamW, CpuSession, DType, EffectBatchStep, EffectRuntime, GgmlType,
+    Graph, IndexValue, InferenceAppendStateLink, InferenceStateLink, KernelBindings,
+    KernelBufferDesc, LaneInstruction, MovementKernelKind, MovementValue, NodeId, Operation,
+    QuantizedTensorData, ReduceKind, ResNet, ResNetConfig, ResNetMetalError, ResNetMetalPlan,
+    Scalar, Shape, Slice, Storage, TensorData, TrainingParameterInit, TypedValue, UOp, UType,
+    schedule,
 };
 
 fn packed_ones(kind: GgmlType, rows: usize) -> QuantizedTensorData {
@@ -1101,11 +1102,11 @@ fn metal_stateful_inference_zero_work_owns_no_native_resources() {
     assert!(mock.calls().is_empty());
 }
 
-fn compiled_scalar_adamw() -> CpuCompiledAdamW {
-    compiled_scalar_adamw_with_accumulation(1)
+fn compiled_scalar_adamw_plan() -> CompiledAdamWPlan {
+    compiled_scalar_adamw_plan_with_accumulation(1)
 }
 
-fn compiled_scalar_adamw_with_accumulation(steps: u64) -> CpuCompiledAdamW {
+fn compiled_scalar_adamw_plan_with_accumulation(steps: u64) -> CompiledAdamWPlan {
     let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
         .unwrap()
         .with_gradient_accumulation(steps)
@@ -1113,12 +1114,18 @@ fn compiled_scalar_adamw_with_accumulation(steps: u64) -> CpuCompiledAdamW {
         .with_input("target", [], DType::F32)
         .unwrap();
     let parameter = TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap();
-    CpuCompiledAdamW::compile(config, [parameter], |graph, inputs, parameters| {
+    CompiledAdamWPlan::compile(config, [parameter], |graph, inputs, parameters| {
         let delta = graph.sub(parameters["weight"], inputs["target"])?;
         let loss = graph.square(delta)?;
         Ok((loss, BTreeMap::from([("delta".into(), delta)])))
     })
     .unwrap()
+}
+
+fn compiled_scalar_adamw_with_accumulation(steps: u64) -> CpuCompiledAdamW {
+    compiled_scalar_adamw_plan_with_accumulation(steps)
+        .prepare_cpu()
+        .unwrap()
 }
 
 fn compiled_vector_adamw_with_gradient_clipping(max_norm: f32) -> CpuCompiledAdamW {
@@ -1197,9 +1204,9 @@ fn run_one_compiled_adamw_step<R: CompiledAdamWRuntime>(
 
 #[test]
 fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops() {
-    let mut cpu = compiled_scalar_adamw();
-    let seed = compiled_scalar_adamw();
-    let plan = seed
+    let program = compiled_scalar_adamw_plan();
+    let mut cpu = program.prepare_cpu().unwrap();
+    let plan = program
         .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
         .unwrap();
     let mock = Arc::new(MockDispatch::default());
@@ -1323,9 +1330,10 @@ fn compiled_adamw_accumulation_uses_the_same_recurrent_capture_on_metal() {
 
 #[test]
 fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_checkpoint() {
-    let mut cpu = compiled_scalar_adamw();
+    let program = compiled_scalar_adamw_plan();
+    let mut cpu = program.prepare_cpu().unwrap();
     let renderer = MetalRenderer::new(8, capabilities()).unwrap();
-    let plan = cpu.metal_plan(renderer).unwrap();
+    let plan = program.metal_plan(renderer.clone()).unwrap();
     assert_eq!(plan.capture_identity(), cpu.capture_identity());
     assert_eq!(plan.step_count(), 0);
     assert_eq!(plan.max_gradient_norm(), None);
@@ -1409,7 +1417,7 @@ fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_check
         .unwrap()
         .with_input("target", [], DType::F32)
         .unwrap();
-    let mut resumed = CpuCompiledAdamW::compile_from_checkpoint(
+    let resumed_program = CompiledAdamWPlan::compile_from_checkpoint(
         config,
         &checkpoint,
         |graph, inputs, parameters| {
@@ -1419,6 +1427,13 @@ fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_check
         },
     )
     .unwrap();
+    assert_eq!(resumed_program.step_count(), 1);
+    assert_eq!(resumed_program.capture_identity(), cpu.capture_identity());
+    assert_eq!(
+        resumed_program.metal_plan(renderer).unwrap().step_count(),
+        1
+    );
+    let mut resumed = resumed_program.prepare_cpu().unwrap();
     assert_eq!(resumed.step_count(), 1);
     assert_eq!(
         resumed.parameter_snapshots().unwrap(),
