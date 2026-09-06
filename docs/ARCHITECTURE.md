@@ -1010,17 +1010,27 @@ and zero retained D2H calls/bytes; ordinary `step` and every generic runtime
 contract remain unchanged. This is periodic-observation plumbing, not an
 asynchronous training API or a throughput claim.
 `CompiledAdamWConfig::with_host_token_input` atomically declares one nonempty
-batch-one I32 transient and opts only that schema into compiled-training index
-authentication. The autograd rule records a private proof binding the exact
+fixed rank-two `[B, T]` I32 transient and opts only that schema into
+compiled-training index authentication. The autograd rule records a private
+proof binding the exact
 Gather data target to its F32-zero-base first-order ScatterAdd, shared
 index/axis/domain, and update cotangent. Metal planning rederives the
-value-preserving reshape/expand materialization and reauthenticates those facts
-plus the complete two-owner consumer inventory. Both owners
+value-preserving `[B, T] -> [B*T, 1] -> [B*T, E]` reshape/expand
+materialization, including checked products and normalized `[1, 0]` strides
+(`[0, 0]` when `B*T == 1` because singleton axes normalize to zero),
+and reauthenticates those facts plus the complete two-owner consumer inventory.
+Both owners
 then use versioned status-free kernels, allowing the otherwise unchanged static
 schedule to submit one command buffer. Every token lane is checked before any
 driver call or epoch/progress/scoreboard mutation. The policy changes Metal
 deployment identity but is neither recurrent state nor checkpoint/capture
-identity; ordinary Gather/Scatter rendering remains status-bearing.
+identity; ordinary Gather/Scatter rendering remains status-bearing. Dynamic
+batch or sequence extents and rank-three minibatch index materializations are
+not admitted.
+When singleton reductions leave a public loss or named output as a terminal
+affine alias, compiled training selectively inserts a concrete owner before
+mixed capture. Already-owned outputs keep their existing topology, and RGSM
+does not gain a passthrough ABI.
 Metal parameter publication prevalidates the exact fixed-state parameter ID,
 descriptor, active-bank buffer, and queue inventory before its first read, then
 downloads only that subset in one unchanged active epoch. Zero-byte parameters

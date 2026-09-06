@@ -540,8 +540,8 @@ impl CapturedInference {
                 || captured.desc.id != captured.node.index() as u64
                 || captured.desc.dtype != DType::I32
                 || captured.desc.shape != *declared_shape
-                || input_elements == 0
-                || captured.desc.shape.dims() != [1, input_elements]
+                || captured.desc.shape.rank() != 2
+                || captured.desc.shape.dims().contains(&0)
                 || captured.desc.bytes
                     != input_elements
                         .checked_mul(DType::I32.itemsize())
@@ -553,7 +553,7 @@ impl CapturedInference {
                 || !captured.desc.read_only
             {
                 return Err(CapturedInferenceError::Binding(format!(
-                    "host indexed movement input {name} must be one dense nonempty batch-one I32 transient"
+                    "host indexed movement input {name} must be one dense nonempty fixed rank-two I32 transient"
                 )));
             }
 

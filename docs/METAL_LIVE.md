@@ -119,7 +119,7 @@ session and four after checkpoint restoration. Four observed invocations
 download only the scalar loss; eight device-only invocations
 commit the complete fixed-state successor with zero outputs and zero retained
 D2H calls or bytes. Every invocation must commit 59 state pairs, 784 logical
-state bytes, and 194 work items. Its declared batch-one I32 token input is
+state bytes, and 194 work items. Its declared fixed `[2,3]` I32 token minibatch is
 capture-authenticated through an autograd-recorded proof binding the exact
 embedding Gather data target to its F32-zero-base first-order ScatterAdd,
 shared flatten/expand index/axis/domain, and update cotangent. Every token
@@ -128,17 +128,20 @@ distinct status-free Metal kernels, while ordinary indexed movement remains
 guarded. With no transactional/indexed owners left, each replay submits and
 waits for exactly one command buffer. The artifact records the two authenticated
 owners, zero guarded indexed owners, planned kernel count, and exactly twelve
-aggregate submissions/waits. It separately requires 336 transient H2D bytes and
+aggregate submissions/waits. The prepared input descriptors prove three
+transient writes totaling 52 bytes per replay, so the artifact separately
+requires 624 transient H2D bytes and
 exactly 4 retained-output D2H calls totaling 16 bytes. Midpoint checkpointing
 and final parameter publication remain explicit host-observation boundaries
 outside these per-step transfer totals.
 
 A successful compiled-Transformer job trains through step eight, resumes the
-same Metal capture exactly from step four, and explicitly publishes the final
-resumed trainable frontier into the fresh reconstruction module. It checks 19
+same Metal capture exactly from step four, and consumes the owned resumed
+session to atomically publish the final trainable frontier and return the fresh
+reconstruction module. It checks 19
 canonical tensors totaling 256 logical bytes, tied-head canonicalization,
-one host-version advance per unique parameter, and unchanged runtime
-progress/checkpoint state. The current public Metal scoreboard observes
+one host-version advance per unique parameter, and exact final checkpoint
+equality before the consuming finish. The current public Metal scoreboard observes
 training invocations but does not meter standalone state-snapshot reads, so the
 live artifact records the 19-tensor/256-byte logical payload and leaves native
 read count null rather than claiming 19 measured driver reads. The semantic

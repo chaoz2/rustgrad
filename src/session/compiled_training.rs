@@ -688,7 +688,7 @@ impl CompiledAdamWConfig {
         Ok(self)
     }
 
-    /// Declares one fixed-shape batch-one I32 token input whose exact
+    /// Declares one nonempty fixed-shape rank-two I32 token batch whose exact
     /// embedding Gather and first-order ScatterAdd VJP may be authenticated
     /// for status-free Metal replay. The input name is declared atomically, so
     /// it collides with [`Self::with_input`] in either call order.
@@ -701,10 +701,9 @@ impl CompiledAdamWConfig {
         validate_user_name(&name, "input")?;
         let shape = shape.into();
         checked_descriptor(&shape, DType::I32)?;
-        let elements = shape.numel()?;
-        if elements == 0 || shape.dims() != [1, elements] {
+        if shape.rank() != 2 || shape.dims().contains(&0) {
             return Err(training(
-                "compiled host token input must be nonempty batch-one I32",
+                "compiled host token input must be nonempty fixed rank-two I32",
             ));
         }
         if self.inputs.contains_key(&name) || self.host_token_inputs.contains_key(&name) {
@@ -1894,6 +1893,31 @@ struct CpuCompiledTrainingProgram {
     step: u64,
 }
 
+/// Gives only terminal public aliases a concrete schedule owner before mixed
+/// capture. RGSM stays owner-only, while ordinary already-materialized losses
+/// and named outputs retain their existing graph and capture identities.
+fn materialize_compiled_public_aliases(
+    graph: &mut Graph,
+    requested: &[NodeId],
+) -> Result<Vec<NodeId>> {
+    let preview = schedule_many(graph, requested).map_err(schedule_error)?;
+    let aliases = preview
+        .requested_passthroughs
+        .iter()
+        .map(|alias| alias.requested)
+        .collect::<BTreeSet<_>>();
+    requested
+        .iter()
+        .map(|node| {
+            if aliases.contains(node) {
+                graph.contiguous(*node)
+            } else {
+                Ok(*node)
+            }
+        })
+        .collect()
+}
+
 impl CompiledTrainingPlan {
     /// Compiles one exact static training program.
     ///
@@ -2067,6 +2091,7 @@ impl CompiledTrainingPlan {
         let public_requested = std::iter::once(loss)
             .chain(outputs.values().copied())
             .collect::<Vec<_>>();
+        let public_requested = materialize_compiled_public_aliases(&mut graph, &public_requested)?;
         let state_links = specs
             .iter()
             .map(|spec| InferenceStateLink::new(state_nodes[&spec.key], updates[&spec.key]))
@@ -5350,7 +5375,7 @@ mod tests {
     fn compiled_adamw_host_token_input_is_atomic_sorted_and_strict() {
         let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
             .unwrap()
-            .with_host_token_input("tokens_b", [1, 3])
+            .with_host_token_input("tokens_b", [2, 3])
             .unwrap()
             .with_host_token_input("tokens_a", [1, 2])
             .unwrap();
@@ -5359,7 +5384,7 @@ mod tests {
                 .host_token_inputs()
                 .map(|(name, shape)| (name, shape.dims()))
                 .collect::<Vec<_>>(),
-            [("tokens_a", &[1, 2][..]), ("tokens_b", &[1, 3][..])]
+            [("tokens_a", &[1, 2][..]), ("tokens_b", &[2, 3][..])]
         );
         assert_eq!(
             config
@@ -5368,7 +5393,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("tokens_a", &[1, 2][..], DType::I32),
-                ("tokens_b", &[1, 3][..], DType::I32),
+                ("tokens_b", &[2, 3][..], DType::I32),
             ]
         );
 
@@ -5387,7 +5412,13 @@ mod tests {
                 .with_input("tokens", [1, 2], DType::I32)
                 .is_err()
         );
-        for shape in [Shape::new([1, 0]), Shape::new([2]), Shape::new([2, 2])] {
+        for shape in [
+            Shape::new([0, 2]),
+            Shape::new([2, 0]),
+            Shape::new([2]),
+            Shape::new([1, 2, 1]),
+            Shape::new([usize::MAX, 2]),
+        ] {
             assert!(base.clone().with_host_token_input("tokens", shape).is_err());
         }
     }
