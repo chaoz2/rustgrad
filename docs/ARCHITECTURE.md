@@ -983,6 +983,15 @@ traversal, global clipping, accumulation, moments, checkpointing, and
 publication; only their decoupled decay multiplication is omitted. An empty
 set follows the historical lowering byte-for-byte, while a nonempty policy is
 part of the captured update topology and therefore checkpoint authentication.
+The maintained owned tiny-Transformer lifecycle cycles three deterministic,
+distinct fixed `[2,3]` microbatches through an accumulation window of three
+with an active finite global norm limit. Two initial microbatches are cancelled
+without rewinding replay or dropout progress, and an empty reset is exact. The
+step-four checkpoint retains accumulation index two at optimizer step zero;
+restoration into a fresh owned module commits at replay five, then matches the
+uninterrupted complete recurrent frontier through the second update at replay
+eight and consuming publication. The same sequence is the CPU acceptance,
+strict-Metal acceptance, maintained example, and protected evidence workload.
 `CompiledAdamWPlan` is the resource-free public compiler result: it owns the
 authenticated mixed capture, admitted recurrent frontier, optimizer policy,
 and optional restored checkpoint state before a runtime is chosen. It prepares

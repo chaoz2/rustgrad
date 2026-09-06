@@ -15,7 +15,7 @@
 use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
-    Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWRuntime,
+    Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWRuntime, CompiledAdamWStep,
     CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledModuleAdamWPlan,
     CompiledModuleAdamWSession, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
     CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NodeId, Parameter, Result, Scalar,
@@ -28,6 +28,8 @@ const EMBEDDING: usize = 2;
 const BATCH: usize = 2;
 const TIME: usize = 3;
 const TOKEN_COUNT: usize = BATCH * TIME;
+const ACCUMULATION_STEPS: u64 = 3;
+const MAX_GRADIENT_NORM: f32 = 0.25;
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -121,12 +123,24 @@ fn config() -> Result<CompiledAdamWConfig> {
     CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)?
         .with_weight_decay_exclusions(WEIGHT_DECAY_EXCLUSIONS)?
         .with_loss_scale(128.0)?
+        .with_gradient_accumulation(ACCUMULATION_STEPS)?
+        .with_max_gradient_norm(MAX_GRADIENT_NORM)?
         .with_host_token_input("tokens", [BATCH, TIME])?
         .with_host_token_input("targets", [BATCH, TIME])
 }
 
 fn dropout_config() -> CompiledDropoutConfig {
     CompiledDropoutConfig::new(CompiledDropoutKey([0x1234_5678, 0x9abc_def0]))
+}
+
+fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
+    let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
+    let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
+    let target_indices = graph.reshape(targets, [TOKEN_COUNT, 1])?;
+    let selected = graph.gather(log_probabilities, target_indices, 1)?;
+    let selected = graph.reshape(selected, [TOKEN_COUNT])?;
+    let losses = graph.neg(selected)?;
+    graph.mean_default(losses)
 }
 
 fn build(
@@ -136,13 +150,7 @@ fn build(
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
     let logits = model.forward(graph, inputs["tokens"], dropout)?;
-    let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
-    let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
-    let target_indices = graph.reshape(inputs["targets"], [TOKEN_COUNT, 1])?;
-    let selected = graph.gather(log_probabilities, target_indices, 1)?;
-    let selected = graph.reshape(selected, [TOKEN_COUNT])?;
-    let losses = graph.neg(selected)?;
-    let loss = graph.mean_default(losses)?;
+    let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
     Ok((loss, BTreeMap::new()))
 }
 
@@ -151,7 +159,7 @@ fn compile(model: TinyCausalTransformer) -> Result<CompiledModuleAdamWPlan<TinyC
         .map_err(|error| error.into_parts().1)
 }
 
-fn batch() -> Result<BTreeMap<String, TensorData>> {
+fn batch(replay: u64) -> Result<BTreeMap<String, TensorData>> {
     let tensor = |values: [i32; TOKEN_COUNT]| {
         TensorData::from_scalars(
             Shape::new([BATCH, TIME]),
@@ -159,9 +167,15 @@ fn batch() -> Result<BTreeMap<String, TensorData>> {
             values.into_iter().map(|value| Scalar::I(i64::from(value))),
         )
     };
+    let (tokens, targets) = match (replay - 1) % ACCUMULATION_STEPS {
+        0 => ([0, 1, 2, 2, 0, 1], [1, 2, 0, 0, 1, 2]),
+        1 => ([1, 2, 0, 0, 1, 2], [2, 0, 1, 1, 2, 0]),
+        2 => ([2, 0, 1, 1, 2, 0], [0, 1, 2, 2, 0, 1]),
+        _ => unreachable!(),
+    };
     Ok(BTreeMap::from([
-        ("tokens".into(), tensor([0, 1, 2, 2, 0, 1])?),
-        ("targets".into(), tensor([1, 2, 0, 0, 1, 2])?),
+        ("tokens".into(), tensor(tokens)?),
+        ("targets".into(), tensor(targets)?),
     ]))
 }
 
@@ -170,8 +184,27 @@ fn evaluate(model: &TinyCausalTransformer) -> Result<TensorData> {
     let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
     let logits = model.forward_eval(&mut graph, tokens)?;
     let mut bindings = model.input_bindings(&graph)?;
-    bindings.insert("tokens".into(), batch()?.remove("tokens").unwrap());
+    bindings.insert("tokens".into(), batch(1)?.remove("tokens").unwrap());
     CpuBackend.execute(&graph, logits, &bindings)
+}
+
+fn evaluate_mean_sparse_loss(model: &TinyCausalTransformer) -> Result<f64> {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let logits = model.forward_eval(&mut graph, tokens)?;
+    let loss = sparse_causal_loss(&mut graph, logits, targets)?;
+    let parameter_bindings = model.input_bindings(&graph)?;
+    let mut total = 0.0;
+    for replay in 1..=ACCUMULATION_STEPS {
+        let mut bindings = parameter_bindings.clone();
+        bindings.extend(batch(replay)?);
+        total += CpuBackend
+            .execute(&graph, loss, &bindings)?
+            .scalar_at(0)
+            .as_f64();
+    }
+    Ok(total / ACCUMULATION_STEPS as f64)
 }
 
 fn run_exact_resume<R, P>(target_name: &str, mut prepare: P) -> Result<()>
@@ -182,6 +215,7 @@ where
     ) -> Result<CompiledModuleAdamWSession<TinyCausalTransformer, R>>,
 {
     let model = TinyCausalTransformer::new(7)?;
+    let initial_mean_sparse_loss = evaluate_mean_sparse_loss(&model)?;
     let plan = compile(model)?;
     let capture_identity = plan.capture_identity();
     let mut uninterrupted = prepare(plan)?;
@@ -191,11 +225,52 @@ where
         !parameters.contains_key("lm_head.weight"),
         "the tied output head must share the embedding's recurrent state"
     );
+    assert_eq!(
+        uninterrupted.gradient_accumulation_steps(),
+        ACCUMULATION_STEPS
+    );
+    assert_eq!(uninterrupted.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
+    let initial_parameters = uninterrupted.parameter_snapshots()?;
+    let initial_first_moments = uninterrupted.first_moment_snapshots()?;
+    let initial_second_moments = uninterrupted.second_moment_snapshots()?;
+    let empty_accumulators = uninterrupted.gradient_accumulator_snapshots()?;
 
-    let mut losses = Vec::with_capacity(INITIAL_STEPS + RESUMED_STEPS);
-    for _ in 0..INITIAL_STEPS {
-        let step = uninterrupted.step(batch()?, TensorData::scalar(0.05))?;
-        losses.push(step.loss().scalar_at(0).as_f64());
+    for replay in 1..=2 {
+        let step = uninterrupted.step(batch(replay)?, TensorData::scalar(0.05))?;
+        assert_eq!(step.optimizer_step(), 0);
+        assert_eq!(step.accumulation_index(), replay);
+        assert!(!step.did_update());
+    }
+    assert_ne!(
+        uninterrupted.gradient_accumulator_snapshots()?,
+        empty_accumulators
+    );
+    assert_eq!(uninterrupted.parameter_snapshots()?, initial_parameters);
+    assert_eq!(
+        uninterrupted.first_moment_snapshots()?,
+        initial_first_moments
+    );
+    assert_eq!(
+        uninterrupted.second_moment_snapshots()?,
+        initial_second_moments
+    );
+    assert_eq!(uninterrupted.zero_grad()?.discarded_microbatches(), 2);
+    assert_eq!(uninterrupted.step_count(), 2);
+    assert_eq!(uninterrupted.optimizer_step()?, 0);
+    assert_eq!(uninterrupted.accumulation_index()?, 0);
+    assert_eq!(
+        uninterrupted.gradient_accumulator_snapshots()?,
+        empty_accumulators
+    );
+    let after_reset = uninterrupted.checkpoint()?;
+    assert_eq!(uninterrupted.zero_grad()?.discarded_microbatches(), 0);
+    assert_eq!(uninterrupted.checkpoint()?, after_reset);
+
+    for replay in 3..=INITIAL_STEPS as u64 {
+        let step = uninterrupted.step(batch(replay)?, TensorData::scalar(0.05))?;
+        assert_eq!(step.optimizer_step(), 0);
+        assert_eq!(step.accumulation_index(), replay - 2);
+        assert!(!step.did_update());
     }
 
     let saved = uninterrupted.checkpoint()?;
@@ -214,20 +289,33 @@ where
     assert_eq!(restored_plan.capture_identity(), capture_identity);
     assert_eq!(restored_plan.step_count(), INITIAL_STEPS as u64);
     let mut resumed = prepare(restored_plan)?;
+    assert_eq!(resumed.optimizer_step()?, 0);
+    assert_eq!(resumed.accumulation_index()?, 2);
+    assert_eq!(resumed.checkpoint()?, checkpoint);
 
-    for _ in 0..RESUMED_STEPS {
-        let expected = uninterrupted.step(batch()?, TensorData::scalar(0.05))?;
-        let actual = resumed.step(batch()?, TensorData::scalar(0.05))?;
+    for replay in (INITIAL_STEPS as u64 + 1)..=(INITIAL_STEPS + RESUMED_STEPS) as u64 {
+        let expected = uninterrupted.step(batch(replay)?, TensorData::scalar(0.05))?;
+        let actual = resumed.step(batch(replay)?, TensorData::scalar(0.05))?;
         assert_eq!(actual.loss(), expected.loss());
         assert_eq!(actual.outputs(), expected.outputs());
         assert_eq!(actual.step(), expected.step());
-        losses.push(expected.loss().scalar_at(0).as_f64());
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+        assert_eq!(actual.did_update(), expected.did_update());
+        let (optimizer_step, accumulation_index, did_update) = match replay {
+            5 => (1, 0, true),
+            6 => (1, 1, false),
+            7 => (1, 2, false),
+            8 => (2, 0, true),
+            _ => unreachable!(),
+        };
+        assert_eq!(actual.optimizer_step(), optimizer_step);
+        assert_eq!(actual.accumulation_index(), accumulation_index);
+        assert_eq!(actual.did_update(), did_update);
     }
+    assert_eq!(resumed.optimizer_step()?, 2);
+    assert_eq!(resumed.accumulation_index()?, 0);
 
-    assert!(
-        losses.last() < losses.first(),
-        "compiled causal Transformer loss did not decrease: {losses:?}"
-    );
     assert_eq!(
         resumed.parameter_snapshots()?,
         uninterrupted.parameter_snapshots()?
@@ -239,6 +327,14 @@ where
     assert_eq!(
         resumed.second_moment_snapshots()?,
         uninterrupted.second_moment_snapshots()?
+    );
+    assert_eq!(
+        resumed.gradient_accumulator_snapshots()?,
+        uninterrupted.gradient_accumulator_snapshots()?
+    );
+    assert_eq!(
+        resumed.gradient_accumulator_snapshots()?,
+        empty_accumulators
     );
     assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
     let published = resumed.parameter_snapshots()?;
@@ -270,6 +366,7 @@ where
         .collect::<Result<BTreeMap<_, _>>>()?;
     let first_eval = evaluate(&restored_model)?;
     let second_eval = evaluate(&restored_model)?;
+    let final_mean_sparse_loss = evaluate_mean_sparse_loss(&restored_model)?;
     assert_eq!(first_eval.shape(), &Shape::new([BATCH, TIME, VOCAB]));
     assert_eq!(first_eval, second_eval);
     assert!(
@@ -279,11 +376,13 @@ where
     for (name, parameter) in restored_model.trainable_parameters()? {
         assert_eq!(parameter.version()?, versions_before_eval[&name]);
     }
+    assert!(
+        final_mean_sparse_loss < initial_mean_sparse_loss,
+        "compiled causal Transformer eval loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
+    );
     println!(
-        "{target_name}: capture={capture_identity:016x}, steps={}, loss={:.6} -> {:.6}, exact_resume=true, published=true",
-        runtime_step,
-        losses[0],
-        losses.last().expect("eight losses were recorded")
+        "{target_name}: capture={capture_identity:016x}, steps={}, eval_mean_sparse_loss={:.6} -> {:.6}, exact_resume=true, published=true",
+        runtime_step, initial_mean_sparse_loss, final_mean_sparse_loss
     );
     Ok(())
 }
