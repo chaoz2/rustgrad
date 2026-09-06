@@ -25,6 +25,20 @@ use std::{collections::BTreeMap, env, error::Error};
 const VOCAB: usize = 3;
 const EMBEDDING: usize = 2;
 const TIME: usize = 3;
+const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
+    "block.ff1.1",
+    "block.ff2.1",
+    "block.key.1",
+    "block.ln1.0",
+    "block.ln1.1",
+    "block.ln2.0",
+    "block.ln2.1",
+    "block.out.1",
+    "block.query.1",
+    "block.value.1",
+    "norm.bias",
+    "norm.weight",
+];
 const INITIAL_STEPS: usize = 4;
 const RESUMED_STEPS: usize = 4;
 
@@ -101,7 +115,8 @@ impl Module for TinyCausalTransformer {
 }
 
 fn config() -> Result<CompiledAdamWConfig> {
-    CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)?
+    CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)?
+        .with_weight_decay_exclusions(WEIGHT_DECAY_EXCLUSIONS)?
         .with_loss_scale(128.0)?
         .with_input("tokens", [1, TIME], DType::I32)?
         .with_input("targets", [1, TIME], DType::I32)

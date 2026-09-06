@@ -213,6 +213,7 @@ struct ModuleParameterEntry {
 #[derive(Clone, Debug)]
 struct ModuleParameterPlan {
     entries: Vec<ModuleParameterEntry>,
+    noncanonical_names: BTreeSet<String>,
 }
 
 impl ModuleParameterPlan {
@@ -220,9 +221,14 @@ impl ModuleParameterPlan {
         let mut entries = Vec::<ModuleParameterEntry>::new();
         let mut identities = BTreeMap::<ParameterId, usize>::new();
         let mut names = BTreeSet::new();
+        let mut noncanonical_names = BTreeSet::new();
         let mut error = None;
         module.visit("", &mut |name, parameter, kind| {
             if error.is_some() {
+                return;
+            }
+            if !names.insert(name.clone()) {
+                error = Some(training("compiled module state names repeat"));
                 return;
             }
             let identity = parameter.id();
@@ -232,11 +238,9 @@ impl ModuleParameterPlan {
                     error = Some(training(
                         "tied compiled module state has inconsistent trainability",
                     ));
+                } else {
+                    noncanonical_names.insert(name);
                 }
-                return;
-            }
-            if !names.insert(name.clone()) {
-                error = Some(training("compiled module state names repeat"));
                 return;
             }
             match parameter.snapshot() {
@@ -261,7 +265,38 @@ impl ModuleParameterPlan {
                 "compiled module needs at least one trainable parameter",
             ));
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            noncanonical_names,
+        })
+    }
+
+    fn validate_weight_decay_exclusions(&self, config: &CompiledAdamWConfig) -> Result<()> {
+        for name in &config.weight_decay_exclusions {
+            if self.noncanonical_names.contains(name) {
+                return Err(training(
+                    "compiled AdamW weight-decay exclusion is a noncanonical tied alias",
+                ));
+            }
+            match self
+                .entries
+                .iter()
+                .find(|entry| entry.name == name.as_str())
+            {
+                Some(entry) if entry.trainable => {}
+                Some(_) => {
+                    return Err(training(
+                        "compiled AdamW weight-decay exclusion is not a trainable parameter",
+                    ));
+                }
+                None => {
+                    return Err(training(
+                        "compiled AdamW weight-decay exclusion name is unknown",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn initial_parameters(&self) -> Result<Vec<TrainingParameterInit>> {
@@ -363,6 +398,7 @@ pub struct CompiledAdamWConfig {
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
+    weight_decay_exclusions: BTreeSet<String>,
     inputs: BTreeMap<String, (Shape, DType)>,
 }
 
@@ -387,6 +423,7 @@ impl CompiledAdamWConfig {
             gradient_accumulation_steps: 1,
             max_gradient_norm: None,
             loss_scale: 1.0,
+            weight_decay_exclusions: BTreeSet::new(),
             inputs: BTreeMap::new(),
         })
     }
@@ -433,6 +470,27 @@ impl CompiledAdamWConfig {
         Ok(self)
     }
 
+    /// Excludes exact canonical trainable parameter names from decoupled
+    /// weight decay. Names are accumulated across calls and duplicates are
+    /// rejected; module compilation also rejects frozen state, buffers, tied
+    /// aliases, and names outside the canonical trainable inventory.
+    pub fn with_weight_decay_exclusions<I, S>(mut self, names: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for name in names {
+            let name = name.into();
+            validate_user_name(&name, "AdamW weight-decay exclusion")?;
+            if !self.weight_decay_exclusions.insert(name) {
+                return Err(training(
+                    "duplicate compiled AdamW weight-decay exclusion name",
+                ));
+            }
+        }
+        Ok(self)
+    }
+
     pub fn with_input(
         mut self,
         name: impl Into<String>,
@@ -463,6 +521,11 @@ impl CompiledAdamWConfig {
 
     pub fn weight_decay(&self) -> f32 {
         self.weight_decay
+    }
+
+    /// Returns canonical exclusion names in deterministic sorted order.
+    pub fn weight_decay_exclusions(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.weight_decay_exclusions.iter().map(String::as_str)
     }
 
     pub fn gradient_accumulation_steps(&self) -> u64 {
@@ -1135,7 +1198,11 @@ fn lower_adamw_update_candidates(
         let root = graph.sqrt(corrected_second)?;
         let denominator = graph.add(root, eps)?;
         let normalized = graph.div(corrected_first, denominator)?;
-        let decayed = graph.mul(*parameter, decay_factor)?;
+        let decayed = if config.weight_decay_exclusions.contains(name) {
+            *parameter
+        } else {
+            graph.mul(*parameter, decay_factor)?
+        };
         let scaled = graph.mul(learning_rate, normalized)?;
         let next_parameter = graph.sub(decayed, scaled)?;
         validate_parameter_update(graph, *parameter, next_first)?;
@@ -2185,6 +2252,11 @@ impl CompiledAdamWPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
+        let parameters = parameters.into_iter().collect::<Vec<_>>();
+        validate_weight_decay_exclusion_names(
+            &config,
+            parameters.iter().map(TrainingParameterInit::name),
+        )?;
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let max_gradient_norm = config.max_gradient_norm;
         let loss_scale = config.loss_scale;
@@ -2212,6 +2284,7 @@ impl CompiledAdamWPlan {
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
         let parameter_plan = ModuleParameterPlan::new(module)?;
+        parameter_plan.validate_weight_decay_exclusions(&config)?;
         let parameters = parameter_plan.initial_parameters()?;
         Self::compile(config, parameters, move |graph, inputs, parameters| {
             parameter_plan.lower(graph, parameters, |graph| build(module, graph, inputs))
@@ -2264,6 +2337,7 @@ impl CompiledAdamWPlan {
             &mut dyn TrainingDropoutProvider,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
+        parameter_plan.validate_weight_decay_exclusions(&config)?;
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let max_gradient_norm = config.max_gradient_norm;
         let loss_scale = config.loss_scale;
@@ -2399,6 +2473,7 @@ impl CompiledAdamWPlan {
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
         let parameter_plan = ModuleParameterPlan::new(module)?;
+        parameter_plan.validate_weight_decay_exclusions(&config)?;
         Self::compile_from_checkpoint(config, checkpoint, move |graph, inputs, parameters| {
             parameter_plan.lower(graph, parameters, |graph| build(module, graph, inputs))
         })
@@ -3942,6 +4017,26 @@ fn canonical_parameters(
     Ok(values)
 }
 
+fn validate_weight_decay_exclusion_names<'a>(
+    config: &CompiledAdamWConfig,
+    parameter_names: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    if config.weight_decay_exclusions.is_empty() {
+        return Ok(());
+    }
+    let parameter_names = parameter_names.into_iter().collect::<BTreeSet<_>>();
+    if let Some(name) = config
+        .weight_decay_exclusions
+        .iter()
+        .find(|name| !parameter_names.contains(name.as_str()))
+    {
+        return Err(training(format!(
+            "compiled AdamW weight-decay exclusion name {name:?} is unknown"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_user_name(name: &str, kind: &str) -> Result<()> {
     if name.is_empty() || name == "loss" || name.starts_with(INTERNAL_PREFIX) {
         return Err(training(format!("invalid compiled {kind} name")));
@@ -5110,6 +5205,234 @@ mod tests {
             scaled.second_moment_snapshots().unwrap(),
             clipped.second_moment_snapshots().unwrap()
         );
+    }
+
+    #[test]
+    fn adamw_weight_decay_exclusions_preserve_the_complete_optimizer_frontier() {
+        let parameters = || {
+            [
+                TrainingParameterInit::new("a", TensorData::scalar(2.0)).unwrap(),
+                TrainingParameterInit::new("b", TensorData::scalar(3.0)).unwrap(),
+            ]
+        };
+        let config = |weight_decay, exclusions: &[&str]| {
+            let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, weight_decay)
+                .unwrap()
+                .with_gradient_accumulation(2)
+                .unwrap()
+                .with_max_gradient_norm(1.0)
+                .unwrap();
+            config
+                .with_weight_decay_exclusions(exclusions.iter().copied())
+                .unwrap()
+        };
+        let compile = |config| {
+            CpuCompiledAdamW::compile(config, parameters(), build_two_parameter_linear_loss)
+                .unwrap()
+        };
+        let mut excluded = compile(config(0.1, &["b"]));
+        let mut full_decay = compile(config(0.1, &[]));
+        let mut no_decay = compile(config(0.0, &[]));
+
+        for runtime in [&mut excluded, &mut full_decay, &mut no_decay] {
+            let first = runtime
+                .step(BTreeMap::new(), TensorData::scalar(0.1))
+                .unwrap();
+            assert!(!first.did_update());
+            assert_eq!(
+                runtime.gradient_accumulator_snapshots().unwrap(),
+                BTreeMap::from([
+                    ("a".into(), TensorData::scalar(3.0)),
+                    ("b".into(), TensorData::scalar(4.0)),
+                ])
+            );
+            let second = runtime
+                .step(BTreeMap::new(), TensorData::scalar(0.1))
+                .unwrap();
+            assert!(second.did_update());
+        }
+
+        let excluded_parameters = excluded.parameter_snapshots().unwrap();
+        let full_decay_parameters = full_decay.parameter_snapshots().unwrap();
+        let no_decay_parameters = no_decay.parameter_snapshots().unwrap();
+        assert_eq!(excluded_parameters["a"], full_decay_parameters["a"]);
+        assert_ne!(excluded_parameters["a"], no_decay_parameters["a"]);
+        assert_eq!(excluded_parameters["b"], no_decay_parameters["b"]);
+        assert_ne!(excluded_parameters["b"], full_decay_parameters["b"]);
+        assert_eq!(
+            excluded.first_moment_snapshots().unwrap(),
+            full_decay.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            excluded.first_moment_snapshots().unwrap(),
+            no_decay.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            excluded.second_moment_snapshots().unwrap(),
+            full_decay.second_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            excluded.second_moment_snapshots().unwrap(),
+            no_decay.second_moment_snapshots().unwrap()
+        );
+        assert!(
+            excluded
+                .gradient_accumulator_snapshots()
+                .unwrap()
+                .values()
+                .all(|value| value == &TensorData::scalar(0.0))
+        );
+
+        let checkpoint = excluded.checkpoint().unwrap();
+        let resumed = CpuCompiledAdamW::compile_from_checkpoint(
+            config(0.1, &["b"]),
+            &checkpoint,
+            build_two_parameter_linear_loss,
+        )
+        .unwrap();
+        assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+        assert!(
+            CpuCompiledAdamW::compile_from_checkpoint(
+                config(0.1, &[]),
+                &checkpoint,
+                build_two_parameter_linear_loss,
+            )
+            .is_err()
+        );
+        assert!(
+            CpuCompiledAdamW::compile_from_checkpoint(
+                config(0.1, &["a"]),
+                &checkpoint,
+                build_two_parameter_linear_loss,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn adamw_weight_decay_exclusion_names_validate_before_graph_construction() {
+        struct NamesModule {
+            trainable: Parameter,
+            frozen: Parameter,
+            buffer: Parameter,
+        }
+
+        impl Module for NamesModule {
+            fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+                assert!(prefix.is_empty());
+                visitor("weight".into(), &self.trainable, StateKind::Parameter);
+                visitor("weight_alias".into(), &self.trainable, StateKind::Parameter);
+                visitor("frozen".into(), &self.frozen, StateKind::Parameter);
+                visitor("running".into(), &self.buffer, StateKind::Buffer);
+            }
+        }
+
+        struct RepeatedCanonicalName(Parameter);
+
+        impl Module for RepeatedCanonicalName {
+            fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+                assert!(prefix.is_empty());
+                visitor("weight".into(), &self.0, StateKind::Parameter);
+                visitor("weight".into(), &self.0, StateKind::Parameter);
+            }
+        }
+
+        let base = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.1).unwrap();
+        assert_eq!(base.weight_decay_exclusions().len(), 0);
+        assert_eq!(
+            base.clone()
+                .with_weight_decay_exclusions(["z", "a"])
+                .unwrap()
+                .weight_decay_exclusions()
+                .collect::<Vec<_>>(),
+            vec!["a", "z"]
+        );
+        assert!(
+            base.clone()
+                .with_weight_decay_exclusions(["weight", "weight"])
+                .is_err()
+        );
+        assert!(
+            base.clone()
+                .with_weight_decay_exclusions(["weight"])
+                .unwrap()
+                .with_weight_decay_exclusions(["weight"])
+                .is_err()
+        );
+
+        let parameters =
+            || [TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap()];
+        let empty = CpuCompiledAdamW::compile(
+            base.clone()
+                .with_weight_decay_exclusions(std::iter::empty::<&str>())
+                .unwrap(),
+            parameters(),
+            |graph, _, parameters| {
+                Ok((
+                    graph.mul(parameters["weight"], parameters["weight"])?,
+                    BTreeMap::new(),
+                ))
+            },
+        )
+        .unwrap();
+        let ordinary =
+            CpuCompiledAdamW::compile(base.clone(), parameters(), |graph, _, parameters| {
+                assert_eq!(graph.dtype(parameters["weight"])?, DType::F32);
+                Ok((
+                    graph.mul(parameters["weight"], parameters["weight"])?,
+                    BTreeMap::new(),
+                ))
+            })
+            .unwrap();
+        assert_eq!(empty.capture_identity(), ordinary.capture_identity());
+        assert_eq!(empty.checkpoint().unwrap(), ordinary.checkpoint().unwrap());
+
+        let repeated = RepeatedCanonicalName(Parameter::new(TensorData::scalar(1.0), true));
+        let invoked = std::cell::Cell::new(false);
+        let result = CpuCompiledAdamW::compile_module(base.clone(), &repeated, |_, _, _| {
+            invoked.set(true);
+            Err(training("builder should not run"))
+        });
+        assert!(result.is_err());
+        assert!(!invoked.get());
+
+        let invoked = std::cell::Cell::new(false);
+        let result = CpuCompiledAdamW::compile(
+            base.clone()
+                .with_weight_decay_exclusions(["missing"])
+                .unwrap(),
+            parameters(),
+            |_, _, _| {
+                invoked.set(true);
+                Err(training("builder should not run"))
+            },
+        );
+        assert!(result.is_err());
+        assert!(!invoked.get());
+
+        let module = NamesModule {
+            trainable: Parameter::new(TensorData::scalar(1.0), true),
+            frozen: Parameter::new(TensorData::scalar(2.0), false),
+            buffer: Parameter::new(TensorData::scalar(3.0), false),
+        };
+        for invalid in ["weight_alias", "frozen", "running", "missing"] {
+            let invoked = std::cell::Cell::new(false);
+            let result = CpuCompiledAdamW::compile_module(
+                base.clone()
+                    .with_weight_decay_exclusions([invalid])
+                    .unwrap(),
+                &module,
+                |_, _, _| {
+                    invoked.set(true);
+                    Err(training("builder should not run"))
+                },
+            );
+            assert!(
+                result.is_err(),
+                "invalid exclusion {invalid:?} was accepted"
+            );
+            assert!(!invoked.get());
+        }
     }
 
     #[test]

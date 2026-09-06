@@ -1123,6 +1123,26 @@ fn compiled_scalar_adamw_plan_with_accumulation(steps: u64) -> CompiledAdamWPlan
     .unwrap()
 }
 
+fn compiled_decay_exclusion_adamw_plan(exclude_bias: bool) -> CompiledAdamWPlan {
+    let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.1).unwrap();
+    let config = if exclude_bias {
+        config.with_weight_decay_exclusions(["bias"]).unwrap()
+    } else {
+        config
+    };
+    let parameters = [
+        TrainingParameterInit::new("weight", TensorData::scalar(2.0)).unwrap(),
+        TrainingParameterInit::new("bias", TensorData::scalar(3.0)).unwrap(),
+    ];
+    CompiledAdamWPlan::compile(config, parameters, |graph, _, parameters| {
+        Ok((
+            graph.add(parameters["weight"], parameters["bias"])?,
+            BTreeMap::new(),
+        ))
+    })
+    .unwrap()
+}
+
 struct CompiledDropoutFixture {
     weight: Parameter,
 }
@@ -1318,6 +1338,48 @@ fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops()
             .successful_run_count,
         1
     );
+}
+
+#[test]
+fn compiled_adamw_weight_decay_exclusion_is_the_same_strict_metal_capture() {
+    let program = compiled_decay_exclusion_adamw_plan(true);
+    let ordinary = compiled_decay_exclusion_adamw_plan(false);
+    assert_ne!(program.capture_identity(), ordinary.capture_identity());
+    let mut cpu = program.prepare_cpu().unwrap();
+    let plan = program
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap();
+    assert_eq!(plan.capture_identity(), program.capture_identity());
+    assert_eq!(plan.summary().fallback_count, 0);
+    assert_eq!(plan.summary().state_pair_count, 7);
+    assert_eq!(plan.summary().state_bank_count, 2);
+    assert!(
+        plan.rendered_items()
+            .all(|item| item.transaction.is_none() && item.indexed_movement().is_none())
+    );
+    let mut metal = plan
+        .prepare(test_device(Arc::new(MockDispatch::default())))
+        .unwrap();
+
+    let expected = cpu.step(BTreeMap::new(), TensorData::scalar(0.1)).unwrap();
+    let actual = metal
+        .step(BTreeMap::new(), TensorData::scalar(0.1))
+        .unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(
+        metal.parameter_snapshots().unwrap(),
+        cpu.parameter_snapshots().unwrap()
+    );
+    assert_eq!(
+        metal.first_moment_snapshots().unwrap(),
+        cpu.first_moment_snapshots().unwrap()
+    );
+    assert_eq!(
+        metal.second_moment_snapshots().unwrap(),
+        cpu.second_moment_snapshots().unwrap()
+    );
+    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
 }
 
 fn assert_compiled_adamw_device_only_failure_is_unpublished(runtime: &crate::MetalCompiledAdamW) {

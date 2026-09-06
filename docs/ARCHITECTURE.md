@@ -954,6 +954,15 @@ optimizer-owned recurrent inputs, tied handles share that one node/state tuple,
 and frozen parameters or buffers become immutable capture constants.
 `compile_module_from_checkpoint` rebuilds the same module topology and requires
 its frozen values and graph to reproduce the authenticated capture identity.
+`CompiledAdamWConfig::with_weight_decay_exclusions` accumulates a deterministic
+set of exact canonical trainable names. The existing `ModuleParameterPlan`
+traversal validates that set before graph construction, rejecting unknown
+state, frozen parameters, buffers, and later tied aliases without a second
+module walk. Excluded parameters still participate in the single gradient
+traversal, global clipping, accumulation, moments, checkpointing, and
+publication; only their decoupled decay multiplication is omitted. An empty
+set follows the historical lowering byte-for-byte, while a nonempty policy is
+part of the captured update topology and therefore checkpoint authentication.
 `CompiledAdamWPlan` is the resource-free public compiler result: it owns the
 authenticated mixed capture, admitted recurrent frontier, optimizer policy,
 and optional restored checkpoint state before a runtime is chosen. It prepares
