@@ -1205,7 +1205,7 @@ fn run_one_compiled_adamw_step<R: CompiledAdamWRuntime>(
 #[test]
 fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops() {
     let program = compiled_scalar_adamw_plan();
-    let mut cpu = program.prepare(&CpuSessionTarget::new()).unwrap();
+    let mut cpu = CpuSessionTarget::new().prepare(&program).unwrap();
     let mock = Arc::new(MockDispatch::default());
     let context =
         MetalScoreboardContext::new("compiled-target", "test-revision", "semantic mock").unwrap();
@@ -1215,7 +1215,7 @@ fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops()
     assert_eq!(target.device().info().capabilities, capabilities());
     let _renderer = target.renderer();
     assert_eq!(target.scoreboard_context(), Some(&context));
-    let mut metal = program.prepare(&target).unwrap();
+    let mut metal = target.prepare(&program).unwrap();
 
     let expected = run_one_compiled_adamw_step(&mut cpu);
     let actual = run_one_compiled_adamw_step(&mut metal);
@@ -2585,20 +2585,17 @@ fn llama_metal_prompt_facade_prefills_with_one_read_and_matches_cpu() {
 
     let mock = Arc::new(MockDispatch::default());
     let device = test_device(mock.clone());
+    let target = MetalSessionTarget::new(device.clone(), 8).unwrap();
     let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
-    let plan = crate::models::transformer::LlamaMetalPlan::from_workflow(
-        workflow,
-        &device,
-        MetalPlanOptions::new(8),
-    )
-    .unwrap();
+    let plan =
+        crate::models::transformer::LlamaMetalPlan::from_workflow_on(workflow, &target).unwrap();
     assert_eq!(plan.selected_device_owner_id(), device.owner_id());
     assert_eq!(plan.transient_inputs().len(), 1);
     assert_eq!(plan.runtime_control_inputs().len(), 1);
     assert_eq!(plan.summary().fallback_count, 0);
     let stable_identity = plan.step_deployment_identity();
     let stable_capture = plan.capture().identity;
-    let mut session = plan.prepare().unwrap();
+    let mut session = target.prepare(plan).unwrap();
     assert!(session.execution_scoreboard().is_none());
     assert!(session.scoreboard_recording_error().is_none());
     let stable_kernels = session.compiled_kernels().count();
@@ -3069,24 +3066,38 @@ fn llama_metal_device_greedy_packed_matches_cpu_without_logits_download() {
         .unwrap();
     let mock = Arc::new(MockDispatch::default());
     let device = test_device(mock);
-    let plan = LlamaMetalGreedyPlan::from_workflow(
+    let context =
+        MetalScoreboardContext::new("llama-target", "test-revision", "semantic mock").unwrap();
+    let target = MetalSessionTarget::new(device, 8)
+        .unwrap()
+        .with_scoreboard(context);
+    let plan = LlamaMetalGreedyPlan::builder_on(
         LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
-        &device,
-        MetalPlanOptions::new(8),
+        &target,
     )
+    .build()
     .unwrap();
     assert_eq!(plan.summary().requested_output_count, 1);
     assert_eq!(plan.summary().fallback_count, 0);
     assert!(plan.summary().quantized_constant_count > 0);
-    let mut session = plan.prepare().unwrap();
-    assert!(session.execution_scoreboard().is_none());
-    assert_eq!(session.execution_scoreboard_report(), Ok(None));
+    let mut session = target.prepare(plan).unwrap();
+    assert!(session.execution_scoreboard().is_some());
+    assert!(session.execution_scoreboard_report().unwrap().is_some());
     assert!(session.scoreboard_recording_error().is_none());
     let actual = session.generate_ids(&[3], 2).unwrap();
     assert_eq!(actual.generation(), &expected);
     assert!(actual.reports().iter().all(|report| {
         report.output_count == 1 && report.retained_d2h_calls == 1 && report.retained_d2h_bytes == 4
     }));
+    assert_eq!(
+        session
+            .execution_scoreboard_report()
+            .unwrap()
+            .unwrap()
+            .token_step
+            .successful_run_count,
+        u64::try_from(actual.reports().len()).unwrap()
+    );
 }
 
 #[test]
@@ -3097,11 +3108,11 @@ fn llama_metal_device_greedy_builder_preserves_resource_free_plan_inspection() {
     );
     let mock = Arc::new(MockDispatch::default());
     let device = test_device(mock.clone());
+    let target = MetalSessionTarget::new(device.clone(), 8).unwrap();
     let calls_before_plan = mock.calls();
 
     let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
-    let plan = LlamaMetalGreedyPlan::builder(workflow, &device)
-        .with_plan_options(MetalPlanOptions::new(8))
+    let plan = LlamaMetalGreedyPlan::builder_on(workflow, &target)
         .with_prefill_span(NonZeroUsize::new(3).unwrap())
         .build()
         .unwrap();
@@ -3116,7 +3127,7 @@ fn llama_metal_device_greedy_builder_preserves_resource_free_plan_inspection() {
     assert!(plan.rendered_items().len() > 0);
     assert!(plan.prefill_rendered_items().unwrap().len() > 0);
 
-    let session = plan.prepare().unwrap();
+    let session = target.prepare(plan).unwrap();
     assert_eq!(session.device_owner_id(), device.owner_id());
     assert_eq!(session.prefill_span_rows().unwrap().get(), 3);
     assert_eq!(session.summary().fallback_count, 0);
@@ -5204,9 +5215,12 @@ fn default_resnet18_is_one_boundary_free_resident_metal_session() {
     zero_trainable_module_parameters(&model);
     let mock = Arc::new(MockDispatch::virtual_zero_execution());
     let device = test_device(mock.clone());
-    let plan =
-        ResNetMetalPlan::eval_f32(&model, &device, [1, 3, 224, 224], MetalPlanOptions::new(64))
-            .unwrap();
+    let scoreboard_context =
+        MetalScoreboardContext::new("resnet-target", "test-revision", "semantic mock").unwrap();
+    let target = MetalSessionTarget::new(device.clone(), 64)
+        .unwrap()
+        .with_scoreboard(scoreboard_context);
+    let plan = ResNetMetalPlan::eval_f32_on(&model, &target, [1, 3, 224, 224]).unwrap();
     let graph = plan.graph();
     let image = plan.image_input().node;
     let logits = plan.logits_node();
@@ -5311,7 +5325,9 @@ fn default_resnet18_is_one_boundary_free_resident_metal_session() {
     // allocations. With zero trainable parameters, exact source logits are
     // zero for any finite image, so zero-filled retained output is observable
     // source truth without billions of host convolution operations.
-    let mut session = plan.prepare().unwrap();
+    let mut session = target.prepare(plan).unwrap();
+    assert!(session.execution_scoreboard().is_some());
+    assert!(session.scoreboard_recording_error().is_none());
     assert!(mock.registered_semantic_program_count() > 0);
     assert!(
         mock.registered_semantic_program_count()
@@ -5409,6 +5425,10 @@ fn default_resnet18_is_one_boundary_free_resident_metal_session() {
         }
         observed_bindings = Some(bindings);
     }
+    let scoreboard = session.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(scoreboard.successful_run_count, 2);
+    assert_eq!(scoreboard.fallback_count, 0);
+    assert!(session.scoreboard_recording_error().is_none());
 }
 
 #[test]

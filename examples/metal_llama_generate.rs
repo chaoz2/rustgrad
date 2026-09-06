@@ -2,7 +2,7 @@
 
 use rustgrad::models::transformer::{LlamaChatMessage, LlamaChatRole};
 use rustgrad::runtime::metal::{
-    MetalDeviceInfo, MetalDeviceSessionSummary, MetalDiscovery, MetalPlanOptions, MetalRuntime,
+    MetalDeviceInfo, MetalDeviceSessionSummary, MetalDiscovery, MetalRuntime,
     MetalScoreboardContext,
 };
 use rustgrad::{
@@ -10,7 +10,7 @@ use rustgrad::{
     LlamaMetalExecutionScoreboardReport, LlamaMetalGeneration, LlamaMetalGenerationError,
     LlamaMetalGenerationStage, LlamaMetalGreedyPlan, LlamaMetalWorkloadEvidenceArtifact,
     LlamaMetalWorkloadEvidenceContext, LlamaPromptWorkflow, MetalDeviceBufferMeasurement,
-    RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD, ReplayInput,
+    MetalSessionTarget, RUSTGRAD_METAL_GGUF_LLAMA_WORKLOAD, ReplayInput,
 };
 use serde::Serialize;
 use std::{
@@ -230,18 +230,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         .transpose()?;
     let cache = device.cache();
     let cache_entries_before_prepare = cache.len();
-    let workflow = LlamaPromptWorkflow::from_path(&args.model_path)?;
-    let plan = match args.prefill_span {
-        Some(span_rows) => LlamaMetalGreedyPlan::from_workflow_with_prefill_span(
-            workflow,
-            &device,
-            MetalPlanOptions::default(),
-            span_rows,
-        )?,
-        None => {
-            LlamaMetalGreedyPlan::from_workflow(workflow, &device, MetalPlanOptions::default())?
-        }
+    let target = MetalSessionTarget::new(device.clone(), 64)?;
+    let target = match scoreboard_context {
+        Some(context) => target.with_scoreboard(context),
+        None => target,
     };
+    let workflow = LlamaPromptWorkflow::from_path(&args.model_path)?;
+    let mut builder = LlamaMetalGreedyPlan::builder_on(workflow, &target);
+    if let Some(span_rows) = args.prefill_span {
+        builder = builder.with_prefill_span(span_rows);
+    }
+    let plan = builder.build()?;
     let stable = StablePlanFacts {
         device_info: plan.selected_device_info().clone(),
         device_owner_id: plan.selected_device_owner_id(),
@@ -272,10 +271,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         stable.summary.planned_device_bytes,
     );
 
-    let mut session = match scoreboard_context {
-        Some(context) => plan.prepare_with_scoreboard(context)?,
-        None => plan.prepare()?,
-    };
+    let mut session = target.prepare(plan)?;
     validate_stable_session(&session, &stable)?;
     let cache_entries_after_prepare = cache.len();
     let preparation = session.preparation_report().clone();

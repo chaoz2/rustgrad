@@ -34,7 +34,7 @@ pub use inference::{
     ReportedNativeModuleInferenceResult, infer_module_cpu, infer_module_native_cpu,
     infer_module_native_cpu_with_report,
 };
-pub use target::{CompiledSessionTarget, CpuSessionTarget, MetalSessionTarget};
+pub use target::{CpuSessionTarget, MetalSessionTarget, SessionTarget};
 pub use train::{
     CpuBinaryModuleTrainer, CpuModeModuleTrainer, CpuModuleTrainer, ModuleBinaryCrossEntropy,
     ModuleCrossEntropy, ModuleStepResult,

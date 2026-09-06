@@ -3,8 +3,11 @@
 use super::{Mode, ResNet};
 use crate::runtime::metal::{
     MetalDevice, MetalDeviceInfo, MetalDeviceRun, MetalDeviceRunReport, MetalDeviceSession,
-    MetalDeviceSessionSummary, MetalError, MetalInferencePlan, MetalPlanOptions, RenderedMetal,
+    MetalDeviceSessionSummary, MetalError, MetalInferencePlan, MetalPlanOptions,
+    MetalScoreboardContext, MetalScoreboardError, MetalScoreboardObserver, MetalSessionScoreboard,
+    MetalSessionScoreboardReport, RenderedMetal,
 };
+use crate::session::{MetalSessionTarget, SessionTarget};
 use crate::{
     BufferDesc, CapturedInference, CapturedInferenceError, CapturedSchedule, DType, Error,
     ExecutionPlanSummary, Graph, NodeId, ReplayInput, Shape, TensorData,
@@ -32,6 +35,7 @@ pub struct ResNetMetalSession {
     inner: MetalDeviceSession,
     image_shape: Shape,
     logits_shape: Shape,
+    scoreboard: Option<MetalScoreboardObserver>,
 }
 
 /// Detached logits and measurements committed by one successful invocation.
@@ -45,6 +49,7 @@ pub enum ResNetMetalError {
     Graph(Error),
     Capture(CapturedInferenceError),
     Metal(MetalError),
+    Scoreboard(MetalScoreboardError),
     ClassifierRequired,
     InvalidImage {
         expected_shape: Shape,
@@ -60,6 +65,7 @@ impl fmt::Display for ResNetMetalError {
             Self::Graph(error) => write!(f, "ResNet graph: {error}"),
             Self::Capture(error) => write!(f, "ResNet capture: {error}"),
             Self::Metal(error) => write!(f, "ResNet Metal: {error}"),
+            Self::Scoreboard(error) => write!(f, "ResNet Metal scoreboard: {error}"),
             Self::ClassifierRequired => write!(f, "ResNet Metal inference requires a classifier"),
             Self::InvalidImage {
                 expected_shape,
@@ -94,7 +100,23 @@ impl From<MetalError> for ResNetMetalError {
     }
 }
 
+impl From<MetalScoreboardError> for ResNetMetalError {
+    fn from(value: MetalScoreboardError) -> Self {
+        Self::Scoreboard(value)
+    }
+}
+
 impl ResNetMetalPlan {
+    /// Builds through one typed target so planning and preparation share its
+    /// selected device and renderer controls.
+    pub fn eval_f32_on(
+        model: &ResNet,
+        target: &MetalSessionTarget,
+        input_shape: [usize; 4],
+    ) -> Result<Self, ResNetMetalError> {
+        Self::eval_f32(model, target.device(), input_shape, target.plan_options())
+    }
+
     /// Builds, captures, and renders one complete static Eval/F32 ResNet graph.
     /// No queue, pipeline, or buffer is created during this operation.
     pub fn eval_f32(
@@ -248,14 +270,54 @@ impl ResNetMetalPlan {
 
     /// Creates persistent resources on the exact device selected at planning.
     pub fn prepare(self) -> Result<ResNetMetalSession, ResNetMetalError> {
+        let device = self.selected_device.clone();
+        self.prepare_inner(device, None)
+    }
+
+    /// Creates persistent resources and binds fail-soft execution observation
+    /// before the first image can run.
+    pub fn prepare_with_scoreboard(
+        self,
+        context: MetalScoreboardContext,
+    ) -> Result<ResNetMetalSession, ResNetMetalError> {
+        let device = self.selected_device.clone();
+        self.prepare_inner(device, Some(context))
+    }
+
+    fn prepare_inner(
+        self,
+        device: MetalDevice,
+        scoreboard_context: Option<MetalScoreboardContext>,
+    ) -> Result<ResNetMetalSession, ResNetMetalError> {
+        if device.owner_id() != self.selected_device.owner_id() {
+            return Err(MetalError::OwnerMismatch.into());
+        }
         let image_shape = self.image.desc.shape.clone();
         let logits_shape = self.logits_desc.shape.clone();
-        let inner = self.inner.prepare(self.selected_device)?;
+        let scoreboard =
+            scoreboard_context.map(|context| MetalSessionScoreboard::new(context, &self.inner));
+        let inner = self.inner.prepare(device)?;
+        let scoreboard = scoreboard
+            .map(|recorder| MetalScoreboardObserver::bind(recorder, &inner))
+            .transpose()?;
         Ok(ResNetMetalSession {
             inner,
             image_shape,
             logits_shape,
+            scoreboard,
         })
+    }
+}
+
+impl SessionTarget<ResNetMetalPlan> for MetalSessionTarget {
+    type Session = ResNetMetalSession;
+    type Error = ResNetMetalError;
+
+    fn prepare(&self, plan: ResNetMetalPlan) -> Result<Self::Session, Self::Error> {
+        match self.scoreboard_context() {
+            Some(context) => plan.prepare_inner(self.device().clone(), Some(context.clone())),
+            None => plan.prepare_inner(self.device().clone(), None),
+        }
     }
 }
 
@@ -263,6 +325,29 @@ impl ResNetMetalSession {
     /// Exposes the underlying strict session for detailed inspection tooling.
     pub const fn metal_session(&self) -> &MetalDeviceSession {
         &self.inner
+    }
+
+    /// Returns the bound execution scoreboard, when preparation requested one.
+    pub fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
+        self.scoreboard
+            .as_ref()
+            .map(MetalScoreboardObserver::recorder)
+    }
+
+    /// Returns the first fail-soft recording error, if observation stopped.
+    pub fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
+        self.scoreboard
+            .as_ref()
+            .and_then(MetalScoreboardObserver::first_error)
+    }
+
+    /// Returns the authenticated report over the successful observed prefix.
+    pub fn execution_scoreboard_report(
+        &self,
+    ) -> Result<Option<MetalSessionScoreboardReport>, MetalScoreboardError> {
+        self.execution_scoreboard()
+            .map(MetalSessionScoreboard::report)
+            .transpose()
     }
 
     /// Executes one exact F32 NCHW image and returns detached logits plus metrics.
@@ -280,6 +365,9 @@ impl ResNetMetalSession {
         debug_assert_eq!(run.outputs().len(), 1);
         debug_assert_eq!(run.outputs()[0].shape(), &self.logits_shape);
         debug_assert_eq!(run.outputs()[0].dtype(), DType::F32);
+        if let Some(scoreboard) = &mut self.scoreboard {
+            scoreboard.observe(&run);
+        }
         Ok(ResNetMetalRun { inner: run })
     }
 }
