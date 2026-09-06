@@ -68,7 +68,7 @@ pub use state::{
     ModuleForward, PendingModeEffects, RealizedBatchNormStats, StateDict, StateKind,
     StrictStateLoadLimits, get_parameters, get_state_dict,
 };
-pub use transformer::TransformerBlock;
+pub use transformer::{TrainingDropoutProvider, TransformerBlock};
 
 pub(crate) use parameter::{ParameterRestore, next_version, restore_parameters};
 pub(crate) use state::module_input_node_bindings;

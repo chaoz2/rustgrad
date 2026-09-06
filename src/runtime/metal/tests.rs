@@ -639,12 +639,13 @@ use crate::{
     Backend, BinaryOp, BufferRole, CapturedAppendStateInference, CapturedInference,
     CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
     CompareOp, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
-    CompiledTrainingStep, CpuBackend, CpuCompiledAdamW, CpuSession, CpuSessionTarget, DType,
-    EffectBatchStep, EffectRuntime, GgmlType, Graph, IndexValue, InferenceAppendStateLink,
-    InferenceStateLink, KernelBindings, KernelBufferDesc, LaneInstruction, MetalSessionTarget,
-    MovementKernelKind, MovementValue, NodeId, Operation, QuantizedTensorData, ReduceKind, ResNet,
-    ResNetConfig, ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
-    TrainingParameterInit, TypedValue, UOp, UType, schedule,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
+    CpuSession, CpuSessionTarget, DType, EffectBatchStep, EffectRuntime, GgmlType, Graph,
+    IndexValue, InferenceAppendStateLink, InferenceStateLink, KernelBindings, KernelBufferDesc,
+    LaneInstruction, MetalSessionTarget, MovementKernelKind, MovementValue, NodeId, Operation,
+    QuantizedTensorData, ReduceKind, ResNet, ResNetConfig, ResNetMetalError, ResNetMetalPlan,
+    Scalar, Shape, Slice, Storage, TensorData, TrainingDropoutProvider, TrainingParameterInit,
+    TypedValue, UOp, UType, schedule,
 };
 
 fn packed_ones(kind: GgmlType, rows: usize) -> QuantizedTensorData {
@@ -1122,6 +1123,41 @@ fn compiled_scalar_adamw_plan_with_accumulation(steps: u64) -> CompiledAdamWPlan
     .unwrap()
 }
 
+struct CompiledDropoutFixture {
+    weight: Parameter,
+}
+
+impl Module for CompiledDropoutFixture {
+    fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        assert!(prefix.is_empty());
+        visitor("weight".into(), &self.weight, StateKind::Parameter);
+    }
+}
+
+fn compiled_dropout_adamw_plan() -> CompiledAdamWPlan {
+    let module = CompiledDropoutFixture {
+        weight: Parameter::new(TensorData::scalar(0.5), true),
+    };
+    let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_input("x", [3], DType::F32)
+        .unwrap();
+    CompiledAdamWPlan::compile_module_with_dropout(
+        config,
+        CompiledDropoutConfig::new(CompiledDropoutKey([0x1020_3040, 0x5060_7080])),
+        &module,
+        |module, graph, inputs, dropout: &mut dyn TrainingDropoutProvider| {
+            let dropped = dropout.dropout(graph, inputs["x"], 0.25)?;
+            let weight = module.weight.bind(graph)?;
+            let output = graph.mul(dropped, weight)?;
+            let squared = graph.square(output)?;
+            let loss = graph.sum_all(squared)?;
+            Ok((loss, BTreeMap::from([("output".into(), output)])))
+        },
+    )
+    .unwrap()
+}
+
 fn compiled_scalar_adamw_with_accumulation(steps: u64) -> CpuCompiledAdamW {
     compiled_scalar_adamw_plan_with_accumulation(steps)
         .prepare_cpu()
@@ -1233,6 +1269,100 @@ fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops()
             .successful_run_count,
         1
     );
+}
+
+#[test]
+fn compiled_dropout_counter_is_one_strict_metal_state_pair_and_matches_cpu() {
+    let program = compiled_dropout_adamw_plan();
+    assert_eq!(program.dropout_blocks_per_replay(), Some(2));
+    let mut cpu = program.prepare_cpu().unwrap();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let ordinary = compiled_scalar_adamw_plan()
+        .metal_plan(renderer.clone())
+        .unwrap();
+    let ordinary_summary = ordinary.summary().clone();
+    let rendered = program.metal_plan(renderer).unwrap();
+    assert_eq!(rendered.summary().fallback_count, 0);
+    assert_eq!(
+        rendered.summary().state_pair_count,
+        ordinary_summary.state_pair_count + 1
+    );
+    assert_eq!(
+        rendered.summary().logical_state_bytes,
+        ordinary_summary.logical_state_bytes + 8
+    );
+    assert_eq!(
+        rendered.summary().state_device_bytes,
+        ordinary_summary.state_device_bytes + 16
+    );
+    assert!(
+        rendered
+            .rendered_items()
+            .all(|item| item.transaction.is_none() && item.indexed_movement().is_none())
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let failed_prepare = compiled_dropout_adamw_plan()
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap();
+    mock.state.lock().unwrap().failures.write = Some("dropout initial state upload");
+    assert!(failed_prepare.prepare(test_device(mock.clone())).is_err());
+    mock.clear_failures();
+    let scoreboard =
+        MetalScoreboardContext::new("compiled-dropout", "test-revision", "strict semantic mock")
+            .unwrap();
+    let mut metal = rendered
+        .prepare_with_scoreboard(test_device(mock.clone()), scoreboard)
+        .unwrap();
+    let inputs = || {
+        BTreeMap::from([(
+            "x".into(),
+            TensorData::new([3], vec![1.0, 2.0, 3.0]).unwrap(),
+        )])
+    };
+    let initial = metal.checkpoint().unwrap();
+    for stage in ["launch", "wait", "read"] {
+        match stage {
+            "launch" => mock.state.lock().unwrap().failures.launch = Some("dropout launch"),
+            "wait" => mock.state.lock().unwrap().failures.wait = Some("dropout wait"),
+            _ => mock.state.lock().unwrap().failures.read = Some("dropout output read"),
+        }
+        assert!(metal.step(inputs(), TensorData::scalar(0.01)).is_err());
+        assert_eq!(metal.step_count(), 0);
+        assert_eq!(metal.metal_session().successful_run_count(), 0);
+        assert!(!metal.metal_session().state_epoch());
+        assert_eq!(
+            metal
+                .execution_scoreboard_report()
+                .unwrap()
+                .unwrap()
+                .successful_run_count,
+            0
+        );
+        mock.clear_failures();
+        assert_eq!(metal.dropout_block_counter().unwrap(), Some(0));
+        assert_eq!(metal.checkpoint().unwrap(), initial);
+    }
+    for counter in [2, 4] {
+        let expected = cpu.step(inputs(), TensorData::scalar(0.01)).unwrap();
+        let actual = metal.step(inputs(), TensorData::scalar(0.01)).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.report().command_submission_count, 1);
+        assert_eq!(actual.report().command_wait_count, 1);
+        assert_eq!(cpu.dropout_block_counter().unwrap(), Some(counter));
+    }
+    assert_eq!(metal.dropout_block_counter().unwrap(), Some(4));
+    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+    assert_eq!(
+        metal
+            .execution_scoreboard_report()
+            .unwrap()
+            .unwrap()
+            .successful_run_count,
+        2
+    );
+    assert!(mock.calls().iter().all(|call| !call.contains("status")));
 }
 
 #[test]
