@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:9518ee160aef0afa",
+  "source_fingerprint": "fnv1a64:c7f35021f88da5d9",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -423,7 +423,7 @@
       "subject": "Compiled persistent-state training runtime",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Public `CompiledAdamWPlan` compiles graph construction, one batched reverse traversal, AdamW state/update math, mixed scheduling/capture, recurrent-state admission, and optional portable checkpoint restoration before a concrete runtime is chosen. The same immutable plan prepares independent graph-free CPU replay or strict resource-free Metal rendering with one capture identity, optimizer policy, restored step, and initial frontier; Metal preparation no longer depends on first constructing a CPU session. Existing `CpuCompiledAdamW` constructors remain compatibility delegates through the plan. Public `CompiledAdamWRuntime` and `CompiledAdamWStep` let one generic loop drive either prepared runtime while concrete Metal results retain exact device reports and scoreboard access. This does not introduce a backend dispatcher enum, CPU fallback, live-module synchronization, mixed-precision parameter state, dynamic shapes, or a generic optimizer interface."
+        "Acceptance requirement": "Public `CompiledAdamWPlan` compiles graph construction, one batched reverse traversal, AdamW state/update math, mixed scheduling/capture, recurrent-state admission, and optional portable checkpoint restoration before a concrete runtime is chosen. The same immutable plan prepares independent graph-free CPU replay or strict resource-free Metal rendering with one capture identity, optimizer policy, restored step, and initial frontier; Metal preparation no longer depends on first constructing a CPU session. Existing `CpuCompiledAdamW` constructors remain compatibility delegates through the plan. Public `CompiledSessionTarget<P>` selects an associated concrete session without a dispatcher enum: `CpuSessionTarget` prepares independent host runtimes, while `MetalSessionTarget` owns one explicit device, derives rendering from that device's capabilities, and can bind the existing scoreboard before resource preparation. Public `CompiledAdamWRuntime` and `CompiledAdamWStep` let one generic loop drive either prepared runtime while concrete Metal results retain exact device reports and scoreboard access. This does not introduce CPU fallback, live-module synchronization, mixed-precision parameter state, dynamic shapes, or a generic optimizer interface."
       }
     },
     {
