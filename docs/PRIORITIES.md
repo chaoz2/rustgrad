@@ -108,6 +108,18 @@ projection biases and LayerNorm affine state. Exclusions retain gradients,
 accumulation, clipping, moments, checkpoints, and publication on CPU and strict
 Metal; only the decay term is omitted, and mismatched policies fail checkpoint
 restoration through authenticated capture mismatch.
+The owned `CompiledModuleAdamWPlan<M>` path now seals the exact module used for
+compilation and transfers it into a target-selected
+`CompiledModuleAdamWSession<M, R>`. CPU and strict Metal sessions delegate the
+same runtime/checkpoint/AdamW capabilities, while Metal retains its typed
+output-suppressed commit. Consuming `finish` validates the complete original
+topology and raw state, atomically publishes only the trained frontier while
+holding every unique module state lock, and returns the module. Recoverable
+compile/prepare/finish errors retain the intact owner; an explicit abort returns
+the sealed host module without publication. The owned strict-Metal facade also
+forwards read-only device-session and scoreboard evidence without exposing its
+runtime or module, so no detached module/runtime lifecycle is silently
+abandoned.
 
 ### 3. P1 — lower the identical training capture to Metal
 

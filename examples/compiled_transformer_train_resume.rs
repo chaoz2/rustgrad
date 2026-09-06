@@ -15,10 +15,12 @@
 use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
-    Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuBackend, CpuSessionTarget,
-    DType, Graph, LossOptions, MetalSessionTarget, Module, NodeId, Parameter, Reduction, Result,
-    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
+    Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWRuntime,
+    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledModuleAdamWPlan,
+    CompiledModuleAdamWSession, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
+    CpuSessionTarget, DType, Graph, LossOptions, MetalSessionTarget, Module, NodeId, Parameter,
+    Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
+    cross_entropy,
 };
 use std::{collections::BTreeMap, env, error::Error};
 
@@ -147,8 +149,9 @@ fn build(
     Ok((loss, BTreeMap::from([("logits".into(), logits)])))
 }
 
-fn compile(model: &TinyCausalTransformer) -> Result<CompiledAdamWPlan> {
-    CompiledAdamWPlan::compile_module_with_dropout(config()?, dropout_config(), model, build)
+fn compile(model: TinyCausalTransformer) -> Result<CompiledModuleAdamWPlan<TinyCausalTransformer>> {
+    CompiledModuleAdamWPlan::compile_with_dropout(config()?, dropout_config(), model, build)
+        .map_err(|error| error.into_parts().1)
 }
 
 fn batch() -> Result<BTreeMap<String, TensorData>> {
@@ -177,12 +180,14 @@ fn evaluate(model: &TinyCausalTransformer) -> Result<TensorData> {
 fn run_exact_resume<R, P>(target_name: &str, mut prepare: P) -> Result<()>
 where
     R: CompiledAdamWRuntime,
-    P: FnMut(&CompiledAdamWPlan) -> Result<R>,
+    P: FnMut(
+        CompiledModuleAdamWPlan<TinyCausalTransformer>,
+    ) -> Result<CompiledModuleAdamWSession<TinyCausalTransformer, R>>,
 {
     let model = TinyCausalTransformer::new(7)?;
-    let plan = compile(&model)?;
+    let plan = compile(model)?;
     let capture_identity = plan.capture_identity();
-    let mut uninterrupted = prepare(&plan)?;
+    let mut uninterrupted = prepare(plan)?;
     let parameters = uninterrupted.parameter_snapshots()?;
     assert!(parameters.contains_key("tokens.weight"));
     assert!(
@@ -199,16 +204,19 @@ where
     let saved = uninterrupted.checkpoint()?;
     let checkpoint = CompiledAdamWCheckpoint::from_bytes(saved.into_bytes())?;
     let restored_model = TinyCausalTransformer::new(7)?;
-    let restored_plan = CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+    let tied = restored_model.tokens.weight.clone();
+    let frozen = restored_model.frozen_scale.clone();
+    let restored_plan = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
         config()?,
         dropout_config(),
-        &restored_model,
+        restored_model,
         &checkpoint,
         build,
-    )?;
+    )
+    .map_err(|error| error.into_parts().1)?;
     assert_eq!(restored_plan.capture_identity(), capture_identity);
     assert_eq!(restored_plan.step_count(), INITIAL_STEPS as u64);
-    let mut resumed = prepare(&restored_plan)?;
+    let mut resumed = prepare(restored_plan)?;
 
     for _ in 0..RESUMED_STEPS {
         let expected = uninterrupted.step(batch()?, TensorData::scalar(0.05))?;
@@ -237,11 +245,13 @@ where
     );
     assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
     let published = resumed.parameter_snapshots()?;
-    let tied_version = restored_model.tokens.weight.version()?;
-    let frozen_before = restored_model.frozen_scale.snapshot()?;
-    let runtime_checkpoint = resumed.checkpoint()?;
+    let tied_version = tied.version()?;
+    let frozen_before = frozen.snapshot()?;
     let runtime_step = resumed.step_count();
-    assert!(resumed.publish_parameters(&restored_model)?.is_clean());
+    let _uninterrupted_model = uninterrupted
+        .finish()
+        .map_err(|error| error.into_parts().1)?;
+    let restored_model = resumed.finish().map_err(|error| error.into_parts().1)?;
     let live = restored_model.state_dict()?;
     for (name, value) in &published {
         assert_eq!(&live.tensors()[name], value);
@@ -256,8 +266,6 @@ where
     let frozen_after = restored_model.frozen_scale.snapshot()?;
     assert_eq!(frozen_after.data, frozen_before.data);
     assert_eq!(frozen_after.version, frozen_before.version);
-    assert_eq!(resumed.step_count(), runtime_step);
-    assert_eq!(resumed.checkpoint()?, runtime_checkpoint);
     let versions_before_eval = restored_model
         .trainable_parameters()?
         .into_iter()
@@ -275,7 +283,7 @@ where
     }
     println!(
         "{target_name}: capture={capture_identity:016x}, steps={}, loss={:.6} -> {:.6}, exact_resume=true, published=true",
-        resumed.step_count(),
+        runtime_step,
         losses[0],
         losses.last().expect("eight losses were recorded")
     );
@@ -286,15 +294,20 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     match env::args().nth(1).as_deref().unwrap_or("cpu") {
         "cpu" => {
             let target = CpuSessionTarget::new();
-            run_exact_resume("CPU", |plan| plan.prepare(&target))?;
+            run_exact_resume("CPU", |plan| {
+                plan.prepare(&target).map_err(|error| error.into_parts().1)
+            })?;
         }
         "metal" => {
             let device = MetalRuntime::load()?.device(0)?;
             let target = MetalSessionTarget::new(device, 64)?;
             run_exact_resume("Metal", |plan| {
-                let rendered = plan.metal_plan(target.renderer().clone())?;
-                assert_eq!(rendered.summary().fallback_count, 0);
-                plan.prepare(&target)
+                assert_eq!(
+                    plan.metal_summary(target.renderer().clone())?
+                        .fallback_count,
+                    0
+                );
+                plan.prepare(&target).map_err(|error| error.into_parts().1)
             })?;
         }
         other => {

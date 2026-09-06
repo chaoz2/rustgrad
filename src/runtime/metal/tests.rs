@@ -639,12 +639,12 @@ use crate::{
     Backend, BinaryOp, BufferRole, CapturedAppendStateInference, CapturedInference,
     CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
     CompareOp, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingRuntime, CompiledTrainingStep,
-    CpuBackend, CpuCompiledAdamW, CpuSession, CpuSessionTarget, DType, EffectBatchStep,
-    EffectRuntime, GgmlType, Graph, IndexValue, InferenceAppendStateLink, InferenceStateLink,
-    KernelBindings, KernelBufferDesc, LaneInstruction, MetalSessionTarget, MovementKernelKind,
-    MovementValue, NodeId, Operation, QuantizedTensorData, ReduceKind, ResNet, ResNetConfig,
-    ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledModuleAdamWPlan, CompiledTrainingRuntime,
+    CompiledTrainingStep, CpuBackend, CpuCompiledAdamW, CpuSession, CpuSessionTarget, DType,
+    EffectBatchStep, EffectRuntime, GgmlType, Graph, IndexValue, InferenceAppendStateLink,
+    InferenceStateLink, KernelBindings, KernelBufferDesc, LaneInstruction, MetalSessionTarget,
+    MovementKernelKind, MovementValue, NodeId, Operation, QuantizedTensorData, ReduceKind, ResNet,
+    ResNetConfig, ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
     TrainingDropoutProvider, TrainingParameterInit, TypedValue, UOp, UType, schedule,
 };
 
@@ -1178,6 +1178,7 @@ fn compiled_dropout_adamw_plan() -> CompiledAdamWPlan {
     .unwrap()
 }
 
+#[derive(Debug)]
 struct CompiledPublicationFixture {
     first: Parameter,
     second: Parameter,
@@ -1223,6 +1224,31 @@ fn compiled_publication_adamw_plan(module: &CompiledPublicationFixture) -> Compi
         let nonempty_loss = graph.add(first_loss, second_loss)?;
         let loss = graph.add(nonempty_loss, empty_loss)?;
         Ok((loss, BTreeMap::new()))
+    })
+    .unwrap()
+}
+
+fn compiled_owned_publication_adamw_plan(
+    module: CompiledPublicationFixture,
+) -> CompiledModuleAdamWPlan<CompiledPublicationFixture> {
+    let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_input("target", [2], DType::F32)
+        .unwrap();
+    CompiledModuleAdamWPlan::compile(config, module, |module, graph, inputs| {
+        let first = module.first.bind(graph)?;
+        let second = module.second.bind(graph)?;
+        let empty = module.empty.bind(graph)?;
+        let first_delta = graph.sub(first, inputs["target"])?;
+        let first_squared = graph.square(first_delta)?;
+        let first_loss = graph.sum_all(first_squared)?;
+        let target_sum = graph.sum_all(inputs["target"])?;
+        let second_delta = graph.sub(second, target_sum)?;
+        let second_loss = graph.square(second_delta)?;
+        let empty_squared = graph.square(empty)?;
+        let empty_loss = graph.sum_all(empty_squared)?;
+        let nonempty_loss = graph.add(first_loss, second_loss)?;
+        Ok((graph.add(nonempty_loss, empty_loss)?, BTreeMap::new()))
     })
     .unwrap()
 }
@@ -1599,6 +1625,95 @@ fn compiled_adamw_parameter_publication_reads_only_parameters_and_retries_atomic
         successful_runs
     );
     assert_eq!(metal.metal_session().state_epoch(), state_epoch);
+}
+
+#[test]
+fn owned_compiled_module_metal_session_suppresses_outputs_and_recovers_finish() {
+    let module = CompiledPublicationFixture::new([1.0, -1.0], 0.5);
+    let first = module.first.clone();
+    let second = module.second.clone();
+    let empty = module.empty.clone();
+    let before_versions = [
+        first.version().unwrap(),
+        second.version().unwrap(),
+        empty.version().unwrap(),
+    ];
+    let plan = compiled_owned_publication_adamw_plan(module);
+    let capture_identity = plan.capture_identity();
+    let mock = Arc::new(MockDispatch::default());
+    let target = MetalSessionTarget::new(test_device(mock.clone()), 8)
+        .unwrap()
+        .with_scoreboard(
+            MetalScoreboardContext::new("owned-compiled-adamw", "test-revision", "semantic mock")
+                .unwrap(),
+        );
+    let summary = plan.metal_summary(target.renderer().clone()).unwrap();
+    assert_eq!(summary.fallback_count, 0);
+    let mut session = plan.prepare(&target).unwrap();
+    mock.clear_calls();
+    let commit = session
+        .step_without_host_outputs(
+            BTreeMap::from([(
+                "target".into(),
+                TensorData::new([2], vec![0.0, 0.0]).unwrap(),
+            )]),
+            TensorData::scalar(0.01),
+        )
+        .unwrap();
+    assert_eq!(commit.capture_identity(), capture_identity);
+    assert_eq!(commit.step(), 1);
+    assert_eq!(commit.report().output_count, 0);
+    assert_eq!(commit.report().retained_d2h_calls, 0);
+    assert_eq!(commit.report().retained_d2h_bytes, 0);
+    assert!(mock.calls().iter().all(|call| !call.starts_with("read:")));
+    assert_eq!(session.metal_session().successful_run_count(), 1);
+    assert!(session.scoreboard_recording_error().is_none());
+    let scoreboard = session.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(scoreboard.successful_run_count, 1);
+    assert_eq!(scoreboard.successful_runs[0].output_count, 0);
+    assert_eq!(
+        session.execution_scoreboard().unwrap().report().unwrap(),
+        scoreboard
+    );
+
+    let expected = session.parameter_snapshots().unwrap();
+    mock.clear_calls();
+    mock.state.lock().unwrap().failures.read_after = Some((1, "owned finish"));
+    let error = session.finish().unwrap_err();
+    assert_eq!(error.session().step_count(), 1);
+    assert_eq!(first.version().unwrap(), before_versions[0]);
+    assert_eq!(second.version().unwrap(), before_versions[1]);
+    assert_eq!(empty.version().unwrap(), before_versions[2]);
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|call| call.starts_with("read:"))
+            .count(),
+        1
+    );
+
+    mock.clear_failures();
+    mock.clear_calls();
+    let module = error.into_session().finish().unwrap();
+    let reads = mock
+        .calls()
+        .into_iter()
+        .filter(|call| call.starts_with("read:"))
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 2, "the zero-byte parameter must not be read");
+    assert_eq!(
+        reads
+            .iter()
+            .map(|call| call.rsplit(':').next().unwrap().parse::<usize>().unwrap())
+            .sum::<usize>(),
+        12
+    );
+    assert_eq!(module.first.value().unwrap(), expected["first"]);
+    assert_eq!(module.second.value().unwrap(), expected["second"]);
+    assert_eq!(module.empty.value().unwrap(), expected["empty"]);
+    assert_eq!(module.first.version().unwrap(), before_versions[0] + 1);
+    assert_eq!(module.second.version().unwrap(), before_versions[1] + 1);
+    assert_eq!(module.empty.version().unwrap(), before_versions[2] + 1);
 }
 
 #[test]

@@ -1,7 +1,10 @@
 //! Graph-free CPU replay for static training programs with recurrent state.
 
 use super::target::{CpuSessionTarget, MetalSessionTarget, SessionTarget};
-use crate::nn::{StateKind, TrainingDropoutProvider};
+use crate::nn::{
+    Parameter, ParameterRestore, ParameterSnapshot, StateKind, TrainingDropoutProvider,
+    next_version, restore_parameters,
+};
 use crate::runtime::metal::{
     MetalDevice, MetalDeviceRun, MetalDeviceRunReport, MetalDeviceSession,
     MetalDeviceSessionSummary, MetalError, MetalRenderer, MetalScoreboardContext,
@@ -15,7 +18,10 @@ use crate::{
     ScheduleStateBinding, ScheduleValueBinding, Shape, StateDict, TensorData, bind_schedule_states,
     combine_mixed_schedules, load_safetensors, save_safetensors, schedule_effects, schedule_many,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 const INTERNAL_PREFIX: &str = "__rustgrad_compiled_training_";
 const LEARNING_RATE_INPUT: &str = "__rustgrad_compiled_training_learning_rate";
@@ -214,6 +220,179 @@ struct ModuleParameterEntry {
 struct ModuleParameterPlan {
     entries: Vec<ModuleParameterEntry>,
     noncanonical_names: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SealedModuleVisit {
+    name: String,
+    identity: ParameterId,
+    kind: StateKind,
+    trainable: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SealedModuleState {
+    name: String,
+    parameter: Parameter,
+    snapshot: ParameterSnapshot,
+    kind: StateKind,
+    trainable: bool,
+}
+
+/// Complete host-module state retained while an owned compiled session runs.
+///
+/// The seal is deliberately private: it is meaningful only together with the
+/// exact module value consumed by [`CompiledModuleAdamWPlan`].
+#[derive(Clone, Debug)]
+struct CompiledModuleSeal {
+    visits: Vec<SealedModuleVisit>,
+    states: BTreeMap<ParameterId, SealedModuleState>,
+}
+
+impl CompiledModuleSeal {
+    fn capture(module: &(impl Module + ?Sized)) -> Result<Self> {
+        let mut names = BTreeSet::new();
+        let mut visits = Vec::new();
+        let mut states = BTreeMap::<ParameterId, SealedModuleState>::new();
+        let mut error = None;
+        module.visit("", &mut |name, parameter, kind| {
+            if error.is_some() {
+                return;
+            }
+            if !names.insert(name.clone()) {
+                error = Some(training("compiled module state names repeat"));
+                return;
+            }
+            let snapshot = match parameter.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    error = Some(err);
+                    return;
+                }
+            };
+            let trainable = snapshot.trainable && matches!(kind, StateKind::Parameter);
+            visits.push(SealedModuleVisit {
+                name: name.clone(),
+                identity: snapshot.identity,
+                kind,
+                trainable,
+            });
+            if let Some(first) = states.get(&snapshot.identity) {
+                let same_bytes = first.snapshot.data.to_le_bytes().and_then(|expected| {
+                    snapshot.data.to_le_bytes().map(|actual| expected == actual)
+                });
+                match same_bytes {
+                    Ok(true)
+                        if first.kind == kind
+                            && first.snapshot.trainable == snapshot.trainable
+                            && first.snapshot.shape == snapshot.shape
+                            && first.snapshot.dtype == snapshot.dtype
+                            && first.snapshot.version == snapshot.version => {}
+                    Ok(_) => {
+                        error = Some(training(
+                            "tied compiled module state has inconsistent kind or snapshot",
+                        ));
+                    }
+                    Err(err) => error = Some(err),
+                }
+                return;
+            }
+            states.insert(
+                snapshot.identity,
+                SealedModuleState {
+                    name,
+                    parameter: parameter.clone(),
+                    snapshot,
+                    kind,
+                    trainable,
+                },
+            );
+        });
+        match error {
+            Some(error) => Err(error),
+            None => {
+                for state in states.values().filter(|state| state.trainable) {
+                    next_version(state.snapshot.version)?;
+                }
+                Ok(Self { visits, states })
+            }
+        }
+    }
+
+    fn validate_unchanged(&self, module: &(impl Module + ?Sized)) -> Result<()> {
+        let current = Self::capture(module)?;
+        if current.visits != self.visits || current.states.keys().ne(self.states.keys()) {
+            return Err(training("owned compiled module topology changed"));
+        }
+        for (identity, expected) in &self.states {
+            let actual = &current.states[identity];
+            if actual.name != expected.name
+                || actual.kind != expected.kind
+                || actual.trainable != expected.trainable
+                || actual.snapshot.shape != expected.snapshot.shape
+                || actual.snapshot.dtype != expected.snapshot.dtype
+                || actual.snapshot.version != expected.snapshot.version
+                || actual.snapshot.input_name != expected.snapshot.input_name
+                || actual.snapshot.data.to_le_bytes()? != expected.snapshot.data.to_le_bytes()?
+            {
+                return Err(training("owned compiled module state changed while sealed"));
+            }
+        }
+        Ok(())
+    }
+
+    fn publish(
+        &self,
+        module: &(impl Module + ?Sized),
+        parameters: &BTreeMap<String, TensorData>,
+    ) -> Result<LoadReport> {
+        self.validate_unchanged(module)?;
+        let trainable = self
+            .states
+            .values()
+            .filter(|state| state.trainable)
+            .map(|state| (state.name.as_str(), state))
+            .collect::<BTreeMap<_, _>>();
+        if parameters.len() != trainable.len()
+            || parameters
+                .keys()
+                .map(String::as_str)
+                .ne(trainable.keys().copied())
+        {
+            return Err(training(
+                "owned compiled module trainable parameter names changed",
+            ));
+        }
+
+        let mut restores = Vec::with_capacity(self.states.len());
+        let mut loaded_keys = Vec::with_capacity(trainable.len());
+        for state in self.states.values() {
+            let (data, restored_version) = if state.trainable {
+                let value = &parameters[&state.name];
+                if value.shape() != &state.snapshot.shape || value.dtype() != state.snapshot.dtype {
+                    return Err(training(
+                        "owned compiled module trainable parameter descriptor changed",
+                    ));
+                }
+                loaded_keys.push(state.name.clone());
+                (value.clone(), next_version(state.snapshot.version)?)
+            } else {
+                (state.snapshot.data.clone(), state.snapshot.version)
+            };
+            restores.push(ParameterRestore {
+                parameter: state.parameter.clone(),
+                data,
+                expected_version: state.snapshot.version,
+                restored_version,
+            });
+        }
+        restore_parameters(restores)?;
+        loaded_keys.sort();
+        Ok(LoadReport {
+            loaded_keys,
+            ..LoadReport::default()
+        })
+    }
 }
 
 impl ModuleParameterPlan {
@@ -1245,6 +1424,174 @@ pub struct CompiledAdamWPlan {
     loss_scale: f32,
     progress: AdamWProgress,
     dropout: Option<CompiledDropoutState>,
+}
+
+/// Resource-free AdamW plan paired with the exact module value used to build it.
+///
+/// The module is not exposed while the plan or its prepared session exists.
+/// This prevents ordinary callers from accidentally treating its stale host
+/// parameters as the active training frontier. Successful
+/// [`CompiledModuleAdamWSession::finish`] publishes before returning it; the
+/// explicit abort path returns the sealed host state without publication.
+pub struct CompiledModuleAdamWPlan<M> {
+    module: M,
+    plan: CompiledAdamWPlan,
+    seal: CompiledModuleSeal,
+}
+
+/// Prepared compiled AdamW session that owns its source module for the complete
+/// replay lifecycle.
+pub struct CompiledModuleAdamWSession<M, R> {
+    module: M,
+    runtime: R,
+    seal: CompiledModuleSeal,
+}
+
+/// Recoverable compilation failure retaining the exact uncompiled module.
+pub struct CompiledModuleAdamWCompileError<M> {
+    module: M,
+    source: Error,
+}
+
+impl<M> CompiledModuleAdamWCompileError<M> {
+    pub fn source_error(&self) -> &Error {
+        &self.source
+    }
+
+    pub fn into_module(self) -> M {
+        self.module
+    }
+
+    pub fn into_parts(self) -> (M, Error) {
+        (self.module, self.source)
+    }
+}
+
+impl<M> fmt::Debug for CompiledModuleAdamWCompileError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledModuleAdamWCompileError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> fmt::Display for CompiledModuleAdamWCompileError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "owned compiled AdamW compilation failed: {}",
+            self.source
+        )
+    }
+}
+
+impl<M> std::error::Error for CompiledModuleAdamWCompileError<M> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Recoverable target-preparation failure retaining the unconsumed owned plan.
+pub struct CompiledModuleAdamWPrepareError<M, E> {
+    plan: CompiledModuleAdamWPlan<M>,
+    source: E,
+}
+
+impl<M, E> CompiledModuleAdamWPrepareError<M, E> {
+    pub fn source_error(&self) -> &E {
+        &self.source
+    }
+
+    pub fn into_plan(self) -> CompiledModuleAdamWPlan<M> {
+        self.plan
+    }
+
+    pub fn into_parts(self) -> (CompiledModuleAdamWPlan<M>, E) {
+        (self.plan, self.source)
+    }
+}
+
+impl<M, E: fmt::Debug> fmt::Debug for CompiledModuleAdamWPrepareError<M, E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledModuleAdamWPrepareError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M, E: fmt::Display> fmt::Display for CompiledModuleAdamWPrepareError<M, E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "owned compiled AdamW preparation failed: {}",
+            self.source
+        )
+    }
+}
+
+impl<M, E: std::error::Error + 'static> std::error::Error
+    for CompiledModuleAdamWPrepareError<M, E>
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Publication failure retaining the intact owned module/session pair.
+pub struct CompiledModuleAdamWFinishError<M, R> {
+    session: CompiledModuleAdamWSession<M, R>,
+    source: Error,
+}
+
+impl<M, R> CompiledModuleAdamWFinishError<M, R> {
+    pub fn source_error(&self) -> &Error {
+        &self.source
+    }
+
+    pub fn session(&self) -> &CompiledModuleAdamWSession<M, R> {
+        &self.session
+    }
+
+    pub fn into_session(self) -> CompiledModuleAdamWSession<M, R> {
+        self.session
+    }
+
+    pub fn into_parts(self) -> (CompiledModuleAdamWSession<M, R>, Error) {
+        (self.session, self.source)
+    }
+
+    /// Discards the failed runtime frontier and returns the sealed host module
+    /// exactly as it currently exists, without attempting publication again.
+    pub fn into_module_without_publication(self) -> M {
+        self.session.into_module_without_publication()
+    }
+}
+
+impl<M, R> fmt::Debug for CompiledModuleAdamWFinishError<M, R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledModuleAdamWFinishError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M, R> fmt::Display for CompiledModuleAdamWFinishError<M, R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "owned compiled AdamW publication failed: {}",
+            self.source
+        )
+    }
+}
+
+impl<M, R> std::error::Error for CompiledModuleAdamWFinishError<M, R> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// One compiled AdamW training program with recurrent first/second moments, a
@@ -2687,6 +3034,220 @@ impl CompiledAdamWPlan {
     }
 }
 
+impl<M: Module> CompiledModuleAdamWPlan<M> {
+    fn build_owned<F>(
+        module: M,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(&M) -> Result<CompiledAdamWPlan>,
+    {
+        let result: Result<(CompiledAdamWPlan, CompiledModuleSeal)> = (|| {
+            let seal = CompiledModuleSeal::capture(&module)?;
+            let plan = build(&module)?;
+            seal.validate_unchanged(&module)?;
+            Ok((plan, seal))
+        })();
+        match result {
+            Ok((plan, seal)) => Ok(Self { module, plan, seal }),
+            Err(source) => Err(CompiledModuleAdamWCompileError { module, source }),
+        }
+    }
+
+    /// Compiles AdamW from, and takes ownership of, one exact module value.
+    pub fn compile<F>(
+        config: CompiledAdamWConfig,
+        module: M,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Self::build_owned(module, |module| {
+            CompiledAdamWPlan::compile_module(config, module, build)
+        })
+    }
+
+    /// Compiles the explicit recurrent-dropout workload while taking ownership
+    /// of its exact module value.
+    pub fn compile_with_dropout<F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: M,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Self::build_owned(module, |module| {
+            CompiledAdamWPlan::compile_module_with_dropout(config, dropout, module, build)
+        })
+    }
+
+    /// Rebuilds an owned module program and restores its authenticated AdamW
+    /// frontier before target preparation.
+    pub fn compile_from_checkpoint<F>(
+        config: CompiledAdamWConfig,
+        module: M,
+        checkpoint: &CompiledAdamWCheckpoint,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Self::build_owned(module, |module| {
+            CompiledAdamWPlan::compile_module_from_checkpoint(config, module, checkpoint, build)
+        })
+    }
+
+    /// Rebuilds the owned recurrent-dropout workload and restores its complete
+    /// optimizer/dropout frontier.
+    pub fn compile_with_dropout_from_checkpoint<F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: M,
+        checkpoint: &CompiledAdamWCheckpoint,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Self::build_owned(module, |module| {
+            CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+                config, dropout, module, checkpoint, build,
+            )
+        })
+    }
+
+    /// Consumes this owner into a target-specific session. A preparation error
+    /// retains the complete plan and module for inspection or retry.
+    pub fn prepare<T>(
+        self,
+        target: &T,
+    ) -> std::result::Result<<T as SessionTarget<Self>>::Session, <T as SessionTarget<Self>>::Error>
+    where
+        T: SessionTarget<Self>,
+    {
+        target.prepare(self)
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.plan.capture_identity()
+    }
+
+    pub fn step_count(&self) -> u64 {
+        self.plan.step_count()
+    }
+
+    pub fn dropout_config(&self) -> Option<CompiledDropoutConfig> {
+        self.plan.dropout_config()
+    }
+
+    /// Inspects strict Metal admission without exposing an independently
+    /// preparable runtime path or releasing the owned module. Resource
+    /// preparation still consumes this owner through [`Self::prepare`].
+    pub fn metal_summary(&self, renderer: MetalRenderer) -> Result<MetalDeviceSessionSummary> {
+        Ok(self.plan.metal_plan(renderer)?.summary().clone())
+    }
+}
+
+impl<M, R> CompiledModuleAdamWSession<M, R> {
+    /// Discards the compiled runtime frontier and returns the sealed host
+    /// module without publishing any trained parameter values.
+    pub fn into_module_without_publication(self) -> M {
+        self.module
+    }
+}
+
+impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleAdamWSession<M, R> {
+    /// Atomically publishes the runtime's exact trainable frontier and returns
+    /// the owned module. The complete module topology, identities, versions,
+    /// descriptors, and frozen/buffer bytes must still match the compile seal.
+    /// A failure retains the intact session and can be recovered with
+    /// [`CompiledModuleAdamWFinishError::into_session`].
+    pub fn finish(self) -> std::result::Result<M, CompiledModuleAdamWFinishError<M, R>> {
+        if let Err(source) = self.seal.validate_unchanged(&self.module) {
+            return Err(CompiledModuleAdamWFinishError {
+                session: self,
+                source,
+            });
+        }
+        let parameters = match self.runtime.parameter_snapshots() {
+            Ok(parameters) => parameters,
+            Err(source) => {
+                return Err(CompiledModuleAdamWFinishError {
+                    session: self,
+                    source,
+                });
+            }
+        };
+        if let Err(source) = self.seal.publish(&self.module, &parameters) {
+            return Err(CompiledModuleAdamWFinishError {
+                session: self,
+                source,
+            });
+        }
+        let Self { module, .. } = self;
+        Ok(module)
+    }
+}
+
+impl<M: Module> CompiledModuleAdamWSession<M, MetalCompiledAdamW> {
+    /// Strict Metal replay that commits the complete device state frontier
+    /// without downloading loss or named outputs.
+    pub fn step_without_host_outputs(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<MetalCompiledAdamWCommitResult> {
+        self.runtime
+            .step_without_host_outputs(inputs, learning_rate)
+    }
+
+    /// Returns the sealed runtime's read-only Metal session evidence without
+    /// exposing the owned module or mutable backend internals.
+    pub fn metal_session(&self) -> &MetalDeviceSession {
+        self.runtime.metal_session()
+    }
+
+    /// Returns the opt-in successful-step recorder attached during target
+    /// preparation, when present.
+    pub fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
+        self.runtime.execution_scoreboard()
+    }
+
+    /// Snapshots the owned Metal runtime's successfully recorded prefix.
+    pub fn execution_scoreboard_report(
+        &self,
+    ) -> std::result::Result<Option<MetalSessionScoreboardReport>, MetalScoreboardError> {
+        self.runtime.execution_scoreboard_report()
+    }
+
+    /// Returns the first fail-soft scoreboard recording error, when recording
+    /// has frozen.
+    pub fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
+        self.runtime.scoreboard_recording_error()
+    }
+}
+
 impl CpuCompiledAdamW {
     pub fn compile<F>(
         config: CompiledAdamWConfig,
@@ -3029,6 +3590,85 @@ impl CompiledAdamWRuntime for CpuCompiledAdamW {
     }
 }
 
+impl<M, R> CompiledTrainingRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledTrainingRuntime,
+{
+    type Step = R::Step;
+
+    fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        self.runtime.step(inputs, learning_rate)
+    }
+
+    fn step_count(&self) -> u64 {
+        self.runtime.step_count()
+    }
+
+    fn capture_identity(&self) -> u64 {
+        self.runtime.capture_identity()
+    }
+
+    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.runtime.parameter_snapshots()
+    }
+}
+
+impl<M, R> CompiledCheckpointRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledCheckpointRuntime,
+{
+    type Checkpoint = R::Checkpoint;
+
+    fn checkpoint(&self) -> Result<Self::Checkpoint> {
+        self.runtime.checkpoint()
+    }
+}
+
+impl<M, R> CompiledAdamWRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledAdamWRuntime,
+{
+    fn gradient_accumulation_steps(&self) -> u64 {
+        self.runtime.gradient_accumulation_steps()
+    }
+
+    fn max_gradient_norm(&self) -> Option<f32> {
+        self.runtime.max_gradient_norm()
+    }
+
+    fn loss_scale(&self) -> f32 {
+        self.runtime.loss_scale()
+    }
+
+    fn optimizer_step(&self) -> Result<u64> {
+        self.runtime.optimizer_step()
+    }
+
+    fn accumulation_index(&self) -> Result<u64> {
+        self.runtime.accumulation_index()
+    }
+
+    fn zero_grad(&mut self) -> Result<CompiledAdamWZeroGradResult> {
+        self.runtime.zero_grad()
+    }
+
+    fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.runtime.first_moment_snapshots()
+    }
+
+    fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.runtime.second_moment_snapshots()
+    }
+
+    fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.runtime.gradient_accumulator_snapshots()
+    }
+}
+
 fn adamw_step_result(
     inner: CompiledTrainingStepResult,
     progress: AdamWProgress,
@@ -3061,6 +3701,62 @@ impl<'a> SessionTarget<&'a CompiledAdamWPlan> for MetalSessionTarget {
             }
             None => rendered.prepare(self.device().clone()),
         }
+    }
+}
+
+impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for CpuSessionTarget {
+    type Session = CompiledModuleAdamWSession<M, CpuCompiledAdamW>;
+    type Error = CompiledModuleAdamWPrepareError<M, Error>;
+
+    fn prepare(
+        &self,
+        plan: CompiledModuleAdamWPlan<M>,
+    ) -> std::result::Result<Self::Session, Self::Error> {
+        if let Err(source) = plan.seal.validate_unchanged(&plan.module) {
+            return Err(CompiledModuleAdamWPrepareError { plan, source });
+        }
+        let runtime = match plan.plan.prepare_cpu() {
+            Ok(runtime) => runtime,
+            Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
+        };
+        let CompiledModuleAdamWPlan {
+            module,
+            seal,
+            plan: _,
+        } = plan;
+        Ok(CompiledModuleAdamWSession {
+            module,
+            runtime,
+            seal,
+        })
+    }
+}
+
+impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for MetalSessionTarget {
+    type Session = CompiledModuleAdamWSession<M, MetalCompiledAdamW>;
+    type Error = CompiledModuleAdamWPrepareError<M, Error>;
+
+    fn prepare(
+        &self,
+        plan: CompiledModuleAdamWPlan<M>,
+    ) -> std::result::Result<Self::Session, Self::Error> {
+        if let Err(source) = plan.seal.validate_unchanged(&plan.module) {
+            return Err(CompiledModuleAdamWPrepareError { plan, source });
+        }
+        let runtime = match <Self as SessionTarget<&CompiledAdamWPlan>>::prepare(self, &plan.plan) {
+            Ok(runtime) => runtime,
+            Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
+        };
+        let CompiledModuleAdamWPlan {
+            module,
+            seal,
+            plan: _,
+        } = plan;
+        Ok(CompiledModuleAdamWSession {
+            module,
+            runtime,
+            seal,
+        })
     }
 }
 
@@ -4314,6 +5010,7 @@ mod tests {
     struct TiedFrozenModule {
         shared: Parameter,
         frozen: Parameter,
+        buffer: Parameter,
     }
 
     impl TiedFrozenModule {
@@ -4321,6 +5018,7 @@ mod tests {
             Self {
                 shared: Parameter::new(TensorData::new([2], vec![0.25, -0.5]).unwrap(), true),
                 frozen: Parameter::new(TensorData::new([2], frozen.to_vec()).unwrap(), false),
+                buffer: Parameter::new(TensorData::scalar(3.0), false),
             }
         }
     }
@@ -4331,6 +5029,7 @@ mod tests {
             visitor("shared".into(), &self.shared, StateKind::Parameter);
             visitor("shared_alias".into(), &self.shared, StateKind::Parameter);
             visitor("frozen".into(), &self.frozen, StateKind::Parameter);
+            visitor("buffer".into(), &self.buffer, StateKind::Buffer);
         }
     }
 
@@ -5777,6 +6476,146 @@ mod tests {
         assert_eq!(compiled.parameter_snapshots().unwrap(), parameters);
         assert_eq!(compiled.first_moment_snapshots().unwrap(), first);
         assert_eq!(compiled.second_moment_snapshots().unwrap(), second);
+    }
+
+    #[test]
+    fn owned_module_compile_failures_retain_module_and_preflight_versions() {
+        let module = TiedFrozenModule::new([1.0, -1.0]);
+        let shared_identity = module.shared.id();
+        let error = match CompiledModuleAdamWPlan::compile(module_config(), module, |_, _, _| {
+            Err(training("owned graph builder rejected the program"))
+        }) {
+            Ok(_) => panic!("failing graph builder compiled"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .source_error()
+                .to_string()
+                .contains("owned graph builder rejected")
+        );
+        let (module, source) = error.into_parts();
+        assert!(source.to_string().contains("owned graph builder rejected"));
+        assert_eq!(module.shared.id(), shared_identity);
+
+        module.shared.set_version_for_test(u64::MAX).unwrap();
+        let error =
+            match CompiledModuleAdamWPlan::compile(module_config(), module, build_tied_frozen) {
+                Ok(_) => panic!("unpublishable maximum-version module compiled"),
+                Err(error) => error,
+            };
+        assert!(matches!(
+            error.source_error(),
+            Error::ParameterVersionOverflow { version: u64::MAX }
+        ));
+        let module = error.into_module();
+        assert_eq!(module.shared.id(), shared_identity);
+        assert_eq!(module.shared.version().unwrap(), u64::MAX);
+
+        let dropout = CompiledDropoutConfig::new(CompiledDropoutKey([31, 37]));
+        let source = TiedFrozenModule::new([1.0, -1.0]);
+        let checkpoint = CompiledAdamWPlan::compile_module_with_dropout(
+            module_config(),
+            dropout,
+            &source,
+            build_tied_dropout,
+        )
+        .unwrap()
+        .prepare_cpu()
+        .unwrap()
+        .checkpoint()
+        .unwrap();
+        let candidate = TiedFrozenModule::new([1.0, -1.0]);
+        let candidate_identity = candidate.shared.id();
+        let error = match CompiledModuleAdamWPlan::compile_from_checkpoint(
+            module_config(),
+            candidate,
+            &checkpoint,
+            build_tied_frozen,
+        ) {
+            Ok(_) => panic!("mismatched checkpoint restored"),
+            Err(error) => error,
+        };
+        assert_eq!(error.into_module().shared.id(), candidate_identity);
+    }
+
+    #[test]
+    fn owned_module_adamw_session_seals_replay_and_finishes_atomically() {
+        let module = TiedFrozenModule::new([1.0, -1.0]);
+        let shared = module.shared.clone();
+        let frozen = module.frozen.clone();
+        let buffer = module.buffer.clone();
+        let shared_before = shared.snapshot().unwrap();
+        let frozen_before = frozen.snapshot().unwrap();
+        let buffer_before = buffer.snapshot().unwrap();
+        let plan =
+            CompiledModuleAdamWPlan::compile(module_config(), module, build_tied_frozen).unwrap();
+        let capture_identity = plan.capture_identity();
+        let mut session = plan.prepare(&CpuSessionTarget::new()).unwrap();
+        let input = BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]);
+        let step = session.step(input, TensorData::scalar(0.01)).unwrap();
+        assert_eq!(step.capture_identity(), capture_identity);
+        let published = session.parameter_snapshots().unwrap();
+        let checkpoint = session.checkpoint().unwrap();
+        let module = session.finish().unwrap();
+
+        assert_eq!(module.shared.value().unwrap(), published["shared"]);
+        assert_eq!(module.shared.version().unwrap(), shared_before.version + 1);
+        assert_eq!(module.frozen.value().unwrap(), frozen_before.data);
+        assert_eq!(module.frozen.version().unwrap(), frozen_before.version);
+        assert_eq!(module.buffer.value().unwrap(), buffer_before.data);
+        assert_eq!(module.buffer.version().unwrap(), buffer_before.version);
+        assert_eq!(module.shared.id(), shared.id());
+        assert_eq!(module.frozen.id(), frozen.id());
+        assert_eq!(module.buffer.id(), buffer.id());
+        assert_eq!(
+            CompiledAdamWCheckpoint::from_bytes(checkpoint.as_bytes().to_vec()).unwrap(),
+            checkpoint
+        );
+
+        let stale = TiedFrozenModule::new([1.0, -1.0]);
+        let stale_frozen = stale.frozen.clone();
+        let plan =
+            CompiledModuleAdamWPlan::compile(module_config(), stale, build_tied_frozen).unwrap();
+        let mut session = plan.prepare(&CpuSessionTarget::new()).unwrap();
+        session
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        let runtime_checkpoint = session.checkpoint().unwrap();
+        stale_frozen
+            .replace(TensorData::new([2], vec![7.0, 8.0]).unwrap())
+            .unwrap();
+        let error = match session.finish() {
+            Ok(_) => panic!("stale module state must reject publication"),
+            Err(error) => error,
+        };
+        assert_eq!(error.session().step_count(), 1);
+        assert_eq!(error.session().checkpoint().unwrap(), runtime_checkpoint);
+        assert_eq!(error.session().parameter_snapshots().unwrap().len(), 1);
+        assert_eq!(stale_frozen.value().unwrap().values(), &[7.0, 8.0]);
+        let stale = error.into_module_without_publication();
+        assert_eq!(stale.frozen.value().unwrap().values(), &[7.0, 8.0]);
+
+        let stale_before_prepare = TiedFrozenModule::new([1.0, -1.0]);
+        let leaked = stale_before_prepare.shared.clone();
+        let plan = CompiledModuleAdamWPlan::compile(
+            module_config(),
+            stale_before_prepare,
+            build_tied_frozen,
+        )
+        .unwrap();
+        let capture_identity = plan.capture_identity();
+        leaked
+            .replace(TensorData::new([2], vec![4.0, 5.0]).unwrap())
+            .unwrap();
+        let error = match plan.prepare(&CpuSessionTarget::new()) {
+            Ok(_) => panic!("stale owned plan prepared"),
+            Err(error) => error,
+        };
+        assert_eq!(error.into_plan().capture_identity(), capture_identity);
     }
 
     #[test]

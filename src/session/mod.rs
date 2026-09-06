@@ -19,10 +19,12 @@ pub use compiled_training::{
     CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
     CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWZeroGradResult,
     CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
-    CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult, CompiledTrainingRuntime,
-    CompiledTrainingStep, CompiledTrainingStepResult, CpuCompiledAdamW, CpuCompiledMomentumSgd,
-    MetalCompiledAdamW, MetalCompiledAdamWCommitResult, MetalCompiledAdamWPlan,
-    MetalCompiledAdamWStepResult, TrainingParameterInit,
+    CompiledModuleAdamWCompileError, CompiledModuleAdamWFinishError, CompiledModuleAdamWPlan,
+    CompiledModuleAdamWPrepareError, CompiledModuleAdamWSession, CompiledMomentumSgdConfig,
+    CompiledMomentumSgdStepResult, CompiledTrainingRuntime, CompiledTrainingStep,
+    CompiledTrainingStepResult, CpuCompiledAdamW, CpuCompiledMomentumSgd, MetalCompiledAdamW,
+    MetalCompiledAdamWCommitResult, MetalCompiledAdamWPlan, MetalCompiledAdamWStepResult,
+    TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,

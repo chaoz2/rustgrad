@@ -1,6 +1,4 @@
 #[cfg(target_os = "macos")]
-use rustgrad::CompiledTrainingRuntime;
-#[cfg(target_os = "macos")]
 use rustgrad::MetalSessionTarget;
 use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::{MetalCapabilities, MetalRenderer};
@@ -10,9 +8,10 @@ use rustgrad::runtime::metal::{
 };
 use rustgrad::{
     Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuBackend, CpuSessionTarget,
-    DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Parameter, Reduction,
-    Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
+    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledModuleAdamWPlan,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
+    LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Parameter, Reduction, Result, Scalar,
+    Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
 };
 use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
@@ -177,6 +176,12 @@ fn evaluate(model: &TinyCausalTransformer) -> TensorData {
 fn compiled_transformer(model: &TinyCausalTransformer) -> CompiledAdamWPlan {
     CompiledAdamWPlan::compile_module_with_dropout(config(), dropout_config(), model, build)
         .expect("the fixed causal Transformer training program must compile")
+}
+
+fn owned_compiled_transformer(
+    model: TinyCausalTransformer,
+) -> rustgrad::CompiledModuleAdamWPlan<TinyCausalTransformer> {
+    CompiledModuleAdamWPlan::compile_with_dropout(config(), dropout_config(), model, build).unwrap()
 }
 
 fn run_exact_resume<R, P>(mut prepare: P) -> Vec<f64>
@@ -354,6 +359,88 @@ fn compiled_transformer_plan_cpu_target_decreases_loss_and_resumes_exactly() {
     assert!(
         losses.last().unwrap() < losses.first().unwrap(),
         "compiled causal Transformer loss did not decrease: {losses:?}"
+    );
+}
+
+#[test]
+fn owned_compiled_transformer_session_finishes_and_resumes_one_module_lifecycle() {
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let tied_identity = model.tokens.weight.id();
+    let frozen = model.frozen_scale.clone();
+    let frozen_before = frozen.snapshot().unwrap();
+    let plan = owned_compiled_transformer(model);
+    let capture_identity = plan.capture_identity();
+    let mut session = plan.prepare(&CpuSessionTarget::new()).unwrap();
+    let mut losses = Vec::new();
+    for _ in 0..4 {
+        losses.push(
+            session
+                .step(batch(), learning_rate())
+                .unwrap()
+                .loss()
+                .scalar_at(0)
+                .as_f64(),
+        );
+    }
+    let checkpoint = session.checkpoint().unwrap();
+    let midpoint = session.parameter_snapshots().unwrap();
+    let model = session.finish().unwrap();
+    assert_eq!(model.tokens.weight.id(), tied_identity);
+    assert_eq!(
+        model.tokens.weight.value().unwrap(),
+        midpoint["tokens.weight"]
+    );
+    assert_eq!(model.tokens.weight.version().unwrap(), 1);
+    assert_eq!(
+        model.frozen_scale.snapshot().unwrap().data,
+        frozen_before.data
+    );
+    assert_eq!(model.frozen_scale.version().unwrap(), frozen_before.version);
+    assert!(
+        !model
+            .state_dict()
+            .unwrap()
+            .tensors()
+            .contains_key("lm_head.weight")
+    );
+
+    let resumed = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
+        config(),
+        dropout_config(),
+        model,
+        &checkpoint,
+        build,
+    )
+    .unwrap();
+    assert_eq!(resumed.capture_identity(), capture_identity);
+    assert_eq!(resumed.step_count(), 4);
+    let mut session = resumed.prepare(&CpuSessionTarget::new()).unwrap();
+    for _ in 0..4 {
+        losses.push(
+            session
+                .step(batch(), learning_rate())
+                .unwrap()
+                .loss()
+                .scalar_at(0)
+                .as_f64(),
+        );
+    }
+    let final_parameters = session.parameter_snapshots().unwrap();
+    let model = session.finish().unwrap();
+    assert_eq!(model.tokens.weight.id(), tied_identity);
+    assert_eq!(
+        model.tokens.weight.value().unwrap(),
+        final_parameters["tokens.weight"]
+    );
+    assert_eq!(model.tokens.weight.version().unwrap(), 2);
+    assert_eq!(
+        model.frozen_scale.snapshot().unwrap().data,
+        frozen_before.data
+    );
+    assert_eq!(model.frozen_scale.version().unwrap(), frozen_before.version);
+    assert!(
+        losses.last().unwrap() < losses.first().unwrap(),
+        "owned compiled causal Transformer loss did not decrease: {losses:?}"
     );
 }
 

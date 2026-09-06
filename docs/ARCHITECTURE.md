@@ -947,7 +947,27 @@ their first traversal name; frozen parameters and buffers remain unchanged.
 Each successful publication advances every unique host version once even when
 the bytes are unchanged. This is explicit trainable-only publication, not a
 retained live-module binding or synchronization of frozen state, buffers,
-optimizer state, progress, capture, or checkpoints. `CpuCompiledAdamW::compile_module` reuses the
+optimizer state, progress, capture, or checkpoints.
+`CompiledModuleAdamWPlan<M>` is the stricter owned lifecycle: compilation
+consumes the exact module value, target preparation transfers it into
+`CompiledModuleAdamWSession<M, R>`, and replay exposes no module handle. A
+private complete-state seal authenticates traversal order/names, tied
+identities, kinds, trainability, descriptors, versions, and raw bytes before
+resources and again at finish. Consuming `finish` downloads only the runtime's
+canonical trainable frontier, then uses the existing sorted all-lock restore
+transaction to recheck every unique module identity, advance each trainable
+version once, preserve frozen/buffer bytes and versions, and return the module.
+Compilation failure returns the exact module, including graph-build,
+checkpoint-admission, seal, and maximum-version preflight failures. Snapshot or
+publication failure returns an error that retains the intact session;
+preparation failure likewise retains the owned plan. A caller can explicitly
+abort either a live or failed session to recover its sealed host module without
+publishing the runtime frontier. The wrapper delegates the existing
+runtime/checkpoint/AdamW traits, and its strict-Metal specialization retains
+`step_without_host_outputs` plus read-only session and scoreboard evidence
+without a backend enum. An owned plan exposes only a cloned resource-free Metal
+summary for admission inspection, not an independently preparable Metal plan.
+`CpuCompiledAdamW::compile_module` reuses the
 ordinary `Module` traversal and `Parameter::bind` forward seam without making
 the host module live state: unique trainable identities resolve to the
 optimizer-owned recurrent inputs, tied handles share that one node/state tuple,
