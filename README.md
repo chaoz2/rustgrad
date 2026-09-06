@@ -73,6 +73,7 @@ layers:
 
 - [`examples/cpu_train_resume.rs`](examples/cpu_train_resume.rs)
 - [`examples/cpu_module_train.rs`](examples/cpu_module_train.rs)
+- [`examples/compiled_transformer_train_resume.rs`](examples/compiled_transformer_train_resume.rs)
 - [`examples/strict_state_inference.rs`](examples/strict_state_inference.rs)
 - [`examples/mnist_idx_local.rs`](examples/mnist_idx_local.rs)
 - [`examples/cifar10_local.rs`](examples/cifar10_local.rs)
@@ -86,6 +87,12 @@ For repeated training, the compiled runtime captures
 and optimizer slots in one atomic recurrent frontier. `CompiledTrainingRuntime`
 is the small optimizer-neutral loop contract; checkpointing and AdamW policy are
 separate capabilities, and concrete Metal sessions keep their device reports.
+The maintained tiny causal Transformer example compiles one backend-neutral
+`CompiledAdamWPlan`, runs and resumes it through the same generic loop, and
+selects only the concrete preparation target. Its Metal form selects the first
+visible device explicitly, verifies strict zero-fallback admission before
+allocation, and keeps the checkpoint bytes portable through the same
+authenticated recompile boundary as CPU.
 
 ## Run ResNet on a persistent Metal session
 
