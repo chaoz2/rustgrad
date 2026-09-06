@@ -737,6 +737,33 @@ impl InitializedMetalPrefix {
         })
     }
 
+    pub(super) fn share_resources_at_epoch(
+        &self,
+        dense: &BTreeMap<u64, u64>,
+        alternate_state_bank: bool,
+    ) -> Result<MetalSharedResources, MetalError> {
+        let dense = dense
+            .iter()
+            .map(|(target, source)| {
+                let buffer = self
+                    .inner
+                    .shared_buffer_for_epoch(*source, alternate_state_bank)
+                    .ok_or_else(|| {
+                        MetalError::InvalidBinding(format!(
+                            "shared Metal source state buffer {source} is absent"
+                        ))
+                    })?
+                    .share()?;
+                Ok((*target, buffer))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(MetalSharedResources {
+            dense,
+            quantized: BTreeMap::new(),
+            queue: self.inner.shared_queue().cloned(),
+        })
+    }
+
     pub(super) fn execute(
         &self,
         values: &mut BTreeMap<u64, TensorData>,

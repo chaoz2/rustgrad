@@ -79,7 +79,12 @@ while discarding the partial window; two subsequent replays are checkpointed
 and authenticated recompilation into a fresh owned module continues the exact
 partial frontier through optimizer updates at replays five and eight. Exact
 outputs and complete recurrent parameter/moment/accumulator state match the
-uninterrupted run. Compiled
+uninterrupted run. In-session evaluation observes that same live parameter
+frontier before publication: CPU binds current runtime snapshots, while strict
+Metal aliases the active epoch parameter bank without parameter transfer.
+Evaluation is stateless with respect to replay, optimizer, dropout,
+accumulation, checkpoint, and scoreboard state, including after a `zero_grad`
+bank flip. Compiled
 AdamW now optionally retains F32 gradient sums and an accumulation cursor in
 that same frontier, commits one averaged update at each fixed microbatch
 window, resets the sums in-capture, and checkpoints partial windows exactly.

@@ -186,6 +186,12 @@ fn captured_fixed_host_gather_checks_every_lane_before_driver_work() {
         .unwrap();
     assert_eq!(inference.capture().to_bytes().unwrap(), frozen_capture);
     assert_ne!(inference.deployment_identity(), ordinary_identity);
+    let (_, _, _, fixed_cardinality_links, _, _) = inference.clone().into_parts();
+    let mut legacy_identity = std::collections::hash_map::DefaultHasher::new();
+    "rustgrad-captured-host-gather-v1".hash(&mut legacy_identity);
+    ordinary_identity.hash(&mut legacy_identity);
+    fixed_cardinality_links.hash(&mut legacy_identity);
+    assert_eq!(inference.deployment_identity(), legacy_identity.finish());
 
     let renderer = MetalRenderer::new(8, capabilities()).unwrap();
     let plan = MetalInferencePlan::new(inference, renderer).unwrap();
@@ -1050,6 +1056,140 @@ fn metal_stateful_inference_commits_only_after_public_projection_and_retries() {
         session.state_snapshots().unwrap()["cache"],
         TensorData::new([2], vec![4.0, 6.0]).unwrap()
     );
+}
+
+#[test]
+fn metal_fixed_state_reader_uploads_no_residents_and_tracks_active_bank() {
+    let initial = TensorData::new([2], vec![1.0, 2.0]).unwrap();
+    let mut source_graph = Graph::new();
+    let source_state = source_graph.input_dtype("cache", [2], DType::F32);
+    let source_token = source_graph.input_dtype("token", [2], DType::F32);
+    let source_next = source_graph.add(source_state, source_token).unwrap();
+    let source_output = source_graph.square(source_next).unwrap();
+    let source_capture = CapturedStatefulInference::from_module_graph(
+        &IdentityModule,
+        &source_graph,
+        &[source_output],
+        &[InferenceStateLink::new(source_state, source_next)],
+        BTreeMap::from([("cache".into(), initial.clone())]),
+    )
+    .unwrap();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let source_plan = MetalStatefulInferencePlan::new(source_capture, renderer.clone()).unwrap();
+
+    let mut evaluation_graph = Graph::new();
+    let evaluation_state = evaluation_graph.input_dtype("cache", [2], DType::F32);
+    let evaluation_token = evaluation_graph.input_dtype("eval_token", [2], DType::F32);
+    let evaluation_output = evaluation_graph
+        .add(evaluation_state, evaluation_token)
+        .unwrap();
+    let evaluation = CapturedInference::from_graph_residents(
+        &evaluation_graph,
+        &[evaluation_output],
+        BTreeMap::from([("cache".into(), (evaluation_state, initial))]),
+        &[],
+    )
+    .unwrap();
+    let mismatched_evaluation = CapturedInference::from_graph_residents(
+        &evaluation_graph,
+        &[evaluation_output],
+        BTreeMap::from([(
+            "cache".into(),
+            (
+                evaluation_state,
+                TensorData::new([2], vec![1.0, 3.0]).unwrap(),
+            ),
+        )]),
+        &[],
+    )
+    .unwrap();
+    assert!(matches!(
+        MetalFixedStateReadPlan::new(
+            mismatched_evaluation,
+            renderer.clone(),
+            &source_plan,
+            &BTreeSet::from(["cache".to_owned()]),
+        ),
+        Err(MetalError::InvalidBinding(detail)) if detail.contains("payload differs")
+    ));
+    let reader_plan = MetalFixedStateReadPlan::new(
+        evaluation,
+        renderer,
+        &source_plan,
+        &BTreeSet::from(["cache".to_owned()]),
+    )
+    .unwrap();
+
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let mut source = source_plan.prepare(device.clone()).unwrap();
+    let mut reader = reader_plan.prepare(device, &source).unwrap();
+    for report in reader.preparation_reports() {
+        assert_eq!(report.resident_h2d_calls, 0);
+        assert_eq!(report.resident_h2d_bytes, 0);
+        assert_eq!(report.initial_state_h2d_calls, 0);
+        assert_eq!(report.initial_state_h2d_bytes, 0);
+    }
+    let [false_summary, true_summary] = reader.summaries();
+    assert_eq!(false_summary, true_summary);
+    assert_eq!(false_summary.nonzero_item_count, 1);
+    assert_eq!(false_summary.zero_item_count, 0);
+
+    let evaluation_inputs = BTreeMap::from([(
+        "eval_token".into(),
+        TensorData::new([2], vec![10.0, 20.0]).unwrap(),
+    )]);
+    let first = reader
+        .run(source.state_epoch(), &evaluation_inputs)
+        .unwrap();
+    assert_eq!(
+        first.outputs(),
+        &[TensorData::new([2], vec![11.0, 22.0]).unwrap()]
+    );
+    assert_eq!(first.report().transient_h2d_calls, 1);
+    assert_eq!(first.report().transient_h2d_bytes, 8);
+    assert_eq!(first.report().retained_d2h_calls, 1);
+    assert_eq!(first.report().retained_d2h_bytes, 8);
+    assert_eq!(first.report().output_count, 1);
+    assert_eq!(first.report().kernel_launch_count, 1);
+    assert_eq!(first.report().zero_item_count, 0);
+    assert_eq!(first.report().command_submission_count, 1);
+    assert_eq!(first.report().command_wait_count, 1);
+    assert_eq!(first.report().committed_state_pair_count, 0);
+    assert_eq!(first.report().committed_state_bytes, 0);
+    assert_eq!(first.report().committed_state_work_items, 0);
+
+    source
+        .run(&BTreeMap::from([(
+            "token".into(),
+            TensorData::new([2], vec![2.0, 3.0]).unwrap(),
+        )]))
+        .unwrap();
+    assert!(source.state_epoch());
+    let source_epoch = source.state_epoch();
+    let source_successful_runs = source.successful_run_count();
+    let source_frontier = source.state_snapshots().unwrap();
+    mock.state.lock().unwrap().failures.read = Some("evaluation output read");
+    assert!(
+        reader
+            .run(source.state_epoch(), &evaluation_inputs)
+            .is_err()
+    );
+    assert_eq!(source.state_epoch(), source_epoch);
+    assert_eq!(source.successful_run_count(), source_successful_runs);
+    mock.clear_failures();
+    assert_eq!(source.state_snapshots().unwrap(), source_frontier);
+    let second = reader
+        .run(source.state_epoch(), &evaluation_inputs)
+        .unwrap();
+    assert_eq!(
+        second.outputs(),
+        &[TensorData::new([2], vec![13.0, 25.0]).unwrap()]
+    );
+    assert_eq!(second.report().successful_invocation, 1);
+    assert_eq!(source.state_epoch(), source_epoch);
+    assert_eq!(source.successful_run_count(), source_successful_runs);
+    assert_eq!(source.state_snapshots().unwrap(), source_frontier);
 }
 
 #[test]

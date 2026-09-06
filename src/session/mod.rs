@@ -18,13 +18,14 @@ pub use classification::{
 pub use compiled_training::{
     CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
     CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWZeroGradResult,
-    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
-    CompiledModuleAdamWCompileError, CompiledModuleAdamWFinishError, CompiledModuleAdamWPlan,
+    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
+    CompiledEvaluationResult, CompiledEvaluationRuntime, CompiledModuleAdamWCompileError,
+    CompiledModuleAdamWEvaluationError, CompiledModuleAdamWFinishError, CompiledModuleAdamWPlan,
     CompiledModuleAdamWPrepareError, CompiledModuleAdamWSession, CompiledMomentumSgdConfig,
     CompiledMomentumSgdStepResult, CompiledTrainingRuntime, CompiledTrainingStep,
     CompiledTrainingStepResult, CpuCompiledAdamW, CpuCompiledMomentumSgd, MetalCompiledAdamW,
     MetalCompiledAdamWCommitResult, MetalCompiledAdamWPlan, MetalCompiledAdamWStepResult,
-    TrainingParameterInit,
+    MetalCompiledEvaluationResult, TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,

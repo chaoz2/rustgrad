@@ -1018,6 +1018,17 @@ pretend to implement `CompiledTrainingStep`. The report records zero outputs
 and zero retained D2H calls/bytes; ordinary `step` and every generic runtime
 contract remain unchanged. This is periodic-observation plumbing, not an
 asynchronous training API or a throughput claim.
+Owned compiled AdamW plans may additionally attach one pure evaluation graph
+through `with_evaluation`. The capture reuses the exact training input schema,
+canonical tied trainable identities, and frozen capture constants. CPU replay
+binds detached snapshots of the current runtime frontier; strict Metal prepares
+two stateless evaluators whose trainable resident inputs alias the two physical
+parameter banks and selects the training session's active epoch for each call.
+Evaluation therefore advances no replay, optimizer, accumulation, dropout,
+checkpoint, module version, or training-scoreboard state. Metal uploads and
+downloads no trainable parameter payload for evaluation; only evaluation batch
+inputs and requested loss/outputs cross the host boundary. Invalid inputs and
+device failures leave both the evaluator and training frontier retryable.
 `CompiledAdamWConfig::with_host_token_input` atomically declares one nonempty
 fixed rank-two `[B, T]` I32 transient and opts only that schema into
 compiled-training index authentication. The autograd rule records a private

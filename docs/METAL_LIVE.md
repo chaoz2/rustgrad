@@ -113,7 +113,7 @@ of silently testing the newer revision.
 
 ## Evidence boundary
 
-The compiled-Transformer artifact uses schema v5 and executes the same
+The compiled-Transformer artifact uses schema v6 and executes the same
 dropout-bearing capture twelve times: eight invocations on the uninterrupted
 session and four after checkpoint restoration. Four observed invocations
 download only the scalar loss; eight device-only invocations
@@ -148,6 +148,15 @@ synchronous copy commands before the atomic epoch flip. Repeating `zero_grad`
 on that empty window is an exact epoch/checkpoint no-op. Midpoint checkpointing
 and final parameter publication remain explicit host-observation boundaries
 outside these per-step transfer totals.
+
+Training evidence format v6 also records the compiled evaluation aggregate.
+The owned plan prepares a read-only evaluation capture against both
+physical parameter banks. Three final fixed-dataset evaluations select the
+currently active bank, upload only tokens/targets, and retain loss/logits; they
+perform no trainable-parameter H2D/D2H and do not change the training epoch,
+checkpoint, dropout counter, successful-run count, or complete scoreboard
+report. Each evaluation is a separate stateless one-submit/one-wait invocation,
+not a training replay or throughput claim.
 
 A successful compiled-Transformer job trains through step eight, resumes the
 same Metal capture exactly from a partial step-four frontier (optimizer step
