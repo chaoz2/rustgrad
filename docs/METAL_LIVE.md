@@ -119,16 +119,17 @@ session and four after checkpoint restoration. Four observed invocations
 download only the scalar loss; eight device-only invocations
 commit the complete fixed-state successor with zero outputs and zero retained
 D2H calls or bytes. Every invocation must commit 59 state pairs, 784 logical
-state bytes, and 194 work items. Its declared fixed `[2,3]` I32 token minibatch is
-capture-authenticated through an autograd-recorded proof binding the exact
-embedding Gather data target to its F32-zero-base first-order ScatterAdd,
-shared flatten/expand index/axis/domain, and update cotangent. Every token
-lane is range-checked on the host before driver work; only that proven pair uses
-distinct status-free Metal kernels, while ordinary indexed movement remains
-guarded. With no transactional/indexed owners left, each replay submits and
-waits for exactly one command buffer. The artifact records the two authenticated
-owners, zero guarded indexed owners, planned kernel count, and exactly twelve
-aggregate submissions/waits. The prepared input descriptors prove three
+state bytes, and 194 work items. Its declared fixed `[2,3]` I32 input and target
+token matrices are capture-authenticated through separate autograd-recorded
+proofs binding the embedding and axis-one log-probability Gathers to their exact
+F32-zero-base first-order ScatterAdds, shared flattened index/axis/domain, and
+update cotangents. Every token and target lane is range-checked on the host
+before driver work; only those two proven pairs use distinct status-free Metal
+kernels, while ordinary indexed movement remains guarded. With no
+transactional/indexed owners left, each replay submits and waits for exactly
+one command buffer. The artifact records the four authenticated owners, zero
+guarded indexed owners, planned kernel count, and exactly twelve aggregate
+submissions/waits. The prepared input descriptors prove three
 transient writes totaling 52 bytes per replay, so the artifact separately
 requires 624 transient H2D bytes and
 exactly 4 retained-output D2H calls totaling 16 bytes. Midpoint checkpointing

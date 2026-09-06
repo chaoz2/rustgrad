@@ -2013,8 +2013,8 @@ pub(crate) fn authenticate_host_gather_lineage(
     )
 }
 
-/// Reauthenticates the exact pair of raw embedding movements driven by one
-/// flattened-and-expanded host I32 token input. The forward Gather and its
+/// Reauthenticates one exact pair of raw F32 indexed movements driven by a
+/// flattened host I32 token input. The forward Gather and its
 /// additive VJP Scatter must be the complete consumer set of one materialized
 /// index; no arbitrary indexed movement is made status-free by this proof.
 pub(crate) fn authenticate_host_indexed_movement_lineage(

@@ -18,9 +18,8 @@ use rustgrad::{
     Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWRuntime,
     CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledModuleAdamWPlan,
     CompiledModuleAdamWSession, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
-    CpuSessionTarget, DType, Graph, LossOptions, MetalSessionTarget, Module, NodeId, Parameter,
-    Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
-    cross_entropy,
+    CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NodeId, Parameter, Result, Scalar,
+    Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
 };
 use std::{collections::BTreeMap, env, error::Error};
 
@@ -123,7 +122,7 @@ fn config() -> Result<CompiledAdamWConfig> {
         .with_weight_decay_exclusions(WEIGHT_DECAY_EXCLUSIONS)?
         .with_loss_scale(128.0)?
         .with_host_token_input("tokens", [BATCH, TIME])?
-        .with_input("targets", [BATCH, TIME], DType::I32)
+        .with_host_token_input("targets", [BATCH, TIME])
 }
 
 fn dropout_config() -> CompiledDropoutConfig {
@@ -138,16 +137,12 @@ fn build(
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
     let logits = model.forward(graph, inputs["tokens"], dropout)?;
     let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
-    let flat_targets = graph.reshape(inputs["targets"], [TOKEN_COUNT])?;
-    let loss = cross_entropy(
-        graph,
-        flat_logits,
-        flat_targets,
-        LossOptions {
-            reduction: Reduction::Mean,
-            ..LossOptions::default()
-        },
-    )?;
+    let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
+    let target_indices = graph.reshape(inputs["targets"], [TOKEN_COUNT, 1])?;
+    let selected = graph.gather(log_probabilities, target_indices, 1)?;
+    let selected = graph.reshape(selected, [TOKEN_COUNT])?;
+    let losses = graph.neg(selected)?;
+    let loss = graph.mean_default(losses)?;
     Ok((loss, BTreeMap::new()))
 }
 
