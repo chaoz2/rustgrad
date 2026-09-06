@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:cdb56460b1bab37b",
+  "source_fingerprint": "fnv1a64:3d384d0b53475a6e",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -765,7 +765,7 @@
       "subject": "Platform CI and sanitizer coverage",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "The checked-in GitHub Actions release gate has passed remotely with formatting, all-target checks, strict Clippy, compatibility-manifest drift, and the default suite on Linux/macOS, plus a pinned-nightly Linux AddressSanitizer and LeakSanitizer library suite. The CUDA regression that deliberately leaks quarantined mock blocks after unprovable asynchronous completion remains in normal CI but is explicitly skipped under LeakSanitizer; unexpected leaks elsewhere still fail the job. A manual-only exact-SHA Metal workflow is checked in for a protected self-hosted Apple-GPU lane, but it remains dormant until matching runner labels and the `live-metal` environment are provisioned; ordinary macOS CI remains mock-only and no live-device evidence is claimed. Broader architectures, Miri, and coverage remain required."
+        "Acceptance requirement": "The checked-in GitHub Actions release gate has passed remotely with formatting, all-target checks, strict Clippy, compatibility-manifest drift, and the default suite on Linux/macOS, plus a pinned-nightly Linux AddressSanitizer and LeakSanitizer library suite. The CUDA regression that deliberately leaks quarantined mock blocks after unprovable asynchronous completion remains in normal CI but is explicitly skipped under LeakSanitizer; unexpected leaks elsewhere still fail the job. A manual-only exact-SHA Metal workflow is checked in for a protected self-hosted Apple-GPU lane. Its attested Llama benchmark job fails closed unless at least one state-only fixed-span prefill invocation and one steady-decode token-step invocation execute with nonzero kernel/submission/wait work, zero fixed-prefill downloads, and exactly one four-byte I32 download per selecting invocation. Typed attestation is accepted only beside that complete normalized benchmark observation; ordinary scoreboard and workload-evidence CLI outputs retain their bounded zero-phase behavior without an attestation. The lane remains dormant until matching runner labels and the `live-metal` environment are provisioned; ordinary macOS CI remains mock-only and no live-device evidence is claimed. Broader architectures, Miri, and coverage remain required."
       }
     },
     {

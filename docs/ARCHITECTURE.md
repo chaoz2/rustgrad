@@ -2945,11 +2945,15 @@ beside the Linear report. The observation keeps planned static-slot memory and
 the measured RustGrad-owned physical-buffer high-water as separate fields.
 The separate Llama job accepts only the protected Metal registry identity and
 a runner-local GGUF whose SHA-256 matches protected configuration, plus a
-protected prompt, positive token bound, and independently pinned greedy token
-IDs. It performs no model download, prepares
-one persistent dense-or-packed session, checks ordered token-step reports,
-resident/cache ownership, zero fallback, suppressed prompt downloads, and
-exactly one checked four-byte I32 download per selecting invocation, then
+protected prompt, a generation bound of at least two, and at least two
+independently pinned greedy token IDs. The tokenizer must produce at least one
+more prompt ID than the configured fixed span. It performs no model download,
+prepares one persistent dense-or-packed session, and fails closed unless the
+scoreboard contains both a state-only fixed-span prompt invocation and a
+steady-decode token-step invocation with nonzero kernel/submission/wait work.
+It also checks ordered reports, resident/cache ownership, zero fallback, zero
+fixed-prefill downloads, and exactly one checked four-byte I32 download per
+selecting invocation, then
 normalizes the validated in-memory scoreboard directly into a create-new
 `BenchmarkObservation` v1 and uploads it beside the device-greedy Llama execution
 scoreboard v2, typed provenance attestation, and basename-only `SHA256SUMS`. The

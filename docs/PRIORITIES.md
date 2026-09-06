@@ -284,10 +284,13 @@ position is logically rewound; stale later K/V rows remain causally masked,
 and each newly visible row is overwritten before attention can read it.
 Scoreboard-bound sessions reject reset atomically so each evidence envelope
 remains single-sequence. Its checked
-prompt/decode phase accounting is ready for live evidence capture, but remaining
-work still proves live-device output agreement and publishes measured
-prompt/decode performance; the current scoreboard is host-observed execution
-accounting, not a speedup claim.
+prompt/decode phase accounting is ready for live evidence capture. The protected
+attested harness now fails closed unless the configured prompt executes at least
+one state-only fixed-span prefill invocation and generation executes at least one
+steady-decode token step, with nonzero command work and the exact zero/four-byte
+download contract. Remaining work still proves live-device output agreement and
+publishes measured prompt/decode performance; the current scoreboard is
+host-observed execution accounting, not a speedup claim.
 Benchmark comparisons target tinygrad and Candle, plus llama.cpp for the GGUF
 serving path.
 
