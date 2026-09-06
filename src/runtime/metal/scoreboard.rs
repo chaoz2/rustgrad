@@ -2,14 +2,14 @@
 
 use super::{
     MetalAppendStateInferencePlan, MetalDeviceInfo, MetalDeviceRun, MetalDeviceSession,
-    MetalDeviceSessionSummary, MetalInferencePlan,
+    MetalDeviceSessionSummary, MetalInferencePlan, MetalStatefulInferencePlan,
 };
 use crate::{CapturedSchedule, DType, ExecutionPlanSummary, ReplayInput, Shape};
 use serde::{Serialize, Serializer};
 use std::{collections::BTreeSet, fmt, fs, io, path::Path, rc::Rc, time::Duration};
 
 /// Current deterministic JSON schema emitted by [`MetalSessionScoreboardReport`].
-pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 7;
+pub const METAL_SESSION_SCOREBOARD_FORMAT_VERSION: u32 = 8;
 const MAX_METADATA_BYTES: usize = 1_024;
 
 /// Caller-supplied labels attached to one measurement series.
@@ -77,6 +77,8 @@ pub enum MetalScoreboardStatePolicy {
     Stateless,
     /// One fixed-capacity state bank receives one authenticated span per success.
     Append,
+    /// Two fixed state banks alternate after each successful invocation.
+    Epoch,
 }
 
 /// Exact captured descriptor retained as report evidence.
@@ -452,6 +454,75 @@ pub struct MetalSessionScoreboard {
     totals: RunTotals,
 }
 
+/// Fail-soft observation state shared by higher-level persistent Metal sessions.
+/// A measurement failure never changes the result of an already committed run.
+pub(crate) struct MetalScoreboardObserver {
+    recorder: MetalSessionScoreboard,
+    first_error: Option<MetalScoreboardError>,
+    #[cfg(test)]
+    record_attempts: usize,
+}
+
+impl MetalScoreboardObserver {
+    pub(crate) fn bind(
+        mut recorder: MetalSessionScoreboard,
+        session: &MetalDeviceSession,
+    ) -> Result<Self, MetalScoreboardError> {
+        recorder.bind(session)?;
+        Ok(Self {
+            recorder,
+            first_error: None,
+            #[cfg(test)]
+            record_attempts: 0,
+        })
+    }
+
+    pub(crate) fn recorder(&self) -> &MetalSessionScoreboard {
+        &self.recorder
+    }
+
+    pub(crate) fn first_error(&self) -> Option<&MetalScoreboardError> {
+        self.first_error.as_ref()
+    }
+
+    pub(crate) fn freeze(&mut self, error: MetalScoreboardError) {
+        if self.first_error.is_none() {
+            self.first_error = Some(error);
+        }
+    }
+
+    pub(crate) fn observe(&mut self, run: &MetalDeviceRun) {
+        if self.first_error.is_some() {
+            return;
+        }
+        let result = self.recorder.record(run);
+        self.observe_result(result);
+    }
+
+    pub(crate) fn observe_from_position(&mut self, run: &MetalDeviceRun, position: usize) {
+        if self.first_error.is_some() {
+            return;
+        }
+        let result = self.recorder.record_from_position(run, position);
+        self.observe_result(result);
+    }
+
+    fn observe_result(&mut self, result: Result<(), MetalScoreboardError>) {
+        #[cfg(test)]
+        {
+            self.record_attempts += 1;
+        }
+        if let Err(error) = result {
+            self.first_error = Some(error);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_attempts(&self) -> usize {
+        self.record_attempts
+    }
+}
+
 struct BoundScoreboard {
     session_token: Rc<()>,
     device: MetalDeviceInfo,
@@ -481,6 +552,27 @@ impl MetalSessionScoreboard {
                 resident_inputs: plan.resident_inputs(),
                 state_inputs: &[],
                 state_policy: MetalScoreboardStatePolicy::Stateless,
+            },
+        )
+    }
+
+    /// Snapshots one authenticated epoch-swapped recurrent deployment without
+    /// creating a Metal resource. This is the state policy used by compiled
+    /// training programs and other fixed-state recurrent captures.
+    pub fn new_epoch_state(
+        context: MetalScoreboardContext,
+        plan: &MetalStatefulInferencePlan,
+    ) -> Self {
+        Self::from_plan(
+            context,
+            ScoreboardPlanView {
+                deployment_identity: plan.deployment_identity(),
+                capture: plan.capture(),
+                execution_plan: plan.execution_plan(),
+                summary: plan.summary(),
+                resident_inputs: plan.resident_inputs(),
+                state_inputs: plan.state_inputs(),
+                state_policy: MetalScoreboardStatePolicy::Epoch,
             },
         )
     }
@@ -574,7 +666,7 @@ impl MetalSessionScoreboard {
             return Err(MetalScoreboardError::AlreadyBound);
         }
         let expected_position = match self.state_policy {
-            MetalScoreboardStatePolicy::Stateless => None,
+            MetalScoreboardStatePolicy::Stateless | MetalScoreboardStatePolicy::Epoch => None,
             MetalScoreboardStatePolicy::Append => Some(0),
         };
         if session.inference_deployment_identity() != Some(self.deployment_identity)
@@ -597,7 +689,7 @@ impl MetalSessionScoreboard {
     /// from the exact bound session; failed calls produce no run and no change.
     pub fn record(&mut self, run: &MetalDeviceRun) -> Result<(), MetalScoreboardError> {
         let expected_start = match self.state_policy {
-            MetalScoreboardStatePolicy::Stateless => 0,
+            MetalScoreboardStatePolicy::Stateless | MetalScoreboardStatePolicy::Epoch => 0,
             MetalScoreboardStatePolicy::Append => self
                 .runs
                 .last()
@@ -632,7 +724,7 @@ impl MetalSessionScoreboard {
         }
         let recorded = MetalScoreboardRun::from_report(run.report());
         let expected_position = match self.state_policy {
-            MetalScoreboardStatePolicy::Stateless => None,
+            MetalScoreboardStatePolicy::Stateless | MetalScoreboardStatePolicy::Epoch => None,
             MetalScoreboardStatePolicy::Append => Some(
                 expected_start
                     .checked_add(self.append_span_rows)
@@ -656,6 +748,20 @@ impl MetalSessionScoreboard {
                     && recorded.committed_state_bytes == self.plan_summary.append_state_row_bytes
                     && recorded.committed_state_work_items
                         == self.plan_summary.append_state_work_items
+            }
+            MetalScoreboardStatePolicy::Epoch => {
+                let expected_work_items = self
+                    .inputs
+                    .iter()
+                    .filter(|input| input.kind == MetalScoreboardInputKind::State)
+                    .try_fold(0usize, |total, input| {
+                        total.checked_add(input.shape.numel().ok()?)
+                    });
+                expected_work_items.is_some_and(|expected_work_items| {
+                    recorded.committed_state_pair_count == self.plan_summary.state_pair_count
+                        && recorded.committed_state_bytes == self.plan_summary.logical_state_bytes
+                        && recorded.committed_state_work_items == expected_work_items
+                })
             }
         };
         if !state_commit_matches {
@@ -710,7 +816,7 @@ impl MetalSessionScoreboard {
             .and_then(|total| total.checked_add(totals.runtime_control_h2d_bytes))
             .ok_or(MetalScoreboardError::Overflow)?;
         let committed_state_position = match self.state_policy {
-            MetalScoreboardStatePolicy::Stateless => None,
+            MetalScoreboardStatePolicy::Stateless | MetalScoreboardStatePolicy::Epoch => None,
             MetalScoreboardStatePolicy::Append => Some(
                 self.runs
                     .last()
@@ -1117,7 +1223,7 @@ mod tests {
         let first = report.to_json_bytes().unwrap();
         assert_eq!(first, report.to_json_bytes().unwrap());
         let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
-        assert_eq!(value["format_version"], 7);
+        assert_eq!(value["format_version"], 8);
         assert_eq!(value["append_span_rows"], 0);
         assert_eq!(value["workload"], "linear");
         assert_eq!(value["implementation_revision"], "abc123");

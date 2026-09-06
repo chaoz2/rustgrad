@@ -3,7 +3,9 @@
 use crate::nn::StateKind;
 use crate::runtime::metal::{
     MetalDevice, MetalDeviceRunReport, MetalDeviceSession, MetalDeviceSessionSummary, MetalError,
-    MetalRenderer, MetalStatefulInferencePlan, RenderedMetal,
+    MetalRenderer, MetalScoreboardContext, MetalScoreboardError, MetalScoreboardObserver,
+    MetalSessionScoreboard, MetalSessionScoreboardReport, MetalStatefulInferencePlan,
+    RenderedMetal,
 };
 use crate::{
     BufferState, CapturedMixedSchedule, CapturedSchedule, CapturedStatefulInference, CompareOp,
@@ -876,6 +878,7 @@ pub struct MetalCompiledAdamW {
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
+    scoreboard: Option<MetalScoreboardObserver>,
 }
 
 /// One committed Metal AdamW step plus its exact device execution report.
@@ -1798,7 +1801,32 @@ impl MetalCompiledAdamWPlan {
     /// Creates all native resources and uploads the captured recurrent
     /// frontier once. No training step is executed during preparation.
     pub fn prepare(self, device: MetalDevice) -> Result<MetalCompiledAdamW> {
+        self.prepare_inner(device, None)
+    }
+
+    /// Creates the persistent training session and binds an epoch-state
+    /// scoreboard before the first step can execute.
+    pub fn prepare_with_scoreboard(
+        self,
+        device: MetalDevice,
+        context: MetalScoreboardContext,
+    ) -> Result<MetalCompiledAdamW> {
+        let recorder = MetalSessionScoreboard::new_epoch_state(context, &self.inner);
+        self.prepare_inner(device, Some(recorder))
+    }
+
+    fn prepare_inner(
+        self,
+        device: MetalDevice,
+        recorder: Option<MetalSessionScoreboard>,
+    ) -> Result<MetalCompiledAdamW> {
         let session = self.inner.prepare(device).map_err(metal_training_error)?;
+        let scoreboard = recorder
+            .map(|recorder| {
+                MetalScoreboardObserver::bind(recorder, &session)
+                    .map_err(|error| training(format!("compiled Metal scoreboard: {error}")))
+            })
+            .transpose()?;
         Ok(MetalCompiledAdamW {
             session,
             inputs: self.inputs,
@@ -1809,6 +1837,7 @@ impl MetalCompiledAdamWPlan {
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
+            scoreboard,
         })
     }
 }
@@ -1827,6 +1856,9 @@ impl MetalCompiledAdamW {
         let mut provided = inputs;
         provided.insert(LEARNING_RATE_INPUT.into(), learning_rate);
         let run = self.session.run(&provided).map_err(metal_training_error)?;
+        if let Some(scoreboard) = &mut self.scoreboard {
+            scoreboard.observe(&run);
+        }
         let (outputs, report) = run.into_parts();
         debug_assert_eq!(outputs.len(), 1 + self.output_names.len());
         let mut outputs = outputs.into_iter();
@@ -1869,6 +1901,29 @@ impl MetalCompiledAdamW {
 
     pub fn metal_session(&self) -> &MetalDeviceSession {
         &self.session
+    }
+
+    /// Returns the opt-in successful-step recorder, when preparation enabled it.
+    pub fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
+        self.scoreboard
+            .as_ref()
+            .map(MetalScoreboardObserver::recorder)
+    }
+
+    /// Returns a deterministic snapshot of all successfully observed steps.
+    pub fn execution_scoreboard_report(
+        &self,
+    ) -> std::result::Result<Option<MetalSessionScoreboardReport>, MetalScoreboardError> {
+        self.execution_scoreboard()
+            .map(MetalSessionScoreboard::report)
+            .transpose()
+    }
+
+    /// Returns the first fail-soft measurement error, if recording froze.
+    pub fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
+        self.scoreboard
+            .as_ref()
+            .and_then(MetalScoreboardObserver::first_error)
     }
 
     /// Downloads every currently committed recurrent value once and returns

@@ -107,10 +107,10 @@ of silently testing the newer revision.
 
 ## Evidence boundary
 
-A successful Linear/ResNet job uploads two v7 scoreboards plus the normalized
+A successful Linear/ResNet job uploads two v8 scoreboards plus the normalized
 ResNet `BenchmarkObservation` v1. A successful Llama job uploads its
 device-greedy execution scoreboard v2, whose token-step and
-fixed-span components are authenticated v7 reports, plus a normalized
+fixed-span components are authenticated v8 reports, plus a normalized
 `BenchmarkObservation` v1, typed provenance attestation, and `SHA256SUMS`. The
 observation binds the workflow-verified model hash, exact plain-prompt byte hash,
 actual prompt token count, executed generation bound, canonical expected-ID hash,
