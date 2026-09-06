@@ -15,10 +15,10 @@ pub use classification::{
     summarize_classification,
 };
 pub use compiled_training::{
-    CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWStepResult,
-    CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult, CompiledTrainingStepResult,
-    CpuCompiledAdamW, CpuCompiledMomentumSgd, MetalCompiledAdamW, MetalCompiledAdamWPlan,
-    MetalCompiledAdamWStepResult, TrainingParameterInit,
+    CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWRuntime, CompiledAdamWStep,
+    CompiledAdamWStepResult, CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult,
+    CompiledTrainingStepResult, CpuCompiledAdamW, CpuCompiledMomentumSgd, MetalCompiledAdamW,
+    MetalCompiledAdamWPlan, MetalCompiledAdamWStepResult, TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,

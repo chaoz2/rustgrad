@@ -934,9 +934,14 @@ optimizer-owned recurrent inputs, tied handles share that one node/state tuple,
 and frozen parameters or buffers become immutable capture constants.
 `compile_module_from_checkpoint` rebuilds the same module topology and requires
 its frozen values and graph to reproduce the authenticated capture identity.
-This CPU foundation deliberately adds no native/device execution, mixed
-precision, or dynamic-shape training ABI yet. `CompiledAdamWCheckpoint` is the
-narrow portable restore
+`CompiledAdamWRuntime` and `CompiledAdamWStep` are the shared public execution
+contract implemented by both the CPU and Metal sessions: one generic training
+loop observes the same capture identity, recurrent optimizer policy, step
+progress, snapshots, and checkpoint, while concrete runtimes retain their
+backend-specific diagnostics. This keeps backend selection out of optimizer
+and persistence logic without introducing a dispatcher enum or hiding device
+evidence. Mixed-precision and dynamic-shape training remain outside the
+contract. `CompiledAdamWCheckpoint` is the narrow portable restore
 boundary: deterministic safetensors bytes retain ordered parameter/moment
 values, step, and capture identity, while `EffectRuntime` and
 `MixedReplayCursor` restore the exact logical versions only after full schema
