@@ -65,36 +65,44 @@ workload to demonstrate the need.
 
 ### 2. P0 — tiny Transformer training and exact resume
 
-The protected tiny causal Transformer now trains from deterministic random
-initialization through embedding, causal attention, LayerNorm, tied output
-weights, cross-entropy, one batched reverse traversal, and captured AdamW.
-Eight CPU steps decrease loss, and recompilation from the midpoint checkpoint
-continues with exact outputs and recurrent parameter/moment state. Compiled
+The maintained public example and protected acceptance build one tiny causal
+Transformer from deterministic random initialization through embedding, causal
+attention, LayerNorm, tied output weights, cross-entropy, one batched reverse
+traversal, and captured AdamW. One resource-free `CompiledAdamWPlan` prepares
+through `CpuSessionTarget` or an explicitly selected strict
+`MetalSessionTarget`; the optimizer-neutral loop is shared without a backend
+enum. Eight CPU steps decrease loss, and authenticated recompilation from a
+midpoint checkpoint byte round trip continues with exact outputs and recurrent
+parameter/moment state. Compiled
 AdamW now optionally retains F32 gradient sums and an accumulation cursor in
 that same frontier, commits one averaged update at each fixed microbatch
 window, resets the sums in-capture, and checkpoints partial windows exactly.
 An optional global L2 limit clips the complete ordered gradient set once after
 window averaging, inside the same capture. Optional static loss scaling uses a
 scaled differentiation root but returns the original loss and unscales the
-complete F32 gradient set before accumulation and clipping. The protected tiny
-Transformer exercises that policy through the identical strict-Metal program
-with zero fallback. Explicit accumulation cancellation, dynamic loss scaling,
-and broader freezing semantics remain workload-driven follow-ups.
+complete F32 gradient set before accumulation and clipping. The maintained
+example exposes the same strict-Metal target with zero-fallback preflight, while
+the protected live Transformer acceptance exercises the identical program and
+exact Metal checkpoint continuation. Explicit accumulation cancellation,
+dynamic loss scaling, and broader freezing semantics remain workload-driven
+follow-ups.
 
 ### 3. P1 — lower the identical training capture to Metal
 
 The same captured loss/backward/AdamW program now passes strict Metal admission
 with zero fallback and initializes parameter, first/second-moment, and U64-step
 state in failure-atomic epoch-swapped device banks. The checked-in protected
-Apple-GPU acceptance executes eight tiny-Transformer steps, proves decreasing
-loss, checkpoints at step four, prepares a second Metal session from those
-bytes, and requires exact continued outputs and final checkpoint equality. Its
+Apple-GPU acceptance now enters through the same public `CompiledAdamWPlan` and
+scoreboard-bound `MetalSessionTarget` path as the maintained example. It
+executes eight tiny-Transformer steps, proves decreasing loss, checkpoints at
+step four, prepares a second Metal session from those bytes, and requires exact
+continued outputs and final checkpoint equality. Its
 create-new evidence records the selected device, capture/deployment identities,
 kernel/command/transfer counts, loss endpoints, and resume result. Running that
 manual exact-SHA lane on provisioned Apple hardware is the remaining proof;
 the shared scoreboard now records this epoch-swapped training session directly,
-and `MetalCompiledAdamWPlan::prepare_with_scoreboard` binds fail-soft observation
-before the first step rather than introducing a parallel training API.
+and `MetalSessionTarget::with_scoreboard` binds fail-soft observation before the
+first step rather than introducing a parallel training API.
 `CompiledTrainingRuntime` and `CompiledTrainingStep` now expose the common
 replay seam across CPU momentum-SGD, CPU AdamW, and Metal AdamW without an
 optimizer or backend enum. `CompiledCheckpointRuntime` isolates portable

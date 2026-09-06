@@ -1,9 +1,12 @@
+#[cfg(target_os = "macos")]
+use rustgrad::MetalSessionTarget;
 use rustgrad::nn::{Embedding, LayerNorm, StateKind};
 use rustgrad::runtime::metal::{MetalCapabilities, MetalRenderer};
 #[cfg(target_os = "macos")]
 use rustgrad::runtime::metal::{MetalDiscovery, MetalRuntime, MetalScoreboardContext};
 use rustgrad::{
-    CompiledAdamWConfig, CpuCompiledAdamW, DType, Graph, LossOptions, Mode, ModeModuleForward,
+    CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
+    CompiledTrainingStep, CpuSessionTarget, DType, Graph, LossOptions, Mode, ModeModuleForward,
     Module, NodeId, Parameter, Reduction, Result, Scalar, Shape, TensorData, TransformerBlock,
     cross_entropy,
 };
@@ -111,28 +114,21 @@ fn learning_rate() -> TensorData {
     TensorData::scalar(0.05)
 }
 
-fn compiled_transformer(model: &TinyCausalTransformer) -> CpuCompiledAdamW {
-    CpuCompiledAdamW::compile_module(config(), model, build)
+fn compiled_transformer(model: &TinyCausalTransformer) -> CompiledAdamWPlan {
+    CompiledAdamWPlan::compile_module(config(), model, build)
         .expect("the fixed causal Transformer training program must compile")
 }
 
-fn metal_renderer() -> MetalRenderer {
-    MetalRenderer::new(
-        8,
-        MetalCapabilities {
-            max_buffer_length: 1 << 30,
-            unified_memory: true,
-            family: "Apple9".into(),
-        },
-    )
-    .unwrap()
-}
-
-#[test]
-fn compiled_causal_transformer_training_decreases_loss_and_resumes_exactly() {
+fn run_exact_resume<R, P>(mut prepare: P) -> Vec<f64>
+where
+    R: CompiledAdamWRuntime,
+    P: FnMut(&CompiledAdamWPlan) -> Result<R>,
+{
     let model = TinyCausalTransformer::new(7).unwrap();
     assert!(model.block.is_causal());
-    let mut uninterrupted = compiled_transformer(&model);
+    let plan = compiled_transformer(&model);
+    let capture_identity = plan.capture_identity();
+    let mut uninterrupted = prepare(&plan).unwrap();
     assert!(
         uninterrupted
             .parameter_snapshots()
@@ -159,15 +155,19 @@ fn compiled_causal_transformer_training_decreases_loss_and_resumes_exactly() {
         );
     }
 
-    let checkpoint = uninterrupted.checkpoint().unwrap();
+    let saved = uninterrupted.checkpoint().unwrap();
+    let checkpoint = CompiledAdamWCheckpoint::from_bytes(saved.into_bytes()).unwrap();
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
-    let mut resumed = CpuCompiledAdamW::compile_module_from_checkpoint(
+    let resumed_plan = CompiledAdamWPlan::compile_module_from_checkpoint(
         config(),
         &resumed_model,
         &checkpoint,
         build,
     )
     .unwrap();
+    assert_eq!(resumed_plan.capture_identity(), capture_identity);
+    assert_eq!(resumed_plan.step_count(), 4);
+    let mut resumed = prepare(&resumed_plan).unwrap();
 
     for _ in 0..4 {
         let expected = uninterrupted.step(batch(), learning_rate()).unwrap();
@@ -178,10 +178,6 @@ fn compiled_causal_transformer_training_decreases_loss_and_resumes_exactly() {
         losses.push(expected.loss().scalar_at(0).as_f64());
     }
 
-    assert!(
-        losses.last().unwrap() < losses.first().unwrap(),
-        "compiled causal Transformer loss did not decrease: {losses:?}"
-    );
     assert_eq!(
         resumed.parameter_snapshots().unwrap(),
         uninterrupted.parameter_snapshots().unwrap()
@@ -198,14 +194,43 @@ fn compiled_causal_transformer_training_decreases_loss_and_resumes_exactly() {
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
     );
+    losses
+}
+
+fn metal_renderer() -> MetalRenderer {
+    MetalRenderer::new(
+        8,
+        MetalCapabilities {
+            max_buffer_length: 1 << 30,
+            unified_memory: true,
+            family: "Apple9".into(),
+        },
+    )
+    .unwrap()
 }
 
 #[test]
-fn causal_transformer_training_capture_is_strictly_renderable_for_metal() {
+fn compiled_transformer_plan_cpu_target_decreases_loss_and_resumes_exactly() {
+    let target = CpuSessionTarget::new();
+    let losses = run_exact_resume(|plan| plan.prepare(&target));
+
+    assert!(
+        losses.last().unwrap() < losses.first().unwrap(),
+        "compiled causal Transformer loss did not decrease: {losses:?}"
+    );
+}
+
+#[test]
+fn compiled_transformer_plan_is_strictly_renderable_for_metal() {
     let model = TinyCausalTransformer::new(7).unwrap();
     let compiled = compiled_transformer(&model);
     assert_eq!(compiled.loss_scale(), 128.0);
-    let parameter_count = compiled.parameter_snapshots().unwrap().len();
+    let parameter_count = compiled
+        .prepare(&CpuSessionTarget::new())
+        .unwrap()
+        .parameter_snapshots()
+        .unwrap()
+        .len();
     let plan = compiled.metal_plan(metal_renderer()).unwrap();
 
     assert_eq!(plan.capture_identity(), compiled.capture_identity());
@@ -275,30 +300,28 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let model = TinyCausalTransformer::new(7).unwrap();
     let seed = compiled_transformer(&model);
     let capture_identity = seed.capture_identity();
-    let plan = seed
-        .metal_plan(
-            device
-                .renderer(64)
-                .expect("selected device must produce its exact renderer identity"),
-        )
-        .expect("the complete training capture must be entirely Metal-admitted");
-    assert_eq!(plan.capture_identity(), capture_identity);
-    assert_eq!(plan.loss_scale(), 128.0);
-    assert_eq!(plan.summary().fallback_count, 0);
-    assert!(plan.summary().nonzero_item_count > 0);
-    let deployment_identity = plan.deployment_identity();
-    let state_pair_count = plan.summary().state_pair_count;
-    let planned_kernel_count = plan.summary().nonzero_item_count;
-    let mut uninterrupted = plan
-        .prepare_with_scoreboard(
-            device.clone(),
+    let target = MetalSessionTarget::new(device.clone(), 64)
+        .expect("selected device must produce its exact renderer identity")
+        .with_scoreboard(
             MetalScoreboardContext::new(
                 "tiny-causal-transformer-compiled-adamw",
                 expected_sha.clone(),
                 "protected live Metal",
             )
             .unwrap(),
-        )
+        );
+    let rendered = seed
+        .metal_plan(target.renderer().clone())
+        .expect("the complete training capture must be entirely Metal-admitted");
+    assert_eq!(rendered.capture_identity(), capture_identity);
+    assert_eq!(rendered.loss_scale(), 128.0);
+    assert_eq!(rendered.summary().fallback_count, 0);
+    assert!(rendered.summary().nonzero_item_count > 0);
+    let deployment_identity = rendered.deployment_identity();
+    let state_pair_count = rendered.summary().state_pair_count;
+    let planned_kernel_count = rendered.summary().nonzero_item_count;
+    let mut uninterrupted = seed
+        .prepare(&target)
         .expect("live Metal preparation must compile, allocate, and upload training state");
     assert_eq!(uninterrupted.loss_scale(), 128.0);
     assert_eq!(uninterrupted.step_count(), 0);
@@ -325,7 +348,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
 
     let checkpoint = uninterrupted.checkpoint().unwrap();
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
-    let resumed_seed = CpuCompiledAdamW::compile_module_from_checkpoint(
+    let resumed_seed = CompiledAdamWPlan::compile_module_from_checkpoint(
         config(),
         &resumed_model,
         &checkpoint,
@@ -333,35 +356,33 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     )
     .unwrap();
     assert_eq!(resumed_seed.step_count(), 4);
-    assert_eq!(resumed_seed.checkpoint().unwrap(), checkpoint);
-    let resumed_plan = resumed_seed
-        .metal_plan(
-            device
-                .renderer(64)
-                .expect("selected device must retain its renderer identity"),
-        )
-        .expect("the checkpoint-restored capture must remain entirely Metal-admitted");
-    assert_eq!(resumed_plan.capture_identity(), capture_identity);
-    let resumed_deployment_identity = resumed_plan.deployment_identity();
-    assert_ne!(
-        resumed_deployment_identity, deployment_identity,
-        "the deployment identity must authenticate the checkpoint-restored state bytes"
-    );
-    assert_eq!(resumed_plan.summary().fallback_count, 0);
-    let mut resumed = resumed_plan
-        .prepare_with_scoreboard(
-            device,
+    let resumed_target = MetalSessionTarget::new(device, 64)
+        .expect("selected device must retain its renderer identity")
+        .with_scoreboard(
             MetalScoreboardContext::new(
                 "tiny-causal-transformer-compiled-adamw-resume",
                 expected_sha.clone(),
                 "protected live Metal checkpoint resume",
             )
             .unwrap(),
-        )
+        );
+    let resumed_rendered = resumed_seed
+        .metal_plan(resumed_target.renderer().clone())
+        .expect("the checkpoint-restored capture must remain entirely Metal-admitted");
+    assert_eq!(resumed_rendered.capture_identity(), capture_identity);
+    let resumed_deployment_identity = resumed_rendered.deployment_identity();
+    assert_ne!(
+        resumed_deployment_identity, deployment_identity,
+        "the deployment identity must authenticate the checkpoint-restored state bytes"
+    );
+    assert_eq!(resumed_rendered.summary().fallback_count, 0);
+    let mut resumed = resumed_seed
+        .prepare(&resumed_target)
         .expect("checkpoint-restored Metal preparation must succeed");
     assert_eq!(resumed.loss_scale(), 128.0);
     assert_eq!(resumed.step_count(), 4);
     assert_eq!(resumed.optimizer_step().unwrap(), 4);
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
 
     for resumed_index in 0..4u64 {
         let expected = uninterrupted.step(batch(), learning_rate()).unwrap();
