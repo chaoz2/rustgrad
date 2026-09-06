@@ -113,13 +113,21 @@ of silently testing the newer revision.
 
 ## Evidence boundary
 
-The compiled-Transformer artifact uses schema v4 and executes the same
+The compiled-Transformer artifact uses schema v5 and executes the same
 dropout-bearing capture twelve times: eight invocations on the uninterrupted
 session and four after checkpoint restoration. Four observed invocations
 download only the scalar loss; eight device-only invocations
 commit the complete fixed-state successor with zero outputs and zero retained
-D2H calls or bytes. Every invocation must commit 59 state pairs, 784 logical
-state bytes, and 194 work items. Its declared fixed `[2,3]` I32 input and target
+D2H calls or bytes. Training progress is measured separately as the
+deterministic eval-mode mean sparse loss over the same three fixed microbatches
+before module ownership and after final parameter publication; replay-loss
+endpoints are not compared across different microbatches or dropout masks. A
+three-microbatch accumulation window adds one gradient sum per canonical
+trainable parameter plus its cursor, so every invocation must commit 79 state
+pairs, 1,048 logical state bytes, and 259 descriptor-derived work items. A
+finite 0.25 global norm limit clips the complete averaged gradient set
+immediately before each AdamW update. Its
+declared fixed `[2,3]` I32 input and target
 token matrices are capture-authenticated through separate autograd-recorded
 proofs binding the embedding and axis-one log-probability Gathers to their exact
 F32-zero-base first-order ScatterAdds, shared flattened index/axis/domain, and
@@ -132,12 +140,19 @@ guarded indexed owners, planned kernel count, and exactly twelve aggregate
 submissions/waits. The prepared input descriptors prove three
 transient writes totaling 52 bytes per replay, so the artifact separately
 requires 624 transient H2D bytes and
-exactly 4 retained-output D2H calls totaling 16 bytes. Midpoint checkpointing
+exactly 4 retained-output D2H calls totaling 16 bytes. The first two distinct
+microbatches populate a nonempty window; `zero_grad` discards both without a
+training replay, compute-command report, successful scoreboard run,
+parameter/moment change, or dropout draw. The inactive-bank reset still submits
+synchronous copy commands before the atomic epoch flip. Repeating `zero_grad`
+on that empty window is an exact epoch/checkpoint no-op. Midpoint checkpointing
 and final parameter publication remain explicit host-observation boundaries
 outside these per-step transfer totals.
 
 A successful compiled-Transformer job trains through step eight, resumes the
-same Metal capture exactly from step four, and consumes the owned resumed
+same Metal capture exactly from a partial step-four frontier (optimizer step
+zero, accumulation index two), commits optimizer steps one and two at replays
+five and eight, and consumes the owned resumed
 session to atomically publish the final trainable frontier and return the fresh
 reconstruction module. It checks 19
 canonical tensors totaling 256 logical bytes, tied-head canonicalization,

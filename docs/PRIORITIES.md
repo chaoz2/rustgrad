@@ -72,9 +72,14 @@ likelihood, one batched reverse traversal, and captured AdamW. One resource-free
 `CompiledAdamWPlan` prepares
 through `CpuSessionTarget` or an explicitly selected strict
 `MetalSessionTarget`; the optimizer-neutral loop is shared without a backend
-enum. Eight CPU steps decrease loss, and authenticated recompilation from a
-midpoint checkpoint byte round trip continues with exact outputs and recurrent
-parameter/moment state. Compiled
+enum. Eight CPU replays use deterministic distinct `[2,3]` microbatches under a
+three-replay accumulation window and active finite global clipping. After two
+replays, a nonempty `zero_grad` cancellation preserves replay/dropout progress
+while discarding the partial window; two subsequent replays are checkpointed
+and authenticated recompilation into a fresh owned module continues the exact
+partial frontier through optimizer updates at replays five and eight. Exact
+outputs and complete recurrent parameter/moment/accumulator state match the
+uninterrupted run. Compiled
 AdamW now optionally retains F32 gradient sums and an accumulation cursor in
 that same frontier, commits one averaged update at each fixed microbatch
 window, resets the sums in-capture, and checkpoints partial windows exactly.
@@ -146,12 +151,14 @@ with zero fallback and initializes parameter, first/second-moment, and U64-step
 state in failure-atomic epoch-swapped device banks. The checked-in protected
 Apple-GPU acceptance now enters through the same public `CompiledAdamWPlan` and
 scoreboard-bound `MetalSessionTarget` path as the maintained example. It
-executes eight tiny-Transformer steps, proves decreasing loss, checkpoints at
-step four, prepares a second Metal session from those bytes, and requires exact
-continued outputs and final checkpoint equality. Its
-create-new evidence records the selected device, capture/deployment identities,
-kernel/command/transfer counts, loss endpoints, and resume result. Running that
-manual exact-SHA lane on provisioned Apple hardware is the remaining proof;
+executes eight tiny-Transformer steps, proves decreasing deterministic
+eval-mode mean sparse loss over the same three fixed microbatches, checkpoints
+at step four, prepares a second Metal session from those bytes, and requires
+exact continued outputs and final checkpoint equality. Its create-new evidence
+records the selected device, capture/deployment identities,
+kernel/command/transfer counts, controlled evaluation endpoints, and resume
+result. Running that manual exact-SHA lane on provisioned Apple hardware is the
+remaining proof;
 the shared scoreboard now records this epoch-swapped training session directly,
 and `MetalSessionTarget::with_scoreboard` binds fail-soft observation before the
 first step rather than introducing a parallel training API.

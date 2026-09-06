@@ -8,10 +8,11 @@ use rustgrad::runtime::metal::{
 };
 use rustgrad::{
     Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledModuleAdamWPlan,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
-    LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Parameter, Reduction, Result, Scalar,
-    Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
+    CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
+    CompiledModuleAdamWPlan, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
+    CpuSessionTarget, DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Parameter,
+    Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
+    cross_entropy, load_safetensors,
 };
 use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "macos")]
@@ -22,6 +23,8 @@ const EMBEDDING: usize = 2;
 const BATCH: usize = 2;
 const TIME: usize = 3;
 const TOKEN_COUNT: usize = BATCH * TIME;
+const ACCUMULATION_STEPS: u64 = 3;
+const MAX_GRADIENT_NORM: f32 = 0.25;
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -110,12 +113,23 @@ impl Module for TinyCausalTransformer {
 }
 
 fn config() -> CompiledAdamWConfig {
-    CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)
+    config_with_max_gradient_norm(Some(MAX_GRADIENT_NORM))
+}
+
+fn config_with_max_gradient_norm(max_gradient_norm: Option<f32>) -> CompiledAdamWConfig {
+    let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)
         .unwrap()
         .with_weight_decay_exclusions(WEIGHT_DECAY_EXCLUSIONS)
         .unwrap()
         .with_loss_scale(128.0)
         .unwrap()
+        .with_gradient_accumulation(ACCUMULATION_STEPS)
+        .unwrap();
+    let config = match max_gradient_norm {
+        Some(max_gradient_norm) => config.with_max_gradient_norm(max_gradient_norm).unwrap(),
+        None => config,
+    };
+    config
         .with_host_token_input("tokens", [BATCH, TIME])
         .unwrap()
         .with_host_token_input("targets", [BATCH, TIME])
@@ -147,7 +161,7 @@ fn dropout_config() -> CompiledDropoutConfig {
     CompiledDropoutConfig::new(CompiledDropoutKey([0x1234_5678, 0x9abc_def0]))
 }
 
-fn batch() -> BTreeMap<String, TensorData> {
+fn batch(replay: u64) -> BTreeMap<String, TensorData> {
     let tensor = |values: [i32; TOKEN_COUNT]| {
         TensorData::from_scalars(
             Shape::new([BATCH, TIME]),
@@ -156,14 +170,26 @@ fn batch() -> BTreeMap<String, TensorData> {
         )
         .unwrap()
     };
+    let (tokens, targets) = match (replay - 1) % ACCUMULATION_STEPS {
+        0 => ([0, 1, 2, 2, 0, 1], [1, 2, 0, 0, 1, 2]),
+        1 => ([1, 2, 0, 0, 1, 2], [2, 0, 1, 1, 2, 0]),
+        2 => ([2, 0, 1, 1, 2, 0], [0, 1, 2, 2, 0, 1]),
+        _ => unreachable!(),
+    };
     BTreeMap::from([
-        ("tokens".into(), tensor([0, 1, 2, 2, 0, 1])),
-        ("targets".into(), tensor([1, 2, 0, 0, 1, 2])),
+        ("tokens".into(), tensor(tokens)),
+        ("targets".into(), tensor(targets)),
     ])
 }
 
 fn learning_rate() -> TensorData {
     TensorData::scalar(0.05)
+}
+
+#[cfg(target_os = "macos")]
+fn checkpoint_dropout_block_counter(checkpoint: &CompiledAdamWCheckpoint) -> u64 {
+    let (state, _) = load_safetensors(checkpoint.as_bytes()).unwrap();
+    state["dropout_block_counter"].scalar_at(0).as_u64()
 }
 
 #[test]
@@ -259,8 +285,35 @@ fn evaluate(model: &TinyCausalTransformer) -> TensorData {
     let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
     let logits = model.forward_eval(&mut graph, tokens).unwrap();
     let mut bindings = model.input_bindings(&graph).unwrap();
-    bindings.insert("tokens".into(), batch().remove("tokens").unwrap());
+    bindings.insert("tokens".into(), batch(1).remove("tokens").unwrap());
     CpuBackend.execute(&graph, logits, &bindings).unwrap()
+}
+
+fn evaluate_mean_sparse_loss(model: &TinyCausalTransformer) -> f64 {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let logits = model.forward_eval(&mut graph, tokens).unwrap();
+    let loss = sparse_causal_loss(&mut graph, logits, targets).unwrap();
+    let parameter_bindings = model.input_bindings(&graph).unwrap();
+    let total = (1..=ACCUMULATION_STEPS)
+        .map(|replay| {
+            let mut bindings = parameter_bindings.clone();
+            bindings.extend(batch(replay));
+            CpuBackend
+                .execute(&graph, loss, &bindings)
+                .unwrap()
+                .scalar_at(0)
+                .as_f64()
+        })
+        .sum::<f64>();
+    total / ACCUMULATION_STEPS as f64
+}
+
+#[derive(Debug)]
+struct ExactResumeEvaluation {
+    initial_mean_sparse_loss: f64,
+    final_mean_sparse_loss: f64,
 }
 
 fn compiled_transformer(model: &TinyCausalTransformer) -> CompiledAdamWPlan {
@@ -274,7 +327,7 @@ fn owned_compiled_transformer(
     CompiledModuleAdamWPlan::compile_with_dropout(config(), dropout_config(), model, build).unwrap()
 }
 
-fn run_exact_resume<R, P>(mut prepare: P) -> Vec<f64>
+fn run_exact_resume<R, P>(mut prepare: P) -> ExactResumeEvaluation
 where
     R: CompiledAdamWRuntime,
     P: FnMut(
@@ -283,6 +336,10 @@ where
 {
     let model = TinyCausalTransformer::new(7).unwrap();
     assert!(model.block.is_causal());
+    assert_ne!(batch(1), batch(2));
+    assert_ne!(batch(2), batch(3));
+    assert_ne!(batch(1), batch(3));
+    let initial_mean_sparse_loss = evaluate_mean_sparse_loss(&model);
     let plan = owned_compiled_transformer(model);
     let capture_identity = plan.capture_identity();
     let mut uninterrupted = prepare(plan).unwrap();
@@ -299,20 +356,78 @@ where
             .contains_key("lm_head.weight"),
         "the tied output head must share the embedding's recurrent state"
     );
+    assert_eq!(
+        uninterrupted.gradient_accumulation_steps(),
+        ACCUMULATION_STEPS
+    );
+    assert_eq!(uninterrupted.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
+    let initial_parameters = uninterrupted.parameter_snapshots().unwrap();
+    let initial_first_moments = uninterrupted.first_moment_snapshots().unwrap();
+    let initial_second_moments = uninterrupted.second_moment_snapshots().unwrap();
+    let empty_accumulators = uninterrupted.gradient_accumulator_snapshots().unwrap();
 
-    let mut losses = Vec::new();
-    for _ in 0..4 {
-        losses.push(
-            uninterrupted
-                .step(batch(), learning_rate())
-                .unwrap()
-                .loss()
-                .scalar_at(0)
-                .as_f64(),
-        );
+    for replay in 1..=2 {
+        let step = uninterrupted.step(batch(replay), learning_rate()).unwrap();
+        assert_eq!(step.step(), replay);
+        assert_eq!(step.optimizer_step(), 0);
+        assert_eq!(step.accumulation_index(), replay);
+        assert!(!step.did_update());
+    }
+    assert_ne!(
+        uninterrupted.gradient_accumulator_snapshots().unwrap(),
+        empty_accumulators,
+        "two distinct microbatches must populate the partial gradient window"
+    );
+    assert_eq!(
+        uninterrupted.parameter_snapshots().unwrap(),
+        initial_parameters
+    );
+    assert_eq!(
+        uninterrupted.first_moment_snapshots().unwrap(),
+        initial_first_moments
+    );
+    assert_eq!(
+        uninterrupted.second_moment_snapshots().unwrap(),
+        initial_second_moments
+    );
+    let reset = uninterrupted.zero_grad().unwrap();
+    assert_eq!(reset.discarded_microbatches(), 2);
+    assert_eq!(uninterrupted.step_count(), 2);
+    assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
+    assert_eq!(uninterrupted.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        uninterrupted.gradient_accumulator_snapshots().unwrap(),
+        empty_accumulators
+    );
+    let after_reset = uninterrupted.checkpoint().unwrap();
+    assert_eq!(
+        uninterrupted.zero_grad().unwrap().discarded_microbatches(),
+        0
+    );
+    assert_eq!(uninterrupted.checkpoint().unwrap(), after_reset);
+
+    for replay in 3..=4 {
+        let step = uninterrupted.step(batch(replay), learning_rate()).unwrap();
+        assert_eq!(step.step(), replay);
+        assert_eq!(step.optimizer_step(), 0);
+        assert_eq!(step.accumulation_index(), replay - 2);
+        assert!(!step.did_update());
     }
     let saved = uninterrupted.checkpoint().unwrap();
     let checkpoint = CompiledAdamWCheckpoint::from_bytes(saved.into_bytes()).unwrap();
+    let (checkpoint_state, checkpoint_metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+    assert_eq!(checkpoint_metadata["format"], "rustgrad-compiled-adamw-v4");
+    assert_eq!(checkpoint_metadata["replay_step"], "4");
+    assert_eq!(checkpoint_metadata["optimizer_step"], "0");
+    assert_eq!(checkpoint_metadata["gradient_accumulation_steps"], "3");
+    assert_eq!(checkpoint_metadata["accumulation_index"], "2");
+    assert_eq!(checkpoint_metadata["discarded_microbatch_count"], "2");
+    assert_eq!(
+        checkpoint_state["dropout_block_counter"]
+            .scalar_at(0)
+            .as_u64(),
+        48
+    );
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
     let tied = resumed_model.tokens.weight.clone();
     let frozen = resumed_model.frozen_scale.clone();
@@ -327,15 +442,33 @@ where
     assert_eq!(resumed_plan.capture_identity(), capture_identity);
     assert_eq!(resumed_plan.step_count(), 4);
     let mut resumed = prepare(resumed_plan).unwrap();
+    assert_eq!(resumed.optimizer_step().unwrap(), 0);
+    assert_eq!(resumed.accumulation_index().unwrap(), 2);
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
 
-    for _ in 0..4 {
-        let expected = uninterrupted.step(batch(), learning_rate()).unwrap();
-        let actual = resumed.step(batch(), learning_rate()).unwrap();
+    for replay in 5..=8 {
+        let expected = uninterrupted.step(batch(replay), learning_rate()).unwrap();
+        let actual = resumed.step(batch(replay), learning_rate()).unwrap();
         assert_eq!(actual.loss(), expected.loss());
         assert_eq!(actual.outputs(), expected.outputs());
         assert_eq!(actual.step(), expected.step());
-        losses.push(expected.loss().scalar_at(0).as_f64());
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+        assert_eq!(actual.did_update(), expected.did_update());
+        let (optimizer_step, accumulation_index, did_update) = match replay {
+            5 => (1, 0, true),
+            6 => (1, 1, false),
+            7 => (1, 2, false),
+            8 => (2, 0, true),
+            _ => unreachable!(),
+        };
+        assert_eq!(actual.optimizer_step(), optimizer_step);
+        assert_eq!(actual.accumulation_index(), accumulation_index);
+        assert_eq!(actual.did_update(), did_update);
     }
+    assert_eq!(resumed.step_count(), 8);
+    assert_eq!(resumed.optimizer_step().unwrap(), 2);
+    assert_eq!(resumed.accumulation_index().unwrap(), 0);
     assert_eq!(
         resumed.parameter_snapshots().unwrap(),
         uninterrupted.parameter_snapshots().unwrap()
@@ -349,8 +482,26 @@ where
         uninterrupted.second_moment_snapshots().unwrap()
     );
     assert_eq!(
+        resumed.gradient_accumulator_snapshots().unwrap(),
+        uninterrupted.gradient_accumulator_snapshots().unwrap()
+    );
+    assert_eq!(
+        resumed.gradient_accumulator_snapshots().unwrap(),
+        empty_accumulators
+    );
+    assert_eq!(
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
+    );
+    let (final_state, final_metadata) =
+        load_safetensors(resumed.checkpoint().unwrap().as_bytes()).unwrap();
+    assert_eq!(final_metadata["replay_step"], "8");
+    assert_eq!(final_metadata["optimizer_step"], "2");
+    assert_eq!(final_metadata["accumulation_index"], "0");
+    assert_eq!(final_metadata["discarded_microbatch_count"], "2");
+    assert_eq!(
+        final_state["dropout_block_counter"].scalar_at(0).as_u64(),
+        96
     );
     let published = resumed.parameter_snapshots().unwrap();
     let tied_version = tied.version().unwrap();
@@ -378,6 +529,7 @@ where
         .collect::<BTreeMap<_, _>>();
     let first_eval = evaluate(&resumed_model);
     let second_eval = evaluate(&resumed_model);
+    let final_mean_sparse_loss = evaluate_mean_sparse_loss(&resumed_model);
     assert_eq!(first_eval.shape(), &Shape::new([BATCH, TIME, VOCAB]));
     assert_eq!(first_eval, second_eval);
     assert!(
@@ -387,7 +539,10 @@ where
     for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
         assert_eq!(parameter.version().unwrap(), versions_before_eval[&name]);
     }
-    losses
+    ExactResumeEvaluation {
+        initial_mean_sparse_loss,
+        final_mean_sparse_loss,
+    }
 }
 
 fn metal_renderer() -> MetalRenderer {
@@ -425,12 +580,75 @@ fn assert_strict_dropout_kernels(plan: &MetalCompiledAdamWPlan) {
 #[test]
 fn compiled_transformer_plan_cpu_target_decreases_loss_and_resumes_exactly() {
     let target = CpuSessionTarget::new();
-    let losses =
+    let evaluation =
         run_exact_resume(|plan| plan.prepare(&target).map_err(|error| error.into_parts().1));
 
     assert!(
-        losses.last().unwrap() < losses.first().unwrap(),
-        "compiled causal Transformer loss did not decrease: {losses:?}"
+        evaluation.final_mean_sparse_loss < evaluation.initial_mean_sparse_loss,
+        "compiled causal Transformer eval loss did not decrease: {evaluation:?}"
+    );
+}
+
+#[test]
+fn compiled_transformer_active_global_clip_changes_the_first_window_update() {
+    let clipped_plan = CompiledModuleAdamWPlan::compile_with_dropout(
+        config(),
+        dropout_config(),
+        TinyCausalTransformer::new(7).unwrap(),
+        build,
+    )
+    .unwrap();
+    let unclipped_plan = CompiledModuleAdamWPlan::compile_with_dropout(
+        config_with_max_gradient_norm(None),
+        dropout_config(),
+        TinyCausalTransformer::new(7).unwrap(),
+        build,
+    )
+    .unwrap();
+    assert_eq!(
+        clipped_plan.dropout_config(),
+        unclipped_plan.dropout_config()
+    );
+    assert_ne!(
+        clipped_plan.capture_identity(),
+        unclipped_plan.capture_identity(),
+        "the global clipping policy must remain capture-authenticated"
+    );
+
+    let target = CpuSessionTarget::new();
+    let mut clipped = clipped_plan.prepare(&target).unwrap();
+    let mut unclipped = unclipped_plan.prepare(&target).unwrap();
+    assert_eq!(clipped.gradient_accumulation_steps(), ACCUMULATION_STEPS);
+    assert_eq!(unclipped.gradient_accumulation_steps(), ACCUMULATION_STEPS);
+    assert_eq!(clipped.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
+    assert_eq!(unclipped.max_gradient_norm(), None);
+    assert_eq!(clipped.loss_scale(), unclipped.loss_scale());
+
+    for replay in 1..=ACCUMULATION_STEPS {
+        let clipped_step = clipped.step(batch(replay), learning_rate()).unwrap();
+        let unclipped_step = unclipped.step(batch(replay), learning_rate()).unwrap();
+        assert_eq!(clipped_step.loss(), unclipped_step.loss());
+        assert_eq!(clipped_step.outputs(), unclipped_step.outputs());
+        assert_eq!(clipped_step.step(), replay);
+        assert_eq!(unclipped_step.step(), replay);
+        let did_update = replay == ACCUMULATION_STEPS;
+        assert_eq!(clipped_step.did_update(), did_update);
+        assert_eq!(unclipped_step.did_update(), did_update);
+    }
+
+    assert_eq!(clipped.optimizer_step().unwrap(), 1);
+    assert_eq!(unclipped.optimizer_step().unwrap(), 1);
+    assert_eq!(clipped.accumulation_index().unwrap(), 0);
+    assert_eq!(unclipped.accumulation_index().unwrap(), 0);
+    assert_ne!(
+        clipped.first_moment_snapshots().unwrap(),
+        unclipped.first_moment_snapshots().unwrap(),
+        "the maintained gradient norm must exceed its configured clipping limit"
+    );
+    assert_ne!(
+        clipped.parameter_snapshots().unwrap(),
+        unclipped.parameter_snapshots().unwrap(),
+        "active clipping must change the maintained Transformer's update"
     );
 }
 
@@ -440,19 +658,12 @@ fn owned_compiled_transformer_session_finishes_and_resumes_one_module_lifecycle(
     let tied_identity = model.tokens.weight.id();
     let frozen = model.frozen_scale.clone();
     let frozen_before = frozen.snapshot().unwrap();
+    let initial_mean_sparse_loss = evaluate_mean_sparse_loss(&model);
     let plan = owned_compiled_transformer(model);
     let capture_identity = plan.capture_identity();
     let mut session = plan.prepare(&CpuSessionTarget::new()).unwrap();
-    let mut losses = Vec::new();
-    for _ in 0..4 {
-        losses.push(
-            session
-                .step(batch(), learning_rate())
-                .unwrap()
-                .loss()
-                .scalar_at(0)
-                .as_f64(),
-        );
+    for replay in 1..=4 {
+        session.step(batch(replay), learning_rate()).unwrap();
     }
     let checkpoint = session.checkpoint().unwrap();
     let midpoint = session.parameter_snapshots().unwrap();
@@ -487,15 +698,8 @@ fn owned_compiled_transformer_session_finishes_and_resumes_one_module_lifecycle(
     assert_eq!(resumed.capture_identity(), capture_identity);
     assert_eq!(resumed.step_count(), 4);
     let mut session = resumed.prepare(&CpuSessionTarget::new()).unwrap();
-    for _ in 0..4 {
-        losses.push(
-            session
-                .step(batch(), learning_rate())
-                .unwrap()
-                .loss()
-                .scalar_at(0)
-                .as_f64(),
-        );
+    for replay in 5..=8 {
+        session.step(batch(replay), learning_rate()).unwrap();
     }
     let final_parameters = session.parameter_snapshots().unwrap();
     let model = session.finish().unwrap();
@@ -510,9 +714,10 @@ fn owned_compiled_transformer_session_finishes_and_resumes_one_module_lifecycle(
         frozen_before.data
     );
     assert_eq!(model.frozen_scale.version().unwrap(), frozen_before.version);
+    let final_mean_sparse_loss = evaluate_mean_sparse_loss(&model);
     assert!(
-        losses.last().unwrap() < losses.first().unwrap(),
-        "owned compiled causal Transformer loss did not decrease: {losses:?}"
+        final_mean_sparse_loss < initial_mean_sparse_loss,
+        "owned compiled causal Transformer eval loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
     );
 }
 
@@ -525,8 +730,8 @@ fn compiled_transformer_dropout_is_keyed_replay_varying_and_zero_grad_is_not_a_d
     let mut replay_losses = Vec::new();
 
     for replay in 1..=8 {
-        let left_step = left.step(batch(), TensorData::scalar(0.0)).unwrap();
-        let right_step = right.step(batch(), TensorData::scalar(0.0)).unwrap();
+        let left_step = left.step(batch(replay), TensorData::scalar(0.0)).unwrap();
+        let right_step = right.step(batch(replay), TensorData::scalar(0.0)).unwrap();
         assert_eq!(left_step.loss(), right_step.loss());
         assert_eq!(left_step.outputs(), right_step.outputs());
         replay_losses.push(left_step.loss().clone());
@@ -537,7 +742,7 @@ fn compiled_transformer_dropout_is_keyed_replay_varying_and_zero_grad_is_not_a_d
     assert_eq!(left.dropout_block_counter().unwrap(), Some(96));
     assert_eq!(right.dropout_block_counter().unwrap(), Some(96));
     let before = left.dropout_block_counter().unwrap();
-    assert!(!left.zero_grad().unwrap().did_discard());
+    assert_eq!(left.zero_grad().unwrap().discarded_microbatches(), 2);
     assert_eq!(left.dropout_block_counter().unwrap(), before);
 }
 
@@ -572,25 +777,35 @@ fn compiled_transformer_plan_is_strictly_renderable_for_metal() {
         ]
     );
     let compiled = compiled_transformer(&model);
+    assert_eq!(compiled.gradient_accumulation_steps(), ACCUMULATION_STEPS);
+    assert_eq!(compiled.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
     assert_eq!(compiled.loss_scale(), 128.0);
     assert_eq!(compiled.dropout_config(), Some(dropout_config()));
     assert_eq!(compiled.dropout_blocks_per_replay(), Some(12));
-    let parameter_count = compiled
+    let parameters = compiled
         .prepare(&CpuSessionTarget::new())
         .unwrap()
         .parameter_snapshots()
-        .unwrap()
-        .len();
+        .unwrap();
+    let parameter_count = parameters.len();
+    let parameter_bytes = parameters
+        .values()
+        .map(|value| value.shape().numel().unwrap() * value.dtype().itemsize())
+        .sum::<usize>();
     let plan = compiled.metal_plan(metal_renderer()).unwrap();
 
     assert_eq!(plan.capture_identity(), compiled.capture_identity());
     assert_eq!(plan.loss_scale(), 128.0);
     assert_eq!(plan.step_count(), 0);
     assert_eq!(plan.summary().fallback_count, 0);
-    assert_eq!(plan.summary().state_pair_count, parameter_count * 3 + 2);
+    assert_eq!(plan.summary().state_pair_count, parameter_count * 4 + 3);
     assert_eq!(plan.summary().state_bank_count, 2);
-    assert_eq!(plan.summary().logical_state_bytes, 784);
-    assert_eq!(plan.summary().state_device_bytes, 1_568);
+    assert_eq!(
+        plan.summary().logical_state_bytes,
+        parameter_bytes * 4 + 3 * 8
+    );
+    assert_eq!(plan.summary().logical_state_bytes, 1_048);
+    assert_eq!(plan.summary().state_device_bytes, 2_096);
     assert_eq!(plan.summary().requested_output_count, 1);
     assert!(plan.summary().nonzero_item_count > 0);
     assert_strict_dropout_kernels(&plan);
@@ -619,7 +834,7 @@ fn protected_live_metal_workflow_runs_the_exact_compiled_training_acceptance() {
     let workflow = include_str!("../.github/workflows/metal-live.yml");
     for required in [
         "RUSTGRAD_METAL_TRAINING_EVIDENCE_PATH:",
-        "metal-live-compiled-training-v4.json",
+        "metal-live-compiled-training-v5.json",
         "Train and resume the compiled causal Transformer on Metal",
         "cargo test --release --test compiled_transformer_training",
         "live_metal_compiled_causal_transformer_training_resumes_exactly",
@@ -654,6 +869,7 @@ impl LiveTrainingTotals {
         observed: bool,
         state_pair_count: usize,
         logical_state_bytes: usize,
+        state_work_items: usize,
         planned_kernel_count: usize,
         expected_command_count: usize,
         expected_transient_h2d_calls: usize,
@@ -665,7 +881,7 @@ impl LiveTrainingTotals {
         assert_eq!(report.retained_d2h_bytes, output_multiplier * 4);
         assert_eq!(report.committed_state_pair_count, state_pair_count);
         assert_eq!(report.committed_state_bytes, logical_state_bytes);
-        assert_eq!(report.committed_state_work_items, 194);
+        assert_eq!(report.committed_state_work_items, state_work_items);
         assert_eq!(report.kernel_launch_count, planned_kernel_count);
         assert_eq!(report.command_submission_count, expected_command_count);
         assert_eq!(report.command_wait_count, expected_command_count);
@@ -720,6 +936,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let device_info = device.info().clone();
 
     let model = TinyCausalTransformer::new(7).unwrap();
+    let initial_mean_sparse_loss = evaluate_mean_sparse_loss(&model);
     let seed = owned_compiled_transformer(model);
     let capture_identity = seed.capture_identity();
     let target = MetalSessionTarget::new(device.clone(), 64)
@@ -739,15 +956,22 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert!(summary.nonzero_item_count > 0);
     let state_pair_count = summary.state_pair_count;
     let logical_state_bytes = summary.logical_state_bytes;
-    assert_eq!(state_pair_count, 59);
-    assert_eq!(logical_state_bytes, 784);
+    assert_eq!(state_pair_count, 79);
+    assert_eq!(logical_state_bytes, 1_048);
     assert_eq!(summary.state_bank_count, 2);
-    assert_eq!(summary.state_device_bytes, 1_568);
+    assert_eq!(summary.state_device_bytes, 2_096);
     let planned_kernel_count = summary.nonzero_item_count;
     let command_count_per_invocation = 1;
     let mut uninterrupted = seed
         .prepare(&target)
         .expect("live Metal preparation must compile, allocate, and upload training state");
+    let state_work_items = uninterrupted
+        .metal_session()
+        .state_inputs()
+        .iter()
+        .map(|input| input.desc.shape.numel().unwrap())
+        .sum::<usize>();
+    assert_eq!(state_work_items, 259);
     let deployment_identity = uninterrupted
         .execution_scoreboard_report()
         .unwrap()
@@ -818,48 +1042,151 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(transient_h2d_calls_per_invocation, 3);
     assert_eq!(transient_h2d_bytes_per_invocation, 52);
     assert_eq!(uninterrupted.loss_scale(), 128.0);
+    assert_eq!(
+        uninterrupted.gradient_accumulation_steps(),
+        ACCUMULATION_STEPS
+    );
+    assert_eq!(uninterrupted.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
     assert_eq!(uninterrupted.step_count(), 0);
     assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
+    assert_eq!(uninterrupted.accumulation_index().unwrap(), 0);
+    let empty_accumulators = uninterrupted.gradient_accumulator_snapshots().unwrap();
 
-    let mut losses = Vec::new();
     let mut totals = LiveTrainingTotals::default();
     for index in 0..4u64 {
         if matches!(index, 1 | 2) {
             let result = uninterrupted
-                .step_without_host_outputs(batch(), learning_rate())
+                .step_without_host_outputs(batch(index + 1), learning_rate())
                 .unwrap();
             assert_eq!(result.step(), index + 1);
             assert_eq!(result.capture_identity(), capture_identity);
             assert_eq!(result.report().successful_invocation, index + 1);
+            assert_eq!(result.optimizer_step(), 0);
+            assert_eq!(
+                result.accumulation_index(),
+                if index < 2 { index + 1 } else { index - 1 }
+            );
+            assert!(!result.did_update());
             totals.record(
                 result.report(),
                 false,
                 state_pair_count,
                 logical_state_bytes,
+                state_work_items,
                 planned_kernel_count,
                 command_count_per_invocation,
                 transient_h2d_calls_per_invocation,
                 transient_h2d_bytes_per_invocation,
             );
         } else {
-            let result = uninterrupted.step(batch(), learning_rate()).unwrap();
+            let result = uninterrupted
+                .step(batch(index + 1), learning_rate())
+                .unwrap();
             assert_eq!(result.step(), index + 1);
             assert_eq!(result.capture_identity(), capture_identity);
             assert_eq!(result.report().successful_invocation, index + 1);
-            losses.push(result.loss().scalar_at(0).as_f64());
+            assert_eq!(result.optimizer_step(), 0);
+            assert_eq!(
+                result.accumulation_index(),
+                if index < 2 { index + 1 } else { index - 1 }
+            );
+            assert!(!result.did_update());
             totals.record(
                 result.report(),
                 true,
                 state_pair_count,
                 logical_state_bytes,
+                state_work_items,
                 planned_kernel_count,
                 command_count_per_invocation,
                 transient_h2d_calls_per_invocation,
                 transient_h2d_bytes_per_invocation,
             );
         }
+        if index == 1 {
+            let parameters_before_reset = uninterrupted.parameter_snapshots().unwrap();
+            let first_moments_before_reset = uninterrupted.first_moment_snapshots().unwrap();
+            let second_moments_before_reset = uninterrupted.second_moment_snapshots().unwrap();
+            assert_ne!(
+                uninterrupted.gradient_accumulator_snapshots().unwrap(),
+                empty_accumulators
+            );
+            let state_epoch = uninterrupted.metal_session().state_epoch();
+            let checkpoint_before_reset = uninterrupted.checkpoint().unwrap();
+            let dropout_counter_before_reset =
+                checkpoint_dropout_block_counter(&checkpoint_before_reset);
+            assert_eq!(dropout_counter_before_reset, 24);
+            let scoreboard_before_reset = uninterrupted
+                .execution_scoreboard_report()
+                .unwrap()
+                .unwrap();
+            let reset = uninterrupted.zero_grad().unwrap();
+            assert_eq!(reset.discarded_microbatches(), 2);
+            assert_eq!(uninterrupted.step_count(), 2);
+            assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
+            assert_eq!(uninterrupted.accumulation_index().unwrap(), 0);
+            assert_ne!(uninterrupted.metal_session().state_epoch(), state_epoch);
+            assert_eq!(
+                uninterrupted
+                    .execution_scoreboard_report()
+                    .unwrap()
+                    .unwrap(),
+                scoreboard_before_reset
+            );
+            assert_eq!(
+                checkpoint_dropout_block_counter(&uninterrupted.checkpoint().unwrap()),
+                dropout_counter_before_reset
+            );
+            assert_eq!(
+                uninterrupted.gradient_accumulator_snapshots().unwrap(),
+                empty_accumulators
+            );
+            assert_eq!(
+                uninterrupted.parameter_snapshots().unwrap(),
+                parameters_before_reset
+            );
+            assert_eq!(
+                uninterrupted.first_moment_snapshots().unwrap(),
+                first_moments_before_reset
+            );
+            assert_eq!(
+                uninterrupted.second_moment_snapshots().unwrap(),
+                second_moments_before_reset
+            );
+            let checkpoint_after_reset = uninterrupted.checkpoint().unwrap();
+            let state_epoch = uninterrupted.metal_session().state_epoch();
+            assert!(!uninterrupted.zero_grad().unwrap().did_discard());
+            assert_eq!(uninterrupted.metal_session().state_epoch(), state_epoch);
+            assert_eq!(uninterrupted.checkpoint().unwrap(), checkpoint_after_reset);
+            assert_eq!(
+                uninterrupted
+                    .execution_scoreboard_report()
+                    .unwrap()
+                    .unwrap(),
+                scoreboard_before_reset
+            );
+            assert_eq!(
+                checkpoint_dropout_block_counter(&uninterrupted.checkpoint().unwrap()),
+                dropout_counter_before_reset
+            );
+        }
     }
+    assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
+    assert_eq!(uninterrupted.accumulation_index().unwrap(), 2);
     let checkpoint = uninterrupted.checkpoint().unwrap();
+    let (checkpoint_state, checkpoint_metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+    assert_eq!(checkpoint_metadata["format"], "rustgrad-compiled-adamw-v4");
+    assert_eq!(checkpoint_metadata["replay_step"], "4");
+    assert_eq!(checkpoint_metadata["optimizer_step"], "0");
+    assert_eq!(checkpoint_metadata["gradient_accumulation_steps"], "3");
+    assert_eq!(checkpoint_metadata["accumulation_index"], "2");
+    assert_eq!(checkpoint_metadata["discarded_microbatch_count"], "2");
+    assert_eq!(
+        checkpoint_state["dropout_block_counter"]
+            .scalar_at(0)
+            .as_u64(),
+        48
+    );
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
     let tied = resumed_model.tokens.weight.clone();
     let frozen = resumed_model.frozen_scale.clone();
@@ -915,22 +1242,35 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         uninterrupted.metal_session().transient_inputs()
     );
     assert_eq!(resumed.loss_scale(), 128.0);
+    assert_eq!(resumed.gradient_accumulation_steps(), ACCUMULATION_STEPS);
+    assert_eq!(resumed.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
     assert_eq!(resumed.step_count(), 4);
-    assert_eq!(resumed.optimizer_step().unwrap(), 4);
+    assert_eq!(resumed.optimizer_step().unwrap(), 0);
+    assert_eq!(resumed.accumulation_index().unwrap(), 2);
     assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
 
     for resumed_index in 0..4u64 {
+        let replay = resumed_index + 5;
         if resumed_index < 3 {
             let expected = uninterrupted
-                .step_without_host_outputs(batch(), learning_rate())
+                .step_without_host_outputs(batch(replay), learning_rate())
                 .unwrap();
             let actual = resumed
-                .step_without_host_outputs(batch(), learning_rate())
+                .step_without_host_outputs(batch(replay), learning_rate())
                 .unwrap();
             assert_eq!(actual.step(), expected.step());
             assert_eq!(actual.optimizer_step(), expected.optimizer_step());
             assert_eq!(actual.accumulation_index(), expected.accumulation_index());
             assert_eq!(actual.did_update(), expected.did_update());
+            let (optimizer_step, accumulation_index, did_update) = match replay {
+                5 => (1, 0, true),
+                6 => (1, 1, false),
+                7 => (1, 2, false),
+                _ => unreachable!(),
+            };
+            assert_eq!(actual.optimizer_step(), optimizer_step);
+            assert_eq!(actual.accumulation_index(), accumulation_index);
+            assert_eq!(actual.did_update(), did_update);
             assert_eq!(actual.report().successful_invocation, resumed_index + 1);
             for report in [expected.report(), actual.report()] {
                 totals.record(
@@ -938,6 +1278,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                     false,
                     state_pair_count,
                     logical_state_bytes,
+                    state_work_items,
                     planned_kernel_count,
                     command_count_per_invocation,
                     transient_h2d_calls_per_invocation,
@@ -945,11 +1286,17 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                 );
             }
         } else {
-            let expected = uninterrupted.step(batch(), learning_rate()).unwrap();
-            let actual = resumed.step(batch(), learning_rate()).unwrap();
+            let expected = uninterrupted.step(batch(replay), learning_rate()).unwrap();
+            let actual = resumed.step(batch(replay), learning_rate()).unwrap();
             assert_eq!(actual.loss(), expected.loss());
             assert_eq!(actual.outputs(), expected.outputs());
             assert_eq!(actual.step(), expected.step());
+            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+            assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+            assert_eq!(actual.did_update(), expected.did_update());
+            assert_eq!(actual.optimizer_step(), 2);
+            assert_eq!(actual.accumulation_index(), 0);
+            assert!(actual.did_update());
             assert_eq!(actual.report().successful_invocation, resumed_index + 1);
             for report in [expected.report(), actual.report()] {
                 totals.record(
@@ -957,22 +1304,30 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                     true,
                     state_pair_count,
                     logical_state_bytes,
+                    state_work_items,
                     planned_kernel_count,
                     command_count_per_invocation,
                     transient_h2d_calls_per_invocation,
                     transient_h2d_bytes_per_invocation,
                 );
             }
-            losses.push(expected.loss().scalar_at(0).as_f64());
         }
     }
 
-    assert!(
-        losses.last().unwrap() < losses.first().unwrap(),
-        "live compiled causal Transformer loss did not decrease: {losses:?}"
-    );
     assert_eq!(resumed.step_count(), 8);
     assert_eq!(uninterrupted.step_count(), 8);
+    assert_eq!(resumed.optimizer_step().unwrap(), 2);
+    assert_eq!(uninterrupted.optimizer_step().unwrap(), 2);
+    assert_eq!(resumed.accumulation_index().unwrap(), 0);
+    assert_eq!(uninterrupted.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        resumed.gradient_accumulator_snapshots().unwrap(),
+        uninterrupted.gradient_accumulator_snapshots().unwrap()
+    );
+    assert_eq!(
+        resumed.gradient_accumulator_snapshots().unwrap(),
+        empty_accumulators
+    );
     assert_eq!(totals.observed_training_invocations, 4);
     assert_eq!(totals.device_only_training_invocations, 8);
     assert_eq!(totals.command_submission_count, 12);
@@ -993,6 +1348,16 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
+    );
+    let (final_state, final_metadata) =
+        load_safetensors(resumed.checkpoint().unwrap().as_bytes()).unwrap();
+    assert_eq!(final_metadata["replay_step"], "8");
+    assert_eq!(final_metadata["optimizer_step"], "2");
+    assert_eq!(final_metadata["accumulation_index"], "0");
+    assert_eq!(final_metadata["discarded_microbatch_count"], "2");
+    assert_eq!(
+        final_state["dropout_block_counter"].scalar_at(0).as_u64(),
+        96
     );
     let published = resumed.parameter_snapshots().unwrap();
     let published_bytes = published
@@ -1045,7 +1410,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                     && run.command_wait_count == command_count_per_invocation
                     && run.committed_state_pair_count == state_pair_count
                     && run.committed_state_bytes == logical_state_bytes
-                    && run.committed_state_work_items == 194
+                    && run.committed_state_work_items == state_work_items
                     && ((run.output_count == 0
                         && run.retained_host_api_d2h_calls == 0
                         && run.retained_host_api_d2h_bytes == 0)
@@ -1079,6 +1444,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(frozen_after.version, frozen_before.version);
     let first_eval = evaluate(&resumed_model);
     let second_eval = evaluate(&resumed_model);
+    let final_mean_sparse_loss = evaluate_mean_sparse_loss(&resumed_model);
     assert_eq!(first_eval.shape(), &Shape::new([BATCH, TIME, VOCAB]));
     assert_eq!(first_eval, second_eval);
     assert!(
@@ -1088,6 +1454,10 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
         assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
     }
+    assert!(
+        final_mean_sparse_loss < initial_mean_sparse_loss,
+        "live compiled causal Transformer eval loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
+    );
 
     let device_evidence = serde_json::json!({
         "name": device_info.name,
@@ -1105,9 +1475,9 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let state_evidence = serde_json::json!({
         "state_pair_count": state_pair_count,
         "logical_state_bytes": logical_state_bytes,
-        "state_work_items": 194,
+        "state_work_items": state_work_items,
         "state_bank_count": 2,
-        "state_device_bytes": 1_568,
+        "state_device_bytes": summary.state_device_bytes,
         "planned_kernel_count": planned_kernel_count,
         "indexed_movement_item_count": 0,
         "authenticated_host_indexed_movement_item_count": authenticated_host_indexed_movement_item_count,
@@ -1115,6 +1485,8 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     });
     let invocation_evidence = serde_json::json!({
         "primary_training_steps": 8,
+        "primary_optimizer_steps": 2,
+        "final_accumulation_index": 0,
         "resume_replay_steps": 4,
         "total_device_invocations": 12,
         "observed_training_invocations": totals.observed_training_invocations,
@@ -1122,14 +1494,21 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     });
     let checkpoint_evidence = serde_json::json!({
         "checkpoint_resume_step": 4,
+        "checkpoint_optimizer_step": 0,
+        "checkpoint_accumulation_index": 2,
+        "discarded_microbatches": 2,
+        "zero_grad_nonempty_calls": 1,
+        "zero_grad_empty_calls": 1,
+        "checkpoint_dropout_block_counter": 48,
+        "final_dropout_block_counter": 96,
         "checkpoint_resume_exact": true,
         "published_parameter_count": published.len(),
         "published_parameter_bytes": published_bytes,
         "publication_native_read_count": serde_json::Value::Null,
     });
     let loss_evidence = serde_json::json!({
-        "initial_loss": losses.first().unwrap(),
-        "final_loss": losses.last().unwrap(),
+        "initial_eval_mean_sparse_loss": initial_mean_sparse_loss,
+        "final_eval_mean_sparse_loss": final_mean_sparse_loss,
     });
     let accounting_evidence = serde_json::json!({
         "kernel_launch_count": totals.kernel_launch_count,
@@ -1149,7 +1528,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "resumed_scoreboard": resumed_scoreboard,
     });
     let mut evidence = serde_json::json!({
-        "format_version": 4,
+        "format_version": 5,
         "workload": "tiny-causal-transformer-compiled-adamw",
         "implementation_revision": expected_sha,
         "device": device_evidence,
@@ -1172,6 +1551,11 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         evidence_object.extend(fragment);
     }
     evidence_object.insert("weight_decay".into(), config().weight_decay().into());
+    evidence_object.insert(
+        "gradient_accumulation_steps".into(),
+        ACCUMULATION_STEPS.into(),
+    );
+    evidence_object.insert("max_gradient_norm".into(), MAX_GRADIENT_NORM.into());
     evidence_object.insert(
         "weight_decay_exclusions".into(),
         serde_json::json!(WEIGHT_DECAY_EXCLUSIONS),
