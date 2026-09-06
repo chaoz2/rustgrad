@@ -213,6 +213,7 @@ pub struct CompiledAdamWConfig {
     eps: f32,
     weight_decay: f32,
     gradient_accumulation_steps: u64,
+    max_gradient_norm: Option<f32>,
     inputs: BTreeMap<String, (Shape, DType)>,
 }
 
@@ -235,6 +236,7 @@ impl CompiledAdamWConfig {
             eps,
             weight_decay,
             gradient_accumulation_steps: 1,
+            max_gradient_norm: None,
             inputs: BTreeMap::new(),
         })
     }
@@ -250,6 +252,20 @@ impl CompiledAdamWConfig {
             ));
         }
         self.gradient_accumulation_steps = steps;
+        Ok(self)
+    }
+
+    /// Clips the complete ordered parameter-gradient set to one global L2
+    /// norm inside the compiled graph. With gradient accumulation, clipping is
+    /// applied once to the averaged window immediately before AdamW updates;
+    /// individual microbatch gradients are never clipped independently.
+    pub fn with_max_gradient_norm(mut self, max_norm: f32) -> Result<Self> {
+        if !max_norm.is_finite() || max_norm <= 0.0 {
+            return Err(training(
+                "compiled AdamW maximum gradient norm must be positive and finite",
+            ));
+        }
+        self.max_gradient_norm = Some(max_norm);
         Ok(self)
     }
 
@@ -287,6 +303,10 @@ impl CompiledAdamWConfig {
 
     pub fn gradient_accumulation_steps(&self) -> u64 {
         self.gradient_accumulation_steps
+    }
+
+    pub fn max_gradient_norm(&self) -> Option<f32> {
+        self.max_gradient_norm
     }
 
     pub fn inputs(&self) -> impl Iterator<Item = (&str, &Shape, DType)> {
@@ -590,12 +610,13 @@ impl CompiledOptimizerProgram for AdamWProgram {
         states: &BTreeMap<String, NodeId>,
     ) -> Result<BTreeMap<String, NodeId>> {
         if self.config.gradient_accumulation_steps == 1 {
+            let gradients = clip_gradients_by_global_norm(&self.config, graph, gradients)?;
             return lower_adamw_update_candidates(
                 &self.config,
                 graph,
                 learning_rate,
                 parameters,
-                gradients,
+                &gradients,
                 states,
             );
         }
@@ -621,6 +642,9 @@ impl CompiledOptimizerProgram for AdamWProgram {
             accumulated_gradients.insert(name.clone(), accumulated);
             averaged_gradients.insert(name.clone(), averaged);
         }
+
+        let averaged_gradients =
+            clip_gradients_by_global_norm(&self.config, graph, &averaged_gradients)?;
 
         let candidates = lower_adamw_update_candidates(
             &self.config,
@@ -658,6 +682,40 @@ impl CompiledOptimizerProgram for AdamWProgram {
         }
         Ok(updates)
     }
+}
+
+fn clip_gradients_by_global_norm(
+    config: &CompiledAdamWConfig,
+    graph: &mut Graph,
+    gradients: &BTreeMap<String, NodeId>,
+) -> Result<BTreeMap<String, NodeId>> {
+    let Some(max_norm) = config.max_gradient_norm else {
+        return Ok(gradients.clone());
+    };
+
+    let mut squared_norms = Vec::with_capacity(gradients.len());
+    for gradient in gradients.values() {
+        let squared = graph.mul(*gradient, *gradient)?;
+        squared_norms.push(graph.sum_all(squared)?);
+    }
+    let mut squared_norms = squared_norms.into_iter();
+    let mut total = squared_norms
+        .next()
+        .ok_or_else(|| training("compiled AdamW has no gradients to clip"))?;
+    for squared_norm in squared_norms {
+        total = graph.add(total, squared_norm)?;
+    }
+    let norm = graph.sqrt(total)?;
+    let max_norm = scalar_f32(graph, max_norm)?;
+    // max(norm, limit) makes the scale exactly one below the limit, while a
+    // NaN norm remains the ordered lhs and therefore propagates through every
+    // gradient instead of being silently treated as finite.
+    let denominator = graph.maximum(norm, max_norm)?;
+    let scale = graph.div(max_norm, denominator)?;
+    gradients
+        .iter()
+        .map(|(name, gradient)| Ok((name.clone(), graph.mul(*gradient, scale)?)))
+        .collect()
 }
 
 fn lower_adamw_update_candidates(
@@ -736,6 +794,7 @@ pub struct CpuCompiledMomentumSgd {
 pub struct CpuCompiledAdamW {
     inner: CpuCompiledTrainingProgram,
     gradient_accumulation_steps: u64,
+    max_gradient_norm: Option<f32>,
 }
 
 /// Resource-free Metal rendering of the same recurrent program owned by a
@@ -750,6 +809,7 @@ pub struct MetalCompiledAdamWPlan {
     program_identity: u64,
     step: u64,
     gradient_accumulation_steps: u64,
+    max_gradient_norm: Option<f32>,
 }
 
 /// Device-resident AdamW training session backed by one fixed Metal capture.
@@ -764,6 +824,7 @@ pub struct MetalCompiledAdamW {
     program_identity: u64,
     step: u64,
     gradient_accumulation_steps: u64,
+    max_gradient_norm: Option<f32>,
 }
 
 /// One committed Metal AdamW step plus its exact device execution report.
@@ -1344,9 +1405,11 @@ impl CpuCompiledAdamW {
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
+        let max_gradient_norm = config.max_gradient_norm;
         Ok(Self {
             inner: CpuCompiledTrainingProgram::compile(AdamWProgram { config }, parameters, build)?,
             gradient_accumulation_steps,
+            max_gradient_norm,
         })
     }
 
@@ -1485,6 +1548,10 @@ impl CpuCompiledAdamW {
         self.gradient_accumulation_steps
     }
 
+    pub fn max_gradient_norm(&self) -> Option<f32> {
+        self.max_gradient_norm
+    }
+
     pub fn optimizer_step(&self) -> Result<u64> {
         Ok(self.inner.global_snapshot("step")?.scalar_at(0).as_u64())
     }
@@ -1572,6 +1639,7 @@ impl CpuCompiledAdamW {
             program_identity: self.capture_identity(),
             step: self.step_count(),
             gradient_accumulation_steps: self.gradient_accumulation_steps,
+            max_gradient_norm: self.max_gradient_norm,
         })
     }
 
@@ -1653,6 +1721,10 @@ impl MetalCompiledAdamWPlan {
         self.gradient_accumulation_steps
     }
 
+    pub fn max_gradient_norm(&self) -> Option<f32> {
+        self.max_gradient_norm
+    }
+
     pub fn summary(&self) -> &MetalDeviceSessionSummary {
         self.inner.summary()
     }
@@ -1673,6 +1745,7 @@ impl MetalCompiledAdamWPlan {
             program_identity: self.program_identity,
             step: self.step,
             gradient_accumulation_steps: self.gradient_accumulation_steps,
+            max_gradient_norm: self.max_gradient_norm,
         })
     }
 }
@@ -1717,6 +1790,10 @@ impl MetalCompiledAdamW {
 
     pub fn gradient_accumulation_steps(&self) -> u64 {
         self.gradient_accumulation_steps
+    }
+
+    pub fn max_gradient_norm(&self) -> Option<f32> {
+        self.max_gradient_norm
     }
 
     pub fn capture_identity(&self) -> u64 {
@@ -2484,6 +2561,18 @@ mod tests {
         CpuCompiledAdamW::compile(adamw_config(), initial_parameters(), build_tinybob).unwrap()
     }
 
+    fn build_two_parameter_linear_loss(
+        graph: &mut Graph,
+        _inputs: &BTreeMap<String, NodeId>,
+        parameters: &BTreeMap<String, NodeId>,
+    ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+        let three = graph.full_with_dtype(Shape::from([]), Scalar::F(3.0), DType::F32)?;
+        let four = graph.full_with_dtype(Shape::from([]), Scalar::F(4.0), DType::F32)?;
+        let a = graph.mul(parameters["a"], three)?;
+        let b = graph.mul(parameters["b"], four)?;
+        Ok((graph.add(a, b)?, BTreeMap::new()))
+    }
+
     fn batch() -> BTreeMap<String, TensorData> {
         BTreeMap::from([
             (
@@ -2843,6 +2932,90 @@ mod tests {
     }
 
     #[test]
+    fn adamw_clips_the_complete_parameter_gradient_set_by_one_global_norm() {
+        let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+            .unwrap()
+            .with_max_gradient_norm(1.0)
+            .unwrap();
+        assert_eq!(config.max_gradient_norm(), Some(1.0));
+        let parameters = || {
+            ["a", "b"]
+                .map(|name| TrainingParameterInit::new(name, TensorData::scalar(0.0)).unwrap())
+        };
+        let unclipped = CpuCompiledAdamW::compile(
+            CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0).unwrap(),
+            parameters(),
+            build_two_parameter_linear_loss,
+        )
+        .unwrap();
+        let mut clipped =
+            CpuCompiledAdamW::compile(config, parameters(), build_two_parameter_linear_loss)
+                .unwrap();
+        assert_eq!(clipped.max_gradient_norm(), Some(1.0));
+        assert_ne!(clipped.capture_identity(), unclipped.capture_identity());
+
+        clipped
+            .step(BTreeMap::new(), TensorData::scalar(0.1))
+            .unwrap();
+        let moments = clipped.first_moment_snapshots().unwrap();
+        let a = moments["a"].scalar_at(0).as_f64();
+        let b = moments["b"].scalar_at(0).as_f64();
+        assert!((a - 0.6).abs() < 1e-6, "clipped a gradient was {a}");
+        assert!((b - 0.8).abs() < 1e-6, "clipped b gradient was {b}");
+    }
+
+    #[test]
+    fn adamw_accumulation_clips_once_after_averaging_the_complete_window() {
+        let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+            .unwrap()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_max_gradient_norm(1.0)
+            .unwrap()
+            .with_input("scale", [], DType::F32)
+            .unwrap();
+        let parameter = TrainingParameterInit::new("weight", TensorData::scalar(0.0)).unwrap();
+        let mut compiled =
+            CpuCompiledAdamW::compile(config, [parameter], |graph, inputs, parameters| {
+                Ok((
+                    graph.mul(parameters["weight"], inputs["scale"])?,
+                    BTreeMap::new(),
+                ))
+            })
+            .unwrap();
+
+        let input = |scale| BTreeMap::from([("scale".into(), TensorData::scalar(scale))]);
+        let first = compiled
+            .step(input(100.0), TensorData::scalar(0.1))
+            .unwrap();
+        assert!(!first.did_update());
+        assert_eq!(
+            compiled.gradient_accumulator_snapshots().unwrap()["weight"]
+                .scalar_at(0)
+                .as_f64(),
+            100.0
+        );
+
+        let second = compiled
+            .step(input(-99.0), TensorData::scalar(0.1))
+            .unwrap();
+        assert!(second.did_update());
+        let first_moment = compiled.first_moment_snapshots().unwrap()["weight"]
+            .scalar_at(0)
+            .as_f64();
+        assert!(
+            (first_moment - 0.5).abs() < 1e-6,
+            "window-average gradient was {first_moment}"
+        );
+        assert_eq!(
+            compiled.gradient_accumulator_snapshots().unwrap()["weight"]
+                .scalar_at(0)
+                .as_f64(),
+            0.0
+        );
+    }
+
+    #[test]
     fn adamw_accumulates_recurrent_gradients_and_commits_only_at_window_end() {
         let mut compiled = CpuCompiledAdamW::compile(
             accumulated_adamw_config(2),
@@ -2972,6 +3145,7 @@ mod tests {
     fn adamw_default_keeps_v1_checkpoint_and_accumulation_one_behavior() {
         let mut compiled = compiled_adamw();
         assert_eq!(compiled.gradient_accumulation_steps(), 1);
+        assert_eq!(compiled.max_gradient_norm(), None);
         assert!(
             compiled
                 .gradient_accumulator_snapshots()
@@ -3093,6 +3267,14 @@ mod tests {
                 .with_gradient_accumulation(0)
                 .is_err()
         );
+        for max_norm in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+                    .unwrap()
+                    .with_max_gradient_norm(max_norm)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -3179,6 +3361,10 @@ mod tests {
             .unwrap();
         assert!(
             CpuCompiledAdamW::compile_from_checkpoint(wrong, &checkpoint, build_tinybob).is_err()
+        );
+        let clipped = adamw_config().with_max_gradient_norm(1.0).unwrap();
+        assert!(
+            CpuCompiledAdamW::compile_from_checkpoint(clipped, &checkpoint, build_tinybob).is_err()
         );
 
         let mut accumulated = CpuCompiledAdamW::compile(
