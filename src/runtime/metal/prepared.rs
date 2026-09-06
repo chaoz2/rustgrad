@@ -707,8 +707,10 @@ impl InitializedMetalPrefix {
         &self,
         values: &mut BTreeMap<u64, TensorData>,
         alternate_state_bank: bool,
+        host_outputs: StaticHostOutputSelection,
     ) -> Result<StaticExecutionReport, MetalError> {
-        self.inner.execute_stateful(values, alternate_state_bank)
+        self.inner
+            .execute_stateful(values, alternate_state_bank, host_outputs)
     }
 
     pub(super) fn snapshot_state(

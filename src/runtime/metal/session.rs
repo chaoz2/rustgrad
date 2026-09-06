@@ -1646,6 +1646,20 @@ impl MetalDeviceSession {
         self.run_with_host_outputs(transient_inputs, StaticHostOutputSelection::None, None)
     }
 
+    /// Commits one complete fixed-state successor without materializing the
+    /// capture's requested outputs on the host.
+    pub(crate) fn run_epoch_without_host_outputs(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        if !matches!(self.state_policy, MetalSessionStatePolicy::Epoch { .. }) {
+            return Err(MetalError::InvalidBinding(
+                "host-output suppression requires fixed epoch state".into(),
+            ));
+        }
+        self.run_with_host_outputs(transient_inputs, StaticHostOutputSelection::None, None)
+    }
+
     fn run_with_host_outputs(
         &mut self,
         transient_inputs: &BTreeMap<String, TensorData>,
@@ -1741,12 +1755,14 @@ impl MetalDeviceSession {
         committed_position: usize,
         output_proof: Option<MetalOutputProof>,
     ) -> Result<MetalDeviceRun, MetalError> {
-        if host_outputs == StaticHostOutputSelection::None
-            && (!matches!(self.state_policy, MetalSessionStatePolicy::Append { .. })
-                || self.lifetime.runtime_controls().len() != 1)
-        {
+        let host_output_suppression_is_sealed = match self.state_policy {
+            MetalSessionStatePolicy::Epoch { .. } => self.lifetime.runtime_controls().is_empty(),
+            MetalSessionStatePolicy::Append { .. } => self.lifetime.runtime_controls().len() == 1,
+            MetalSessionStatePolicy::None => false,
+        };
+        if host_outputs == StaticHostOutputSelection::None && !host_output_suppression_is_sealed {
             return Err(MetalError::InvalidBinding(
-                "host-output suppression requires sealed append-state inference".into(),
+                "host-output suppression requires sealed fixed or append state".into(),
             ));
         }
         let successful_invocation = self
@@ -1800,9 +1816,10 @@ impl MetalDeviceSession {
         let execute_start = Instant::now();
         let transfer = match self.state_policy {
             MetalSessionStatePolicy::None => self.prepared.execute(&mut values)?,
-            MetalSessionStatePolicy::Epoch { .. } => self
-                .prepared
-                .execute_stateful(&mut values, self.state_epoch)?,
+            MetalSessionStatePolicy::Epoch { .. } => {
+                self.prepared
+                    .execute_stateful(&mut values, self.state_epoch, host_outputs)?
+            }
             MetalSessionStatePolicy::Append { .. } => {
                 self.prepared
                     .execute_append_state(&mut values, committed_position, host_outputs)?

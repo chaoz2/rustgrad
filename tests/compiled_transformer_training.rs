@@ -5,7 +5,9 @@ use rustgrad::MetalSessionTarget;
 use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::{MetalCapabilities, MetalRenderer};
 #[cfg(target_os = "macos")]
-use rustgrad::runtime::metal::{MetalDiscovery, MetalRuntime, MetalScoreboardContext};
+use rustgrad::runtime::metal::{
+    MetalDeviceRunReport, MetalDiscovery, MetalRuntime, MetalScoreboardContext,
+};
 use rustgrad::{
     Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
     CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuBackend, CpuSessionTarget,
@@ -383,6 +385,8 @@ fn compiled_transformer_plan_is_strictly_renderable_for_metal() {
     assert_eq!(plan.summary().fallback_count, 0);
     assert_eq!(plan.summary().state_pair_count, parameter_count * 3 + 2);
     assert_eq!(plan.summary().state_bank_count, 2);
+    assert_eq!(plan.summary().logical_state_bytes, 784);
+    assert_eq!(plan.summary().state_device_bytes, 1_568);
     assert_eq!(plan.summary().requested_output_count, 2);
     assert!(plan.summary().nonzero_item_count > 0);
     assert_strict_dropout_kernels(&plan);
@@ -397,6 +401,7 @@ fn protected_live_metal_workflow_runs_the_exact_compiled_training_acceptance() {
     let workflow = include_str!("../.github/workflows/metal-live.yml");
     for required in [
         "RUSTGRAD_METAL_TRAINING_EVIDENCE_PATH:",
+        "metal-live-compiled-training-v3.json",
         "Train and resume the compiled causal Transformer on Metal",
         "cargo test --release --test compiled_transformer_training",
         "live_metal_compiled_causal_transformer_training_resumes_exactly",
@@ -406,6 +411,56 @@ fn protected_live_metal_workflow_runs_the_exact_compiled_training_acceptance() {
             workflow.contains(required),
             "protected live Metal workflow is missing {required:?}"
         );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct LiveTrainingTotals {
+    kernel_launch_count: usize,
+    command_submission_count: usize,
+    command_wait_count: usize,
+    transient_h2d_bytes: usize,
+    retained_d2h_calls: usize,
+    retained_d2h_bytes: usize,
+    observed_training_invocations: usize,
+    device_only_training_invocations: usize,
+}
+
+#[cfg(target_os = "macos")]
+impl LiveTrainingTotals {
+    fn record(
+        &mut self,
+        report: &MetalDeviceRunReport,
+        observed: bool,
+        state_pair_count: usize,
+        logical_state_bytes: usize,
+        planned_kernel_count: usize,
+        expected_command_count: usize,
+    ) {
+        let output_multiplier = if observed { 1 } else { 0 };
+        assert_eq!(report.output_count, output_multiplier * 2);
+        assert_eq!(report.retained_d2h_calls, output_multiplier * 2);
+        assert_eq!(report.retained_d2h_bytes, output_multiplier * 40);
+        assert_eq!(report.committed_state_pair_count, state_pair_count);
+        assert_eq!(report.committed_state_bytes, logical_state_bytes);
+        assert_eq!(report.committed_state_work_items, 194);
+        assert_eq!(report.kernel_launch_count, planned_kernel_count);
+        assert_eq!(report.command_submission_count, expected_command_count);
+        assert_eq!(report.command_wait_count, expected_command_count);
+        assert_eq!(report.transient_h2d_calls, 3);
+        assert_eq!(report.transient_h2d_bytes, 28);
+        self.kernel_launch_count += report.kernel_launch_count;
+        self.command_submission_count += report.command_submission_count;
+        self.command_wait_count += report.command_wait_count;
+        self.transient_h2d_bytes += report.transient_h2d_bytes;
+        self.retained_d2h_calls += report.retained_d2h_calls;
+        self.retained_d2h_bytes += report.retained_d2h_bytes;
+        if observed {
+            self.observed_training_invocations += 1;
+        } else {
+            self.device_only_training_invocations += 1;
+        }
     }
 }
 
@@ -465,7 +520,18 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_strict_dropout_kernels(&rendered);
     let deployment_identity = rendered.deployment_identity();
     let state_pair_count = rendered.summary().state_pair_count;
+    let logical_state_bytes = rendered.summary().logical_state_bytes;
+    assert_eq!(state_pair_count, 59);
+    assert_eq!(logical_state_bytes, 784);
+    assert_eq!(rendered.summary().state_bank_count, 2);
+    assert_eq!(rendered.summary().state_device_bytes, 1_568);
     let planned_kernel_count = rendered.summary().nonzero_item_count;
+    let indexed_movement_item_count = rendered
+        .rendered_items()
+        .filter(|item| item.indexed_movement().is_some())
+        .count();
+    assert!(indexed_movement_item_count > 0);
+    let command_count_per_invocation = planned_kernel_count;
     let mut uninterrupted = seed
         .prepare(&target)
         .expect("live Metal preparation must compile, allocate, and upload training state");
@@ -474,29 +540,38 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
 
     let mut losses = Vec::new();
-    let mut kernel_launch_count = 0usize;
-    let mut command_submission_count = 0usize;
-    let mut command_wait_count = 0usize;
-    let mut transient_h2d_bytes = 0usize;
-    let mut retained_d2h_bytes = 0usize;
+    let mut totals = LiveTrainingTotals::default();
     for index in 0..4u64 {
-        let result = uninterrupted.step(batch(), learning_rate()).unwrap();
-        assert_eq!(result.step(), index + 1);
-        assert_eq!(result.capture_identity(), capture_identity);
-        assert_eq!(result.report().successful_invocation, index + 1);
-        assert_eq!(result.report().committed_state_pair_count, state_pair_count);
-        assert_eq!(result.report().kernel_launch_count, planned_kernel_count);
-        assert_eq!(
-            result.report().command_submission_count,
-            result.report().command_wait_count
-        );
-        assert!(result.report().command_submission_count > 0);
-        losses.push(result.loss().scalar_at(0).as_f64());
-        kernel_launch_count += result.report().kernel_launch_count;
-        command_submission_count += result.report().command_submission_count;
-        command_wait_count += result.report().command_wait_count;
-        transient_h2d_bytes += result.report().transient_h2d_bytes;
-        retained_d2h_bytes += result.report().retained_d2h_bytes;
+        if matches!(index, 1 | 2) {
+            let result = uninterrupted
+                .step_without_host_outputs(batch(), learning_rate())
+                .unwrap();
+            assert_eq!(result.step(), index + 1);
+            assert_eq!(result.capture_identity(), capture_identity);
+            assert_eq!(result.report().successful_invocation, index + 1);
+            totals.record(
+                result.report(),
+                false,
+                state_pair_count,
+                logical_state_bytes,
+                planned_kernel_count,
+                command_count_per_invocation,
+            );
+        } else {
+            let result = uninterrupted.step(batch(), learning_rate()).unwrap();
+            assert_eq!(result.step(), index + 1);
+            assert_eq!(result.capture_identity(), capture_identity);
+            assert_eq!(result.report().successful_invocation, index + 1);
+            losses.push(result.loss().scalar_at(0).as_f64());
+            totals.record(
+                result.report(),
+                true,
+                state_pair_count,
+                logical_state_bytes,
+                planned_kernel_count,
+                command_count_per_invocation,
+            );
+        }
     }
 
     let checkpoint = uninterrupted.checkpoint().unwrap();
@@ -540,35 +615,47 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
 
     for resumed_index in 0..4u64 {
-        let expected = uninterrupted.step(batch(), learning_rate()).unwrap();
-        let actual = resumed.step(batch(), learning_rate()).unwrap();
-        assert_eq!(actual.loss(), expected.loss());
-        assert_eq!(actual.outputs(), expected.outputs());
-        assert_eq!(actual.step(), expected.step());
-        assert_eq!(actual.report().successful_invocation, resumed_index + 1);
-        assert_eq!(actual.report().committed_state_pair_count, state_pair_count);
-        assert_eq!(actual.report().kernel_launch_count, planned_kernel_count);
-        assert_eq!(
-            expected.report().command_submission_count,
-            expected.report().command_wait_count
-        );
-        assert_eq!(
-            actual.report().command_submission_count,
-            actual.report().command_wait_count
-        );
-        assert!(expected.report().command_submission_count > 0);
-        assert!(actual.report().command_submission_count > 0);
-        losses.push(expected.loss().scalar_at(0).as_f64());
-        kernel_launch_count += expected.report().kernel_launch_count;
-        kernel_launch_count += actual.report().kernel_launch_count;
-        command_submission_count += expected.report().command_submission_count;
-        command_submission_count += actual.report().command_submission_count;
-        command_wait_count += expected.report().command_wait_count;
-        command_wait_count += actual.report().command_wait_count;
-        transient_h2d_bytes += expected.report().transient_h2d_bytes;
-        transient_h2d_bytes += actual.report().transient_h2d_bytes;
-        retained_d2h_bytes += expected.report().retained_d2h_bytes;
-        retained_d2h_bytes += actual.report().retained_d2h_bytes;
+        if resumed_index < 3 {
+            let expected = uninterrupted
+                .step_without_host_outputs(batch(), learning_rate())
+                .unwrap();
+            let actual = resumed
+                .step_without_host_outputs(batch(), learning_rate())
+                .unwrap();
+            assert_eq!(actual.step(), expected.step());
+            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+            assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+            assert_eq!(actual.did_update(), expected.did_update());
+            assert_eq!(actual.report().successful_invocation, resumed_index + 1);
+            for report in [expected.report(), actual.report()] {
+                totals.record(
+                    report,
+                    false,
+                    state_pair_count,
+                    logical_state_bytes,
+                    planned_kernel_count,
+                    command_count_per_invocation,
+                );
+            }
+        } else {
+            let expected = uninterrupted.step(batch(), learning_rate()).unwrap();
+            let actual = resumed.step(batch(), learning_rate()).unwrap();
+            assert_eq!(actual.loss(), expected.loss());
+            assert_eq!(actual.outputs(), expected.outputs());
+            assert_eq!(actual.step(), expected.step());
+            assert_eq!(actual.report().successful_invocation, resumed_index + 1);
+            for report in [expected.report(), actual.report()] {
+                totals.record(
+                    report,
+                    true,
+                    state_pair_count,
+                    logical_state_bytes,
+                    planned_kernel_count,
+                    command_count_per_invocation,
+                );
+            }
+            losses.push(expected.loss().scalar_at(0).as_f64());
+        }
     }
 
     assert!(
@@ -577,8 +664,17 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     );
     assert_eq!(resumed.step_count(), 8);
     assert_eq!(uninterrupted.step_count(), 8);
-    assert_eq!(command_submission_count, command_wait_count);
-    assert!(command_submission_count >= 12);
+    assert_eq!(totals.observed_training_invocations, 4);
+    assert_eq!(totals.device_only_training_invocations, 8);
+    assert_eq!(
+        totals.command_submission_count,
+        command_count_per_invocation * 12
+    );
+    assert_eq!(totals.command_wait_count, command_count_per_invocation * 12);
+    assert_eq!(totals.kernel_launch_count, planned_kernel_count * 12);
+    assert_eq!(totals.transient_h2d_bytes, 336);
+    assert_eq!(totals.retained_d2h_calls, 8);
+    assert_eq!(totals.retained_d2h_bytes, 160);
     assert_eq!(
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
@@ -653,9 +749,48 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(resumed_scoreboard.fallback_count, 0);
     assert!(uninterrupted.scoreboard_recording_error().is_none());
     assert!(resumed.scoreboard_recording_error().is_none());
+    assert_eq!(initial_scoreboard.retained_host_api_d2h_calls, 6);
+    assert_eq!(initial_scoreboard.retained_host_api_d2h_bytes, 120);
+    assert_eq!(resumed_scoreboard.retained_host_api_d2h_calls, 2);
+    assert_eq!(resumed_scoreboard.retained_host_api_d2h_bytes, 40);
+    assert_eq!(
+        initial_scoreboard
+            .successful_runs
+            .iter()
+            .filter(|run| run.output_count == 0)
+            .count(),
+        5
+    );
+    assert_eq!(
+        resumed_scoreboard
+            .successful_runs
+            .iter()
+            .filter(|run| run.output_count == 0)
+            .count(),
+        3
+    );
+    assert!(
+        initial_scoreboard
+            .successful_runs
+            .iter()
+            .chain(&resumed_scoreboard.successful_runs)
+            .all(
+                |run| run.command_submission_count == command_count_per_invocation
+                    && run.command_wait_count == command_count_per_invocation
+                    && run.committed_state_pair_count == state_pair_count
+                    && run.committed_state_bytes == logical_state_bytes
+                    && run.committed_state_work_items == 194
+                    && ((run.output_count == 0
+                        && run.retained_host_api_d2h_calls == 0
+                        && run.retained_host_api_d2h_bytes == 0)
+                        || (run.output_count == 2
+                            && run.retained_host_api_d2h_calls == 2
+                            && run.retained_host_api_d2h_bytes == 40))
+            )
+    );
 
     let evidence = serde_json::json!({
-        "format_version": 2,
+        "format_version": 3,
         "workload": "tiny-causal-transformer-compiled-adamw",
         "implementation_revision": expected_sha,
         "device": {
@@ -670,10 +805,18 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "resumed_deployment_identity": resumed_deployment_identity,
         "fallback_count": 0,
         "state_pair_count": state_pair_count,
+        "logical_state_bytes": logical_state_bytes,
+        "state_work_items": 194,
+        "state_bank_count": 2,
+        "state_device_bytes": 1_568,
         "planned_kernel_count": planned_kernel_count,
+        "indexed_movement_item_count": indexed_movement_item_count,
+        "command_count_per_invocation": command_count_per_invocation,
         "primary_training_steps": 8,
         "resume_replay_steps": 4,
         "total_device_invocations": 12,
+        "observed_training_invocations": totals.observed_training_invocations,
+        "device_only_training_invocations": totals.device_only_training_invocations,
         "checkpoint_resume_step": 4,
         "checkpoint_resume_exact": true,
         "published_parameter_count": published.len(),
@@ -681,11 +824,16 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "publication_native_read_count": serde_json::Value::Null,
         "initial_loss": losses.first().unwrap(),
         "final_loss": losses.last().unwrap(),
-        "kernel_launch_count": kernel_launch_count,
-        "command_submission_count": command_submission_count,
-        "command_wait_count": command_wait_count,
-        "transient_host_api_h2d_bytes": transient_h2d_bytes,
-        "retained_host_api_d2h_bytes": retained_d2h_bytes,
+        "kernel_launch_count": totals.kernel_launch_count,
+        "command_submission_count": totals.command_submission_count,
+        "command_wait_count": totals.command_wait_count,
+        "transient_host_api_h2d_bytes": totals.transient_h2d_bytes,
+        "retained_host_api_d2h_calls": totals.retained_d2h_calls,
+        "retained_host_api_d2h_bytes": totals.retained_d2h_bytes,
+        "device_only_retained_host_api_d2h_calls": 0,
+        "device_only_retained_host_api_d2h_bytes": 0,
+        "observed_retained_host_api_d2h_calls": totals.retained_d2h_calls,
+        "observed_retained_host_api_d2h_bytes": totals.retained_d2h_bytes,
         "initial_scoreboard": initial_scoreboard,
         "resumed_scoreboard": resumed_scoreboard,
     });

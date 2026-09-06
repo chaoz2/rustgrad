@@ -969,6 +969,17 @@ live-module schema without selecting an optimizer or backend enum.
 `CompiledAdamWRuntime` and `CompiledAdamWStep` extend those smaller contracts
 with accumulation, clipping, loss-scaling, moment, and optimizer-step
 inspection. Concrete Metal results retain their exact device reports.
+The concrete `MetalCompiledAdamW` additionally exposes
+`step_without_host_outputs` for training iterations whose loss and named
+outputs do not need host observation. It executes the identical authenticated
+capture, stages the same batch and learning rate, produces the complete
+inactive parameter/optimizer/dropout state bank, and advances replay progress
+only after the shared synchronous command succeeds and the epoch flips. Its
+typed commit result contains progress and the exact device report but does not
+pretend to implement `CompiledTrainingStep`. The report records zero outputs
+and zero retained D2H calls/bytes; ordinary `step` and every generic runtime
+contract remain unchanged. This is periodic-observation plumbing, not an
+asynchronous training API or a throughput claim.
 Metal parameter publication prevalidates the exact fixed-state parameter ID,
 descriptor, active-bank buffer, and queue inventory before its first read, then
 downloads only that subset in one unchanged active epoch. Zero-byte parameters

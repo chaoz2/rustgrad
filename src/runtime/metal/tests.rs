@@ -1320,6 +1320,136 @@ fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops()
     );
 }
 
+fn assert_compiled_adamw_device_only_failure_is_unpublished(runtime: &crate::MetalCompiledAdamW) {
+    assert_eq!(runtime.step_count(), 0);
+    assert_eq!(runtime.optimizer_step().unwrap(), 0);
+    assert_eq!(runtime.metal_session().successful_run_count(), 0);
+    assert!(!runtime.metal_session().state_epoch());
+    assert_eq!(
+        runtime
+            .execution_scoreboard_report()
+            .unwrap()
+            .unwrap()
+            .successful_run_count,
+        0
+    );
+}
+
+#[test]
+fn compiled_adamw_device_only_step_commits_full_epoch_without_host_reads() {
+    let program = compiled_scalar_adamw_plan();
+    let observed_mock = Arc::new(MockDispatch::default());
+    let device_only_mock = Arc::new(MockDispatch::default());
+    let observed_target = MetalSessionTarget::new(test_device(observed_mock.clone()), 8).unwrap();
+    let device_only_target = MetalSessionTarget::new(test_device(device_only_mock.clone()), 8)
+        .unwrap()
+        .with_scoreboard(
+            MetalScoreboardContext::new("compiled-device-only", "test-revision", "semantic mock")
+                .unwrap(),
+        );
+    let mut observed = observed_target.prepare(&program).unwrap();
+    let mut device_only = device_only_target.prepare(&program).unwrap();
+    let inputs = || BTreeMap::from([("target".into(), TensorData::scalar(0.0))]);
+    let learning_rate = || TensorData::scalar(0.1);
+
+    device_only_mock.clear_calls();
+    assert!(
+        device_only
+            .step_without_host_outputs(BTreeMap::new(), learning_rate())
+            .is_err()
+    );
+    assert!(device_only_mock.calls().is_empty());
+    assert_eq!(device_only.step_count(), 0);
+    assert_eq!(device_only.metal_session().successful_run_count(), 0);
+
+    device_only_mock.state.lock().unwrap().failures.write = Some("device-only transient write");
+    assert!(
+        device_only
+            .step_without_host_outputs(inputs(), learning_rate())
+            .is_err()
+    );
+    assert_compiled_adamw_device_only_failure_is_unpublished(&device_only);
+
+    device_only_mock.clear_calls();
+    device_only_mock.state.lock().unwrap().failures.launch = Some("device-only launch");
+    assert!(
+        device_only
+            .step_without_host_outputs(inputs(), learning_rate())
+            .is_err()
+    );
+    assert_compiled_adamw_device_only_failure_is_unpublished(&device_only);
+
+    device_only_mock.clear_calls();
+    device_only_mock.state.lock().unwrap().failures.launch_after =
+        Some((1, "device-only mid-batch launch"));
+    assert!(
+        device_only
+            .step_without_host_outputs(inputs(), learning_rate())
+            .is_err()
+    );
+    assert_compiled_adamw_device_only_failure_is_unpublished(&device_only);
+
+    device_only_mock.clear_calls();
+    device_only_mock.state.lock().unwrap().failures.wait = Some("device-only wait");
+    assert!(
+        device_only
+            .step_without_host_outputs(inputs(), learning_rate())
+            .is_err()
+    );
+    assert_compiled_adamw_device_only_failure_is_unpublished(&device_only);
+
+    device_only_mock.clear_calls();
+    let expected = observed.step(inputs(), learning_rate()).unwrap();
+    let actual = device_only
+        .step_without_host_outputs(inputs(), learning_rate())
+        .unwrap();
+    assert_eq!(actual.step(), expected.step());
+    assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+    assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+    assert_eq!(actual.did_update(), expected.did_update());
+    assert_eq!(actual.capture_identity(), expected.capture_identity());
+    assert_eq!(actual.report().output_count, 0);
+    assert_eq!(actual.report().retained_d2h_calls, 0);
+    assert_eq!(actual.report().retained_d2h_bytes, 0);
+    assert_eq!(actual.report().committed_state_pair_count, 4);
+    assert_eq!(actual.report().committed_state_bytes, 20);
+    assert_eq!(actual.report().committed_state_work_items, 4);
+    assert_eq!(actual.report().command_submission_count, 1);
+    assert_eq!(actual.report().command_wait_count, 1);
+    assert!(
+        device_only_mock
+            .calls()
+            .iter()
+            .all(|call| !call.starts_with("read:") && !call.contains("status"))
+    );
+    assert_eq!(device_only.step_count(), 1);
+    assert_eq!(device_only.optimizer_step().unwrap(), 1);
+    assert_eq!(device_only.metal_session().successful_run_count(), 1);
+    assert!(device_only.metal_session().state_epoch());
+    let scoreboard = device_only.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(scoreboard.successful_run_count, 1);
+    assert_eq!(scoreboard.successful_runs[0].output_count, 0);
+    assert_eq!(scoreboard.retained_host_api_d2h_calls, 0);
+    assert_eq!(scoreboard.retained_host_api_d2h_bytes, 0);
+
+    assert_eq!(
+        device_only.parameter_snapshots().unwrap(),
+        observed.parameter_snapshots().unwrap()
+    );
+    assert_eq!(
+        device_only.first_moment_snapshots().unwrap(),
+        observed.first_moment_snapshots().unwrap()
+    );
+    assert_eq!(
+        device_only.second_moment_snapshots().unwrap(),
+        observed.second_moment_snapshots().unwrap()
+    );
+    assert_eq!(
+        device_only.checkpoint().unwrap(),
+        observed.checkpoint().unwrap()
+    );
+}
+
 #[test]
 fn compiled_adamw_parameter_publication_reads_only_parameters_and_retries_atomically() {
     let source = CompiledPublicationFixture::new([1.0, -1.0], 0.5);
@@ -1480,14 +1610,31 @@ fn compiled_dropout_counter_is_one_strict_metal_state_pair_and_matches_cpu() {
         assert_eq!(metal.dropout_block_counter().unwrap(), Some(0));
         assert_eq!(metal.checkpoint().unwrap(), initial);
     }
-    for counter in [2, 4] {
+    for (index, counter) in [2, 4].into_iter().enumerate() {
         let expected = cpu.step(inputs(), TensorData::scalar(0.01)).unwrap();
-        let actual = metal.step(inputs(), TensorData::scalar(0.01)).unwrap();
-        assert_eq!(actual.loss(), expected.loss());
-        assert_eq!(actual.outputs(), expected.outputs());
-        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
-        assert_eq!(actual.report().command_submission_count, 1);
-        assert_eq!(actual.report().command_wait_count, 1);
+        if index == 0 {
+            mock.clear_calls();
+            let actual = metal
+                .step_without_host_outputs(inputs(), TensorData::scalar(0.01))
+                .unwrap();
+            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+            assert_eq!(actual.report().retained_d2h_calls, 0);
+            assert_eq!(actual.report().retained_d2h_bytes, 0);
+            assert_eq!(actual.report().command_submission_count, 1);
+            assert_eq!(actual.report().command_wait_count, 1);
+            assert!(
+                mock.calls()
+                    .iter()
+                    .all(|call| !call.starts_with("read:") && !call.contains("status"))
+            );
+        } else {
+            let actual = metal.step(inputs(), TensorData::scalar(0.01)).unwrap();
+            assert_eq!(actual.loss(), expected.loss());
+            assert_eq!(actual.outputs(), expected.outputs());
+            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+            assert_eq!(actual.report().command_submission_count, 1);
+            assert_eq!(actual.report().command_wait_count, 1);
+        }
         assert_eq!(cpu.dropout_block_counter().unwrap(), Some(counter));
     }
     assert_eq!(metal.dropout_block_counter().unwrap(), Some(4));
@@ -1596,14 +1743,28 @@ fn compiled_adamw_accumulation_uses_the_same_recurrent_capture_on_metal() {
     let learning_rate = || TensorData::scalar(0.1);
     for replay in 1..=3 {
         let expected = cpu.step(inputs(), learning_rate()).unwrap();
-        let actual = metal.step(inputs(), learning_rate()).unwrap();
-        assert_eq!(actual.loss(), expected.loss());
-        assert_eq!(actual.outputs(), expected.outputs());
-        assert_eq!(actual.step(), replay);
-        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
-        assert_eq!(actual.accumulation_index(), expected.accumulation_index());
-        assert_eq!(actual.did_update(), expected.did_update());
-        assert_eq!(actual.report().committed_state_pair_count, 6);
+        if replay < 3 {
+            let actual = metal
+                .step_without_host_outputs(inputs(), learning_rate())
+                .unwrap();
+            assert_eq!(actual.step(), replay);
+            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+            assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+            assert_eq!(actual.did_update(), expected.did_update());
+            assert_eq!(actual.report().output_count, 0);
+            assert_eq!(actual.report().retained_d2h_calls, 0);
+            assert_eq!(actual.report().retained_d2h_bytes, 0);
+            assert_eq!(actual.report().committed_state_pair_count, 6);
+        } else {
+            let actual = metal.step(inputs(), learning_rate()).unwrap();
+            assert_eq!(actual.loss(), expected.loss());
+            assert_eq!(actual.outputs(), expected.outputs());
+            assert_eq!(actual.step(), replay);
+            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+            assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+            assert_eq!(actual.did_update(), expected.did_update());
+            assert_eq!(actual.report().committed_state_pair_count, 6);
+        }
     }
     assert_eq!(metal.optimizer_step().unwrap(), 1);
     assert_eq!(metal.accumulation_index().unwrap(), 1);
