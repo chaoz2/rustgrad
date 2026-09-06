@@ -3,10 +3,10 @@
 use super::target::{CpuSessionTarget, MetalSessionTarget, SessionTarget};
 use crate::nn::{StateKind, TrainingDropoutProvider};
 use crate::runtime::metal::{
-    MetalDevice, MetalDeviceRunReport, MetalDeviceSession, MetalDeviceSessionSummary, MetalError,
-    MetalRenderer, MetalScoreboardContext, MetalScoreboardError, MetalScoreboardObserver,
-    MetalSessionScoreboard, MetalSessionScoreboardReport, MetalStatefulInferencePlan,
-    RenderedMetal,
+    MetalDevice, MetalDeviceRun, MetalDeviceRunReport, MetalDeviceSession,
+    MetalDeviceSessionSummary, MetalError, MetalRenderer, MetalScoreboardContext,
+    MetalScoreboardError, MetalScoreboardObserver, MetalSessionScoreboard,
+    MetalSessionScoreboardReport, MetalStatefulInferencePlan, RenderedMetal,
 };
 use crate::{
     BufferState, CapturedMixedSchedule, CapturedSchedule, CapturedStatefulInference, CompareOp,
@@ -1209,8 +1209,9 @@ pub struct MetalCompiledAdamWPlan {
 
 /// Device-resident AdamW training session backed by one fixed Metal capture.
 /// Parameters and optimizer slots remain in the double-buffered device state
-/// frontier between calls; only batch inputs, learning rate, and requested
-/// outputs cross the host boundary on each step.
+/// frontier between calls. Batch inputs and learning rate cross the host
+/// boundary on every step; requested outputs cross only when the caller uses
+/// the observed [`MetalCompiledAdamW::step`] path.
 pub struct MetalCompiledAdamW {
     session: MetalDeviceSession,
     inputs: BTreeMap<String, (Shape, DType)>,
@@ -1229,6 +1230,41 @@ pub struct MetalCompiledAdamW {
 pub struct MetalCompiledAdamWStepResult {
     inner: CompiledAdamWStepResult,
     report: MetalDeviceRunReport,
+}
+
+/// One committed Metal AdamW step whose loss and named outputs remained on the
+/// device. The exact replay and optimizer progress plus device report remain
+/// available without manufacturing an observed [`CompiledTrainingStep`].
+pub struct MetalCompiledAdamWCommitResult {
+    progress: AdamWProgress,
+    capture_identity: u64,
+    report: MetalDeviceRunReport,
+}
+
+impl MetalCompiledAdamWCommitResult {
+    pub fn step(&self) -> u64 {
+        self.progress.replay_step
+    }
+
+    pub fn optimizer_step(&self) -> u64 {
+        self.progress.optimizer_step
+    }
+
+    pub fn accumulation_index(&self) -> u64 {
+        self.progress.accumulation_index
+    }
+
+    pub fn did_update(&self) -> bool {
+        self.progress.accumulation_index == 0
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.capture_identity
+    }
+
+    pub fn report(&self) -> &MetalDeviceRunReport {
+        &self.report
+    }
 }
 
 impl MetalCompiledAdamWStepResult {
@@ -3040,11 +3076,11 @@ impl MetalCompiledAdamWPlan {
 }
 
 impl MetalCompiledAdamW {
-    pub fn step(
-        &mut self,
-        inputs: BTreeMap<String, TensorData>,
+    fn prepare_step(
+        &self,
+        mut inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
-    ) -> Result<MetalCompiledAdamWStepResult> {
+    ) -> Result<(AdamWProgress, BTreeMap<String, TensorData>)> {
         validate_step_inputs(&self.inputs, &inputs, &learning_rate)?;
         let next = self
             .progress
@@ -3052,12 +3088,24 @@ impl MetalCompiledAdamW {
         if let Some(dropout) = self.dropout {
             expected_dropout_counter(dropout, next.replay_step)?;
         }
-        let mut provided = inputs;
-        provided.insert(LEARNING_RATE_INPUT.into(), learning_rate);
-        let run = self.session.run(&provided).map_err(metal_training_error)?;
+        inputs.insert(LEARNING_RATE_INPUT.into(), learning_rate);
+        Ok((next, inputs))
+    }
+
+    fn observe_committed_step(&mut self, run: &MetalDeviceRun) {
         if let Some(scoreboard) = &mut self.scoreboard {
-            scoreboard.observe(&run);
+            scoreboard.observe(run);
         }
+    }
+
+    pub fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<MetalCompiledAdamWStepResult> {
+        let (next, provided) = self.prepare_step(inputs, learning_rate)?;
+        let run = self.session.run(&provided).map_err(metal_training_error)?;
+        self.observe_committed_step(&run);
         let (outputs, report) = run.into_parts();
         debug_assert_eq!(outputs.len(), 1 + self.output_names.len());
         let mut outputs = outputs.into_iter();
@@ -3076,6 +3124,35 @@ impl MetalCompiledAdamW {
             self.progress,
         );
         Ok(MetalCompiledAdamWStepResult { inner, report })
+    }
+
+    /// Executes and commits the identical captured training program while
+    /// leaving its loss and named outputs on the device. Batch inputs and the
+    /// learning rate are still staged, the complete inactive state bank is
+    /// produced, and successful replay/optimizer progress advances normally.
+    /// Use [`Self::step`] whenever the caller needs to observe loss or outputs.
+    pub fn step_without_host_outputs(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<MetalCompiledAdamWCommitResult> {
+        let (next, provided) = self.prepare_step(inputs, learning_rate)?;
+        let run = self
+            .session
+            .run_epoch_without_host_outputs(&provided)
+            .map_err(metal_training_error)?;
+        debug_assert!(run.outputs().is_empty());
+        debug_assert_eq!(run.report().output_count, 0);
+        debug_assert_eq!(run.report().retained_d2h_calls, 0);
+        debug_assert_eq!(run.report().retained_d2h_bytes, 0);
+        self.observe_committed_step(&run);
+        let (_, report) = run.into_parts();
+        self.progress = next;
+        Ok(MetalCompiledAdamWCommitResult {
+            progress: self.progress,
+            capture_identity: self.program_identity,
+            report,
+        })
     }
 
     pub fn step_count(&self) -> u64 {

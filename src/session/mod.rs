@@ -21,8 +21,8 @@ pub use compiled_training::{
     CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
     CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult, CompiledTrainingRuntime,
     CompiledTrainingStep, CompiledTrainingStepResult, CpuCompiledAdamW, CpuCompiledMomentumSgd,
-    MetalCompiledAdamW, MetalCompiledAdamWPlan, MetalCompiledAdamWStepResult,
-    TrainingParameterInit,
+    MetalCompiledAdamW, MetalCompiledAdamWCommitResult, MetalCompiledAdamWPlan,
+    MetalCompiledAdamWStepResult, TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,

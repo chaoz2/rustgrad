@@ -4043,12 +4043,13 @@ impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
         &self,
         values: &mut BTreeMap<u64, TensorData>,
         alternate_state_bank: bool,
+        host_outputs: StaticHostOutputSelection,
     ) -> Result<StaticExecutionReport, A::Error> {
         self.prepared.execute_skipping_residents_at_epoch(
             values,
             &self.resident_ids,
             alternate_state_bank,
-            StaticHostOutputSelection::All,
+            host_outputs,
         )
     }
 

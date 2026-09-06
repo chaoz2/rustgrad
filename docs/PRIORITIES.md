@@ -128,6 +128,13 @@ erased into a lowest-common-denominator result. Metal publication prevalidates
 and reads only the parameter fixed-state subset, including zero-read empty
 tensors; optimizer moments, accumulators, the optimizer step, and dropout
 counter remain device-resident and unread.
+Concrete Metal training can now commit selected iterations without
+materializing loss or named outputs on the host. The narrow
+`step_without_host_outputs` method retains the exact captured Transformer and
+complete epoch-swapped AdamW/dropout frontier, returns typed progress plus the
+device report, and records zero retained D2H traffic. Callers use the unchanged
+observed `step` periodically. This removes per-step observation transfer but
+does not remove the synchronous command wait or claim a live-device speedup.
 `CompiledAdamWPlan` now makes compilation and checkpoint restoration themselves
 backend-neutral: callers choose CPU replay or strict Metal rendering only after
 the complete graph, gradient, optimizer, capture, and recurrent frontier have

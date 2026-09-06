@@ -113,6 +113,22 @@ of silently testing the newer revision.
 
 ## Evidence boundary
 
+The compiled-Transformer artifact uses schema v3 and executes the same
+dropout-bearing capture twelve times: eight invocations on the uninterrupted
+session and four after checkpoint restoration. Four observed invocations
+download the scalar loss and `[1,3,3]` logits; eight device-only invocations
+commit the complete fixed-state successor with zero outputs and zero retained
+D2H calls or bytes. Every invocation must commit 59 state pairs, 784 logical
+state bytes, and 194 work items. The current Transformer capture retains
+indexed-movement kernels, so Metal uses its guarded per-item command/status/wait
+path rather than claiming one batched command buffer. The artifact records the
+indexed-movement count, planned kernel count, commands per invocation, and exact
+aggregate submissions/waits. It separately requires 336 transient H2D bytes and
+exactly 8 retained-output D2H calls totaling 160 bytes. Indexed-movement status
+traffic is outside the retained-output counters. Midpoint checkpointing and
+final parameter publication remain explicit host-observation boundaries outside
+these per-step transfer totals.
+
 A successful compiled-Transformer job trains through step eight, resumes the
 same Metal capture exactly from step four, and explicitly publishes the final
 resumed trainable frontier into the fresh reconstruction module. It checks 19
