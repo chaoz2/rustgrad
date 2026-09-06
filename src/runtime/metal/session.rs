@@ -309,6 +309,158 @@ pub(crate) struct MetalSharedAppendProof {
     quantized: BTreeMap<u64, u64>,
 }
 
+#[derive(Clone, Debug)]
+struct MetalSharedFixedStateReadProof {
+    source_capture_identity: u64,
+    source_deployment_identity: u64,
+    target_capture_identity: u64,
+    target_deployment_identity: u64,
+    dense: BTreeMap<u64, u64>,
+    alternate_state_bank: bool,
+}
+
+enum MetalSharedPreparation<'a> {
+    Append(&'a MetalDeviceSession, MetalSharedAppendProof),
+    FixedStateRead(&'a MetalDeviceSession, MetalSharedFixedStateReadProof),
+}
+
+/// Private pair of stateless evaluators whose resident parameter inputs alias
+/// the two physical banks of one authenticated epoch-state training plan.
+pub(crate) struct MetalFixedStateReadPlan {
+    plans: [MetalInferencePlan; 2],
+    proofs: [MetalSharedFixedStateReadProof; 2],
+}
+
+/// Prepared read-only evaluators for the false/true physical state banks.
+pub(crate) struct MetalFixedStateReadSession {
+    sessions: [MetalDeviceSession; 2],
+}
+
+impl MetalFixedStateReadPlan {
+    pub(crate) fn new(
+        inference: CapturedInference,
+        renderer: MetalRenderer,
+        source: &MetalStatefulInferencePlan,
+        parameter_names: &BTreeSet<String>,
+    ) -> Result<Self, MetalError> {
+        let plans = [
+            MetalInferencePlan::new(inference.clone(), renderer.clone())?,
+            MetalInferencePlan::new(inference, renderer)?,
+        ];
+        let mut proofs = Vec::with_capacity(2);
+        for (ordinal, target) in plans.iter().enumerate() {
+            if target.inner.resident_inputs().len() != parameter_names.len()
+                || target
+                    .inner
+                    .resident_inputs()
+                    .iter()
+                    .any(|input| !parameter_names.contains(&input.name))
+            {
+                return Err(MetalError::InvalidBinding(
+                    "read-only Metal parameter inventory differs".into(),
+                ));
+            }
+            let mut dense = BTreeMap::new();
+            for target_input in target.inner.resident_inputs() {
+                let source_input =
+                    exact_input_by_name(source.inner.state_inputs(), &target_input.name)?;
+                if !same_shared_storage_descriptor(&target_input.desc, &source_input.desc) {
+                    return Err(MetalError::InvalidBinding(format!(
+                        "read-only Metal parameter {} descriptor differs",
+                        target_input.name
+                    )));
+                }
+                let target_value = target.resident_bindings.get(&target_input.name);
+                let source_value = source.initial_state.get(&target_input.name);
+                let (Some(target_value), Some(source_value)) = (target_value, source_value) else {
+                    return Err(MetalError::InvalidBinding(format!(
+                        "read-only Metal parameter {} payload is absent",
+                        target_input.name
+                    )));
+                };
+                if !same_tensor_payload(target_value, source_value)? {
+                    return Err(MetalError::InvalidBinding(format!(
+                        "read-only Metal parameter {} payload differs",
+                        target_input.name
+                    )));
+                }
+                dense.insert(target_input.desc.id, source_input.desc.id);
+            }
+            proofs.push(MetalSharedFixedStateReadProof {
+                source_capture_identity: source.capture().identity,
+                source_deployment_identity: source.deployment_identity,
+                target_capture_identity: target.inner.capture().identity,
+                target_deployment_identity: target.deployment_identity,
+                dense,
+                alternate_state_bank: ordinal != 0,
+            });
+        }
+        let proofs: [MetalSharedFixedStateReadProof; 2] = proofs
+            .try_into()
+            .expect("two fixed-state read proofs are constructed");
+        Ok(Self { plans, proofs })
+    }
+
+    pub(crate) fn prepare(
+        self,
+        device: MetalDevice,
+        source: &MetalDeviceSession,
+    ) -> Result<MetalFixedStateReadSession, MetalError> {
+        let [false_plan, true_plan] = self.plans;
+        let [false_proof, true_proof] = self.proofs;
+        let MetalInferencePlan {
+            inner: false_inner,
+            resident_bindings: false_residents,
+            deployment_identity: false_identity,
+            ..
+        } = false_plan;
+        let MetalInferencePlan {
+            inner: true_inner,
+            resident_bindings: true_residents,
+            deployment_identity: true_identity,
+            ..
+        } = true_plan;
+        let false_session = false_inner.prepare_with_shared_fixed_state(
+            device.clone(),
+            false_residents,
+            false_identity,
+            source,
+            false_proof,
+        )?;
+        let true_session = true_inner.prepare_with_shared_fixed_state(
+            device,
+            true_residents,
+            true_identity,
+            source,
+            true_proof,
+        )?;
+        Ok(MetalFixedStateReadSession {
+            sessions: [false_session, true_session],
+        })
+    }
+}
+
+impl MetalFixedStateReadSession {
+    pub(crate) fn summaries(&self) -> [&MetalDeviceSessionSummary; 2] {
+        [self.sessions[0].summary(), self.sessions[1].summary()]
+    }
+
+    pub(crate) fn preparation_reports(&self) -> [&MetalDevicePreparationReport; 2] {
+        [
+            self.sessions[0].preparation_report(),
+            self.sessions[1].preparation_report(),
+        ]
+    }
+
+    pub(crate) fn run(
+        &mut self,
+        alternate_state_bank: bool,
+        inputs: &BTreeMap<String, TensorData>,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        self.sessions[usize::from(alternate_state_bank)].run(inputs)
+    }
+}
+
 /// Compares the physical contract for storage shared by two captured programs.
 /// `view` is deliberately excluded: it describes each program's use-site
 /// indexing and may differ even when both inputs name the same allocation.
@@ -1213,7 +1365,24 @@ impl MetalDeviceSessionPlan {
             resident_inputs,
             initial_state,
             Some(inference_deployment_identity),
-            Some((source, proof)),
+            Some(MetalSharedPreparation::Append(source, proof)),
+        )
+    }
+
+    fn prepare_with_shared_fixed_state(
+        self,
+        device: MetalDevice,
+        resident_inputs: BTreeMap<String, TensorData>,
+        inference_deployment_identity: u64,
+        source: &MetalDeviceSession,
+        proof: MetalSharedFixedStateReadProof,
+    ) -> Result<MetalDeviceSession, MetalError> {
+        self.prepare_impl(
+            device,
+            resident_inputs,
+            BTreeMap::new(),
+            Some(inference_deployment_identity),
+            Some(MetalSharedPreparation::FixedStateRead(source, proof)),
         )
     }
 
@@ -1223,7 +1392,7 @@ impl MetalDeviceSessionPlan {
         resident_inputs: BTreeMap<String, TensorData>,
         initial_state: BTreeMap<String, TensorData>,
         inference_deployment_identity: Option<u64>,
-        shared: Option<(&MetalDeviceSession, MetalSharedAppendProof)>,
+        shared: Option<MetalSharedPreparation<'_>>,
     ) -> Result<MetalDeviceSession, MetalError> {
         // Value and capability validation precede cache, compilation,
         // allocation, queue creation, or upload.
@@ -1254,19 +1423,35 @@ impl MetalDeviceSessionPlan {
                 "Metal session renderer/device capability identity mismatch".into(),
             ));
         }
-        if let Some((source, proof)) = &shared
-            && (proof.target_capture_identity != self.capture().identity
-                || Some(proof.target_deployment_identity) != inference_deployment_identity
-                || proof.source_capture_identity != source.capture_identity()
-                || source.inference_deployment_identity() != Some(proof.source_deployment_identity)
-                || source.device_owner_id() != device.owner_id()
-                || !matches!(source.state_policy, MetalSessionStatePolicy::Append { .. })
-                || source.successful_runs != 0
-                || source.committed_state_position != 0)
-        {
-            return Err(MetalError::InvalidBinding(
-                "shared Metal session proof does not belong to these deployments".into(),
-            ));
+        if let Some(shared) = &shared {
+            let invalid = match shared {
+                MetalSharedPreparation::Append(source, proof) => {
+                    proof.target_capture_identity != self.capture().identity
+                        || Some(proof.target_deployment_identity) != inference_deployment_identity
+                        || proof.source_capture_identity != source.capture_identity()
+                        || source.inference_deployment_identity()
+                            != Some(proof.source_deployment_identity)
+                        || source.device_owner_id() != device.owner_id()
+                        || !matches!(source.state_policy, MetalSessionStatePolicy::Append { .. })
+                        || source.successful_runs != 0
+                        || source.committed_state_position != 0
+                }
+                MetalSharedPreparation::FixedStateRead(source, proof) => {
+                    proof.target_capture_identity != self.capture().identity
+                        || Some(proof.target_deployment_identity) != inference_deployment_identity
+                        || proof.source_capture_identity != source.capture_identity()
+                        || source.inference_deployment_identity()
+                            != Some(proof.source_deployment_identity)
+                        || source.device_owner_id() != device.owner_id()
+                        || !matches!(self.state_policy, MetalSessionStatePolicy::None)
+                        || !matches!(source.state_policy, MetalSessionStatePolicy::Epoch { .. })
+                }
+            };
+            if invalid {
+                return Err(MetalError::InvalidBinding(
+                    "shared Metal session proof does not belong to these deployments".into(),
+                ));
+            }
         }
         let device_info = device.info().clone();
         let device_owner_id = device.owner_id();
@@ -1301,7 +1486,7 @@ impl MetalDeviceSessionPlan {
         }
         let native_prepare_start = Instant::now();
         let (prepared, imported_dense) = match shared {
-            Some((source, proof)) => {
+            Some(MetalSharedPreparation::Append(source, proof)) => {
                 let resources = source
                     .prepared
                     .share_resources(&proof.dense, &proof.quantized)?;
@@ -1314,6 +1499,22 @@ impl MetalDeviceSessionPlan {
                         resources,
                         &imported_dense,
                         &imported_quantized,
+                    )?,
+                    imported_dense,
+                )
+            }
+            Some(MetalSharedPreparation::FixedStateRead(source, proof)) => {
+                let resources = source
+                    .prepared
+                    .share_resources_at_epoch(&proof.dense, proof.alternate_state_bank)?;
+                let imported_dense = proof.dense.keys().copied().collect::<BTreeSet<_>>();
+                (
+                    PreparedMetalPrefix::from_plan_with_shared(
+                        device.clone(),
+                        self.prefix,
+                        resources,
+                        &imported_dense,
+                        &BTreeSet::new(),
                     )?,
                     imported_dense,
                 )

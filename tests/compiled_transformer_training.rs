@@ -9,10 +9,10 @@ use rustgrad::runtime::metal::{
 use rustgrad::{
     Backend, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan,
     CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig,
-    CompiledDropoutKey, CompiledModuleAdamWPlan, CompiledTrainingRuntime, CompiledTrainingStep,
-    CpuBackend, CpuSessionTarget, DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module,
-    NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider,
-    TransformerBlock, cross_entropy, load_safetensors,
+    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledModuleAdamWPlan,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
+    LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Op, Parameter, Reduction, Result, Scalar,
+    Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy, load_safetensors,
 };
 use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "macos")]
@@ -155,6 +155,16 @@ fn build(
     let logits = model.forward(graph, inputs["tokens"], dropout)?;
     let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
     Ok((loss, BTreeMap::new()))
+}
+
+fn build_evaluation(
+    model: &TinyCausalTransformer,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let logits = model.forward_eval(graph, inputs["tokens"])?;
+    let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
+    Ok((loss, BTreeMap::from([("logits".into(), logits)])))
 }
 
 fn dropout_config() -> CompiledDropoutConfig {
@@ -601,12 +611,15 @@ fn compiled_transformer(model: &TinyCausalTransformer) -> CompiledAdamWPlan {
 fn owned_compiled_transformer(
     model: TinyCausalTransformer,
 ) -> rustgrad::CompiledModuleAdamWPlan<TinyCausalTransformer> {
-    CompiledModuleAdamWPlan::compile_with_dropout(config(), dropout_config(), model, build).unwrap()
+    CompiledModuleAdamWPlan::compile_with_dropout(config(), dropout_config(), model, build)
+        .unwrap()
+        .with_evaluation(build_evaluation)
+        .unwrap()
 }
 
 fn run_exact_resume<R, P>(mut prepare: P) -> ExactResumeEvaluation
 where
-    R: CompiledAdamWRuntime,
+    R: CompiledAdamWRuntime + CompiledEvaluationRuntime,
     P: FnMut(
         CompiledModuleAdamWPlan<TinyCausalTransformer>,
     ) -> Result<rustgrad::CompiledModuleAdamWSession<TinyCausalTransformer, R>>,
@@ -715,6 +728,8 @@ where
         &checkpoint,
         build,
     )
+    .unwrap()
+    .with_evaluation(build_evaluation)
     .unwrap();
     assert_eq!(resumed_plan.capture_identity(), capture_identity);
     assert_eq!(resumed_plan.step_count(), 4);
@@ -780,6 +795,20 @@ where
         final_state["dropout_block_counter"].scalar_at(0).as_u64(),
         96
     );
+    let before_evaluation = resumed.checkpoint().unwrap();
+    let evaluation_identity = resumed.evaluation_capture_identity().unwrap();
+    let mut final_mean_sparse_loss = 0.0;
+    for replay in 1..=ACCUMULATION_STEPS {
+        let evaluated = resumed.evaluate(batch(replay)).unwrap();
+        assert_eq!(evaluated.capture_identity(), evaluation_identity);
+        assert_eq!(
+            evaluated.output("logits").unwrap().shape(),
+            &Shape::new([BATCH, TIME, VOCAB])
+        );
+        final_mean_sparse_loss += evaluated.loss().scalar_at(0).as_f64();
+    }
+    final_mean_sparse_loss /= ACCUMULATION_STEPS as f64;
+    assert_eq!(resumed.checkpoint().unwrap(), before_evaluation);
     let published = resumed.parameter_snapshots().unwrap();
     let tied_version = tied.version().unwrap();
     let frozen_before = frozen.snapshot().unwrap();
@@ -806,7 +835,7 @@ where
         .collect::<BTreeMap<_, _>>();
     let first_eval = evaluate(&resumed_model);
     let second_eval = evaluate(&resumed_model);
-    let final_mean_sparse_loss = evaluate_mean_sparse_loss(&resumed_model);
+    let published_mean_sparse_loss = evaluate_mean_sparse_loss(&resumed_model);
     assert_eq!(first_eval.shape(), &Shape::new([BATCH, TIME, VOCAB]));
     assert_eq!(first_eval, second_eval);
     assert!(
@@ -816,6 +845,7 @@ where
     for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
         assert_eq!(parameter.version().unwrap(), versions_before_eval[&name]);
     }
+    assert_eq!(final_mean_sparse_loss, published_mean_sparse_loss);
     ExactResumeEvaluation {
         initial_mean_sparse_loss,
         final_mean_sparse_loss,
@@ -864,6 +894,25 @@ fn compiled_transformer_plan_cpu_target_decreases_loss_and_resumes_exactly() {
         evaluation.final_mean_sparse_loss < evaluation.initial_mean_sparse_loss,
         "compiled causal Transformer eval loss did not decrease: {evaluation:?}"
     );
+}
+
+#[test]
+fn compiled_evaluation_is_failure_atomic_and_retryable() {
+    let plan = owned_compiled_transformer(TinyCausalTransformer::new(7).unwrap());
+    let mut session = plan.prepare(&CpuSessionTarget).unwrap();
+    for replay in 1..=ACCUMULATION_STEPS {
+        session.step(batch(replay), learning_rate()).unwrap();
+    }
+    let checkpoint = session.checkpoint().unwrap();
+    let mut incomplete = batch(1);
+    incomplete.remove("targets");
+    assert!(session.evaluate(incomplete).is_err());
+    assert_eq!(session.checkpoint().unwrap(), checkpoint);
+    let first = session.evaluate(batch(1)).unwrap();
+    let second = session.evaluate(batch(1)).unwrap();
+    assert_eq!(first.loss(), second.loss());
+    assert_eq!(first.outputs(), second.outputs());
+    assert_eq!(session.checkpoint().unwrap(), checkpoint);
 }
 
 #[test]
@@ -1242,6 +1291,23 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let mut uninterrupted = seed
         .prepare(&target)
         .expect("live Metal preparation must compile, allocate, and upload training state");
+    for report in uninterrupted.evaluation_preparation_reports().unwrap() {
+        assert_eq!(report.resident_h2d_calls, 0);
+        assert_eq!(report.resident_h2d_bytes, 0);
+        assert_eq!(report.initial_state_h2d_calls, 0);
+        assert_eq!(report.initial_state_h2d_bytes, 0);
+    }
+    let [evaluation_false_summary, evaluation_true_summary] =
+        uninterrupted.evaluation_summaries().unwrap();
+    let evaluation_false_summary = (*evaluation_false_summary).clone();
+    let evaluation_true_summary = (*evaluation_true_summary).clone();
+    assert_eq!(evaluation_false_summary, evaluation_true_summary);
+    assert_eq!(evaluation_false_summary.transient_input_names.len(), 2);
+    assert_eq!(evaluation_false_summary.transient_input_bytes, 48);
+    assert_eq!(evaluation_false_summary.requested_output_count, 2);
+    assert_eq!(evaluation_false_summary.fallback_count, 0);
+    let evaluation_kernel_count = evaluation_false_summary.nonzero_item_count;
+    let evaluation_zero_item_count = evaluation_false_summary.zero_item_count;
     let state_work_items = uninterrupted
         .metal_session()
         .state_inputs()
@@ -1397,6 +1463,18 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                 .execution_scoreboard_report()
                 .unwrap()
                 .unwrap();
+            let evaluation_before_reset = uninterrupted.evaluate(batch(1)).unwrap();
+            let evaluation_loss_before_reset = evaluation_before_reset.loss().clone();
+            let evaluation_logits_before_reset =
+                evaluation_before_reset.output("logits").unwrap().clone();
+            assert_eq!(uninterrupted.checkpoint().unwrap(), checkpoint_before_reset);
+            assert_eq!(
+                uninterrupted
+                    .execution_scoreboard_report()
+                    .unwrap()
+                    .unwrap(),
+                scoreboard_before_reset
+            );
             let reset = uninterrupted.zero_grad().unwrap();
             assert_eq!(reset.discarded_microbatches(), 2);
             assert_eq!(uninterrupted.step_count(), 2);
@@ -1413,6 +1491,19 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
             assert_eq!(
                 checkpoint_dropout_block_counter(&uninterrupted.checkpoint().unwrap()),
                 dropout_counter_before_reset
+            );
+            let evaluation_after_reset = uninterrupted.evaluate(batch(1)).unwrap();
+            assert_eq!(evaluation_after_reset.loss(), &evaluation_loss_before_reset);
+            assert_eq!(
+                evaluation_after_reset.output("logits").unwrap(),
+                &evaluation_logits_before_reset
+            );
+            assert_eq!(
+                uninterrupted
+                    .execution_scoreboard_report()
+                    .unwrap()
+                    .unwrap(),
+                scoreboard_before_reset
             );
             assert_eq!(
                 uninterrupted.gradient_accumulator_snapshots().unwrap(),
@@ -1482,6 +1573,8 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         &checkpoint,
         build,
     )
+    .unwrap()
+    .with_evaluation(build_evaluation)
     .unwrap();
     assert_eq!(resumed_seed.step_count(), 4);
     let resumed_target = MetalSessionTarget::new(device, 64)
@@ -1505,6 +1598,15 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let mut resumed = resumed_seed
         .prepare(&resumed_target)
         .expect("checkpoint-restored Metal preparation must succeed");
+    for report in resumed.evaluation_preparation_reports().unwrap() {
+        assert_eq!(report.resident_h2d_calls, 0);
+        assert_eq!(report.resident_h2d_bytes, 0);
+        assert_eq!(report.initial_state_h2d_calls, 0);
+        assert_eq!(report.initial_state_h2d_bytes, 0);
+    }
+    let [resumed_false_summary, resumed_true_summary] = resumed.evaluation_summaries().unwrap();
+    assert_eq!(resumed_false_summary, &evaluation_false_summary);
+    assert_eq!(resumed_true_summary, &evaluation_true_summary);
     let resumed_deployment_identity = resumed
         .execution_scoreboard_report()
         .unwrap()
@@ -1626,6 +1728,57 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
     );
+    let checkpoint_before_evaluation = resumed.checkpoint().unwrap();
+    let scoreboard_before_evaluation = resumed.execution_scoreboard_report().unwrap().unwrap();
+    let epoch_before_evaluation = resumed.metal_session().state_epoch();
+    let dropout_before_evaluation = checkpoint_dropout_block_counter(&checkpoint_before_evaluation);
+    let evaluation_identity = resumed.evaluation_capture_identity().unwrap();
+    let mut compiled_final_mean_sparse_loss = 0.0;
+    let mut evaluation_reports = Vec::new();
+    for replay in 1..=ACCUMULATION_STEPS {
+        let evaluated = resumed.evaluate(batch(replay)).unwrap();
+        assert_eq!(evaluated.capture_identity(), evaluation_identity);
+        assert_eq!(
+            evaluated.output("logits").unwrap().shape(),
+            &Shape::new([BATCH, TIME, VOCAB])
+        );
+        compiled_final_mean_sparse_loss += evaluated.loss().scalar_at(0).as_f64();
+        evaluation_reports.push(evaluated.report().clone());
+    }
+    compiled_final_mean_sparse_loss /= ACCUMULATION_STEPS as f64;
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint_before_evaluation);
+    assert_eq!(
+        resumed.execution_scoreboard_report().unwrap().unwrap(),
+        scoreboard_before_evaluation
+    );
+    assert_eq!(
+        resumed.metal_session().state_epoch(),
+        epoch_before_evaluation
+    );
+    assert_eq!(
+        checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
+        dropout_before_evaluation
+    );
+    let evaluation_retained_bytes = DType::F32.itemsize() * (1 + TOKEN_COUNT * VOCAB);
+    assert_eq!(evaluation_retained_bytes, 76);
+    for (index, report) in evaluation_reports.iter().enumerate() {
+        assert_eq!(report.successful_invocation, index as u64 + 1);
+        assert_eq!(report.transient_h2d_calls, 2);
+        assert_eq!(report.transient_h2d_bytes, 48);
+        assert_eq!(report.runtime_control_h2d_calls, 0);
+        assert_eq!(report.runtime_control_h2d_bytes, 0);
+        assert_eq!(report.retained_d2h_calls, 2);
+        assert_eq!(report.retained_d2h_bytes, evaluation_retained_bytes);
+        assert_eq!(report.output_count, 2);
+        assert_eq!(report.kernel_launch_count, evaluation_kernel_count);
+        assert_eq!(report.zero_item_count, evaluation_zero_item_count);
+        assert_eq!(report.command_submission_count, 1);
+        assert_eq!(report.command_wait_count, 1);
+        assert_eq!(report.committed_state_pair_count, 0);
+        assert_eq!(report.committed_state_bytes, 0);
+        assert_eq!(report.committed_state_work_items, 0);
+        assert_eq!(report.committed_state_position, None);
+    }
     let (final_state, final_metadata) =
         load_safetensors(resumed.checkpoint().unwrap().as_bytes()).unwrap();
     assert_eq!(final_metadata["replay_step"], "8");
@@ -1735,6 +1888,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         final_mean_sparse_loss < initial_mean_sparse_loss,
         "live compiled causal Transformer eval loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
     );
+    assert!((compiled_final_mean_sparse_loss - final_mean_sparse_loss).abs() < 1e-5);
 
     let device_evidence = serde_json::json!({
         "name": device_info.name,
@@ -1786,6 +1940,8 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let loss_evidence = serde_json::json!({
         "initial_eval_mean_sparse_loss": initial_mean_sparse_loss,
         "final_eval_mean_sparse_loss": final_mean_sparse_loss,
+        "compiled_in_session_eval_mean_sparse_loss": compiled_final_mean_sparse_loss,
+        "compiled_in_session_eval_calls": evaluation_reports.len(),
     });
     let accounting_evidence = serde_json::json!({
         "kernel_launch_count": totals.kernel_launch_count,
@@ -1800,12 +1956,29 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "observed_retained_host_api_d2h_calls": totals.retained_d2h_calls,
         "observed_retained_host_api_d2h_bytes": totals.retained_d2h_bytes,
     });
+    let evaluation_evidence = serde_json::json!({
+        "evaluation_parameter_resident_h2d_calls": 0,
+        "evaluation_parameter_resident_h2d_bytes": 0,
+        "evaluation_calls": evaluation_reports.len(),
+        "evaluation_transient_host_api_h2d_calls": 2 * evaluation_reports.len(),
+        "evaluation_transient_host_api_h2d_bytes": 48 * evaluation_reports.len(),
+        "evaluation_retained_host_api_d2h_calls": 2 * evaluation_reports.len(),
+        "evaluation_retained_host_api_d2h_bytes": evaluation_retained_bytes * evaluation_reports.len(),
+        "evaluation_output_count_per_invocation": 2,
+        "evaluation_kernel_launch_count_per_invocation": evaluation_kernel_count,
+        "evaluation_zero_item_count_per_invocation": evaluation_zero_item_count,
+        "evaluation_command_submission_count": evaluation_reports.len(),
+        "evaluation_command_wait_count": evaluation_reports.len(),
+        "evaluation_committed_state_pair_count": 0,
+        "evaluation_committed_state_bytes": 0,
+        "evaluation_committed_state_work_items": 0,
+    });
     let scoreboard_evidence = serde_json::json!({
         "initial_scoreboard": initial_scoreboard,
         "resumed_scoreboard": resumed_scoreboard,
     });
     let mut evidence = serde_json::json!({
-        "format_version": 5,
+        "format_version": 6,
         "workload": "tiny-causal-transformer-compiled-adamw",
         "implementation_revision": expected_sha,
         "device": device_evidence,
@@ -1820,6 +1993,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         checkpoint_evidence,
         loss_evidence,
         accounting_evidence,
+        evaluation_evidence,
         scoreboard_evidence,
     ] {
         let serde_json::Value::Object(fragment) = fragment else {

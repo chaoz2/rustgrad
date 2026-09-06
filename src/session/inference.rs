@@ -341,8 +341,27 @@ impl CapturedInference {
     /// lineage is a value-preserving Reshape/Expand chain. The Gather itself
     /// must be an internal single-output raw movement owner.
     pub(crate) fn with_authenticated_host_gathers(
+        self,
+        names: &[&str],
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        self.with_authenticated_host_gathers_impl(names, None)
+    }
+
+    /// Adds the compiled-evaluation-only fixed rank-two form of the private
+    /// status-free host Gather policy. Each declaration must match the exact
+    /// transient descriptor and canonical flattened index lineage.
+    pub(crate) fn with_authenticated_fixed_host_gathers(
+        self,
+        declarations: &BTreeMap<String, Shape>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        let names = declarations.keys().map(String::as_str).collect::<Vec<_>>();
+        self.with_authenticated_host_gathers_impl(&names, Some(declarations))
+    }
+
+    fn with_authenticated_host_gathers_impl(
         mut self,
         names: &[&str],
+        fixed: Option<&BTreeMap<String, Shape>>,
     ) -> std::result::Result<Self, CapturedInferenceError> {
         if names.is_empty() {
             return Ok(self);
@@ -390,6 +409,17 @@ impl CapturedInference {
                 .shape
                 .numel()
                 .map_err(CapturedInferenceError::State)?;
+            let descriptor_matches = match fixed {
+                Some(declarations) => declarations.get(name).is_some_and(|shape| {
+                    shape.rank() == 2 && !shape.dims().contains(&0) && &captured.desc.shape == shape
+                }),
+                None => input_elements == 1 || captured.desc.shape.dims() == [1, input_elements],
+            };
+            let descriptor_requirement = if fixed.is_some() {
+                "one declared nonempty fixed rank-two I32 transient"
+            } else {
+                "one dense scalar or batch-one fixed I32 transient"
+            };
             if captured.desc.id != source.index() as u64
                 || captured.desc.dtype != DType::I32
                 || input_elements == 0
@@ -402,10 +432,10 @@ impl CapturedInference {
                             )
                         })?
                 || !captured.desc.read_only
-                || (input_elements > 1 && captured.desc.shape.dims() != [1, input_elements])
+                || !descriptor_matches
             {
                 return Err(CapturedInferenceError::Binding(format!(
-                    "host Gather input {name} must be one dense scalar or batch-one fixed I32 transient"
+                    "host Gather input {name} must be {descriptor_requirement}"
                 )));
             }
             for item in &self.capture.items {
@@ -448,12 +478,18 @@ impl CapturedInference {
                     axis_extent: link.axis_extent,
                     index_elements: link.index_elements,
                 };
-                if crate::runtime::static_schedule::authenticate_host_gather_lineage(
-                    &self.capture.items,
-                    &static_link,
-                )
-                .is_ok()
-                {
+                let authenticated = if fixed.is_some() {
+                    crate::runtime::static_schedule::authenticate_fixed_host_gather_lineage(
+                        &self.capture.items,
+                        &static_link,
+                    )
+                } else {
+                    crate::runtime::static_schedule::authenticate_host_gather_lineage(
+                        &self.capture.items,
+                        &static_link,
+                    )
+                };
+                if authenticated.is_ok() {
                     matches.entry(name.clone()).or_default().push(link);
                 }
             }
@@ -471,18 +507,10 @@ impl CapturedInference {
         }
         host_gathers.sort_by_key(|link| link.output);
         let mut hasher = DefaultHasher::new();
-        let has_fixed_policy = host_gathers.iter().any(|link| {
-            link.input
-                .desc
-                .shape
-                .numel()
-                .ok()
-                .is_none_or(|elements| elements != 1)
-        });
-        if !has_fixed_policy {
-            "rustgrad-captured-host-gather-v1".hash(&mut hasher);
-        } else {
+        if fixed.is_some() {
             "rustgrad-captured-host-gather-fixed-v1".hash(&mut hasher);
+        } else {
+            "rustgrad-captured-host-gather-v1".hash(&mut hasher);
         }
         self.identity.hash(&mut hasher);
         host_gathers.hash(&mut hasher);
@@ -2428,6 +2456,46 @@ mod tests {
                 .with_authenticated_host_gathers(&["token"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fixed_singleton_host_gather_has_distinct_policy_identity() {
+        let module = Sequential::default();
+        let mut graph = Graph::new();
+        let table = graph.input_dtype("table", [4, 2], DType::F32);
+        let token = graph.input_dtype("token", [1, 1], DType::I32);
+        let flattened = graph.reshape(token, [1, 1]).unwrap();
+        let indices = graph.expand(flattened, [1, 2]).unwrap();
+        let gathered = graph.gather(table, indices, 0).unwrap();
+        let output = graph.square(gathered).unwrap();
+        let capture = CapturedInference::from_module_graph(&module, &graph, &[output]).unwrap();
+        let capture_identity = capture.deployment_identity();
+        let ordinary = capture
+            .clone()
+            .with_authenticated_host_gathers(&["token"])
+            .unwrap();
+        let fixed = capture
+            .with_authenticated_fixed_host_gathers(&BTreeMap::from([(
+                "token".to_owned(),
+                Shape::from([1, 1]),
+            )]))
+            .unwrap();
+        let (_, _, _, ordinary_links, _, _) = ordinary.clone().into_parts();
+        let (_, _, _, fixed_links, _, _) = fixed.clone().into_parts();
+        assert_eq!(ordinary_links, fixed_links);
+
+        let mut ordinary_identity = DefaultHasher::new();
+        "rustgrad-captured-host-gather-v1".hash(&mut ordinary_identity);
+        capture_identity.hash(&mut ordinary_identity);
+        ordinary_links.hash(&mut ordinary_identity);
+        assert_eq!(ordinary.deployment_identity(), ordinary_identity.finish());
+
+        let mut fixed_identity = DefaultHasher::new();
+        "rustgrad-captured-host-gather-fixed-v1".hash(&mut fixed_identity);
+        capture_identity.hash(&mut fixed_identity);
+        fixed_links.hash(&mut fixed_identity);
+        assert_eq!(fixed.deployment_identity(), fixed_identity.finish());
+        assert_ne!(fixed.deployment_identity(), ordinary.deployment_identity());
     }
 
     fn configured_cifar_classifier() -> (Sequential, Parameter) {

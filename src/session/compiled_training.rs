@@ -7,9 +7,10 @@ use crate::nn::{
 };
 use crate::runtime::metal::{
     MetalDevice, MetalDeviceRun, MetalDeviceRunReport, MetalDeviceSession,
-    MetalDeviceSessionSummary, MetalError, MetalRenderer, MetalScoreboardContext,
-    MetalScoreboardError, MetalScoreboardObserver, MetalSessionScoreboard,
-    MetalSessionScoreboardReport, MetalStatefulInferencePlan, RenderedMetal,
+    MetalDeviceSessionSummary, MetalError, MetalFixedStateReadPlan, MetalFixedStateReadSession,
+    MetalRenderer, MetalScoreboardContext, MetalScoreboardError, MetalScoreboardObserver,
+    MetalSessionScoreboard, MetalSessionScoreboardReport, MetalStatefulInferencePlan,
+    RenderedMetal,
 };
 use crate::{
     BufferState, CapturedMixedSchedule, CapturedSchedule, CapturedStatefulInference, CompareOp,
@@ -771,6 +772,113 @@ pub struct CompiledTrainingStepResult {
     capture_identity: u64,
 }
 
+/// Detached outputs from one read-only evaluation of the live compiled
+/// parameter frontier.
+#[derive(Clone, Debug)]
+pub struct CompiledEvaluationResult {
+    loss: TensorData,
+    outputs: BTreeMap<String, TensorData>,
+    capture_identity: u64,
+}
+
+impl CompiledEvaluationResult {
+    pub fn loss(&self) -> &TensorData {
+        &self.loss
+    }
+
+    pub fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        &self.outputs
+    }
+
+    pub fn output(&self, name: &str) -> Option<&TensorData> {
+        self.outputs.get(name)
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.capture_identity
+    }
+}
+
+/// Backend-neutral view of one successful read-only compiled evaluation.
+pub trait CompiledEvaluation {
+    fn loss(&self) -> &TensorData;
+
+    fn outputs(&self) -> &BTreeMap<String, TensorData>;
+
+    fn output(&self, name: &str) -> Option<&TensorData> {
+        self.outputs().get(name)
+    }
+
+    fn capture_identity(&self) -> u64;
+}
+
+impl CompiledEvaluation for CompiledEvaluationResult {
+    fn loss(&self) -> &TensorData {
+        self.loss()
+    }
+
+    fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        self.outputs()
+    }
+
+    fn capture_identity(&self) -> u64 {
+        self.capture_identity()
+    }
+}
+
+/// Successful strict-Metal evaluation plus its exact stateless run evidence.
+pub struct MetalCompiledEvaluationResult {
+    inner: CompiledEvaluationResult,
+    report: MetalDeviceRunReport,
+}
+
+impl MetalCompiledEvaluationResult {
+    pub fn loss(&self) -> &TensorData {
+        self.inner.loss()
+    }
+
+    pub fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        self.inner.outputs()
+    }
+
+    pub fn output(&self, name: &str) -> Option<&TensorData> {
+        self.inner.output(name)
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+
+    pub fn report(&self) -> &MetalDeviceRunReport {
+        &self.report
+    }
+}
+
+impl CompiledEvaluation for MetalCompiledEvaluationResult {
+    fn loss(&self) -> &TensorData {
+        self.loss()
+    }
+
+    fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        self.outputs()
+    }
+
+    fn capture_identity(&self) -> u64 {
+        self.capture_identity()
+    }
+}
+
+/// Optional read-only evaluation capability for a compiled training session.
+/// Evaluation observes the current parameter frontier without advancing or
+/// mutating training, optimizer, accumulation, or workload state.
+pub trait CompiledEvaluationRuntime {
+    type Evaluation: CompiledEvaluation;
+
+    fn evaluate(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Evaluation>;
+
+    fn evaluation_capture_identity(&self) -> Option<u64>;
+}
+
 impl CompiledTrainingStepResult {
     pub fn loss(&self) -> &TensorData {
         &self.loss
@@ -1461,6 +1569,7 @@ pub struct CompiledAdamWPlan {
     progress: AdamWProgress,
     dropout: Option<CompiledDropoutState>,
     host_token_inputs: BTreeMap<String, Shape>,
+    evaluation: Option<CompiledEvaluationPlan>,
 }
 
 /// Resource-free AdamW plan paired with the exact module value used to build it.
@@ -1533,6 +1642,51 @@ impl<M> std::error::Error for CompiledModuleAdamWCompileError<M> {
 pub struct CompiledModuleAdamWPrepareError<M, E> {
     plan: CompiledModuleAdamWPlan<M>,
     source: E,
+}
+
+/// Recoverable evaluation-capture failure retaining the complete owned plan.
+pub struct CompiledModuleAdamWEvaluationError<M> {
+    plan: Box<CompiledModuleAdamWPlan<M>>,
+    source: Error,
+}
+
+impl<M> CompiledModuleAdamWEvaluationError<M> {
+    pub fn source_error(&self) -> &Error {
+        &self.source
+    }
+
+    pub fn into_plan(self) -> CompiledModuleAdamWPlan<M> {
+        *self.plan
+    }
+
+    pub fn into_parts(self) -> (CompiledModuleAdamWPlan<M>, Error) {
+        (*self.plan, self.source)
+    }
+}
+
+impl<M> fmt::Debug for CompiledModuleAdamWEvaluationError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledModuleAdamWEvaluationError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> fmt::Display for CompiledModuleAdamWEvaluationError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "owned compiled AdamW evaluation capture failed: {}",
+            self.source
+        )
+    }
+}
+
+impl<M> std::error::Error for CompiledModuleAdamWEvaluationError<M> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 impl<M, E> CompiledModuleAdamWPrepareError<M, E> {
@@ -1641,6 +1795,7 @@ pub struct CpuCompiledAdamW {
     progress: AdamWProgress,
     dropout: Option<CompiledDropoutState>,
     host_token_inputs: BTreeMap<String, Shape>,
+    evaluation: Option<CpuCompiledEvaluation>,
 }
 
 /// Resource-free Metal rendering of one compiled AdamW plan. Preparing it
@@ -1657,6 +1812,7 @@ pub struct MetalCompiledAdamWPlan {
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
     dropout: Option<CompiledDropoutState>,
+    evaluation: Option<(MetalFixedStateReadPlan, Vec<String>, u64)>,
 }
 
 /// Device-resident AdamW training session backed by one fixed Metal capture.
@@ -1676,6 +1832,7 @@ pub struct MetalCompiledAdamW {
     loss_scale: f32,
     dropout: Option<CompiledDropoutState>,
     scoreboard: Option<MetalScoreboardObserver>,
+    evaluation: Option<(MetalFixedStateReadSession, Vec<String>, u64)>,
 }
 
 /// One committed Metal AdamW step plus its exact device execution report.
@@ -1875,6 +2032,20 @@ struct CompiledTrainingPlan {
     state_input_keys: BTreeMap<String, String>,
     state_values: BTreeMap<String, TensorData>,
     step: u64,
+}
+
+#[derive(Clone)]
+struct CompiledEvaluationPlan {
+    inference: crate::CapturedInference,
+    inputs: BTreeMap<String, (Shape, DType)>,
+    output_names: Vec<String>,
+    parameter_inputs: BTreeMap<String, String>,
+    capture_identity: u64,
+}
+
+#[derive(Clone)]
+struct CpuCompiledEvaluation {
+    plan: CompiledEvaluationPlan,
 }
 
 /// One static CPU training program with runtime-owned recurrent state.
@@ -2301,6 +2472,147 @@ impl CompiledTrainingPlan {
     }
 }
 
+impl CompiledEvaluationPlan {
+    fn compile<M, F>(module: &M, training_plan: &CompiledAdamWPlan, build: F) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let parameter_plan = ModuleParameterPlan::new(module)?;
+        let mut graph = Graph::new();
+        let inputs = training_plan
+            .inner
+            .inputs
+            .iter()
+            .map(|(name, (shape, dtype))| {
+                (
+                    name.clone(),
+                    graph.input_dtype_requires_grad(name.clone(), shape.clone(), *dtype, false),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut parameters = BTreeMap::new();
+        let mut parameter_inputs = BTreeMap::new();
+        let mut residents = BTreeMap::new();
+        for init in parameter_plan.initial_parameters()? {
+            let key = parameter_key(init.name());
+            let input_name = training_plan
+                .inner
+                .state_input_keys
+                .iter()
+                .find_map(|(input, candidate)| (candidate == &key).then(|| input.clone()))
+                .ok_or_else(|| training("compiled evaluation parameter state is absent"))?;
+            let value = training_plan
+                .inner
+                .state_values
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| training("compiled evaluation parameter value is absent"))?;
+            let node = graph.input_dtype_requires_grad(
+                input_name.clone(),
+                value.shape().clone(),
+                value.dtype(),
+                true,
+            );
+            parameters.insert(init.name().to_owned(), node);
+            parameter_inputs.insert(init.name().to_owned(), input_name.clone());
+            residents.insert(input_name, (node, value));
+        }
+        let (loss, outputs) = parameter_plan.lower(&mut graph, &parameters, |graph| {
+            build(module, graph, &inputs)
+        })?;
+        validate_loss(&graph, loss)?;
+        validate_outputs(
+            loss,
+            &outputs,
+            training_plan
+                .inner
+                .inputs
+                .keys()
+                .chain(parameter_inputs.keys()),
+        )?;
+        let requested = std::iter::once(loss)
+            .chain(outputs.values().copied())
+            .collect::<Vec<_>>();
+        let requested = materialize_compiled_public_aliases(&mut graph, &requested)?;
+        let inference =
+            crate::CapturedInference::from_graph_residents(&graph, &requested, residents, &[])
+                .map_err(captured_inference_error)?
+                .with_authenticated_fixed_host_gathers(&training_plan.host_token_inputs)
+                .map_err(captured_inference_error)?;
+        let transient_names = inference
+            .transient_inputs()
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if transient_names
+            != training_plan
+                .inner
+                .inputs
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(training("compiled evaluation input inventory differs"));
+        }
+        let capture_identity = inference.capture().identity;
+        Ok(Self {
+            inference,
+            inputs: training_plan.inner.inputs.clone(),
+            output_names: outputs.keys().cloned().collect(),
+            parameter_inputs,
+            capture_identity,
+        })
+    }
+
+    fn evaluate(
+        &self,
+        mut inputs: BTreeMap<String, TensorData>,
+        parameters: BTreeMap<String, TensorData>,
+    ) -> Result<CompiledEvaluationResult> {
+        validate_evaluation_inputs(&self.inputs, &inputs)?;
+        if parameters.keys().ne(self.parameter_inputs.keys()) {
+            return Err(training("compiled evaluation parameter inventory differs"));
+        }
+        for (name, value) in parameters {
+            let input = self
+                .parameter_inputs
+                .get(&name)
+                .ok_or_else(|| training("compiled evaluation parameter is absent"))?;
+            inputs.insert(input.clone(), value);
+        }
+        let values = self
+            .inference
+            .capture()
+            .replay(&inputs)
+            .map_err(replay_error)?;
+        evaluation_result(values, &self.output_names, self.capture_identity)
+    }
+}
+
+fn evaluation_result(
+    values: Vec<TensorData>,
+    output_names: &[String],
+    capture_identity: u64,
+) -> Result<CompiledEvaluationResult> {
+    if values.len() != 1 + output_names.len() {
+        return Err(training("compiled evaluation output inventory differs"));
+    }
+    let mut values = values.into_iter();
+    let loss = values
+        .next()
+        .expect("compiled evaluation output cardinality was checked");
+    Ok(CompiledEvaluationResult {
+        loss,
+        outputs: output_names.iter().cloned().zip(values).collect(),
+        capture_identity,
+    })
+}
+
 impl CpuCompiledTrainingProgram {
     /// Executes one graph-free replay and atomically publishes every recurrent
     /// successor. The learning rate is an explicit rank-zero F32 input.
@@ -2683,6 +2995,7 @@ impl CompiledAdamWPlan {
             progress: AdamWProgress::INITIAL,
             dropout: None,
             host_token_inputs,
+            evaluation: None,
         })
     }
 
@@ -2790,6 +3103,7 @@ impl CompiledAdamWPlan {
             progress: AdamWProgress::INITIAL,
             dropout: Some(dropout),
             host_token_inputs,
+            evaluation: None,
         })
     }
 
@@ -3009,6 +3323,10 @@ impl CompiledAdamWPlan {
             progress: self.progress,
             dropout: self.dropout,
             host_token_inputs: self.host_token_inputs.clone(),
+            evaluation: self
+                .evaluation
+                .clone()
+                .map(|plan| CpuCompiledEvaluation { plan }),
         })
     }
 
@@ -3061,6 +3379,25 @@ impl CompiledAdamWPlan {
                 training(format!("compiled Metal runtime: {error:?}{detail}"))
             },
         )?;
+        let evaluation = self
+            .evaluation
+            .clone()
+            .map(|evaluation| {
+                let parameter_names = evaluation
+                    .parameter_inputs
+                    .values()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                MetalFixedStateReadPlan::new(
+                    evaluation.inference,
+                    renderer,
+                    &inner,
+                    &parameter_names,
+                )
+                .map(|plan| (plan, evaluation.output_names, evaluation.capture_identity))
+                .map_err(metal_training_error)
+            })
+            .transpose()?;
         Ok(MetalCompiledAdamWPlan {
             inner,
             inputs: self.inner.inputs.clone(),
@@ -3072,6 +3409,7 @@ impl CompiledAdamWPlan {
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
             dropout: self.dropout,
+            evaluation,
         })
     }
 
@@ -3209,6 +3547,42 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         })
     }
 
+    /// Attaches one read-only evaluation capture to this exact owned plan.
+    /// The evaluator reuses the training input schema and live canonical
+    /// trainable frontier; frozen parameters and buffers remain capture-owned
+    /// constants. Failure retains the unconsumed plan for retry or recovery.
+    pub fn with_evaluation<F>(
+        mut self,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWEvaluationError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let result = (|| {
+            if self.plan.evaluation.is_some() {
+                return Err(training("compiled evaluation is already attached"));
+            }
+            self.seal.validate_unchanged(&self.module)?;
+            let evaluation = CompiledEvaluationPlan::compile(&self.module, &self.plan, build)?;
+            self.seal.validate_unchanged(&self.module)?;
+            Ok(evaluation)
+        })();
+        match result {
+            Ok(evaluation) => {
+                self.plan.evaluation = Some(evaluation);
+                Ok(self)
+            }
+            Err(source) => Err(CompiledModuleAdamWEvaluationError {
+                plan: Box::new(self),
+                source,
+            }),
+        }
+    }
+
     /// Consumes this owner into a target-specific session. A preparation error
     /// retains the complete plan and module for inspection or retry.
     pub fn prepare<T>(
@@ -3231,6 +3605,13 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
 
     pub fn dropout_config(&self) -> Option<CompiledDropoutConfig> {
         self.plan.dropout_config()
+    }
+
+    pub fn evaluation_capture_identity(&self) -> Option<u64> {
+        self.plan
+            .evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.capture_identity)
     }
 
     /// Inspects strict Metal admission without exposing an independently
@@ -3317,6 +3698,20 @@ impl<M: Module> CompiledModuleAdamWSession<M, MetalCompiledAdamW> {
     /// has frozen.
     pub fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
         self.runtime.scoreboard_recording_error()
+    }
+
+    /// Returns preparation evidence for the two read-only active-bank
+    /// evaluators, when evaluation was attached before preparation.
+    pub fn evaluation_preparation_reports(
+        &self,
+    ) -> Option<[&crate::runtime::metal::MetalDevicePreparationReport; 2]> {
+        self.runtime.evaluation_preparation_reports()
+    }
+
+    /// Returns deterministic resource/execution summaries for both read-only
+    /// physical-bank evaluators.
+    pub fn evaluation_summaries(&self) -> Option<[&MetalDeviceSessionSummary; 2]> {
+        self.runtime.evaluation_summaries()
     }
 }
 
@@ -3411,6 +3806,25 @@ impl CpuCompiledAdamW {
         result.step = next.replay_step;
         self.progress = next;
         Ok(adamw_step_result(result, next))
+    }
+
+    pub fn evaluate(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<CompiledEvaluationResult> {
+        let evaluation = self
+            .evaluation
+            .as_ref()
+            .ok_or_else(|| training("compiled evaluation is not attached"))?;
+        evaluation
+            .plan
+            .evaluate(inputs, self.inner.parameter_snapshots()?)
+    }
+
+    pub fn evaluation_capture_identity(&self) -> Option<u64> {
+        self.evaluation
+            .as_ref()
+            .map(|evaluation| evaluation.plan.capture_identity)
     }
 
     pub fn step_count(&self) -> u64 {
@@ -3526,6 +3940,10 @@ impl CpuCompiledAdamW {
             progress: self.progress,
             dropout: self.dropout,
             host_token_inputs: self.host_token_inputs.clone(),
+            evaluation: self
+                .evaluation
+                .as_ref()
+                .map(|evaluation| evaluation.plan.clone()),
         }
         .metal_plan(renderer)
     }
@@ -3617,6 +4035,18 @@ impl CompiledTrainingRuntime for CpuCompiledAdamW {
     }
 }
 
+impl CompiledEvaluationRuntime for CpuCompiledAdamW {
+    type Evaluation = CompiledEvaluationResult;
+
+    fn evaluate(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Evaluation> {
+        CpuCompiledAdamW::evaluate(self, inputs)
+    }
+
+    fn evaluation_capture_identity(&self) -> Option<u64> {
+        CpuCompiledAdamW::evaluation_capture_identity(self)
+    }
+}
+
 impl CompiledCheckpointRuntime for CpuCompiledAdamW {
     type Checkpoint = CompiledAdamWCheckpoint;
 
@@ -3698,6 +4128,21 @@ where
 
     fn checkpoint(&self) -> Result<Self::Checkpoint> {
         self.runtime.checkpoint()
+    }
+}
+
+impl<M, R> CompiledEvaluationRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledEvaluationRuntime,
+{
+    type Evaluation = R::Evaluation;
+
+    fn evaluate(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Evaluation> {
+        self.runtime.evaluate(inputs)
+    }
+
+    fn evaluation_capture_identity(&self) -> Option<u64> {
+        self.runtime.evaluation_capture_identity()
     }
 }
 
@@ -3896,7 +4341,18 @@ impl MetalCompiledAdamWPlan {
         device: MetalDevice,
         recorder: Option<MetalSessionScoreboard>,
     ) -> Result<MetalCompiledAdamW> {
-        let session = self.inner.prepare(device).map_err(metal_training_error)?;
+        let session = self
+            .inner
+            .prepare(device.clone())
+            .map_err(metal_training_error)?;
+        let evaluation = self
+            .evaluation
+            .map(|(plan, output_names, capture_identity)| {
+                plan.prepare(device.clone(), &session)
+                    .map(|session| (session, output_names, capture_identity))
+                    .map_err(metal_training_error)
+            })
+            .transpose()?;
         let scoreboard = recorder
             .map(|recorder| {
                 MetalScoreboardObserver::bind(recorder, &session)
@@ -3915,6 +4371,7 @@ impl MetalCompiledAdamWPlan {
             loss_scale: self.loss_scale,
             dropout: self.dropout,
             scoreboard,
+            evaluation,
         })
     }
 }
@@ -3997,6 +4454,46 @@ impl MetalCompiledAdamW {
             capture_identity: self.program_identity,
             report,
         })
+    }
+
+    pub fn evaluate(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<MetalCompiledEvaluationResult> {
+        validate_evaluation_inputs(&self.inputs, &inputs)?;
+        let (evaluation, output_names, capture_identity) = self
+            .evaluation
+            .as_mut()
+            .ok_or_else(|| training("compiled evaluation is not attached"))?;
+        let run = evaluation
+            .run(self.session.state_epoch(), &inputs)
+            .map_err(metal_training_error)?;
+        let (values, report) = run.into_parts();
+        let inner = evaluation_result(values, output_names, *capture_identity)?;
+        Ok(MetalCompiledEvaluationResult { inner, report })
+    }
+
+    pub fn evaluation_capture_identity(&self) -> Option<u64> {
+        self.evaluation
+            .as_ref()
+            .map(|(_, _, capture_identity)| *capture_identity)
+    }
+
+    /// Returns preparation evidence for both stateless evaluators sharing the
+    /// training session's physical parameter banks. Imported trainable state
+    /// contributes zero resident or initial-state uploads.
+    pub fn evaluation_preparation_reports(
+        &self,
+    ) -> Option<[&crate::runtime::metal::MetalDevicePreparationReport; 2]> {
+        self.evaluation
+            .as_ref()
+            .map(|(evaluation, _, _)| evaluation.preparation_reports())
+    }
+
+    pub fn evaluation_summaries(&self) -> Option<[&MetalDeviceSessionSummary; 2]> {
+        self.evaluation
+            .as_ref()
+            .map(|(evaluation, _, _)| evaluation.summaries())
     }
 
     pub fn step_count(&self) -> u64 {
@@ -4293,6 +4790,18 @@ impl CompiledTrainingRuntime for MetalCompiledAdamW {
 
     fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         MetalCompiledAdamW::parameter_snapshots(self)
+    }
+}
+
+impl CompiledEvaluationRuntime for MetalCompiledAdamW {
+    type Evaluation = MetalCompiledEvaluationResult;
+
+    fn evaluate(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Evaluation> {
+        MetalCompiledAdamW::evaluate(self, inputs)
+    }
+
+    fn evaluation_capture_identity(&self) -> Option<u64> {
+        MetalCompiledAdamW::evaluation_capture_identity(self)
     }
 }
 
@@ -4843,6 +5352,25 @@ fn validate_loss(graph: &Graph, loss: NodeId) -> Result<()> {
         return Err(training(
             "compiled training loss must be a rank-zero F32 scalar",
         ));
+    }
+    Ok(())
+}
+
+fn validate_evaluation_inputs(
+    expected: &BTreeMap<String, (Shape, DType)>,
+    provided: &BTreeMap<String, TensorData>,
+) -> Result<()> {
+    if expected.len() != provided.len() || expected.keys().ne(provided.keys()) {
+        return Err(training("compiled evaluation input names mismatch"));
+    }
+    for (name, (shape, dtype)) in expected {
+        let value = &provided[name];
+        if value.shape() != shape || value.dtype() != *dtype {
+            return Err(training(format!(
+                "compiled evaluation input {name:?} descriptor mismatch"
+            )));
+        }
+        checked_bytes(value)?;
     }
     Ok(())
 }

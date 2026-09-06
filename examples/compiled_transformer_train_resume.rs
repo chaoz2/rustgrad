@@ -16,10 +16,11 @@ use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
     Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWRuntime, CompiledAdamWStep,
-    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledModuleAdamWPlan,
-    CompiledModuleAdamWSession, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
-    CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NodeId, Parameter, Result, Scalar,
-    Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
+    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
+    CompiledEvaluationRuntime, CompiledModuleAdamWPlan, CompiledModuleAdamWSession,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
+    MetalSessionTarget, Module, NodeId, Parameter, Result, Scalar, Shape, TensorData,
+    TrainingDropoutProvider, TransformerBlock,
 };
 use std::{collections::BTreeMap, env, error::Error};
 
@@ -154,8 +155,20 @@ fn build(
     Ok((loss, BTreeMap::new()))
 }
 
+fn build_evaluation(
+    model: &TinyCausalTransformer,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let logits = model.forward_eval(graph, inputs["tokens"])?;
+    let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
+    Ok((loss, BTreeMap::from([("logits".into(), logits)])))
+}
+
 fn compile(model: TinyCausalTransformer) -> Result<CompiledModuleAdamWPlan<TinyCausalTransformer>> {
     CompiledModuleAdamWPlan::compile_with_dropout(config()?, dropout_config(), model, build)
+        .map_err(|error| error.into_parts().1)?
+        .with_evaluation(build_evaluation)
         .map_err(|error| error.into_parts().1)
 }
 
@@ -209,7 +222,7 @@ fn evaluate_mean_sparse_loss(model: &TinyCausalTransformer) -> Result<f64> {
 
 fn run_exact_resume<R, P>(target_name: &str, mut prepare: P) -> Result<()>
 where
-    R: CompiledAdamWRuntime,
+    R: CompiledAdamWRuntime + CompiledEvaluationRuntime,
     P: FnMut(
         CompiledModuleAdamWPlan<TinyCausalTransformer>,
     ) -> Result<CompiledModuleAdamWSession<TinyCausalTransformer, R>>,
@@ -219,6 +232,9 @@ where
     let plan = compile(model)?;
     let capture_identity = plan.capture_identity();
     let mut uninterrupted = prepare(plan)?;
+    let evaluation_identity = uninterrupted
+        .evaluation_capture_identity()
+        .expect("evaluation was attached before preparation");
     let parameters = uninterrupted.parameter_snapshots()?;
     assert!(parameters.contains_key("tokens.weight"));
     assert!(
@@ -285,6 +301,8 @@ where
         &checkpoint,
         build,
     )
+    .map_err(|error| error.into_parts().1)?
+    .with_evaluation(build_evaluation)
     .map_err(|error| error.into_parts().1)?;
     assert_eq!(restored_plan.capture_identity(), capture_identity);
     assert_eq!(restored_plan.step_count(), INITIAL_STEPS as u64);
@@ -337,6 +355,19 @@ where
         empty_accumulators
     );
     assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
+    let before_evaluation_checkpoint = resumed.checkpoint()?;
+    let mut final_mean_sparse_loss = 0.0;
+    for replay in 1..=ACCUMULATION_STEPS {
+        let evaluated = resumed.evaluate(batch(replay)?)?;
+        assert_eq!(evaluated.capture_identity(), evaluation_identity);
+        assert_eq!(
+            evaluated.output("logits").unwrap().shape(),
+            &Shape::new([BATCH, TIME, VOCAB])
+        );
+        final_mean_sparse_loss += evaluated.loss().scalar_at(0).as_f64();
+    }
+    final_mean_sparse_loss /= ACCUMULATION_STEPS as f64;
+    assert_eq!(resumed.checkpoint()?, before_evaluation_checkpoint);
     let published = resumed.parameter_snapshots()?;
     let tied_version = tied.version()?;
     let frozen_before = frozen.snapshot()?;
@@ -366,7 +397,7 @@ where
         .collect::<Result<BTreeMap<_, _>>>()?;
     let first_eval = evaluate(&restored_model)?;
     let second_eval = evaluate(&restored_model)?;
-    let final_mean_sparse_loss = evaluate_mean_sparse_loss(&restored_model)?;
+    let published_mean_sparse_loss = evaluate_mean_sparse_loss(&restored_model)?;
     assert_eq!(first_eval.shape(), &Shape::new([BATCH, TIME, VOCAB]));
     assert_eq!(first_eval, second_eval);
     assert!(
@@ -380,6 +411,7 @@ where
         final_mean_sparse_loss < initial_mean_sparse_loss,
         "compiled causal Transformer eval loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
     );
+    assert!((final_mean_sparse_loss - published_mean_sparse_loss).abs() < 1e-5);
     println!(
         "{target_name}: capture={capture_identity:016x}, steps={}, eval_mean_sparse_loss={:.6} -> {:.6}, exact_resume=true, published=true",
         runtime_step, initial_mean_sparse_loss, final_mean_sparse_loss

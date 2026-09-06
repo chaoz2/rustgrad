@@ -2013,6 +2013,84 @@ pub(crate) fn authenticate_host_gather_lineage(
     )
 }
 
+/// Reauthenticates the exact flattened affine materialization feeding one raw
+/// Gather from a nonempty fixed rank-two host input. This is deliberately
+/// separate from the scalar/batch-one inference proof.
+pub(crate) fn authenticate_fixed_host_gather_lineage(
+    items: &[ScheduleItem],
+    link: &StaticHostGather,
+) -> Result<(), String> {
+    let gather_items = items
+        .iter()
+        .filter(|item| item.outputs.iter().any(|output| output.id == link.output))
+        .collect::<Vec<_>>();
+    let [gather_item] = gather_items.as_slice() else {
+        return Err("fixed host Gather output must have one captured owner".into());
+    };
+    let crate::Operation::Movement(crate::MovementValue::Plan(gather_plan)) =
+        gather_item.kernel.operation()
+    else {
+        return Err("fixed host Gather owner is not a movement plan".into());
+    };
+    let crate::MovementKernelKind::Gather { index, axis, .. } = &gather_plan.kind else {
+        return Err("fixed host Gather owner is not Gather".into());
+    };
+    let portable = crate::movement_plan::PortableIndexedMovement::new(gather_plan)
+        .and_then(|portable| {
+            portable.validate_schedule_bindings(gather_item.ordered_inputs())?;
+            Ok(portable)
+        })
+        .map_err(|error| error.to_string())?;
+    let gather_output = gather_item.outputs.primary();
+    let gather_bytes = gather_plan
+        .output_shape
+        .numel()
+        .map_err(|error| error.to_string())?
+        .checked_mul(gather_plan.dtype.itemsize())
+        .ok_or_else(|| "fixed host Gather output byte extent overflow".to_owned())?;
+    if gather_item.outputs.len() != 1
+        || gather_item.node != gather_plan.output
+        || gather_plan.dtype != DType::F32
+        || gather_output.id != gather_plan.output.index() as u64
+        || gather_output.shape != gather_plan.output_shape
+        || gather_output.dtype != gather_plan.dtype
+        || gather_output.bytes != gather_bytes
+        || gather_output.alignment != gather_plan.dtype.itemsize().max(1)
+        || gather_output.view.is_some()
+        || gather_output.read_only
+        || index.node.index() as u64 != link.index
+        || *axis != link.axis
+        || portable.axis() != link.axis
+        || portable.axis_extent() != link.axis_extent
+        || portable.index_elements() != link.index_elements
+    {
+        return Err("fixed host Gather movement geometry is inconsistent".into());
+    }
+    let index_items = items
+        .iter()
+        .filter(|item| item.outputs.iter().any(|output| output.id == link.index))
+        .collect::<Vec<_>>();
+    let [index_item] = index_items.as_slice() else {
+        return Err("fixed host Gather index must have one captured producer".into());
+    };
+    let index_output = index_item.outputs.primary();
+    if index_output.shape != index.shape
+        || index_output.dtype != index.dtype
+        || index_output.id != link.index
+    {
+        return Err("fixed host Gather affine provenance is inconsistent".into());
+    }
+    authenticate_host_index_producer(
+        index_item,
+        link.input,
+        Some(&link.input_desc),
+        link.index,
+        &index_output.shape,
+        &[gather_item],
+        true,
+    )
+}
+
 /// Reauthenticates one exact pair of raw F32 indexed movements driven by a
 /// flattened host I32 token input. The forward Gather and its
 /// additive VJP Scatter must be the complete consumer set of one materialized
@@ -3329,7 +3407,9 @@ impl<R> StaticSchedulePlan<R> {
         let mut gather_outputs = BTreeSet::new();
         let mut gather_inputs = BTreeSet::new();
         for link in &host_gathers {
-            authenticate_host_gather_lineage(items, link).map_err(A::invalid_binding)?;
+            authenticate_host_gather_lineage(items, link)
+                .or_else(|_| authenticate_fixed_host_gather_lineage(items, link))
+                .map_err(A::invalid_binding)?;
             if link.axis_extent == 0 && link.index_elements != 0
                 || !gather_outputs.insert(link.output)
                 || !gather_inputs.insert(link.input)
@@ -4406,6 +4486,14 @@ impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
 
     pub(crate) fn shared_buffer(&self, id: u64) -> Option<&A::Buffer> {
         self.prepared.shared_buffer(id)
+    }
+
+    pub(crate) fn shared_buffer_for_epoch(
+        &self,
+        id: u64,
+        alternate_state_bank: bool,
+    ) -> Option<&A::Buffer> {
+        self.prepared.buffer_for_epoch(id, alternate_state_bank)
     }
 
     pub(crate) fn shared_queue(&self) -> Option<&A::Queue> {
