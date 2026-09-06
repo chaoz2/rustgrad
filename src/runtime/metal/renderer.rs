@@ -23,6 +23,8 @@ pub const METAL_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION: &str =
 pub const METAL_INDEXED_MOVEMENT_RENDERER_VERSION: &str = "rustgrad-metal-indexed-movement-v1";
 pub const METAL_HOST_GATHER_RENDERER_VERSION: &str = "rustgrad-metal-host-gather-v1";
 pub const METAL_FIXED_HOST_GATHER_RENDERER_VERSION: &str = "rustgrad-metal-host-gather-fixed-v1";
+pub const METAL_TRAINING_HOST_INDEXED_MOVEMENT_RENDERER_VERSION: &str =
+    "rustgrad-metal-training-host-indexed-movement-v1";
 pub const METAL_APPEND_STATE_RENDERER_VERSION: &str = "rustgrad-metal-append-state-v1";
 const METAL_APPEND_SPAN_RENDERER_VERSION: &str = "rustgrad-metal-append-span-v1";
 const METAL_APPEND_SPAN_IOTA_RENDERER_VERSION: &str = "rustgrad-metal-append-span-iota-i32-v1";
@@ -904,6 +906,14 @@ impl MetalRenderer {
         link: &crate::runtime::static_schedule::StaticHostGather,
     ) -> Result<RenderedMetal, MetalError> {
         render_host_gather(self, root, link)
+    }
+
+    pub(crate) fn render_host_indexed_movement(
+        &self,
+        root: &UOp,
+        link: &crate::runtime::static_schedule::StaticHostIndexedMovement,
+    ) -> Result<RenderedMetal, MetalError> {
+        render_host_indexed_movement(self, root, link)
     }
 }
 
@@ -2164,7 +2174,7 @@ fn render_indexed_movement(
     if portable.output_elements() != 0 {
         match portable.scatter_add() {
             None => emit_metal_gather_body(&portable, output_position, &mut lines),
-            Some(add) => emit_metal_scatter_body(&portable, output_position, add, &mut lines),
+            Some(add) => emit_metal_scatter_body(&portable, output_position, add, true, &mut lines),
         }
     }
     lines.push("}".into());
@@ -2191,6 +2201,139 @@ fn render_indexed_movement(
         capabilities: renderer.capabilities.clone(),
         transaction: None,
         indexed_movement: Some(transaction),
+        append_state: None,
+        schedule_inputs,
+        semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
+            root.clone(),
+        ))),
+    })
+}
+
+fn render_host_indexed_movement(
+    renderer: &MetalRenderer,
+    root: &UOp,
+    link: &crate::runtime::static_schedule::StaticHostIndexedMovement,
+) -> Result<RenderedMetal, MetalError> {
+    use crate::runtime::static_schedule::StaticHostIndexedMovementKind;
+
+    root.validate()
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let Operation::Movement(MovementValue::Plan(plan)) = root.operation() else {
+        return Err(MetalError::InvalidBinding(
+            "host indexed movement owner is not a movement plan".into(),
+        ));
+    };
+    let portable = crate::movement_plan::PortableIndexedMovement::new(plan)
+        .map_err(|error| MetalError::InvalidBinding(error.to_string()))?;
+    let expected_kind = match portable.scatter_add() {
+        None => StaticHostIndexedMovementKind::Gather,
+        Some(true) => StaticHostIndexedMovementKind::ScatterAdd,
+        Some(false) => {
+            return Err(MetalError::InvalidBinding(
+                "host indexed movement does not admit overwrite Scatter".into(),
+            ));
+        }
+    };
+    if expected_kind != link.kind
+        || plan.output.index() as u64 != link.output
+        || portable.inputs()[portable.index_abi()].node.index() as u64 != link.index
+        || portable.axis() != link.axis
+        || portable.axis_extent() != link.axis_extent
+        || portable.index_elements() != link.index_elements
+    {
+        return Err(MetalError::InvalidBinding(
+            "host indexed movement geometry mismatch".into(),
+        ));
+    }
+    if portable.output_elements() > u32::MAX as usize {
+        return Err(MetalError::Unsupported(
+            "Metal host indexed movement output exceeds uint thread indexing".into(),
+        ));
+    }
+    let mut buffers = portable
+        .inputs()
+        .iter()
+        .map(|input| {
+            Ok(MetalBufferAbi {
+                id: input.node.index() as u64,
+                dtype: input.dtype,
+                source_shape: input.shape.clone(),
+                elements: input.shape.numel().map_err(|_| MetalError::Overflow)?,
+                mutable: false,
+                view: None,
+            })
+        })
+        .collect::<Result<Vec<_>, MetalError>>()?;
+    let schedule_inputs = buffers.clone();
+    let output_position = buffers.len();
+    buffers.push(MetalBufferAbi {
+        id: link.output,
+        dtype: DType::F32,
+        source_shape: plan.output_shape.clone(),
+        elements: portable.output_elements(),
+        mutable: true,
+        view: None,
+    });
+    let entry = match link.kind {
+        StaticHostIndexedMovementKind::Gather => "rg_metal_training_host_gather_f32_i32",
+        StaticHostIndexedMovementKind::ScatterAdd => "rg_metal_training_host_scatter_add_f32_i32",
+    }
+    .to_owned();
+    let mut lines = vec![
+        format!(
+            "// {METAL_TRAINING_HOST_INDEXED_MOVEMENT_RENDERER_VERSION} ABI {METAL_ABI_VERSION}"
+        ),
+        "#include <metal_stdlib>".into(),
+        "using namespace metal;".into(),
+        format!("kernel void {entry}("),
+    ];
+    for (position, input) in portable.inputs().iter().enumerate() {
+        lines.push(format!(
+            "    device const {}* b{position} [[buffer({position})]],",
+            metal_storage_type(input.dtype)
+        ));
+    }
+    lines.extend([
+        format!("    device float* b{output_position} [[buffer({output_position})]],"),
+        format!("    constant ulong& extent [[buffer({})]],", buffers.len()),
+        "    uint rg_gid [[thread_position_in_grid]]) {".into(),
+        "  const ulong gid = (ulong)rg_gid;".into(),
+        "  if (gid >= extent) return;".into(),
+    ]);
+    if portable.output_elements() != 0 {
+        match link.kind {
+            StaticHostIndexedMovementKind::Gather => {
+                emit_metal_trusted_gather_body(&portable, output_position, &mut lines)
+            }
+            StaticHostIndexedMovementKind::ScatterAdd => {
+                emit_metal_scatter_body(&portable, output_position, true, false, &mut lines)
+            }
+        }
+    }
+    lines.push("}".into());
+    let source = lines.join("\n") + "\n";
+    let cache_key = stable_key(&(
+        METAL_TRAINING_HOST_INDEXED_MOVEMENT_RENDERER_VERSION,
+        METAL_ABI_VERSION,
+        renderer.local_size,
+        &renderer.capabilities,
+        portable.plan(),
+        link,
+        &source,
+        &buffers,
+    ));
+    Ok(RenderedMetal {
+        source,
+        source_map: BTreeMap::new(),
+        pointer_order: (0..buffers.len()).map(MetalPointerAbi::Dense).collect(),
+        quantized_buffers: Vec::new(),
+        buffers,
+        extent: portable.output_elements(),
+        entry,
+        cache_key,
+        capabilities: renderer.capabilities.clone(),
+        transaction: None,
+        indexed_movement: None,
         append_state: None,
         schedule_inputs,
         semantic_program: Arc::new(super::dispatch::KernelSemanticProgram::UOp(Arc::new(
@@ -2386,6 +2529,7 @@ fn emit_metal_scatter_body(
     portable: &crate::movement_plan::PortableIndexedMovement<'_>,
     output_position: usize,
     add: bool,
+    check_bounds: bool,
     lines: &mut Vec<String>,
 ) {
     lines.push("  float rg_value = b0[gid];".into());
@@ -2454,16 +2598,18 @@ fn emit_metal_scatter_body(
             indexed_axis.index_divisor
         ));
         lines.push(format!("      const int rg_selected = b{index}[rg_index];"));
-        lines.push(format!(
-            "      if (rg_selected < 0 || (ulong)rg_selected >= (ulong){}ul) {{",
-            portable.axis_extent()
-        ));
-        lines.push(
-            "        atomic_fetch_min_explicit(rg_status, (uint)rg_index, memory_order_relaxed);"
-                .into(),
-        );
-        lines.push("        continue;".into());
-        lines.push("      }".into());
+        if check_bounds {
+            lines.push(format!(
+                "      if (rg_selected < 0 || (ulong)rg_selected >= (ulong){}ul) {{",
+                portable.axis_extent()
+            ));
+            lines.push(
+                "        atomic_fetch_min_explicit(rg_status, (uint)rg_index, memory_order_relaxed);"
+                    .into(),
+            );
+            lines.push("        continue;".into());
+            lines.push("      }".into());
+        }
         let update_offset = portable
             .axes()
             .iter()

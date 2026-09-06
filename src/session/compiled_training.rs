@@ -579,6 +579,7 @@ pub struct CompiledAdamWConfig {
     loss_scale: f32,
     weight_decay_exclusions: BTreeSet<String>,
     inputs: BTreeMap<String, (Shape, DType)>,
+    host_token_inputs: BTreeMap<String, Shape>,
 }
 
 impl CompiledAdamWConfig {
@@ -604,6 +605,7 @@ impl CompiledAdamWConfig {
             loss_scale: 1.0,
             weight_decay_exclusions: BTreeSet::new(),
             inputs: BTreeMap::new(),
+            host_token_inputs: BTreeMap::new(),
         })
     }
 
@@ -686,6 +688,34 @@ impl CompiledAdamWConfig {
         Ok(self)
     }
 
+    /// Declares one fixed-shape batch-one I32 token input whose exact
+    /// embedding Gather and first-order ScatterAdd VJP may be authenticated
+    /// for status-free Metal replay. The input name is declared atomically, so
+    /// it collides with [`Self::with_input`] in either call order.
+    pub fn with_host_token_input(
+        mut self,
+        name: impl Into<String>,
+        shape: impl Into<Shape>,
+    ) -> Result<Self> {
+        let name = name.into();
+        validate_user_name(&name, "input")?;
+        let shape = shape.into();
+        checked_descriptor(&shape, DType::I32)?;
+        let elements = shape.numel()?;
+        if elements == 0 || shape.dims() != [1, elements] {
+            return Err(training(
+                "compiled host token input must be nonempty batch-one I32",
+            ));
+        }
+        if self.inputs.contains_key(&name) || self.host_token_inputs.contains_key(&name) {
+            return Err(training("duplicate compiled training input name"));
+        }
+        self.inputs
+            .insert(name.clone(), (shape.clone(), DType::I32));
+        self.host_token_inputs.insert(name, shape);
+        Ok(self)
+    }
+
     pub fn beta1(&self) -> f32 {
         self.beta1
     }
@@ -723,6 +753,13 @@ impl CompiledAdamWConfig {
         self.inputs
             .iter()
             .map(|(name, (shape, dtype))| (name.as_str(), shape, *dtype))
+    }
+
+    /// Returns authenticated host-token declarations in lexical name order.
+    pub fn host_token_inputs(&self) -> impl ExactSizeIterator<Item = (&str, &Shape)> {
+        self.host_token_inputs
+            .iter()
+            .map(|(name, shape)| (name.as_str(), shape))
     }
 }
 
@@ -1424,6 +1461,7 @@ pub struct CompiledAdamWPlan {
     loss_scale: f32,
     progress: AdamWProgress,
     dropout: Option<CompiledDropoutState>,
+    host_token_inputs: BTreeMap<String, Shape>,
 }
 
 /// Resource-free AdamW plan paired with the exact module value used to build it.
@@ -1603,6 +1641,7 @@ pub struct CpuCompiledAdamW {
     loss_scale: f32,
     progress: AdamWProgress,
     dropout: Option<CompiledDropoutState>,
+    host_token_inputs: BTreeMap<String, Shape>,
 }
 
 /// Resource-free Metal rendering of one compiled AdamW plan. Preparing it
@@ -2607,6 +2646,7 @@ impl CompiledAdamWPlan {
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let max_gradient_norm = config.max_gradient_norm;
         let loss_scale = config.loss_scale;
+        let host_token_inputs = config.host_token_inputs.clone();
         let inner = CompiledTrainingPlan::compile(AdamWProgram { config }, parameters, build)?;
         let program_identity = inner.capture_identity()?;
         Ok(Self {
@@ -2617,6 +2657,7 @@ impl CompiledAdamWPlan {
             loss_scale,
             progress: AdamWProgress::INITIAL,
             dropout: None,
+            host_token_inputs,
         })
     }
 
@@ -2688,6 +2729,7 @@ impl CompiledAdamWPlan {
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let max_gradient_norm = config.max_gradient_norm;
         let loss_scale = config.loss_scale;
+        let host_token_inputs = config.host_token_inputs.clone();
         let workload = StateSpec {
             key: DROPOUT_COUNTER_KEY.into(),
             input_name: DROPOUT_COUNTER_INPUT.into(),
@@ -2722,6 +2764,7 @@ impl CompiledAdamWPlan {
             loss_scale,
             progress: AdamWProgress::INITIAL,
             dropout: Some(dropout),
+            host_token_inputs,
         })
     }
 
@@ -2940,6 +2983,7 @@ impl CompiledAdamWPlan {
             loss_scale: self.loss_scale,
             progress: self.progress,
             dropout: self.dropout,
+            host_token_inputs: self.host_token_inputs.clone(),
         })
     }
 
@@ -2965,6 +3009,9 @@ impl CompiledAdamWPlan {
     /// creating device resources.
     pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
         let recurrent = self.inner.recurrent_capture()?;
+        let recurrent = recurrent
+            .with_authenticated_host_indexed_movements(&self.host_token_inputs)
+            .map_err(captured_inference_error)?;
         let inner = MetalStatefulInferencePlan::new(recurrent.clone(), renderer.clone()).map_err(
             |error| {
                 let detail = if matches!(&error, MetalError::Unsupported(_)) {
@@ -3453,6 +3500,7 @@ impl CpuCompiledAdamW {
             loss_scale: self.loss_scale,
             progress: self.progress,
             dropout: self.dropout,
+            host_token_inputs: self.host_token_inputs.clone(),
         }
         .metal_plan(renderer)
     }
@@ -5296,6 +5344,52 @@ mod tests {
             .unwrap()
             .with_input("x", [2], DType::F32)
             .unwrap()
+    }
+
+    #[test]
+    fn compiled_adamw_host_token_input_is_atomic_sorted_and_strict() {
+        let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_host_token_input("tokens_b", [1, 3])
+            .unwrap()
+            .with_host_token_input("tokens_a", [1, 2])
+            .unwrap();
+        assert_eq!(
+            config
+                .host_token_inputs()
+                .map(|(name, shape)| (name, shape.dims()))
+                .collect::<Vec<_>>(),
+            [("tokens_a", &[1, 2][..]), ("tokens_b", &[1, 3][..])]
+        );
+        assert_eq!(
+            config
+                .inputs()
+                .map(|(name, shape, dtype)| (name, shape.dims(), dtype))
+                .collect::<Vec<_>>(),
+            [
+                ("tokens_a", &[1, 2][..], DType::I32),
+                ("tokens_b", &[1, 3][..], DType::I32),
+            ]
+        );
+
+        let base = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0).unwrap();
+        assert!(
+            base.clone()
+                .with_input("tokens", [1, 2], DType::I32)
+                .unwrap()
+                .with_host_token_input("tokens", [1, 2])
+                .is_err()
+        );
+        assert!(
+            base.clone()
+                .with_host_token_input("tokens", [1, 2])
+                .unwrap()
+                .with_input("tokens", [1, 2], DType::I32)
+                .is_err()
+        );
+        for shape in [Shape::new([1, 0]), Shape::new([2]), Shape::new([2, 2])] {
+            assert!(base.clone().with_host_token_input("tokens", shape).is_err());
+        }
     }
 
     fn build_tied_frozen(

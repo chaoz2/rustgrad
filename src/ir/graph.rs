@@ -136,6 +136,21 @@ pub(crate) struct Node {
     pub requires_grad: bool,
 }
 
+/// Graph-local proof emitted only by the exact Gather reverse rule.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct GatherVjpProvenance {
+    pub(crate) gather: NodeId,
+    pub(crate) data: NodeId,
+    pub(crate) index: NodeId,
+    pub(crate) axis: usize,
+    pub(crate) zero_base: NodeId,
+    pub(crate) update: NodeId,
+    pub(crate) scatter_add: NodeId,
+    pub(crate) data_shape: Shape,
+    pub(crate) index_shape: Shape,
+    pub(crate) gather_shape: Shape,
+}
+
 #[derive(Clone, Debug)]
 pub struct Graph {
     pub(crate) nodes: Vec<Node>,
@@ -144,6 +159,7 @@ pub struct Graph {
     pub(crate) grad_enabled: bool,
     parameter_bindings: BTreeMap<(ParameterId, u64), ParameterBinding>,
     parameter_overrides: BTreeMap<ParameterId, NodeId>,
+    pub(crate) gather_vjp_provenance: Vec<GatherVjpProvenance>,
 }
 
 /// One heterogeneous source `Tensor.sequential` transform.
@@ -2147,6 +2163,7 @@ impl Default for Graph {
             grad_enabled: true,
             parameter_bindings: BTreeMap::new(),
             parameter_overrides: BTreeMap::new(),
+            gather_vjp_provenance: Vec::new(),
         }
     }
 }
@@ -2154,6 +2171,10 @@ impl Default for Graph {
 impl Graph {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn gather_vjp_provenance(&self) -> &[GatherVjpProvenance] {
+        &self.gather_vjp_provenance
     }
 
     /// Preserves a floating probability tensor after CPU validation that every

@@ -120,7 +120,7 @@ fn config() -> Result<CompiledAdamWConfig> {
     CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)?
         .with_weight_decay_exclusions(WEIGHT_DECAY_EXCLUSIONS)?
         .with_loss_scale(128.0)?
-        .with_input("tokens", [1, TIME], DType::I32)?
+        .with_host_token_input("tokens", [1, TIME])?
         .with_input("targets", [1, TIME], DType::I32)
 }
 
@@ -146,7 +146,7 @@ fn build(
             ..LossOptions::default()
         },
     )?;
-    Ok((loss, BTreeMap::from([("logits".into(), logits)])))
+    Ok((loss, BTreeMap::new()))
 }
 
 fn compile(model: TinyCausalTransformer) -> Result<CompiledModuleAdamWPlan<TinyCausalTransformer>> {

@@ -14,9 +14,10 @@ use std::{
 use crate::runtime::static_schedule::{
     InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticAppendStateLink,
     StaticBufferAllocation, StaticCommandReport, StaticDeviceAdapter, StaticExecutionReport,
-    StaticHostGather, StaticHostOutputSelection, StaticPlanAdapter, StaticPreparedLaunch,
-    StaticQuantizedBufferPlan, StaticRendered, StaticRenderedBuffer, StaticRenderedQuantizedBuffer,
-    StaticSchedulePlan, StaticSharedResources, StaticStateLink, bind_rendered_buffers,
+    StaticHostGather, StaticHostIndexedMovement, StaticHostOutputSelection, StaticPlanAdapter,
+    StaticPreparedLaunch, StaticQuantizedBufferPlan, StaticRendered, StaticRenderedBuffer,
+    StaticRenderedQuantizedBuffer, StaticSchedulePlan, StaticSharedResources, StaticStateLink,
+    bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
@@ -27,6 +28,7 @@ struct MetalStaticAdapter {
     append_state: BTreeMap<u64, StaticAppendStateLink>,
     append_span_iota: BTreeMap<u64, StaticAppendStateLink>,
     host_gathers: BTreeMap<u64, StaticHostGather>,
+    host_indexed_movements: BTreeMap<u64, StaticHostIndexedMovement>,
 }
 
 impl MetalStaticAdapter {
@@ -39,6 +41,7 @@ impl MetalStaticAdapter {
             append_state: BTreeMap::new(),
             append_span_iota: BTreeMap::new(),
             host_gathers: BTreeMap::new(),
+            host_indexed_movements: BTreeMap::new(),
         }
     }
 
@@ -52,6 +55,7 @@ impl MetalStaticAdapter {
             append_state: BTreeMap::new(),
             append_span_iota: BTreeMap::new(),
             host_gathers: BTreeMap::new(),
+            host_indexed_movements: BTreeMap::new(),
         }
     }
 
@@ -78,6 +82,24 @@ impl MetalStaticAdapter {
             {
                 return Err(MetalError::InvalidBinding(
                     "duplicate Metal host Gather output".into(),
+                ));
+            }
+        }
+        Ok(self)
+    }
+
+    fn with_host_indexed_movements(
+        mut self,
+        links: &[StaticHostIndexedMovement],
+    ) -> Result<Self, MetalError> {
+        for link in links {
+            if self
+                .host_indexed_movements
+                .insert(link.output, link.clone())
+                .is_some()
+            {
+                return Err(MetalError::InvalidBinding(
+                    "duplicate Metal host indexed movement output".into(),
                 ));
             }
         }
@@ -128,18 +150,31 @@ impl StaticPlanAdapter for MetalStaticAdapter {
             self.append_state.get(&item.outputs.primary().id),
             self.append_span_iota.get(&item.outputs.primary().id),
             self.host_gathers.get(&item.outputs.primary().id),
+            self.host_indexed_movements.get(&item.outputs.primary().id),
         ) {
-            (Some(_), _, Some(_)) | (_, Some(_), Some(_)) | (Some(_), Some(_), _) => {
+            (Some(_), _, Some(_), _)
+            | (_, Some(_), Some(_), _)
+            | (Some(_), Some(_), _, _)
+            | (Some(_), _, _, Some(_))
+            | (_, Some(_), _, Some(_))
+            | (_, _, Some(_), Some(_)) => {
                 return Err(MetalError::InvalidBinding(
-                    "Metal item cannot mix append state, span iota, and host Gather policy".into(),
+                    "Metal item cannot mix authenticated rendering policies".into(),
                 ));
             }
-            (Some(link), None, None) => self.renderer.render_append_state(&item.kernel, link)?,
-            (None, Some(link), None) => self
+            (Some(link), None, None, None) => {
+                self.renderer.render_append_state(&item.kernel, link)?
+            }
+            (None, Some(link), None, None) => self
                 .renderer
                 .render_authenticated_append_span_iota(&item.kernel, link)?,
-            (None, None, Some(link)) => self.renderer.render_host_gather(&item.kernel, link)?,
-            (None, None, None) => self.renderer.render(&item.kernel)?,
+            (None, None, Some(link), None) => {
+                self.renderer.render_host_gather(&item.kernel, link)?
+            }
+            (None, None, None, Some(link)) => self
+                .renderer
+                .render_host_indexed_movement(&item.kernel, link)?,
+            (None, None, None, None) => self.renderer.render(&item.kernel)?,
         };
         rendered.validate_schedule_bindings(item.ordered_inputs())?;
         rendered.validate_quantized_schedule_bindings(&item.quantized_input_bindings)?;
@@ -428,10 +463,12 @@ impl MetalPrefixPlan {
         protected_outputs: &[u64],
         state_links: &[StaticStateLink],
         host_gathers: &[StaticHostGather],
+        host_indexed_movements: &[StaticHostIndexedMovement],
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
-        let adapter =
-            MetalStaticAdapter::planner(renderer.clone()).with_host_gathers(host_gathers)?;
+        let adapter = MetalStaticAdapter::planner(renderer.clone())
+            .with_host_gathers(host_gathers)?
+            .with_host_indexed_movements(host_indexed_movements)?;
         Ok(Self {
             plan: StaticSchedulePlan::build_with_output_policy(
                 &adapter,
@@ -440,6 +477,7 @@ impl MetalPrefixPlan {
                 protected_outputs,
                 state_links,
                 host_gathers,
+                host_indexed_movements,
             )?,
             renderer,
         })
@@ -451,11 +489,13 @@ impl MetalPrefixPlan {
         protected_outputs: &[u64],
         append_state_links: &[StaticAppendStateLink],
         host_gathers: &[StaticHostGather],
+        host_indexed_movements: &[StaticHostIndexedMovement],
         renderer: MetalRenderer,
     ) -> Result<Self, MetalError> {
         let adapter = MetalStaticAdapter::planner(renderer.clone())
             .with_append_state(append_state_links)?
-            .with_host_gathers(host_gathers)?;
+            .with_host_gathers(host_gathers)?
+            .with_host_indexed_movements(host_indexed_movements)?;
         Ok(Self {
             plan: StaticSchedulePlan::build_with_append_policy(
                 &adapter,
@@ -464,6 +504,7 @@ impl MetalPrefixPlan {
                 protected_outputs,
                 append_state_links,
                 host_gathers,
+                host_indexed_movements,
             )?,
             renderer,
         })
