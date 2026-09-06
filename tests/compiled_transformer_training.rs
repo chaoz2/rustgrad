@@ -21,6 +21,20 @@ use std::{env, fs::OpenOptions, io::Write, path::PathBuf};
 const VOCAB: usize = 3;
 const EMBEDDING: usize = 2;
 const TIME: usize = 3;
+const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
+    "block.ff1.1",
+    "block.ff2.1",
+    "block.key.1",
+    "block.ln1.0",
+    "block.ln1.1",
+    "block.ln2.0",
+    "block.ln2.1",
+    "block.out.1",
+    "block.query.1",
+    "block.value.1",
+    "norm.bias",
+    "norm.weight",
+];
 
 struct TinyCausalTransformer {
     tokens: Embedding,
@@ -95,7 +109,9 @@ impl Module for TinyCausalTransformer {
 }
 
 fn config() -> CompiledAdamWConfig {
-    CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+    CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)
+        .unwrap()
+        .with_weight_decay_exclusions(WEIGHT_DECAY_EXCLUSIONS)
         .unwrap()
         .with_loss_scale(128.0)
         .unwrap()
@@ -367,6 +383,33 @@ fn compiled_transformer_dropout_is_keyed_replay_varying_and_zero_grad_is_not_a_d
 #[test]
 fn compiled_transformer_plan_is_strictly_renderable_for_metal() {
     let model = TinyCausalTransformer::new(7).unwrap();
+    let policy = config();
+    assert_eq!(
+        policy.weight_decay_exclusions().collect::<Vec<_>>(),
+        WEIGHT_DECAY_EXCLUSIONS
+    );
+    let exclusions = policy
+        .weight_decay_exclusions()
+        .collect::<std::collections::BTreeSet<_>>();
+    let decayed = model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !exclusions.contains(name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        decayed,
+        vec![
+            "block.ff1.0",
+            "block.ff2.0",
+            "block.key.0",
+            "block.out.0",
+            "block.query.0",
+            "block.value.0",
+            "tokens.weight",
+        ]
+    );
     let compiled = compiled_transformer(&model);
     assert_eq!(compiled.loss_scale(), 128.0);
     assert_eq!(compiled.dropout_config(), Some(dropout_config()));
@@ -789,7 +832,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
             )
     );
 
-    let evidence = serde_json::json!({
+    let mut evidence = serde_json::json!({
         "format_version": 3,
         "workload": "tiny-causal-transformer-compiled-adamw",
         "implementation_revision": expected_sha,
@@ -837,6 +880,14 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "initial_scoreboard": initial_scoreboard,
         "resumed_scoreboard": resumed_scoreboard,
     });
+    let evidence_object = evidence
+        .as_object_mut()
+        .expect("live evidence root must remain an object");
+    evidence_object.insert("weight_decay".into(), config().weight_decay().into());
+    evidence_object.insert(
+        "weight_decay_exclusions".into(),
+        serde_json::json!(WEIGHT_DECAY_EXCLUSIONS),
+    );
     let encoded = serde_json::to_vec(&evidence).expect("live evidence JSON must serialize");
     let mut file = OpenOptions::new()
         .write(true)

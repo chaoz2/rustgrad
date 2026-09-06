@@ -100,7 +100,14 @@ attention-weight dropout. The same runtime seam now explicitly publishes its
 canonical trainable snapshot into any fresh or existing `Module` with the exact
 schema. One atomic host transaction preserves ties, frozen parameters, and
 buffers while advancing every unique published `Parameter` version once;
-publication changes no runtime progress or checkpoint state.
+publication changes no runtime progress or checkpoint state. The same
+module-bound compile traversal now validates an explicit canonical set of
+AdamW decay exclusions before graph construction. The maintained Transformer
+uses nonzero decoupled decay for embedding/projection matrices while excluding
+projection biases and LayerNorm affine state. Exclusions retain gradients,
+accumulation, clipping, moments, checkpoints, and publication on CPU and strict
+Metal; only the decay term is omitted, and mismatched policies fail checkpoint
+restoration through authenticated capture mismatch.
 
 ### 3. P1 — lower the identical training capture to Metal
 
