@@ -7,12 +7,12 @@ use rustgrad::runtime::metal::{
     MetalDeviceRunReport, MetalDiscovery, MetalRuntime, MetalScoreboardContext,
 };
 use rustgrad::{
-    Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
-    CompiledModuleAdamWPlan, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
-    CpuSessionTarget, DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Parameter,
-    Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
-    cross_entropy, load_safetensors,
+    Backend, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan,
+    CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig,
+    CompiledDropoutKey, CompiledModuleAdamWPlan, CompiledTrainingRuntime, CompiledTrainingStep,
+    CpuBackend, CpuSessionTarget, DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module,
+    NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider,
+    TransformerBlock, cross_entropy, load_safetensors,
 };
 use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "macos")]
@@ -278,6 +278,283 @@ fn sparse_causal_loss_matches_dense_reference_and_analytic_gradient() {
     }
     expected_loss /= TOKEN_COUNT as f64;
     assert!((sparse.outputs[0].scalar_at(0).as_f64() - expected_loss).abs() < 1e-5);
+}
+
+struct FixedResidualDropout {
+    masks: [TensorData; 2],
+    next: usize,
+}
+
+impl FixedResidualDropout {
+    fn new() -> Self {
+        let mask = |values: [bool; BATCH * TIME * EMBEDDING]| {
+            TensorData::from_scalars(
+                [BATCH, TIME, EMBEDDING],
+                DType::Bool,
+                values.into_iter().map(Scalar::Bool),
+            )
+            .unwrap()
+        };
+        Self {
+            masks: [
+                mask([
+                    true, false, true, true, false, true, false, true, true, false, true, false,
+                ]),
+                mask([
+                    false, true, true, false, true, true, true, true, false, true, false, true,
+                ]),
+            ],
+            next: 0,
+        }
+    }
+}
+
+impl TrainingDropoutProvider for FixedResidualDropout {
+    fn dropout(&mut self, graph: &mut Graph, input: NodeId, probability: f64) -> Result<NodeId> {
+        assert_eq!(probability.to_bits(), 0.25f64.to_bits());
+        assert_eq!(graph.dtype(input)?, DType::F32);
+        assert_eq!(graph.shape(input)?, &Shape::new([BATCH, TIME, EMBEDDING]));
+        let mask = self
+            .masks
+            .get(self.next)
+            .expect("the maintained block has exactly two residual-dropout sites")
+            .clone();
+        self.next += 1;
+        let mask = graph.constant(mask);
+        let mask = graph.contiguous(mask)?;
+        let zero = graph.zeros_with_dtype(Shape::new([]), DType::F32)?;
+        let kept = graph.select(mask, input, zero)?;
+        let denominator = graph.constant(TensorData::scalar(0.75));
+        graph.div(kept, denominator)
+    }
+}
+
+fn module_parameter_state(model: &TinyCausalTransformer) -> BTreeMap<String, (TensorData, u64)> {
+    let mut state = BTreeMap::new();
+    let mut error = None;
+    model.visit("", &mut |name, parameter, _| match parameter.snapshot() {
+        Ok(snapshot) => {
+            state.insert(name, (snapshot.data, snapshot.version));
+        }
+        Err(snapshot_error) => error = Some(snapshot_error),
+    });
+    if let Some(error) = error {
+        panic!("the maintained Transformer state must remain readable: {error}");
+    }
+    state
+}
+
+fn perturbed_parameter_bindings(
+    bindings: &HashMap<String, TensorData>,
+    input_name: &str,
+    value: &TensorData,
+    coordinate: usize,
+    delta: f64,
+) -> HashMap<String, TensorData> {
+    let mut perturbed = bindings.clone();
+    let replacement = TensorData::from_scalars(
+        value.shape().clone(),
+        value.dtype(),
+        (0..value.len()).map(|index| {
+            if index == coordinate {
+                Scalar::F(value.scalar_at(index).as_f64() + delta)
+            } else {
+                value.scalar_at(index)
+            }
+        }),
+    )
+    .unwrap();
+    assert!(perturbed.insert(input_name.into(), replacement).is_some());
+    perturbed
+}
+
+fn assert_relu_region_unchanged(base: &TensorData, perturbed: &TensorData, context: &str) {
+    assert_eq!(perturbed.shape(), base.shape());
+    for coordinate in 0..base.len() {
+        let base = base.scalar_at(coordinate).as_f64();
+        let perturbed = perturbed.scalar_at(coordinate).as_f64();
+        assert!(
+            (base > 0.0) == (perturbed > 0.0),
+            "finite difference crossed the ReLU kink at {context}[{coordinate}]: {base} -> {perturbed}"
+        );
+    }
+}
+
+#[test]
+fn maintained_causal_transformer_all_parameter_vjps_match_central_differences() {
+    const EPSILON: f64 = 1e-3;
+    const RELU_MARGIN: f64 = 0.5;
+    const ABSOLUTE_TOLERANCE: f64 = 3e-3;
+    const RELATIVE_TOLERANCE: f64 = 3e-3;
+
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    let mut traversal = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        traversal.insert(name, (parameter.id(), kind, parameter.is_trainable()));
+    });
+    assert_eq!(
+        traversal["tokens.weight"].0, traversal["lm_head.weight"].0,
+        "the output head must be the embedding Parameter"
+    );
+    assert!(!traversal["frozen_scale"].2);
+    assert!(state_before.tensors().contains_key("tokens.weight"));
+    assert!(!state_before.tensors().contains_key("lm_head.weight"));
+
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let mut dropout = FixedResidualDropout::new();
+    let logits = model.forward(&mut graph, tokens, &mut dropout).unwrap();
+    assert_eq!(dropout.next, 2);
+    let loss = sparse_causal_loss(&mut graph, logits, targets).unwrap();
+
+    let trainable = model.trainable_parameters().unwrap();
+    assert_eq!(trainable.len(), 19);
+    assert!(trainable.iter().any(|(name, _)| name == "tokens.weight"));
+    assert!(trainable.iter().all(|(name, _)| name != "lm_head.weight"));
+    assert!(trainable.iter().all(|(name, _)| name != "frozen_scale"));
+    let targets = trainable
+        .iter()
+        .map(|(_, parameter)| parameter.node(&graph).unwrap())
+        .collect::<Vec<_>>();
+    let target_input_names = targets
+        .iter()
+        .map(|target| match graph.op(*target).unwrap() {
+            Op::Input { name } => name.clone(),
+            op => panic!("bound trainable target %{target} must be an input, got {op:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targets
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        targets.len(),
+        "canonical trainable parameters must map to distinct graph leaves"
+    );
+
+    let relu_inputs = graph
+        .trace(loss)
+        .unwrap()
+        .steps
+        .into_iter()
+        .filter_map(|step| {
+            let Op::Select {
+                condition,
+                on_true,
+                on_false,
+            } = graph.op(step.node).unwrap()
+            else {
+                return None;
+            };
+            let Op::Compare {
+                op: CompareOp::Lt,
+                lhs,
+                rhs,
+            } = graph.op(*condition).unwrap()
+            else {
+                return None;
+            };
+            if lhs != on_false || rhs != on_true {
+                return None;
+            }
+            match graph.op(*lhs).unwrap() {
+                Op::Constant(zero)
+                    if zero.shape() == &Shape::new([])
+                        && zero.dtype() == graph.dtype(*rhs).unwrap()
+                        && zero.scalar_at(0).as_f64() == 0.0 =>
+                {
+                    Some(*rhs)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(relu_inputs.len(), 1);
+
+    // Deliberately keep two feed-forward lanes active and two inactive. LayerNorm
+    // bounds the two-element input, so these biases provide a wide fixed region
+    // for every parameter perturbation without mutating the module itself.
+    let ff1_bias_index = trainable
+        .iter()
+        .position(|(name, _)| name == "block.ff1.1")
+        .unwrap();
+    let mut bindings = model.input_bindings(&graph).unwrap();
+    bindings.insert(
+        target_input_names[ff1_bias_index].clone(),
+        TensorData::new([4], vec![2.0, -2.0, 1.5, -1.5]).unwrap(),
+    );
+    bindings.extend(batch(1));
+
+    // This is the same one-batched-reverse entry point used by compiled AdamW.
+    let gradients = graph.gradient_default(loss, &targets).unwrap();
+    assert_eq!(gradients.len(), trainable.len());
+    let mut analytic_outputs = Vec::with_capacity(1 + gradients.len() + relu_inputs.len());
+    analytic_outputs.push(loss);
+    analytic_outputs.extend(gradients.iter().copied());
+    analytic_outputs.extend(relu_inputs.iter().copied());
+    let analytic = CpuBackend
+        .execute_many(&graph, &analytic_outputs, &bindings)
+        .unwrap();
+    let base_relu = &analytic.outputs[1 + gradients.len()];
+    assert!(
+        base_relu
+            .to_vec_f64()
+            .into_iter()
+            .all(|value| value.abs() >= RELU_MARGIN),
+        "the finite-difference fixture must stay well away from the ReLU kink"
+    );
+
+    let finite_difference_outputs = [loss, relu_inputs[0]];
+    let analytic_gradients = &analytic.outputs[1..1 + gradients.len()];
+    let mut coordinates_checked = 0;
+    for (((name, parameter), input_name), gradient) in trainable
+        .iter()
+        .zip(&target_input_names)
+        .zip(analytic_gradients)
+    {
+        let snapshot = parameter.snapshot().unwrap();
+        let fixture = bindings.get(input_name).unwrap();
+        assert_eq!(fixture.shape(), &snapshot.shape);
+        assert_eq!(fixture.dtype(), snapshot.dtype);
+        for coordinate in 0..fixture.len() {
+            let plus_bindings =
+                perturbed_parameter_bindings(&bindings, input_name, fixture, coordinate, EPSILON);
+            let minus_bindings =
+                perturbed_parameter_bindings(&bindings, input_name, fixture, coordinate, -EPSILON);
+            let plus = CpuBackend
+                .execute_many(&graph, &finite_difference_outputs, &plus_bindings)
+                .unwrap();
+            let minus = CpuBackend
+                .execute_many(&graph, &finite_difference_outputs, &minus_bindings)
+                .unwrap();
+            assert_relu_region_unchanged(base_relu, &plus.outputs[1], &format!("{name} + epsilon"));
+            assert_relu_region_unchanged(
+                base_relu,
+                &minus.outputs[1],
+                &format!("{name} - epsilon"),
+            );
+            let numerical = (plus.outputs[0].scalar_at(0).as_f64()
+                - minus.outputs[0].scalar_at(0).as_f64())
+                / (2.0 * EPSILON);
+            let analytic = gradient.scalar_at(coordinate).as_f64();
+            assert!(analytic.is_finite() && numerical.is_finite());
+            let error = (analytic - numerical).abs();
+            let tolerance =
+                ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * analytic.abs().max(numerical.abs());
+            assert!(
+                error <= tolerance,
+                "{name}[{coordinate}] VJP mismatch: analytic={analytic}, numerical={numerical}, error={error}, tolerance={tolerance}"
+            );
+            coordinates_checked += 1;
+        }
+    }
+    assert_eq!(coordinates_checked, 64);
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
 }
 
 fn evaluate(model: &TinyCausalTransformer) -> TensorData {
