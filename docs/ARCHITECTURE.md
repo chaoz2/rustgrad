@@ -940,11 +940,15 @@ and optional restored checkpoint state before a runtime is chosen. It prepares
 independent CPU replay or a strict resource-free Metal plan directly; Metal no
 longer requires constructing a CPU training session first. `CpuCompiledAdamW`
 keeps its original constructors as compatibility delegates through this plan.
-`CompiledAdamWRuntime` and `CompiledAdamWStep` are the shared public execution
-contract implemented by both prepared sessions: one generic training loop
-observes the same capture identity, recurrent optimizer policy, step progress,
-snapshots, and checkpoint, while concrete runtimes retain their backend-specific
-diagnostics. `SessionTarget<P>` is the preparation seam: implementations retain
+`CompiledTrainingRuntime` and `CompiledTrainingStep` are the shared public
+execution contract implemented by CPU momentum-SGD, CPU AdamW, and Metal AdamW:
+one generic loop observes loss, named outputs, capture identity, replay progress,
+and parameter snapshots without selecting an optimizer or backend enum.
+`CompiledCheckpointRuntime` is the separate persistence capability;
+`CompiledAdamWRuntime` and `CompiledAdamWStep` extend those smaller contracts
+with accumulation, clipping, loss-scaling, moment, and optimizer-step
+inspection. Concrete Metal results retain their exact device reports.
+`SessionTarget<P>` is the preparation seam: implementations retain
 the plan-specific concrete session, error, and borrowed-versus-consumed
 ownership without a central backend switch. `CpuSessionTarget` prepares
 independent host runtimes, while `MetalSessionTarget` owns one explicitly

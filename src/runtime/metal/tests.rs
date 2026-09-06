@@ -639,11 +639,11 @@ use crate::{
     Backend, BinaryOp, BufferRole, CapturedAppendStateInference, CapturedInference,
     CapturedMixedBatch, CapturedReplayExecutor, CapturedSchedule, CapturedStatefulInference,
     CompareOp, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
-    CpuBackend, CpuCompiledAdamW, CpuSession, CpuSessionTarget, DType, EffectBatchStep,
-    EffectRuntime, GgmlType, Graph, IndexValue, InferenceAppendStateLink, InferenceStateLink,
-    KernelBindings, KernelBufferDesc, LaneInstruction, MetalSessionTarget, MovementKernelKind,
-    MovementValue, NodeId, Operation, QuantizedTensorData, ReduceKind, ResNet, ResNetConfig,
-    ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
+    CompiledTrainingStep, CpuBackend, CpuCompiledAdamW, CpuSession, CpuSessionTarget, DType,
+    EffectBatchStep, EffectRuntime, GgmlType, Graph, IndexValue, InferenceAppendStateLink,
+    InferenceStateLink, KernelBindings, KernelBufferDesc, LaneInstruction, MetalSessionTarget,
+    MovementKernelKind, MovementValue, NodeId, Operation, QuantizedTensorData, ReduceKind, ResNet,
+    ResNetConfig, ResNetMetalError, ResNetMetalPlan, Scalar, Shape, Slice, Storage, TensorData,
     TrainingParameterInit, TypedValue, UOp, UType, schedule,
 };
 
