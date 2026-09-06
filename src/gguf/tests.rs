@@ -1,5 +1,6 @@
 use super::*;
 use crate::{DType, Shape, Storage};
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct TensorFixture<'a> {
@@ -437,6 +438,52 @@ fn rank_two_quantized_weight_can_remain_exact_packed_storage() {
         file.materialize_f32("linear.weight").unwrap()
     );
     assert_eq!(weight, file.quantized_tensor("linear.weight").unwrap());
+}
+
+#[test]
+fn shared_quantized_ranges_preserve_value_identity_without_tensor_copies() {
+    let block = [0u8; 18];
+    let bytes = fixture(
+        3,
+        &[metadata_u32("general.alignment", 32)],
+        &[
+            TensorFixture {
+                name: "first.weight",
+                dimensions: &[32, 1],
+                kind: 2,
+                offset: 0,
+                data: &block,
+            },
+            TensorFixture {
+                name: "second.weight",
+                dimensions: &[32, 1],
+                kind: 2,
+                offset: 32,
+                data: &block,
+            },
+        ],
+        32,
+    );
+    let original_pointer = bytes.as_ptr();
+    let owner = Arc::new(bytes);
+    assert_eq!(owner.as_ptr(), original_pointer);
+    let file = read_gguf(owner.as_slice()).unwrap();
+    let first_range = file.tensor("first.weight").unwrap().raw_range();
+    let second_range = file.tensor("second.weight").unwrap().raw_range();
+    let first = file
+        .quantized_tensor_from_shared_owner("first.weight", owner.clone())
+        .unwrap();
+    let second = file
+        .quantized_tensor_from_shared_owner("second.weight", owner.clone())
+        .unwrap();
+
+    assert!(first.shares_byte_owner(&second));
+    assert_eq!(first.bytes().as_ptr(), owner[first_range].as_ptr());
+    assert_eq!(second.bytes().as_ptr(), owner[second_range].as_ptr());
+    assert_eq!(first, second);
+    let standalone = file.quantized_tensor("first.weight").unwrap();
+    assert_eq!(first, standalone);
+    assert!(!first.shares_byte_owner(&standalone));
 }
 
 #[test]

@@ -15,6 +15,7 @@ use crate::{
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     error, fmt,
+    sync::Arc,
 };
 
 const ARCHITECTURE_KEY: &str = "general.architecture";
@@ -349,6 +350,14 @@ impl LlamaModelState {
     /// rank-two projections and the embedding table retain packed GGML bytes;
     /// norms, biases, and optional RoPE auxiliaries become dense F32.
     pub fn bind(config: &LlamaModelConfig, file: &GgufFile<'_>) -> Result<Self, LlamaModelError> {
+        Self::bind_with_quantized_owner(config, file, None)
+    }
+
+    fn bind_with_quantized_owner(
+        config: &LlamaModelConfig,
+        file: &GgufFile<'_>,
+        quantized_owner: Option<Arc<Vec<u8>>>,
+    ) -> Result<Self, LlamaModelError> {
         let schema = config.schema;
         let query_width = schema.query_heads.checked_mul(schema.head_dim).ok_or(
             LlamaModelError::InvalidConfig {
@@ -486,7 +495,12 @@ impl LlamaModelState {
                         LlamaLinearWeight::Dense(file.materialize_f32(name)?)
                     }
                     GgmlLayout::Quantized { .. } => {
-                        LlamaLinearWeight::Quantized(file.quantized_tensor(name)?)
+                        LlamaLinearWeight::Quantized(match quantized_owner.as_ref() {
+                            Some(owner) => {
+                                file.quantized_tensor_from_shared_owner(name, owner.clone())?
+                            }
+                            None => file.quantized_tensor(name)?,
+                        })
                     }
                 };
                 linears.insert(name.to_owned(), weight);
@@ -663,6 +677,16 @@ impl LlamaModel {
         Ok((Self::new(config, state)?, tokenizer))
     }
 
+    pub(super) fn from_gguf_with_quantized_owner(
+        file: &GgufFile<'_>,
+        owner: Arc<Vec<u8>>,
+    ) -> Result<(Self, SimpleTokenizer), LlamaModelError> {
+        let tokenizer = SimpleTokenizer::from_gguf(file)?;
+        let config = LlamaModelConfig::from_gguf(file)?;
+        let state = LlamaModelState::bind_with_quantized_owner(&config, file, Some(owner))?;
+        Ok((Self::new(config, state)?, tokenizer))
+    }
+
     /// Returns the immutable metadata-derived configuration.
     pub fn config(&self) -> &LlamaModelConfig {
         &self.config
@@ -687,6 +711,20 @@ impl LlamaModel {
 
     pub(super) const fn model_state(&self) -> &LlamaModelState {
         &self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quantized_weights_share_one_owner(&self) -> bool {
+        let mut weights = std::iter::once(&self.state.embedding)
+            .chain(self.state.linears.values())
+            .filter_map(|weight| match weight {
+                LlamaLinearWeight::Dense(_) => None,
+                LlamaLinearWeight::Quantized(value) => Some(value),
+            });
+        let Some(first) = weights.next() else {
+            return true;
+        };
+        weights.all(|value| first.shares_byte_owner(value))
     }
 
     /// Builds an inspectable all-position full-sequence graph.

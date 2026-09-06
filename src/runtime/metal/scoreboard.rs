@@ -578,7 +578,7 @@ impl MetalSessionScoreboard {
             MetalScoreboardStatePolicy::Append => Some(0),
         };
         if session.inference_deployment_identity() != Some(self.deployment_identity)
-            || session.capture().identity != self.capture_identity
+            || session.capture_identity() != self.capture_identity
             || session.summary() != &self.plan_summary
             || session.successful_run_count() != 0
             || session.committed_state_position() != expected_position

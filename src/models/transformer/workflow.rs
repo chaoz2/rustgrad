@@ -9,7 +9,7 @@ use crate::{
     gguf::{GgufError, read_gguf},
     tokenizer::SimpleTokenizer,
 };
-use std::{error, fmt, path::Path};
+use std::{error, fmt, path::Path, sync::Arc};
 
 /// A validated local GGUF Llama model with its source-compatible tokenizer and
 /// the one checked chat-template contract. It owns no device resources and
@@ -44,11 +44,21 @@ impl LlamaPromptWorkflow {
     /// involved.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, LlamaPromptWorkflowError> {
         let path = path.as_ref();
-        let bytes = std::fs::read(path).map_err(|error| LlamaPromptWorkflowError::ReadFile {
-            path: path.display().to_string(),
-            kind: error.kind(),
-        })?;
-        Self::from_gguf_bytes(&bytes)
+        let bytes =
+            Arc::new(
+                std::fs::read(path).map_err(|error| LlamaPromptWorkflowError::ReadFile {
+                    path: path.display().to_string(),
+                    kind: error.kind(),
+                })?,
+            );
+        let file = read_gguf(bytes.as_slice())?;
+        let (model, tokenizer) = LlamaModel::from_gguf_with_quantized_owner(&file, bytes.clone())?;
+        let chat_template = LlamaChatTemplate::from_gguf(&file)?;
+        Ok(Self {
+            model,
+            tokenizer,
+            chat_template,
+        })
     }
 
     /// Runs a plain text prompt with deterministic greedy selection through

@@ -3,6 +3,29 @@ use super::{
     LlamaNativePromptWorkflowError, LlamaPromptWorkflow, LlamaPromptWorkflowError,
 };
 use crate::ItemBackend;
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+static TEST_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TestFile(PathBuf);
+
+impl Drop for TestFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn test_file(label: &str) -> TestFile {
+    let sequence = TEST_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    TestFile(std::env::temp_dir().join(format!(
+        "rustgrad-{label}-{}-{sequence}.gguf",
+        std::process::id()
+    )))
+}
 
 #[test]
 fn prompt_workflow_binds_fixture_generates_deterministically_and_fails_closed() {
@@ -36,6 +59,23 @@ fn prompt_workflow_binds_fixture_generates_deterministically_and_fails_closed() 
         LlamaPromptWorkflow::from_gguf_bytes(&unsupported),
         Err(LlamaPromptWorkflowError::Chat(_))
     ));
+}
+
+#[test]
+fn path_workflow_shares_one_file_owner_while_borrowed_bytes_remain_standalone() {
+    let bytes = super::packed_metal_workflow_bytes();
+    let borrowed = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
+    assert!(!borrowed.model().quantized_weights_share_one_owner());
+
+    let path = test_file("shared-packed-workflow");
+    fs::write(&path.0, &bytes).unwrap();
+    let owned = LlamaPromptWorkflow::from_path(&path.0).unwrap();
+    assert!(owned.model().quantized_weights_share_one_owner());
+    assert_eq!(owned.model().config(), borrowed.model().config());
+    assert_eq!(
+        owned.tokenizer().encode("a").unwrap(),
+        borrowed.tokenizer().encode("a").unwrap()
+    );
 }
 
 #[test]

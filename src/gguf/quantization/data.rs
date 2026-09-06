@@ -7,7 +7,13 @@ use super::blocks::{
     decode_q6_k_block, decode_q8_0_block,
 };
 use crate::{GgmlLayout, GgmlType, Shape, TensorData};
-use std::{fmt, sync::Arc};
+use std::{
+    cmp::Ordering,
+    fmt,
+    hash::{Hash, Hasher},
+    ops::{Deref, Range},
+    sync::Arc,
+};
 
 /// Descriptor for a read-only packed GGML buffer. It deliberately has no
 /// `DType`: block quantization is a physical encoding, not a scalar dtype.
@@ -69,11 +75,89 @@ impl QuantizedBufferDesc {
     }
 }
 
+/// One immutable byte owner plus the exact range occupied by a packed tensor.
+#[derive(Clone)]
+struct SharedByteRange {
+    owner: Arc<Vec<u8>>,
+    range: Range<usize>,
+}
+
+impl SharedByteRange {
+    fn from_vec(bytes: Vec<u8>) -> Self {
+        let range = 0..bytes.len();
+        Self {
+            owner: Arc::new(bytes),
+            range,
+        }
+    }
+
+    fn new(owner: Arc<Vec<u8>>, range: Range<usize>) -> Result<Self, QuantizedError> {
+        owner
+            .get(range.clone())
+            .ok_or(QuantizedError::InvalidGeometry)?;
+        Ok(Self { owner, range })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.owner[self.range.clone()]
+    }
+
+    #[cfg(test)]
+    fn shares_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
+    }
+
+    #[cfg(test)]
+    fn owner_count(&self) -> usize {
+        Arc::strong_count(&self.owner)
+    }
+}
+
+impl Deref for SharedByteRange {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl fmt::Debug for SharedByteRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
+impl PartialEq for SharedByteRange {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for SharedByteRange {}
+
+impl PartialOrd for SharedByteRange {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SharedByteRange {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl Hash for SharedByteRange {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
 /// Immutable exact GGML bytes plus their validated portable descriptor.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct QuantizedTensorData {
     desc: QuantizedBufferDesc,
-    bytes: Arc<[u8]>,
+    bytes: SharedByteRange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,12 +189,40 @@ impl QuantizedTensorData {
         Self::from_aligned_bytes(ggml_type, logical_shape, bytes, 1, 0)
     }
 
-    /// Validates source alignment before copying into portable byte-aligned
+    /// Validates source alignment before retaining portable byte-aligned
     /// storage. Source offsets never participate in artifact identity.
     pub fn from_aligned_bytes(
         ggml_type: GgmlType,
         logical_shape: Shape,
         bytes: Vec<u8>,
+        alignment: usize,
+        source_offset: usize,
+    ) -> Result<Self, QuantizedError> {
+        Self::from_byte_range(
+            ggml_type,
+            logical_shape,
+            SharedByteRange::from_vec(bytes),
+            alignment,
+            source_offset,
+        )
+    }
+
+    pub(crate) fn from_shared_aligned_bytes(
+        ggml_type: GgmlType,
+        logical_shape: Shape,
+        owner: Arc<Vec<u8>>,
+        range: Range<usize>,
+        alignment: usize,
+    ) -> Result<Self, QuantizedError> {
+        let source_offset = range.start;
+        let bytes = SharedByteRange::new(owner, range)?;
+        Self::from_byte_range(ggml_type, logical_shape, bytes, alignment, source_offset)
+    }
+
+    fn from_byte_range(
+        ggml_type: GgmlType,
+        logical_shape: Shape,
+        bytes: SharedByteRange,
         alignment: usize,
         source_offset: usize,
     ) -> Result<Self, QuantizedError> {
@@ -176,10 +288,7 @@ impl QuantizedTensorData {
             identity: 0,
         };
         desc.identity = identity(&desc, &bytes);
-        let value = Self {
-            desc,
-            bytes: bytes.into(),
-        };
+        let value = Self { desc, bytes };
         value.validate()?;
         Ok(value)
     }
@@ -189,7 +298,17 @@ impl QuantizedTensorData {
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_byte_owner(&self, other: &Self) -> bool {
+        self.bytes.shares_owner(&other.bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn byte_owner_count(&self) -> usize {
+        self.bytes.owner_count()
     }
 
     pub fn validate(&self) -> Result<(), QuantizedError> {
@@ -212,7 +331,7 @@ impl QuantizedTensorData {
     fn from_aligned_bytes_unchecked_identity(
         ggml_type: GgmlType,
         logical_shape: Shape,
-        bytes: Arc<[u8]>,
+        bytes: SharedByteRange,
         alignment: usize,
     ) -> Result<Self, QuantizedError> {
         if alignment == 0

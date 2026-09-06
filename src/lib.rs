@@ -198,14 +198,15 @@ pub use memory_space::{
 pub use models::transformer::{
     LLAMA_METAL_EXECUTION_SCOREBOARD_FORMAT_VERSION, LLAMA_METAL_WORKLOAD_EVIDENCE_FORMAT_VERSION,
     LlamaMetalExecutionScoreboardReport, LlamaMetalGeneration, LlamaMetalGenerationError,
-    LlamaMetalGenerationStage, LlamaMetalGreedyPlan, LlamaMetalGreedySession, LlamaMetalGreedyStep,
-    LlamaMetalGreedyStepPlan, LlamaMetalGreedyStepSession, LlamaMetalPlan, LlamaMetalPrefill,
-    LlamaMetalProgress, LlamaMetalPromptOutput, LlamaMetalScoreboardInvocation,
-    LlamaMetalScoreboardPhase, LlamaMetalScoreboardPhaseAggregate, LlamaMetalScoreboardProgram,
-    LlamaMetalSession, LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan,
-    LlamaMetalStepSession, LlamaMetalTokenCommit, LlamaMetalWorkloadEvidence,
-    LlamaMetalWorkloadEvidenceArtifact, LlamaMetalWorkloadEvidenceContext,
-    LlamaMetalWorkloadEvidenceError, LlamaMetalWorkloadPhase, LlamaPromptWorkflow, LlamaSampling,
+    LlamaMetalGenerationStage, LlamaMetalGreedyPlan, LlamaMetalGreedyPlanBuilder,
+    LlamaMetalGreedySession, LlamaMetalGreedyStep, LlamaMetalGreedyStepPlan,
+    LlamaMetalGreedyStepSession, LlamaMetalPlan, LlamaMetalPrefill, LlamaMetalProgress,
+    LlamaMetalPromptOutput, LlamaMetalScoreboardInvocation, LlamaMetalScoreboardPhase,
+    LlamaMetalScoreboardPhaseAggregate, LlamaMetalScoreboardProgram, LlamaMetalSession,
+    LlamaMetalStep, LlamaMetalStepError, LlamaMetalStepPlan, LlamaMetalStepSession,
+    LlamaMetalTokenCommit, LlamaMetalWorkloadEvidence, LlamaMetalWorkloadEvidenceArtifact,
+    LlamaMetalWorkloadEvidenceContext, LlamaMetalWorkloadEvidenceError, LlamaMetalWorkloadPhase,
+    LlamaPromptWorkflow, LlamaSampling,
 };
 pub use movement_plan::{
     MovementExecutionError, MovementKernelKind, MovementKernelPlan, MovementOperand,

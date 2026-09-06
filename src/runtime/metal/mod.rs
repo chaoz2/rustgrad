@@ -34,11 +34,13 @@ pub use scoreboard::{
     MetalScoreboardError, MetalScoreboardInput, MetalScoreboardInputKind, MetalScoreboardRun,
     MetalScoreboardStatePolicy, MetalSessionScoreboard, MetalSessionScoreboardReport,
 };
+pub(crate) use session::MetalCausalOverwriteRewindProof;
 pub(crate) use session::MetalSharedAppendSession;
 pub use session::{
     MetalAppendStateInferencePlan, MetalDevicePreparationReport, MetalDeviceRun,
     MetalDeviceRunReport, MetalDeviceSession, MetalDeviceSessionPlan, MetalDeviceSessionSummary,
-    MetalInferencePlan, MetalPlanOptions, MetalStatefulInferencePlan,
+    MetalInferencePlan, MetalPlanOptions, MetalPreparedCaptureManifest, MetalPreparedCaptureOutput,
+    MetalPreparedQuantizedIndexDomain, MetalStatefulInferencePlan,
 };
 pub use transaction::{
     GuardedIntegerOp, METAL_INDEXED_MOVEMENT_ABI_VERSION, METAL_TRANSACTION_ABI_VERSION,

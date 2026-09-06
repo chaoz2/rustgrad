@@ -2552,7 +2552,7 @@ fn llama_metal_prompt_facade_prefills_with_one_read_and_matches_cpu() {
     );
     assert_eq!(session.position(), prompt.len());
     assert_eq!(session.compiled_kernels().count(), stable_kernels);
-    assert_eq!(session.capture().identity, stable_capture);
+    assert_eq!(session.capture_identity(), stable_capture);
     assert!(!mock.calls().iter().any(|call| {
         call.starts_with("buffer_create:")
             || call.starts_with("library_compile:")
@@ -2947,6 +2947,303 @@ fn llama_metal_device_greedy_packed_matches_cpu_without_logits_download() {
     assert!(actual.reports().iter().all(|report| {
         report.output_count == 1 && report.retained_d2h_calls == 1 && report.retained_d2h_bytes == 4
     }));
+}
+
+#[test]
+fn llama_metal_device_greedy_builder_preserves_resource_free_plan_inspection() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        8,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let calls_before_plan = mock.calls();
+
+    let workflow = LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap();
+    let plan = LlamaMetalGreedyPlan::builder(workflow, &device)
+        .with_plan_options(MetalPlanOptions::new(8))
+        .with_prefill_span(NonZeroUsize::new(3).unwrap())
+        .build()
+        .unwrap();
+
+    assert_eq!(mock.calls(), calls_before_plan);
+    assert_eq!(plan.selected_device_owner_id(), device.owner_id());
+    assert_eq!(plan.prefill_span_rows().unwrap().get(), 3);
+    assert_eq!(plan.summary().fallback_count, 0);
+    assert_eq!(plan.prefill_summary().unwrap().fallback_count, 0);
+    assert!(!plan.capture().items.is_empty());
+    assert!(!plan.prefill_capture().unwrap().items.is_empty());
+    assert!(plan.rendered_items().len() > 0);
+    assert!(plan.prefill_rendered_items().unwrap().len() > 0);
+
+    let session = plan.prepare().unwrap();
+    assert_eq!(session.device_owner_id(), device.owner_id());
+    assert_eq!(session.prefill_span_rows().unwrap().get(), 3);
+    assert_eq!(session.summary().fallback_count, 0);
+    assert!(session.execution_scoreboard().is_none());
+    assert!(mock.calls().iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("library_compile:")
+            || call.starts_with("pipeline_create:")
+            || call.starts_with("queue_create:")
+    }));
+}
+
+#[test]
+fn llama_metal_device_greedy_reset_reuses_residents_and_masks_stale_kv() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        8,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let plan = LlamaMetalGreedyPlan::from_workflow_with_prefill_span(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+        NonZeroUsize::new(3).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(plan.summary().fallback_count, 0);
+    let token_identity = plan.step_deployment_identity();
+    let prefill_identity = plan.prefill_deployment_identity();
+    let mut session = plan.prepare().unwrap();
+    let owner = session.device_owner_id();
+    let preparation = session.preparation_report().clone();
+    let prefill_preparation = session.prefill_preparation_report().cloned();
+    let compiled = session
+        .compiled_kernels()
+        .map(|rendered| rendered.cache_key.clone())
+        .collect::<Vec<_>>();
+    let compiled_prefill = session
+        .compiled_prefill_kernels()
+        .unwrap()
+        .map(|rendered| rendered.cache_key.clone())
+        .collect::<Vec<_>>();
+    let allocation_baseline = device.buffer_allocation_stats();
+    let physical_buffers = mock.state.lock().unwrap().buffer_lengths.clone();
+
+    let first = session.generate_ids(&[3, 4, 5, 3, 4, 5], 1).unwrap();
+    assert!(!first.reports().is_empty());
+    assert_eq!(session.position(), 6);
+    assert_eq!(session.sequence_component_positions().0, 6);
+    assert_eq!(session.sequence_component_positions().1, Some(3));
+    let successful_before_reset = session.successful_invocation_count();
+    let stats_before_reset = device.buffer_allocation_stats();
+    mock.clear_calls();
+    session.reset_sequence().unwrap();
+    assert_eq!(session.position(), 0);
+    assert_eq!(session.sequence_component_positions(), (0, Some(0)));
+    assert_eq!(
+        session.successful_invocation_count(),
+        successful_before_reset
+    );
+    assert!(mock.calls().is_empty());
+    assert_eq!(session.device_owner_id(), owner);
+    assert_eq!(session.token_step_deployment_identity(), token_identity);
+    assert_eq!(
+        session.fixed_prefill_deployment_identity(),
+        prefill_identity
+    );
+    assert_eq!(session.preparation_report(), &preparation);
+    assert_eq!(
+        session.prefill_preparation_report(),
+        prefill_preparation.as_ref()
+    );
+    assert_eq!(
+        session
+            .compiled_kernels()
+            .map(|rendered| rendered.cache_key.clone())
+            .collect::<Vec<_>>(),
+        compiled
+    );
+    assert_eq!(
+        session
+            .compiled_prefill_kernels()
+            .unwrap()
+            .map(|rendered| rendered.cache_key.clone())
+            .collect::<Vec<_>>(),
+        compiled_prefill
+    );
+    assert_eq!(device.buffer_allocation_stats(), stats_before_reset);
+    assert_eq!(mock.state.lock().unwrap().buffer_lengths, physical_buffers);
+
+    let second = session.generate_ids(&[3, 5, 4, 3], 2).unwrap();
+    assert!(
+        second
+            .reports()
+            .iter()
+            .all(|report| !report.first_successful_run)
+    );
+    assert!(session.successful_invocation_count() > successful_before_reset);
+    let calls = mock.calls();
+    assert!(!calls.iter().any(|call| {
+        call.starts_with("buffer_create:")
+            || call.starts_with("library_compile:")
+            || call.starts_with("pipeline_create:")
+            || call.starts_with("queue_create:")
+    }));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("write:"))
+            .count(),
+        second
+            .reports()
+            .iter()
+            .map(|report| report.transient_h2d_calls + report.runtime_control_h2d_calls)
+            .sum::<usize>()
+    );
+    let stats_after_second = device.buffer_allocation_stats();
+    assert_eq!(
+        stats_after_second.current_physical_buffer_count,
+        allocation_baseline.current_physical_buffer_count
+    );
+    assert_eq!(
+        stats_after_second.current_physical_buffer_bytes,
+        allocation_baseline.current_physical_buffer_bytes
+    );
+    assert!(
+        stats_after_second.lifetime_high_water_physical_buffer_count
+            >= stats_before_reset.lifetime_high_water_physical_buffer_count
+    );
+    assert!(
+        stats_after_second.lifetime_high_water_physical_buffer_bytes
+            >= stats_before_reset.lifetime_high_water_physical_buffer_bytes
+    );
+    assert_eq!(mock.state.lock().unwrap().buffer_lengths, physical_buffers);
+
+    let fresh_mock = Arc::new(MockDispatch::default());
+    let fresh_device = test_device(fresh_mock);
+    let mut fresh = LlamaMetalGreedyPlan::from_workflow_with_prefill_span(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &fresh_device,
+        MetalPlanOptions::new(8),
+        NonZeroUsize::new(3).unwrap(),
+    )
+    .unwrap()
+    .prepare()
+    .unwrap();
+    let expected = fresh.generate_ids(&[3, 5, 4, 3], 2).unwrap();
+    assert_eq!(second.generation(), expected.generation());
+}
+
+#[test]
+fn llama_metal_sequence_reset_is_deterministic_when_fresh_partial_and_full() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        4,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let mut session = crate::models::transformer::LlamaMetalPlan::from_workflow(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+    )
+    .unwrap()
+    .prepare()
+    .unwrap();
+    let preparation = session.preparation_report().clone();
+    let allocation_baseline = device.buffer_allocation_stats();
+
+    mock.clear_calls();
+    let fresh_stats = device.buffer_allocation_stats();
+    session.reset_sequence().unwrap();
+    assert_eq!(session.position(), 0);
+    assert_eq!(session.sequence_component_positions(), (0, None));
+    assert_eq!(session.successful_invocation_count(), 0);
+    assert_eq!(device.buffer_allocation_stats(), fresh_stats);
+    assert!(mock.calls().is_empty());
+
+    session.run_token(3).unwrap();
+    let partial_successes = session.successful_invocation_count();
+    assert_eq!(session.position(), 1);
+    let partial_stats = device.buffer_allocation_stats();
+    mock.clear_calls();
+    session.reset_sequence().unwrap();
+    assert_eq!(session.position(), 0);
+    assert_eq!(session.sequence_component_positions(), (0, None));
+    assert_eq!(session.successful_invocation_count(), partial_successes);
+    assert_eq!(device.buffer_allocation_stats(), partial_stats);
+    assert!(mock.calls().is_empty());
+
+    for _ in 0..session.max_context() {
+        session.run_token(3).unwrap();
+    }
+    assert!(session.is_full());
+    let full_successes = session.successful_invocation_count();
+    let full_stats = device.buffer_allocation_stats();
+    mock.clear_calls();
+    session.reset_sequence().unwrap();
+    assert_eq!(session.position(), 0);
+    assert!(!session.is_full());
+    assert_eq!(session.sequence_component_positions(), (0, None));
+    assert_eq!(session.successful_invocation_count(), full_successes);
+    assert_eq!(session.preparation_report(), &preparation);
+    assert_eq!(device.buffer_allocation_stats(), full_stats);
+    assert_eq!(
+        full_stats.current_physical_buffer_count,
+        allocation_baseline.current_physical_buffer_count
+    );
+    assert_eq!(
+        full_stats.current_physical_buffer_bytes,
+        allocation_baseline.current_physical_buffer_bytes
+    );
+    assert!(mock.calls().is_empty());
+}
+
+#[test]
+fn llama_metal_scoreboard_bound_reset_fails_before_any_position_changes() {
+    let bytes = crate::models::transformer::model_tests::serialized_model_with_template(
+        8,
+        Some(LLAMA_SIMPLE_CHAT_TEMPLATE),
+    );
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock.clone());
+    let plan = LlamaMetalGreedyPlan::from_workflow_with_prefill_span(
+        LlamaPromptWorkflow::from_gguf_bytes(&bytes).unwrap(),
+        &device,
+        MetalPlanOptions::new(8),
+        NonZeroUsize::new(3).unwrap(),
+    )
+    .unwrap();
+    let mut session = plan
+        .prepare_with_scoreboard(
+            MetalScoreboardContext::new("reset", "test-revision", "semantic mock").unwrap(),
+        )
+        .unwrap();
+
+    mock.clear_calls();
+    assert!(matches!(
+        session.reset_sequence(),
+        Err(crate::models::transformer::LlamaMetalGenerationError::SequenceResetWithScoreboard)
+    ));
+    assert_eq!(session.position(), 0);
+    assert_eq!(session.sequence_component_positions(), (0, Some(0)));
+    assert_eq!(session.successful_invocation_count(), 0);
+    assert!(mock.calls().is_empty());
+
+    session.generate_ids(&[3, 4, 5, 6], 1).unwrap();
+    let position = session.position();
+    let component_positions = session.sequence_component_positions();
+    let successful = session.successful_invocation_count();
+    let scoreboard = session.execution_scoreboard_report().unwrap().unwrap();
+    let allocations = device.buffer_allocation_stats();
+    mock.clear_calls();
+    assert!(matches!(
+        session.reset_sequence(),
+        Err(crate::models::transformer::LlamaMetalGenerationError::SequenceResetWithScoreboard)
+    ));
+    assert_eq!(session.position(), position);
+    assert_eq!(session.sequence_component_positions(), component_positions);
+    assert_eq!(session.successful_invocation_count(), successful);
+    assert_eq!(
+        session.execution_scoreboard_report().unwrap().unwrap(),
+        scoreboard
+    );
+    assert_eq!(device.buffer_allocation_stats(), allocations);
+    assert!(mock.calls().is_empty());
 }
 
 #[test]
@@ -5365,6 +5662,147 @@ fn prepared_metal_prefix_reuses_disjoint_exact_temporary_slots() {
             .count(),
         4
     );
+}
+
+#[test]
+fn prepared_metal_session_releases_capture_payload_owners_after_upload() {
+    let failed_weight = packed_ones(GgmlType::Q4_0, 2);
+    let failed_capture = CapturedSchedule::capture_quantized_row_gather(
+        "indices",
+        NodeId::from_index(70),
+        NodeId::from_index(71),
+        NodeId::from_index(72),
+        Shape::from([1]),
+        DType::I32,
+        failed_weight.clone(),
+    )
+    .unwrap();
+    let failed_plan = MetalDeviceSessionPlan::from_capture(
+        failed_capture,
+        Vec::<String>::new(),
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(failed_weight.byte_owner_count(), 2);
+    let failed_mock = Arc::new(MockDispatch::default());
+    let failed_device = test_device(failed_mock.clone());
+    failed_mock.state.lock().unwrap().failures.write = Some("packed upload");
+    assert!(failed_plan.prepare(failed_device, BTreeMap::new()).is_err());
+    assert_eq!(failed_weight.byte_owner_count(), 1);
+
+    let weight = packed_ones(GgmlType::Q4_0, 2);
+    let weight_id = 81;
+    let capture = CapturedSchedule::capture_quantized_row_gather(
+        "indices",
+        NodeId::from_index(80),
+        NodeId::from_index(weight_id as usize),
+        NodeId::from_index(82),
+        Shape::from([1]),
+        DType::I32,
+        weight.clone(),
+    )
+    .unwrap();
+    let capture_identity = capture.identity;
+    let weight_desc = weight.descriptor().clone();
+    let plan = MetalDeviceSessionPlan::from_capture(
+        capture,
+        Vec::<String>::new(),
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(weight.byte_owner_count(), 2);
+    let mock = Arc::new(MockDispatch::default());
+    let device = test_device(mock);
+    let mut session = plan.prepare(device, BTreeMap::new()).unwrap();
+    assert_eq!(weight.byte_owner_count(), 1);
+    assert_eq!(session.capture_identity(), capture_identity);
+    assert_eq!(
+        session
+            .capture_manifest()
+            .quantized_constant_descriptors()
+            .get(&weight_id),
+        Some(&weight_desc)
+    );
+    assert_eq!(
+        session.capture_manifest().quantized_index_domains().len(),
+        1
+    );
+    let domain = &session.capture_manifest().quantized_index_domains()[0];
+    assert_eq!(domain.input_id(), 80);
+    assert_eq!(domain.input_shape(), &Shape::from([1]));
+    assert_eq!(domain.rows(), 2);
+    assert_eq!(
+        session
+            .capture_manifest()
+            .retained_constant_fallback_ids()
+            .count(),
+        0
+    );
+    let run = session
+        .run(&BTreeMap::from([(
+            "indices".into(),
+            TensorData::from_storage([1], Storage::I32(vec![1])).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(run.outputs()[0].shape(), &Shape::from([1, 32]));
+}
+
+#[test]
+fn prepared_metal_session_retains_only_requested_dense_constant_fallbacks() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2]);
+    let weight = graph.constant(TensorData::new([2], vec![2.0, 3.0]).unwrap());
+    let output = graph.add(input, weight).unwrap();
+    let captured =
+        CapturedSchedule::capture(&graph, &schedule(&graph, output).unwrap(), &[output]).unwrap();
+    let plan = MetalDeviceSessionPlan::from_capture(
+        captured,
+        Vec::<String>::new(),
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = plan.prepare(test_device(mock), BTreeMap::new()).unwrap();
+    assert_eq!(
+        session
+            .capture_manifest()
+            .retained_constant_fallback_ids()
+            .count(),
+        0
+    );
+    let run = session
+        .run(&BTreeMap::from([(
+            "input".into(),
+            TensorData::new([2], vec![5.0, 7.0]).unwrap(),
+        )]))
+        .unwrap();
+    assert_eq!(run.outputs()[0].values(), &[7.0, 10.0]);
+
+    let mut constant_graph = Graph::new();
+    let requested = constant_graph.constant(TensorData::new([2], vec![11.0, 13.0]).unwrap());
+    let captured = CapturedSchedule::capture(
+        &constant_graph,
+        &schedule(&constant_graph, requested).unwrap(),
+        &[requested],
+    )
+    .unwrap();
+    let plan = MetalDeviceSessionPlan::from_capture(
+        captured,
+        Vec::<String>::new(),
+        MetalRenderer::new(8, capabilities()).unwrap(),
+    )
+    .unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let mut session = plan.prepare(test_device(mock), BTreeMap::new()).unwrap();
+    assert_eq!(
+        session
+            .capture_manifest()
+            .retained_constant_fallback_ids()
+            .collect::<Vec<_>>(),
+        [requested.index() as u64]
+    );
+    let run = session.run(&BTreeMap::new()).unwrap();
+    assert_eq!(run.outputs()[0].values(), &[11.0, 13.0]);
 }
 
 #[test]

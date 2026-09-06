@@ -6,9 +6,9 @@ use super::{
     layer::{add_bias, permute_rope_projection, rms_norm},
 };
 use crate::runtime::metal::{
-    MetalAppendStateInferencePlan, MetalDevice, MetalDeviceRunReport, MetalDeviceSession,
-    MetalDeviceSessionSummary, MetalError, MetalRenderer, MetalScoreboardError,
-    MetalSessionScoreboard, RenderedMetal,
+    MetalAppendStateInferencePlan, MetalCausalOverwriteRewindProof, MetalDevice,
+    MetalDeviceRunReport, MetalDeviceSession, MetalDeviceSessionSummary, MetalError, MetalRenderer,
+    MetalScoreboardError, MetalSessionScoreboard, RenderedMetal,
 };
 use crate::{
     AttentionOptions, CapturedAppendStateInference, CapturedInferenceError, CapturedSchedule,
@@ -644,6 +644,16 @@ impl LlamaMetalStepSession {
             .and_then(LlamaMetalScoreboardObserver::first_error)
     }
 
+    pub(crate) fn causal_overwrite_rewind_proof(
+        &self,
+    ) -> Result<MetalCausalOverwriteRewindProof, MetalError> {
+        self.inner.causal_overwrite_rewind_proof()
+    }
+
+    pub(crate) fn rewind_sequence_position(&mut self, proof: MetalCausalOverwriteRewindProof) {
+        self.inner.rewind_causal_overwrite_position(proof);
+    }
+
     pub(crate) fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError) {
         if let Some(state) = &mut self.scoreboard {
             state.freeze(error);
@@ -792,6 +802,16 @@ impl LlamaMetalGreedyStepSession {
         self.scoreboard
             .as_ref()
             .and_then(LlamaMetalScoreboardObserver::first_error)
+    }
+
+    pub(crate) fn causal_overwrite_rewind_proof(
+        &self,
+    ) -> Result<MetalCausalOverwriteRewindProof, MetalError> {
+        self.inner.causal_overwrite_rewind_proof()
+    }
+
+    pub(crate) fn rewind_sequence_position(&mut self, proof: MetalCausalOverwriteRewindProof) {
+        self.inner.rewind_causal_overwrite_position(proof);
     }
 
     pub(crate) fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError) {
@@ -1136,6 +1156,9 @@ fn build_prefill_graph(
     let absolute_positions = nodes[ATTENTION_POSITIONS];
     let absolute_positions = graph.reshape(absolute_positions, [1, 1, 1, config.max_context()])?;
     let query_positions = graph.reshape(positions, [1, 1, rows, 1])?;
+    // This exact absolute-position <= query-position mask is one half of the
+    // typed sequence-rewind contract. Rows after a rewound sequence's current
+    // query remain unobservable even though their old bytes stay allocated.
     let attention_mask = graph.le(absolute_positions, query_positions)?;
 
     let cache_shape = Shape::new([
@@ -1285,6 +1308,8 @@ fn build_step_graph(model: &LlamaModel) -> Result<BuiltStepGraph, LlamaMetalStep
     let positions = nodes[ATTENTION_POSITIONS];
     let positions = graph.reshape(positions, [1, 1, 1, config.max_context()])?;
     let position_mask = graph.reshape(position, [1, 1, 1, 1])?;
+    // Sequence rewind depends on this exact causal mask together with each
+    // layer's Scatter below occurring before that layer reads K/V for attention.
     let attention_mask = graph.le(positions, position_mask)?;
 
     let cache_shape = Shape::new([
@@ -1538,6 +1563,8 @@ fn append_cache_row(
     index: NodeId,
     value: NodeId,
 ) -> Result<(NodeId, NodeId), Error> {
+    // The returned Scatter value is the one consumed by attention, so a
+    // rewound sequence overwrites its newly visible row before any K/V read.
     let update = graph.contiguous(value)?;
     let output = graph.scatter(state, index, update, 2)?;
     Ok((update, output))
@@ -1697,6 +1724,8 @@ impl PrefillLayerBuildContext<'_> {
         let append_index = append_index
             .map(Ok)
             .unwrap_or_else(|| fixed_span_append_index(graph, position, key_update, 2))?;
+        // Overwrite every newly visible current row before attention can read
+        // it; the causal mask keeps all stale later rows unobservable.
         let key = graph.scatter(past_key, append_index, key_update, 2)?;
         let value_update = graph.contiguous(value)?;
         let value = graph.scatter(past_value, append_index, value_update, 2)?;
