@@ -23,9 +23,10 @@ use crate::{
     CapturedSchedule, ExecutionPlanSummary, ReplayInput,
     runtime::metal::{
         MetalDevice, MetalDeviceInfo, MetalDevicePreparationReport, MetalDeviceRunReport,
-        MetalDeviceSessionSummary, MetalPlanOptions, MetalPreparedCaptureManifest,
+        MetalDeviceSessionSummary, MetalError, MetalPlanOptions, MetalPreparedCaptureManifest,
         MetalScoreboardContext, MetalScoreboardError, MetalSessionScoreboard, RenderedMetal,
     },
+    session::{MetalSessionTarget, SessionTarget},
     tokenizer::SimpleTokenizer,
 };
 use std::num::NonZeroUsize;
@@ -115,6 +116,16 @@ impl LlamaMetalGreedyPlanBuilder {
 }
 
 impl LlamaMetalGreedyPlan {
+    /// Starts a builder through one typed target so planning and preparation
+    /// share its selected device and renderer controls.
+    pub fn builder_on(
+        workflow: LlamaPromptWorkflow,
+        target: &MetalSessionTarget,
+    ) -> LlamaMetalGreedyPlanBuilder {
+        LlamaMetalGreedyPlanBuilder::new(workflow, target.device())
+            .with_plan_options(target.plan_options())
+    }
+
     /// Starts a zero-fallback greedy deployment for one validated workflow and
     /// explicitly selected device. Building retains the resource-free plan
     /// inspection boundary before either preparation mode creates resources.
@@ -362,6 +373,21 @@ impl LlamaMetalGreedyPlan {
             tokenizer: self.tokenizer,
             chat_template: self.chat_template,
         })
+    }
+}
+
+impl SessionTarget<LlamaMetalGreedyPlan> for MetalSessionTarget {
+    type Session = LlamaMetalGreedySession;
+    type Error = LlamaMetalGenerationError;
+
+    fn prepare(&self, plan: LlamaMetalGreedyPlan) -> Result<Self::Session, Self::Error> {
+        if plan.selected_device_owner_id() != self.device().owner_id() {
+            return Err(LlamaMetalStepError::Metal(MetalError::OwnerMismatch).into());
+        }
+        match self.scoreboard_context() {
+            Some(context) => plan.prepare_with_scoreboard(context.clone()),
+            None => plan.prepare(),
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 //! Graph-free CPU replay for static training programs with recurrent state.
 
+use super::target::{CpuSessionTarget, MetalSessionTarget, SessionTarget};
 use crate::nn::StateKind;
 use crate::runtime::metal::{
     MetalDevice, MetalDeviceRunReport, MetalDeviceSession, MetalDeviceSessionSummary, MetalError,
@@ -1845,6 +1846,24 @@ impl CompiledAdamWPlan {
         })
     }
 
+    /// Prepares this authenticated plan through a concrete session target.
+    ///
+    /// The target's associated session and error keep backend-specific
+    /// diagnostics statically available without a runtime backend enum or CPU
+    /// fallback.
+    pub fn prepare<'a, T>(
+        &'a self,
+        target: &T,
+    ) -> std::result::Result<
+        <T as SessionTarget<&'a Self>>::Session,
+        <T as SessionTarget<&'a Self>>::Error,
+    >
+    where
+        T: SessionTarget<&'a Self>,
+    {
+        target.prepare(self)
+    }
+
     /// Renders the compiled program for strict Metal admission without
     /// creating device resources.
     pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
@@ -2191,6 +2210,30 @@ fn adamw_step_result(
         optimizer_step,
         accumulation_index,
     })
+}
+
+impl<'a> SessionTarget<&'a CompiledAdamWPlan> for CpuSessionTarget {
+    type Session = CpuCompiledAdamW;
+    type Error = Error;
+
+    fn prepare(&self, plan: &'a CompiledAdamWPlan) -> Result<Self::Session> {
+        plan.prepare_cpu()
+    }
+}
+
+impl<'a> SessionTarget<&'a CompiledAdamWPlan> for MetalSessionTarget {
+    type Session = MetalCompiledAdamW;
+    type Error = Error;
+
+    fn prepare(&self, plan: &'a CompiledAdamWPlan) -> Result<Self::Session> {
+        let rendered = plan.metal_plan(self.renderer().clone())?;
+        match self.scoreboard_context() {
+            Some(context) => {
+                rendered.prepare_with_scoreboard(self.device().clone(), context.clone())
+            }
+            None => rendered.prepare(self.device().clone()),
+        }
+    }
 }
 
 impl MetalCompiledAdamWPlan {

@@ -92,21 +92,17 @@ of using CPU fallback.
 
 ```rust,no_run
 use rustgrad::nn::{ResNet, ResNetConfig, ResNetMetalPlan};
-use rustgrad::runtime::metal::{MetalPlanOptions, MetalRuntime};
-use rustgrad::TensorData;
+use rustgrad::runtime::metal::MetalRuntime;
+use rustgrad::{MetalSessionTarget, TensorData};
 
 let device = MetalRuntime::load()?.device(0)?;
+let target = MetalSessionTarget::new(device, 64)?;
 let model = ResNet::new_static(ResNetConfig::default(), 7)?;
-let plan = ResNetMetalPlan::eval_f32(
-    &model,
-    &device,
-    [1, 3, 224, 224],
-    MetalPlanOptions::default(),
-)?;
+let plan = ResNetMetalPlan::eval_f32_on(&model, &target, [1, 3, 224, 224])?;
 assert_eq!(plan.summary().fallback_count, 0);
 println!("kernels: {}", plan.rendered_items().count());
 
-let mut session = plan.prepare()?;
+let mut session = target.prepare(plan)?;
 let image = TensorData::zeros([1, 3, 224, 224])?;
 let first = session.run(image.clone())?;
 let second = session.run(image)?;
@@ -133,21 +129,21 @@ initial read remains ordinary owned file I/O; this is not an mmap claim.
 ```rust,no_run
 use std::num::NonZeroUsize;
 
-use rustgrad::{LlamaMetalGreedyPlan, LlamaPromptWorkflow};
-use rustgrad::runtime::metal::{MetalPlanOptions, MetalRuntime};
+use rustgrad::{LlamaMetalGreedyPlan, LlamaPromptWorkflow, MetalSessionTarget};
+use rustgrad::runtime::metal::MetalRuntime;
 
 let device = MetalRuntime::load()?.device(0)?;
+let target = MetalSessionTarget::new(device, 64)?;
 let workflow = LlamaPromptWorkflow::from_path("model.gguf")?;
-let plan = LlamaMetalGreedyPlan::builder(workflow, &device)
-    .with_plan_options(MetalPlanOptions::default())
+let plan = LlamaMetalGreedyPlan::builder_on(workflow, &target)
     .with_prefill_span(NonZeroUsize::new(8).unwrap())
     .build()?;
 
 // Capture, rendering, schemas, selected device, and zero-fallback facts are
 // inspectable before prepare creates resources or uploads the model.
 assert_eq!(plan.summary().fallback_count, 0);
-assert_eq!(plan.selected_device_owner_id(), device.owner_id());
-let mut session = plan.prepare()?;
+assert_eq!(plan.selected_device_owner_id(), target.device().owner_id());
+let mut session = target.prepare(plan)?;
 let output = session.generate_text("Hello", 32)?;
 println!("{}", output.generation().decoded());
 session.reset_sequence()?;

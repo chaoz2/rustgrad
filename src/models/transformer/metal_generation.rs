@@ -21,6 +21,7 @@ use crate::{
         MetalScoreboardError, MetalScoreboardObserver, MetalSessionScoreboard,
         MetalSharedAppendSession, RenderedMetal,
     },
+    session::{MetalSessionTarget, SessionTarget},
     tokenizer::{SimpleTokenizer, TokenizerError},
 };
 use std::{collections::BTreeMap, error, fmt, num::NonZeroUsize};
@@ -270,6 +271,30 @@ impl From<LlamaChatError> for LlamaMetalGenerationError {
 }
 
 impl LlamaMetalPlan {
+    /// Builds the token-step deployment through one typed target so planning
+    /// and preparation share its selected device and renderer controls.
+    pub fn from_workflow_on(
+        workflow: LlamaPromptWorkflow,
+        target: &MetalSessionTarget,
+    ) -> Result<Self, LlamaMetalGenerationError> {
+        Self::from_workflow(workflow, target.device(), target.plan_options())
+    }
+
+    /// Builds token-step and fixed-span prefill deployments through one typed
+    /// target.
+    pub fn from_workflow_with_prefill_span_on(
+        workflow: LlamaPromptWorkflow,
+        target: &MetalSessionTarget,
+        span_rows: NonZeroUsize,
+    ) -> Result<Self, LlamaMetalGenerationError> {
+        Self::from_workflow_with_prefill_span(
+            workflow,
+            target.device(),
+            target.plan_options(),
+            span_rows,
+        )
+    }
+
     /// Consumes one GGUF-bound workflow into an inspectable resource-free plan
     /// for the explicitly selected Metal device.
     pub fn from_workflow(
@@ -671,6 +696,21 @@ impl LlamaMetalProgress {
     /// Returns the device position retained after failure.
     pub const fn committed_position(&self) -> usize {
         self.committed_position
+    }
+}
+
+impl SessionTarget<LlamaMetalPlan> for MetalSessionTarget {
+    type Session = LlamaMetalSession;
+    type Error = LlamaMetalGenerationError;
+
+    fn prepare(&self, plan: LlamaMetalPlan) -> Result<Self::Session, Self::Error> {
+        if plan.selected_device_owner_id() != self.device().owner_id() {
+            return Err(LlamaMetalStepError::Metal(MetalError::OwnerMismatch).into());
+        }
+        match self.scoreboard_context() {
+            Some(context) => plan.prepare_with_scoreboard(context.clone()),
+            None => plan.prepare(),
+        }
     }
 }
 

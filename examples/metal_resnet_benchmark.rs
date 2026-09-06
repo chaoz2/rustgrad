@@ -2,12 +2,12 @@
 
 use rustgrad::nn::{ResNet, ResNetConfig, ResNetMetalPlan};
 use rustgrad::runtime::metal::{
-    MetalDiscovery, MetalPlanOptions, MetalRuntime, MetalScoreboardContext, MetalSessionScoreboard,
+    MetalDiscovery, MetalRuntime, MetalScoreboardContext, MetalSessionScoreboard,
 };
 use rustgrad::{
     Backend, BenchmarkFramework, BenchmarkImplementation, BenchmarkObservation, BenchmarkWorkload,
-    CpuBackend, DType, MetalDeviceBufferMeasurement, Module, RUSTGRAD_METAL_RESNET18_WORKLOAD,
-    Storage, TensorData,
+    CpuBackend, DType, MetalDeviceBufferMeasurement, MetalSessionTarget, Module,
+    RUSTGRAD_METAL_RESNET18_WORKLOAD, Storage, TensorData,
 };
 use std::{
     env,
@@ -50,9 +50,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let device_buffer_measurement = MetalDeviceBufferMeasurement::begin(&device)?;
+    let target = MetalSessionTarget::new(device.clone(), 64)?;
     let model = ResNet::new_static(ResNetConfig::default(), 19)?;
-    let plan =
-        ResNetMetalPlan::eval_f32(&model, &device, [1, 3, 224, 224], MetalPlanOptions::new(64))?;
+    let plan = ResNetMetalPlan::eval_f32_on(&model, &target, [1, 3, 224, 224])?;
     let image = benchmark_image()?;
     let mut oracle_bindings = model.input_bindings(plan.graph())?;
     oracle_bindings.insert("image".into(), image.clone());
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !cache.is_empty() {
         return Err(io::Error::other("new benchmark device cache is not empty").into());
     }
-    let mut session = plan.prepare()?;
+    let mut session = target.prepare(plan)?;
     scoreboard.bind(session.metal_session())?;
     for _ in 0..evidence.runs {
         let run = session.run(image.clone())?;

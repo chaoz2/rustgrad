@@ -1,18 +1,19 @@
-//! Backend selection for resource-free compiled session plans.
+//! Typed runtime selection for resource-free session plans.
 
-use super::{CompiledAdamWPlan, CpuCompiledAdamW, MetalCompiledAdamW};
-use crate::Result;
-use crate::runtime::metal::{MetalDevice, MetalError, MetalRenderer, MetalScoreboardContext};
+use crate::runtime::metal::{
+    MetalDevice, MetalError, MetalPlanOptions, MetalRenderer, MetalScoreboardContext,
+};
 
-/// A concrete preparation target for one resource-free compiled plan.
+/// A concrete preparation target for one resource-free session plan.
 ///
-/// The plan type determines the prepared session type through this trait's
-/// associated type. Adding a backend therefore requires an implementation,
-/// not another central dispatcher branch.
-pub trait CompiledSessionTarget<P> {
+/// Both the prepared session and its error remain plan-specific. Adding a
+/// model or backend therefore requires an implementation in the owning module,
+/// not another central dispatcher branch or a lowest-common-denominator enum.
+pub trait SessionTarget<P> {
     type Session;
+    type Error;
 
-    fn prepare(&self, plan: &P) -> Result<Self::Session>;
+    fn prepare(&self, plan: P) -> std::result::Result<Self::Session, Self::Error>;
 }
 
 /// Graph-free CPU replay target for compiled training plans.
@@ -23,14 +24,26 @@ impl CpuSessionTarget {
     pub const fn new() -> Self {
         Self
     }
+
+    /// Prepares a plan implemented for the CPU target.
+    pub fn prepare<P>(
+        &self,
+        plan: P,
+    ) -> std::result::Result<<Self as SessionTarget<P>>::Session, <Self as SessionTarget<P>>::Error>
+    where
+        Self: SessionTarget<P>,
+    {
+        <Self as SessionTarget<P>>::prepare(self, plan)
+    }
 }
 
-/// Strict persistent Metal target for compiled training plans.
+/// Strict persistent Metal target for compiled training and inference plans.
 ///
 /// Construction derives the renderer from the selected device, so capability
 /// identity cannot drift between rendering and resource preparation. The
-/// target is reusable: each preparation creates an independent device session
-/// from the same authenticated compiled plan.
+/// Target implementations decide whether a plan is reusable by reference or
+/// consumed into its device resources. The optional scoreboard is bound before
+/// resources are exposed by every supported plan.
 #[derive(Clone)]
 pub struct MetalSessionTarget {
     device: MetalDevice,
@@ -65,46 +78,31 @@ impl MetalSessionTarget {
     pub fn scoreboard_context(&self) -> Option<&MetalScoreboardContext> {
         self.scoreboard.as_ref()
     }
-}
 
-impl CompiledSessionTarget<CompiledAdamWPlan> for CpuSessionTarget {
-    type Session = CpuCompiledAdamW;
-
-    fn prepare(&self, plan: &CompiledAdamWPlan) -> Result<Self::Session> {
-        plan.prepare_cpu()
+    /// Returns the planning controls already authenticated by this target.
+    pub const fn plan_options(&self) -> MetalPlanOptions {
+        MetalPlanOptions::new(self.renderer.local_size)
     }
-}
 
-impl CompiledSessionTarget<CompiledAdamWPlan> for MetalSessionTarget {
-    type Session = MetalCompiledAdamW;
-
-    fn prepare(&self, plan: &CompiledAdamWPlan) -> Result<Self::Session> {
-        let rendered = plan.metal_plan(self.renderer.clone())?;
-        match &self.scoreboard {
-            Some(context) => rendered.prepare_with_scoreboard(self.device.clone(), context.clone()),
-            None => rendered.prepare(self.device.clone()),
-        }
-    }
-}
-
-impl CompiledAdamWPlan {
-    /// Prepares this authenticated plan through a concrete target.
-    ///
-    /// The target's associated session keeps backend-specific reports and
-    /// controls statically available without a runtime backend enum or CPU
-    /// fallback.
-    pub fn prepare<T>(&self, target: &T) -> Result<T::Session>
+    /// Prepares a plan implemented for this exact Metal target.
+    pub fn prepare<P>(
+        &self,
+        plan: P,
+    ) -> std::result::Result<<Self as SessionTarget<P>>::Session, <Self as SessionTarget<P>>::Error>
     where
-        T: CompiledSessionTarget<Self>,
+        Self: SessionTarget<P>,
     {
-        target.prepare(self)
+        <Self as SessionTarget<P>>::prepare(self, plan)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CompiledAdamWConfig, DType, Scalar, Shape, TensorData, TrainingParameterInit};
+    use crate::{
+        CompiledAdamWConfig, CompiledAdamWPlan, DType, Scalar, Shape, TensorData,
+        TrainingParameterInit,
+    };
     use std::collections::BTreeMap;
 
     fn scalar_plan() -> CompiledAdamWPlan {
@@ -125,8 +123,8 @@ mod tests {
     fn cpu_target_prepares_independent_sessions_from_one_plan() {
         let plan = scalar_plan();
         let target = CpuSessionTarget::new();
-        let first = plan.prepare(&target).unwrap();
-        let second = plan.prepare(&target).unwrap();
+        let first = target.prepare(&plan).unwrap();
+        let second = target.prepare(&plan).unwrap();
 
         assert_eq!(first.capture_identity(), plan.capture_identity());
         assert_eq!(second.capture_identity(), plan.capture_identity());

@@ -944,12 +944,16 @@ keeps its original constructors as compatibility delegates through this plan.
 contract implemented by both prepared sessions: one generic training loop
 observes the same capture identity, recurrent optimizer policy, step progress,
 snapshots, and checkpoint, while concrete runtimes retain their backend-specific
-diagnostics. `CompiledSessionTarget<P>` is the preparation seam: implementations
-select the associated concrete session without a central backend switch.
-`CpuSessionTarget` prepares independent host runtimes, while
-`MetalSessionTarget` owns one explicitly selected device, derives its renderer
-from that device's capabilities, and optionally binds the existing scoreboard
-before resources are created. This keeps backend selection out of graph
+diagnostics. `SessionTarget<P>` is the preparation seam: implementations retain
+the plan-specific concrete session, error, and borrowed-versus-consumed
+ownership without a central backend switch. `CpuSessionTarget` prepares
+independent host runtimes, while `MetalSessionTarget` owns one explicitly
+selected device, derives its renderer from that device's capabilities, and
+optionally binds the existing scoreboard before resources are created. The same
+Metal target now prepares compiled AdamW by reference and consumes typed ResNet,
+host-logits Llama, or device-greedy Llama plans into persistent sessions. Plan
+implementations remain beside their owning training or model facade rather than
+accumulating in the target module. This keeps backend selection out of graph
 construction, optimizer, and persistence logic without introducing a dispatcher
 enum or hiding device evidence. Mixed-precision and dynamic-shape training remain
 outside the contract.
@@ -2590,7 +2594,11 @@ the graph, capture, logical memory plan, resident/transient schemas, rendered
 MSL, and deterministic session summary. `ResNetMetalSession::run` accepts only
 the authenticated image descriptor before driver work and returns detached
 typed logits with the underlying committed run report; it adds no CPU path or
-fallback policy.
+fallback policy. `eval_f32_on` derives both planning inputs from one
+`MetalSessionTarget`; target preparation consumes the plan, verifies its device
+owner, and can bind the same fail-soft scoreboard before resources. Successful
+runs extend only that observed prefix, while a recording failure leaves logits
+and the underlying device commit unchanged.
 
 `CapturedStatefulInference` adds an authenticated fixed-shape recurrent
 sidecar without changing captured schedule bytes. Each `InferenceStateLink`
@@ -2790,7 +2798,11 @@ captured dense-or-packed model, `SimpleTokenizer`, and checked
 the explicitly selected `MetalDevice`, exposes capture/schedule/schemas/MSL and
 resource facts, and prepares without another device argument. Its
 `step_deployment_identity` names only the captured compute deployment; it does
-not claim to identify tokenizer or chat policy. The prepared
+not claim to identify tokenizer or chat policy. `from_workflow_on` and its
+fixed-span counterpart bind planning to one `MetalSessionTarget`; target
+preparation verifies the selected owner and selects ordinary versus
+scoreboard-bound preparation without erasing the concrete Llama session or
+error. The prepared
 `LlamaMetalSession` retains no host model or dense weight object. It prevalidates
 the complete prompt, context bound, token range, and explicit sampling tape
 before the first driver call. Sequential prefill executes `commit_token` for
@@ -2805,6 +2817,9 @@ all source-compatible validation but no Metal work.
 prompt-to-tokens/text/chat facade for deterministic greedy selection without a
 host logits transfer. `LlamaMetalGreedyPlan::builder` returns a typed
 `LlamaMetalGreedyPlanBuilder` bound to one explicitly selected device.
+`builder_on` binds that same builder to one `MetalSessionTarget`, including its
+renderer controls, so the inspected plan and prepared runtime cannot silently
+select different policies.
 The builder defaults the renderer policy, accepts an optional nonzero fixed
 prefill span, and produces the same inspectable resource-free plan as the
 explicit constructors. It deliberately stops at the plan boundary: callers
