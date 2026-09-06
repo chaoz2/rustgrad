@@ -1174,6 +1174,75 @@ fn host_token_declarations() -> BTreeMap<String, Shape> {
     BTreeMap::from([("tokens".into(), Shape::new([2, 3]))])
 }
 
+fn compiled_host_token_and_target_config(authenticate_targets: bool) -> CompiledAdamWConfig {
+    let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_host_token_input("tokens", [2, 3])
+        .unwrap();
+    if authenticate_targets {
+        config.with_host_token_input("targets", [2, 3]).unwrap()
+    } else {
+        config.with_input("targets", [2, 3], DType::I32).unwrap()
+    }
+}
+
+fn build_host_token_and_target_loss(
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    parameters: &BTreeMap<String, NodeId>,
+) -> crate::Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let token_rows = graph.reshape(inputs["tokens"], [6, 1])?;
+    let token_indices = graph.expand(token_rows, [6, 2])?;
+    let embeddings = graph.gather(parameters["table"], token_indices, 0)?;
+    let target_indices = graph.reshape(inputs["targets"], [6, 1])?;
+    let selected = graph.gather(parameters["log_probabilities"], target_indices, 1)?;
+    let embedding_loss = graph.sum_all(embeddings)?;
+    let target_loss = graph.sum_all(selected)?;
+    Ok((graph.add(embedding_loss, target_loss)?, BTreeMap::new()))
+}
+
+fn compiled_host_token_and_target_plan(authenticate_targets: bool) -> CompiledAdamWPlan {
+    let parameters = [
+        TrainingParameterInit::new(
+            "log_probabilities",
+            TensorData::new(
+                [6, 4],
+                (0..24)
+                    .map(|index| index as f32 * 0.01 - 0.1)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        TrainingParameterInit::new(
+            "table",
+            TensorData::new([4, 2], vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]).unwrap(),
+        )
+        .unwrap(),
+    ];
+    CompiledAdamWPlan::compile(
+        compiled_host_token_and_target_config(authenticate_targets),
+        parameters,
+        build_host_token_and_target_loss,
+    )
+    .unwrap()
+}
+
+fn host_token_and_target_batch(targets: [i32; 6]) -> BTreeMap<String, TensorData> {
+    let matrix = |values: [i32; 6]| {
+        TensorData::from_scalars(
+            [2, 3],
+            DType::I32,
+            values.into_iter().map(|value| Scalar::I(i64::from(value))),
+        )
+        .unwrap()
+    };
+    BTreeMap::from([
+        ("targets".into(), matrix(targets)),
+        ("tokens".into(), matrix([0, 1, 2, 2, 0, 1])),
+    ])
+}
+
 #[test]
 fn host_token_authentication_rejects_compatible_independent_index_pair() {
     let mut graph = Graph::new();
@@ -1297,7 +1366,7 @@ fn compiled_host_token_indexing_is_status_free_prevalidated_and_retryable() {
         unused
             .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
             .is_err(),
-        "a declared token schema without the exact embedding owner pair must reject"
+        "a declared token schema without one exact indexed owner pair must reject"
     );
 
     let ordinary = compiled_host_token_adamw_plan(false);
@@ -1573,6 +1642,138 @@ fn compiled_host_token_indexing_is_status_free_prevalidated_and_retryable() {
             .all(|call| !call.starts_with("read:"))
     );
     assert!(suppressed_calls.iter().all(|call| !call.contains("status")));
+}
+
+#[test]
+fn compiled_host_targets_are_independently_prevalidated_and_resume_exactly() {
+    let ordinary = compiled_host_token_and_target_plan(false);
+    let authenticated = compiled_host_token_and_target_plan(true);
+    assert_eq!(
+        ordinary.capture_identity(),
+        authenticated.capture_identity()
+    );
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let ordinary_plan = ordinary.metal_plan(renderer.clone()).unwrap();
+    let plan = authenticated.metal_plan(renderer).unwrap();
+    assert_ne!(
+        ordinary_plan.deployment_identity(),
+        plan.deployment_identity()
+    );
+    assert_eq!(
+        ordinary_plan
+            .rendered_items()
+            .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
+            .count(),
+        2
+    );
+    assert!(
+        ordinary_plan
+            .rendered_items()
+            .filter(|item| item.indexed_movement().is_some())
+            .count()
+            >= 2
+    );
+    let authenticated_movements = plan
+        .rendered_items()
+        .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
+        .collect::<Vec<_>>();
+    assert_eq!(authenticated_movements.len(), 4);
+    assert!(authenticated_movements.iter().all(|item| {
+        item.transaction.is_none()
+            && item.indexed_movement().is_none()
+            && !item.source.contains("rg_status")
+    }));
+    assert!(
+        plan.rendered_items()
+            .all(|item| item.transaction.is_none() && item.indexed_movement().is_none())
+    );
+
+    let mock = Arc::new(MockDispatch::default());
+    let context = MetalScoreboardContext::new(
+        "compiled-host-token-target",
+        "test-revision",
+        "semantic mock",
+    )
+    .unwrap();
+    let mut metal = plan
+        .prepare_with_scoreboard(test_device(mock.clone()), context)
+        .unwrap();
+    mock.clear_calls();
+    let initial_checkpoint = metal.checkpoint().unwrap();
+    let initial_scoreboard = metal.execution_scoreboard_report().unwrap();
+    mock.clear_calls();
+    for position in 0..6 {
+        for invalid in [-1, 4] {
+            let mut targets = [0, 1, 2, 3, 2, 1];
+            targets[position] = invalid;
+            let error = match metal.step(
+                host_token_and_target_batch(targets),
+                TensorData::scalar(0.01),
+            ) {
+                Ok(_) => panic!("invalid target must reject before Metal driver work"),
+                Err(error) => error,
+            };
+            let detail = format!("{error:?}");
+            assert!(detail.contains("IndexOutOfBounds"));
+            assert!(detail.contains(&format!("index: {position}")));
+            assert!(detail.contains(&format!("value: {invalid}")));
+            assert!(detail.contains("dim: 4"));
+            assert!(mock.calls().is_empty());
+            assert_eq!(metal.step_count(), 0);
+            assert_eq!(metal.optimizer_step().unwrap(), 0);
+            assert_eq!(metal.accumulation_index().unwrap(), 0);
+            assert_eq!(metal.metal_session().successful_run_count(), 0);
+            assert!(!metal.metal_session().state_epoch());
+            assert_eq!(metal.checkpoint().unwrap(), initial_checkpoint);
+            assert_eq!(
+                metal.execution_scoreboard_report().unwrap(),
+                initial_scoreboard
+            );
+            mock.clear_calls();
+        }
+    }
+
+    let mut cpu = authenticated.prepare_cpu().unwrap();
+    let first_batch = host_token_and_target_batch([0, 1, 2, 3, 2, 1]);
+    let expected = cpu
+        .step(first_batch.clone(), TensorData::scalar(0.01))
+        .unwrap();
+    let actual = metal.step(first_batch, TensorData::scalar(0.01)).unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+    assert_eq!(actual.report().command_submission_count, 1);
+    assert_eq!(actual.report().command_wait_count, 1);
+    assert!(mock.calls().iter().all(|call| !call.contains("status")));
+
+    let checkpoint = metal.checkpoint().unwrap();
+    let restored = CompiledAdamWPlan::compile_from_checkpoint(
+        compiled_host_token_and_target_config(true),
+        &checkpoint,
+        build_host_token_and_target_loss,
+    )
+    .unwrap();
+    assert_eq!(
+        restored.capture_identity(),
+        authenticated.capture_identity()
+    );
+    assert_eq!(restored.step_count(), 1);
+    let mut resumed = restored
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap()
+        .prepare(test_device(Arc::new(MockDispatch::default())))
+        .unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+    let second_batch = host_token_and_target_batch([3, 2, 1, 0, 1, 2]);
+    let expected = metal
+        .step(second_batch.clone(), TensorData::scalar(0.01))
+        .unwrap();
+    let actual = resumed
+        .step(second_batch, TensorData::scalar(0.01))
+        .unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(resumed.checkpoint().unwrap(), metal.checkpoint().unwrap());
 }
 
 fn compiled_decay_exclusion_adamw_plan(exclude_bias: bool) -> CompiledAdamWPlan {

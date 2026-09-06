@@ -13,7 +13,7 @@ use rustgrad::{
     LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Parameter, Reduction, Result, Scalar,
     Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(target_os = "macos")]
 use std::{env, fs::OpenOptions, io::Write, path::PathBuf};
 
@@ -118,8 +118,18 @@ fn config() -> CompiledAdamWConfig {
         .unwrap()
         .with_host_token_input("tokens", [BATCH, TIME])
         .unwrap()
-        .with_input("targets", [BATCH, TIME], DType::I32)
+        .with_host_token_input("targets", [BATCH, TIME])
         .unwrap()
+}
+
+fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
+    let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
+    let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
+    let target_indices = graph.reshape(targets, [TOKEN_COUNT, 1])?;
+    let selected = graph.gather(log_probabilities, target_indices, 1)?;
+    let selected = graph.reshape(selected, [TOKEN_COUNT])?;
+    let losses = graph.neg(selected)?;
+    graph.mean_default(losses)
 }
 
 fn build(
@@ -129,17 +139,7 @@ fn build(
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
     let logits = model.forward(graph, inputs["tokens"], dropout)?;
-    let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
-    let flat_targets = graph.reshape(inputs["targets"], [TOKEN_COUNT])?;
-    let loss = cross_entropy(
-        graph,
-        flat_logits,
-        flat_targets,
-        LossOptions {
-            reduction: Reduction::Mean,
-            ..LossOptions::default()
-        },
-    )?;
+    let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
     Ok((loss, BTreeMap::new()))
 }
 
@@ -164,6 +164,94 @@ fn batch() -> BTreeMap<String, TensorData> {
 
 fn learning_rate() -> TensorData {
     TensorData::scalar(0.05)
+}
+
+#[test]
+fn sparse_causal_loss_matches_dense_reference_and_analytic_gradient() {
+    let logits_values = vec![
+        2.0, 1.0, -0.5, -1.0, 0.5, 1.5, 0.25, -0.75, 1.25, 1.75, -0.25, 0.5, -0.5, 2.25, 0.75, 0.0,
+        1.0, -1.0,
+    ];
+    let target_values: [i32; 6] = [0, 2, 1, 0, 1, 2];
+    let logits = TensorData::new([BATCH, TIME, VOCAB], logits_values.clone()).unwrap();
+    let targets = TensorData::from_scalars(
+        [BATCH, TIME],
+        DType::I32,
+        target_values
+            .into_iter()
+            .map(|target| Scalar::I(i64::from(target))),
+    )
+    .unwrap();
+    let bindings = HashMap::from([
+        ("logits".into(), logits.clone()),
+        ("targets".into(), targets.clone()),
+    ]);
+
+    let mut sparse_graph = Graph::new();
+    let sparse_logits =
+        sparse_graph.input_dtype_requires_grad("logits", [BATCH, TIME, VOCAB], DType::F32, true);
+    let sparse_targets = sparse_graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let sparse_loss = sparse_causal_loss(&mut sparse_graph, sparse_logits, sparse_targets).unwrap();
+    let sparse_gradient = sparse_graph.grad(sparse_loss, sparse_logits).unwrap();
+    let sparse = CpuBackend
+        .execute_many(&sparse_graph, &[sparse_loss, sparse_gradient], &bindings)
+        .unwrap();
+
+    let mut dense_graph = Graph::new();
+    let dense_logits =
+        dense_graph.input_dtype_requires_grad("logits", [BATCH, TIME, VOCAB], DType::F32, true);
+    let dense_targets = dense_graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let dense_logits = dense_graph
+        .reshape(dense_logits, [TOKEN_COUNT, VOCAB])
+        .unwrap();
+    let dense_targets = dense_graph.reshape(dense_targets, [TOKEN_COUNT]).unwrap();
+    let dense_loss = cross_entropy(
+        &mut dense_graph,
+        dense_logits,
+        dense_targets,
+        LossOptions {
+            reduction: Reduction::Mean,
+            ..LossOptions::default()
+        },
+    )
+    .unwrap();
+    let dense_gradient = dense_graph.grad(dense_loss, dense_logits).unwrap();
+    let dense = CpuBackend
+        .execute_many(&dense_graph, &[dense_loss, dense_gradient], &bindings)
+        .unwrap();
+
+    assert!(
+        (sparse.outputs[0].scalar_at(0).as_f64() - dense.outputs[0].scalar_at(0).as_f64()).abs()
+            < 1e-6
+    );
+    for index in 0..TOKEN_COUNT * VOCAB {
+        assert!(
+            (sparse.outputs[1].scalar_at(index).as_f64()
+                - dense.outputs[1].scalar_at(index).as_f64())
+            .abs()
+                < 1e-6
+        );
+    }
+
+    let mut expected_loss = 0.0f64;
+    for (row, target) in target_values.into_iter().enumerate() {
+        let row_logits = &logits_values[row * VOCAB..(row + 1) * VOCAB];
+        let maximum = row_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let denominator = row_logits
+            .iter()
+            .map(|value| (f64::from(*value) - maximum).exp())
+            .sum::<f64>();
+        expected_loss -= f64::from(row_logits[target as usize]) - maximum - denominator.ln();
+        for (class, value) in row_logits.iter().enumerate() {
+            let probability = (f64::from(*value) - maximum).exp() / denominator;
+            let selected = if class == target as usize { 1.0 } else { 0.0 };
+            let expected = (probability - selected) / TOKEN_COUNT as f64;
+            let actual = sparse.outputs[1].scalar_at(row * VOCAB + class).as_f64();
+            assert!((actual - expected).abs() < 1e-5);
+        }
+    }
+    expected_loss /= TOKEN_COUNT as f64;
+    assert!((sparse.outputs[0].scalar_at(0).as_f64() - expected_loss).abs() < 1e-5);
 }
 
 fn evaluate(model: &TinyCausalTransformer) -> TensorData {
@@ -510,7 +598,7 @@ fn compiled_transformer_plan_is_strictly_renderable_for_metal() {
         .rendered_items()
         .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
         .collect::<Vec<_>>();
-    assert_eq!(authenticated.len(), 2);
+    assert_eq!(authenticated.len(), 4);
     assert!(authenticated.iter().all(|item| {
         item.transaction.is_none()
             && item.indexed_movement().is_none()
@@ -670,7 +758,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         .compiled_kernels()
         .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
         .count();
-    assert_eq!(authenticated_host_indexed_movement_item_count, 2);
+    assert_eq!(authenticated_host_indexed_movement_item_count, 4);
     assert!(
         uninterrupted
             .metal_session()

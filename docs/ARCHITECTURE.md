@@ -1015,18 +1015,24 @@ compiled-training index authentication. The autograd rule records a private
 proof binding the exact
 Gather data target to its F32-zero-base first-order ScatterAdd, shared
 index/axis/domain, and update cotangent. Metal planning rederives the
-value-preserving `[B, T] -> [B*T, 1] -> [B*T, E]` reshape/expand
+value-preserving `[B, T] -> [B*T, 1] -> [B*T, width]` reshape/optional-expand
 materialization, including checked products and normalized `[1, 0]` strides
-(`[0, 0]` when `B*T == 1` because singleton axes normalize to zero),
-and reauthenticates those facts plus the complete two-owner consumer inventory.
-Both owners
+(`[0, 0]` when `B*T == 1` because singleton axes normalize to zero), and
+reauthenticates those facts plus the complete two-owner consumer inventory.
+The maintained causal Transformer uses one pair at width `E` for embedding and
+one width-one pair to select each target token from `[B*T, V]` log
+probabilities. Its scalar mean loss therefore avoids the general
+cross-entropy helper's dense `[B*T, V]` one-hot selection while leaving that
+helper's probability-target, ignore-index, smoothing, and invalid-label
+semantics unchanged. Both owners of each proven pair
 then use versioned status-free kernels, allowing the otherwise unchanged static
 schedule to submit one command buffer. Every token lane is checked before any
 driver call or epoch/progress/scoreboard mutation. The policy changes Metal
 deployment identity but is neither recurrent state nor checkpoint/capture
 identity; ordinary Gather/Scatter rendering remains status-bearing. Dynamic
-batch or sequence extents and rank-three minibatch index materializations are
-not admitted.
+batch or sequence extents, rank-three minibatch index materializations,
+weighted loss, ignore-index, and label-smoothed compiled causal loss are not
+admitted.
 When singleton reductions leave a public loss or named output as a terminal
 affine alias, compiled training selectively inserts a concrete owner before
 mixed capture. Already-owned outputs keep their existing topology, and RGSM

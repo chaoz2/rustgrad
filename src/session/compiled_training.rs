@@ -689,9 +689,9 @@ impl CompiledAdamWConfig {
     }
 
     /// Declares one nonempty fixed-shape rank-two I32 token batch whose exact
-    /// embedding Gather and first-order ScatterAdd VJP may be authenticated
-    /// for status-free Metal replay. The input name is declared atomically, so
-    /// it collides with [`Self::with_input`] in either call order.
+    /// raw F32 Gather and first-order ScatterAdd VJP may be authenticated for
+    /// status-free Metal replay. The input name is declared atomically, so it
+    /// collides with [`Self::with_input`] in either call order.
     pub fn with_host_token_input(
         mut self,
         name: impl Into<String>,

@@ -67,8 +67,9 @@ workload to demonstrate the need.
 
 The maintained public example and protected acceptance build one tiny causal
 Transformer from deterministic random initialization through embedding, causal
-attention, LayerNorm, tied output weights, cross-entropy, one batched reverse
-traversal, and captured AdamW. One resource-free `CompiledAdamWPlan` prepares
+attention, LayerNorm, tied output weights, sparse causal negative log
+likelihood, one batched reverse traversal, and captured AdamW. One resource-free
+`CompiledAdamWPlan` prepares
 through `CpuSessionTarget` or an explicitly selected strict
 `MetalSessionTarget`; the optimizer-neutral loop is shared without a backend
 enum. Eight CPU steps decrease loss, and authenticated recompilation from a
@@ -121,17 +122,22 @@ forwards read-only device-session and scoreboard evidence without exposing its
 runtime or module, so no detached module/runtime lifecycle is silently
 abandoned.
 The maintained Transformer now trains two deterministic rows per replay and
-declares its fixed `[2, T]` I32 token input through the compiled AdamW config.
+declares its fixed `[2, T]` I32 input and target token matrices through the
+compiled AdamW config. Its causal loss selects one log probability per target
+with a raw axis-one Gather before negation and mean, avoiding the general
+cross-entropy helper's dense `[B*T, V]` one-hot selection without changing that
+public helper.
 The public policy accepts any exact nonempty fixed rank-two `[B, T]` schema;
 strict Metal reauthenticates the exact
-autograd-recorded embedding Gather/first-order ScatterAdd relationship,
-including the exact data target, F32-zero base, flattened `[B*T, E]` index,
-axis/domain, and update cotangent, before selecting private status-free
-renderers. Host validation
+autograd-recorded Gather/first-order ScatterAdd relationships for embedding and
+target selection, including each exact data target, F32-zero base, flattened
+`[B*T, E]` or `[B*T, 1]` index, axis/domain, and update cotangent, before
+selecting private status-free renderers. Host validation
 checks every lane before driver work, leaving no transactional/indexed owner in
 that workload and reducing each prepared replay to one submission and one wait.
 Ordinary untrusted indexed movement remains guarded, and this transient policy
-does not alter checkpoint bytes or recurrent state.
+does not alter recurrent state or checkpoint format. Weighted, ignored, and
+label-smoothed causal loss remain outside this workload-specific composition.
 
 ### 3. P1 — lower the identical training capture to Metal
 

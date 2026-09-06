@@ -49,8 +49,8 @@ pub(crate) enum CapturedHostIndexedMovementKind {
     ScatterAdd,
 }
 
-/// Capture-authenticated permission for the exact embedding Gather/ScatterAdd
-/// pair driven by one host-validated token input. Ordinary indexed movement
+/// Capture-authenticated permission for one exact raw F32 Gather/ScatterAdd
+/// pair driven by a host-validated token input. Ordinary indexed movement
 /// remains guarded and is never admitted through this policy.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct CapturedHostIndexedMovement {
@@ -492,9 +492,9 @@ impl CapturedInference {
     }
 
     /// Adds a private, capture-derived status-free policy for the exact raw
-    /// embedding Gather and its additive VJP Scatter driven by each named host
-    /// token input. Each input must own one complete value-preserving
-    /// flatten/expand index lineage and exactly those two movement consumers.
+    /// F32 Gather and its additive VJP Scatter driven by each named host-token
+    /// input. Each input must own one complete value-preserving flattened index
+    /// lineage and exactly those two movement consumers.
     pub(crate) fn with_authenticated_host_indexed_movements(
         mut self,
         declarations: &BTreeMap<String, Shape>,
