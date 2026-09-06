@@ -29,6 +29,7 @@ pub use resource::{
     MetalCache, MetalCommand, MetalCommandQueue, MetalCompletion, MetalDevice, MetalDiscovery,
     MetalLibrary, MetalPipeline, MetalRuntime, MetalTransaction,
 };
+pub(crate) use scoreboard::MetalScoreboardObserver;
 pub use scoreboard::{
     METAL_SESSION_SCOREBOARD_FORMAT_VERSION, MetalHostWallTimeSummary, MetalScoreboardContext,
     MetalScoreboardError, MetalScoreboardInput, MetalScoreboardInputKind, MetalScoreboardRun,

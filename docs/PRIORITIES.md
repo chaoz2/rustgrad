@@ -92,8 +92,9 @@ bytes, and requires exact continued outputs and final checkpoint equality. Its
 create-new evidence records the selected device, capture/deployment identities,
 kernel/command/transfer counts, loss endpoints, and resume result. Running that
 manual exact-SHA lane on provisioned Apple hardware is the remaining proof;
-generic epoch-state scoreboard integration follows rather than a parallel
-training API.
+the shared scoreboard now records this epoch-swapped training session directly,
+and `MetalCompiledAdamWPlan::prepare_with_scoreboard` binds fail-soft observation
+before the first step rather than introducing a parallel training API.
 
 ## Deferred hardware inference queue
 
@@ -125,16 +126,19 @@ including that protected semantic ResNet-18 path, prevalidate their launches,
 encode ordered kernels into one compute command buffer, commit once, wait once,
 and retain resources through completion; zero-work invocations submit nothing.
 Any guarded or indexed item keeps the existing per-item transactional path. The
-opt-in Metal scoreboard v7 records
-one exact stateless or append-only session's successful prefix with ordered
+opt-in Metal scoreboard v8 records one exact stateless, append-only, or
+epoch-swapped session's successful prefix with ordered
 per-run host-wall/copy/kernel/compute-command, optional GPU command execution
-time, and append-position/row-commit records, checked aggregates, successful cache-miss pipeline-build time, logical
+time, append-position/row-commit or fixed-state commit records, checked
+aggregates, successful cache-miss pipeline-build time, logical
 schedule/peak-live facts, and distinct physical Metal slot/state-bank facts.
 Failed attempts cannot enter that prefix or advance recorder-owned counters.
+Compiled AdamW uses the same shared fail-soft observer as the Llama session
+facades, so a measurement failure cannot change an already committed update.
 The host-logits and device-greedy Llama facades bind one recorder to each real
 token-step or fixed-prefill physical session before preparation. One shared
-token-step observer owns bind, record, fail-soft freeze, error, and test
-instrumentation for both paths. Their Llama execution scoreboard v2 keeps
+observer owns bind, record, fail-soft freeze, error, and test instrumentation
+across Llama and compiled training paths. Their Llama execution scoreboard v2 keeps
 their local identities and first-run attribution intact while linking exact
 spans, positions, bytes, and work items in one global success order. Closed
 standalone, prompt-prefill, and steady-decode labels join back to those physical
@@ -159,7 +163,7 @@ environment. The benchmark executes the complete initialized body with one
 deterministic image, computes one complete CPU oracle, compares finite logits
 under a documented F32 native-compilation tolerance, and records ten persistent
 session runs by default without duplicating the full execution elsewhere in the
-workflow. It publishes both the authentic scoreboard v7 and a create-new
+workflow. It publishes both the authentic scoreboard v8 and a create-new
 normalized `BenchmarkObservation` v1 bound to the exact revision, deterministic
 model identity and checked-in raw little-endian F32 input-payload SHA-256,
 selected Metal device, runner OS, command/configuration, planned static-slot
@@ -206,7 +210,7 @@ Provision the protected Apple-GPU lane and run the checked-in exact-SHA
 acceptance, closing only demonstrated live renderer/runtime gaps. Required
 evidence is full CPU-oracle output agreement, zero fallback, stable resident
 weights and intermediates, inspectable kernels/memory/transfers, and the
-checked-in v7 compile/prepare/first-run/ordered-steady reporting with host-wall
+checked-in v8 compile/prepare/first-run/ordered-steady reporting with host-wall
 versus device evidence labeled exactly. Benchmark comparisons target the
 equivalent tinygrad and Candle workload.
 
@@ -230,7 +234,7 @@ The typed model facade now consumes the same GGUF-bound model, tokenizer, and
 chat template, prepares one persistent Metal session, suppresses intermediate
 prefill logits, and provides sequential T=1 ID/text/chat generation with host
 sampling. The generic Metal append runtime now authenticates fixed nonzero row
-spans and commits their checked position atomically. Scoreboard v7 records the
+spans and commits their checked position atomically. Scoreboard v8 records the
 exact authenticated span, expected committed position, bytes, and work items
 for each physical append session. Private Metal
 admission now also accepts exact dense batch-one `[1,T]` I32 token or position

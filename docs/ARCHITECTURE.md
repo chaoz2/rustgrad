@@ -2617,7 +2617,7 @@ uncommitted rows provisional; retry uses the same start and overwrites the
 complete span, while the successful-run count, committed position, outputs,
 and metrics advance only after all launches, waits, public downloads, decoding,
 and projection succeed. A zero non-axis payload remains addressless but advances
-by the authenticated span. Scoreboard v7 records any authenticated fixed span,
+by the authenticated span. Scoreboard v8 records any authenticated fixed span,
 requires the exact caller-owned start plus span as the committed end, and checks
 the plan's exact per-span bytes and work items before extending its prefix. The
 legacy fallible token-step constructor still rejects spans larger than one.
@@ -2666,9 +2666,9 @@ reach no driver work; a failed execution publishes neither outputs nor a
 successful-run metric and the settled prefix remains retryable. Zero-work
 captures allocate, compile, upload, launch, wait, and read nothing.
 
-`MetalSessionScoreboard` v7 is an opt-in observation layer over that existing
-evidence. It snapshots either a stateless `MetalInferencePlan` or an
-append-only `MetalAppendStateInferencePlan`, binds once to the exact prepared
+`MetalSessionScoreboard` v8 is an opt-in observation layer over that existing
+evidence. It snapshots a stateless `MetalInferencePlan`, append-only
+`MetalAppendStateInferencePlan`, or epoch-swapped `MetalStatefulInferencePlan`, binds once to the exact prepared
 deployment/session identity, and accepts only its consecutive successful
 `MetalDeviceRun` prefix. The immutable report preserves every run's ordinal,
 first-run bit, host-wall times, optional exact compute-command GPU duration,
@@ -2695,15 +2695,17 @@ measured allocator peak memory, nor process RSS. GPU command execution time is
 not host wall time, copy time, end-to-end latency, or throughput, and host-API
 copy counts/bytes are not physical-bus measurements. Failed, skipped, reordered, foreign-session, or pre-bind records
 cannot mutate the scoreboard. The scoreboard observes an already-authenticated
-append session; it does not build a token generator, choose samples, or advance
-state independently. Fixed epoch-swapped state remains an explicit follow-up.
+session; it does not build a token generator, choose samples, or advance state
+independently. `MetalCompiledAdamWPlan::prepare_with_scoreboard` binds the epoch
+recorder before preparation, and each committed step passes through the same
+shared fail-soft observer without changing training results on measurement failure.
 
 `LlamaMetalPlan::prepare_with_scoreboard` and
 `LlamaMetalGreedyPlan::prepare_with_scoreboard` snapshot both append-state
-plans before preparation and bind one v7 recorder to each real prepared
+plans before preparation and bind one v8 recorder to each real prepared
 physical session. Their host-logits and device-greedy T=1 sessions delegate
 bind, observe, fail-soft freeze, error inspection, and focused test counters to
-one crate-private `LlamaMetalScoreboardObserver`; the outer coordinator shares
+one crate-private `MetalScoreboardObserver`; the outer coordinator shares
 the same global/local join and report construction for both facades.
 Fixed-prefill chunks and retained-logit, output-suppressed, or checked-I32 T=1
 invocations pass their authenticated `MetalDeviceRun` to the matching recorder
@@ -2862,7 +2864,7 @@ orders the observations canonically; it neither executes a workload nor derives 
 speedup. Optional null metrics are unavailable, whereas a present zero is a
 measured zero.
 
-`BenchmarkObservation::from_metal_session_scoreboard` maps the ResNet-18 v7
+`BenchmarkObservation::from_metal_session_scoreboard` maps the ResNet-18 v8
 scoreboard into normalized host-observed timing, planned static-slot/kernel facts,
 executed kernels, host-API payload, and fallback fields.
 `BenchmarkObservation::from_llama_metal_scoreboard` combines the Llama v2
@@ -2902,7 +2904,7 @@ oracle. The typed ResNet benchmark constructs the complete default Eval/F32
 Metal session, and checks ten repeated session outputs by default under the
 documented F32 native-compilation tolerance. The workflow runs that complete
 benchmark exactly once rather than duplicating it through the ignored live
-test, and uploads its deterministic v7 scoreboard and normalized observation v1
+test, and uploads its deterministic v8 scoreboard and normalized observation v1
 beside the Linear report. The observation keeps planned static-slot memory and
 the measured RustGrad-owned physical-buffer high-water as separate fields.
 The separate Llama job accepts only the protected Metal registry identity and
@@ -2933,7 +2935,7 @@ with another runtime.
 These paths prove stable resident schemas, compiled cache identities, device
 ownership, zero run-time resident upload, and zero fallback. The release profile
 keeps the one complete CPU oracle practical without weakening the device
-workload. Component scoreboard v7 and Llama execution scoreboard v2 keep host
+workload. Component scoreboard v8 and Llama execution scoreboard v2 keep host
 wall time, optional compute-command GPU execution time, host-API copy counters,
 and compute-command submission/wait counters distinct. GPU command time is not
 copy time, end-to-end latency, tokens per second, or a live-device speedup

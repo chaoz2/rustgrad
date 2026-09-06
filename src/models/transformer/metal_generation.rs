@@ -18,7 +18,8 @@ use crate::{
         MetalCausalOverwriteRewindProof, MetalDevice, MetalDeviceInfo,
         MetalDevicePreparationReport, MetalDeviceRunReport, MetalDeviceSessionSummary, MetalError,
         MetalPlanOptions, MetalPreparedCaptureManifest, MetalScoreboardContext,
-        MetalScoreboardError, MetalSessionScoreboard, MetalSharedAppendSession, RenderedMetal,
+        MetalScoreboardError, MetalScoreboardObserver, MetalSessionScoreboard,
+        MetalSharedAppendSession, RenderedMetal,
     },
     tokenizer::{SimpleTokenizer, TokenizerError},
 };
@@ -54,14 +55,7 @@ pub(super) struct LlamaMetalPrefillSession {
     span_rows: NonZeroUsize,
     token_input_name: String,
     position_input_name: String,
-    scoreboard: Option<LlamaMetalPrefillScoreboardObserver>,
-}
-
-struct LlamaMetalPrefillScoreboardObserver {
-    recorder: MetalSessionScoreboard,
-    first_error: Option<MetalScoreboardError>,
-    #[cfg(test)]
-    record_attempts: usize,
+    scoreboard: Option<MetalScoreboardObserver>,
 }
 
 pub(super) trait LlamaMetalScoreboardStepSession {
@@ -1401,20 +1395,19 @@ impl LlamaMetalPrefillSession {
 
     pub(super) fn bind_execution_scoreboard(
         &mut self,
-        mut recorder: MetalSessionScoreboard,
+        recorder: MetalSessionScoreboard,
     ) -> Result<(), MetalScoreboardError> {
-        recorder.bind(self.inner.metal_session())?;
-        self.scoreboard = Some(LlamaMetalPrefillScoreboardObserver {
+        self.scoreboard = Some(MetalScoreboardObserver::bind(
             recorder,
-            first_error: None,
-            #[cfg(test)]
-            record_attempts: 0,
-        });
+            self.inner.metal_session(),
+        )?);
         Ok(())
     }
 
     pub(super) fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
-        self.scoreboard.as_ref().map(|state| &state.recorder)
+        self.scoreboard
+            .as_ref()
+            .map(MetalScoreboardObserver::recorder)
     }
 
     fn causal_overwrite_rewind_proof(&self) -> Result<MetalCausalOverwriteRewindProof, MetalError> {
@@ -1428,14 +1421,12 @@ impl LlamaMetalPrefillSession {
     pub(super) fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
         self.scoreboard
             .as_ref()
-            .and_then(|state| state.first_error.as_ref())
+            .and_then(MetalScoreboardObserver::first_error)
     }
 
     pub(super) fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError) {
-        if let Some(state) = &mut self.scoreboard
-            && state.first_error.is_none()
-        {
-            state.first_error = Some(error);
+        if let Some(state) = &mut self.scoreboard {
+            state.freeze(error);
         }
     }
 
@@ -1512,18 +1503,8 @@ impl LlamaMetalPrefillSession {
     }
 
     fn observe_run(&mut self, run: &crate::runtime::metal::MetalDeviceRun, start_position: usize) {
-        let Some(state) = &mut self.scoreboard else {
-            return;
-        };
-        if state.first_error.is_some() {
-            return;
-        }
-        #[cfg(test)]
-        {
-            state.record_attempts += 1;
-        }
-        if let Err(error) = state.recorder.record_from_position(run, start_position) {
-            state.first_error = Some(error);
+        if let Some(state) = &mut self.scoreboard {
+            state.observe_from_position(run, start_position);
         }
     }
 }

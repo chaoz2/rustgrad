@@ -1267,11 +1267,28 @@ fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_check
     assert!(plan.rendered_items().len() > 1);
 
     let mock = Arc::new(MockDispatch::default());
-    let mut metal = plan.prepare(test_device(mock)).unwrap();
+    let mut metal = plan
+        .prepare_with_scoreboard(
+            test_device(mock),
+            MetalScoreboardContext::new("compiled-adamw", "test-revision", "semantic mock")
+                .unwrap(),
+        )
+        .unwrap();
     assert_eq!(metal.step_count(), 0);
     assert_eq!(metal.max_gradient_norm(), None);
     assert_eq!(metal.loss_scale(), 1.0);
     assert_eq!(metal.optimizer_step().unwrap(), 0);
+    assert!(metal.scoreboard_recording_error().is_none());
+    let empty_scoreboard = metal.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(empty_scoreboard.format_version, 8);
+    assert_eq!(
+        empty_scoreboard.state_policy,
+        MetalScoreboardStatePolicy::Epoch
+    );
+    assert_eq!(empty_scoreboard.state_pair_count, 4);
+    assert_eq!(empty_scoreboard.state_bank_count, 2);
+    assert_eq!(empty_scoreboard.successful_run_count, 0);
+    assert_eq!(empty_scoreboard.committed_state_position, None);
     assert_eq!(
         metal.parameter_snapshots().unwrap(),
         BTreeMap::from([("weight".into(), TensorData::scalar(1.0))])
@@ -1288,6 +1305,21 @@ fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_check
     assert_eq!(actual.report().committed_state_pair_count, 4);
     assert_eq!(actual.report().retained_d2h_calls, 2);
     assert_eq!(actual.report().transient_h2d_calls, 2);
+    let first_scoreboard = metal.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(first_scoreboard.successful_run_count, 1);
+    assert_eq!(
+        first_scoreboard.successful_runs[0].committed_state_pair_count,
+        4
+    );
+    assert_eq!(
+        first_scoreboard.successful_runs[0].committed_state_bytes,
+        20
+    );
+    assert_eq!(
+        first_scoreboard.successful_runs[0].committed_state_work_items,
+        4
+    );
+    assert_eq!(first_scoreboard.fallback_count, 0);
     assert_eq!(metal.optimizer_step().unwrap(), 1);
     assert_eq!(
         metal.parameter_snapshots().unwrap(),
@@ -1332,6 +1364,16 @@ fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_check
     assert_eq!(resumed_step.outputs(), expected.outputs());
     assert_eq!(metal.step_count(), 2);
     assert_eq!(resumed.step_count(), 2);
+    let second_scoreboard = metal.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(second_scoreboard.successful_run_count, 2);
+    assert_eq!(second_scoreboard.committed_state_pair_count, 8);
+    assert_eq!(second_scoreboard.committed_state_bytes, 40);
+    assert_eq!(second_scoreboard.committed_state_work_items, 8);
+    assert!(
+        second_scoreboard
+            .steady_run_host_wall_time_summary
+            .is_some()
+    );
     assert_eq!(metal.checkpoint().unwrap(), resumed.checkpoint().unwrap());
 }
 
@@ -1497,7 +1539,7 @@ fn metal_append_state_is_one_bank_sparse_monotonic_and_retryable() {
     assert_eq!(second.report().committed_state_position, Some(2));
     scoreboard.record(&second).unwrap();
     let report = scoreboard.report().unwrap();
-    assert_eq!(report.format_version, 7);
+    assert_eq!(report.format_version, 8);
     assert_eq!(report.successful_run_count, 2);
     assert_eq!(
         report.gpu_command_execution_time,
@@ -4260,7 +4302,7 @@ fn llama_metal_scoreboard_records_exact_token_execution_prefix_fail_soft() {
         )
         .unwrap();
     let empty = session.execution_scoreboard().unwrap().report().unwrap();
-    assert_eq!(empty.format_version, 7);
+    assert_eq!(empty.format_version, 8);
     assert_eq!(empty.successful_run_count, 0);
     assert_eq!(empty.committed_state_position, Some(0));
     assert!(session.scoreboard_recording_error().is_none());

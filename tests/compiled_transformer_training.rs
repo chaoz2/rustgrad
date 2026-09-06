@@ -1,7 +1,7 @@
 use rustgrad::nn::{Embedding, LayerNorm, StateKind};
 use rustgrad::runtime::metal::{MetalCapabilities, MetalRenderer};
 #[cfg(target_os = "macos")]
-use rustgrad::runtime::metal::{MetalDiscovery, MetalRuntime};
+use rustgrad::runtime::metal::{MetalDiscovery, MetalRuntime, MetalScoreboardContext};
 use rustgrad::{
     CompiledAdamWConfig, CpuCompiledAdamW, DType, Graph, LossOptions, Mode, ModeModuleForward,
     Module, NodeId, Parameter, Reduction, Result, Scalar, Shape, TensorData, TransformerBlock,
@@ -290,7 +290,15 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let state_pair_count = plan.summary().state_pair_count;
     let planned_kernel_count = plan.summary().nonzero_item_count;
     let mut uninterrupted = plan
-        .prepare(device.clone())
+        .prepare_with_scoreboard(
+            device.clone(),
+            MetalScoreboardContext::new(
+                "tiny-causal-transformer-compiled-adamw",
+                expected_sha.clone(),
+                "protected live Metal",
+            )
+            .unwrap(),
+        )
         .expect("live Metal preparation must compile, allocate, and upload training state");
     assert_eq!(uninterrupted.loss_scale(), 128.0);
     assert_eq!(uninterrupted.step_count(), 0);
@@ -341,7 +349,15 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     );
     assert_eq!(resumed_plan.summary().fallback_count, 0);
     let mut resumed = resumed_plan
-        .prepare(device)
+        .prepare_with_scoreboard(
+            device,
+            MetalScoreboardContext::new(
+                "tiny-causal-transformer-compiled-adamw-resume",
+                expected_sha.clone(),
+                "protected live Metal checkpoint resume",
+            )
+            .unwrap(),
+        )
         .expect("checkpoint-restored Metal preparation must succeed");
     assert_eq!(resumed.loss_scale(), 128.0);
     assert_eq!(resumed.step_count(), 4);
@@ -377,6 +393,20 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
     );
+    let initial_scoreboard = uninterrupted
+        .execution_scoreboard_report()
+        .unwrap()
+        .expect("live compiled training scoreboard must be enabled");
+    let resumed_scoreboard = resumed
+        .execution_scoreboard_report()
+        .unwrap()
+        .expect("live resumed training scoreboard must be enabled");
+    assert_eq!(initial_scoreboard.successful_run_count, 8);
+    assert_eq!(resumed_scoreboard.successful_run_count, 4);
+    assert_eq!(initial_scoreboard.fallback_count, 0);
+    assert_eq!(resumed_scoreboard.fallback_count, 0);
+    assert!(uninterrupted.scoreboard_recording_error().is_none());
+    assert!(resumed.scoreboard_recording_error().is_none());
 
     let evidence = serde_json::json!({
         "format_version": 1,
@@ -406,6 +436,8 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "command_submission_count": command_submission_count,
         "transient_host_api_h2d_bytes": transient_h2d_bytes,
         "retained_host_api_d2h_bytes": retained_d2h_bytes,
+        "initial_scoreboard": initial_scoreboard,
+        "resumed_scoreboard": resumed_scoreboard,
     });
     let encoded = serde_json::to_vec(&evidence).expect("live evidence JSON must serialize");
     let mut file = OpenOptions::new()

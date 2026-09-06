@@ -8,7 +8,7 @@ use super::{
 use crate::runtime::metal::{
     MetalAppendStateInferencePlan, MetalCausalOverwriteRewindProof, MetalDevice,
     MetalDeviceRunReport, MetalDeviceSession, MetalDeviceSessionSummary, MetalError, MetalRenderer,
-    MetalScoreboardError, MetalSessionScoreboard, RenderedMetal,
+    MetalScoreboardError, MetalScoreboardObserver, MetalSessionScoreboard, RenderedMetal,
 };
 use crate::{
     AttentionOptions, CapturedAppendStateInference, CapturedInferenceError, CapturedSchedule,
@@ -68,7 +68,7 @@ pub struct LlamaMetalStepSession {
     inner: MetalDeviceSession,
     max_context: usize,
     vocab_size: usize,
-    scoreboard: Option<LlamaMetalScoreboardObserver>,
+    scoreboard: Option<MetalScoreboardObserver>,
 }
 
 /// Persistent device-resident token session with typed greedy-only output.
@@ -76,61 +76,7 @@ pub struct LlamaMetalGreedyStepSession {
     inner: MetalDeviceSession,
     max_context: usize,
     vocab_size: usize,
-    scoreboard: Option<LlamaMetalScoreboardObserver>,
-}
-
-struct LlamaMetalScoreboardObserver {
-    recorder: MetalSessionScoreboard,
-    first_error: Option<MetalScoreboardError>,
-    #[cfg(test)]
-    record_attempts: usize,
-}
-
-impl LlamaMetalScoreboardObserver {
-    fn bind(
-        mut recorder: MetalSessionScoreboard,
-        session: &MetalDeviceSession,
-    ) -> Result<Self, MetalScoreboardError> {
-        recorder.bind(session)?;
-        Ok(Self {
-            recorder,
-            first_error: None,
-            #[cfg(test)]
-            record_attempts: 0,
-        })
-    }
-
-    fn recorder(&self) -> &MetalSessionScoreboard {
-        &self.recorder
-    }
-
-    fn first_error(&self) -> Option<&MetalScoreboardError> {
-        self.first_error.as_ref()
-    }
-
-    fn freeze(&mut self, error: MetalScoreboardError) {
-        if self.first_error.is_none() {
-            self.first_error = Some(error);
-        }
-    }
-
-    fn observe(&mut self, run: &crate::runtime::metal::MetalDeviceRun, position: usize) {
-        if self.first_error.is_some() {
-            return;
-        }
-        #[cfg(test)]
-        {
-            self.record_attempts += 1;
-        }
-        if let Err(error) = self.recorder.record_from_position(run, position) {
-            self.first_error = Some(error);
-        }
-    }
-
-    #[cfg(test)]
-    fn record_attempts(&self) -> usize {
-        self.record_attempts
-    }
+    scoreboard: Option<MetalScoreboardObserver>,
 }
 
 /// One successfully committed token invocation.
@@ -628,20 +574,20 @@ impl LlamaMetalStepSession {
         &mut self,
         recorder: MetalSessionScoreboard,
     ) -> Result<(), MetalScoreboardError> {
-        self.scoreboard = Some(LlamaMetalScoreboardObserver::bind(recorder, &self.inner)?);
+        self.scoreboard = Some(MetalScoreboardObserver::bind(recorder, &self.inner)?);
         Ok(())
     }
 
     pub(crate) fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
         self.scoreboard
             .as_ref()
-            .map(LlamaMetalScoreboardObserver::recorder)
+            .map(MetalScoreboardObserver::recorder)
     }
 
     pub(crate) fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
         self.scoreboard
             .as_ref()
-            .and_then(LlamaMetalScoreboardObserver::first_error)
+            .and_then(MetalScoreboardObserver::first_error)
     }
 
     pub(crate) fn causal_overwrite_rewind_proof(
@@ -664,7 +610,7 @@ impl LlamaMetalStepSession {
     pub(crate) fn scoreboard_record_attempts(&self) -> Option<usize> {
         self.scoreboard
             .as_ref()
-            .map(LlamaMetalScoreboardObserver::record_attempts)
+            .map(MetalScoreboardObserver::record_attempts)
     }
 
     /// Runs exactly one token. Invalid tokens, a full context, and failed
@@ -756,7 +702,7 @@ impl LlamaMetalStepSession {
 
     fn observe_run(&mut self, run: &crate::runtime::metal::MetalDeviceRun, position: usize) {
         if let Some(state) = &mut self.scoreboard {
-            state.observe(run, position);
+            state.observe_from_position(run, position);
         }
     }
 }
@@ -788,20 +734,20 @@ impl LlamaMetalGreedyStepSession {
         &mut self,
         recorder: MetalSessionScoreboard,
     ) -> Result<(), MetalScoreboardError> {
-        self.scoreboard = Some(LlamaMetalScoreboardObserver::bind(recorder, &self.inner)?);
+        self.scoreboard = Some(MetalScoreboardObserver::bind(recorder, &self.inner)?);
         Ok(())
     }
 
     pub(crate) fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
         self.scoreboard
             .as_ref()
-            .map(LlamaMetalScoreboardObserver::recorder)
+            .map(MetalScoreboardObserver::recorder)
     }
 
     pub(crate) fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
         self.scoreboard
             .as_ref()
-            .and_then(LlamaMetalScoreboardObserver::first_error)
+            .and_then(MetalScoreboardObserver::first_error)
     }
 
     pub(crate) fn causal_overwrite_rewind_proof(
@@ -824,7 +770,7 @@ impl LlamaMetalGreedyStepSession {
     pub(crate) fn scoreboard_record_attempts(&self) -> Option<usize> {
         self.scoreboard
             .as_ref()
-            .map(LlamaMetalScoreboardObserver::record_attempts)
+            .map(MetalScoreboardObserver::record_attempts)
     }
 
     /// Runs one token, downloads only the guarded I32 greedy token, and commits
@@ -931,7 +877,7 @@ impl LlamaMetalGreedyStepSession {
 
     fn observe_run(&mut self, run: &crate::runtime::metal::MetalDeviceRun, position: usize) {
         if let Some(state) = &mut self.scoreboard {
-            state.observe(run, position);
+            state.observe_from_position(run, position);
         }
     }
 }

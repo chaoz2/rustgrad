@@ -115,7 +115,7 @@ println!("steady run: {:?}", second.report());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The lower-level session and opt-in v7 scoreboard distinguish kernel encodes
+The lower-level session and opt-in v8 scoreboard distinguish kernel encodes
 from compute-command submissions and waits, and report an optional exact sum of
 completed compute-command `GPUStartTime`/`GPUEndTime` intervals. Unavailable,
 invalid, or unrepresentable timestamp sets remain absent rather than becoming
@@ -170,7 +170,7 @@ The greedy facade reduces finite logits on device and downloads one checked I32
 token per selecting invocation. An opt-in fixed span executes complete prompt
 chunks while sharing the same resident weights, K/V cache, and command queue.
 Its opt-in execution scoreboard reuses the same authenticated v2 workload
-envelope as the host-logits facade: each physical program keeps its own v7
+envelope as the host-logits facade: each physical program keeps its own v8
 session report and identity while the envelope records exact global order and
 closed prompt-prefill or steady-decode phases. The maintained
 `metal_llama_generate` CLI uses this scoreboard-capable device-greedy path, so
