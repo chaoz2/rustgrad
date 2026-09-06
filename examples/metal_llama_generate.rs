@@ -1117,7 +1117,7 @@ fn validate_stable_session(
         .collect::<Vec<_>>();
     if session.device_info() != &expected.device_info
         || session.device_owner_id() != expected.device_owner_id
-        || session.capture().identity != expected.capture_identity
+        || session.capture_identity() != expected.capture_identity
         || session.summary() != &expected.summary
         || session.resident_inputs() != expected.resident_inputs
         || session.state_inputs() != expected.state_inputs

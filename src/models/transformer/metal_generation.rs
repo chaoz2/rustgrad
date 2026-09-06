@@ -15,9 +15,10 @@ use super::{
 use crate::{
     CapturedSchedule, DType, ExecutionPlanSummary, ReplayInput, Scalar, TensorData,
     runtime::metal::{
-        MetalDevice, MetalDeviceInfo, MetalDevicePreparationReport, MetalDeviceRunReport,
-        MetalDeviceSessionSummary, MetalPlanOptions, MetalScoreboardContext, MetalScoreboardError,
-        MetalSessionScoreboard, MetalSharedAppendSession, RenderedMetal,
+        MetalCausalOverwriteRewindProof, MetalDevice, MetalDeviceInfo,
+        MetalDevicePreparationReport, MetalDeviceRunReport, MetalDeviceSessionSummary, MetalError,
+        MetalPlanOptions, MetalPreparedCaptureManifest, MetalScoreboardContext,
+        MetalScoreboardError, MetalSessionScoreboard, MetalSharedAppendSession, RenderedMetal,
     },
     tokenizer::{SimpleTokenizer, TokenizerError},
 };
@@ -35,7 +36,7 @@ pub struct LlamaMetalPlan {
     selected_device: MetalDevice,
 }
 
-/// Persistent single-sequence Metal generation session.
+/// Persistent Metal generation session with one active logical sequence.
 pub struct LlamaMetalSession {
     step: LlamaMetalStepSession,
     prefill: Option<LlamaMetalPrefillSession>,
@@ -69,6 +70,11 @@ pub(super) trait LlamaMetalScoreboardStepSession {
     fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError);
 }
 
+pub(super) trait LlamaMetalCausalRewindStepSession {
+    fn causal_overwrite_rewind_proof(&self) -> Result<MetalCausalOverwriteRewindProof, MetalError>;
+    fn rewind_sequence_position(&mut self, proof: MetalCausalOverwriteRewindProof);
+}
+
 impl LlamaMetalScoreboardStepSession for LlamaMetalStepSession {
     fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
         LlamaMetalStepSession::execution_scoreboard(self)
@@ -80,6 +86,16 @@ impl LlamaMetalScoreboardStepSession for LlamaMetalStepSession {
 
     fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError) {
         LlamaMetalStepSession::freeze_scoreboard_recording(self, error);
+    }
+}
+
+impl LlamaMetalCausalRewindStepSession for LlamaMetalStepSession {
+    fn causal_overwrite_rewind_proof(&self) -> Result<MetalCausalOverwriteRewindProof, MetalError> {
+        LlamaMetalStepSession::causal_overwrite_rewind_proof(self)
+    }
+
+    fn rewind_sequence_position(&mut self, proof: MetalCausalOverwriteRewindProof) {
+        LlamaMetalStepSession::rewind_sequence_position(self, proof);
     }
 }
 
@@ -95,6 +111,48 @@ impl LlamaMetalScoreboardStepSession for LlamaMetalGreedyStepSession {
     fn freeze_scoreboard_recording(&mut self, error: MetalScoreboardError) {
         LlamaMetalGreedyStepSession::freeze_scoreboard_recording(self, error);
     }
+}
+
+impl LlamaMetalCausalRewindStepSession for LlamaMetalGreedyStepSession {
+    fn causal_overwrite_rewind_proof(&self) -> Result<MetalCausalOverwriteRewindProof, MetalError> {
+        LlamaMetalGreedyStepSession::causal_overwrite_rewind_proof(self)
+    }
+
+    fn rewind_sequence_position(&mut self, proof: MetalCausalOverwriteRewindProof) {
+        LlamaMetalGreedyStepSession::rewind_sequence_position(self, proof);
+    }
+}
+
+pub(super) fn reset_llama_sequence<
+    S: LlamaMetalScoreboardStepSession + LlamaMetalCausalRewindStepSession,
+>(
+    step: &mut S,
+    prefill: &mut Option<LlamaMetalPrefillSession>,
+    committed_position: &mut usize,
+    scoreboard_bound: bool,
+) -> Result<(), LlamaMetalGenerationError> {
+    if scoreboard_bound
+        || step.execution_scoreboard().is_some()
+        || prefill
+            .as_ref()
+            .is_some_and(|prefill| prefill.execution_scoreboard().is_some())
+    {
+        return Err(LlamaMetalGenerationError::SequenceResetWithScoreboard);
+    }
+    let step_proof = step
+        .causal_overwrite_rewind_proof()
+        .map_err(LlamaMetalStepError::Metal)?;
+    let prefill_proof = prefill
+        .as_ref()
+        .map(LlamaMetalPrefillSession::causal_overwrite_rewind_proof)
+        .transpose()
+        .map_err(LlamaMetalStepError::Metal)?;
+    step.rewind_sequence_position(step_proof);
+    if let Some((prefill, proof)) = prefill.as_mut().zip(prefill_proof) {
+        prefill.rewind_sequence_position(proof);
+    }
+    *committed_position = 0;
+    Ok(())
 }
 
 /// Successful prompt ingestion with only its final logits downloaded.
@@ -149,6 +207,8 @@ pub enum LlamaMetalGenerationError {
     FreshSessionRequired {
         position: usize,
     },
+    /// Sequence evidence cannot be partitioned safely after recorder binding.
+    SequenceResetWithScoreboard,
     Execution {
         progress: Box<LlamaMetalProgress>,
         stage: LlamaMetalGenerationStage,
@@ -709,9 +769,14 @@ impl LlamaMetalSession {
         self.step.metal_session().compiled_kernels()
     }
 
-    /// Returns the authenticated token-step capture.
-    pub fn capture(&self) -> &CapturedSchedule {
-        self.step.metal_session().capture()
+    /// Returns the token-step capture identity authenticated before preparation.
+    pub fn capture_identity(&self) -> u64 {
+        self.step.metal_session().capture_identity()
+    }
+
+    /// Returns payload-free token-step capture facts retained after upload.
+    pub fn capture_manifest(&self) -> &MetalPreparedCaptureManifest {
+        self.step.metal_session().capture_manifest()
     }
 
     /// Returns immutable model and RoPE resident schemas.
@@ -743,6 +808,30 @@ impl LlamaMetalSession {
     /// fixed-span prefill and token-step programs.
     pub fn successful_invocation_count(&self) -> u64 {
         self.successful_invocations
+    }
+
+    /// Reuses the prepared model for an independent sequence without driver
+    /// work or K/V clearing. The sealed Llama graphs mask attention to
+    /// `absolute_position <= query_position`, and each newly visible row is
+    /// overwritten before attention, so stale later rows remain unobservable.
+    /// Preparation and successful-invocation counters remain cumulative.
+    pub fn reset_sequence(&mut self) -> Result<(), LlamaMetalGenerationError> {
+        reset_llama_sequence(
+            &mut self.step,
+            &mut self.prefill,
+            &mut self.committed_position,
+            self.scoreboard_invocations.is_some(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sequence_component_positions(&self) -> (usize, Option<usize>) {
+        (
+            self.step.position(),
+            self.prefill
+                .as_ref()
+                .map(LlamaMetalPrefillSession::committed_position),
+        )
     }
 
     /// Returns the fixed K/V capacity.
@@ -923,9 +1012,9 @@ impl LlamaMetalSession {
         })
     }
 
-    /// Generates from explicit IDs on a fresh session. Successful prefix steps
-    /// remain committed if a later device transaction fails; the failing token
-    /// never advances the committed position.
+    /// Generates from explicit IDs on a fresh logical sequence. Successful
+    /// prefix steps remain committed if a later device transaction fails; the
+    /// failing token never advances the committed position.
     pub fn generate_ids(
         &mut self,
         prompt_ids: &[u32],
@@ -1051,7 +1140,7 @@ impl LlamaMetalSession {
         })
     }
 
-    /// Encodes and generates from one plain-text prompt on a fresh session.
+    /// Encodes and generates from one plain-text prompt on a fresh sequence.
     pub fn generate_text(
         &mut self,
         prompt: &str,
@@ -1067,7 +1156,7 @@ impl LlamaMetalSession {
     }
 
     /// Renders the checked chat template with a generation prompt, then
-    /// generates on a fresh session.
+    /// generates on a fresh sequence.
     pub fn generate_chat(
         &mut self,
         messages: &[LlamaChatMessage],
@@ -1328,6 +1417,14 @@ impl LlamaMetalPrefillSession {
         self.scoreboard.as_ref().map(|state| &state.recorder)
     }
 
+    fn causal_overwrite_rewind_proof(&self) -> Result<MetalCausalOverwriteRewindProof, MetalError> {
+        self.inner.causal_overwrite_rewind_proof()
+    }
+
+    fn rewind_sequence_position(&mut self, proof: MetalCausalOverwriteRewindProof) {
+        self.inner.rewind_causal_overwrite_position(proof);
+    }
+
     pub(super) fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
         self.scoreboard
             .as_ref()
@@ -1344,6 +1441,14 @@ impl LlamaMetalPrefillSession {
 
     pub(super) const fn span_rows(&self) -> NonZeroUsize {
         self.span_rows
+    }
+
+    #[cfg(test)]
+    pub(super) fn committed_position(&self) -> usize {
+        self.inner
+            .metal_session()
+            .committed_state_position()
+            .expect("Llama prefill always uses append-state execution")
     }
 
     pub(super) fn summary(&self) -> &MetalDeviceSessionSummary {

@@ -15,8 +15,15 @@ use std::{
 };
 
 use crate::runtime::static_schedule::{
-    CapturedStaticExecution, StaticAppendStateLink, StaticExecutionReport, StaticHostGather,
-    StaticHostOutputSelection, StaticLifetimePlan, StaticStateLink,
+    CapturedStaticExecution, PreparedStaticLifetimePlan, StaticAppendStateLink,
+    StaticExecutionReport, StaticHostGather, StaticHostOutputSelection, StaticLifetimePlan,
+    StaticStateLink,
+};
+
+pub use crate::runtime::static_schedule::{
+    PreparedCaptureManifest as MetalPreparedCaptureManifest,
+    PreparedCaptureOutput as MetalPreparedCaptureOutput,
+    PreparedQuantizedIndexDomain as MetalPreparedQuantizedIndexDomain,
 };
 
 /// Resource-free planning controls shared by typed Metal inference facades.
@@ -197,6 +204,10 @@ enum MetalOutputProof {
         output: usize,
         upper_exclusive: usize,
     },
+}
+
+pub(crate) struct MetalCausalOverwriteRewindProof {
+    session_token: Rc<()>,
 }
 
 impl MetalDeviceRun {
@@ -1196,7 +1207,7 @@ impl MetalDeviceSessionPlan {
         if let Some((source, proof)) = &shared
             && (proof.target_capture_identity != self.capture().identity
                 || Some(proof.target_deployment_identity) != inference_deployment_identity
-                || proof.source_capture_identity != source.capture().identity
+                || proof.source_capture_identity != source.capture_identity()
                 || source.inference_deployment_identity() != Some(proof.source_deployment_identity)
                 || source.device_owner_id() != device.owner_id()
                 || !matches!(source.state_policy, MetalSessionStatePolicy::Append { .. })
@@ -1307,9 +1318,10 @@ impl MetalDeviceSessionPlan {
             initial_state_h2d_bytes,
         };
         let resident_sources = self.lifetime.retain_projection_sources(resident_values);
+        let lifetime = self.lifetime.into_prepared();
         let public_output_count = self.summary.requested_output_count;
         Ok(MetalDeviceSession {
-            lifetime: self.lifetime,
+            lifetime,
             resident_sources,
             prepared,
             summary: self.summary,
@@ -1329,7 +1341,7 @@ impl MetalDeviceSessionPlan {
 
 /// Thread-confined persistent Metal execution state for one concrete capture.
 pub struct MetalDeviceSession {
-    lifetime: StaticLifetimePlan,
+    lifetime: PreparedStaticLifetimePlan,
     resident_sources: BTreeMap<u64, TensorData>,
     prepared: InitializedMetalPrefix,
     summary: MetalDeviceSessionSummary,
@@ -1376,12 +1388,30 @@ impl MetalSharedAppendSession {
         self.inner
             .run_without_host_outputs_at(transient_inputs, committed_position)
     }
+
+    pub(crate) fn causal_overwrite_rewind_proof(
+        &self,
+    ) -> Result<MetalCausalOverwriteRewindProof, MetalError> {
+        self.inner.causal_overwrite_rewind_proof()
+    }
+
+    pub(crate) fn rewind_causal_overwrite_position(
+        &mut self,
+        proof: MetalCausalOverwriteRewindProof,
+    ) {
+        self.inner.rewind_causal_overwrite_position(proof);
+    }
 }
 
 impl MetalDeviceSession {
-    /// Returns the exact authenticated capture owned by this session.
-    pub fn capture(&self) -> &CapturedSchedule {
-        self.lifetime.capture()
+    /// Returns the capture identity authenticated before resource preparation.
+    pub fn capture_identity(&self) -> u64 {
+        self.lifetime.manifest().capture_identity()
+    }
+
+    /// Returns the payload-free capture facts retained after successful upload.
+    pub fn capture_manifest(&self) -> &MetalPreparedCaptureManifest {
+        self.lifetime.manifest()
     }
 
     /// Returns the typed resident named-input schemas.
@@ -1484,6 +1514,35 @@ impl MetalDeviceSession {
             MetalSessionStatePolicy::Append { .. } => Some(self.committed_state_position),
             _ => None,
         }
+    }
+
+    /// Internal position-only rewind for a typed caller whose captured program
+    /// proves that newly visible rows are overwritten before use and every
+    /// later stale row remains masked. This deliberately is not a public
+    /// general append-state reset.
+    pub(crate) fn causal_overwrite_rewind_proof(
+        &self,
+    ) -> Result<MetalCausalOverwriteRewindProof, MetalError> {
+        if matches!(self.state_policy, MetalSessionStatePolicy::Append { .. }) {
+            Ok(MetalCausalOverwriteRewindProof {
+                session_token: self.session_token.clone(),
+            })
+        } else {
+            Err(MetalError::InvalidBinding(
+                "causal overwrite rewind requires append-state inference".into(),
+            ))
+        }
+    }
+
+    pub(crate) fn rewind_causal_overwrite_position(
+        &mut self,
+        proof: MetalCausalOverwriteRewindProof,
+    ) {
+        assert!(
+            Rc::ptr_eq(&self.session_token, &proof.session_token),
+            "causal overwrite rewind proof belongs to another Metal session"
+        );
+        self.committed_state_position = 0;
     }
 
     /// Validates exact transient inputs, executes each nonzero schedule item

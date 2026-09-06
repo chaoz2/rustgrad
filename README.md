@@ -126,24 +126,45 @@ Dense-or-packed F32 GGUF Llama models also have a typed persistent Metal
 prompt-to-tokens facade. One GGUF parse owns the matching model, tokenizer, and
 chat template; planning binds them to an explicitly selected device, uploads
 Q4_0/Q8_0/Q4_K/Q6_K or dense weights once, and retains fixed-capacity K/V state.
+The local-file loader retains one immutable file-byte owner, and packed weights
+refer to their validated ranges instead of copying each tensor payload. The
+initial read remains ordinary owned file I/O; this is not an mmap claim.
 
 ```rust,no_run
+use std::num::NonZeroUsize;
+
 use rustgrad::{LlamaMetalGreedyPlan, LlamaPromptWorkflow};
 use rustgrad::runtime::metal::{MetalPlanOptions, MetalRuntime};
 
 let device = MetalRuntime::load()?.device(0)?;
 let workflow = LlamaPromptWorkflow::from_path("model.gguf")?;
-let plan = LlamaMetalGreedyPlan::from_workflow(
-    workflow,
-    &device,
-    MetalPlanOptions::default(),
-)?;
+let plan = LlamaMetalGreedyPlan::builder(workflow, &device)
+    .with_plan_options(MetalPlanOptions::default())
+    .with_prefill_span(NonZeroUsize::new(8).unwrap())
+    .build()?;
+
+// Capture, rendering, schemas, selected device, and zero-fallback facts are
+// inspectable before prepare creates resources or uploads the model.
 assert_eq!(plan.summary().fallback_count, 0);
+assert_eq!(plan.selected_device_owner_id(), device.owner_id());
 let mut session = plan.prepare()?;
 let output = session.generate_text("Hello", 32)?;
 println!("{}", output.generation().decoded());
+session.reset_sequence()?;
+let independent = session.generate_text("Goodbye", 32)?;
+println!("{}", independent.generation().decoded());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+`reset_sequence` retains the selected device, compiled pipelines, resident
+weights, and K/V allocations while logically rewinding causal state for an
+independent prompt. Scoreboard-bound sessions reject reset so each evidence
+envelope remains single-sequence.
+
+Call `plan.prepare_with_scoreboard(context)` instead of `plan.prepare()` when
+one independent sequence needs the opt-in authenticated execution scoreboard.
+Generation output always carries its typed workload evidence; neither planning
+nor preparation can silently select the CPU implementation.
 
 The greedy facade reduces finite logits on device and downloads one checked I32
 token per selecting invocation. An opt-in fixed span executes complete prompt

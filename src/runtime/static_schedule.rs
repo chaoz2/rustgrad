@@ -325,18 +325,6 @@ impl CapturedStaticExecution {
         self.project_with_fallback(values, &BTreeMap::new())
     }
 
-    pub(crate) fn project_prefix(
-        &self,
-        count: usize,
-        values: &BTreeMap<u64, TensorData>,
-        fallback: &BTreeMap<u64, TensorData>,
-    ) -> Result<Vec<TensorData>, String> {
-        if count > self.requested().len() {
-            return Err("captured static requested prefix is out of range".into());
-        }
-        self.project_requested(&self.requested()[..count], values, fallback)
-    }
-
     fn project_with_fallback(
         &self,
         values: &BTreeMap<u64, TensorData>,
@@ -398,6 +386,324 @@ impl CapturedStaticExecution {
 /// bytes or schedule identities.
 pub(crate) struct StaticLifetimePlan {
     capture: CapturedStaticExecution,
+    prepared_capture: PreparedCapturePlan,
+    resident_inputs: Vec<ReplayInput>,
+    state_inputs: Vec<ReplayInput>,
+    runtime_controls: Vec<ReplayInput>,
+    transient_inputs: Vec<ReplayInput>,
+    resident_ids: BTreeSet<u64>,
+}
+
+/// One logical requested output retained by a prepared static session without
+/// keeping its capture-owned model payloads alive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedCaptureOutput {
+    requested_id: u64,
+    source_id: u64,
+    shape: Shape,
+    dtype: DType,
+    bytes: usize,
+}
+
+impl PreparedCaptureOutput {
+    pub const fn requested_id(&self) -> u64 {
+        self.requested_id
+    }
+
+    pub const fn source_id(&self) -> u64 {
+        self.source_id
+    }
+
+    pub const fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    pub const fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    pub const fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// Prevalidated host index domain for one packed row-gather in a prepared
+/// static session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedQuantizedIndexDomain {
+    input_id: u64,
+    input_shape: Shape,
+    rows: usize,
+}
+
+impl PreparedQuantizedIndexDomain {
+    pub const fn input_id(&self) -> u64 {
+        self.input_id
+    }
+
+    pub const fn input_shape(&self) -> &Shape {
+        &self.input_shape
+    }
+
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
+/// Payload-free authenticated capture facts retained after a static device
+/// session has uploaded its immutable owners successfully.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedCaptureManifest {
+    capture_identity: u64,
+    inputs: Vec<ReplayInput>,
+    outputs: Vec<PreparedCaptureOutput>,
+    requested_passthroughs: Vec<RequestedPassthrough>,
+    quantized_constant_descriptors: BTreeMap<u64, QuantizedBufferDesc>,
+    quantized_index_domains: Vec<PreparedQuantizedIndexDomain>,
+    retained_constant_fallback_ids: Vec<u64>,
+}
+
+impl PreparedCaptureManifest {
+    pub const fn capture_identity(&self) -> u64 {
+        self.capture_identity
+    }
+
+    pub fn inputs(&self) -> &[ReplayInput] {
+        &self.inputs
+    }
+
+    pub fn outputs(&self) -> &[PreparedCaptureOutput] {
+        &self.outputs
+    }
+
+    pub fn requested_passthroughs(&self) -> &[RequestedPassthrough] {
+        &self.requested_passthroughs
+    }
+
+    pub fn quantized_constant_descriptors(&self) -> &BTreeMap<u64, QuantizedBufferDesc> {
+        &self.quantized_constant_descriptors
+    }
+
+    pub fn quantized_index_domains(&self) -> &[PreparedQuantizedIndexDomain] {
+        &self.quantized_index_domains
+    }
+
+    /// Exact dense capture constants that remain host-resident only because
+    /// they are requested directly or back a requested affine passthrough.
+    pub fn retained_constant_fallback_ids(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.retained_constant_fallback_ids.iter().copied()
+    }
+
+    fn project_requested(
+        &self,
+        count: usize,
+        values: &BTreeMap<u64, TensorData>,
+        fallback: &BTreeMap<u64, TensorData>,
+        constant_fallbacks: &BTreeMap<u64, TensorData>,
+    ) -> Result<Vec<TensorData>, String> {
+        if count > self.outputs.len() {
+            return Err("prepared capture requested prefix is out of range".into());
+        }
+        let passthroughs = self
+            .requested_passthroughs
+            .iter()
+            .map(|passthrough| (passthrough.requested.index() as u64, passthrough))
+            .collect::<BTreeMap<_, _>>();
+        let value = |id: u64| {
+            values
+                .get(&id)
+                .or_else(|| fallback.get(&id))
+                .or_else(|| constant_fallbacks.get(&id))
+        };
+        self.outputs[..count]
+            .iter()
+            .map(|output| {
+                if let Some(passthrough) = passthroughs.get(&output.requested_id) {
+                    let source = value(output.source_id).ok_or_else(|| {
+                        "prepared capture passthrough source is absent".to_string()
+                    })?;
+                    return passthrough
+                        .project(source)
+                        .map_err(|error| format!("prepared capture passthrough: {error}"));
+                }
+                value(output.source_id).cloned().ok_or_else(|| {
+                    format!(
+                        "prepared capture requested value {} is absent",
+                        output.requested_id
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
+struct PreparedCapturePlan {
+    capture_identity: u64,
+    inputs: Vec<ReplayInput>,
+    outputs: Vec<PreparedCaptureOutput>,
+    requested_passthroughs: Vec<RequestedPassthrough>,
+    quantized_constant_descriptors: BTreeMap<u64, QuantizedBufferDesc>,
+    quantized_index_domains: Vec<PreparedQuantizedIndexDomain>,
+    constant_fallback_ids: BTreeSet<u64>,
+}
+
+impl PreparedCapturePlan {
+    fn new(capture: &CapturedStaticExecution) -> Result<Self, String> {
+        let owned = capture
+            .owned_capture()
+            .ok_or_else(|| "prepared capture manifest requires owned capture backing".to_owned())?;
+        let passthroughs = owned
+            .requested_passthroughs
+            .iter()
+            .map(|passthrough| (passthrough.requested.index() as u64, passthrough))
+            .collect::<BTreeMap<_, _>>();
+        let outputs = owned
+            .requested
+            .iter()
+            .map(|requested| {
+                if let Some(passthrough) = passthroughs.get(requested) {
+                    let view =
+                        passthrough.desc.view.as_ref().ok_or_else(|| {
+                            "prepared capture passthrough view is absent".to_owned()
+                        })?;
+                    let bytes = view
+                        .logical_shape
+                        .numel()
+                        .map_err(|error| error.to_string())?
+                        .checked_mul(passthrough.desc.dtype.itemsize())
+                        .ok_or_else(|| "prepared capture output byte size overflows".to_owned())?;
+                    return Ok(PreparedCaptureOutput {
+                        requested_id: *requested,
+                        source_id: passthrough.source.index() as u64,
+                        shape: view.logical_shape.clone(),
+                        dtype: passthrough.desc.dtype,
+                        bytes,
+                    });
+                }
+                if let Some(desc) = owned
+                    .items
+                    .iter()
+                    .flat_map(|item| item.outputs.iter())
+                    .find(|desc| desc.id == *requested)
+                {
+                    return Ok(PreparedCaptureOutput {
+                        requested_id: *requested,
+                        source_id: *requested,
+                        shape: desc.shape.clone(),
+                        dtype: desc.dtype,
+                        bytes: desc.bytes,
+                    });
+                }
+                if let Some(input) = owned
+                    .inputs
+                    .iter()
+                    .find(|input| input.desc.id == *requested)
+                {
+                    return Ok(PreparedCaptureOutput {
+                        requested_id: *requested,
+                        source_id: *requested,
+                        shape: input.desc.shape.clone(),
+                        dtype: input.desc.dtype,
+                        bytes: input.desc.bytes,
+                    });
+                }
+                let value = owned.constants.get(requested).ok_or_else(|| {
+                    format!("prepared capture requested value {requested} has no descriptor")
+                })?;
+                let bytes = value
+                    .shape()
+                    .numel()
+                    .map_err(|error| error.to_string())?
+                    .checked_mul(value.dtype().itemsize())
+                    .ok_or_else(|| "prepared capture output byte size overflows".to_owned())?;
+                Ok(PreparedCaptureOutput {
+                    requested_id: *requested,
+                    source_id: *requested,
+                    shape: value.shape().clone(),
+                    dtype: value.dtype(),
+                    bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut constant_fallback_ids = owned
+            .requested
+            .iter()
+            .copied()
+            .filter(|id| owned.constants.contains_key(id))
+            .collect::<BTreeSet<_>>();
+        constant_fallback_ids.extend(
+            owned
+                .requested_passthroughs
+                .iter()
+                .map(|passthrough| passthrough.source.index() as u64)
+                .filter(|id| owned.constants.contains_key(id)),
+        );
+        let quantized_index_domains = owned
+            .items
+            .iter()
+            .filter_map(|item| {
+                let Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+                    item.kernel.operation()
+                else {
+                    return None;
+                };
+                Some(plan)
+            })
+            .map(|plan| {
+                plan.validate().map_err(|error| error.to_string())?;
+                Ok(PreparedQuantizedIndexDomain {
+                    input_id: plan.indices.index() as u64,
+                    input_shape: plan.indices_shape.clone(),
+                    rows: plan.weight_desc.logical_shape.dims()[0],
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self {
+            capture_identity: owned.identity,
+            inputs: owned.inputs.clone(),
+            outputs,
+            requested_passthroughs: owned.requested_passthroughs.clone(),
+            quantized_constant_descriptors: owned
+                .quantized_constants
+                .iter()
+                .map(|(id, value)| (*id, value.descriptor().clone()))
+                .collect(),
+            quantized_index_domains,
+            constant_fallback_ids,
+        })
+    }
+
+    fn finish(
+        self,
+        capture: &CapturedStaticExecution,
+    ) -> (PreparedCaptureManifest, BTreeMap<u64, TensorData>) {
+        let constant_fallbacks = self
+            .constant_fallback_ids
+            .iter()
+            .map(|id| (*id, capture.constants()[id].clone()))
+            .collect();
+        (
+            PreparedCaptureManifest {
+                capture_identity: self.capture_identity,
+                inputs: self.inputs,
+                outputs: self.outputs,
+                requested_passthroughs: self.requested_passthroughs,
+                quantized_constant_descriptors: self.quantized_constant_descriptors,
+                quantized_index_domains: self.quantized_index_domains,
+                retained_constant_fallback_ids: self
+                    .constant_fallback_ids
+                    .iter()
+                    .copied()
+                    .collect(),
+            },
+            constant_fallbacks,
+        )
+    }
+}
+
+pub(crate) struct PreparedStaticLifetimePlan {
+    manifest: PreparedCaptureManifest,
+    constant_fallbacks: BTreeMap<u64, TensorData>,
     resident_inputs: Vec<ReplayInput>,
     state_inputs: Vec<ReplayInput>,
     runtime_controls: Vec<ReplayInput>,
@@ -468,6 +774,7 @@ impl StaticLifetimePlan {
         if capture.owned_capture().is_none() {
             return Err("static lifetime plan requires owned capture backing".into());
         }
+        let prepared_capture = PreparedCapturePlan::new(&capture)?;
         let mut names = BTreeSet::new();
         for name in resident_names {
             if name.is_empty() || !names.insert(name.as_str()) {
@@ -533,6 +840,7 @@ impl StaticLifetimePlan {
             .collect();
         Ok(Self {
             capture,
+            prepared_capture,
             resident_inputs,
             state_inputs,
             runtime_controls,
@@ -586,40 +894,24 @@ impl StaticLifetimePlan {
         values: &BTreeMap<u64, TensorData>,
         allowed_missing: &BTreeSet<u64>,
     ) -> Result<(), StaticQuantizedGatherError> {
-        for item in &self.capture().items {
-            let Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
-                item.kernel.operation()
-            else {
-                continue;
-            };
-            let id = plan.indices.index() as u64;
-            let Some(indices) = values.get(&id) else {
-                if allowed_missing.contains(&id) {
-                    continue;
-                }
-                return Err(StaticQuantizedGatherError::Invalid(format!(
-                    "quantized row-gather indices {id} are absent"
-                )));
-            };
-            plan.validate()
-                .map_err(|error| StaticQuantizedGatherError::Invalid(error.to_string()))?;
-            let rows = plan.weight_desc.logical_shape.dims()[0];
-            validate_i32_index_domain(indices, &plan.indices_shape, rows).map_err(|error| {
-                match error {
-                    CheckedI32IndexError::Descriptor => StaticQuantizedGatherError::Invalid(
-                        "quantized row-gather index descriptor mismatch".into(),
-                    ),
-                    CheckedI32IndexError::IndexOutOfBounds { position, value } => {
-                        StaticQuantizedGatherError::IndexOutOfBounds {
-                            position,
-                            value,
-                            rows,
-                        }
-                    }
-                }
-            })?;
+        validate_quantized_index_domains(
+            &self.prepared_capture.quantized_index_domains,
+            values,
+            allowed_missing,
+        )
+    }
+
+    pub(crate) fn into_prepared(self) -> PreparedStaticLifetimePlan {
+        let (manifest, constant_fallbacks) = self.prepared_capture.finish(&self.capture);
+        PreparedStaticLifetimePlan {
+            manifest,
+            constant_fallbacks,
+            resident_inputs: self.resident_inputs,
+            state_inputs: self.state_inputs,
+            runtime_controls: self.runtime_controls,
+            transient_inputs: self.transient_inputs,
+            resident_ids: self.resident_ids,
         }
-        Ok(())
     }
 
     pub(crate) fn stage_resident(
@@ -655,6 +947,100 @@ impl StaticLifetimePlan {
             "initial Metal state",
         )?;
         Ok(values)
+    }
+
+    pub(crate) fn retain_projection_sources(
+        &self,
+        values: BTreeMap<u64, TensorData>,
+    ) -> BTreeMap<u64, TensorData> {
+        let mut required = self
+            .capture
+            .requested()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        required.extend(
+            self.capture
+                .passthroughs
+                .values()
+                .map(|alias| alias.source.index() as u64),
+        );
+        required.retain(|id| !self.capture.constants().contains_key(id));
+        values
+            .into_iter()
+            .filter(|(id, _)| required.contains(id))
+            .collect()
+    }
+}
+
+fn validate_quantized_index_domains(
+    domains: &[PreparedQuantizedIndexDomain],
+    values: &BTreeMap<u64, TensorData>,
+    allowed_missing: &BTreeSet<u64>,
+) -> Result<(), StaticQuantizedGatherError> {
+    for domain in domains {
+        let id = domain.input_id;
+        let Some(indices) = values.get(&id) else {
+            if allowed_missing.contains(&id) {
+                continue;
+            }
+            return Err(StaticQuantizedGatherError::Invalid(format!(
+                "quantized row-gather indices {id} are absent"
+            )));
+        };
+        validate_i32_index_domain(indices, &domain.input_shape, domain.rows).map_err(|error| {
+            match error {
+                CheckedI32IndexError::Descriptor => StaticQuantizedGatherError::Invalid(
+                    "quantized row-gather index descriptor mismatch".into(),
+                ),
+                CheckedI32IndexError::IndexOutOfBounds { position, value } => {
+                    StaticQuantizedGatherError::IndexOutOfBounds {
+                        position,
+                        value,
+                        rows: domain.rows,
+                    }
+                }
+            }
+        })?;
+    }
+    Ok(())
+}
+
+impl PreparedStaticLifetimePlan {
+    pub(crate) fn manifest(&self) -> &PreparedCaptureManifest {
+        &self.manifest
+    }
+
+    pub(crate) fn resident_inputs(&self) -> &[ReplayInput] {
+        &self.resident_inputs
+    }
+
+    pub(crate) fn state_inputs(&self) -> &[ReplayInput] {
+        &self.state_inputs
+    }
+
+    pub(crate) fn transient_inputs(&self) -> &[ReplayInput] {
+        &self.transient_inputs
+    }
+
+    pub(crate) fn runtime_controls(&self) -> &[ReplayInput] {
+        &self.runtime_controls
+    }
+
+    pub(crate) fn resident_ids(&self) -> &BTreeSet<u64> {
+        &self.resident_ids
+    }
+
+    pub(crate) fn validate_quantized_gathers(
+        &self,
+        values: &BTreeMap<u64, TensorData>,
+        allowed_missing: &BTreeSet<u64>,
+    ) -> Result<(), StaticQuantizedGatherError> {
+        validate_quantized_index_domains(
+            &self.manifest.quantized_index_domains,
+            values,
+            allowed_missing,
+        )
     }
 
     pub(crate) fn stage_transient(
@@ -707,7 +1093,12 @@ impl StaticLifetimePlan {
         values: &BTreeMap<u64, TensorData>,
         resident_sources: &BTreeMap<u64, TensorData>,
     ) -> Result<Vec<TensorData>, String> {
-        self.capture.project_with_fallback(values, resident_sources)
+        self.manifest.project_requested(
+            self.manifest.outputs.len(),
+            values,
+            resident_sources,
+            &self.constant_fallbacks,
+        )
     }
 
     pub(crate) fn project_prefix(
@@ -716,30 +1107,8 @@ impl StaticLifetimePlan {
         values: &BTreeMap<u64, TensorData>,
         resident_sources: &BTreeMap<u64, TensorData>,
     ) -> Result<Vec<TensorData>, String> {
-        self.capture.project_prefix(count, values, resident_sources)
-    }
-
-    pub(crate) fn retain_projection_sources(
-        &self,
-        values: BTreeMap<u64, TensorData>,
-    ) -> BTreeMap<u64, TensorData> {
-        let mut required = self
-            .capture
-            .requested()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        required.extend(
-            self.capture
-                .passthroughs
-                .values()
-                .map(|alias| alias.source.index() as u64),
-        );
-        required.retain(|id| !self.capture.constants().contains_key(id));
-        values
-            .into_iter()
-            .filter(|(id, _)| required.contains(id))
-            .collect()
+        self.manifest
+            .project_requested(count, values, resident_sources, &self.constant_fallbacks)
     }
 }
 
@@ -4820,6 +5189,7 @@ mod tests {
             .unwrap();
         assert!(resident.contains_key(&(weight.index() as u64)));
         assert!(resident.contains_key(&(constant.index() as u64)));
+        let lifetime = lifetime.into_prepared();
         let values = lifetime
             .stage_transient(&BTreeMap::from([(
                 "input".into(),
@@ -4865,6 +5235,7 @@ mod tests {
         .unwrap();
         assert!(lifetime.transient_inputs().is_empty());
         assert_eq!(lifetime.runtime_controls(), std::slice::from_ref(&control));
+        let lifetime = lifetime.into_prepared();
         let mut values = lifetime.stage_transient(&BTreeMap::new()).unwrap();
         assert_eq!(
             lifetime.stage_committed_position(7, &mut values).unwrap(),

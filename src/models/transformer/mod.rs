@@ -48,7 +48,9 @@ pub use metal_generation::{
     LlamaMetalGeneration, LlamaMetalGenerationError, LlamaMetalGenerationStage, LlamaMetalPlan,
     LlamaMetalPrefill, LlamaMetalProgress, LlamaMetalPromptOutput, LlamaMetalSession,
 };
-pub use metal_greedy_generation::{LlamaMetalGreedyPlan, LlamaMetalGreedySession};
+pub use metal_greedy_generation::{
+    LlamaMetalGreedyPlan, LlamaMetalGreedyPlanBuilder, LlamaMetalGreedySession,
+};
 pub use metal_scoreboard::{
     LLAMA_METAL_EXECUTION_SCOREBOARD_FORMAT_VERSION, LlamaMetalExecutionScoreboardReport,
     LlamaMetalScoreboardInvocation, LlamaMetalScoreboardPhase, LlamaMetalScoreboardPhaseAggregate,

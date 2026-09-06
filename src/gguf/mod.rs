@@ -6,7 +6,7 @@
 //! dequantization; other quantized layouts remain opaque.
 
 use crate::{DType, TensorData};
-use std::{collections::BTreeMap, error, fmt};
+use std::{collections::BTreeMap, error, fmt, sync::Arc};
 
 mod metadata;
 mod quantization;
@@ -280,6 +280,48 @@ impl<'a> GgufFile<'a> {
             self.bytes[range.clone()].to_vec(),
             self.alignment,
             range.start,
+        )
+        .map_err(|_| {
+            GgufError::new(
+                GgufErrorKind::QuantizedMaterialization {
+                    tensor: name.to_owned(),
+                    kind: tensor.ggml_type(),
+                },
+                range.start,
+            )
+        })
+    }
+
+    /// Retains a validated tensor range from the exact immutable owner backing
+    /// this borrowed GGUF view. This is reserved for local-file workflows that
+    /// already own the complete file bytes.
+    pub(crate) fn quantized_tensor_from_shared_owner(
+        &self,
+        name: &str,
+        owner: Arc<Vec<u8>>,
+    ) -> Result<QuantizedTensorData, GgufError> {
+        let tensor = self.tensor(name).ok_or_else(|| {
+            GgufError::new(
+                GgufErrorKind::TensorNotFound(name.to_owned()),
+                self.data_offset,
+            )
+        })?;
+        let range = tensor.raw_range();
+        if owner.len() != self.bytes.len() || owner.as_ptr() != self.bytes.as_ptr() {
+            return Err(GgufError::new(
+                GgufErrorKind::QuantizedMaterialization {
+                    tensor: name.to_owned(),
+                    kind: tensor.ggml_type(),
+                },
+                range.start,
+            ));
+        }
+        QuantizedTensorData::from_shared_aligned_bytes(
+            tensor.ggml_type(),
+            tensor.shape().clone(),
+            owner,
+            range.clone(),
+            self.alignment,
         )
         .map_err(|_| {
             GgufError::new(

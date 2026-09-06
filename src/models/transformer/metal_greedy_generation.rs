@@ -6,7 +6,8 @@ use super::{
     LlamaMetalPromptOutput, LlamaPromptWorkflow,
     metal_generation::{
         LlamaMetalEvidenceInputs, LlamaMetalPrefillSession, build_workload_evidence,
-        execution_scoreboard_report, observe_scoreboard_run, progress, scoreboard_recording_error,
+        execution_scoreboard_report, observe_scoreboard_run, progress, reset_llama_sequence,
+        scoreboard_recording_error,
     },
     metal_scoreboard::{
         LlamaMetalExecutionScoreboardReport, LlamaMetalScoreboardInvocation,
@@ -22,12 +23,28 @@ use crate::{
     CapturedSchedule, ExecutionPlanSummary, ReplayInput,
     runtime::metal::{
         MetalDevice, MetalDeviceInfo, MetalDevicePreparationReport, MetalDeviceRunReport,
-        MetalDeviceSessionSummary, MetalPlanOptions, MetalScoreboardContext, MetalScoreboardError,
-        MetalSessionScoreboard, RenderedMetal,
+        MetalDeviceSessionSummary, MetalPlanOptions, MetalPreparedCaptureManifest,
+        MetalScoreboardContext, MetalScoreboardError, MetalSessionScoreboard, RenderedMetal,
     },
     tokenizer::SimpleTokenizer,
 };
 use std::num::NonZeroUsize;
+
+/// Typed, resource-free configuration for one selected-device greedy Llama
+/// deployment.
+///
+/// [`Self::build`] captures and renders an inspectable
+/// [`LlamaMetalGreedyPlan`], but it does not create buffers, compile pipelines,
+/// or upload model state. Callers retain the explicit choice between
+/// [`LlamaMetalGreedyPlan::prepare`] and
+/// [`LlamaMetalGreedyPlan::prepare_with_scoreboard`] after inspecting that
+/// plan.
+pub struct LlamaMetalGreedyPlanBuilder {
+    workflow: LlamaPromptWorkflow,
+    selected_device: MetalDevice,
+    options: MetalPlanOptions,
+    prefill_span_rows: Option<NonZeroUsize>,
+}
 
 /// Resource-free Llama deployment whose token-step capture publishes only a
 /// finite-guarded greedy I32 token.
@@ -53,7 +70,61 @@ pub struct LlamaMetalGreedySession {
     chat_template: LlamaChatTemplate,
 }
 
+impl LlamaMetalGreedyPlanBuilder {
+    /// Binds a validated workflow to one selected device without creating any
+    /// session resources.
+    pub fn new(workflow: LlamaPromptWorkflow, device: &MetalDevice) -> Self {
+        Self {
+            workflow,
+            selected_device: device.clone(),
+            options: MetalPlanOptions::default(),
+            prefill_span_rows: None,
+        }
+    }
+
+    /// Replaces the renderer options used when the inspectable plan is built.
+    pub fn with_plan_options(mut self, options: MetalPlanOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Adds the existing fixed-span, state-only prompt program. A span of one
+    /// retains the exact token-step-only plan.
+    pub fn with_prefill_span(mut self, span_rows: NonZeroUsize) -> Self {
+        self.prefill_span_rows = Some(span_rows);
+        self
+    }
+
+    /// Captures the resource-free plan for inspection before any buffers,
+    /// pipelines, uploads, or command queue are created.
+    pub fn build(self) -> Result<LlamaMetalGreedyPlan, LlamaMetalGenerationError> {
+        match self.prefill_span_rows {
+            Some(span_rows) => LlamaMetalGreedyPlan::from_workflow_with_prefill_span(
+                self.workflow,
+                &self.selected_device,
+                self.options,
+                span_rows,
+            ),
+            None => LlamaMetalGreedyPlan::from_workflow(
+                self.workflow,
+                &self.selected_device,
+                self.options,
+            ),
+        }
+    }
+}
+
 impl LlamaMetalGreedyPlan {
+    /// Starts a zero-fallback greedy deployment for one validated workflow and
+    /// explicitly selected device. Building retains the resource-free plan
+    /// inspection boundary before either preparation mode creates resources.
+    pub fn builder(
+        workflow: LlamaPromptWorkflow,
+        device: &MetalDevice,
+    ) -> LlamaMetalGreedyPlanBuilder {
+        LlamaMetalGreedyPlanBuilder::new(workflow, device)
+    }
+
     pub fn from_workflow(
         workflow: LlamaPromptWorkflow,
         device: &MetalDevice,
@@ -378,8 +449,12 @@ impl LlamaMetalGreedySession {
             .map(LlamaMetalPrefillSession::compiled_kernels)
     }
 
-    pub fn capture(&self) -> &CapturedSchedule {
-        self.step.metal_session().capture()
+    pub fn capture_identity(&self) -> u64 {
+        self.step.metal_session().capture_identity()
+    }
+
+    pub fn capture_manifest(&self) -> &MetalPreparedCaptureManifest {
+        self.step.metal_session().capture_manifest()
     }
 
     pub fn resident_inputs(&self) -> &[ReplayInput] {
@@ -404,6 +479,31 @@ impl LlamaMetalGreedySession {
 
     pub const fn successful_invocation_count(&self) -> u64 {
         self.successful_invocations
+    }
+
+    /// Reuses the prepared zero-fallback model for an independent sequence
+    /// without driver work or K/V clearing. The sealed Llama graphs mask
+    /// attention to `absolute_position <= query_position`, and each newly
+    /// visible row is overwritten before attention, so stale later rows remain
+    /// unobservable. Preparation and successful-invocation counters remain
+    /// cumulative.
+    pub fn reset_sequence(&mut self) -> Result<(), LlamaMetalGenerationError> {
+        reset_llama_sequence(
+            &mut self.step,
+            &mut self.prefill,
+            &mut self.committed_position,
+            self.scoreboard_invocations.is_some(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sequence_component_positions(&self) -> (usize, Option<usize>) {
+        (
+            self.step.position(),
+            self.prefill
+                .as_ref()
+                .map(LlamaMetalPrefillSession::committed_position),
+        )
     }
 
     pub fn max_context(&self) -> usize {

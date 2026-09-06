@@ -2784,8 +2784,15 @@ all source-compatible validation but no Metal work.
 
 `LlamaMetalGreedyPlan` and `LlamaMetalGreedySession` are the parallel public
 prompt-to-tokens/text/chat facade for deterministic greedy selection without a
-host logits transfer. Their T=1 step appends a finite guard and last-axis
-`ArgMax` to the same dense-or-packed Llama body. The graph returns the
+host logits transfer. `LlamaMetalGreedyPlan::builder` returns a typed
+`LlamaMetalGreedyPlanBuilder` bound to one explicitly selected device.
+The builder defaults the renderer policy, accepts an optional nonzero fixed
+prefill span, and produces the same inspectable resource-free plan as the
+explicit constructors. It deliberately stops at the plan boundary: callers
+inspect capture, rendering, schemas, device ownership, and zero-fallback facts
+before explicitly choosing ordinary or scoreboard-bound preparation. Their T=1
+step appends a finite guard and last-axis `ArgMax` to the same dense-or-packed
+Llama body. The graph returns the
 first-occurrence greedy index only when every logits lane is finite; otherwise
 it returns a negative sentinel. Before logical state, position, metrics, or the
 selected token commit, the Metal session proves that the single downloaded I32
@@ -2806,15 +2813,20 @@ Therefore a later launch, wait, read, selection, or decode failure cannot
 promise whole-call rollback. Typed errors instead retain the prompt/decode
 stage, token offset, committed device position, already selected generated IDs,
 and every successful run report, while the failed token leaves the current row
-retryable. High-level
-prompt/text/chat generation requires a fresh session; `prefill_ids` and
-`run_token` remain explicit continuation seams. The current evidence is
-protected semantic-mock execution, not a live-device or performance result.
+retryable. High-level prompt/text/chat generation requires a fresh logical
+sequence; `reset_sequence` reuses the prepared device deployment for the next
+independent sequence, while `prefill_ids` and `run_token` remain explicit
+continuation seams. The current evidence is protected semantic-mock execution,
+not a live-device or performance result.
 
-Packed bytes are immutable `Arc<[u8]>` payloads: model, capture, and prepared
-session ownership clone handles rather than full weights. Capture identity
-still hashes exact content and descriptors, and preparation uploads each
-unique packed owner once even when tied bindings reference it more than once.
+Packed bytes use immutable `Arc<Vec<u8>>` owner-plus-range views: a path-loaded
+GGUF moves the ordinary file-read allocation into one full-file owner without
+per-tensor packed copies, while the borrowed in-memory API preserves standalone
+tensor owners. Model, capture, and prepared-session ownership clone handles
+rather than full weights. Capture identity still hashes only the exact tensor
+bytes and descriptor, and preparation uploads each unique packed value once
+even when tied bindings reference it more than once. This is owned file I/O,
+not mmap or a zero-copy file-read claim.
 
 This boundary is concrete, pure, static inference only. Symbolic programs,
 effects, RNG state, mutable training state, dynamically

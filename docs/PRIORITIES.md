@@ -109,6 +109,12 @@ numerical acceptance checked in, hardware evidence pending.
 `MetalDeviceSessionPlan` authenticates one concrete pure capture and an
 explicit resident/transient input partition before resources. Preparation
 uploads immutable weights once and owns persistent slots, pipelines, and queue;
+the resource-free plan retains exact byte-bearing capture inspection, while a
+successful upload consumes it into a prepared manifest containing only capture
+identity, input/output/passthrough and packed descriptors, prevalidated packed
+index domains, and genuinely requested dense constant fallbacks. Prepared
+sessions therefore release all other dense constants and all packed host
+owners; failed preparation publishes neither the transition nor a session.
 repeated synchronous runs stage only transients, download requested outputs,
 expose truthful host-API/planned metrics, and have no CPU fallback. Protected
 acceptance now takes the complete default Eval/F32 ResNet-18 `[1,3,224,224]`
@@ -237,7 +243,19 @@ facade bind separate authenticated recorders to the shared fixed-prefill and
 T=1 programs, then publish one ordered Llama execution scoreboard v2 without
 inventing a shared physical-session identity. The public greedy CLI now records
 that same envelope while retaining only one checked I32 token per selecting
-invocation; the host-logits/Gumbel API remains separate. Its checked
+invocation; the host-logits/Gumbel API remains separate. Public
+`LlamaMetalGreedyPlan::builder` and its typed builder preserve the
+resource-free plan inspection boundary while removing constructor branching for
+default versus fixed-span prompt deployment. Ordinary and scoreboard-bound
+preparation remain explicit, mutually visible choices on the completed plan.
+Public
+`reset_sequence` surfaces let both prepared high-level sessions begin
+independent sequences without driver allocation, upload, compilation, or queue
+work. Successful-run and transfer counters remain cumulative while causal
+position is logically rewound; stale later K/V rows remain causally masked,
+and each newly visible row is overwritten before attention can read it.
+Scoreboard-bound sessions reject reset atomically so each evidence envelope
+remains single-sequence. Its checked
 prompt/decode phase accounting is ready for live evidence capture, but remaining
 work still proves live-device output agreement and publishes measured
 prompt/decode performance; the current scoreboard is host-observed execution
@@ -322,9 +340,11 @@ why an unsupported model or template is rejected.
 **Evidence.** `LlamaPromptWorkflow` and `examples/llama_prompt.rs` provide a
 documented local-file route from checked GGUF through fixed-schema Llama
 binding, tokenizer, exact supported chat rendering, CPU graph generation, and
-decoded greedy text. Its fixture acceptance covers deterministic prompt/token/
-text output, context rejection without a later-output leak, and malformed GGUF
-rejection. The explicit `--native` route uses
+decoded greedy text. Path loading retains one immutable full-file byte owner;
+every packed model tensor holds only its validated range, while the borrowed
+byte API preserves standalone tensor ownership. Its fixture acceptance covers
+deterministic prompt/token/text output, context rejection without a later-output
+leak, and malformed GGUF rejection. The explicit `--native` route uses
 `LlamaPromptWorkflow::generate_chat_native` and strict native replay with no
 CPU fallback; its fixture acceptance compares deterministic tokens/text with
 the CPU route and checks resource-free native stage evidence.
