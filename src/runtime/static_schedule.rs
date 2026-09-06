@@ -1672,7 +1672,8 @@ pub(crate) struct StaticSchedulePlan<R> {
 }
 
 /// Runtime-only proof that one internal Gather consumes an affine expansion
-/// of a host-validated scalar-or-fixed batch-one I32 transient.
+/// of a host-validated I32 transient. Each authentication boundary separately
+/// constrains the admitted physical and logical shapes.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct StaticHostGather {
     pub(crate) input: u64,
@@ -1733,7 +1734,7 @@ fn authenticate_host_index_producer(
     index: u64,
     index_shape: &Shape,
     consumers: &[&ScheduleItem],
-    allow_flattened_batch_one: bool,
+    allow_flattened_fixed_matrix: bool,
 ) -> Result<(), String> {
     index_item
         .kernel
@@ -1843,7 +1844,13 @@ fn authenticate_host_index_producer(
         .shape
         .numel()
         .map_err(|error| error.to_string())?;
-    let canonical_fixed_axes = input_elements > 1
+    let matrix_dims = input_desc.shape.dims();
+    let fixed_matrix = input_desc.shape.rank() == 2
+        && matrix_dims.iter().all(|extent| *extent != 0)
+        && matrix_dims[0]
+            .checked_mul(matrix_dims[1])
+            .is_some_and(|elements| elements == input_elements);
+    let canonical_batch_one_axes = input_elements > 1
         && input_desc.shape.dims() == [1, input_elements]
         && index_shape.rank() == 3
         && index_shape.dims()[..2] == [1, input_elements]
@@ -1854,12 +1861,11 @@ fn authenticate_host_index_producer(
         && !normalized.axes[1].reversed
         && normalized.axes[2].stride == 0
         && !normalized.axes[2].reversed;
-    let canonical_flattened_fixed_axes = input_elements > 1
-        && input_desc.shape.dims() == [1, input_elements]
+    let canonical_flattened_fixed_axes = fixed_matrix
         && index_shape.rank() == 2
         && index_shape.dims()[0] == input_elements
         && normalized.axes.len() == 2
-        && normalized.axes[0].stride == 1
+        && normalized.axes[0].stride == usize::from(input_elements > 1)
         && !normalized.axes[0].reversed
         && normalized.axes[1].stride == 0
         && !normalized.axes[1].reversed;
@@ -1920,9 +1926,8 @@ fn authenticate_host_index_producer(
             .iter()
             .any(|item| !item.dependencies.contains(&index_item.id))
         || normalized.offset != 0
-        || !(canonical_scalar_axes
-            || canonical_fixed_axes
-            || allow_flattened_batch_one && canonical_flattened_fixed_axes)
+        || !((!allow_flattened_fixed_matrix && (canonical_scalar_axes || canonical_batch_one_axes))
+            || (allow_flattened_fixed_matrix && canonical_flattened_fixed_axes))
     {
         return Err("host Gather index affine provenance is inconsistent".into());
     }

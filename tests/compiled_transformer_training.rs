@@ -19,7 +19,9 @@ use std::{env, fs::OpenOptions, io::Write, path::PathBuf};
 
 const VOCAB: usize = 3;
 const EMBEDDING: usize = 2;
+const BATCH: usize = 2;
 const TIME: usize = 3;
+const TOKEN_COUNT: usize = BATCH * TIME;
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -114,9 +116,9 @@ fn config() -> CompiledAdamWConfig {
         .unwrap()
         .with_loss_scale(128.0)
         .unwrap()
-        .with_host_token_input("tokens", [1, TIME])
+        .with_host_token_input("tokens", [BATCH, TIME])
         .unwrap()
-        .with_input("targets", [1, TIME], DType::I32)
+        .with_input("targets", [BATCH, TIME], DType::I32)
         .unwrap()
 }
 
@@ -127,8 +129,8 @@ fn build(
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
     let logits = model.forward(graph, inputs["tokens"], dropout)?;
-    let flat_logits = graph.reshape(logits, [TIME, VOCAB])?;
-    let flat_targets = graph.reshape(inputs["targets"], [TIME])?;
+    let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
+    let flat_targets = graph.reshape(inputs["targets"], [TOKEN_COUNT])?;
     let loss = cross_entropy(
         graph,
         flat_logits,
@@ -146,17 +148,17 @@ fn dropout_config() -> CompiledDropoutConfig {
 }
 
 fn batch() -> BTreeMap<String, TensorData> {
-    let tensor = |values: [i32; TIME]| {
+    let tensor = |values: [i32; TOKEN_COUNT]| {
         TensorData::from_scalars(
-            Shape::new([1, TIME]),
+            Shape::new([BATCH, TIME]),
             DType::I32,
             values.into_iter().map(|value| Scalar::I(i64::from(value))),
         )
         .unwrap()
     };
     BTreeMap::from([
-        ("tokens".into(), tensor([0, 1, 2])),
-        ("targets".into(), tensor([1, 2, 0])),
+        ("tokens".into(), tensor([0, 1, 2, 2, 0, 1])),
+        ("targets".into(), tensor([1, 2, 0, 0, 1, 2])),
     ])
 }
 
@@ -166,7 +168,7 @@ fn learning_rate() -> TensorData {
 
 fn evaluate(model: &TinyCausalTransformer) -> TensorData {
     let mut graph = Graph::new();
-    let tokens = graph.input_dtype("tokens", [1, TIME], DType::I32);
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
     let logits = model.forward_eval(&mut graph, tokens).unwrap();
     let mut bindings = model.input_bindings(&graph).unwrap();
     bindings.insert("tokens".into(), batch().remove("tokens").unwrap());
@@ -187,13 +189,15 @@ fn owned_compiled_transformer(
 fn run_exact_resume<R, P>(mut prepare: P) -> Vec<f64>
 where
     R: CompiledAdamWRuntime,
-    P: FnMut(&CompiledAdamWPlan) -> Result<R>,
+    P: FnMut(
+        CompiledModuleAdamWPlan<TinyCausalTransformer>,
+    ) -> Result<rustgrad::CompiledModuleAdamWSession<TinyCausalTransformer, R>>,
 {
     let model = TinyCausalTransformer::new(7).unwrap();
     assert!(model.block.is_causal());
-    let plan = compiled_transformer(&model);
+    let plan = owned_compiled_transformer(model);
     let capture_identity = plan.capture_identity();
-    let mut uninterrupted = prepare(&plan).unwrap();
+    let mut uninterrupted = prepare(plan).unwrap();
     assert!(
         uninterrupted
             .parameter_snapshots()
@@ -219,21 +223,22 @@ where
                 .as_f64(),
         );
     }
-
     let saved = uninterrupted.checkpoint().unwrap();
     let checkpoint = CompiledAdamWCheckpoint::from_bytes(saved.into_bytes()).unwrap();
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
-    let resumed_plan = CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+    let tied = resumed_model.tokens.weight.clone();
+    let frozen = resumed_model.frozen_scale.clone();
+    let resumed_plan = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
         config(),
         dropout_config(),
-        &resumed_model,
+        resumed_model,
         &checkpoint,
         build,
     )
     .unwrap();
     assert_eq!(resumed_plan.capture_identity(), capture_identity);
     assert_eq!(resumed_plan.step_count(), 4);
-    let mut resumed = prepare(&resumed_plan).unwrap();
+    let mut resumed = prepare(resumed_plan).unwrap();
 
     for _ in 0..4 {
         let expected = uninterrupted.step(batch(), learning_rate()).unwrap();
@@ -243,7 +248,6 @@ where
         assert_eq!(actual.step(), expected.step());
         losses.push(expected.loss().scalar_at(0).as_f64());
     }
-
     assert_eq!(
         resumed.parameter_snapshots().unwrap(),
         uninterrupted.parameter_snapshots().unwrap()
@@ -260,46 +264,24 @@ where
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
     );
-    let runtime_checkpoint = resumed.checkpoint().unwrap();
-    let runtime_progress = (
-        resumed.step_count(),
-        resumed.optimizer_step().unwrap(),
-        resumed.accumulation_index().unwrap(),
-    );
     let published = resumed.parameter_snapshots().unwrap();
-    let frozen_before = resumed_model.frozen_scale.snapshot().unwrap();
-    let before_versions = resumed_model
-        .trainable_parameters()
-        .unwrap()
-        .into_iter()
-        .map(|(name, parameter)| (name, parameter.version().unwrap()))
-        .collect::<BTreeMap<_, _>>();
-    assert!(
-        resumed
-            .publish_parameters(&resumed_model)
-            .unwrap()
-            .is_clean()
-    );
+    let tied_version = tied.version().unwrap();
+    let frozen_before = frozen.snapshot().unwrap();
+    let _uninterrupted_model = uninterrupted.finish().unwrap();
+    let resumed_model = resumed.finish().unwrap();
     let live = resumed_model.state_dict().unwrap();
     for (name, value) in &published {
         assert_eq!(&live.tensors()[name], value);
     }
     assert!(!live.tensors().contains_key("lm_head.weight"));
-    for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
-        assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
-    }
+    assert_eq!(resumed_model.tokens.weight.id(), tied.id());
+    assert_eq!(
+        resumed_model.tokens.weight.version().unwrap(),
+        tied_version + 1
+    );
     let frozen_after = resumed_model.frozen_scale.snapshot().unwrap();
     assert_eq!(frozen_after.data, frozen_before.data);
     assert_eq!(frozen_after.version, frozen_before.version);
-    assert_eq!(resumed.checkpoint().unwrap(), runtime_checkpoint);
-    assert_eq!(
-        (
-            resumed.step_count(),
-            resumed.optimizer_step().unwrap(),
-            resumed.accumulation_index().unwrap(),
-        ),
-        runtime_progress
-    );
     let versions_before_eval = resumed_model
         .trainable_parameters()
         .unwrap()
@@ -308,6 +290,7 @@ where
         .collect::<BTreeMap<_, _>>();
     let first_eval = evaluate(&resumed_model);
     let second_eval = evaluate(&resumed_model);
+    assert_eq!(first_eval.shape(), &Shape::new([BATCH, TIME, VOCAB]));
     assert_eq!(first_eval, second_eval);
     assert!(
         (0..first_eval.shape().numel().unwrap())
@@ -354,7 +337,8 @@ fn assert_strict_dropout_kernels(plan: &MetalCompiledAdamWPlan) {
 #[test]
 fn compiled_transformer_plan_cpu_target_decreases_loss_and_resumes_exactly() {
     let target = CpuSessionTarget::new();
-    let losses = run_exact_resume(|plan| plan.prepare(&target));
+    let losses =
+        run_exact_resume(|plan| plan.prepare(&target).map_err(|error| error.into_parts().1));
 
     assert!(
         losses.last().unwrap() < losses.first().unwrap(),
@@ -452,16 +436,18 @@ fn compiled_transformer_dropout_is_keyed_replay_varying_and_zero_grad_is_not_a_d
     let mut right = compiled_transformer(&right_model).prepare_cpu().unwrap();
     let mut replay_losses = Vec::new();
 
-    for replay in 1..=3 {
+    for replay in 1..=8 {
         let left_step = left.step(batch(), TensorData::scalar(0.0)).unwrap();
         let right_step = right.step(batch(), TensorData::scalar(0.0)).unwrap();
         assert_eq!(left_step.loss(), right_step.loss());
         assert_eq!(left_step.outputs(), right_step.outputs());
         replay_losses.push(left_step.loss().clone());
-        assert_eq!(left.dropout_block_counter().unwrap(), Some(replay * 6));
-        assert_eq!(right.dropout_block_counter().unwrap(), Some(replay * 6));
+        assert_eq!(left.dropout_block_counter().unwrap(), Some(replay * 12));
+        assert_eq!(right.dropout_block_counter().unwrap(), Some(replay * 12));
     }
     assert_ne!(replay_losses[0], replay_losses[1]);
+    assert_eq!(left.dropout_block_counter().unwrap(), Some(96));
+    assert_eq!(right.dropout_block_counter().unwrap(), Some(96));
     let before = left.dropout_block_counter().unwrap();
     assert!(!left.zero_grad().unwrap().did_discard());
     assert_eq!(left.dropout_block_counter().unwrap(), before);
@@ -500,7 +486,7 @@ fn compiled_transformer_plan_is_strictly_renderable_for_metal() {
     let compiled = compiled_transformer(&model);
     assert_eq!(compiled.loss_scale(), 128.0);
     assert_eq!(compiled.dropout_config(), Some(dropout_config()));
-    assert_eq!(compiled.dropout_blocks_per_replay(), Some(6));
+    assert_eq!(compiled.dropout_blocks_per_replay(), Some(12));
     let parameter_count = compiled
         .prepare(&CpuSessionTarget::new())
         .unwrap()
@@ -520,6 +506,20 @@ fn compiled_transformer_plan_is_strictly_renderable_for_metal() {
     assert_eq!(plan.summary().requested_output_count, 1);
     assert!(plan.summary().nonzero_item_count > 0);
     assert_strict_dropout_kernels(&plan);
+    let authenticated = plan
+        .rendered_items()
+        .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
+        .collect::<Vec<_>>();
+    assert_eq!(authenticated.len(), 2);
+    assert!(authenticated.iter().all(|item| {
+        item.transaction.is_none()
+            && item.indexed_movement().is_none()
+            && !item.source.contains("rg_status")
+    }));
+    assert!(
+        plan.rendered_items()
+            .all(|item| item.transaction.is_none() && item.indexed_movement().is_none())
+    );
     assert_eq!(
         plan.rendered_items().len(),
         plan.summary().nonzero_item_count
@@ -568,6 +568,8 @@ impl LiveTrainingTotals {
         logical_state_bytes: usize,
         planned_kernel_count: usize,
         expected_command_count: usize,
+        expected_transient_h2d_calls: usize,
+        expected_transient_h2d_bytes: usize,
     ) {
         let output_multiplier = if observed { 1 } else { 0 };
         assert_eq!(report.output_count, output_multiplier);
@@ -579,8 +581,8 @@ impl LiveTrainingTotals {
         assert_eq!(report.kernel_launch_count, planned_kernel_count);
         assert_eq!(report.command_submission_count, expected_command_count);
         assert_eq!(report.command_wait_count, expected_command_count);
-        assert_eq!(report.transient_h2d_calls, 3);
-        assert_eq!(report.transient_h2d_bytes, 28);
+        assert_eq!(report.transient_h2d_calls, expected_transient_h2d_calls);
+        assert_eq!(report.transient_h2d_bytes, expected_transient_h2d_bytes);
         self.kernel_launch_count += report.kernel_launch_count;
         self.command_submission_count += report.command_submission_count;
         self.command_wait_count += report.command_wait_count;
@@ -630,7 +632,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let device_info = device.info().clone();
 
     let model = TinyCausalTransformer::new(7).unwrap();
-    let seed = compiled_transformer(&model);
+    let seed = owned_compiled_transformer(model);
     let capture_identity = seed.capture_identity();
     let target = MetalSessionTarget::new(device.clone(), 64)
         .expect("selected device must produce its exact renderer identity")
@@ -642,36 +644,91 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
             )
             .unwrap(),
         );
-    let rendered = seed
-        .metal_plan(target.renderer().clone())
+    let summary = seed
+        .metal_summary(target.renderer().clone())
         .expect("the complete training capture must be entirely Metal-admitted");
-    assert_eq!(rendered.capture_identity(), capture_identity);
-    assert_eq!(rendered.loss_scale(), 128.0);
-    assert_eq!(rendered.summary().fallback_count, 0);
-    assert!(rendered.summary().nonzero_item_count > 0);
-    assert_strict_dropout_kernels(&rendered);
-    let deployment_identity = rendered.deployment_identity();
-    let state_pair_count = rendered.summary().state_pair_count;
-    let logical_state_bytes = rendered.summary().logical_state_bytes;
+    assert_eq!(summary.fallback_count, 0);
+    assert!(summary.nonzero_item_count > 0);
+    let state_pair_count = summary.state_pair_count;
+    let logical_state_bytes = summary.logical_state_bytes;
     assert_eq!(state_pair_count, 59);
     assert_eq!(logical_state_bytes, 784);
-    assert_eq!(rendered.summary().state_bank_count, 2);
-    assert_eq!(rendered.summary().state_device_bytes, 1_568);
-    let planned_kernel_count = rendered.summary().nonzero_item_count;
-    let authenticated_host_indexed_movement_item_count = rendered
-        .rendered_items()
-        .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
-        .count();
-    assert_eq!(authenticated_host_indexed_movement_item_count, 2);
-    assert!(
-        rendered
-            .rendered_items()
-            .all(|item| { item.transaction.is_none() && item.indexed_movement().is_none() })
-    );
+    assert_eq!(summary.state_bank_count, 2);
+    assert_eq!(summary.state_device_bytes, 1_568);
+    let planned_kernel_count = summary.nonzero_item_count;
     let command_count_per_invocation = 1;
     let mut uninterrupted = seed
         .prepare(&target)
         .expect("live Metal preparation must compile, allocate, and upload training state");
+    let deployment_identity = uninterrupted
+        .execution_scoreboard_report()
+        .unwrap()
+        .expect("the prepared owned session must expose its deployment evidence")
+        .deployment_identity;
+    let authenticated_host_indexed_movement_item_count = uninterrupted
+        .metal_session()
+        .compiled_kernels()
+        .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
+        .count();
+    assert_eq!(authenticated_host_indexed_movement_item_count, 2);
+    assert!(
+        uninterrupted
+            .metal_session()
+            .compiled_kernels()
+            .all(|item| { item.transaction.is_none() && item.indexed_movement().is_none() })
+    );
+    assert_eq!(
+        uninterrupted
+            .metal_session()
+            .compiled_kernels()
+            .filter(|item| item.entry.starts_with("rg_metal_threefry_"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        uninterrupted
+            .metal_session()
+            .compiled_kernels()
+            .filter(|item| item.entry == "rg_metal_portable_bitcast")
+            .count(),
+        4
+    );
+    let transient_h2d_calls_per_invocation = uninterrupted.metal_session().transient_inputs().len();
+    let token_input = uninterrupted
+        .metal_session()
+        .transient_inputs()
+        .iter()
+        .find(|input| input.name == "tokens")
+        .expect("the fixed token minibatch must remain transient");
+    assert_eq!(token_input.desc.shape, Shape::new([BATCH, TIME]));
+    assert_eq!(token_input.desc.dtype, DType::I32);
+    assert_eq!(token_input.desc.bytes, TOKEN_COUNT * DType::I32.itemsize());
+    let target_input = uninterrupted
+        .metal_session()
+        .transient_inputs()
+        .iter()
+        .find(|input| input.name == "targets")
+        .expect("the fixed target minibatch must remain transient");
+    assert_eq!(target_input.desc.shape, Shape::new([BATCH, TIME]));
+    assert_eq!(target_input.desc.dtype, DType::I32);
+    assert_eq!(target_input.desc.bytes, TOKEN_COUNT * DType::I32.itemsize());
+    let learning_rate_input = uninterrupted
+        .metal_session()
+        .transient_inputs()
+        .iter()
+        .find(|input| input.name == "__rustgrad_compiled_training_learning_rate")
+        .expect("the scalar learning rate must remain transient");
+    assert_eq!(learning_rate_input.desc.shape, Shape::new([]));
+    assert_eq!(learning_rate_input.desc.dtype, DType::F32);
+    assert_eq!(learning_rate_input.desc.bytes, DType::F32.itemsize());
+    let transient_h2d_bytes_per_invocation = uninterrupted
+        .metal_session()
+        .transient_inputs()
+        .iter()
+        .map(|input| input.desc.bytes)
+        .sum::<usize>();
+    assert_eq!(transient_h2d_calls_per_invocation, 3);
+    assert_eq!(transient_h2d_bytes_per_invocation, 52);
     assert_eq!(uninterrupted.loss_scale(), 128.0);
     assert_eq!(uninterrupted.step_count(), 0);
     assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
@@ -693,6 +750,8 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                 logical_state_bytes,
                 planned_kernel_count,
                 command_count_per_invocation,
+                transient_h2d_calls_per_invocation,
+                transient_h2d_bytes_per_invocation,
             );
         } else {
             let result = uninterrupted.step(batch(), learning_rate()).unwrap();
@@ -707,16 +766,27 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                 logical_state_bytes,
                 planned_kernel_count,
                 command_count_per_invocation,
+                transient_h2d_calls_per_invocation,
+                transient_h2d_bytes_per_invocation,
             );
         }
     }
-
     let checkpoint = uninterrupted.checkpoint().unwrap();
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
-    let resumed_seed = CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+    let tied = resumed_model.tokens.weight.clone();
+    let frozen = resumed_model.frozen_scale.clone();
+    let tied_version = tied.version().unwrap();
+    let frozen_before = frozen.snapshot().unwrap();
+    let before_versions = resumed_model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.version().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    let resumed_seed = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
         config(),
         dropout_config(),
-        &resumed_model,
+        resumed_model,
         &checkpoint,
         build,
     )
@@ -732,20 +802,30 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
             )
             .unwrap(),
         );
-    let resumed_rendered = resumed_seed
-        .metal_plan(resumed_target.renderer().clone())
-        .expect("the checkpoint-restored capture must remain entirely Metal-admitted");
-    assert_eq!(resumed_rendered.capture_identity(), capture_identity);
-    let resumed_deployment_identity = resumed_rendered.deployment_identity();
+    assert_eq!(resumed_seed.capture_identity(), capture_identity);
+    assert_eq!(
+        resumed_seed
+            .metal_summary(resumed_target.renderer().clone())
+            .expect("the checkpoint-restored capture must remain entirely Metal-admitted")
+            .fallback_count,
+        0
+    );
+    let mut resumed = resumed_seed
+        .prepare(&resumed_target)
+        .expect("checkpoint-restored Metal preparation must succeed");
+    let resumed_deployment_identity = resumed
+        .execution_scoreboard_report()
+        .unwrap()
+        .expect("the prepared restored session must expose its deployment evidence")
+        .deployment_identity;
     assert_ne!(
         resumed_deployment_identity, deployment_identity,
         "the deployment identity must authenticate the checkpoint-restored state bytes"
     );
-    assert_eq!(resumed_rendered.summary().fallback_count, 0);
-    assert_strict_dropout_kernels(&resumed_rendered);
-    let mut resumed = resumed_seed
-        .prepare(&resumed_target)
-        .expect("checkpoint-restored Metal preparation must succeed");
+    assert_eq!(
+        resumed.metal_session().transient_inputs(),
+        uninterrupted.metal_session().transient_inputs()
+    );
     assert_eq!(resumed.loss_scale(), 128.0);
     assert_eq!(resumed.step_count(), 4);
     assert_eq!(resumed.optimizer_step().unwrap(), 4);
@@ -772,6 +852,8 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                     logical_state_bytes,
                     planned_kernel_count,
                     command_count_per_invocation,
+                    transient_h2d_calls_per_invocation,
+                    transient_h2d_bytes_per_invocation,
                 );
             }
         } else {
@@ -789,6 +871,8 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                     logical_state_bytes,
                     planned_kernel_count,
                     command_count_per_invocation,
+                    transient_h2d_calls_per_invocation,
+                    transient_h2d_bytes_per_invocation,
                 );
             }
             losses.push(expected.loss().scalar_at(0).as_f64());
@@ -806,19 +890,21 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(totals.command_submission_count, 12);
     assert_eq!(totals.command_wait_count, 12);
     assert_eq!(totals.kernel_launch_count, planned_kernel_count * 12);
+    assert_eq!(
+        totals.transient_h2d_calls,
+        transient_h2d_calls_per_invocation * 12
+    );
     assert_eq!(totals.transient_h2d_calls, 36);
-    assert_eq!(totals.transient_h2d_bytes, 336);
+    assert_eq!(
+        totals.transient_h2d_bytes,
+        transient_h2d_bytes_per_invocation * 12
+    );
+    assert_eq!(totals.transient_h2d_bytes, 624);
     assert_eq!(totals.retained_d2h_calls, 4);
     assert_eq!(totals.retained_d2h_bytes, 16);
     assert_eq!(
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
-    );
-    let runtime_checkpoint = resumed.checkpoint().unwrap();
-    let runtime_progress = (
-        resumed.step_count(),
-        resumed.optimizer_step().unwrap(),
-        resumed.accumulation_index().unwrap(),
     );
     let published = resumed.parameter_snapshots().unwrap();
     let published_bytes = published
@@ -827,49 +913,6 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         .sum::<usize>();
     assert_eq!(published.len(), 19);
     assert_eq!(published_bytes, 256);
-    let frozen_before = resumed_model.frozen_scale.snapshot().unwrap();
-    let before_versions = resumed_model
-        .trainable_parameters()
-        .unwrap()
-        .into_iter()
-        .map(|(name, parameter)| (name, parameter.version().unwrap()))
-        .collect::<BTreeMap<_, _>>();
-    assert!(
-        resumed
-            .publish_parameters(&resumed_model)
-            .unwrap()
-            .is_clean()
-    );
-    let live = resumed_model.state_dict().unwrap();
-    for (name, value) in &published {
-        assert_eq!(&live.tensors()[name], value);
-    }
-    assert!(!live.tensors().contains_key("lm_head.weight"));
-    for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
-        assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
-    }
-    let frozen_after = resumed_model.frozen_scale.snapshot().unwrap();
-    assert_eq!(frozen_after.data, frozen_before.data);
-    assert_eq!(frozen_after.version, frozen_before.version);
-    assert_eq!(resumed.checkpoint().unwrap(), runtime_checkpoint);
-    assert_eq!(
-        (
-            resumed.step_count(),
-            resumed.optimizer_step().unwrap(),
-            resumed.accumulation_index().unwrap(),
-        ),
-        runtime_progress
-    );
-    let first_eval = evaluate(&resumed_model);
-    let second_eval = evaluate(&resumed_model);
-    assert_eq!(first_eval, second_eval);
-    assert!(
-        (0..first_eval.shape().numel().unwrap())
-            .all(|index| first_eval.scalar_at(index).as_f64().is_finite())
-    );
-    for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
-        assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
-    }
     let initial_scoreboard = uninterrupted
         .execution_scoreboard_report()
         .unwrap()
@@ -923,6 +966,40 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                             && run.retained_host_api_d2h_bytes == 4))
             )
     );
+    let loss_scale = uninterrupted.loss_scale();
+    let _uninterrupted_model = uninterrupted
+        .finish()
+        .expect("the uninterrupted owned module must finish atomically");
+    let resumed_model = resumed
+        .finish()
+        .expect("the resumed owned module must finish atomically");
+    let live = resumed_model.state_dict().unwrap();
+    for (name, value) in &published {
+        assert_eq!(&live.tensors()[name], value);
+    }
+    assert!(!live.tensors().contains_key("lm_head.weight"));
+    assert_eq!(resumed_model.tokens.weight.id(), tied.id());
+    assert_eq!(
+        resumed_model.tokens.weight.version().unwrap(),
+        tied_version + 1
+    );
+    for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
+        assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
+    }
+    let frozen_after = resumed_model.frozen_scale.snapshot().unwrap();
+    assert_eq!(frozen_after.data, frozen_before.data);
+    assert_eq!(frozen_after.version, frozen_before.version);
+    let first_eval = evaluate(&resumed_model);
+    let second_eval = evaluate(&resumed_model);
+    assert_eq!(first_eval.shape(), &Shape::new([BATCH, TIME, VOCAB]));
+    assert_eq!(first_eval, second_eval);
+    assert!(
+        (0..first_eval.shape().numel().unwrap())
+            .all(|index| first_eval.scalar_at(index).as_f64().is_finite())
+    );
+    for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
+        assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
+    }
 
     let device_evidence = serde_json::json!({
         "name": device_info.name,
@@ -932,7 +1009,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     });
     let identity_evidence = serde_json::json!({
         "capture_identity": capture_identity,
-        "loss_scale": uninterrupted.loss_scale(),
+        "loss_scale": loss_scale,
         "initial_deployment_identity": deployment_identity,
         "resumed_deployment_identity": resumed_deployment_identity,
         "fallback_count": 0,

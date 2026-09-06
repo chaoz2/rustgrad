@@ -1,4 +1,4 @@
-//! Compile a tiny causal Transformer once, then train and resume on CPU or strict Metal.
+//! Compile a fixed two-row tiny causal Transformer once, then train and resume on CPU or strict Metal.
 //!
 //! Run on the graph-free CPU replay target:
 //!
@@ -26,7 +26,9 @@ use std::{collections::BTreeMap, env, error::Error};
 
 const VOCAB: usize = 3;
 const EMBEDDING: usize = 2;
+const BATCH: usize = 2;
 const TIME: usize = 3;
+const TOKEN_COUNT: usize = BATCH * TIME;
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -120,8 +122,8 @@ fn config() -> Result<CompiledAdamWConfig> {
     CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)?
         .with_weight_decay_exclusions(WEIGHT_DECAY_EXCLUSIONS)?
         .with_loss_scale(128.0)?
-        .with_host_token_input("tokens", [1, TIME])?
-        .with_input("targets", [1, TIME], DType::I32)
+        .with_host_token_input("tokens", [BATCH, TIME])?
+        .with_input("targets", [BATCH, TIME], DType::I32)
 }
 
 fn dropout_config() -> CompiledDropoutConfig {
@@ -135,8 +137,8 @@ fn build(
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
     let logits = model.forward(graph, inputs["tokens"], dropout)?;
-    let flat_logits = graph.reshape(logits, [TIME, VOCAB])?;
-    let flat_targets = graph.reshape(inputs["targets"], [TIME])?;
+    let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
+    let flat_targets = graph.reshape(inputs["targets"], [TOKEN_COUNT])?;
     let loss = cross_entropy(
         graph,
         flat_logits,
@@ -155,22 +157,22 @@ fn compile(model: TinyCausalTransformer) -> Result<CompiledModuleAdamWPlan<TinyC
 }
 
 fn batch() -> Result<BTreeMap<String, TensorData>> {
-    let tensor = |values: [i32; TIME]| {
+    let tensor = |values: [i32; TOKEN_COUNT]| {
         TensorData::from_scalars(
-            Shape::new([1, TIME]),
+            Shape::new([BATCH, TIME]),
             DType::I32,
             values.into_iter().map(|value| Scalar::I(i64::from(value))),
         )
     };
     Ok(BTreeMap::from([
-        ("tokens".into(), tensor([0, 1, 2])?),
-        ("targets".into(), tensor([1, 2, 0])?),
+        ("tokens".into(), tensor([0, 1, 2, 2, 0, 1])?),
+        ("targets".into(), tensor([1, 2, 0, 0, 1, 2])?),
     ]))
 }
 
 fn evaluate(model: &TinyCausalTransformer) -> Result<TensorData> {
     let mut graph = Graph::new();
-    let tokens = graph.input_dtype("tokens", [1, TIME], DType::I32);
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
     let logits = model.forward_eval(&mut graph, tokens)?;
     let mut bindings = model.input_bindings(&graph)?;
     bindings.insert("tokens".into(), batch()?.remove("tokens").unwrap());
@@ -273,6 +275,7 @@ where
         .collect::<Result<BTreeMap<_, _>>>()?;
     let first_eval = evaluate(&restored_model)?;
     let second_eval = evaluate(&restored_model)?;
+    assert_eq!(first_eval.shape(), &Shape::new([BATCH, TIME, VOCAB]));
     assert_eq!(first_eval, second_eval);
     assert!(
         (0..first_eval.shape().numel()?)

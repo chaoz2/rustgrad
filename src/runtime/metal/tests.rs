@@ -1124,12 +1124,20 @@ fn compiled_scalar_adamw_plan_with_accumulation(steps: u64) -> CompiledAdamWPlan
     .unwrap()
 }
 
-fn compiled_host_token_adamw_plan(authenticated: bool) -> CompiledAdamWPlan {
+fn compiled_host_token_adamw_plan_for_shape(
+    authenticated: bool,
+    token_shape: [usize; 2],
+) -> CompiledAdamWPlan {
+    let token_elements = token_shape[0]
+        .checked_mul(token_shape[1])
+        .expect("test token shape must fit");
     let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0).unwrap();
     let config = if authenticated {
-        config.with_host_token_input("tokens", [1, 3]).unwrap()
+        config.with_host_token_input("tokens", token_shape).unwrap()
     } else {
-        config.with_input("tokens", [1, 3], DType::I32).unwrap()
+        config
+            .with_input("tokens", token_shape, DType::I32)
+            .unwrap()
     };
     let table = TrainingParameterInit::new(
         "table",
@@ -1137,19 +1145,24 @@ fn compiled_host_token_adamw_plan(authenticated: bool) -> CompiledAdamWPlan {
     )
     .unwrap();
     CompiledAdamWPlan::compile(config, [table], |graph, inputs, parameters| {
-        let token_rows = graph.reshape(inputs["tokens"], [3, 1])?;
-        let indices = graph.expand(token_rows, [3, 2])?;
+        let token_rows = graph.reshape(inputs["tokens"], [token_elements, 1])?;
+        let indices = graph.expand(token_rows, [token_elements, 2])?;
         let gathered = graph.gather(parameters["table"], indices, 0)?;
-        Ok((graph.sum_all(gathered)?, BTreeMap::new()))
+        let embedded = graph.reshape(gathered, [token_shape[0], token_shape[1], 2])?;
+        Ok((graph.sum_all(embedded)?, BTreeMap::new()))
     })
     .unwrap()
 }
 
-fn host_token_batch(values: [i32; 3]) -> BTreeMap<String, TensorData> {
+fn compiled_host_token_adamw_plan(authenticated: bool) -> CompiledAdamWPlan {
+    compiled_host_token_adamw_plan_for_shape(authenticated, [2, 3])
+}
+
+fn host_token_batch(values: [i32; 6]) -> BTreeMap<String, TensorData> {
     BTreeMap::from([(
         "tokens".into(),
         TensorData::from_scalars(
-            [1, 3],
+            [2, 3],
             DType::I32,
             values.into_iter().map(|value| Scalar::I(i64::from(value))),
         )
@@ -1158,17 +1171,17 @@ fn host_token_batch(values: [i32; 3]) -> BTreeMap<String, TensorData> {
 }
 
 fn host_token_declarations() -> BTreeMap<String, Shape> {
-    BTreeMap::from([("tokens".into(), Shape::new([1, 3]))])
+    BTreeMap::from([("tokens".into(), Shape::new([2, 3]))])
 }
 
 #[test]
 fn host_token_authentication_rejects_compatible_independent_index_pair() {
     let mut graph = Graph::new();
     let table = graph.input_dtype("table", [4, 2], DType::F32);
-    let tokens = graph.input_dtype("tokens", [1, 3], DType::I32);
-    let updates = graph.input_dtype("updates", [3, 2], DType::F32);
-    let token_rows = graph.reshape(tokens, [3, 1]).unwrap();
-    let indices = graph.expand(token_rows, [3, 2]).unwrap();
+    let tokens = graph.input_dtype("tokens", [2, 3], DType::I32);
+    let updates = graph.input_dtype("updates", [6, 2], DType::F32);
+    let token_rows = graph.reshape(tokens, [6, 1]).unwrap();
+    let indices = graph.expand(token_rows, [6, 2]).unwrap();
     let gather = graph.gather(table, indices, 0).unwrap();
     let zero = graph.constant(TensorData::new([4, 2], vec![0.0; 8]).unwrap());
     let scatter = graph.scatter_add(zero, indices, updates, 0).unwrap();
@@ -1183,13 +1196,58 @@ fn host_token_authentication_rejects_compatible_independent_index_pair() {
     );
 }
 
+#[test]
+fn host_token_authentication_rejects_rank_three_minibatch_index_pair() {
+    let mut graph = Graph::new();
+    let table = graph.input_dtype_requires_grad("table", [4, 3, 2], DType::F32, true);
+    let tokens = graph.input_dtype("tokens", [2, 3], DType::I32);
+    let token_rows = graph.reshape(tokens, [2, 3, 1]).unwrap();
+    let indices = graph.expand(token_rows, [2, 3, 2]).unwrap();
+    let gathered = graph.gather(table, indices, 0).unwrap();
+    let loss = graph.sum_all(gathered).unwrap();
+    let vjp = graph.grad(loss, table).unwrap();
+    let vjp_sum = graph.sum_all(vjp).unwrap();
+    let output = graph.add(loss, vjp_sum).unwrap();
+    let capture = CapturedInference::from_module_graph(&IdentityModule, &graph, &[output]).unwrap();
+    assert!(
+        capture
+            .with_authenticated_host_indexed_movements(&host_token_declarations())
+            .is_err(),
+        "paired training authentication admits only the canonical flattened [B*T,E] index"
+    );
+}
+
+#[test]
+fn host_token_authentication_rejects_singleton_scalar_index_pair() {
+    let mut graph = Graph::new();
+    let table = graph.input_dtype_requires_grad("table", [4], DType::F32, true);
+    let tokens = graph.input_dtype("tokens", [1, 1], DType::I32);
+    let token = graph.reshape(tokens, [1]).unwrap();
+    let indices = graph.expand(token, [2]).unwrap();
+    let gathered = graph.gather(table, indices, 0).unwrap();
+    let loss = graph.sum_all(gathered).unwrap();
+    let vjp = graph.grad(loss, table).unwrap();
+    let vjp_sum = graph.sum_all(vjp).unwrap();
+    let output = graph.add(loss, vjp_sum).unwrap();
+    let capture = CapturedInference::from_module_graph(&IdentityModule, &graph, &[output]).unwrap();
+    assert!(
+        capture
+            .with_authenticated_host_indexed_movements(&BTreeMap::from([(
+                "tokens".into(),
+                Shape::new([1, 1]),
+            )]))
+            .is_err(),
+        "paired training authentication must not admit scalar index geometry"
+    );
+}
+
 fn assert_tampered_vjp_rejects_authentication(nonzero_base: bool) {
     let mut graph = Graph::new();
     let table = graph.input_dtype_requires_grad("table", [4, 2], DType::F32, true);
-    let tokens = graph.input_dtype("tokens", [1, 3], DType::I32);
-    let unrelated = graph.input_dtype("unrelated", [3, 2], DType::F32);
-    let token_rows = graph.reshape(tokens, [3, 1]).unwrap();
-    let indices = graph.expand(token_rows, [3, 2]).unwrap();
+    let tokens = graph.input_dtype("tokens", [2, 3], DType::I32);
+    let unrelated = graph.input_dtype("unrelated", [6, 2], DType::F32);
+    let token_rows = graph.reshape(tokens, [6, 1]).unwrap();
+    let indices = graph.expand(token_rows, [6, 2]).unwrap();
     let gathered = graph.gather(table, indices, 0).unwrap();
     let loss = graph.sum_all(gathered).unwrap();
     let vjp = graph.grad(loss, table).unwrap();
@@ -1227,7 +1285,7 @@ fn host_token_authentication_rejects_unrelated_scatter_update() {
 fn compiled_host_token_indexing_is_status_free_prevalidated_and_retryable() {
     let unused_config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
         .unwrap()
-        .with_host_token_input("tokens", [1, 3])
+        .with_host_token_input("tokens", [2, 3])
         .unwrap();
     let unused_parameter = TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap();
     let unused =
@@ -1244,6 +1302,34 @@ fn compiled_host_token_indexing_is_status_free_prevalidated_and_retryable() {
 
     let ordinary = compiled_host_token_adamw_plan(false);
     let authenticated = compiled_host_token_adamw_plan(true);
+    let batch_one_ordinary = compiled_host_token_adamw_plan_for_shape(false, [1, 3]);
+    let batch_one_authenticated = compiled_host_token_adamw_plan_for_shape(true, [1, 3]);
+    let singleton_authenticated = compiled_host_token_adamw_plan_for_shape(true, [1, 1]);
+    assert_eq!(
+        batch_one_ordinary.capture_identity(),
+        batch_one_authenticated.capture_identity(),
+        "the existing batch-one capture remains policy-neutral"
+    );
+    assert_eq!(
+        batch_one_authenticated
+            .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+            .unwrap()
+            .rendered_items()
+            .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
+            .count(),
+        2,
+        "the existing batch-one status-free path remains admitted"
+    );
+    assert_eq!(
+        singleton_authenticated
+            .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+            .unwrap()
+            .rendered_items()
+            .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
+            .count(),
+        2,
+        "[1,1] must authenticate only through its canonical flattened [1,E] index"
+    );
     assert_eq!(
         ordinary.capture_identity(),
         authenticated.capture_identity()
@@ -1291,9 +1377,42 @@ fn compiled_host_token_indexing_is_status_free_prevalidated_and_retryable() {
         .prepare_with_scoreboard(test_device(mock.clone()), context)
         .unwrap();
     mock.clear_calls();
-    for position in 0..3 {
+    let initial_checkpoint = runtime.checkpoint().unwrap();
+    let initial_scoreboard = runtime.execution_scoreboard_report().unwrap();
+    assert_eq!(
+        initial_scoreboard
+            .as_ref()
+            .expect("scoreboard is bound")
+            .successful_run_count,
+        0
+    );
+    mock.clear_calls();
+    let wrong_shape = BTreeMap::from([(
+        "tokens".into(),
+        TensorData::from_scalars(
+            [1, 6],
+            DType::I32,
+            [0, 1, 2, 2, 0, 1]
+                .into_iter()
+                .map(|value| Scalar::I(i64::from(value))),
+        )
+        .unwrap(),
+    )]);
+    assert!(
+        runtime.step(wrong_shape, TensorData::scalar(0.01)).is_err(),
+        "an equal-byte descriptor mismatch must reject before Metal work"
+    );
+    assert!(mock.calls().is_empty());
+    assert_eq!(runtime.step_count(), 0);
+    assert_eq!(runtime.checkpoint().unwrap(), initial_checkpoint);
+    assert_eq!(
+        runtime.execution_scoreboard_report().unwrap(),
+        initial_scoreboard
+    );
+    mock.clear_calls();
+    for position in 0..6 {
         for invalid in [-1, 4] {
-            let mut values = [0, 1, 2];
+            let mut values = [0, 1, 2, 2, 0, 1];
             values[position] = invalid;
             let error = match runtime.step(host_token_batch(values), TensorData::scalar(0.01)) {
                 Ok(_) => panic!("invalid host token lane must reject"),
@@ -1306,19 +1425,18 @@ fn compiled_host_token_indexing_is_status_free_prevalidated_and_retryable() {
             assert!(detail.contains("dim: 4"));
             assert!(mock.calls().is_empty());
             assert_eq!(runtime.step_count(), 0);
+            assert_eq!(runtime.optimizer_step().unwrap(), 0);
+            assert_eq!(runtime.accumulation_index().unwrap(), 0);
+            assert_eq!(runtime.metal_session().successful_run_count(), 0);
             assert!(!runtime.metal_session().state_epoch());
+            assert_eq!(runtime.checkpoint().unwrap(), initial_checkpoint);
+            assert_eq!(
+                runtime.execution_scoreboard_report().unwrap(),
+                initial_scoreboard
+            );
+            mock.clear_calls();
         }
     }
-
-    let initial_checkpoint = runtime.checkpoint().unwrap();
-    let initial_scoreboard = runtime.execution_scoreboard_report().unwrap();
-    assert_eq!(
-        initial_scoreboard
-            .as_ref()
-            .expect("scoreboard is bound")
-            .successful_run_count,
-        0
-    );
 
     for failure in ["write", "launch", "mid-batch", "wait", "read"] {
         mock.clear_calls();
@@ -1337,7 +1455,10 @@ fn compiled_host_token_indexing_is_status_free_prevalidated_and_retryable() {
         }
         assert!(
             runtime
-                .step(host_token_batch([0, 1, 2]), TensorData::scalar(0.01))
+                .step(
+                    host_token_batch([0, 1, 2, 2, 0, 1]),
+                    TensorData::scalar(0.01),
+                )
                 .is_err()
         );
         assert_eq!(runtime.step_count(), 0);
@@ -1355,17 +1476,18 @@ fn compiled_host_token_indexing_is_status_free_prevalidated_and_retryable() {
 
     mock.clear_calls();
     let committed = runtime
-        .step(host_token_batch([1, 1, 1]), TensorData::scalar(0.01))
+        .step(
+            host_token_batch([1, 1, 1, 1, 1, 1]),
+            TensorData::scalar(0.01),
+        )
         .unwrap();
     let committed_calls = mock.calls();
-    let reference_plan = compiled_host_token_adamw_plan(true)
-        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
-        .unwrap();
-    let mut reference = reference_plan
-        .prepare(test_device(Arc::new(MockDispatch::default())))
-        .unwrap();
+    let mut reference = compiled_host_token_adamw_plan(true).prepare_cpu().unwrap();
     let expected = reference
-        .step(host_token_batch([1, 1, 1]), TensorData::scalar(0.01))
+        .step(
+            host_token_batch([1, 1, 1, 1, 1, 1]),
+            TensorData::scalar(0.01),
+        )
         .unwrap();
     assert_eq!(committed.loss(), expected.loss());
     assert_eq!(
@@ -1407,6 +1529,50 @@ fn compiled_host_token_indexing_is_status_free_prevalidated_and_retryable() {
         1
     );
     assert!(committed_calls.iter().all(|call| !call.contains("status")));
+
+    mock.clear_calls();
+    let suppressed = runtime
+        .step_without_host_outputs(
+            host_token_batch([2, 0, 1, 1, 2, 0]),
+            TensorData::scalar(0.01),
+        )
+        .unwrap();
+    let suppressed_calls = mock.calls();
+    reference
+        .step(
+            host_token_batch([2, 0, 1, 1, 2, 0]),
+            TensorData::scalar(0.01),
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.checkpoint().unwrap(),
+        reference.checkpoint().unwrap()
+    );
+    assert_eq!(suppressed.step(), 2);
+    assert_eq!(suppressed.report().command_submission_count, 1);
+    assert_eq!(suppressed.report().command_wait_count, 1);
+    assert_eq!(suppressed.report().retained_d2h_calls, 0);
+    assert_eq!(suppressed.report().retained_d2h_bytes, 0);
+    assert_eq!(
+        suppressed_calls
+            .iter()
+            .filter(|call| call.starts_with("batch_submit:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        suppressed_calls
+            .iter()
+            .filter(|call| call.starts_with("wait:"))
+            .count(),
+        1
+    );
+    assert!(
+        suppressed_calls
+            .iter()
+            .all(|call| !call.starts_with("read:"))
+    );
+    assert!(suppressed_calls.iter().all(|call| !call.contains("status")));
 }
 
 fn compiled_decay_exclusion_adamw_plan(exclude_bias: bool) -> CompiledAdamWPlan {

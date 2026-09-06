@@ -120,10 +120,12 @@ the sealed host module without publication. The owned strict-Metal facade also
 forwards read-only device-session and scoreboard evidence without exposing its
 runtime or module, so no detached module/runtime lifecycle is silently
 abandoned.
-The maintained Transformer now declares its fixed batch-one I32 token input
-through the compiled AdamW config. Strict Metal reauthenticates the exact
+The maintained Transformer now trains two deterministic rows per replay and
+declares its fixed `[2, T]` I32 token input through the compiled AdamW config.
+The public policy accepts any exact nonempty fixed rank-two `[B, T]` schema;
+strict Metal reauthenticates the exact
 autograd-recorded embedding Gather/first-order ScatterAdd relationship,
-including the exact data target, F32-zero base, flatten/expand index,
+including the exact data target, F32-zero base, flattened `[B*T, E]` index,
 axis/domain, and update cotangent, before selecting private status-free
 renderers. Host validation
 checks every lane before driver work, leaving no transactional/indexed owner in
