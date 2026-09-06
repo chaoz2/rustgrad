@@ -17,6 +17,18 @@ enum ResidualDropout {
     Ambient([RandomStream; 2]),
 }
 
+/// Supplies explicit training-time dropout while a static Transformer graph is
+/// being constructed.
+///
+/// Providers own any replay state and reservation order. The block invokes the
+/// provider exactly twice on successful block lowering, for its attention and
+/// feed-forward residual branches respectively; attention-weight dropout is
+/// intentionally outside this interface. An earlier lowering error may stop
+/// before the second call.
+pub trait TrainingDropoutProvider {
+    fn dropout(&mut self, graph: &mut Graph, input: NodeId, probability: f64) -> Result<NodeId>;
+}
+
 /// The checked source stores each Transformer projection as a `(weight, bias)`
 /// pair with `[input, output]` weight orientation. Keep that local state
 /// contract instead of silently transposing it into the public `nn::Linear`
@@ -275,27 +287,54 @@ impl<A: ModuleForward> TransformerBlock<A> {
         }
     }
 
-    fn lower(&self, graph: &mut Graph, input: NodeId, dropout: ResidualDropout) -> Result<NodeId> {
+    fn lower_with_dropout(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        dropout: &mut dyn FnMut(&mut Graph, NodeId, usize) -> Result<NodeId>,
+    ) -> Result<NodeId> {
         let (batch, time) = self.geometry(graph, input)?;
         if self.prenorm {
             let normalized = self.ln1.forward(graph, input)?;
             let attended = self.attention(graph, normalized, batch, time)?;
-            let attended = self.apply_dropout(graph, attended, 0, dropout)?;
+            let attended = dropout(graph, attended, 0)?;
             let residual = graph.add(input, attended)?;
             let normalized = self.ln2.forward(graph, residual)?;
             let feed_forward = self.feed_forward(graph, normalized)?;
-            let feed_forward = self.apply_dropout(graph, feed_forward, 1, dropout)?;
+            let feed_forward = dropout(graph, feed_forward, 1)?;
             graph.add(residual, feed_forward)
         } else {
             let attended = self.attention(graph, input, batch, time)?;
-            let attended = self.apply_dropout(graph, attended, 0, dropout)?;
+            let attended = dropout(graph, attended, 0)?;
             let residual = graph.add(input, attended)?;
             let residual = self.ln1.forward(graph, residual)?;
             let feed_forward = self.feed_forward(graph, residual)?;
-            let feed_forward = self.apply_dropout(graph, feed_forward, 1, dropout)?;
+            let feed_forward = dropout(graph, feed_forward, 1)?;
             let output = graph.add(residual, feed_forward)?;
             self.ln2.forward(graph, output)
         }
+    }
+
+    fn lower(&self, graph: &mut Graph, input: NodeId, mode: ResidualDropout) -> Result<NodeId> {
+        self.lower_with_dropout(graph, input, &mut |graph, input, branch| {
+            self.apply_dropout(graph, input, branch, mode)
+        })
+    }
+
+    /// Lowers the block's two residual-dropout sites through an explicit
+    /// training provider.
+    ///
+    /// This is the stateful compiled-training entry point. Ordinary
+    /// [`ModeModuleForward`] and ambient-mode behavior remain unchanged.
+    pub fn forward_training_with_dropout<P: TrainingDropoutProvider + ?Sized>(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        provider: &mut P,
+    ) -> Result<NodeId> {
+        self.lower_with_dropout(graph, input, &mut |graph, input, _branch| {
+            provider.dropout(graph, input, self.dropout)
+        })
     }
 }
 

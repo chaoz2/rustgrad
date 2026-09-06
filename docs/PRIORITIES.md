@@ -89,7 +89,14 @@ validated candidate frontier, strict Metal copies the complete successor into
 the inactive epoch bank without downloading gradients, and both preserve
 replay/optimizer progress while empty windows are exact no-ops. Checkpoint v3
 authenticates discarded microbatches while v1/v2 remain readable. Dynamic loss
-scaling and broader freezing semantics remain workload-driven follow-ups.
+scaling and broader freezing semantics remain workload-driven follow-ups. The
+same maintained workload now selects explicit compiled residual dropout: two
+source-ordered fixed-shape F32 draws share an immutable two-word Threefry key
+and one device-resident U64 block counter committed atomically with AdamW.
+Checkpoint v4 continues the exact next mask on CPU or strict Metal while
+v1--v3 and no-dropout bytes remain accepted unchanged. This is a bounded
+Transformer workload stream, not general random-operation parity or
+attention-weight dropout.
 
 ### 3. P1 — lower the identical training capture to Metal
 

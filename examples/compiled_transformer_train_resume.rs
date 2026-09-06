@@ -16,9 +16,9 @@ use rustgrad::nn::{Embedding, LayerNorm, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
     CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledTrainingStep, CpuSessionTarget, DType, Graph, LossOptions, MetalSessionTarget, Mode,
-    ModeModuleForward, Module, NodeId, Parameter, Reduction, Result, Scalar, Shape, TensorData,
-    TransformerBlock, cross_entropy,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuSessionTarget, DType,
+    Graph, LossOptions, MetalSessionTarget, Module, NodeId, Parameter, Reduction, Result, Scalar,
+    Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
 };
 use std::{collections::BTreeMap, env, error::Error};
 
@@ -38,15 +38,22 @@ impl TinyCausalTransformer {
     fn new(seed: u64) -> Result<Self> {
         Ok(Self {
             tokens: Embedding::new_static(VOCAB, EMBEDDING, None, seed)?,
-            block: TransformerBlock::new_static(EMBEDDING, 1, 4, true, 0.0, seed.wrapping_add(1))?
+            block: TransformerBlock::new_static(EMBEDDING, 1, 4, true, 0.25, seed.wrapping_add(1))?
                 .with_causal_attention(true),
             norm: LayerNorm::new_static([EMBEDDING], 1e-5, true)?,
         })
     }
 
-    fn forward(&self, graph: &mut Graph, tokens: NodeId) -> Result<NodeId> {
+    fn forward(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<NodeId> {
         let hidden = self.tokens.forward(graph, tokens)?;
-        let hidden = self.block.forward_mode(graph, hidden, Mode::Eval)?.output;
+        let hidden = self
+            .block
+            .forward_training_with_dropout(graph, hidden, dropout)?;
         let hidden = self.norm.forward(graph, hidden)?;
         let tied_weight = self.tokens.weight.bind(graph)?;
         let tied_weight = graph.permute(tied_weight, [1, 0])?;
@@ -81,12 +88,17 @@ fn config() -> Result<CompiledAdamWConfig> {
         .with_input("targets", [1, TIME], DType::I32)
 }
 
+fn dropout_config() -> CompiledDropoutConfig {
+    CompiledDropoutConfig::new(CompiledDropoutKey([0x1234_5678, 0x9abc_def0]))
+}
+
 fn build(
     model: &TinyCausalTransformer,
     graph: &mut Graph,
     inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
-    let logits = model.forward(graph, inputs["tokens"])?;
+    let logits = model.forward(graph, inputs["tokens"], dropout)?;
     let flat_logits = graph.reshape(logits, [TIME, VOCAB])?;
     let flat_targets = graph.reshape(inputs["targets"], [TIME])?;
     let loss = cross_entropy(
@@ -102,7 +114,7 @@ fn build(
 }
 
 fn compile(model: &TinyCausalTransformer) -> Result<CompiledAdamWPlan> {
-    CompiledAdamWPlan::compile_module(config()?, model, build)
+    CompiledAdamWPlan::compile_module_with_dropout(config()?, dropout_config(), model, build)
 }
 
 fn batch() -> Result<BTreeMap<String, TensorData>> {
@@ -144,8 +156,9 @@ where
     let saved = uninterrupted.checkpoint()?;
     let checkpoint = CompiledAdamWCheckpoint::from_bytes(saved.into_bytes())?;
     let restored_model = TinyCausalTransformer::new(7)?;
-    let restored_plan = CompiledAdamWPlan::compile_module_from_checkpoint(
+    let restored_plan = CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
         config()?,
+        dropout_config(),
         &restored_model,
         &checkpoint,
         build,

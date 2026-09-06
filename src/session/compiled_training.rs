@@ -1,7 +1,7 @@
 //! Graph-free CPU replay for static training programs with recurrent state.
 
 use super::target::{CpuSessionTarget, MetalSessionTarget, SessionTarget};
-use crate::nn::StateKind;
+use crate::nn::{StateKind, TrainingDropoutProvider};
 use crate::runtime::metal::{
     MetalDevice, MetalDeviceRunReport, MetalDeviceSession, MetalDeviceSessionSummary, MetalError,
     MetalRenderer, MetalScoreboardContext, MetalScoreboardError, MetalScoreboardObserver,
@@ -20,6 +20,151 @@ use std::collections::{BTreeMap, BTreeSet};
 const INTERNAL_PREFIX: &str = "__rustgrad_compiled_training_";
 const LEARNING_RATE_INPUT: &str = "__rustgrad_compiled_training_learning_rate";
 const STATE_BUFFER_BASE: u64 = 1_u64 << 62;
+const DROPOUT_COUNTER_KEY: &str = "workload:dropout_block_counter";
+const DROPOUT_COUNTER_INPUT: &str = "__rustgrad_compiled_training_dropout_block_counter";
+
+/// Immutable two-word key for compiled Transformer residual dropout.
+///
+/// The first word occupies the low 32 bits of Threefry's packed U64 key and
+/// the second occupies the high 32 bits. This is deliberately an explicit key,
+/// not a `u64` seed with an implicit or lossy mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledDropoutKey(pub [u32; 2]);
+
+impl CompiledDropoutKey {
+    pub const fn words(self) -> [u32; 2] {
+        self.0
+    }
+
+    const fn packed(self) -> u64 {
+        self.0[0] as u64 | ((self.0[1] as u64) << 32)
+    }
+}
+
+/// Fixed compiled residual-dropout policy for one AdamW Transformer capture.
+///
+/// This policy defines a workload-specific U64-block stream with interleaved
+/// low/high U32 words and low-mantissa F32 conversion. It is intentionally not
+/// sequence-compatible with [`crate::RandomStream`] or its uniform conversion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledDropoutConfig {
+    key: CompiledDropoutKey,
+}
+
+impl CompiledDropoutConfig {
+    pub const fn new(key: CompiledDropoutKey) -> Self {
+        Self { key }
+    }
+
+    pub const fn key(self) -> CompiledDropoutKey {
+        self.key
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompiledDropoutState {
+    config: CompiledDropoutConfig,
+    blocks_per_replay: u64,
+}
+
+struct CompiledDropoutStream {
+    counter: NodeId,
+    key: CompiledDropoutKey,
+    reserved_blocks: u64,
+}
+
+impl CompiledDropoutStream {
+    fn new(counter: NodeId, config: CompiledDropoutConfig) -> Self {
+        Self {
+            counter,
+            key: config.key,
+            reserved_blocks: 0,
+        }
+    }
+
+    fn finish(self, graph: &mut Graph) -> Result<(NodeId, CompiledDropoutState)> {
+        if self.reserved_blocks == 0 {
+            return Err(training(
+                "compiled dropout configuration produced no active F32 draw",
+            ));
+        }
+        let increment =
+            graph.full_with_dtype(Shape::from([]), Scalar::U(self.reserved_blocks), DType::U64)?;
+        let successor = graph.add(self.counter, increment)?;
+        Ok((
+            successor,
+            CompiledDropoutState {
+                config: CompiledDropoutConfig::new(self.key),
+                blocks_per_replay: self.reserved_blocks,
+            },
+        ))
+    }
+}
+
+fn expected_dropout_counter(dropout: CompiledDropoutState, replay_step: u64) -> Result<u64> {
+    replay_step
+        .checked_mul(dropout.blocks_per_replay)
+        .ok_or_else(|| training("compiled dropout block counter would overflow"))
+}
+
+impl TrainingDropoutProvider for CompiledDropoutStream {
+    fn dropout(&mut self, graph: &mut Graph, input: NodeId, probability: f64) -> Result<NodeId> {
+        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+            return Err(training("compiled dropout probability must be in [0, 1]"));
+        }
+        if graph.dtype(input)? != DType::F32 {
+            return Err(training("compiled dropout requires F32 input"));
+        }
+        let shape = graph.shape(input)?.clone();
+        let elements = shape.numel()?;
+        if elements == 0 || probability == 0.0 {
+            return Ok(input);
+        }
+        if probability == 1.0 {
+            return graph.zeros_with_dtype(shape, DType::F32);
+        }
+
+        let blocks = elements
+            .checked_add(1)
+            .ok_or_else(|| training("compiled dropout block count overflow"))?
+            / 2;
+        let blocks =
+            u64::try_from(blocks).map_err(|_| training("compiled dropout block count overflow"))?;
+        let start = self.reserved_blocks;
+        self.reserved_blocks = start
+            .checked_add(blocks)
+            .ok_or_else(|| training("compiled dropout reservation overflow"))?;
+        let offsets = (start..self.reserved_blocks)
+            .map(Scalar::U)
+            .collect::<Vec<_>>();
+        let offsets = graph.constant(TensorData::from_scalars(
+            Shape::new([offsets.len()]),
+            DType::U64,
+            offsets,
+        )?);
+        let counters = graph.add(self.counter, offsets)?;
+        let key =
+            graph.full_with_dtype(Shape::from([]), Scalar::U(self.key.packed()), DType::U64)?;
+        let blocks = graph.threefry(counters, key)?;
+        let words = graph.bitcast(blocks, DType::U32)?;
+        let words = graph.shrink(words, vec![(0, elements)])?;
+        let words = graph.reshape(words, shape.clone())?;
+        let mantissa = graph.bitwise_and_scalar(words, Scalar::U(0x007f_ffff))?;
+        let bits = graph.bitwise_or_scalar(mantissa, Scalar::U(0x3f80_0000))?;
+        let unit = graph.bitcast(bits, DType::F32)?;
+        let one = graph.full_with_dtype(Shape::from([]), Scalar::F(1.0), DType::F32)?;
+        let unit = graph.sub(unit, one)?;
+        let threshold =
+            graph.full_with_dtype(Shape::from([]), Scalar::F(probability), DType::F32)?;
+        let keep = graph.ge(unit, threshold)?;
+        let keep = graph.contiguous(keep)?;
+        let zero = graph.full_with_dtype(Shape::from([]), Scalar::F(0.0), DType::F32)?;
+        let masked = graph.select(keep, input, zero)?;
+        let denominator =
+            graph.full_with_dtype(Shape::from([]), Scalar::F(1.0 - probability), DType::F32)?;
+        graph.div(masked, denominator)
+    }
+}
 
 /// Detached initial value for one compiled training parameter.
 ///
@@ -501,6 +646,7 @@ impl CompiledAdamWStep for CompiledAdamWStepResult {
 const ADAMW_CHECKPOINT_FORMAT_V1: &str = "rustgrad-compiled-adamw-v1";
 const ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-adamw-v2";
 const ADAMW_CHECKPOINT_FORMAT_V3: &str = "rustgrad-compiled-adamw-v3";
+const ADAMW_CHECKPOINT_FORMAT_V4: &str = "rustgrad-compiled-adamw-v4";
 
 /// Outcome of explicitly discarding a compiled AdamW partial gradient window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -529,7 +675,8 @@ impl CompiledAdamWZeroGradResult {
 /// present. Fixed clipping and loss-scaling policy is authenticated by the
 /// capture identity rather than duplicated as mutable checkpoint state. It
 /// never serializes executable code, graphs, runtime slots, or host pointers.
-/// Legacy v1 and v2 bytes remain accepted.
+/// Dropout-bearing v4 adds its recurrent U64 block counter; legacy v1--v3
+/// bytes remain accepted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledAdamWCheckpoint {
     bytes: Vec<u8>,
@@ -559,6 +706,7 @@ struct DecodedAdamWCheckpoint {
     accumulation_steps: u64,
     accumulation_index: u64,
     discarded_microbatches: u64,
+    dropout_block_counter: Option<u64>,
     parameters: BTreeMap<String, TensorData>,
     first_moments: BTreeMap<String, TensorData>,
     second_moments: BTreeMap<String, TensorData>,
@@ -573,6 +721,7 @@ struct AdamWCheckpointProgress {
     accumulation_steps: u64,
     accumulation_index: u64,
     discarded_microbatches: u64,
+    dropout_block_counter: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1028,6 +1177,7 @@ pub struct CompiledAdamWPlan {
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
     progress: AdamWProgress,
+    dropout: Option<CompiledDropoutState>,
 }
 
 /// One compiled AdamW training program with recurrent first/second moments, a
@@ -1038,6 +1188,7 @@ pub struct CpuCompiledAdamW {
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
     progress: AdamWProgress,
+    dropout: Option<CompiledDropoutState>,
 }
 
 /// Resource-free Metal rendering of one compiled AdamW plan. Preparing it
@@ -1053,6 +1204,7 @@ pub struct MetalCompiledAdamWPlan {
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
+    dropout: Option<CompiledDropoutState>,
 }
 
 /// Device-resident AdamW training session backed by one fixed Metal capture.
@@ -1069,6 +1221,7 @@ pub struct MetalCompiledAdamW {
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
+    dropout: Option<CompiledDropoutState>,
     scoreboard: Option<MetalScoreboardObserver>,
 }
 
@@ -1218,6 +1371,7 @@ struct CompiledTrainingPlan {
     output_names: Vec<String>,
     parameter_buffers: BTreeMap<String, u64>,
     optimizer_buffers: BTreeMap<String, u64>,
+    workload_buffers: BTreeMap<String, u64>,
     state_input_buffers: BTreeMap<String, u64>,
     state_input_keys: BTreeMap<String, String>,
     state_values: BTreeMap<String, TensorData>,
@@ -1234,6 +1388,7 @@ struct CpuCompiledTrainingProgram {
     output_names: Vec<String>,
     parameter_buffers: BTreeMap<String, u64>,
     optimizer_buffers: BTreeMap<String, u64>,
+    workload_buffers: BTreeMap<String, u64>,
     state_input_buffers: BTreeMap<String, u64>,
     state_input_keys: BTreeMap<String, String>,
     step: u64,
@@ -1258,6 +1413,32 @@ impl CompiledTrainingPlan {
             &BTreeMap<String, NodeId>,
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Self::compile_with_workload(
+            optimizer,
+            parameters,
+            None,
+            |graph, inputs, parameters, _| {
+                let (loss, outputs) = build(graph, inputs, parameters)?;
+                Ok((loss, outputs, None))
+            },
+        )
+    }
+
+    fn compile_with_workload<F, O>(
+        optimizer: O,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        workload: Option<StateSpec>,
+        build: F,
+    ) -> Result<Self>
+    where
+        O: CompiledOptimizerProgram,
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+            Option<NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>, Option<NodeId>)>,
     {
         let parameters = canonical_parameters(parameters)?;
         if parameters.is_empty() {
@@ -1293,15 +1474,25 @@ impl CompiledTrainingPlan {
             false,
         );
 
-        let specs = optimizer.state_specs(&parameters)?;
+        let mut specs = optimizer.state_specs(&parameters)?;
+        let optimizer_spec_count = specs.len();
+        if let Some(workload) = workload {
+            if specs.iter().any(|spec| spec.key == workload.key) {
+                return Err(training("compiled workload state key repeats"));
+            }
+            specs.push(workload);
+        }
         let mut parameter_nodes = BTreeMap::new();
         let mut state_nodes = BTreeMap::new();
         let mut state_values = Vec::with_capacity(specs.len());
         let mut state_by_input = BTreeMap::new();
         let mut parameter_buffers = BTreeMap::new();
         let mut optimizer_buffers = BTreeMap::new();
+        let mut workload_buffers = BTreeMap::new();
         let mut state_input_buffers = BTreeMap::new();
         let mut state_input_keys = BTreeMap::new();
+        let optimizer_spec_count_u64 = u64::try_from(optimizer_spec_count)
+            .map_err(|_| training("optimizer state count overflow"))?;
         for (ordinal, spec) in specs.iter().enumerate() {
             let ordinal = u64::try_from(ordinal).map_err(|_| training("parameter overflow"))?;
             let parameter_buffer = STATE_BUFFER_BASE
@@ -1322,15 +1513,21 @@ impl CompiledTrainingPlan {
             if let Some(name) = spec.key.strip_prefix("parameter:") {
                 parameter_nodes.insert(name.to_string(), node);
                 parameter_buffers.insert(name.to_string(), parameter_buffer);
-            } else {
+            } else if ordinal < optimizer_spec_count_u64 {
                 optimizer_buffers.insert(spec.key.clone(), parameter_buffer);
+            } else {
+                workload_buffers.insert(spec.key.clone(), parameter_buffer);
             }
         }
         if parameter_nodes.len() != parameters.len() {
             return Err(training("compiled optimizer omitted parameter state"));
         }
 
-        let (loss, outputs) = build(&mut graph, &inputs, &parameter_nodes)?;
+        let workload_node = specs
+            .get(optimizer_spec_count)
+            .map(|spec| state_nodes[&spec.key]);
+        let (loss, outputs, workload_successor) =
+            build(&mut graph, &inputs, &parameter_nodes, workload_node)?;
         validate_loss(&graph, loss)?;
         validate_outputs(
             loss,
@@ -1348,13 +1545,20 @@ impl CompiledTrainingPlan {
             .cloned()
             .zip(gradients)
             .collect::<BTreeMap<_, _>>();
-        let updates = optimizer.lower_updates(
+        let mut updates = optimizer.lower_updates(
             &mut graph,
             learning_rate,
             &parameter_nodes,
             &gradients,
             &state_nodes,
         )?;
+        match (specs.get(optimizer_spec_count), workload_successor) {
+            (Some(spec), Some(successor)) => {
+                updates.insert(spec.key.clone(), successor);
+            }
+            (None, None) => {}
+            _ => return Err(training("compiled workload successor set mismatch")),
+        }
         if updates.len() != specs.len() || specs.iter().any(|spec| !updates.contains_key(&spec.key))
         {
             return Err(training("compiled optimizer successor set mismatch"));
@@ -1449,6 +1653,7 @@ impl CompiledTrainingPlan {
             output_names,
             parameter_buffers,
             optimizer_buffers,
+            workload_buffers,
             state_input_buffers,
             state_input_keys,
             state_values: specs
@@ -1492,6 +1697,7 @@ impl CompiledTrainingPlan {
             .keys()
             .map(|name| parameter_key(name))
             .chain(self.optimizer_buffers.keys().cloned())
+            .chain(self.workload_buffers.keys().cloned())
             .collect::<BTreeSet<_>>();
         if values.keys().cloned().collect::<BTreeSet<_>>() != expected {
             return Err(training("compiled checkpoint state names mismatch"));
@@ -1558,6 +1764,7 @@ impl CompiledTrainingPlan {
             output_names: self.output_names.clone(),
             parameter_buffers: self.parameter_buffers.clone(),
             optimizer_buffers: self.optimizer_buffers.clone(),
+            workload_buffers: self.workload_buffers.clone(),
             state_input_buffers: self.state_input_buffers.clone(),
             state_input_keys: self.state_input_keys.clone(),
             step: 0,
@@ -1656,6 +1863,7 @@ impl CpuCompiledTrainingProgram {
             output_names: self.output_names.clone(),
             parameter_buffers: self.parameter_buffers.clone(),
             optimizer_buffers: self.optimizer_buffers.clone(),
+            workload_buffers: self.workload_buffers.clone(),
             state_input_buffers: self.state_input_buffers.clone(),
             state_input_keys: self.state_input_keys.clone(),
             state_values,
@@ -1716,6 +1924,20 @@ impl CpuCompiledTrainingProgram {
             .clone())
     }
 
+    fn workload_snapshot(&self, key: &str) -> Result<TensorData> {
+        let buffer = self
+            .workload_buffers
+            .get(key)
+            .ok_or_else(|| training("compiled workload state is absent"))?;
+        let state = self.current_state(*buffer)?;
+        Ok(self
+            .runtime
+            .snapshot(state)
+            .map_err(runtime_error)?
+            .tensor()
+            .clone())
+    }
+
     fn restore_frontier(&mut self, step: u64, values: &BTreeMap<String, TensorData>) -> Result<()> {
         let buffers = self
             .parameter_buffers
@@ -1723,6 +1945,11 @@ impl CpuCompiledTrainingProgram {
             .map(|(name, buffer)| (parameter_key(name), *buffer))
             .chain(
                 self.optimizer_buffers
+                    .iter()
+                    .map(|(name, buffer)| (name.clone(), *buffer)),
+            )
+            .chain(
+                self.workload_buffers
                     .iter()
                     .map(|(name, buffer)| (name.clone(), *buffer)),
             )
@@ -1923,6 +2150,7 @@ impl CompiledAdamWPlan {
             max_gradient_norm,
             loss_scale,
             progress: AdamWProgress::INITIAL,
+            dropout: None,
         })
     }
 
@@ -1943,6 +2171,92 @@ impl CompiledAdamWPlan {
         })
     }
 
+    /// Compiles module-bound AdamW with one device-resident Threefry block
+    /// counter shared by the module's explicit residual-dropout calls.
+    pub fn compile_module_with_dropout<M, F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: &M,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let parameter_plan = ModuleParameterPlan::new(module)?;
+        let parameters = parameter_plan.initial_parameters()?;
+        Self::compile_module_with_dropout_parameters(
+            config,
+            dropout,
+            module,
+            parameter_plan,
+            parameters,
+            build,
+        )
+    }
+
+    fn compile_module_with_dropout_parameters<M, F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: &M,
+        parameter_plan: ModuleParameterPlan,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let gradient_accumulation_steps = config.gradient_accumulation_steps;
+        let max_gradient_norm = config.max_gradient_norm;
+        let loss_scale = config.loss_scale;
+        let workload = StateSpec {
+            key: DROPOUT_COUNTER_KEY.into(),
+            input_name: DROPOUT_COUNTER_INPUT.into(),
+            value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
+            requires_grad: false,
+        };
+        let mut dropout_state = None;
+        let inner = CompiledTrainingPlan::compile_with_workload(
+            AdamWProgram { config },
+            parameters,
+            Some(workload),
+            |graph, inputs, parameters, counter| {
+                let counter =
+                    counter.ok_or_else(|| training("compiled dropout state is absent"))?;
+                let mut provider = CompiledDropoutStream::new(counter, dropout);
+                let (loss, outputs) = parameter_plan.lower(graph, parameters, |graph| {
+                    build(module, graph, inputs, &mut provider)
+                })?;
+                let (successor, state) = provider.finish(graph)?;
+                dropout_state = Some(state);
+                Ok((loss, outputs, Some(successor)))
+            },
+        )?;
+        let dropout = dropout_state
+            .ok_or_else(|| training("compiled dropout configuration produced no state"))?;
+        let program_identity = inner.capture_identity()?;
+        Ok(Self {
+            inner,
+            program_identity,
+            gradient_accumulation_steps,
+            max_gradient_norm,
+            loss_scale,
+            progress: AdamWProgress::INITIAL,
+            dropout: Some(dropout),
+        })
+    }
+
     /// Recompiles an exact program and restores its portable AdamW frontier
     /// before any concrete runtime is prepared.
     pub fn compile_from_checkpoint<F>(
@@ -1958,6 +2272,11 @@ impl CompiledAdamWPlan {
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
         let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
+        if decoded.dropout_block_counter.is_some() {
+            return Err(training(
+                "compiled AdamW dropout checkpoint requires dropout restore",
+            ));
+        }
         if config.gradient_accumulation_steps != decoded.accumulation_steps {
             return Err(training(
                 "compiled AdamW checkpoint accumulation policy mismatch",
@@ -2038,6 +2357,111 @@ impl CompiledAdamWPlan {
         })
     }
 
+    /// Recompiles the same explicit residual-dropout program and restores its
+    /// complete optimizer and Threefry-counter frontier.
+    pub fn compile_module_with_dropout_from_checkpoint<M, F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: &M,
+        checkpoint: &CompiledAdamWCheckpoint,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
+        let dropout_counter = decoded
+            .dropout_block_counter
+            .ok_or_else(|| training("compiled AdamW checkpoint has no dropout block counter"))?;
+        if config.gradient_accumulation_steps != decoded.accumulation_steps {
+            return Err(training(
+                "compiled AdamW checkpoint accumulation policy mismatch",
+            ));
+        }
+        let parameter_plan = ModuleParameterPlan::new(module)?;
+        let parameters = decoded
+            .parameters
+            .iter()
+            .map(|(name, value)| TrainingParameterInit::new(name.clone(), value.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut plan = Self::compile_module_with_dropout_parameters(
+            config,
+            dropout,
+            module,
+            parameter_plan,
+            parameters,
+            build,
+        )?;
+        if plan.capture_identity() != decoded.capture_identity {
+            return Err(training(
+                "compiled AdamW checkpoint capture identity mismatch",
+            ));
+        }
+        let expected_counter = decoded
+            .replay_step
+            .checked_mul(
+                plan.dropout
+                    .expect("dropout compilation records its policy")
+                    .blocks_per_replay,
+            )
+            .ok_or_else(|| training("compiled dropout counter progress overflows"))?;
+        if dropout_counter != expected_counter {
+            return Err(training(
+                "compiled dropout counter and replay progress diverged",
+            ));
+        }
+        let mut values = decoded
+            .parameters
+            .into_iter()
+            .map(|(name, value)| (parameter_key(&name), value))
+            .collect::<BTreeMap<_, _>>();
+        for (name, value) in decoded.first_moments {
+            values.insert(slot_key(&name, "first_moment"), value);
+        }
+        for (name, value) in decoded.second_moments {
+            values.insert(slot_key(&name, "second_moment"), value);
+        }
+        for (name, value) in decoded.gradient_accumulators {
+            values.insert(slot_key(&name, "gradient_accumulator"), value);
+        }
+        values.insert(
+            "global:step".into(),
+            TensorData::from_scalars(
+                Shape::from([]),
+                DType::U64,
+                [Scalar::U(decoded.optimizer_step)],
+            )?,
+        );
+        if decoded.accumulation_steps > 1 {
+            values.insert(
+                "global:accumulation_index".into(),
+                TensorData::from_scalars(
+                    Shape::from([]),
+                    DType::U64,
+                    [Scalar::U(decoded.accumulation_index)],
+                )?,
+            );
+        }
+        values.insert(
+            DROPOUT_COUNTER_KEY.into(),
+            TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(dropout_counter)])?,
+        );
+        plan.progress = AdamWProgress {
+            replay_step: decoded.replay_step,
+            optimizer_step: decoded.optimizer_step,
+            accumulation_index: decoded.accumulation_index,
+            discarded_microbatches: decoded.discarded_microbatches,
+        };
+        plan.inner = plan.inner.restore_frontier(decoded.replay_step, values)?;
+        Ok(plan)
+    }
+
     /// Prepares graph-free CPU replay from this plan's exact frontier.
     pub fn prepare_cpu(&self) -> Result<CpuCompiledAdamW> {
         Ok(CpuCompiledAdamW {
@@ -2046,6 +2470,7 @@ impl CompiledAdamWPlan {
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
             progress: self.progress,
+            dropout: self.dropout,
         })
     }
 
@@ -2105,6 +2530,7 @@ impl CompiledAdamWPlan {
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
+            dropout: self.dropout,
         })
     }
 
@@ -2126,6 +2552,16 @@ impl CompiledAdamWPlan {
 
     pub fn loss_scale(&self) -> f32 {
         self.loss_scale
+    }
+
+    /// Returns the explicit compiled dropout policy, when present.
+    pub fn dropout_config(&self) -> Option<CompiledDropoutConfig> {
+        self.dropout.map(|dropout| dropout.config)
+    }
+
+    /// Number of Threefry U64 blocks reserved by each successful replay.
+    pub fn dropout_blocks_per_replay(&self) -> Option<u64> {
+        self.dropout.map(|dropout| dropout.blocks_per_replay)
     }
 }
 
@@ -2213,6 +2649,9 @@ impl CpuCompiledAdamW {
         let next = self
             .progress
             .advance_replay(self.gradient_accumulation_steps)?;
+        if let Some(dropout) = self.dropout {
+            expected_dropout_counter(dropout, next.replay_step)?;
+        }
         let mut result = self.inner.step(inputs, learning_rate)?;
         result.step = next.replay_step;
         self.progress = next;
@@ -2233,6 +2672,19 @@ impl CpuCompiledAdamW {
 
     pub fn loss_scale(&self) -> f32 {
         self.loss_scale
+    }
+
+    /// Explicit diagnostic snapshot of the recurrent dropout counter.
+    pub fn dropout_block_counter(&self) -> Result<Option<u64>> {
+        self.dropout
+            .map(|_| {
+                Ok(self
+                    .inner
+                    .workload_snapshot(DROPOUT_COUNTER_KEY)?
+                    .scalar_at(0)
+                    .as_u64())
+            })
+            .transpose()
     }
 
     pub fn optimizer_step(&self) -> Result<u64> {
@@ -2317,6 +2769,7 @@ impl CpuCompiledAdamW {
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
             progress: self.progress,
+            dropout: self.dropout,
         }
         .metal_plan(renderer)
     }
@@ -2326,6 +2779,22 @@ impl CpuCompiledAdamW {
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
         validate_adamw_progress(self.progress, self.gradient_accumulation_steps)?;
         validate_cpu_adamw_state(&self.inner, self.progress, self.gradient_accumulation_steps)?;
+        let dropout_block_counter = self
+            .dropout
+            .map(|dropout| {
+                let counter = self
+                    .inner
+                    .workload_snapshot(DROPOUT_COUNTER_KEY)?
+                    .scalar_at(0)
+                    .as_u64();
+                if counter != expected_dropout_counter(dropout, self.progress.replay_step)? {
+                    return Err(training(
+                        "compiled CPU dropout counter and replay progress diverged",
+                    ));
+                }
+                Ok(counter)
+            })
+            .transpose()?;
         let bytes = encode_adamw_checkpoint(
             AdamWCheckpointProgress {
                 capture_identity: self.capture_identity(),
@@ -2334,6 +2803,7 @@ impl CpuCompiledAdamW {
                 accumulation_steps: self.gradient_accumulation_steps,
                 accumulation_index: self.progress.accumulation_index,
                 discarded_microbatches: self.progress.discarded_microbatches,
+                dropout_block_counter,
             },
             AdamWCheckpointTensors {
                 parameters: self.parameter_snapshots()?,
@@ -2355,6 +2825,9 @@ impl CpuCompiledAdamW {
         let next = self
             .progress
             .advance_replay(self.gradient_accumulation_steps)?;
+        if let Some(dropout) = self.dropout {
+            expected_dropout_counter(dropout, next.replay_step)?;
+        }
         let mut result = self
             .inner
             .step_inner(inputs, learning_rate, injected_failure)?;
@@ -2494,6 +2967,14 @@ impl MetalCompiledAdamWPlan {
         self.loss_scale
     }
 
+    pub fn dropout_config(&self) -> Option<CompiledDropoutConfig> {
+        self.dropout.map(|dropout| dropout.config)
+    }
+
+    pub fn dropout_blocks_per_replay(&self) -> Option<u64> {
+        self.dropout.map(|dropout| dropout.blocks_per_replay)
+    }
+
     pub fn summary(&self) -> &MetalDeviceSessionSummary {
         self.inner.summary()
     }
@@ -2541,6 +3022,7 @@ impl MetalCompiledAdamWPlan {
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
+            dropout: self.dropout,
             scoreboard,
         })
     }
@@ -2556,6 +3038,9 @@ impl MetalCompiledAdamW {
         let next = self
             .progress
             .advance_replay(self.gradient_accumulation_steps)?;
+        if let Some(dropout) = self.dropout {
+            expected_dropout_counter(dropout, next.replay_step)?;
+        }
         let mut provided = inputs;
         provided.insert(LEARNING_RATE_INPUT.into(), learning_rate);
         let run = self.session.run(&provided).map_err(metal_training_error)?;
@@ -2685,6 +3170,20 @@ impl MetalCompiledAdamW {
         Ok(self.progress.optimizer_step)
     }
 
+    /// Explicit diagnostic download of the recurrent dropout counter.
+    pub fn dropout_block_counter(&self) -> Result<Option<u64>> {
+        self.dropout
+            .map(|_| {
+                Ok(self
+                    .state_snapshots()?
+                    .get(DROPOUT_COUNTER_KEY)
+                    .ok_or_else(|| training("compiled Metal dropout counter is absent"))?
+                    .scalar_at(0)
+                    .as_u64())
+            })
+            .transpose()
+    }
+
     /// Clears a retained partial window entirely inside the epoch-swapped
     /// device frontier. No training run or host gradient download is performed.
     pub fn zero_grad(&mut self) -> Result<CompiledAdamWZeroGradResult> {
@@ -2758,6 +3257,22 @@ impl MetalCompiledAdamW {
         {
             return Err(training("compiled Metal AdamW progress state mismatch"));
         }
+        let dropout_block_counter = self
+            .dropout
+            .map(|dropout| {
+                let counter = states
+                    .get(DROPOUT_COUNTER_KEY)
+                    .ok_or_else(|| training("compiled Metal dropout counter is absent"))?
+                    .scalar_at(0)
+                    .as_u64();
+                if counter != expected_dropout_counter(dropout, self.progress.replay_step)? {
+                    return Err(training(
+                        "compiled Metal dropout counter and replay progress diverged",
+                    ));
+                }
+                Ok(counter)
+            })
+            .transpose()?;
         let parameters = metal_parameter_snapshots(&states);
         let first_moments = metal_slot_snapshots(states.clone(), "first_moment")?;
         let second_moments = metal_slot_snapshots(states.clone(), "second_moment")?;
@@ -2770,6 +3285,7 @@ impl MetalCompiledAdamW {
                 accumulation_steps: self.gradient_accumulation_steps,
                 accumulation_index: self.progress.accumulation_index,
                 discarded_microbatches: self.progress.discarded_microbatches,
+                dropout_block_counter,
             },
             AdamWCheckpointTensors {
                 parameters,
@@ -2889,6 +3405,7 @@ fn encode_adamw_checkpoint(
         accumulation_steps,
         accumulation_index,
         discarded_microbatches,
+        dropout_block_counter,
     } = progress;
     let AdamWCheckpointTensors {
         parameters,
@@ -2934,9 +3451,32 @@ fn encode_adamw_checkpoint(
             );
         }
     }
+    if let Some(counter) = dropout_block_counter {
+        tensors.insert(
+            "dropout_block_counter".into(),
+            TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(counter)])?,
+        );
+    }
     let parameter_names = serde_json::to_string(&names)
         .map_err(|error| training(format!("checkpoint names: {error}")))?;
-    let metadata = if discarded_microbatches != 0 {
+    let metadata = if dropout_block_counter.is_some() {
+        Metadata::from([
+            ("format".into(), ADAMW_CHECKPOINT_FORMAT_V4.into()),
+            ("capture_identity".into(), capture_identity.to_string()),
+            ("replay_step".into(), replay_step.to_string()),
+            ("optimizer_step".into(), optimizer_step.to_string()),
+            (
+                "gradient_accumulation_steps".into(),
+                accumulation_steps.to_string(),
+            ),
+            ("accumulation_index".into(), accumulation_index.to_string()),
+            (
+                "discarded_microbatch_count".into(),
+                discarded_microbatches.to_string(),
+            ),
+            ("parameter_names".into(), parameter_names),
+        ])
+    } else if discarded_microbatches != 0 {
         Metadata::from([
             ("format".into(), ADAMW_CHECKPOINT_FORMAT_V3.into()),
             ("capture_identity".into(), capture_identity.to_string()),
@@ -3005,6 +3545,16 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
             "discarded_microbatch_count",
             "parameter_names",
         ]),
+        ADAMW_CHECKPOINT_FORMAT_V4 => BTreeSet::from([
+            "format",
+            "capture_identity",
+            "replay_step",
+            "optimizer_step",
+            "gradient_accumulation_steps",
+            "accumulation_index",
+            "discarded_microbatch_count",
+            "parameter_names",
+        ]),
         _ => return Err(training("compiled AdamW checkpoint format mismatch")),
     };
     if metadata.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_metadata {
@@ -3030,7 +3580,10 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
             parse_checkpoint_u64(&metadata, "optimizer_step")?,
             parse_checkpoint_u64(&metadata, "gradient_accumulation_steps")?,
             parse_checkpoint_u64(&metadata, "accumulation_index")?,
-            if format == ADAMW_CHECKPOINT_FORMAT_V3 {
+            if matches!(
+                format.as_str(),
+                ADAMW_CHECKPOINT_FORMAT_V3 | ADAMW_CHECKPOINT_FORMAT_V4
+            ) {
                 parse_checkpoint_u64(&metadata, "discarded_microbatch_count")?
             } else {
                 0
@@ -3065,6 +3618,19 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
     }
 
     let mut tensors = state;
+    let dropout_block_counter = if format == ADAMW_CHECKPOINT_FORMAT_V4 {
+        let counter = tensors
+            .remove("dropout_block_counter")
+            .ok_or_else(|| training("compiled AdamW dropout counter is absent"))?;
+        if counter.shape() != &Shape::from([]) || counter.dtype() != DType::U64 {
+            return Err(training(
+                "compiled AdamW dropout counter descriptor mismatch",
+            ));
+        }
+        Some(counter.scalar_at(0).as_u64())
+    } else {
+        None
+    };
     let mut parameters = BTreeMap::new();
     let mut first_moments = BTreeMap::new();
     let mut second_moments = BTreeMap::new();
@@ -3111,6 +3677,7 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
         accumulation_steps,
         accumulation_index,
         discarded_microbatches,
+        dropout_block_counter,
         parameters,
         first_moments,
         second_moments,
@@ -3458,8 +4025,65 @@ fn training(reason: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Backend, CpuBackend, LossOptions, Parameter, cross_entropy};
+    use crate::{Backend, CpuBackend, LossOptions, Op, Parameter, cross_entropy};
     use std::collections::HashMap;
+
+    #[test]
+    fn compiled_dropout_reserves_source_order_blocks_only_for_active_f32_draws() {
+        let mut graph = Graph::new();
+        let counter = graph.input_dtype_requires_grad("counter", [], DType::U64, false);
+        let f32_three = graph.input_dtype_requires_grad("f32_three", [3], DType::F32, true);
+        let f32_four = graph.input_dtype_requires_grad("f32_four", [4], DType::F32, true);
+        let empty = graph.input_dtype_requires_grad("empty", [0], DType::F32, true);
+        let integer = graph.input_dtype_requires_grad("integer", [3], DType::I32, false);
+        let mut stream = CompiledDropoutStream::new(
+            counter,
+            CompiledDropoutConfig::new(CompiledDropoutKey([3, 7])),
+        );
+
+        assert_eq!(
+            stream.dropout(&mut graph, f32_three, 0.0).unwrap(),
+            f32_three
+        );
+        assert_eq!(stream.dropout(&mut graph, empty, 0.5).unwrap(), empty);
+        let all_zero = stream.dropout(&mut graph, f32_three, 1.0).unwrap();
+        assert_eq!(graph.shape(all_zero).unwrap(), &Shape::new([3]));
+        assert!(stream.dropout(&mut graph, integer, 0.5).is_err());
+        let first = stream.dropout(&mut graph, f32_three, 0.5).unwrap();
+        let second = stream.dropout(&mut graph, f32_four, 0.25).unwrap();
+        assert_eq!(graph.shape(first).unwrap(), &Shape::new([3]));
+        assert_eq!(graph.shape(second).unwrap(), &Shape::new([4]));
+
+        let (successor, state) = stream.finish(&mut graph).unwrap();
+        assert_eq!(state.blocks_per_replay, 4);
+        assert_eq!(state.config.key().words(), [3, 7]);
+        assert_eq!(graph.dtype(successor).unwrap(), DType::U64);
+        assert!(!graph.requires_grad(successor).unwrap());
+        let loss = graph.sum_all(first).unwrap();
+        let gradient = graph.gradient_default(loss, &[f32_three]).unwrap()[0];
+        let bindings = HashMap::from([
+            (
+                "counter".into(),
+                TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)]).unwrap(),
+            ),
+            (
+                "f32_three".into(),
+                TensorData::new([3], vec![1.0, 1.0, 1.0]).unwrap(),
+            ),
+        ]);
+        let cpu = CpuBackend;
+        assert_eq!(
+            cpu.execute(&graph, gradient, &bindings).unwrap(),
+            cpu.execute(&graph, first, &bindings).unwrap(),
+            "for unit inputs and p=0.5, the VJP is exactly the realized mask/(1-p)"
+        );
+        assert_eq!(
+            (0..graph.node_count())
+                .filter(|index| matches!(graph.op(NodeId(*index)).unwrap(), Op::Threefry { .. }))
+                .count(),
+            2
+        );
+    }
 
     struct TiedFrozenModule {
         shared: Parameter,
@@ -3482,6 +4106,264 @@ mod tests {
             visitor("shared_alias".into(), &self.shared, StateKind::Parameter);
             visitor("frozen".into(), &self.frozen, StateKind::Parameter);
         }
+    }
+
+    fn build_tied_dropout(
+        module: &TiedFrozenModule,
+        graph: &mut Graph,
+        inputs: &BTreeMap<String, NodeId>,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+        let dropped = dropout.dropout(graph, inputs["x"], 0.5)?;
+        let shared = module.shared.bind(graph)?;
+        let frozen = module.frozen.bind(graph)?;
+        let scaled = graph.mul(dropped, shared)?;
+        let output = graph.add(scaled, frozen)?;
+        let squared = graph.square(output)?;
+        let loss = graph.sum_all(squared)?;
+        Ok((loss, BTreeMap::from([("output".into(), output)])))
+    }
+
+    fn build_double_dropout(
+        module: &TiedFrozenModule,
+        graph: &mut Graph,
+        inputs: &BTreeMap<String, NodeId>,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+        let first = dropout.dropout(graph, inputs["x"], 0.5)?;
+        let second = dropout.dropout(graph, first, 0.5)?;
+        let shared = module.shared.bind(graph)?;
+        let output = graph.mul(second, shared)?;
+        let loss = graph.sum_all(output)?;
+        Ok((loss, BTreeMap::from([("output".into(), output)])))
+    }
+
+    #[test]
+    fn compiled_dropout_effect_failure_retry_and_zero_grad_preserve_counter_contract() {
+        let config = module_config().with_gradient_accumulation(2).unwrap();
+        let key = CompiledDropoutConfig::new(CompiledDropoutKey([11, 13]));
+        let module = TiedFrozenModule::new([0.1, -0.2]);
+        let reference_module = TiedFrozenModule::new([0.1, -0.2]);
+        let mut candidate = CompiledAdamWPlan::compile_module_with_dropout(
+            config.clone(),
+            key,
+            &module,
+            build_tied_dropout,
+        )
+        .unwrap()
+        .prepare_cpu()
+        .unwrap();
+        let mut reference = CompiledAdamWPlan::compile_module_with_dropout(
+            config,
+            key,
+            &reference_module,
+            build_tied_dropout,
+        )
+        .unwrap()
+        .prepare_cpu()
+        .unwrap();
+        let inputs =
+            || BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 2.0]).unwrap())]);
+        let before = candidate.checkpoint().unwrap();
+        assert!(
+            candidate
+                .step_inner(inputs(), TensorData::scalar(0.01), Some(0))
+                .is_err()
+        );
+        assert_eq!(candidate.dropout_block_counter().unwrap(), Some(0));
+        assert_eq!(candidate.checkpoint().unwrap(), before);
+        let expected = reference.step(inputs(), TensorData::scalar(0.01)).unwrap();
+        let actual = candidate.step(inputs(), TensorData::scalar(0.01)).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(candidate.dropout_block_counter().unwrap(), Some(1));
+        assert!(candidate.zero_grad().unwrap().did_discard());
+        assert_eq!(candidate.dropout_block_counter().unwrap(), Some(1));
+        assert_eq!(candidate.step_count(), 1);
+    }
+
+    #[test]
+    fn compiled_dropout_checkpoint_v4_requires_exact_restore_policy_and_counter() {
+        let key = CompiledDropoutConfig::new(CompiledDropoutKey([23, 29]));
+        let module = TiedFrozenModule::new([0.1, -0.2]);
+        let mut runtime = CompiledAdamWPlan::compile_module_with_dropout(
+            module_config(),
+            key,
+            &module,
+            build_tied_dropout,
+        )
+        .unwrap()
+        .prepare_cpu()
+        .unwrap();
+        runtime
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 2.0]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        let checkpoint = runtime.checkpoint().unwrap();
+        let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V4);
+
+        let fresh = TiedFrozenModule::new([0.1, -0.2]);
+        assert!(
+            CompiledAdamWPlan::compile_module_from_checkpoint(
+                module_config(),
+                &fresh,
+                &checkpoint,
+                build_tied_frozen,
+            )
+            .is_err()
+        );
+        assert!(
+            CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+                module_config(),
+                CompiledDropoutConfig::new(CompiledDropoutKey([23, 30])),
+                &fresh,
+                &checkpoint,
+                build_tied_dropout,
+            )
+            .is_err()
+        );
+        assert!(
+            CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+                module_config(),
+                key,
+                &fresh,
+                &checkpoint,
+                build_double_dropout,
+            )
+            .is_err()
+        );
+
+        let decoded = decode_adamw_checkpoint(checkpoint.as_bytes()).unwrap();
+        let malformed = CompiledAdamWCheckpoint::from_bytes(
+            encode_adamw_checkpoint(
+                AdamWCheckpointProgress {
+                    capture_identity: decoded.capture_identity,
+                    replay_step: decoded.replay_step,
+                    optimizer_step: decoded.optimizer_step,
+                    accumulation_steps: decoded.accumulation_steps,
+                    accumulation_index: decoded.accumulation_index,
+                    discarded_microbatches: decoded.discarded_microbatches,
+                    dropout_block_counter: decoded.dropout_block_counter.map(|value| value + 1),
+                },
+                AdamWCheckpointTensors {
+                    parameters: decoded.parameters,
+                    first_moments: decoded.first_moments,
+                    second_moments: decoded.second_moments,
+                    gradient_accumulators: decoded.gradient_accumulators,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+                module_config(),
+                key,
+                &fresh,
+                &malformed,
+                build_tied_dropout,
+            )
+            .is_err()
+        );
+
+        let ordinary = CpuCompiledAdamW::compile_module(module_config(), &fresh, build_tied_frozen)
+            .unwrap()
+            .checkpoint()
+            .unwrap();
+        let (_, metadata) = load_safetensors(ordinary.as_bytes()).unwrap();
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V1);
+        assert!(
+            CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+                module_config(),
+                key,
+                &fresh,
+                &ordinary,
+                build_tied_dropout,
+            )
+            .is_err()
+        );
+        let mut accumulated = CpuCompiledAdamW::compile_module(
+            module_config().with_gradient_accumulation(2).unwrap(),
+            &fresh,
+            build_tied_frozen,
+        )
+        .unwrap();
+        accumulated
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 2.0]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        let v2 = accumulated.checkpoint().unwrap();
+        accumulated.zero_grad().unwrap();
+        let v3 = accumulated.checkpoint().unwrap();
+        for (legacy, format) in [
+            (v2, ADAMW_CHECKPOINT_FORMAT_V2),
+            (v3, ADAMW_CHECKPOINT_FORMAT_V3),
+        ] {
+            let (_, metadata) = load_safetensors(legacy.as_bytes()).unwrap();
+            assert_eq!(metadata["format"], format);
+            assert!(
+                CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+                    module_config().with_gradient_accumulation(2).unwrap(),
+                    key,
+                    &fresh,
+                    &legacy,
+                    build_tied_dropout,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_dropout_rejects_counter_exhaustion_before_replay() {
+        let module = TiedFrozenModule::new([0.1, -0.2]);
+        let mut plan = CompiledAdamWPlan::compile_module_with_dropout(
+            module_config(),
+            CompiledDropoutConfig::new(CompiledDropoutKey([17, 19])),
+            &module,
+            build_double_dropout,
+        )
+        .unwrap();
+        assert_eq!(plan.dropout_blocks_per_replay(), Some(2));
+        let replay_step = u64::MAX / 2;
+        let mut values = plan.inner.state_values.clone();
+        values.insert(
+            "global:step".into(),
+            TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(replay_step)])
+                .unwrap(),
+        );
+        values.insert(
+            DROPOUT_COUNTER_KEY.into(),
+            TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(replay_step * 2)])
+                .unwrap(),
+        );
+        plan.inner = plan
+            .inner
+            .clone()
+            .restore_frontier(replay_step, values)
+            .unwrap();
+        plan.progress = AdamWProgress {
+            replay_step,
+            optimizer_step: replay_step,
+            accumulation_index: 0,
+            discarded_microbatches: 0,
+        };
+        let mut runtime = plan.prepare_cpu().unwrap();
+        let before = runtime.checkpoint().unwrap();
+        assert!(
+            runtime
+                .step(
+                    BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 2.0]).unwrap(),)]),
+                    TensorData::scalar(0.01),
+                )
+                .is_err()
+        );
+        assert_eq!(runtime.checkpoint().unwrap(), before);
     }
 
     fn module_config() -> CompiledAdamWConfig {

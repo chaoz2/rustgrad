@@ -6,9 +6,9 @@ use rustgrad::runtime::metal::{MetalCapabilities, MetalRenderer};
 use rustgrad::runtime::metal::{MetalDiscovery, MetalRuntime, MetalScoreboardContext};
 use rustgrad::{
     CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledTrainingStep, CpuSessionTarget, DType, Graph, LossOptions, Mode, ModeModuleForward,
-    Module, NodeId, Parameter, Reduction, Result, Scalar, Shape, TensorData, TransformerBlock,
-    cross_entropy,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledTrainingStep, CpuSessionTarget, DType,
+    Graph, LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Parameter, Reduction, Result,
+    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
 };
 use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
@@ -28,15 +28,22 @@ impl TinyCausalTransformer {
     fn new(seed: u64) -> Result<Self> {
         Ok(Self {
             tokens: Embedding::new_static(VOCAB, EMBEDDING, None, seed)?,
-            block: TransformerBlock::new_static(EMBEDDING, 1, 4, true, 0.0, seed.wrapping_add(1))?
+            block: TransformerBlock::new_static(EMBEDDING, 1, 4, true, 0.25, seed.wrapping_add(1))?
                 .with_causal_attention(true),
             norm: LayerNorm::new_static([EMBEDDING], 1e-5, true)?,
         })
     }
 
-    fn forward(&self, graph: &mut Graph, tokens: NodeId) -> Result<NodeId> {
+    fn forward(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<NodeId> {
         let hidden = self.tokens.forward(graph, tokens)?;
-        let hidden = self.block.forward_mode(graph, hidden, Mode::Eval)?.output;
+        let hidden = self
+            .block
+            .forward_training_with_dropout(graph, hidden, dropout)?;
         let hidden = self.norm.forward(graph, hidden)?;
         let tied_weight = self.tokens.weight.bind(graph)?;
         let tied_weight = graph.permute(tied_weight, [1, 0])?;
@@ -79,8 +86,9 @@ fn build(
     model: &TinyCausalTransformer,
     graph: &mut Graph,
     inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
-    let logits = model.forward(graph, inputs["tokens"])?;
+    let logits = model.forward(graph, inputs["tokens"], dropout)?;
     let flat_logits = graph.reshape(logits, [TIME, VOCAB])?;
     let flat_targets = graph.reshape(inputs["targets"], [TIME])?;
     let loss = cross_entropy(
@@ -93,6 +101,10 @@ fn build(
         },
     )?;
     Ok((loss, BTreeMap::from([("logits".into(), logits)])))
+}
+
+fn dropout_config() -> CompiledDropoutConfig {
+    CompiledDropoutConfig::new(CompiledDropoutKey([0x1234_5678, 0x9abc_def0]))
 }
 
 fn batch() -> BTreeMap<String, TensorData> {
@@ -115,7 +127,7 @@ fn learning_rate() -> TensorData {
 }
 
 fn compiled_transformer(model: &TinyCausalTransformer) -> CompiledAdamWPlan {
-    CompiledAdamWPlan::compile_module(config(), model, build)
+    CompiledAdamWPlan::compile_module_with_dropout(config(), dropout_config(), model, build)
         .expect("the fixed causal Transformer training program must compile")
 }
 
@@ -158,8 +170,9 @@ where
     let saved = uninterrupted.checkpoint().unwrap();
     let checkpoint = CompiledAdamWCheckpoint::from_bytes(saved.into_bytes()).unwrap();
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
-    let resumed_plan = CompiledAdamWPlan::compile_module_from_checkpoint(
+    let resumed_plan = CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
         config(),
+        dropout_config(),
         &resumed_model,
         &checkpoint,
         build,
@@ -209,6 +222,26 @@ fn metal_renderer() -> MetalRenderer {
     .unwrap()
 }
 
+fn assert_strict_dropout_kernels(plan: &MetalCompiledAdamWPlan) {
+    let threefry = plan
+        .rendered_items()
+        .filter(|item| item.entry.starts_with("rg_metal_threefry_"))
+        .collect::<Vec<_>>();
+    let bitcasts = plan
+        .rendered_items()
+        .filter(|item| item.entry == "rg_metal_portable_bitcast")
+        .collect::<Vec<_>>();
+    assert_eq!(threefry.len(), 2);
+    assert_eq!(bitcasts.len(), 4);
+    assert!(
+        threefry
+            .into_iter()
+            .chain(bitcasts)
+            .all(|item| item.transaction.is_none() && item.indexed_movement().is_none()),
+        "compiled dropout kernels must not introduce a status-read transaction"
+    );
+}
+
 #[test]
 fn compiled_transformer_plan_cpu_target_decreases_loss_and_resumes_exactly() {
     let target = CpuSessionTarget::new();
@@ -221,10 +254,35 @@ fn compiled_transformer_plan_cpu_target_decreases_loss_and_resumes_exactly() {
 }
 
 #[test]
+fn compiled_transformer_dropout_is_keyed_replay_varying_and_zero_grad_is_not_a_draw() {
+    let left_model = TinyCausalTransformer::new(7).unwrap();
+    let right_model = TinyCausalTransformer::new(7).unwrap();
+    let mut left = compiled_transformer(&left_model).prepare_cpu().unwrap();
+    let mut right = compiled_transformer(&right_model).prepare_cpu().unwrap();
+    let mut replay_outputs = Vec::new();
+
+    for replay in 1..=3 {
+        let left_step = left.step(batch(), TensorData::scalar(0.0)).unwrap();
+        let right_step = right.step(batch(), TensorData::scalar(0.0)).unwrap();
+        assert_eq!(left_step.loss(), right_step.loss());
+        assert_eq!(left_step.outputs(), right_step.outputs());
+        replay_outputs.push(left_step.outputs().clone());
+        assert_eq!(left.dropout_block_counter().unwrap(), Some(replay * 6));
+        assert_eq!(right.dropout_block_counter().unwrap(), Some(replay * 6));
+    }
+    assert_ne!(replay_outputs[0], replay_outputs[1]);
+    let before = left.dropout_block_counter().unwrap();
+    assert!(!left.zero_grad().unwrap().did_discard());
+    assert_eq!(left.dropout_block_counter().unwrap(), before);
+}
+
+#[test]
 fn compiled_transformer_plan_is_strictly_renderable_for_metal() {
     let model = TinyCausalTransformer::new(7).unwrap();
     let compiled = compiled_transformer(&model);
     assert_eq!(compiled.loss_scale(), 128.0);
+    assert_eq!(compiled.dropout_config(), Some(dropout_config()));
+    assert_eq!(compiled.dropout_blocks_per_replay(), Some(6));
     let parameter_count = compiled
         .prepare(&CpuSessionTarget::new())
         .unwrap()
@@ -237,10 +295,11 @@ fn compiled_transformer_plan_is_strictly_renderable_for_metal() {
     assert_eq!(plan.loss_scale(), 128.0);
     assert_eq!(plan.step_count(), 0);
     assert_eq!(plan.summary().fallback_count, 0);
-    assert_eq!(plan.summary().state_pair_count, parameter_count * 3 + 1);
+    assert_eq!(plan.summary().state_pair_count, parameter_count * 3 + 2);
     assert_eq!(plan.summary().state_bank_count, 2);
     assert_eq!(plan.summary().requested_output_count, 2);
     assert!(plan.summary().nonzero_item_count > 0);
+    assert_strict_dropout_kernels(&plan);
     assert_eq!(
         plan.rendered_items().len(),
         plan.summary().nonzero_item_count
@@ -317,6 +376,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(rendered.loss_scale(), 128.0);
     assert_eq!(rendered.summary().fallback_count, 0);
     assert!(rendered.summary().nonzero_item_count > 0);
+    assert_strict_dropout_kernels(&rendered);
     let deployment_identity = rendered.deployment_identity();
     let state_pair_count = rendered.summary().state_pair_count;
     let planned_kernel_count = rendered.summary().nonzero_item_count;
@@ -330,6 +390,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let mut losses = Vec::new();
     let mut kernel_launch_count = 0usize;
     let mut command_submission_count = 0usize;
+    let mut command_wait_count = 0usize;
     let mut transient_h2d_bytes = 0usize;
     let mut retained_d2h_bytes = 0usize;
     for index in 0..4u64 {
@@ -339,17 +400,24 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         assert_eq!(result.report().successful_invocation, index + 1);
         assert_eq!(result.report().committed_state_pair_count, state_pair_count);
         assert_eq!(result.report().kernel_launch_count, planned_kernel_count);
+        assert_eq!(
+            result.report().command_submission_count,
+            result.report().command_wait_count
+        );
+        assert!(result.report().command_submission_count > 0);
         losses.push(result.loss().scalar_at(0).as_f64());
         kernel_launch_count += result.report().kernel_launch_count;
         command_submission_count += result.report().command_submission_count;
+        command_wait_count += result.report().command_wait_count;
         transient_h2d_bytes += result.report().transient_h2d_bytes;
         retained_d2h_bytes += result.report().retained_d2h_bytes;
     }
 
     let checkpoint = uninterrupted.checkpoint().unwrap();
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
-    let resumed_seed = CompiledAdamWPlan::compile_module_from_checkpoint(
+    let resumed_seed = CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
         config(),
+        dropout_config(),
         &resumed_model,
         &checkpoint,
         build,
@@ -376,6 +444,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "the deployment identity must authenticate the checkpoint-restored state bytes"
     );
     assert_eq!(resumed_rendered.summary().fallback_count, 0);
+    assert_strict_dropout_kernels(&resumed_rendered);
     let mut resumed = resumed_seed
         .prepare(&resumed_target)
         .expect("checkpoint-restored Metal preparation must succeed");
@@ -393,11 +462,23 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         assert_eq!(actual.report().successful_invocation, resumed_index + 1);
         assert_eq!(actual.report().committed_state_pair_count, state_pair_count);
         assert_eq!(actual.report().kernel_launch_count, planned_kernel_count);
+        assert_eq!(
+            expected.report().command_submission_count,
+            expected.report().command_wait_count
+        );
+        assert_eq!(
+            actual.report().command_submission_count,
+            actual.report().command_wait_count
+        );
+        assert!(expected.report().command_submission_count > 0);
+        assert!(actual.report().command_submission_count > 0);
         losses.push(expected.loss().scalar_at(0).as_f64());
         kernel_launch_count += expected.report().kernel_launch_count;
         kernel_launch_count += actual.report().kernel_launch_count;
         command_submission_count += expected.report().command_submission_count;
         command_submission_count += actual.report().command_submission_count;
+        command_wait_count += expected.report().command_wait_count;
+        command_wait_count += actual.report().command_wait_count;
         transient_h2d_bytes += expected.report().transient_h2d_bytes;
         transient_h2d_bytes += actual.report().transient_h2d_bytes;
         retained_d2h_bytes += expected.report().retained_d2h_bytes;
@@ -410,6 +491,8 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     );
     assert_eq!(resumed.step_count(), 8);
     assert_eq!(uninterrupted.step_count(), 8);
+    assert_eq!(command_submission_count, command_wait_count);
+    assert!(command_submission_count >= 12);
     assert_eq!(
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
@@ -455,6 +538,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "final_loss": losses.last().unwrap(),
         "kernel_launch_count": kernel_launch_count,
         "command_submission_count": command_submission_count,
+        "command_wait_count": command_wait_count,
         "transient_host_api_h2d_bytes": transient_h2d_bytes,
         "retained_host_api_d2h_bytes": retained_d2h_bytes,
         "initial_scoreboard": initial_scoreboard,

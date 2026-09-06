@@ -921,6 +921,15 @@ parameter values, build one private Graph with one batched reverse traversal,
 and capture the pure loss/output/update prefix together with ordered parameter
 and optimizer-state stores. AdamW keeps first and second moments plus its U64
 step counter inside that same captured recurrent frontier.
+Compiled Transformer residual dropout is an explicit workload extension rather
+than optimizer state. `TrainingDropoutProvider` supplies the block's two
+source-ordered residual sites, while `CompiledDropoutConfig` adds one immutable
+two-word key and one recurrent U64 Threefry block counter. Active fixed-shape
+F32 draws reserve `ceil(numel/2)` blocks, reinterpret interleaved U32 words
+through low mantissas without guarded shifts, and commit the counter successor
+in the same CPU/Metal frontier as AdamW. This compiled block stream is distinct
+from `RandomStream`; inference, fixed-seed mode, ambient mode, and attention
+weight dropout remain unchanged.
 The Graph is discarded after compilation. `EffectRuntime` then solely owns the
 parameter and optimizer-state bytes, while `MixedReplayCursor` proves and advances the
 exact recurrent state frontier only after the complete effect batch commits.
@@ -968,6 +977,12 @@ values, step, and capture identity, while `EffectRuntime` and
 validation. It serializes no executable graph, schedule, runtime slot, or host
 pointer. Later extensions must preserve this single captured-program and
 atomic-state contract.
+Dropout-bearing checkpoints use the compositional v4 schema to retain only the
+current block counter in addition to AdamW tensors and progress. The key and
+reservation topology remain capture-authenticated; ordinary restore rejects a
+dropout-bearing checkpoint, while the dedicated restore path validates
+`counter == replay_step * blocks_per_replay`. Legacy v1--v3 and all ordinary
+no-dropout checkpoint bytes remain unchanged.
 `session/classification.rs` is a pure post-evaluation helper for rank-two F32
 logits and integer targets; it owns deterministic first-tie predictions and
 optional empty-batch accuracy without retaining a graph or mutating training state.
