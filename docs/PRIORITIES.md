@@ -74,9 +74,12 @@ AdamW now optionally retains F32 gradient sums and an accumulation cursor in
 that same frontier, commits one averaged update at each fixed microbatch
 window, resets the sums in-capture, and checkpoints partial windows exactly.
 An optional global L2 limit clips the complete ordered gradient set once after
-window averaging, inside the same capture; the identical recurrent program
-remains strict-Metal renderable with zero fallback. Explicit cancellation,
-loss scaling, and broader freezing semantics remain workload-driven follow-ups.
+window averaging, inside the same capture. Optional static loss scaling uses a
+scaled differentiation root but returns the original loss and unscales the
+complete F32 gradient set before accumulation and clipping. The protected tiny
+Transformer exercises that policy through the identical strict-Metal program
+with zero fallback. Explicit accumulation cancellation, dynamic loss scaling,
+and broader freezing semantics remain workload-driven follow-ups.
 
 ### 3. P1 — lower the identical training capture to Metal
 
