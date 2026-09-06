@@ -309,6 +309,19 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
     ) -> Result<(), Self::Error> {
         queue.write(buffer, 0, bytes)
     }
+    fn copy_and_wait(
+        &self,
+        queue: &Self::Queue,
+        source: &Self::Buffer,
+        target: &Self::Buffer,
+        bytes: usize,
+    ) -> Result<(), Self::Error> {
+        queue
+            .copy(source, target, 0, 0, bytes)?
+            .map(MetalCommand::collect)
+            .transpose()?;
+        Ok(())
+    }
     fn launch_and_wait(
         &self,
         queue: &Self::Queue,
@@ -703,6 +716,14 @@ impl InitializedMetalPrefix {
         alternate_state_bank: bool,
     ) -> Result<BTreeMap<u64, TensorData>, MetalError> {
         self.inner.snapshot_state(alternate_state_bank)
+    }
+
+    pub(super) fn replace_state(
+        &self,
+        alternate_state_bank: bool,
+        replacements: &BTreeMap<u64, TensorData>,
+    ) -> Result<(), MetalError> {
+        self.inner.replace_state(alternate_state_bank, replacements)
     }
 
     pub(super) fn execute_append_state(

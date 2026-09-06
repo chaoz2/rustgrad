@@ -1507,6 +1507,41 @@ impl MetalDeviceSession {
         Ok(snapshots)
     }
 
+    /// Typed internal fixed-state mutation used by owners that can prove the
+    /// semantic replacement set. The inactive epoch is populated completely
+    /// before it becomes visible, and ordinary run numbering is unchanged.
+    pub(crate) fn replace_fixed_state(
+        &mut self,
+        replacements: BTreeMap<String, TensorData>,
+    ) -> Result<(), MetalError> {
+        if !matches!(self.state_policy, MetalSessionStatePolicy::Epoch { .. }) {
+            return Err(MetalError::InvalidBinding(
+                "Metal fixed-state replacement requires epoch state".into(),
+            ));
+        }
+        let mut values = BTreeMap::new();
+        for (name, value) in replacements {
+            let input = self
+                .lifetime
+                .state_inputs()
+                .iter()
+                .find(|input| input.name == name)
+                .ok_or_else(|| {
+                    MetalError::InvalidBinding(format!(
+                        "Metal fixed-state replacement {name} is absent"
+                    ))
+                })?;
+            if values.insert(input.desc.id, value).is_some() {
+                return Err(MetalError::InvalidBinding(
+                    "Metal fixed-state replacement name repeats".into(),
+                ));
+            }
+        }
+        self.prepared.replace_state(self.state_epoch, &values)?;
+        self.state_epoch = !self.state_epoch;
+        Ok(())
+    }
+
     /// Returns the next append row for append-state sessions. Other session
     /// policies return `None`.
     pub const fn committed_state_position(&self) -> Option<usize> {

@@ -1202,6 +1202,11 @@ fn run_one_compiled_adamw_step<R: CompiledAdamWRuntime>(
     }
 }
 
+fn zero_compiled_adamw<R: CompiledAdamWRuntime>(runtime: &mut R) -> (bool, u64) {
+    let result = runtime.zero_grad().unwrap();
+    (result.did_discard(), result.discarded_microbatches())
+}
+
 #[test]
 fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops() {
     let program = compiled_scalar_adamw_plan();
@@ -1339,6 +1344,104 @@ fn compiled_adamw_accumulation_uses_the_same_recurrent_capture_on_metal() {
         cpu.gradient_accumulator_snapshots().unwrap()
     );
     assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+}
+
+#[test]
+fn compiled_adamw_zero_grad_is_atomic_device_state_and_preserves_run_numbering() {
+    let program = compiled_scalar_adamw_plan_with_accumulation(2);
+    let mut cpu = program.prepare_cpu().unwrap();
+    let mock = Arc::new(MockDispatch::default());
+    let plan = program
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap();
+    assert_eq!(plan.summary().fallback_count, 0);
+    let mut metal = plan
+        .prepare_with_scoreboard(
+            test_device(mock.clone()),
+            MetalScoreboardContext::new("compiled-zero-grad", "test-revision", "semantic mock")
+                .unwrap(),
+        )
+        .unwrap();
+    let inputs = || BTreeMap::from([("target".into(), TensorData::scalar(0.0))]);
+    let learning_rate = || TensorData::scalar(0.1);
+
+    cpu.step(inputs(), learning_rate()).unwrap();
+    metal.step(inputs(), learning_rate()).unwrap();
+    let active = metal.metal_session().state_epoch();
+    let capture_identity = metal.capture_identity();
+    let deployment_identity = metal
+        .execution_scoreboard_report()
+        .unwrap()
+        .unwrap()
+        .deployment_identity;
+    assert_eq!(metal.metal_session().successful_run_count(), 1);
+    assert_eq!(
+        metal
+            .execution_scoreboard_report()
+            .unwrap()
+            .unwrap()
+            .successful_run_count,
+        1
+    );
+    let expected = zero_compiled_adamw(&mut cpu);
+    mock.clear_calls();
+    let actual = zero_compiled_adamw(&mut metal);
+    assert_eq!(actual, expected);
+    assert_eq!(actual, (true, 1));
+    let reset_calls = mock.calls();
+    assert!(reset_calls.iter().any(|call| call.starts_with("copy:")));
+    assert!(reset_calls.iter().any(|call| call.starts_with("write:")));
+    assert!(!reset_calls.iter().any(|call| call.starts_with("read:")));
+    assert!(!reset_calls.iter().any(|call| call.starts_with("launch:")));
+    assert_ne!(metal.metal_session().state_epoch(), active);
+    assert_eq!(metal.capture_identity(), capture_identity);
+    assert_eq!(metal.metal_session().successful_run_count(), 1);
+    let scoreboard = metal.execution_scoreboard_report().unwrap().unwrap();
+    assert_eq!(scoreboard.deployment_identity, deployment_identity);
+    assert_eq!(scoreboard.successful_run_count, 1);
+    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+    let active = metal.metal_session().state_epoch();
+    mock.clear_calls();
+    assert!(!metal.zero_grad().unwrap().did_discard());
+    assert_eq!(metal.metal_session().state_epoch(), active);
+    assert!(mock.calls().is_empty());
+
+    for successful_invocation in 2..=3 {
+        let expected = cpu.step(inputs(), learning_rate()).unwrap();
+        let actual = metal.step(inputs(), learning_rate()).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(actual.step(), expected.step());
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+        assert_eq!(actual.report().successful_invocation, successful_invocation);
+    }
+    assert_eq!(metal.metal_session().successful_run_count(), 3);
+    assert_eq!(
+        metal
+            .execution_scoreboard_report()
+            .unwrap()
+            .unwrap()
+            .successful_run_count,
+        3
+    );
+    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+
+    let mut failing = compiled_scalar_adamw_plan_with_accumulation(2)
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap()
+        .prepare(test_device(mock.clone()))
+        .unwrap();
+    failing.step(inputs(), learning_rate()).unwrap();
+    let checkpoint = failing.checkpoint().unwrap();
+    let epoch = failing.metal_session().state_epoch();
+    let runs = failing.metal_session().successful_run_count();
+    mock.state.lock().unwrap().failures.copy = Some("zero-grad blit");
+    assert!(failing.zero_grad().is_err());
+    assert_eq!(failing.metal_session().state_epoch(), epoch);
+    assert_eq!(failing.metal_session().successful_run_count(), runs);
+    assert_eq!(failing.checkpoint().unwrap(), checkpoint);
+    assert!(failing.zero_grad().unwrap().did_discard());
 }
 
 #[test]

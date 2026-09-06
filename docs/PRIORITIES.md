@@ -83,9 +83,13 @@ scaled differentiation root but returns the original loss and unscales the
 complete F32 gradient set before accumulation and clipping. The maintained
 example exposes the same strict-Metal target with zero-fallback preflight, while
 the protected live Transformer acceptance exercises the identical program and
-exact Metal checkpoint continuation. Explicit accumulation cancellation,
-dynamic loss scaling, and broader freezing semantics remain workload-driven
-follow-ups.
+exact Metal checkpoint continuation. Public compiled AdamW `zero_grad`
+atomically discards a partial window without a dummy replay: CPU republishes a
+validated candidate frontier, strict Metal copies the complete successor into
+the inactive epoch bank without downloading gradients, and both preserve
+replay/optimizer progress while empty windows are exact no-ops. Checkpoint v3
+authenticates discarded microbatches while v1/v2 remain readable. Dynamic loss
+scaling and broader freezing semantics remain workload-driven follow-ups.
 
 ### 3. P1 — lower the identical training capture to Metal
 

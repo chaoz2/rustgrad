@@ -2457,6 +2457,17 @@ pub(crate) trait StaticDeviceAdapter: StaticPlanAdapter {
         buffer: &Self::Buffer,
         bytes: &[u8],
     ) -> Result<(), Self::Error>;
+    fn copy_and_wait(
+        &self,
+        _queue: &Self::Queue,
+        _source: &Self::Buffer,
+        _target: &Self::Buffer,
+        _bytes: usize,
+    ) -> Result<(), Self::Error> {
+        Err(Self::unsupported(
+            "static device-to-device copy is unsupported by this adapter".into(),
+        ))
+    }
     fn launch_and_wait(
         &self,
         queue: &Self::Queue,
@@ -4074,6 +4085,120 @@ impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
             }
         }
         Ok(values)
+    }
+
+    /// Replaces a subset of one fixed-state frontier without exposing a
+    /// partially written successor. Unchanged values are copied between device
+    /// epoch banks; replacements are fully validated before any inactive-bank
+    /// write begins. The caller owns the epoch flip after successful return.
+    pub(crate) fn replace_state(
+        &self,
+        alternate_state_bank: bool,
+        replacements: &BTreeMap<u64, TensorData>,
+    ) -> Result<(), A::Error> {
+        if self.prepared.state_links.is_empty() || !self.prepared.append_state_links.is_empty() {
+            return Err(A::invalid_binding(
+                "static fixed-state replacement policy is absent".into(),
+            ));
+        }
+        let state_ids = self
+            .prepared
+            .state_links
+            .iter()
+            .map(|link| link.input)
+            .collect::<BTreeSet<_>>();
+        if !replacements.keys().all(|id| state_ids.contains(id)) {
+            return Err(A::invalid_binding(
+                "static fixed-state replacement is outside the state inventory".into(),
+            ));
+        }
+        let mut replacement_bytes = BTreeMap::new();
+        for (id, value) in replacements {
+            let plan = self.prepared.buffer_plans.get(id).ok_or_else(|| {
+                A::invalid_binding("state replacement descriptor is absent".into())
+            })?;
+            let bytes = value
+                .to_le_bytes()
+                .map_err(|_| A::invalid_binding("state replacement bytes are invalid".into()))?;
+            if value.shape() != &plan.source_shape
+                || value.dtype() != plan.dtype
+                || bytes.len() != plan.bytes
+            {
+                return Err(A::invalid_binding(
+                    "state replacement descriptor mismatch".into(),
+                ));
+            }
+            replacement_bytes.insert(*id, bytes);
+        }
+
+        let needs_queue = self
+            .prepared
+            .state_links
+            .iter()
+            .any(|link| self.prepared.buffer_plans[&link.input].bytes != 0);
+        let queue =
+            if needs_queue {
+                Some(self.prepared.queue.as_ref().ok_or_else(|| {
+                    A::invalid_binding("state replacement queue is absent".into())
+                })?)
+            } else {
+                None
+            };
+
+        enum StateReplacement<'a, B> {
+            Write {
+                target: &'a B,
+                value: &'a [u8],
+            },
+            Copy {
+                source: &'a B,
+                target: &'a B,
+                bytes: usize,
+            },
+        }
+        let mut operations = Vec::with_capacity(self.prepared.state_links.len());
+        for link in &self.prepared.state_links {
+            let bytes = self.prepared.buffer_plans[&link.input].bytes;
+            if bytes == 0 {
+                continue;
+            }
+            let target = self
+                .prepared
+                .buffer_for_epoch(link.input, !alternate_state_bank)
+                .ok_or_else(|| A::invalid_binding("state replacement target is absent".into()))?;
+            if let Some(value) = replacement_bytes.get(&link.input) {
+                operations.push(StateReplacement::Write { target, value });
+            } else {
+                let source = self
+                    .prepared
+                    .buffer_for_epoch(link.input, alternate_state_bank)
+                    .ok_or_else(|| {
+                        A::invalid_binding("state replacement source is absent".into())
+                    })?;
+                operations.push(StateReplacement::Copy {
+                    source,
+                    target,
+                    bytes,
+                });
+            }
+        }
+        for operation in operations {
+            let queue = queue.expect("nonempty state replacement has a queue");
+            match operation {
+                StateReplacement::Write { target, value } => {
+                    self.prepared.adapter.write(queue, target, value)?;
+                }
+                StateReplacement::Copy {
+                    source,
+                    target,
+                    bytes,
+                } => self
+                    .prepared
+                    .adapter
+                    .copy_and_wait(queue, source, target, bytes)?,
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn execute_append_state(

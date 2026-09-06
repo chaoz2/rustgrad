@@ -17,11 +17,11 @@ pub use classification::{
 };
 pub use compiled_training::{
     CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledAdamWStep, CompiledAdamWStepResult, CompiledCheckpointRuntime,
-    CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult, CompiledTrainingRuntime,
-    CompiledTrainingStep, CompiledTrainingStepResult, CpuCompiledAdamW, CpuCompiledMomentumSgd,
-    MetalCompiledAdamW, MetalCompiledAdamWPlan, MetalCompiledAdamWStepResult,
-    TrainingParameterInit,
+    CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWZeroGradResult,
+    CompiledCheckpointRuntime, CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult,
+    CompiledTrainingRuntime, CompiledTrainingStep, CompiledTrainingStepResult, CpuCompiledAdamW,
+    CpuCompiledMomentumSgd, MetalCompiledAdamW, MetalCompiledAdamWPlan,
+    MetalCompiledAdamWStepResult, TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,
