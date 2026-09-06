@@ -64,6 +64,8 @@ impl Module for TinyCausalTransformer {
 fn config() -> CompiledAdamWConfig {
     CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
         .unwrap()
+        .with_loss_scale(128.0)
+        .unwrap()
         .with_input("tokens", [1, TIME], DType::I32)
         .unwrap()
         .with_input("targets", [1, TIME], DType::I32)
@@ -202,10 +204,12 @@ fn compiled_causal_transformer_training_decreases_loss_and_resumes_exactly() {
 fn causal_transformer_training_capture_is_strictly_renderable_for_metal() {
     let model = TinyCausalTransformer::new(7).unwrap();
     let compiled = compiled_transformer(&model);
+    assert_eq!(compiled.loss_scale(), 128.0);
     let parameter_count = compiled.parameter_snapshots().unwrap().len();
     let plan = compiled.metal_plan(metal_renderer()).unwrap();
 
     assert_eq!(plan.capture_identity(), compiled.capture_identity());
+    assert_eq!(plan.loss_scale(), 128.0);
     assert_eq!(plan.step_count(), 0);
     assert_eq!(plan.summary().fallback_count, 0);
     assert_eq!(plan.summary().state_pair_count, parameter_count * 3 + 1);
@@ -279,6 +283,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         )
         .expect("the complete training capture must be entirely Metal-admitted");
     assert_eq!(plan.capture_identity(), capture_identity);
+    assert_eq!(plan.loss_scale(), 128.0);
     assert_eq!(plan.summary().fallback_count, 0);
     assert!(plan.summary().nonzero_item_count > 0);
     let deployment_identity = plan.deployment_identity();
@@ -287,6 +292,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let mut uninterrupted = plan
         .prepare(device.clone())
         .expect("live Metal preparation must compile, allocate, and upload training state");
+    assert_eq!(uninterrupted.loss_scale(), 128.0);
     assert_eq!(uninterrupted.step_count(), 0);
     assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
 
@@ -337,6 +343,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let mut resumed = resumed_plan
         .prepare(device)
         .expect("checkpoint-restored Metal preparation must succeed");
+    assert_eq!(resumed.loss_scale(), 128.0);
     assert_eq!(resumed.step_count(), 4);
     assert_eq!(resumed.optimizer_step().unwrap(), 4);
 
@@ -382,6 +389,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
             "unified_memory": device_info.capabilities.unified_memory,
         },
         "capture_identity": capture_identity,
+        "loss_scale": uninterrupted.loss_scale(),
         "initial_deployment_identity": deployment_identity,
         "resumed_deployment_identity": resumed_deployment_identity,
         "fallback_count": 0,

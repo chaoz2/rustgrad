@@ -214,6 +214,7 @@ pub struct CompiledAdamWConfig {
     weight_decay: f32,
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
+    loss_scale: f32,
     inputs: BTreeMap<String, (Shape, DType)>,
 }
 
@@ -237,6 +238,7 @@ impl CompiledAdamWConfig {
             weight_decay,
             gradient_accumulation_steps: 1,
             max_gradient_norm: None,
+            loss_scale: 1.0,
             inputs: BTreeMap::new(),
         })
     }
@@ -266,6 +268,20 @@ impl CompiledAdamWConfig {
             ));
         }
         self.max_gradient_norm = Some(max_norm);
+        Ok(self)
+    }
+
+    /// Scales the differentiation root by a fixed finite factor, then
+    /// unscales the complete F32 parameter-gradient set before accumulation,
+    /// clipping, and AdamW. The public loss remains the original unscaled
+    /// scalar. A scale of one is canonical and adds no graph nodes.
+    pub fn with_loss_scale(mut self, scale: f32) -> Result<Self> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(training(
+                "compiled AdamW loss scale must be positive and finite",
+            ));
+        }
+        self.loss_scale = scale;
         Ok(self)
     }
 
@@ -307,6 +323,10 @@ impl CompiledAdamWConfig {
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
         self.max_gradient_norm
+    }
+
+    pub fn loss_scale(&self) -> f32 {
+        self.loss_scale
     }
 
     pub fn inputs(&self) -> impl Iterator<Item = (&str, &Shape, DType)> {
@@ -403,8 +423,10 @@ const ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-adamw-v2";
 /// The safetensors payload contains parameter and moment tensors plus any
 /// partial gradient sums. String metadata authenticates the format, ordered
 /// parameter names, compiled capture identity, replay/optimizer progress, and
-/// accumulation policy. It never serializes executable code, graphs, runtime
-/// slots, or host pointers. Legacy non-accumulating v1 bytes remain accepted.
+/// accumulation policy. Fixed clipping and loss-scaling policy is authenticated
+/// by the capture identity rather than duplicated as mutable checkpoint state.
+/// It never serializes executable code, graphs, runtime slots, or host pointers.
+/// Legacy non-accumulating v1 bytes remain accepted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledAdamWCheckpoint {
     bytes: Vec<u8>,
@@ -467,6 +489,14 @@ trait CompiledOptimizerProgram {
     fn name(&self) -> &'static str;
     fn inputs(&self) -> &BTreeMap<String, (Shape, DType)>;
     fn state_specs(&self, parameters: &BTreeMap<String, TensorData>) -> Result<Vec<StateSpec>>;
+    fn gradients(
+        &self,
+        graph: &mut Graph,
+        loss: NodeId,
+        targets: &[NodeId],
+    ) -> Result<Vec<NodeId>> {
+        graph.gradient_default(loss, targets)
+    }
     fn lower_updates(
         &self,
         graph: &mut Graph,
@@ -599,6 +629,24 @@ impl CompiledOptimizerProgram for AdamWProgram {
             });
         }
         Ok(specs)
+    }
+
+    fn gradients(
+        &self,
+        graph: &mut Graph,
+        loss: NodeId,
+        targets: &[NodeId],
+    ) -> Result<Vec<NodeId>> {
+        if self.config.loss_scale == 1.0 {
+            return graph.gradient_default(loss, targets);
+        }
+        let scale = scalar_f32(graph, self.config.loss_scale)?;
+        let scaled_loss = graph.mul(loss, scale)?;
+        graph
+            .gradient_default(scaled_loss, targets)?
+            .into_iter()
+            .map(|gradient| graph.div(gradient, scale))
+            .collect()
     }
 
     fn lower_updates(
@@ -789,12 +837,13 @@ pub struct CpuCompiledMomentumSgd {
     inner: CpuCompiledTrainingProgram,
 }
 
-/// One compiled AdamW training program with recurrent first/second moments and
-/// a graph-owned step counter.
+/// One compiled AdamW training program with recurrent first/second moments, a
+/// graph-owned step counter, and capture-authenticated gradient policies.
 pub struct CpuCompiledAdamW {
     inner: CpuCompiledTrainingProgram,
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
+    loss_scale: f32,
 }
 
 /// Resource-free Metal rendering of the same recurrent program owned by a
@@ -810,6 +859,7 @@ pub struct MetalCompiledAdamWPlan {
     step: u64,
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
+    loss_scale: f32,
 }
 
 /// Device-resident AdamW training session backed by one fixed Metal capture.
@@ -825,6 +875,7 @@ pub struct MetalCompiledAdamW {
     step: u64,
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
+    loss_scale: f32,
 }
 
 /// One committed Metal AdamW step plus its exact device execution report.
@@ -991,7 +1042,7 @@ impl CpuCompiledTrainingProgram {
         )?;
 
         let targets = parameter_nodes.values().copied().collect::<Vec<_>>();
-        let gradients = graph.gradient_default(loss, &targets)?;
+        let gradients = optimizer.gradients(&mut graph, loss, &targets)?;
         if gradients.len() != targets.len() {
             return Err(training("compiled gradient target count mismatch"));
         }
@@ -1406,10 +1457,12 @@ impl CpuCompiledAdamW {
     {
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let max_gradient_norm = config.max_gradient_norm;
+        let loss_scale = config.loss_scale;
         Ok(Self {
             inner: CpuCompiledTrainingProgram::compile(AdamWProgram { config }, parameters, build)?,
             gradient_accumulation_steps,
             max_gradient_norm,
+            loss_scale,
         })
     }
 
@@ -1552,6 +1605,10 @@ impl CpuCompiledAdamW {
         self.max_gradient_norm
     }
 
+    pub fn loss_scale(&self) -> f32 {
+        self.loss_scale
+    }
+
     pub fn optimizer_step(&self) -> Result<u64> {
         Ok(self.inner.global_snapshot("step")?.scalar_at(0).as_u64())
     }
@@ -1640,6 +1697,7 @@ impl CpuCompiledAdamW {
             step: self.step_count(),
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
+            loss_scale: self.loss_scale,
         })
     }
 
@@ -1725,6 +1783,10 @@ impl MetalCompiledAdamWPlan {
         self.max_gradient_norm
     }
 
+    pub fn loss_scale(&self) -> f32 {
+        self.loss_scale
+    }
+
     pub fn summary(&self) -> &MetalDeviceSessionSummary {
         self.inner.summary()
     }
@@ -1746,6 +1808,7 @@ impl MetalCompiledAdamWPlan {
             step: self.step,
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
+            loss_scale: self.loss_scale,
         })
     }
 }
@@ -1794,6 +1857,10 @@ impl MetalCompiledAdamW {
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
         self.max_gradient_norm
+    }
+
+    pub fn loss_scale(&self) -> f32 {
+        self.loss_scale
     }
 
     pub fn capture_identity(&self) -> u64 {
@@ -2965,8 +3032,71 @@ mod tests {
     }
 
     #[test]
+    fn adamw_loss_scaling_unscales_before_optimizer_policies() {
+        let parameters = || {
+            ["a", "b"]
+                .map(|name| TrainingParameterInit::new(name, TensorData::scalar(0.0)).unwrap())
+        };
+        let base = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0).unwrap();
+        let unit = CpuCompiledAdamW::compile(
+            base.clone().with_loss_scale(1.0).unwrap(),
+            parameters(),
+            build_two_parameter_linear_loss,
+        )
+        .unwrap();
+        let unscaled =
+            CpuCompiledAdamW::compile(base.clone(), parameters(), build_two_parameter_linear_loss)
+                .unwrap();
+        assert_eq!(unit.loss_scale(), 1.0);
+        assert_eq!(unit.capture_identity(), unscaled.capture_identity());
+
+        let scaled_config = base
+            .with_loss_scale(128.0)
+            .unwrap()
+            .with_max_gradient_norm(1.0)
+            .unwrap();
+        assert_eq!(scaled_config.loss_scale(), 128.0);
+        let mut scaled =
+            CpuCompiledAdamW::compile(scaled_config, parameters(), build_two_parameter_linear_loss)
+                .unwrap();
+        let mut clipped = CpuCompiledAdamW::compile(
+            CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+                .unwrap()
+                .with_max_gradient_norm(1.0)
+                .unwrap(),
+            parameters(),
+            build_two_parameter_linear_loss,
+        )
+        .unwrap();
+        assert_eq!(scaled.loss_scale(), 128.0);
+        assert_ne!(scaled.capture_identity(), clipped.capture_identity());
+
+        let scaled_result = scaled
+            .step(BTreeMap::new(), TensorData::scalar(0.1))
+            .unwrap();
+        let clipped_result = clipped
+            .step(BTreeMap::new(), TensorData::scalar(0.1))
+            .unwrap();
+        assert_eq!(scaled_result.loss(), clipped_result.loss());
+        assert_eq!(
+            scaled.parameter_snapshots().unwrap(),
+            clipped.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            scaled.first_moment_snapshots().unwrap(),
+            clipped.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            scaled.second_moment_snapshots().unwrap(),
+            clipped.second_moment_snapshots().unwrap()
+        );
+    }
+
+    #[test]
     fn adamw_accumulation_clips_once_after_averaging_the_complete_window() {
         let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+            .unwrap()
+            .with_loss_scale(128.0)
             .unwrap()
             .with_gradient_accumulation(2)
             .unwrap()
@@ -3146,6 +3276,7 @@ mod tests {
         let mut compiled = compiled_adamw();
         assert_eq!(compiled.gradient_accumulation_steps(), 1);
         assert_eq!(compiled.max_gradient_norm(), None);
+        assert_eq!(compiled.loss_scale(), 1.0);
         assert!(
             compiled
                 .gradient_accumulator_snapshots()
@@ -3275,6 +3406,14 @@ mod tests {
                     .is_err()
             );
         }
+        for loss_scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+                    .unwrap()
+                    .with_loss_scale(loss_scale)
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -3365,6 +3504,10 @@ mod tests {
         let clipped = adamw_config().with_max_gradient_norm(1.0).unwrap();
         assert!(
             CpuCompiledAdamW::compile_from_checkpoint(clipped, &checkpoint, build_tinybob).is_err()
+        );
+        let scaled = adamw_config().with_loss_scale(128.0).unwrap();
+        assert!(
+            CpuCompiledAdamW::compile_from_checkpoint(scaled, &checkpoint, build_tinybob).is_err()
         );
 
         let mut accumulated = CpuCompiledAdamW::compile(

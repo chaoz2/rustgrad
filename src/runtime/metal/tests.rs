@@ -1175,6 +1175,49 @@ fn compiled_adamw_gradient_clipping_uses_the_same_recurrent_capture_on_metal() {
 }
 
 #[test]
+fn compiled_adamw_loss_scaling_uses_the_same_recurrent_capture_on_metal() {
+    let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_loss_scale(128.0)
+        .unwrap()
+        .with_input("target", [], DType::F32)
+        .unwrap();
+    let parameter = TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap();
+    let mut cpu = CpuCompiledAdamW::compile(config, [parameter], |graph, inputs, parameters| {
+        let delta = graph.sub(parameters["weight"], inputs["target"])?;
+        Ok((
+            graph.square(delta)?,
+            BTreeMap::from([("delta".into(), delta)]),
+        ))
+    })
+    .unwrap();
+    let plan = cpu
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap();
+    assert_eq!(plan.loss_scale(), 128.0);
+    assert_eq!(plan.summary().fallback_count, 0);
+
+    let mock = Arc::new(MockDispatch::default());
+    let mut metal = plan.prepare(test_device(mock)).unwrap();
+    assert_eq!(metal.loss_scale(), 128.0);
+    let inputs = || BTreeMap::from([("target".into(), TensorData::scalar(0.0))]);
+    let expected = cpu.step(inputs(), TensorData::scalar(0.1)).unwrap();
+    let actual = metal.step(inputs(), TensorData::scalar(0.1)).unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+    assert_eq!(
+        metal.parameter_snapshots().unwrap(),
+        cpu.parameter_snapshots().unwrap()
+    );
+    assert_eq!(
+        metal.first_moment_snapshots().unwrap(),
+        cpu.first_moment_snapshots().unwrap()
+    );
+    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+}
+
+#[test]
 fn compiled_adamw_accumulation_uses_the_same_recurrent_capture_on_metal() {
     let mut cpu = compiled_scalar_adamw_with_accumulation(2);
     let plan = cpu
@@ -1216,6 +1259,7 @@ fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_check
     assert_eq!(plan.capture_identity(), cpu.capture_identity());
     assert_eq!(plan.step_count(), 0);
     assert_eq!(plan.max_gradient_norm(), None);
+    assert_eq!(plan.loss_scale(), 1.0);
     assert_eq!(plan.summary().state_pair_count, 4);
     assert_eq!(plan.summary().state_bank_count, 2);
     assert_eq!(plan.summary().fallback_count, 0);
@@ -1226,6 +1270,7 @@ fn compiled_adamw_runs_one_capture_with_device_resident_state_and_portable_check
     let mut metal = plan.prepare(test_device(mock)).unwrap();
     assert_eq!(metal.step_count(), 0);
     assert_eq!(metal.max_gradient_norm(), None);
+    assert_eq!(metal.loss_scale(), 1.0);
     assert_eq!(metal.optimizer_step().unwrap(), 0);
     assert_eq!(
         metal.parameter_snapshots().unwrap(),
