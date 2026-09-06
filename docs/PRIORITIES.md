@@ -95,9 +95,12 @@ manual exact-SHA lane on provisioned Apple hardware is the remaining proof;
 the shared scoreboard now records this epoch-swapped training session directly,
 and `MetalCompiledAdamWPlan::prepare_with_scoreboard` binds fail-soft observation
 before the first step rather than introducing a parallel training API.
-`CompiledAdamWRuntime` and `CompiledAdamWStep` now expose that CPU/Metal seam as
-one generic public training-loop contract. Backend-specific reports and
-scoreboards remain available on the concrete Metal types rather than being
+`CompiledTrainingRuntime` and `CompiledTrainingStep` now expose the common
+replay seam across CPU momentum-SGD, CPU AdamW, and Metal AdamW without an
+optimizer or backend enum. `CompiledCheckpointRuntime` isolates portable
+persistence, while the AdamW extension traits retain accumulation, clipping,
+loss-scaling, moment, and optimizer-step inspection. Backend-specific reports
+and scoreboards remain available on the concrete Metal types rather than being
 erased into a lowest-common-denominator result.
 `CompiledAdamWPlan` now makes compilation and checkpoint restoration themselves
 backend-neutral: callers choose CPU replay or strict Metal rendering only after

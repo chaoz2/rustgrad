@@ -372,6 +372,44 @@ impl CompiledTrainingStepResult {
 
 pub type CompiledMomentumSgdStepResult = CompiledTrainingStepResult;
 
+/// Backend- and optimizer-neutral view of one committed compiled training step.
+///
+/// Concrete optimizer results may expose additional progress, while device
+/// results may retain execution reports. Generic training loops can still
+/// consume loss, named outputs, replay progress, and capture identity without
+/// selecting either concern through an enum.
+pub trait CompiledTrainingStep {
+    fn loss(&self) -> &TensorData;
+
+    fn outputs(&self) -> &BTreeMap<String, TensorData>;
+
+    fn output(&self, name: &str) -> Option<&TensorData> {
+        self.outputs().get(name)
+    }
+
+    fn step(&self) -> u64;
+
+    fn capture_identity(&self) -> u64;
+}
+
+impl CompiledTrainingStep for CompiledTrainingStepResult {
+    fn loss(&self) -> &TensorData {
+        CompiledTrainingStepResult::loss(self)
+    }
+
+    fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        CompiledTrainingStepResult::outputs(self)
+    }
+
+    fn step(&self) -> u64 {
+        CompiledTrainingStepResult::step(self)
+    }
+
+    fn capture_identity(&self) -> u64 {
+        CompiledTrainingStepResult::capture_identity(self)
+    }
+}
+
 /// One committed replay of a compiled AdamW program.
 ///
 /// `step` counts microbatch replays. `optimizer_step` advances only when the
@@ -418,21 +456,11 @@ impl CompiledAdamWStepResult {
     }
 }
 
-/// Backend-neutral view of one successfully committed compiled AdamW step.
+/// AdamW-specific progress for one successfully committed training step.
 ///
 /// Concrete runtimes may retain additional execution evidence. For example,
 /// [`MetalCompiledAdamWStepResult`] also exposes its exact device run report.
-pub trait CompiledAdamWStep {
-    fn loss(&self) -> &TensorData;
-
-    fn outputs(&self) -> &BTreeMap<String, TensorData>;
-
-    fn output(&self, name: &str) -> Option<&TensorData> {
-        self.outputs().get(name)
-    }
-
-    fn step(&self) -> u64;
-
+pub trait CompiledAdamWStep: CompiledTrainingStep {
     fn optimizer_step(&self) -> u64;
 
     fn accumulation_index(&self) -> u64;
@@ -440,11 +468,9 @@ pub trait CompiledAdamWStep {
     fn did_update(&self) -> bool {
         self.accumulation_index() == 0
     }
-
-    fn capture_identity(&self) -> u64;
 }
 
-impl CompiledAdamWStep for CompiledAdamWStepResult {
+impl CompiledTrainingStep for CompiledAdamWStepResult {
     fn loss(&self) -> &TensorData {
         CompiledAdamWStepResult::loss(self)
     }
@@ -457,6 +483,12 @@ impl CompiledAdamWStep for CompiledAdamWStepResult {
         CompiledAdamWStepResult::step(self)
     }
 
+    fn capture_identity(&self) -> u64 {
+        CompiledAdamWStepResult::capture_identity(self)
+    }
+}
+
+impl CompiledAdamWStep for CompiledAdamWStepResult {
     fn optimizer_step(&self) -> u64 {
         CompiledAdamWStepResult::optimizer_step(self)
     }
@@ -464,16 +496,12 @@ impl CompiledAdamWStep for CompiledAdamWStepResult {
     fn accumulation_index(&self) -> u64 {
         CompiledAdamWStepResult::accumulation_index(self)
     }
-
-    fn capture_identity(&self) -> u64 {
-        CompiledAdamWStepResult::capture_identity(self)
-    }
 }
 
 const ADAMW_CHECKPOINT_FORMAT_V1: &str = "rustgrad-compiled-adamw-v1";
 const ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-adamw-v2";
 
-/// Deterministic, portable state for one exact [`CpuCompiledAdamW`] program.
+/// Deterministic, portable state for one exact compiled AdamW program.
 ///
 /// The safetensors payload contains parameter and moment tensors plus any
 /// partial gradient sums. String metadata authenticates the format, ordered
@@ -991,7 +1019,7 @@ impl MetalCompiledAdamWStepResult {
     }
 }
 
-impl CompiledAdamWStep for MetalCompiledAdamWStepResult {
+impl CompiledTrainingStep for MetalCompiledAdamWStepResult {
     fn loss(&self) -> &TensorData {
         MetalCompiledAdamWStepResult::loss(self)
     }
@@ -1004,6 +1032,12 @@ impl CompiledAdamWStep for MetalCompiledAdamWStepResult {
         MetalCompiledAdamWStepResult::step(self)
     }
 
+    fn capture_identity(&self) -> u64 {
+        MetalCompiledAdamWStepResult::capture_identity(self)
+    }
+}
+
+impl CompiledAdamWStep for MetalCompiledAdamWStepResult {
     fn optimizer_step(&self) -> u64 {
         MetalCompiledAdamWStepResult::optimizer_step(self)
     }
@@ -1011,21 +1045,16 @@ impl CompiledAdamWStep for MetalCompiledAdamWStepResult {
     fn accumulation_index(&self) -> u64 {
         MetalCompiledAdamWStepResult::accumulation_index(self)
     }
-
-    fn capture_identity(&self) -> u64 {
-        MetalCompiledAdamWStepResult::capture_identity(self)
-    }
 }
 
-/// Shared public runtime contract for one compiled AdamW program.
+/// Shared execution contract for one compiled training program.
 ///
-/// The CPU and Metal implementations use the same capture identity, recurrent
-/// optimizer state, accumulation policy, and portable checkpoint. Generic
-/// training loops can therefore select a backend during preparation without
-/// duplicating step or persistence logic. Backend-specific inspection remains
-/// available through each concrete runtime and step-result type.
-pub trait CompiledAdamWRuntime {
-    type Step: CompiledAdamWStep;
+/// Optimizer and backend implementations retain their concrete policy,
+/// checkpoint, and device evidence through extension traits and inherent APIs.
+/// This base interface owns only the common replay contract needed by a generic
+/// training loop.
+pub trait CompiledTrainingRuntime {
+    type Step: CompiledTrainingStep;
 
     fn step(
         &mut self,
@@ -1035,6 +1064,29 @@ pub trait CompiledAdamWRuntime {
 
     fn step_count(&self) -> u64;
 
+    fn capture_identity(&self) -> u64;
+
+    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
+}
+
+/// Portable checkpoint capability for a compiled training runtime.
+///
+/// Keeping persistence separate lets non-checkpointable optimizers implement
+/// the common execution contract without inventing an empty checkpoint type.
+pub trait CompiledCheckpointRuntime: CompiledTrainingRuntime {
+    type Checkpoint;
+
+    fn checkpoint(&self) -> Result<Self::Checkpoint>;
+}
+
+/// AdamW-specific policy and recurrent-state inspection.
+///
+/// CPU and Metal AdamW sessions share this extension and the same checkpoint
+/// type while retaining their concrete step-result and device-report types.
+pub trait CompiledAdamWRuntime:
+    CompiledTrainingRuntime<Step: CompiledAdamWStep>
+    + CompiledCheckpointRuntime<Checkpoint = CompiledAdamWCheckpoint>
+{
     fn gradient_accumulation_steps(&self) -> u64;
 
     fn max_gradient_norm(&self) -> Option<f32>;
@@ -1045,17 +1097,11 @@ pub trait CompiledAdamWRuntime {
 
     fn accumulation_index(&self) -> Result<u64>;
 
-    fn capture_identity(&self) -> u64;
-
-    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
-
     fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
 
     fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
 
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
-
-    fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint>;
 }
 
 /// Resource-free output of compiled training graph construction.
@@ -1703,6 +1749,30 @@ impl CpuCompiledMomentumSgd {
     }
 }
 
+impl CompiledTrainingRuntime for CpuCompiledMomentumSgd {
+    type Step = CompiledMomentumSgdStepResult;
+
+    fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        CpuCompiledMomentumSgd::step(self, inputs, learning_rate)
+    }
+
+    fn step_count(&self) -> u64 {
+        CpuCompiledMomentumSgd::step_count(self)
+    }
+
+    fn capture_identity(&self) -> u64 {
+        CpuCompiledMomentumSgd::capture_identity(self)
+    }
+
+    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        CpuCompiledMomentumSgd::parameter_snapshots(self)
+    }
+}
+
 impl CompiledAdamWPlan {
     pub fn compile<F>(
         config: CompiledAdamWConfig,
@@ -2134,7 +2204,7 @@ impl CpuCompiledAdamW {
     }
 }
 
-impl CompiledAdamWRuntime for CpuCompiledAdamW {
+impl CompiledTrainingRuntime for CpuCompiledAdamW {
     type Step = CompiledAdamWStepResult;
 
     fn step(
@@ -2149,6 +2219,24 @@ impl CompiledAdamWRuntime for CpuCompiledAdamW {
         CpuCompiledAdamW::step_count(self)
     }
 
+    fn capture_identity(&self) -> u64 {
+        CpuCompiledAdamW::capture_identity(self)
+    }
+
+    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        CpuCompiledAdamW::parameter_snapshots(self)
+    }
+}
+
+impl CompiledCheckpointRuntime for CpuCompiledAdamW {
+    type Checkpoint = CompiledAdamWCheckpoint;
+
+    fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
+        CpuCompiledAdamW::checkpoint(self)
+    }
+}
+
+impl CompiledAdamWRuntime for CpuCompiledAdamW {
     fn gradient_accumulation_steps(&self) -> u64 {
         CpuCompiledAdamW::gradient_accumulation_steps(self)
     }
@@ -2169,14 +2257,6 @@ impl CompiledAdamWRuntime for CpuCompiledAdamW {
         CpuCompiledAdamW::accumulation_index(self)
     }
 
-    fn capture_identity(&self) -> u64 {
-        CpuCompiledAdamW::capture_identity(self)
-    }
-
-    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        CpuCompiledAdamW::parameter_snapshots(self)
-    }
-
     fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         CpuCompiledAdamW::first_moment_snapshots(self)
     }
@@ -2187,10 +2267,6 @@ impl CompiledAdamWRuntime for CpuCompiledAdamW {
 
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         CpuCompiledAdamW::gradient_accumulator_snapshots(self)
-    }
-
-    fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
-        CpuCompiledAdamW::checkpoint(self)
     }
 }
 
@@ -2510,7 +2586,7 @@ impl MetalCompiledAdamW {
     }
 }
 
-impl CompiledAdamWRuntime for MetalCompiledAdamW {
+impl CompiledTrainingRuntime for MetalCompiledAdamW {
     type Step = MetalCompiledAdamWStepResult;
 
     fn step(
@@ -2525,6 +2601,24 @@ impl CompiledAdamWRuntime for MetalCompiledAdamW {
         MetalCompiledAdamW::step_count(self)
     }
 
+    fn capture_identity(&self) -> u64 {
+        MetalCompiledAdamW::capture_identity(self)
+    }
+
+    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        MetalCompiledAdamW::parameter_snapshots(self)
+    }
+}
+
+impl CompiledCheckpointRuntime for MetalCompiledAdamW {
+    type Checkpoint = CompiledAdamWCheckpoint;
+
+    fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
+        MetalCompiledAdamW::checkpoint(self)
+    }
+}
+
+impl CompiledAdamWRuntime for MetalCompiledAdamW {
     fn gradient_accumulation_steps(&self) -> u64 {
         MetalCompiledAdamW::gradient_accumulation_steps(self)
     }
@@ -2545,14 +2639,6 @@ impl CompiledAdamWRuntime for MetalCompiledAdamW {
         MetalCompiledAdamW::accumulation_index(self)
     }
 
-    fn capture_identity(&self) -> u64 {
-        MetalCompiledAdamW::capture_identity(self)
-    }
-
-    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        MetalCompiledAdamW::parameter_snapshots(self)
-    }
-
     fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         MetalCompiledAdamW::first_moment_snapshots(self)
     }
@@ -2563,10 +2649,6 @@ impl CompiledAdamWRuntime for MetalCompiledAdamW {
 
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         MetalCompiledAdamW::gradient_accumulator_snapshots(self)
-    }
-
-    fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
-        MetalCompiledAdamW::checkpoint(self)
     }
 }
 
@@ -3212,6 +3294,42 @@ mod tests {
 
     fn compiled_adamw() -> CpuCompiledAdamW {
         CpuCompiledAdamW::compile(adamw_config(), initial_parameters(), build_tinybob).unwrap()
+    }
+
+    fn run_core_training_step<R: CompiledTrainingRuntime>(
+        runtime: &mut R,
+    ) -> (TensorData, BTreeMap<String, TensorData>) {
+        let identity = runtime.capture_identity();
+        let before = runtime.parameter_snapshots().unwrap();
+        let step = runtime.step(batch(), lr()).unwrap();
+        assert_eq!(step.step(), 1);
+        assert_eq!(step.capture_identity(), identity);
+        assert_eq!(step.output("logits"), step.outputs().get("logits"));
+        assert_eq!(runtime.step_count(), 1);
+        assert_eq!(runtime.capture_identity(), identity);
+        assert_ne!(runtime.parameter_snapshots().unwrap(), before);
+        (step.loss().clone(), step.outputs().clone())
+    }
+
+    #[test]
+    fn compiled_training_runtime_is_optimizer_neutral() {
+        let mut momentum = compiled();
+        let mut adamw = compiled_adamw();
+
+        let (momentum_loss, momentum_outputs) = run_core_training_step(&mut momentum);
+        let (adamw_loss, adamw_outputs) = run_core_training_step(&mut adamw);
+        assert_eq!(momentum_loss.shape(), adamw_loss.shape());
+        assert_eq!(
+            momentum_outputs.keys().collect::<Vec<_>>(),
+            adamw_outputs.keys().collect::<Vec<_>>()
+        );
+        let checkpoint = adamw.checkpoint().unwrap();
+        assert_eq!(
+            decode_adamw_checkpoint(checkpoint.as_bytes())
+                .unwrap()
+                .capture_identity,
+            adamw.capture_identity()
+        );
     }
 
     #[test]

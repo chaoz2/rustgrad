@@ -81,6 +81,12 @@ layers:
 - [`examples/llama_chat.rs`](examples/llama_chat.rs)
 - [`examples/metal_scoreboard.rs`](examples/metal_scoreboard.rs)
 
+For repeated training, the compiled runtime captures
+`forward → loss → backward → optimizer update` once and keeps parameters
+and optimizer slots in one atomic recurrent frontier. `CompiledTrainingRuntime`
+is the small optimizer-neutral loop contract; checkpointing and AdamW policy are
+separate capabilities, and concrete Metal sessions keep their device reports.
+
 ## Run ResNet on a persistent Metal session
 
 The typed ResNet facade builds and captures the complete Eval/F32 graph, freezes
@@ -157,8 +163,8 @@ weights, and K/V allocations while logically rewinding causal state for an
 independent prompt. Scoreboard-bound sessions reject reset so each evidence
 envelope remains single-sequence.
 
-Call `plan.prepare_with_scoreboard(context)` instead of `plan.prepare()` when
-one independent sequence needs the opt-in authenticated execution scoreboard.
+Attach a scoreboard context to `MetalSessionTarget` before `target.prepare(plan)`
+when one independent sequence needs authenticated execution evidence.
 Generation output always carries its typed workload evidence; neither planning
 nor preparation can silently select the CPU implementation.
 
@@ -213,9 +219,9 @@ direction.
 
 Work is ordered by user value:
 
-1. a strict persistent Metal device session with no fallback;
-2. ResNet-18 Metal conformance on the Apple M5;
-3. device-resident GGUF Llama prefill, KV state, and decode;
+1. one compiled persistent-state training runtime;
+2. exact tiny-Transformer train/resume across CPU and strict Metal;
+3. live-hardware evidence for the existing ResNet and GGUF Llama Metal paths;
 4. evidence-labeled performance and release hygiene.
 
 The CPU adoption, training, state, interchange, and module layers are delivered
