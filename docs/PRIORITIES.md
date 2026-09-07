@@ -256,7 +256,7 @@ session whose only transient is the exact F32 NCHW image.
 An exact ignored Linear acceptance, deterministic typed ResNet-18 benchmark,
 and public GGUF Llama prompt-to-tokens harness plus a manual-only exact-SHA
 workflow are checked in for
-`[self-hosted, macOS, ARM64, rustgrad-metal]` behind the `live-metal`
+`[self-hosted, macOS, ARM64, rustgrad-metal]` through the `live-metal`
 environment. The benchmark executes the complete initialized body with one
 deterministic image, computes one complete CPU oracle, compares finite logits
 under a documented F32 native-compilation tolerance, and records ten persistent
@@ -266,7 +266,7 @@ normalized `BenchmarkObservation` v1 bound to the exact revision, deterministic
 model identity and checked-in raw little-endian F32 input-payload SHA-256,
 selected Metal device, runner OS, command/configuration, planned static-slot
 memory, and a separately attached measured RustGrad-owned physical-buffer
-high-water. A separate job authenticates the selected
+high-water. A separate opt-in job authenticates the selected
 Metal registry ID and
 runner-local GGUF bytes against protected values, uses an independently pinned
 prompt and greedy token IDs, checks the persistent token-step
@@ -277,8 +277,12 @@ model/oracle provenance and exact prompt/ID contract but records, rather than
 independently re-proves, the workflow's prior GGUF hash check. Those IDs are
 bounded conformance evidence, not a broad cross-runtime numerical oracle. The
 release-profile lane is dormant: the current external audit found zero
-runners, no `live-metal` environment, and none of the required protected
-variables. The repository workflow only references those external controls.
+compatible runners. The `live-metal` environment exists as ID `21345725438`,
+but has empty `protection_rules`, no `deployment_branch_policy`, and no
+variables, so it is unprotected and unrestricted. The default Linear, compiled-
+Transformer, and ResNet job does not read GGUF configuration; absent GGUF
+variables block only the typed `run_gguf=true` job. The repository workflow only
+references those external controls.
 Ordinary macOS CI remains mock-only and no live-device result is
 claimed by the workflow definition itself. Its host-wall/API-copy and compute-
 command observations remain distinct from the optional completed-command GPU
@@ -299,7 +303,7 @@ selected RustGrad device and attach its requested-`MTLBuffer`-length lifetime
 high-water as measured peak device memory through the typed attachment API,
 without changing raw reports or conflating it with planned memory, allocator RSS,
 physical residency, driver overhead, or unified-memory pressure. Because the
-protected lane remains dormant, actual live Apple-GPU comparison measurements
+manual lane remains dormant, actual live Apple-GPU comparison measurements
 are still absent.
 
 ### ResNet-18 Metal conformance

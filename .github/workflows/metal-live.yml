@@ -7,6 +7,11 @@ on:
         description: Exact reviewed lowercase 40-character commit SHA
         required: true
         type: string
+      run_gguf:
+        description: Run the separately provisioned GGUF Llama evidence job
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: live-metal-${{ inputs.expected_sha }}
@@ -112,6 +117,7 @@ jobs:
 
   live-metal-llama:
     name: Live Metal GGUF Llama evidence (Apple GPU)
+    if: ${{ inputs.run_gguf }}
     runs-on: [self-hosted, macOS, ARM64, rustgrad-metal]
     environment: live-metal
     timeout-minutes: 60
