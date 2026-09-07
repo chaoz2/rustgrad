@@ -1,6 +1,6 @@
 #[cfg(target_os = "macos")]
 use rustgrad::MetalSessionTarget;
-use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
+use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateDict, StateKind};
 use rustgrad::runtime::metal::{MetalCapabilities, MetalRenderer};
 #[cfg(target_os = "macos")]
 use rustgrad::runtime::metal::{
@@ -378,6 +378,60 @@ fn perturbed_parameter_bindings(
     perturbed
 }
 
+fn directionally_perturbed_parameter_bindings(
+    bindings: &HashMap<String, TensorData>,
+    input_names: &[String],
+    directions: &[TensorData],
+    scale: f64,
+) -> HashMap<String, TensorData> {
+    assert_eq!(input_names.len(), directions.len());
+    let mut perturbed = bindings.clone();
+    for (input_name, direction) in input_names.iter().zip(directions) {
+        let value = bindings.get(input_name).unwrap();
+        assert_eq!(direction.shape(), value.shape());
+        assert_eq!(direction.dtype(), value.dtype());
+        let replacement = TensorData::from_scalars(
+            value.shape().clone(),
+            value.dtype(),
+            (0..value.len()).map(|coordinate| {
+                Scalar::F(
+                    value.scalar_at(coordinate).as_f64()
+                        + scale * direction.scalar_at(coordinate).as_f64(),
+                )
+            }),
+        )
+        .unwrap();
+        assert!(perturbed.insert(input_name.clone(), replacement).is_some());
+    }
+    perturbed
+}
+
+fn canonical_parameter_directions(
+    bindings: &HashMap<String, TensorData>,
+    input_names: &[String],
+) -> Vec<TensorData> {
+    const VALUES: [f64; 8] = [
+        -0.125, -0.09375, -0.0625, -0.03125, 0.03125, 0.0625, 0.09375, 0.125,
+    ];
+
+    let mut offset = 0;
+    input_names
+        .iter()
+        .map(|input_name| {
+            let value = bindings.get(input_name).unwrap();
+            assert_eq!(value.dtype(), DType::F32);
+            let direction = TensorData::from_scalars(
+                value.shape().clone(),
+                DType::F32,
+                (0..value.len()).map(|coordinate| Scalar::F(VALUES[(offset + coordinate) % 8])),
+            )
+            .unwrap();
+            offset += value.len();
+            direction
+        })
+        .collect()
+}
+
 fn assert_relu_region_unchanged(base: &TensorData, perturbed: &TensorData, context: &str) {
     assert_eq!(perturbed.shape(), base.shape());
     for coordinate in 0..base.len() {
@@ -390,13 +444,19 @@ fn assert_relu_region_unchanged(base: &TensorData, perturbed: &TensorData, conte
     }
 }
 
-#[test]
-fn maintained_causal_transformer_all_parameter_vjps_match_central_differences() {
-    const EPSILON: f64 = 1e-3;
-    const RELU_MARGIN: f64 = 0.5;
-    const ABSOLUTE_TOLERANCE: f64 = 3e-3;
-    const RELATIVE_TOLERANCE: f64 = 3e-3;
+struct MaintainedDerivativeFixture {
+    model: TinyCausalTransformer,
+    state_before: StateDict,
+    parameter_state_before: BTreeMap<String, (TensorData, u64)>,
+    graph: Graph,
+    loss: NodeId,
+    targets: Vec<NodeId>,
+    target_input_names: Vec<String>,
+    relu_input: NodeId,
+    bindings: HashMap<String, TensorData>,
+}
 
+fn maintained_derivative_fixture() -> MaintainedDerivativeFixture {
     let model = TinyCausalTransformer::new(7).unwrap();
     let state_before = model.state_dict().unwrap();
     let parameter_state_before = module_parameter_state(&model);
@@ -414,11 +474,11 @@ fn maintained_causal_transformer_all_parameter_vjps_match_central_differences() 
 
     let mut graph = Graph::new();
     let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
-    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let target_tokens = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
     let mut dropout = FixedResidualDropout::new();
     let logits = model.forward(&mut graph, tokens, &mut dropout).unwrap();
     assert_eq!(dropout.next, 2);
-    let loss = sparse_causal_loss(&mut graph, logits, targets).unwrap();
+    let loss = sparse_causal_loss(&mut graph, logits, target_tokens).unwrap();
 
     let trainable = model.trainable_parameters().unwrap();
     assert_eq!(trainable.len(), 19);
@@ -499,13 +559,47 @@ fn maintained_causal_transformer_all_parameter_vjps_match_central_differences() 
     );
     bindings.extend(batch(1));
 
+    MaintainedDerivativeFixture {
+        model,
+        state_before,
+        parameter_state_before,
+        graph,
+        loss,
+        targets,
+        target_input_names,
+        relu_input: relu_inputs[0],
+        bindings,
+    }
+}
+
+#[test]
+fn maintained_causal_transformer_all_parameter_vjps_match_central_differences() {
+    const EPSILON: f64 = 1e-3;
+    const RELU_MARGIN: f64 = 0.5;
+    const ABSOLUTE_TOLERANCE: f64 = 3e-3;
+    const RELATIVE_TOLERANCE: f64 = 3e-3;
+
+    let MaintainedDerivativeFixture {
+        model,
+        state_before,
+        parameter_state_before,
+        mut graph,
+        loss,
+        targets,
+        target_input_names,
+        relu_input,
+        bindings,
+    } = maintained_derivative_fixture();
+
+    let trainable = model.trainable_parameters().unwrap();
+
     // This is the same one-batched-reverse entry point used by compiled AdamW.
     let gradients = graph.gradient_default(loss, &targets).unwrap();
     assert_eq!(gradients.len(), trainable.len());
-    let mut analytic_outputs = Vec::with_capacity(1 + gradients.len() + relu_inputs.len());
+    let mut analytic_outputs = Vec::with_capacity(2 + gradients.len());
     analytic_outputs.push(loss);
     analytic_outputs.extend(gradients.iter().copied());
-    analytic_outputs.extend(relu_inputs.iter().copied());
+    analytic_outputs.push(relu_input);
     let analytic = CpuBackend
         .execute_many(&graph, &analytic_outputs, &bindings)
         .unwrap();
@@ -518,7 +612,7 @@ fn maintained_causal_transformer_all_parameter_vjps_match_central_differences() 
         "the finite-difference fixture must stay well away from the ReLU kink"
     );
 
-    let finite_difference_outputs = [loss, relu_inputs[0]];
+    let finite_difference_outputs = [loss, relu_input];
     let analytic_gradients = &analytic.outputs[1..1 + gradients.len()];
     let mut coordinates_checked = 0;
     for (((name, parameter), input_name), gradient) in trainable
@@ -558,6 +652,132 @@ fn maintained_causal_transformer_all_parameter_vjps_match_central_differences() 
             assert!(
                 error <= tolerance,
                 "{name}[{coordinate}] VJP mismatch: analytic={analytic}, numerical={numerical}, error={error}, tolerance={tolerance}"
+            );
+            coordinates_checked += 1;
+        }
+    }
+    assert_eq!(coordinates_checked, 64);
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
+}
+
+#[test]
+fn maintained_causal_transformer_all_parameter_hvps_match_central_differences() {
+    const EPSILON: f64 = 1e-2;
+    const RELU_MARGIN: f64 = 0.5;
+    const ABSOLUTE_TOLERANCE: f64 = 1e-2;
+    const RELATIVE_TOLERANCE: f64 = 1e-2;
+
+    let MaintainedDerivativeFixture {
+        model,
+        state_before,
+        parameter_state_before,
+        mut graph,
+        loss,
+        targets,
+        target_input_names,
+        relu_input,
+        bindings,
+    } = maintained_derivative_fixture();
+    let trainable = model.trainable_parameters().unwrap();
+    let directions = canonical_parameter_directions(&bindings, &target_input_names);
+    assert_eq!(directions.len(), trainable.len());
+    assert_eq!(directions.iter().map(TensorData::len).sum::<usize>(), 64);
+    assert!(directions.iter().all(|direction| {
+        direction
+            .to_vec_f64()
+            .into_iter()
+            .all(|value| value != 0.0 && value.abs() <= 0.125)
+    }));
+
+    // Both reverse traversals are batched over the same canonical parameter
+    // leaves, matching the compilation path rather than differentiating each
+    // parameter or coordinate in isolation.
+    let gradients = graph.gradient_default(loss, &targets).unwrap();
+    assert_eq!(gradients.len(), trainable.len());
+    let mut directional_terms = Vec::with_capacity(gradients.len());
+    for (gradient, direction) in gradients.iter().zip(&directions) {
+        let direction = graph.constant(direction.clone());
+        let weighted = graph.mul(*gradient, direction).unwrap();
+        directional_terms.push(graph.sum_all(weighted).unwrap());
+    }
+    let mut directional_derivative = directional_terms[0];
+    for term in directional_terms.into_iter().skip(1) {
+        directional_derivative = graph.add(directional_derivative, term).unwrap();
+    }
+    let hvps = graph
+        .gradient_default(directional_derivative, &targets)
+        .unwrap();
+    assert_eq!(hvps.len(), trainable.len());
+
+    let mut base_outputs = Vec::with_capacity(hvps.len() + gradients.len() + 1);
+    base_outputs.extend(hvps.iter().copied());
+    base_outputs.extend(gradients.iter().copied());
+    base_outputs.push(relu_input);
+    let base = CpuBackend
+        .execute_many(&graph, &base_outputs, &bindings)
+        .unwrap();
+    let base_relu = &base.outputs[hvps.len() + gradients.len()];
+    assert!(
+        base_relu
+            .to_vec_f64()
+            .into_iter()
+            .all(|value| value.abs() >= RELU_MARGIN),
+        "the HVP fixture must stay well away from the ReLU kink"
+    );
+
+    let plus_bindings = directionally_perturbed_parameter_bindings(
+        &bindings,
+        &target_input_names,
+        &directions,
+        EPSILON,
+    );
+    let minus_bindings = directionally_perturbed_parameter_bindings(
+        &bindings,
+        &target_input_names,
+        &directions,
+        -EPSILON,
+    );
+    let mut finite_difference_outputs = gradients.clone();
+    finite_difference_outputs.push(relu_input);
+    let plus = CpuBackend
+        .execute_many(&graph, &finite_difference_outputs, &plus_bindings)
+        .unwrap();
+    let minus = CpuBackend
+        .execute_many(&graph, &finite_difference_outputs, &minus_bindings)
+        .unwrap();
+    assert_relu_region_unchanged(
+        base_relu,
+        plus.outputs.last().unwrap(),
+        "+ epsilon * direction",
+    );
+    assert_relu_region_unchanged(
+        base_relu,
+        minus.outputs.last().unwrap(),
+        "- epsilon * direction",
+    );
+
+    let analytic_hvps = &base.outputs[..hvps.len()];
+    let mut coordinates_checked = 0;
+    for (((name, _), analytic), (plus, minus)) in trainable.iter().zip(analytic_hvps).zip(
+        plus.outputs[..gradients.len()]
+            .iter()
+            .zip(&minus.outputs[..gradients.len()]),
+    ) {
+        assert_eq!(analytic.shape(), plus.shape());
+        assert_eq!(analytic.shape(), minus.shape());
+        for coordinate in 0..analytic.len() {
+            let analytic = analytic.scalar_at(coordinate).as_f64();
+            let numerical = (plus.scalar_at(coordinate).as_f64()
+                - minus.scalar_at(coordinate).as_f64())
+                / (2.0 * EPSILON);
+            assert!(analytic.is_finite() && numerical.is_finite());
+            let error = (analytic - numerical).abs();
+            let tolerance =
+                ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * analytic.abs().max(numerical.abs());
+            assert!(
+                error <= tolerance,
+                "{name}[{coordinate}] HVP mismatch: analytic={analytic}, numerical={numerical}, error={error}, tolerance={tolerance}"
             );
             coordinates_checked += 1;
         }
