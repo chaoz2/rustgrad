@@ -1171,6 +1171,36 @@ fn protected_live_metal_workflow_runs_the_exact_compiled_training_acceptance() {
             "protected live Metal workflow is missing {required:?}"
         );
     }
+    for required in [
+        "run_gguf:",
+        "default: false",
+        "type: boolean",
+        "if: ${{ inputs.run_gguf }}",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "protected live Metal workflow is missing the optional GGUF contract {required:?}"
+        );
+    }
+    let (training_job, gguf_job) = workflow
+        .split_once("  live-metal-llama:")
+        .expect("workflow must keep a separate GGUF job");
+    assert!(!training_job.contains("RUSTGRAD_METAL_LLAMA_"));
+    assert!(gguf_job.contains("RUSTGRAD_METAL_LLAMA_GGUF_PATH:"));
+    assert_eq!(
+        workflow
+            .matches("workflow dispatch revision does not match expected_sha")
+            .count(),
+        2,
+        "each runnable Metal job must authenticate its dispatch revision"
+    );
+    assert_eq!(
+        workflow
+            .matches("checked-out revision does not match expected_sha")
+            .count(),
+        2,
+        "each runnable Metal job must authenticate its checkout"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1230,7 +1260,7 @@ impl LiveTrainingTotals {
 
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "requires the protected self-hosted Apple-GPU lane"]
+#[ignore = "requires the manual self-hosted Apple-GPU lane"]
 fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let expected_sha = env::var("RUSTGRAD_METAL_EXPECTED_SHA")
         .expect("the live lane must provide RUSTGRAD_METAL_EXPECTED_SHA");

@@ -3041,7 +3041,7 @@ measurement. `benchmark_compare` reads bounded observation files and
 emits deterministic comparison JSON offline, allowing independently measured
 tinygrad, Candle, and llama.cpp evidence to enter without inferred values.
 
-This comparison plumbing is delivered, but the dormant protected lane has not
+This comparison plumbing is delivered, but the dormant manual lane has not
 produced live Apple-GPU observations. No current speedup, measured peak device
 memory, or physical transfer result follows from these types.
 
@@ -3050,8 +3050,8 @@ memory, or physical transfer result follows from these types.
 benchmark, and prompt-to-tokens entry points for this boundary.
 The manual-only `metal-live.yml` workflow requires a caller-
 supplied lowercase full commit SHA, verifies that the checkout matches it, and
-targets `[self-hosted, macOS, ARM64, rustgrad-metal]` behind the protected
-`live-metal` environment. Before checkout it requires the dispatch
+targets `[self-hosted, macOS, ARM64, rustgrad-metal]` through the `live-metal`
+environment. Before checkout it requires the dispatch
 `GITHUB_SHA` to equal that expected revision, then authenticates `HEAD` again
 after checkout. The repository workflow only names the environment;
 provisioning must configure its reviewers and deployment-ref restrictions. It
@@ -3065,8 +3065,9 @@ benchmark exactly once rather than duplicating it through the ignored live
 test, and uploads its deterministic v8 scoreboard and normalized observation v1
 beside the Linear report. The observation keeps planned static-slot memory and
 the measured RustGrad-owned physical-buffer high-water as separate fields.
-The separate Llama job accepts only the protected Metal registry identity and
-a runner-local GGUF whose SHA-256 matches protected configuration, plus a
+The separate Llama job runs only when the typed `run_gguf` dispatch input is
+explicitly true. It accepts only the protected Metal registry identity and a
+runner-local GGUF whose SHA-256 matches protected configuration, plus a
 protected prompt, a generation bound of at least two, and at least two
 independently pinned greedy token IDs. The tokenizer must produce at least one
 more prompt ID than the configured fixed span. It performs no model download,
@@ -3101,12 +3102,18 @@ workload. Component scoreboard v8 and Llama execution scoreboard v2 keep host
 wall time, optional compute-command GPU execution time, host-API copy counters,
 and compute-command submission/wait counters distinct. GPU command time is not
 copy time, end-to-end latency, tokens per second, or a live-device speedup
-claim. The workflow has no push or pull-request trigger. The current external
-audit found zero runners, no `live-metal` environment, and none of the
-required protected variables, so this lane is dormant and its presence is not
-live-device or performance evidence.
-Provisioning must attach the exact runner labels, restrict deployment refs and
-reviewers on `live-metal`, and define protected
+claim. The workflow has no push or pull-request trigger. Its default manual
+dispatch runs Linear, compiled-Transformer training, and ResNet without
+consulting any GGUF path, hash, prompt, expected-ID, or oracle variable. The
+current external audit found zero compatible runners. The `live-metal`
+environment exists as ID `21345725438`, but has empty `protection_rules`, no
+`deployment_branch_policy`, and no environment variables; it is unprotected
+and unrestricted. Missing GGUF variables block only the opt-in Llama job, not
+the default training-oriented job. The workflow's presence is not live-device
+or performance evidence.
+Provisioning for every run must attach the exact runner labels and restrict
+deployment refs and reviewers on `live-metal`. Opt-in GGUF runs must also define
+protected
 `RUSTGRAD_METAL_LLAMA_GGUF_PATH`, `RUSTGRAD_METAL_LLAMA_GGUF_SHA256`,
 `RUSTGRAD_METAL_LLAMA_REGISTRY_ID`, `RUSTGRAD_METAL_LLAMA_PROMPT`,
 `RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS`, and

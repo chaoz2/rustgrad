@@ -47,7 +47,7 @@ fn assert_resnet_logits_close(actual: &TensorData, expected: &TensorData) {
 }
 
 #[test]
-#[ignore = "requires the protected self-hosted Apple-GPU lane"]
+#[ignore = "requires the manual self-hosted Apple-GPU lane"]
 fn live_metal_linear_persistent_session_emits_scoreboard() {
     let expected_sha = env::var("RUSTGRAD_METAL_EXPECTED_SHA")
         .expect("the live lane must provide RUSTGRAD_METAL_EXPECTED_SHA");
@@ -266,7 +266,7 @@ fn live_metal_linear_persistent_session_emits_scoreboard() {
 }
 
 #[test]
-#[ignore = "requires the protected self-hosted Apple-GPU lane"]
+#[ignore = "requires the manual self-hosted Apple-GPU lane"]
 fn live_metal_resnet18_persistent_session_matches_full_cpu_oracle() {
     let expected_sha = env::var("RUSTGRAD_METAL_EXPECTED_SHA")
         .expect("the live lane must provide RUSTGRAD_METAL_EXPECTED_SHA");
