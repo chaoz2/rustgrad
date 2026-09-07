@@ -1160,7 +1160,7 @@ fn protected_live_metal_workflow_runs_the_exact_compiled_training_acceptance() {
     let workflow = include_str!("../.github/workflows/metal-live.yml");
     for required in [
         "RUSTGRAD_METAL_TRAINING_EVIDENCE_PATH:",
-        "metal-live-compiled-training-v5.json",
+        "metal-live-compiled-training-v6.json",
         "Train and resume the compiled causal Transformer on Metal",
         "cargo test --release --test compiled_transformer_training",
         "live_metal_compiled_causal_transformer_training_resumes_exactly",
