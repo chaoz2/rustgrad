@@ -14,7 +14,7 @@ use rustgrad::{
     LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Op, Parameter, Reduction, Result, Scalar,
     Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy, load_safetensors,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(target_os = "macos")]
 use std::{env, fs::OpenOptions, io::Write, path::PathBuf};
 
@@ -155,6 +155,30 @@ fn build(
     let logits = model.forward(graph, inputs["tokens"], dropout)?;
     let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
     Ok((loss, BTreeMap::new()))
+}
+
+fn build_with_dropout_observations(
+    model: &TinyCausalTransformer,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let mut observed = ObservedResidualDropout {
+        inner: dropout,
+        sites: Vec::new(),
+    };
+    let logits = model.forward(graph, inputs["tokens"], &mut observed)?;
+    assert_eq!(observed.sites.len(), 2);
+    let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
+    Ok((
+        loss,
+        BTreeMap::from([
+            ("dropout_0_input".into(), observed.sites[0].0),
+            ("dropout_0_output".into(), observed.sites[0].1),
+            ("dropout_1_input".into(), observed.sites[1].0),
+            ("dropout_1_output".into(), observed.sites[1].1),
+        ]),
+    ))
 }
 
 fn build_evaluation(
@@ -305,17 +329,31 @@ impl FixedResidualDropout {
             )
             .unwrap()
         };
-        Self {
-            masks: [
-                mask([
-                    true, false, true, true, false, true, false, true, true, false, true, false,
-                ]),
-                mask([
-                    false, true, true, false, true, true, true, true, false, true, false, true,
-                ]),
-            ],
-            next: 0,
-        }
+        Self::from_masks([
+            mask([
+                true, false, true, true, false, true, false, true, true, false, true, false,
+            ]),
+            mask([
+                false, true, true, false, true, true, true, true, false, true, false, true,
+            ]),
+        ])
+    }
+
+    fn from_masks(masks: [TensorData; 2]) -> Self {
+        Self { masks, next: 0 }
+    }
+}
+
+struct ObservedResidualDropout<'a> {
+    inner: &'a mut dyn TrainingDropoutProvider,
+    sites: Vec<(NodeId, NodeId)>,
+}
+
+impl TrainingDropoutProvider for ObservedResidualDropout<'_> {
+    fn dropout(&mut self, graph: &mut Graph, input: NodeId, probability: f64) -> Result<NodeId> {
+        let output = self.inner.dropout(graph, input, probability)?;
+        self.sites.push((input, output));
+        Ok(output)
     }
 }
 
@@ -352,6 +390,59 @@ fn module_parameter_state(model: &TinyCausalTransformer) -> BTreeMap<String, (Te
         panic!("the maintained Transformer state must remain readable: {error}");
     }
     state
+}
+
+fn observed_dropout_masks(outputs: &BTreeMap<String, TensorData>) -> [TensorData; 2] {
+    [0, 1].map(|site| {
+        let input = &outputs[&format!("dropout_{site}_input")];
+        let output = &outputs[&format!("dropout_{site}_output")];
+        assert_eq!(input.shape(), output.shape());
+        TensorData::from_scalars(
+            input.shape().clone(),
+            DType::Bool,
+            (0..input.len()).map(|coordinate| {
+                let input = input.scalar_at(coordinate).as_f64();
+                let output = output.scalar_at(coordinate).as_f64();
+                assert_ne!(input, 0.0, "dropout mask observation must be unambiguous");
+                let kept = output != 0.0;
+                if kept {
+                    assert!((output * 0.75 - input).abs() < 1e-6);
+                }
+                Scalar::Bool(kept)
+            }),
+        )
+        .unwrap()
+    })
+}
+
+fn maintained_transformer_analytic_gradients(
+    model: &TinyCausalTransformer,
+    inputs: BTreeMap<String, TensorData>,
+    masks: [TensorData; 2],
+) -> BTreeMap<String, TensorData> {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let mut dropout = FixedResidualDropout::from_masks(masks);
+    let logits = model.forward(&mut graph, tokens, &mut dropout).unwrap();
+    assert_eq!(dropout.next, 2);
+    let loss = sparse_causal_loss(&mut graph, logits, targets).unwrap();
+    let trainable = model.trainable_parameters().unwrap();
+    let targets = trainable
+        .iter()
+        .map(|(_, parameter)| parameter.node(&graph).unwrap())
+        .collect::<Vec<_>>();
+    let gradients = graph.gradient_default(loss, &targets).unwrap();
+    let mut bindings = model.input_bindings(&graph).unwrap();
+    bindings.extend(inputs);
+    let realized = CpuBackend
+        .execute_many(&graph, &gradients, &bindings)
+        .unwrap();
+    trainable
+        .into_iter()
+        .map(|(name, _)| name)
+        .zip(realized.outputs)
+        .collect()
 }
 
 fn perturbed_parameter_bindings(
@@ -1196,6 +1287,182 @@ fn compiled_transformer_active_global_clip_changes_the_first_window_update() {
         unclipped.parameter_snapshots().unwrap(),
         "active clipping must change the maintained Transformer's update"
     );
+}
+
+#[test]
+fn compiled_transformer_first_accumulated_adamw_update_matches_analytic_reference() {
+    const FIRST_MOMENT_TOLERANCE: f64 = 2e-6;
+    const SECOND_MOMENT_TOLERANCE: f64 = 2e-7;
+    const PARAMETER_TOLERANCE: f64 = 2e-5;
+
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    let tied_identity = model.tokens.weight.id();
+    let frozen_before = model.frozen_scale.snapshot().unwrap();
+    let optimizer = config();
+    let beta1 = optimizer.beta1();
+    let beta2 = optimizer.beta2();
+    let eps = optimizer.eps();
+    let weight_decay = optimizer.weight_decay();
+    let max_norm = optimizer.max_gradient_norm().unwrap();
+    let exclusions = optimizer
+        .weight_decay_exclusions()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let expected_exclusions = WEIGHT_DECAY_EXCLUSIONS
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(exclusions, expected_exclusions);
+
+    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+        optimizer,
+        dropout_config(),
+        &model,
+        build_with_dropout_observations,
+    )
+    .unwrap();
+    assert_eq!(plan.dropout_blocks_per_replay(), Some(12));
+    let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
+    let initial_parameters = runtime.parameter_snapshots().unwrap();
+    assert_eq!(initial_parameters.len(), 19);
+    assert!(initial_parameters.contains_key("tokens.weight"));
+    assert!(!initial_parameters.contains_key("lm_head.weight"));
+    assert!(!initial_parameters.contains_key("frozen_scale"));
+
+    let mut masks = Vec::with_capacity(ACCUMULATION_STEPS as usize);
+    for replay in 1..=ACCUMULATION_STEPS {
+        let step = runtime.step(batch(replay), learning_rate()).unwrap();
+        masks.push(observed_dropout_masks(step.outputs()));
+        assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
+    }
+    assert_eq!(runtime.optimizer_step().unwrap(), 1);
+    assert_eq!(runtime.accumulation_index().unwrap(), 0);
+    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(36));
+
+    let gradients = masks
+        .into_iter()
+        .enumerate()
+        .map(|(index, masks)| {
+            maintained_transformer_analytic_gradients(&model, batch(index as u64 + 1), masks)
+        })
+        .collect::<Vec<_>>();
+    let mut averaged_gradients = BTreeMap::new();
+    let mut squared_norm = 0.0f32;
+    for name in initial_parameters.keys() {
+        let value = &gradients[0][name];
+        let averaged = (0..value.len())
+            .map(|coordinate| {
+                let first = gradients[0][name].scalar_at(coordinate).as_f64() as f32;
+                let second = gradients[1][name].scalar_at(coordinate).as_f64() as f32;
+                let third = gradients[2][name].scalar_at(coordinate).as_f64() as f32;
+                ((first + second) + third) / ACCUMULATION_STEPS as f32
+            })
+            .collect::<Vec<_>>();
+        let parameter_squared_norm = averaged
+            .iter()
+            .fold(0.0f32, |subtotal, gradient| subtotal + gradient * gradient);
+        squared_norm += parameter_squared_norm;
+        averaged_gradients.insert(name.clone(), averaged);
+    }
+    let gradient_norm = squared_norm.sqrt();
+    assert!(
+        gradient_norm > max_norm,
+        "the maintained fixture must activate clipping"
+    );
+    let clip_scale = max_norm / gradient_norm.max(max_norm);
+
+    let actual_parameters = runtime.parameter_snapshots().unwrap();
+    let actual_first_moments = runtime.first_moment_snapshots().unwrap();
+    let actual_second_moments = runtime.second_moment_snapshots().unwrap();
+    let parameter_names = initial_parameters.keys().collect::<Vec<_>>();
+    assert_eq!(
+        actual_parameters.keys().collect::<Vec<_>>(),
+        parameter_names
+    );
+    assert_eq!(
+        actual_first_moments.keys().collect::<Vec<_>>(),
+        parameter_names
+    );
+    assert_eq!(
+        actual_second_moments.keys().collect::<Vec<_>>(),
+        parameter_names
+    );
+    let learning_rate = learning_rate().scalar_at(0).as_f64() as f32;
+    let first_correction = 1.0 - beta1.powf(1.0);
+    let second_correction = 1.0 - beta2.powf(1.0);
+    let decay_factor = 1.0 - learning_rate * weight_decay;
+    let mut coordinates_checked = 0;
+    let mut excluded_decay_counterfactuals = 0;
+    let mut included_decay_counterfactuals = 0;
+    for (name, initial) in &initial_parameters {
+        let excluded = exclusions.contains(name);
+        let actual_parameter = &actual_parameters[name];
+        let actual_first = &actual_first_moments[name];
+        let actual_second = &actual_second_moments[name];
+        for coordinate in 0..initial.len() {
+            let gradient = averaged_gradients[name][coordinate] * clip_scale;
+            let expected_first = (1.0 - beta1) * gradient;
+            let gradient_squared = gradient * gradient;
+            let expected_second = (1.0 - beta2) * gradient_squared;
+            let corrected_first = expected_first / first_correction;
+            let corrected_second = expected_second / second_correction;
+            let normalized = corrected_first / (corrected_second.sqrt() + eps);
+            let initial = initial.scalar_at(coordinate).as_f64() as f32;
+            let without_decay = initial - learning_rate * normalized;
+            let with_decay = initial * decay_factor - learning_rate * normalized;
+            let expected_parameter = if excluded { without_decay } else { with_decay };
+            let assert_close = |kind: &str, actual: f64, expected: f32, tolerance: f64| {
+                assert!(
+                    (actual - f64::from(expected)).abs() <= tolerance,
+                    "{name}[{coordinate}] {kind} mismatch: actual={actual}, expected={expected}"
+                );
+            };
+            assert_close(
+                "first moment",
+                actual_first.scalar_at(coordinate).as_f64(),
+                expected_first,
+                FIRST_MOMENT_TOLERANCE,
+            );
+            assert_close(
+                "second moment",
+                actual_second.scalar_at(coordinate).as_f64(),
+                expected_second,
+                SECOND_MOMENT_TOLERANCE,
+            );
+            assert_close(
+                "parameter",
+                actual_parameter.scalar_at(coordinate).as_f64(),
+                expected_parameter,
+                PARAMETER_TOLERANCE,
+            );
+            if with_decay != without_decay {
+                if excluded {
+                    excluded_decay_counterfactuals += 1;
+                } else {
+                    included_decay_counterfactuals += 1;
+                }
+            }
+            coordinates_checked += 1;
+        }
+    }
+    assert_eq!(coordinates_checked, 64);
+    assert!(excluded_decay_counterfactuals > 0);
+    assert!(included_decay_counterfactuals > 0);
+    assert!(
+        runtime
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .values()
+            .all(|value| value.to_vec_f64().into_iter().all(|lane| lane == 0.0))
+    );
+    assert_eq!(model.tokens.weight.id(), tied_identity);
+    let frozen_after = model.frozen_scale.snapshot().unwrap();
+    assert_eq!(frozen_after.data, frozen_before.data);
+    assert_eq!(frozen_after.version, frozen_before.version);
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
 }
 
 #[test]
