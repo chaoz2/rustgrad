@@ -20,15 +20,195 @@ use crate::{
     combine_mixed_schedules, load_safetensors, save_safetensors, schedule_effects, schedule_many,
 };
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt,
+    ops::Range,
 };
 
 const INTERNAL_PREFIX: &str = "__rustgrad_compiled_training_";
 const LEARNING_RATE_INPUT: &str = "__rustgrad_compiled_training_learning_rate";
 const STATE_BUFFER_BASE: u64 = 1_u64 << 62;
-const DROPOUT_COUNTER_KEY: &str = "workload:dropout_block_counter";
 const DROPOUT_COUNTER_INPUT: &str = "__rustgrad_compiled_training_dropout_block_counter";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdamWParameterState {
+    FirstMoment,
+    SecondMoment,
+    GradientAccumulator,
+}
+
+impl AdamWParameterState {
+    const fn canonical_suffix(self) -> &'static str {
+        match self {
+            Self::FirstMoment => "first_moment",
+            Self::SecondMoment => "second_moment",
+            Self::GradientAccumulator => "gradient_accumulator",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdamWGlobalState {
+    Step,
+    AccumulationIndex,
+}
+
+impl AdamWGlobalState {
+    const fn canonical_suffix(self) -> &'static str {
+        match self {
+            Self::Step => "step",
+            Self::AccumulationIndex => "accumulation_index",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecurrentStateSemantic {
+    Parameter(Range<usize>),
+    Momentum(Range<usize>),
+    AdamWParameter {
+        parameter: Range<usize>,
+        state: AdamWParameterState,
+    },
+    AdamWGlobal(AdamWGlobalState),
+    DropoutCounter,
+}
+
+/// Private semantic identity for every compiled-optimizer recurrent value.
+///
+/// Each constructor materializes the exact legacy spelling once. Equality and
+/// ordering use those stored bytes, so arbitrary parameter punctuation cannot
+/// change capture, checkpoint, or state-bank order. Parameter-bearing kinds
+/// retain only a byte range into that same allocation.
+#[derive(Clone, Debug)]
+struct RecurrentStateKey {
+    canonical: Box<str>,
+    semantic: RecurrentStateSemantic,
+}
+
+impl RecurrentStateKey {
+    fn parameter(name: impl AsRef<str>) -> Self {
+        let (canonical, parameter) = Self::parameterized("parameter:", name.as_ref(), "", "");
+        Self {
+            canonical,
+            semantic: RecurrentStateSemantic::Parameter(parameter),
+        }
+    }
+
+    fn momentum(name: impl AsRef<str>) -> Self {
+        let (canonical, parameter) = Self::parameterized("slot:", name.as_ref(), ":", "momentum");
+        Self {
+            canonical,
+            semantic: RecurrentStateSemantic::Momentum(parameter),
+        }
+    }
+
+    fn adamw_parameter(name: impl AsRef<str>, state: AdamWParameterState) -> Self {
+        let (canonical, parameter) =
+            Self::parameterized("slot:", name.as_ref(), ":", state.canonical_suffix());
+        Self {
+            canonical,
+            semantic: RecurrentStateSemantic::AdamWParameter { parameter, state },
+        }
+    }
+
+    fn adamw_global(state: AdamWGlobalState) -> Self {
+        Self {
+            canonical: format!("global:{}", state.canonical_suffix()).into_boxed_str(),
+            semantic: RecurrentStateSemantic::AdamWGlobal(state),
+        }
+    }
+
+    fn dropout_counter() -> Self {
+        Self {
+            canonical: Box::from("workload:dropout_block_counter"),
+            semantic: RecurrentStateSemantic::DropoutCounter,
+        }
+    }
+
+    fn parameterized(
+        prefix: &str,
+        parameter: &str,
+        separator: &str,
+        suffix: &str,
+    ) -> (Box<str>, Range<usize>) {
+        let start = prefix.len();
+        let end = start + parameter.len();
+        let mut canonical = String::with_capacity(end + separator.len() + suffix.len());
+        canonical.push_str(prefix);
+        canonical.push_str(parameter);
+        canonical.push_str(separator);
+        canonical.push_str(suffix);
+        (canonical.into_boxed_str(), start..end)
+    }
+
+    fn canonical_name(&self) -> &str {
+        &self.canonical
+    }
+
+    fn stored_parameter_name(&self, range: &Range<usize>) -> &str {
+        &self.canonical[range.clone()]
+    }
+
+    fn parameter_name(&self) -> Option<&str> {
+        match &self.semantic {
+            RecurrentStateSemantic::Parameter(parameter) => {
+                Some(self.stored_parameter_name(parameter))
+            }
+            _ => None,
+        }
+    }
+
+    fn momentum_parameter_name(&self) -> Option<&str> {
+        match &self.semantic {
+            RecurrentStateSemantic::Momentum(parameter) => {
+                Some(self.stored_parameter_name(parameter))
+            }
+            _ => None,
+        }
+    }
+
+    fn parameter_for_adamw_state(&self, expected: AdamWParameterState) -> Option<&str> {
+        match &self.semantic {
+            RecurrentStateSemantic::AdamWParameter { parameter, state } if *state == expected => {
+                Some(self.stored_parameter_name(parameter))
+            }
+            _ => None,
+        }
+    }
+
+    fn is_accumulation_reset_state(&self) -> bool {
+        matches!(
+            &self.semantic,
+            RecurrentStateSemantic::AdamWGlobal(AdamWGlobalState::AccumulationIndex)
+                | RecurrentStateSemantic::AdamWParameter {
+                    state: AdamWParameterState::GradientAccumulator,
+                    ..
+                }
+        )
+    }
+}
+
+impl PartialEq for RecurrentStateKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical_name() == other.canonical_name()
+    }
+}
+
+impl Eq for RecurrentStateKey {}
+
+impl Ord for RecurrentStateKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.canonical_name().cmp(other.canonical_name())
+    }
+}
+
+impl PartialOrd for RecurrentStateKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 /// Immutable two-word key for compiled Transformer residual dropout.
 ///
@@ -1192,7 +1372,7 @@ struct AdamWCheckpointTensors {
 
 #[derive(Clone, Debug)]
 struct StateSpec {
-    key: String,
+    key: RecurrentStateKey,
     input_name: String,
     value: TensorData,
     requires_grad: bool,
@@ -1216,8 +1396,8 @@ trait CompiledOptimizerProgram {
         learning_rate: NodeId,
         parameters: &BTreeMap<String, NodeId>,
         gradients: &BTreeMap<String, NodeId>,
-        states: &BTreeMap<String, NodeId>,
-    ) -> Result<BTreeMap<String, NodeId>>;
+        states: &BTreeMap<RecurrentStateKey, NodeId>,
+    ) -> Result<BTreeMap<RecurrentStateKey, NodeId>>;
 }
 
 struct MomentumProgram {
@@ -1226,14 +1406,6 @@ struct MomentumProgram {
 
 struct AdamWProgram {
     config: CompiledAdamWConfig,
-}
-
-fn parameter_key(name: &str) -> String {
-    format!("parameter:{name}")
-}
-
-fn slot_key(name: &str, slot: &str) -> String {
-    format!("slot:{name}:{slot}")
 }
 
 impl CompiledOptimizerProgram for MomentumProgram {
@@ -1249,13 +1421,13 @@ impl CompiledOptimizerProgram for MomentumProgram {
         let mut specs = Vec::with_capacity(parameters.len() * 2);
         for (ordinal, (name, value)) in parameters.iter().enumerate() {
             specs.push(StateSpec {
-                key: parameter_key(name),
+                key: RecurrentStateKey::parameter(name),
                 input_name: format!("{INTERNAL_PREFIX}parameter_{ordinal}"),
                 value: value.clone(),
                 requires_grad: true,
             });
             specs.push(StateSpec {
-                key: slot_key(name, "momentum"),
+                key: RecurrentStateKey::momentum(name),
                 input_name: format!("{INTERNAL_PREFIX}momentum_{ordinal}"),
                 value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
                 requires_grad: false,
@@ -1270,20 +1442,21 @@ impl CompiledOptimizerProgram for MomentumProgram {
         learning_rate: NodeId,
         parameters: &BTreeMap<String, NodeId>,
         gradients: &BTreeMap<String, NodeId>,
-        states: &BTreeMap<String, NodeId>,
-    ) -> Result<BTreeMap<String, NodeId>> {
+        states: &BTreeMap<RecurrentStateKey, NodeId>,
+    ) -> Result<BTreeMap<RecurrentStateKey, NodeId>> {
         let momentum = scalar_f32(graph, self.config.momentum)?;
         let mut updates = BTreeMap::new();
         for (name, parameter) in parameters {
-            let slot = states[&slot_key(name, "momentum")];
+            let momentum_key = RecurrentStateKey::momentum(name);
+            let slot = states[&momentum_key];
             let retained = graph.mul(momentum, slot)?;
             let next_momentum = graph.add(retained, gradients[name])?;
             let scaled = graph.mul(learning_rate, next_momentum)?;
             let next_parameter = graph.sub(*parameter, scaled)?;
             validate_parameter_update(graph, *parameter, next_momentum)?;
             validate_parameter_update(graph, *parameter, next_parameter)?;
-            updates.insert(slot_key(name, "momentum"), next_momentum);
-            updates.insert(parameter_key(name), next_parameter);
+            updates.insert(momentum_key, next_momentum);
+            updates.insert(RecurrentStateKey::parameter(name), next_parameter);
         }
         Ok(updates)
     }
@@ -1305,22 +1478,28 @@ impl CompiledOptimizerProgram for AdamWProgram {
             Vec::with_capacity(parameters.len() * per_parameter + 1 + accumulating as usize);
         for (ordinal, (name, value)) in parameters.iter().enumerate() {
             specs.push(StateSpec {
-                key: parameter_key(name),
+                key: RecurrentStateKey::parameter(name),
                 input_name: format!("{INTERNAL_PREFIX}parameter_{ordinal}"),
                 value: value.clone(),
                 requires_grad: true,
             });
-            for slot in ["first_moment", "second_moment"] {
+            for state in [
+                AdamWParameterState::FirstMoment,
+                AdamWParameterState::SecondMoment,
+            ] {
                 specs.push(StateSpec {
-                    key: slot_key(name, slot),
-                    input_name: format!("{INTERNAL_PREFIX}{slot}_{ordinal}"),
+                    key: RecurrentStateKey::adamw_parameter(name, state),
+                    input_name: format!("{INTERNAL_PREFIX}{}_{ordinal}", state.canonical_suffix()),
                     value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
                     requires_grad: false,
                 });
             }
             if accumulating {
                 specs.push(StateSpec {
-                    key: slot_key(name, "gradient_accumulator"),
+                    key: RecurrentStateKey::adamw_parameter(
+                        name,
+                        AdamWParameterState::GradientAccumulator,
+                    ),
                     input_name: format!("{INTERNAL_PREFIX}gradient_accumulator_{ordinal}"),
                     value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
                     requires_grad: false,
@@ -1328,14 +1507,14 @@ impl CompiledOptimizerProgram for AdamWProgram {
             }
         }
         specs.push(StateSpec {
-            key: "global:step".into(),
+            key: RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
             input_name: format!("{INTERNAL_PREFIX}adamw_step"),
             value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
             requires_grad: false,
         });
         if accumulating {
             specs.push(StateSpec {
-                key: "global:accumulation_index".into(),
+                key: RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
                 input_name: format!("{INTERNAL_PREFIX}adamw_accumulation_index"),
                 value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
                 requires_grad: false,
@@ -1368,8 +1547,8 @@ impl CompiledOptimizerProgram for AdamWProgram {
         learning_rate: NodeId,
         parameters: &BTreeMap<String, NodeId>,
         gradients: &BTreeMap<String, NodeId>,
-        states: &BTreeMap<String, NodeId>,
-    ) -> Result<BTreeMap<String, NodeId>> {
+        states: &BTreeMap<RecurrentStateKey, NodeId>,
+    ) -> Result<BTreeMap<RecurrentStateKey, NodeId>> {
         if self.config.gradient_accumulation_steps == 1 {
             let gradients = clip_gradients_by_global_norm(&self.config, graph, gradients)?;
             return lower_adamw_update_candidates(
@@ -1389,7 +1568,10 @@ impl CompiledOptimizerProgram for AdamWProgram {
             Scalar::U(self.config.gradient_accumulation_steps),
             DType::U64,
         )?;
-        let next_index = graph.add(states["global:accumulation_index"], one_u64)?;
+        let accumulation_index_key =
+            RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex);
+        let step_key = RecurrentStateKey::adamw_global(AdamWGlobalState::Step);
+        let next_index = graph.add(states[&accumulation_index_key], one_u64)?;
         let commit = graph.compare(CompareOp::Eq, next_index, threshold)?;
         let reset_index = graph.select(commit, zero_u64, next_index)?;
         let divisor = scalar_f32(graph, self.config.gradient_accumulation_steps as f32)?;
@@ -1397,7 +1579,8 @@ impl CompiledOptimizerProgram for AdamWProgram {
         let mut averaged_gradients = BTreeMap::new();
         let mut accumulated_gradients = BTreeMap::new();
         for (name, gradient) in gradients {
-            let key = slot_key(name, "gradient_accumulator");
+            let key =
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
             let accumulated = graph.add(states[&key], *gradient)?;
             let averaged = graph.div(accumulated, divisor)?;
             accumulated_gradients.insert(name.clone(), accumulated);
@@ -1416,22 +1599,28 @@ impl CompiledOptimizerProgram for AdamWProgram {
             states,
         )?;
         let mut updates = BTreeMap::new();
-        updates.insert("global:accumulation_index".into(), reset_index);
+        updates.insert(accumulation_index_key, reset_index);
         updates.insert(
-            "global:step".into(),
-            graph.select(commit, candidates["global:step"], states["global:step"])?,
+            step_key.clone(),
+            graph.select(commit, candidates[&step_key], states[&step_key])?,
         );
         for (name, parameter) in parameters {
-            let first_key = slot_key(name, "first_moment");
-            let second_key = slot_key(name, "second_moment");
-            let accumulator_key = slot_key(name, "gradient_accumulator");
+            let first_key =
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment);
+            let second_key =
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment);
+            let accumulator_key =
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
             let accumulator_shape = graph.shape(accumulated_gradients[name])?.clone();
             let zero = graph.lazy_full_with_dtype(accumulator_shape, Scalar::I(0), DType::F32)?;
             let next_accumulator = graph.select(commit, zero, accumulated_gradients[name])?;
             let next_first = graph.select(commit, candidates[&first_key], states[&first_key])?;
             let next_second = graph.select(commit, candidates[&second_key], states[&second_key])?;
-            let next_parameter =
-                graph.select(commit, candidates[&parameter_key(name)], *parameter)?;
+            let next_parameter = graph.select(
+                commit,
+                candidates[&RecurrentStateKey::parameter(name)],
+                *parameter,
+            )?;
             validate_parameter_update(graph, *parameter, next_accumulator)?;
             validate_parameter_update(graph, *parameter, next_first)?;
             validate_parameter_update(graph, *parameter, next_second)?;
@@ -1439,7 +1628,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
             updates.insert(accumulator_key, next_accumulator);
             updates.insert(first_key, next_first);
             updates.insert(second_key, next_second);
-            updates.insert(parameter_key(name), next_parameter);
+            updates.insert(RecurrentStateKey::parameter(name), next_parameter);
         }
         Ok(updates)
     }
@@ -1485,10 +1674,11 @@ fn lower_adamw_update_candidates(
     learning_rate: NodeId,
     parameters: &BTreeMap<String, NodeId>,
     gradients: &BTreeMap<String, NodeId>,
-    states: &BTreeMap<String, NodeId>,
-) -> Result<BTreeMap<String, NodeId>> {
+    states: &BTreeMap<RecurrentStateKey, NodeId>,
+) -> Result<BTreeMap<RecurrentStateKey, NodeId>> {
     let one_u64 = graph.full_with_dtype(Shape::from([]), Scalar::U(1), DType::U64)?;
-    let next_step = graph.add(states["global:step"], one_u64)?;
+    let step_key = RecurrentStateKey::adamw_global(AdamWGlobalState::Step);
+    let next_step = graph.add(states[&step_key], one_u64)?;
     let step_f32 = graph.cast(next_step, DType::F32)?;
     let one = scalar_f32(graph, 1.0)?;
     let beta1 = scalar_f32(graph, config.beta1)?;
@@ -1504,11 +1694,12 @@ fn lower_adamw_update_candidates(
     let decay = graph.mul(learning_rate, weight_decay)?;
     let decay_factor = graph.sub(one, decay)?;
 
-    let mut updates = BTreeMap::from([("global:step".into(), next_step)]);
+    let mut updates = BTreeMap::from([(step_key, next_step)]);
     for (name, parameter) in parameters {
         let gradient = gradients[name];
-        let first_key = slot_key(name, "first_moment");
-        let second_key = slot_key(name, "second_moment");
+        let first_key = RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment);
+        let second_key =
+            RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment);
         let retained_first = graph.mul(beta1, states[&first_key])?;
         let fresh_first = graph.mul(one_minus_beta1, gradient)?;
         let next_first = graph.add(retained_first, fresh_first)?;
@@ -1533,7 +1724,7 @@ fn lower_adamw_update_candidates(
         validate_parameter_update(graph, *parameter, next_parameter)?;
         updates.insert(first_key, next_first);
         updates.insert(second_key, next_second);
-        updates.insert(parameter_key(name), next_parameter);
+        updates.insert(RecurrentStateKey::parameter(name), next_parameter);
     }
     Ok(updates)
 }
@@ -1805,7 +1996,7 @@ pub struct MetalCompiledAdamWPlan {
     inner: MetalStatefulInferencePlan,
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
-    state_input_keys: BTreeMap<String, String>,
+    state_input_keys: BTreeMap<String, RecurrentStateKey>,
     program_identity: u64,
     progress: AdamWProgress,
     gradient_accumulation_steps: u64,
@@ -1824,7 +2015,7 @@ pub struct MetalCompiledAdamW {
     session: MetalDeviceSession,
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
-    state_input_keys: BTreeMap<String, String>,
+    state_input_keys: BTreeMap<String, RecurrentStateKey>,
     program_identity: u64,
     progress: AdamWProgress,
     gradient_accumulation_steps: u64,
@@ -2026,11 +2217,11 @@ struct CompiledTrainingPlan {
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
     parameter_buffers: BTreeMap<String, u64>,
-    optimizer_buffers: BTreeMap<String, u64>,
-    workload_buffers: BTreeMap<String, u64>,
+    optimizer_buffers: BTreeMap<RecurrentStateKey, u64>,
+    workload_buffers: BTreeMap<RecurrentStateKey, u64>,
     state_input_buffers: BTreeMap<String, u64>,
-    state_input_keys: BTreeMap<String, String>,
-    state_values: BTreeMap<String, TensorData>,
+    state_input_keys: BTreeMap<String, RecurrentStateKey>,
+    state_values: BTreeMap<RecurrentStateKey, TensorData>,
     step: u64,
 }
 
@@ -2057,10 +2248,10 @@ struct CpuCompiledTrainingProgram {
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
     parameter_buffers: BTreeMap<String, u64>,
-    optimizer_buffers: BTreeMap<String, u64>,
-    workload_buffers: BTreeMap<String, u64>,
+    optimizer_buffers: BTreeMap<RecurrentStateKey, u64>,
+    workload_buffers: BTreeMap<RecurrentStateKey, u64>,
     state_input_buffers: BTreeMap<String, u64>,
-    state_input_keys: BTreeMap<String, String>,
+    state_input_keys: BTreeMap<String, RecurrentStateKey>,
     step: u64,
 }
 
@@ -2205,7 +2396,7 @@ impl CompiledTrainingPlan {
             state_values.push((parameter_buffer, spec.value.clone()));
             state_input_buffers.insert(spec.input_name.clone(), parameter_buffer);
             state_input_keys.insert(spec.input_name.clone(), spec.key.clone());
-            if let Some(name) = spec.key.strip_prefix("parameter:") {
+            if let Some(name) = spec.key.parameter_name() {
                 parameter_nodes.insert(name.to_string(), node);
                 parameter_buffers.insert(name.to_string(), parameter_buffer);
             } else if ordinal < optimizer_spec_count_u64 {
@@ -2387,11 +2578,15 @@ impl CompiledTrainingPlan {
             .map_err(captured_inference_error)
     }
 
-    fn restore_frontier(mut self, step: u64, values: BTreeMap<String, TensorData>) -> Result<Self> {
+    fn restore_frontier(
+        mut self,
+        step: u64,
+        values: BTreeMap<RecurrentStateKey, TensorData>,
+    ) -> Result<Self> {
         let expected = self
             .parameter_buffers
             .keys()
-            .map(|name| parameter_key(name))
+            .map(RecurrentStateKey::parameter)
             .chain(self.optimizer_buffers.keys().cloned())
             .chain(self.workload_buffers.keys().cloned())
             .collect::<BTreeSet<_>>();
@@ -2499,7 +2694,7 @@ impl CompiledEvaluationPlan {
         let mut parameter_inputs = BTreeMap::new();
         let mut residents = BTreeMap::new();
         for init in parameter_plan.initial_parameters()? {
-            let key = parameter_key(init.name());
+            let key = RecurrentStateKey::parameter(init.name());
             let input_name = training_plan
                 .inner
                 .state_input_keys
@@ -2719,38 +2914,61 @@ impl CpuCompiledTrainingProgram {
         self.versions(&self.parameter_buffers)
     }
 
-    fn slot_snapshots(&self, slot: &str) -> Result<BTreeMap<String, TensorData>> {
-        let suffix = format!(":{slot}");
+    fn adamw_state_snapshots(
+        &self,
+        state: AdamWParameterState,
+    ) -> Result<BTreeMap<String, TensorData>> {
         let buffers = self
             .optimizer_buffers
             .iter()
             .filter_map(|(key, buffer)| {
-                key.strip_prefix("slot:")
-                    .and_then(|key| key.strip_suffix(&suffix))
-                    .map(|name| (name.to_string(), *buffer))
+                key.parameter_for_adamw_state(state)
+                    .map(|name| (name.to_owned(), *buffer))
             })
             .collect::<BTreeMap<_, _>>();
         self.snapshots(&buffers)
     }
 
-    fn slot_versions(&self, slot: &str) -> Result<BTreeMap<String, u64>> {
-        let suffix = format!(":{slot}");
+    fn adamw_state_versions(&self, state: AdamWParameterState) -> Result<BTreeMap<String, u64>> {
         let buffers = self
             .optimizer_buffers
             .iter()
             .filter_map(|(key, buffer)| {
-                key.strip_prefix("slot:")
-                    .and_then(|key| key.strip_suffix(&suffix))
-                    .map(|name| (name.to_string(), *buffer))
+                key.parameter_for_adamw_state(state)
+                    .map(|name| (name.to_owned(), *buffer))
             })
             .collect::<BTreeMap<_, _>>();
         self.versions(&buffers)
     }
 
-    fn global_snapshot(&self, name: &str) -> Result<TensorData> {
+    fn momentum_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        let buffers = self
+            .optimizer_buffers
+            .iter()
+            .filter_map(|(key, buffer)| {
+                key.momentum_parameter_name()
+                    .map(|name| (name.to_owned(), *buffer))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.snapshots(&buffers)
+    }
+
+    fn momentum_versions(&self) -> Result<BTreeMap<String, u64>> {
+        let buffers = self
+            .optimizer_buffers
+            .iter()
+            .filter_map(|(key, buffer)| {
+                key.momentum_parameter_name()
+                    .map(|name| (name.to_owned(), *buffer))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.versions(&buffers)
+    }
+
+    fn global_snapshot(&self, state: AdamWGlobalState) -> Result<TensorData> {
         let buffer = self
             .optimizer_buffers
-            .get(&format!("global:{name}"))
+            .get(&RecurrentStateKey::adamw_global(state))
             .ok_or_else(|| training("compiled global optimizer state is absent"))?;
         let state = self.current_state(*buffer)?;
         Ok(self
@@ -2761,7 +2979,7 @@ impl CpuCompiledTrainingProgram {
             .clone())
     }
 
-    fn workload_snapshot(&self, key: &str) -> Result<TensorData> {
+    fn workload_snapshot(&self, key: &RecurrentStateKey) -> Result<TensorData> {
         let buffer = self
             .workload_buffers
             .get(key)
@@ -2775,11 +2993,15 @@ impl CpuCompiledTrainingProgram {
             .clone())
     }
 
-    fn restore_frontier(&mut self, step: u64, values: &BTreeMap<String, TensorData>) -> Result<()> {
+    fn restore_frontier(
+        &mut self,
+        step: u64,
+        values: &BTreeMap<RecurrentStateKey, TensorData>,
+    ) -> Result<()> {
         let buffers = self
             .parameter_buffers
             .iter()
-            .map(|(name, buffer)| (parameter_key(name), *buffer))
+            .map(|(name, buffer)| (RecurrentStateKey::parameter(name), *buffer))
             .chain(
                 self.optimizer_buffers
                     .iter()
@@ -2828,7 +3050,7 @@ impl CpuCompiledTrainingProgram {
     fn replace_state_values(
         &mut self,
         step: u64,
-        replacements: BTreeMap<String, TensorData>,
+        replacements: BTreeMap<RecurrentStateKey, TensorData>,
     ) -> Result<()> {
         let mut values = self.plan()?.state_values;
         for (key, value) in replacements {
@@ -2915,7 +3137,7 @@ impl CpuCompiledMomentumSgd {
     }
 
     pub fn momentum_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.inner.slot_snapshots("momentum")
+        self.inner.momentum_snapshots()
     }
 
     pub fn parameter_versions(&self) -> Result<BTreeMap<String, u64>> {
@@ -2923,7 +3145,7 @@ impl CpuCompiledMomentumSgd {
     }
 
     pub fn momentum_versions(&self) -> Result<BTreeMap<String, u64>> {
-        self.inner.slot_versions("momentum")
+        self.inner.momentum_versions()
     }
 
     #[cfg(test)]
@@ -3069,7 +3291,7 @@ impl CompiledAdamWPlan {
         let loss_scale = config.loss_scale;
         let host_token_inputs = config.host_token_inputs.clone();
         let workload = StateSpec {
-            key: DROPOUT_COUNTER_KEY.into(),
+            key: RecurrentStateKey::dropout_counter(),
             input_name: DROPOUT_COUNTER_INPUT.into(),
             value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
             requires_grad: false,
@@ -3146,19 +3368,28 @@ impl CompiledAdamWPlan {
         let mut values = decoded
             .parameters
             .into_iter()
-            .map(|(name, value)| (parameter_key(&name), value))
+            .map(|(name, value)| (RecurrentStateKey::parameter(name), value))
             .collect::<BTreeMap<_, _>>();
         for (name, value) in decoded.first_moments {
-            values.insert(slot_key(&name, "first_moment"), value);
+            values.insert(
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment),
+                value,
+            );
         }
         for (name, value) in decoded.second_moments {
-            values.insert(slot_key(&name, "second_moment"), value);
+            values.insert(
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment),
+                value,
+            );
         }
         for (name, value) in decoded.gradient_accumulators {
-            values.insert(slot_key(&name, "gradient_accumulator"), value);
+            values.insert(
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator),
+                value,
+            );
         }
         values.insert(
-            "global:step".into(),
+            RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
             TensorData::from_scalars(
                 Shape::from([]),
                 DType::U64,
@@ -3167,7 +3398,7 @@ impl CompiledAdamWPlan {
         );
         if decoded.accumulation_steps > 1 {
             values.insert(
-                "global:accumulation_index".into(),
+                RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
                 TensorData::from_scalars(
                     Shape::from([]),
                     DType::U64,
@@ -3270,19 +3501,28 @@ impl CompiledAdamWPlan {
         let mut values = decoded
             .parameters
             .into_iter()
-            .map(|(name, value)| (parameter_key(&name), value))
+            .map(|(name, value)| (RecurrentStateKey::parameter(name), value))
             .collect::<BTreeMap<_, _>>();
         for (name, value) in decoded.first_moments {
-            values.insert(slot_key(&name, "first_moment"), value);
+            values.insert(
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment),
+                value,
+            );
         }
         for (name, value) in decoded.second_moments {
-            values.insert(slot_key(&name, "second_moment"), value);
+            values.insert(
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment),
+                value,
+            );
         }
         for (name, value) in decoded.gradient_accumulators {
-            values.insert(slot_key(&name, "gradient_accumulator"), value);
+            values.insert(
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator),
+                value,
+            );
         }
         values.insert(
-            "global:step".into(),
+            RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
             TensorData::from_scalars(
                 Shape::from([]),
                 DType::U64,
@@ -3291,7 +3531,7 @@ impl CompiledAdamWPlan {
         );
         if decoded.accumulation_steps > 1 {
             values.insert(
-                "global:accumulation_index".into(),
+                RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
                 TensorData::from_scalars(
                     Shape::from([]),
                     DType::U64,
@@ -3300,7 +3540,7 @@ impl CompiledAdamWPlan {
             );
         }
         values.insert(
-            DROPOUT_COUNTER_KEY.into(),
+            RecurrentStateKey::dropout_counter(),
             TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(dropout_counter)])?,
         );
         plan.progress = AdamWProgress {
@@ -3849,7 +4089,7 @@ impl CpuCompiledAdamW {
             .map(|_| {
                 Ok(self
                     .inner
-                    .workload_snapshot(DROPOUT_COUNTER_KEY)?
+                    .workload_snapshot(&RecurrentStateKey::dropout_counter())?
                     .scalar_at(0)
                     .as_u64())
             })
@@ -3869,17 +4109,20 @@ impl CpuCompiledAdamW {
     }
 
     pub fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.inner.slot_snapshots("first_moment")
+        self.inner
+            .adamw_state_snapshots(AdamWParameterState::FirstMoment)
     }
 
     pub fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.inner.slot_snapshots("second_moment")
+        self.inner
+            .adamw_state_snapshots(AdamWParameterState::SecondMoment)
     }
 
     /// Partial F32 gradient sums retained between microbatches. The map is
     /// empty when accumulation is disabled (`steps == 1`).
     pub fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.inner.slot_snapshots("gradient_accumulator")
+        self.inner
+            .adamw_state_snapshots(AdamWParameterState::GradientAccumulator)
     }
 
     /// Number of microbatches currently retained toward the next update.
@@ -3896,17 +4139,20 @@ impl CpuCompiledAdamW {
         }
         let mut replacements = self
             .inner
-            .slot_snapshots("gradient_accumulator")?
+            .adamw_state_snapshots(AdamWParameterState::GradientAccumulator)?
             .into_iter()
             .map(|(name, value)| {
                 Ok((
-                    slot_key(&name, "gradient_accumulator"),
+                    RecurrentStateKey::adamw_parameter(
+                        name,
+                        AdamWParameterState::GradientAccumulator,
+                    ),
                     TensorData::zeros_with_dtype(value.shape().clone(), value.dtype())?,
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
         replacements.insert(
-            "global:accumulation_index".into(),
+            RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
             TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
         );
         self.inner
@@ -3920,11 +4166,13 @@ impl CpuCompiledAdamW {
     }
 
     pub fn first_moment_versions(&self) -> Result<BTreeMap<String, u64>> {
-        self.inner.slot_versions("first_moment")
+        self.inner
+            .adamw_state_versions(AdamWParameterState::FirstMoment)
     }
 
     pub fn second_moment_versions(&self) -> Result<BTreeMap<String, u64>> {
-        self.inner.slot_versions("second_moment")
+        self.inner
+            .adamw_state_versions(AdamWParameterState::SecondMoment)
     }
 
     /// Renders the identical loss/backward/AdamW capture for Metal, seeded
@@ -3958,7 +4206,7 @@ impl CpuCompiledAdamW {
             .map(|dropout| {
                 let counter = self
                     .inner
-                    .workload_snapshot(DROPOUT_COUNTER_KEY)?
+                    .workload_snapshot(&RecurrentStateKey::dropout_counter())?
                     .scalar_at(0)
                     .as_u64();
                 if counter != expected_dropout_counter(dropout, self.progress.replay_step)? {
@@ -4545,7 +4793,7 @@ impl MetalCompiledAdamW {
 
     /// Downloads every currently committed recurrent value once and returns
     /// it under the optimizer's semantic state keys.
-    fn state_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+    fn state_snapshots(&self) -> Result<BTreeMap<RecurrentStateKey, TensorData>> {
         let snapshots = self
             .session
             .state_snapshots()
@@ -4587,7 +4835,7 @@ impl MetalCompiledAdamW {
             .state_input_keys
             .iter()
             .filter_map(|(input, key)| {
-                key.strip_prefix("parameter:")
+                key.parameter_name()
                     .map(|name| (input.clone(), name.to_owned()))
             })
             .collect::<BTreeMap<_, _>>();
@@ -4623,15 +4871,18 @@ impl MetalCompiledAdamW {
     }
 
     pub fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        metal_slot_snapshots(self.state_snapshots()?, "first_moment")
+        metal_adamw_state_snapshots(self.state_snapshots()?, AdamWParameterState::FirstMoment)
     }
 
     pub fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        metal_slot_snapshots(self.state_snapshots()?, "second_moment")
+        metal_adamw_state_snapshots(self.state_snapshots()?, AdamWParameterState::SecondMoment)
     }
 
     pub fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        metal_slot_snapshots(self.state_snapshots()?, "gradient_accumulator")
+        metal_adamw_state_snapshots(
+            self.state_snapshots()?,
+            AdamWParameterState::GradientAccumulator,
+        )
     }
 
     pub fn accumulation_index(&self) -> Result<u64> {
@@ -4648,7 +4899,7 @@ impl MetalCompiledAdamW {
             .map(|_| {
                 Ok(self
                     .state_snapshots()?
-                    .get(DROPOUT_COUNTER_KEY)
+                    .get(&RecurrentStateKey::dropout_counter())
                     .ok_or_else(|| training("compiled Metal dropout counter is absent"))?
                     .scalar_at(0)
                     .as_u64())
@@ -4671,9 +4922,7 @@ impl MetalCompiledAdamW {
             .collect::<BTreeMap<_, _>>();
         let mut replacements = BTreeMap::new();
         for (input, key) in &self.state_input_keys {
-            if key == "global:accumulation_index"
-                || key.starts_with("slot:") && key.ends_with(":gradient_accumulator")
-            {
+            if key.is_accumulation_reset_state() {
                 let desc = state_inputs
                     .get(input.as_str())
                     .ok_or_else(|| training("compiled Metal reset state is absent"))?;
@@ -4686,10 +4935,7 @@ impl MetalCompiledAdamW {
         let expected = self
             .state_input_keys
             .values()
-            .filter(|key| {
-                key.as_str() == "global:accumulation_index"
-                    || key.starts_with("slot:") && key.ends_with(":gradient_accumulator")
-            })
+            .filter(|key| key.is_accumulation_reset_state())
             .count();
         if replacements.len() != expected
             || !replacements
@@ -4710,7 +4956,7 @@ impl MetalCompiledAdamW {
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
         let states = self.state_snapshots()?;
         let optimizer_step = states
-            .get("global:step")
+            .get(&RecurrentStateKey::adamw_global(AdamWGlobalState::Step))
             .ok_or_else(|| training("compiled Metal optimizer step is absent"))?
             .scalar_at(0)
             .as_u64();
@@ -4718,7 +4964,9 @@ impl MetalCompiledAdamW {
             0
         } else {
             states
-                .get("global:accumulation_index")
+                .get(&RecurrentStateKey::adamw_global(
+                    AdamWGlobalState::AccumulationIndex,
+                ))
                 .ok_or_else(|| training("compiled Metal accumulation index is absent"))?
                 .scalar_at(0)
                 .as_u64()
@@ -4733,7 +4981,7 @@ impl MetalCompiledAdamW {
             .dropout
             .map(|dropout| {
                 let counter = states
-                    .get(DROPOUT_COUNTER_KEY)
+                    .get(&RecurrentStateKey::dropout_counter())
                     .ok_or_else(|| training("compiled Metal dropout counter is absent"))?
                     .scalar_at(0)
                     .as_u64();
@@ -4746,9 +4994,12 @@ impl MetalCompiledAdamW {
             })
             .transpose()?;
         let parameters = metal_parameter_snapshots(&states);
-        let first_moments = metal_slot_snapshots(states.clone(), "first_moment")?;
-        let second_moments = metal_slot_snapshots(states.clone(), "second_moment")?;
-        let gradient_accumulators = metal_slot_snapshots(states, "gradient_accumulator")?;
+        let first_moments =
+            metal_adamw_state_snapshots(states.clone(), AdamWParameterState::FirstMoment)?;
+        let second_moments =
+            metal_adamw_state_snapshots(states.clone(), AdamWParameterState::SecondMoment)?;
+        let gradient_accumulators =
+            metal_adamw_state_snapshots(states, AdamWParameterState::GradientAccumulator)?;
         CompiledAdamWCheckpoint::from_bytes(encode_adamw_checkpoint(
             AdamWCheckpointProgress {
                 capture_identity: self.program_identity,
@@ -4852,27 +5103,25 @@ impl CompiledAdamWRuntime for MetalCompiledAdamW {
 }
 
 fn metal_parameter_snapshots(
-    states: &BTreeMap<String, TensorData>,
+    states: &BTreeMap<RecurrentStateKey, TensorData>,
 ) -> BTreeMap<String, TensorData> {
     states
         .iter()
         .filter_map(|(key, value)| {
-            key.strip_prefix("parameter:")
+            key.parameter_name()
                 .map(|name| (name.to_owned(), value.clone()))
         })
         .collect()
 }
 
-fn metal_slot_snapshots(
-    states: BTreeMap<String, TensorData>,
-    slot: &str,
+fn metal_adamw_state_snapshots(
+    states: BTreeMap<RecurrentStateKey, TensorData>,
+    state: AdamWParameterState,
 ) -> Result<BTreeMap<String, TensorData>> {
-    let suffix = format!(":{slot}");
     Ok(states
         .into_iter()
         .filter_map(|(key, value)| {
-            key.strip_prefix("slot:")
-                .and_then(|key| key.strip_suffix(&suffix))
+            key.parameter_for_adamw_state(state)
                 .map(|name| (name.to_owned(), value))
         })
         .collect())
@@ -5210,12 +5459,15 @@ fn validate_cpu_adamw_state(
     progress: AdamWProgress,
     accumulation_steps: u64,
 ) -> Result<()> {
-    let optimizer_step = inner.global_snapshot("step")?.scalar_at(0).as_u64();
+    let optimizer_step = inner
+        .global_snapshot(AdamWGlobalState::Step)?
+        .scalar_at(0)
+        .as_u64();
     let accumulation_index = if accumulation_steps == 1 {
         0
     } else {
         inner
-            .global_snapshot("accumulation_index")?
+            .global_snapshot(AdamWGlobalState::AccumulationIndex)?
             .scalar_at(0)
             .as_u64()
     };
@@ -5552,6 +5804,113 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn recurrent_state_keys_preserve_canonical_names_and_lexical_order() {
+        let parameter_names = [
+            "a",
+            "a0",
+            "block:weight",
+            "parameter:weight:momentum",
+            "slot:block:first_moment",
+            "global:step:second_moment",
+            "workload:dropout_block_counter:gradient_accumulator",
+        ];
+        let mut keys = vec![
+            RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
+            RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
+            RecurrentStateKey::dropout_counter(),
+        ];
+        for parameter in parameter_names {
+            let parameter_key = RecurrentStateKey::parameter(parameter);
+            assert_eq!(
+                parameter_key.canonical_name(),
+                format!("parameter:{parameter}")
+            );
+            assert_eq!(parameter_key.parameter_name(), Some(parameter));
+            assert_eq!(parameter_key.momentum_parameter_name(), None);
+            assert_eq!(
+                parameter_key.parameter_for_adamw_state(AdamWParameterState::FirstMoment),
+                None
+            );
+            keys.push(parameter_key);
+
+            let momentum = RecurrentStateKey::momentum(parameter);
+            assert_eq!(
+                momentum.canonical_name(),
+                format!("slot:{parameter}:momentum")
+            );
+            assert_eq!(momentum.parameter_name(), None);
+            assert_eq!(momentum.momentum_parameter_name(), Some(parameter));
+            assert_eq!(
+                momentum.parameter_for_adamw_state(AdamWParameterState::FirstMoment),
+                None
+            );
+            keys.push(momentum);
+
+            for state in [
+                AdamWParameterState::FirstMoment,
+                AdamWParameterState::SecondMoment,
+                AdamWParameterState::GradientAccumulator,
+            ] {
+                let key = RecurrentStateKey::adamw_parameter(parameter, state);
+                assert_eq!(
+                    key.canonical_name(),
+                    format!("slot:{parameter}:{}", state.canonical_suffix())
+                );
+                assert_eq!(key.parameter_name(), None);
+                assert_eq!(key.momentum_parameter_name(), None);
+                assert_eq!(key.parameter_for_adamw_state(state), Some(parameter));
+                for other in [
+                    AdamWParameterState::FirstMoment,
+                    AdamWParameterState::SecondMoment,
+                    AdamWParameterState::GradientAccumulator,
+                ] {
+                    assert_eq!(
+                        key.parameter_for_adamw_state(other).is_some(),
+                        other == state
+                    );
+                }
+                keys.push(key);
+            }
+        }
+        assert_eq!(
+            keys[0].canonical_name(),
+            "global:step",
+            "global spelling changed"
+        );
+        assert_eq!(
+            keys[1].canonical_name(),
+            "global:accumulation_index",
+            "global spelling changed"
+        );
+        assert_eq!(
+            keys[2].canonical_name(),
+            "workload:dropout_block_counter",
+            "workload spelling changed"
+        );
+
+        let canonical = keys
+            .iter()
+            .map(|key| key.canonical_name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            canonical.iter().collect::<BTreeSet<_>>().len(),
+            canonical.len(),
+            "typed key constructors collided"
+        );
+
+        let typed_order = keys
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|key| key.canonical_name().to_owned())
+            .collect::<Vec<_>>();
+        let mut lexical_order = canonical;
+        lexical_order.sort();
+        assert_eq!(typed_order, lexical_order);
+    }
+
+    #[test]
     fn compiled_dropout_reserves_source_order_blocks_only_for_active_f32_draws() {
         let mut graph = Graph::new();
         let counter = graph.input_dtype_requires_grad("counter", [], DType::U64, false);
@@ -5859,12 +6218,12 @@ mod tests {
         let replay_step = u64::MAX / 2;
         let mut values = plan.inner.state_values.clone();
         values.insert(
-            "global:step".into(),
+            RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
             TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(replay_step)])
                 .unwrap(),
         );
         values.insert(
-            DROPOUT_COUNTER_KEY.into(),
+            RecurrentStateKey::dropout_counter(),
             TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(replay_step * 2)])
                 .unwrap(),
         );
@@ -6966,8 +7325,10 @@ mod tests {
         );
 
         let cursor = compiled.inner.cursor.clone();
-        let malformed =
-            BTreeMap::from([("global:accumulation_index".into(), TensorData::scalar(0.0))]);
+        let malformed = BTreeMap::from([(
+            RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
+            TensorData::scalar(0.0),
+        )]);
         let step = compiled.step_count();
         assert!(
             compiled
