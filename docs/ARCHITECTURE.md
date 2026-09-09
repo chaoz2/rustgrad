@@ -915,7 +915,11 @@ ownership remains solely with `PortableTrainingCheckpoint`; this bridge adds no
 trainer, optimizer, state format, device fallback, or persistent gradient map.
 `session/compiled_training.rs` is the static recurrent-training seam.
 Its private optimizer-program interface separates optimizer state/update math
-from one shared compiler, capture, replay, and effect-commit engine.
+from one shared compiler, capture, replay, and effect-commit engine. After
+lowering, an optimizer-neutral Metal plan/runtime core likewise owns recurrent
+rendering, resource preparation, input validation, output projection,
+evaluation, scoreboard observation, and semantic state snapshots; the AdamW
+facade adds only its progress/policy interpretation and portable checkpoint.
 `CpuCompiledMomentumSgd` and `CpuCompiledAdamW` consume detached named F32
 parameter values, build one private Graph with one batched reverse traversal,
 and capture the pure loss/output/update prefix together with ordered parameter
