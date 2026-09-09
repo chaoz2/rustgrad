@@ -428,24 +428,24 @@ where
     }
     final_mean_sparse_loss /= ACCUMULATION_STEPS as f64;
     assert_eq!(resumed.checkpoint()?, before_evaluation_checkpoint);
-    let published = resumed.parameter_snapshots()?;
     let tied_version = tied.version()?;
     let frozen_before = frozen.snapshot()?;
     let runtime_step = resumed.step_count();
-    let _uninterrupted_model = uninterrupted
-        .finish()
+    let (uninterrupted_model, uninterrupted_checkpoint) = uninterrupted
+        .finish_with_checkpoint()
         .map_err(|error| error.into_parts().1)?;
-    let restored_model = resumed.finish().map_err(|error| error.into_parts().1)?;
+    let (restored_model, finished_checkpoint) = resumed
+        .finish_with_checkpoint()
+        .map_err(|error| error.into_parts().1)?;
+    assert_eq!(finished_checkpoint, before_evaluation_checkpoint);
+    assert_eq!(finished_checkpoint, uninterrupted_checkpoint);
     let live = restored_model.state_dict()?;
-    for (name, value) in &published {
-        assert_eq!(&live.tensors()[name], value);
-    }
+    assert_eq!(live, uninterrupted_model.state_dict()?);
     assert_eq!(
         restored_model.tokens.weight.value()?,
         live.tensors()["tokens.weight"]
     );
     assert!(!live.tensors().contains_key("lm_head.weight"));
-    assert!(!published.contains_key("lm_head.weight"));
     assert_eq!(restored_model.tokens.weight.version()?, tied_version + 1);
     let frozen_after = restored_model.frozen_scale.snapshot()?;
     assert_eq!(frozen_after.data, frozen_before.data);

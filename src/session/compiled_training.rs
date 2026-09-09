@@ -2414,7 +2414,12 @@ impl<M, E: std::error::Error + 'static> std::error::Error
     }
 }
 
-/// Publication failure retaining the intact owned module/session pair.
+/// Finalization failure retaining the intact owned module/session pair.
+///
+/// This covers both parameter-only [`CompiledModuleAdamWSession::finish`] and
+/// checkpointed [`CompiledModuleAdamWSession::finish_with_checkpoint`]
+/// finalization. The retained session remains available for inspection, retry,
+/// or recovery without publication.
 pub struct CompiledModuleAdamWFinishError<M, R> {
     session: Box<CompiledModuleAdamWSession<M, R>>,
     source: Error,
@@ -2457,7 +2462,7 @@ impl<M, R> fmt::Display for CompiledModuleAdamWFinishError<M, R> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "owned compiled AdamW publication failed: {}",
+            "owned compiled AdamW finalization failed: {}",
             self.source
         )
     }
@@ -5408,6 +5413,55 @@ impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleAdamWSession<M, R> {
     }
 }
 
+impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
+    /// Atomically publishes and returns the exact checkpointed AdamW frontier.
+    ///
+    /// The module seal is validated before snapshot work. One coherent
+    /// checkpoint snapshot supplies both the returned resumable optimizer state
+    /// and the parameter values published into the owned module, so strict
+    /// device runtimes do not perform a second parameter-only read. Tied and
+    /// policy-frozen identities retain the same publication rules as
+    /// [`Self::finish`]. A checkpoint, decode, or publication failure retains
+    /// the intact session in [`CompiledModuleAdamWFinishError`].
+    pub fn finish_with_checkpoint(
+        self,
+    ) -> std::result::Result<(M, CompiledAdamWCheckpoint), CompiledModuleAdamWFinishError<M, R>>
+    {
+        if let Err(source) = self.seal.validate_unchanged(&self.module) {
+            return Err(CompiledModuleAdamWFinishError {
+                session: Box::new(self),
+                source,
+            });
+        }
+        let checkpoint = match self.runtime.checkpoint() {
+            Ok(checkpoint) => checkpoint,
+            Err(source) => {
+                return Err(CompiledModuleAdamWFinishError {
+                    session: Box::new(self),
+                    source,
+                });
+            }
+        };
+        let parameters = match decode_adamw_checkpoint(checkpoint.as_bytes()) {
+            Ok(decoded) => decoded.parameters,
+            Err(source) => {
+                return Err(CompiledModuleAdamWFinishError {
+                    session: Box::new(self),
+                    source,
+                });
+            }
+        };
+        if let Err(source) = self.seal.publish(&self.module, &parameters) {
+            return Err(CompiledModuleAdamWFinishError {
+                session: Box::new(self),
+                source,
+            });
+        }
+        let Self { module, .. } = self;
+        Ok((module, checkpoint))
+    }
+}
+
 impl<'a, M> CompiledModuleAdamWSession<M, NativeCpuCompiledAdamW<'a>> {
     /// Returns strict-native CPU preparation evidence without exposing the
     /// sealed module or mutable runtime internals.
@@ -8052,7 +8106,7 @@ fn training(reason: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, LossOptions, Op, Parameter, cross_entropy};
-    use std::collections::HashMap;
+    use std::{cell::Cell, collections::HashMap};
 
     #[test]
     fn compiled_state_aliases_receive_explicit_capture_owners() {
@@ -8174,6 +8228,51 @@ mod tests {
             visitor("frozen".into(), &self.frozen, StateKind::Parameter);
             visitor("buffer".into(), &self.buffer, StateKind::Buffer);
         }
+    }
+
+    #[derive(Debug)]
+    struct FinishRaceModule {
+        weight: Parameter,
+        finish_visits: Cell<u64>,
+        race_after_second_visit: Cell<bool>,
+    }
+
+    impl FinishRaceModule {
+        fn new() -> Self {
+            Self {
+                weight: Parameter::new(TensorData::new([2], vec![0.25, -0.5]).unwrap(), true),
+                finish_visits: Cell::new(0),
+                race_after_second_visit: Cell::new(false),
+            }
+        }
+
+        fn arm_finish_race(&self) {
+            self.finish_visits.set(0);
+            self.race_after_second_visit.set(true);
+        }
+    }
+
+    impl Module for FinishRaceModule {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            assert!(prefix.is_empty());
+            let visit = self.finish_visits.get() + 1;
+            self.finish_visits.set(visit);
+            visitor("weight".into(), &self.weight, StateKind::Parameter);
+            if self.race_after_second_visit.get() && visit == 2 {
+                self.weight.replace(self.weight.value().unwrap()).unwrap();
+                self.race_after_second_visit.set(false);
+            }
+        }
+    }
+
+    fn build_finish_race(
+        module: &FinishRaceModule,
+        graph: &mut Graph,
+        inputs: &BTreeMap<String, NodeId>,
+    ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+        let weight = module.weight.bind(graph)?;
+        let output = graph.mul(weight, inputs["x"])?;
+        Ok((graph.sum_all(output)?, BTreeMap::new()))
     }
 
     struct FineTuneModule {
@@ -10407,8 +10506,8 @@ mod tests {
         let step = session.step(input, TensorData::scalar(0.01)).unwrap();
         assert_eq!(step.capture_identity(), capture_identity);
         let published = session.parameter_snapshots().unwrap();
-        let checkpoint = session.checkpoint().unwrap();
-        let module = session.finish().unwrap();
+        let expected_checkpoint = session.checkpoint().unwrap();
+        let (module, checkpoint) = session.finish_with_checkpoint().unwrap();
 
         assert_eq!(module.shared.value().unwrap(), published["shared"]);
         assert_eq!(module.shared.version().unwrap(), shared_before.version + 1);
@@ -10423,9 +10522,11 @@ mod tests {
             CompiledAdamWCheckpoint::from_bytes(checkpoint.as_bytes().to_vec()).unwrap(),
             checkpoint
         );
+        assert_eq!(checkpoint, expected_checkpoint);
 
         let stale = TiedFrozenModule::new([1.0, -1.0]);
         let stale_frozen = stale.frozen.clone();
+        let stale_frozen_before = stale_frozen.snapshot().unwrap();
         let plan =
             CompiledModuleAdamWPlan::compile(module_config(), stale, build_tied_frozen).unwrap();
         let mut session = plan.prepare(&CpuSessionTarget::new()).unwrap();
@@ -10439,7 +10540,7 @@ mod tests {
         stale_frozen
             .replace(TensorData::new([2], vec![7.0, 8.0]).unwrap())
             .unwrap();
-        let error = match session.finish() {
+        let error = match session.finish_with_checkpoint() {
             Ok(_) => panic!("stale module state must reject publication"),
             Err(error) => error,
         };
@@ -10447,8 +10548,15 @@ mod tests {
         assert_eq!(error.session().checkpoint().unwrap(), runtime_checkpoint);
         assert_eq!(error.session().parameter_snapshots().unwrap().len(), 1);
         assert_eq!(stale_frozen.value().unwrap().values(), &[7.0, 8.0]);
-        let stale = error.into_module_without_publication();
-        assert_eq!(stale.frozen.value().unwrap().values(), &[7.0, 8.0]);
+        stale_frozen
+            .replace(stale_frozen_before.data.clone())
+            .unwrap();
+        stale_frozen
+            .set_version_for_test(stale_frozen_before.version)
+            .unwrap();
+        let (stale, retried_checkpoint) = error.into_session().finish_with_checkpoint().unwrap();
+        assert_eq!(retried_checkpoint, runtime_checkpoint);
+        assert_parameter_snapshot_eq(&stale.frozen.snapshot().unwrap(), &stale_frozen_before);
 
         let stale_before_prepare = TiedFrozenModule::new([1.0, -1.0]);
         let leaked = stale_before_prepare.shared.clone();
@@ -10467,6 +10575,46 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.into_plan().capture_identity(), capture_identity);
+    }
+
+    #[test]
+    fn checkpointed_finish_retains_session_after_late_publication_race() {
+        let module = FinishRaceModule::new();
+        let weight = module.weight.clone();
+        let initial = weight.snapshot().unwrap();
+        let plan =
+            CompiledModuleAdamWPlan::compile(module_config(), module, build_finish_race).unwrap();
+        let mut session = plan.prepare(&CpuSessionTarget::new()).unwrap();
+        session
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        let checkpoint = session.checkpoint().unwrap();
+        session.module.arm_finish_race();
+
+        let error = session.finish_with_checkpoint().unwrap_err();
+        assert!(matches!(
+            error.source_error(),
+            Error::ParameterVersionConflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        assert_eq!(error.session().checkpoint().unwrap(), checkpoint);
+        assert_eq!(error.session().step_count(), 1);
+
+        weight.set_version_for_test(initial.version).unwrap();
+        let (module, retried_checkpoint) = error.into_session().finish_with_checkpoint().unwrap();
+        assert_eq!(retried_checkpoint, checkpoint);
+        assert_eq!(module.weight.version().unwrap(), initial.version + 1);
+        assert_eq!(
+            module.weight.value().unwrap(),
+            decode_adamw_checkpoint(checkpoint.as_bytes())
+                .unwrap()
+                .parameters["weight"]
+        );
     }
 
     #[test]

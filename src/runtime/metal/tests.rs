@@ -2714,13 +2714,20 @@ fn owned_compiled_module_metal_session_suppresses_outputs_and_recovers_finish() 
     );
 
     let expected = session.parameter_snapshots().unwrap();
+    let state_epoch = session.metal_session().state_epoch();
+    let successful_runs = session.metal_session().successful_run_count();
     mock.clear_calls();
-    mock.state.lock().unwrap().failures.read_after = Some((1, "owned finish"));
-    let error = session.finish().unwrap_err();
+    mock.state.lock().unwrap().failures.read_after = Some((1, "checkpointed owned finish"));
+    let error = session.finish_with_checkpoint().unwrap_err();
     assert_eq!(error.session().step_count(), 1);
     assert_eq!(first.version().unwrap(), before_versions[0]);
     assert_eq!(second.version().unwrap(), before_versions[1]);
     assert_eq!(empty.version().unwrap(), before_versions[2]);
+    assert_eq!(error.session().metal_session().state_epoch(), state_epoch);
+    assert_eq!(
+        error.session().metal_session().successful_run_count(),
+        successful_runs
+    );
     assert_eq!(
         mock.calls()
             .iter()
@@ -2731,20 +2738,42 @@ fn owned_compiled_module_metal_session_suppresses_outputs_and_recovers_finish() 
 
     mock.clear_failures();
     mock.clear_calls();
-    let module = error.into_session().finish().unwrap();
-    let reads = mock
-        .calls()
+    let (module, checkpoint) = error.into_session().finish_with_checkpoint().unwrap();
+    let calls = mock.calls();
+    assert!(calls.iter().all(|call| {
+        [
+            "read:",
+            "buffer_release:",
+            "pipeline_release:",
+            "library_release:",
+            "queue_release:",
+            "command_release:",
+            "device_release:",
+        ]
+        .iter()
+        .any(|prefix| call.starts_with(prefix))
+    }));
+    let reads = calls
         .into_iter()
         .filter(|call| call.starts_with("read:"))
         .collect::<Vec<_>>();
-    assert_eq!(reads.len(), 2, "the zero-byte parameter must not be read");
+    assert_eq!(
+        reads.len(),
+        7,
+        "one checkpoint snapshot must read each nonempty parameter, moment, and global state once"
+    );
     assert_eq!(
         reads
             .iter()
             .map(|call| call.rsplit(':').next().unwrap().parse::<usize>().unwrap())
             .sum::<usize>(),
-        12
+        44
     );
+    assert_eq!(checkpoint.info().replay_step(), 1);
+    assert_eq!(checkpoint.info().optimizer_step(), 1);
+    assert_eq!(checkpoint.info().accumulation_index(), 0);
+    assert_eq!(checkpoint.info().discarded_microbatches(), 0);
+    assert_eq!(checkpoint.info().flushed_window_count(), 0);
     assert_eq!(module.first.value().unwrap(), expected["first"]);
     assert_eq!(module.second.value().unwrap(), expected["second"]);
     assert_eq!(module.empty.value().unwrap(), expected["empty"]);

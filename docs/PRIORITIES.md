@@ -152,7 +152,9 @@ compile/prepare/finish errors retain the intact owner; an explicit abort returns
 the sealed host module without publication. The owned strict-Metal facade also
 forwards read-only device-session and scoreboard evidence without exposing its
 runtime or module, so no detached module/runtime lifecycle is silently
-abandoned.
+abandoned. `finish_with_checkpoint` binds publication to one coherent validated
+checkpoint snapshot and returns that exact resumable optimizer/dropout/progress
+frontier with the module, without a second parameter-only device read.
 The maintained Transformer now trains two deterministic rows per replay and
 declares its fixed `[2, T]` I32 input and target token matrices through the
 compiled AdamW config. Its causal loss selects one log probability per target
