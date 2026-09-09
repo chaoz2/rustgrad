@@ -117,6 +117,11 @@ fn config() -> CompiledAdamWConfig {
     config_with_max_gradient_norm(Some(MAX_GRADIENT_NORM))
 }
 
+#[cfg(target_os = "macos")]
+fn frozen_embedding_config() -> CompiledAdamWConfig {
+    config().with_frozen_parameters(["tokens.weight"]).unwrap()
+}
+
 fn config_with_max_gradient_norm(max_gradient_norm: Option<f32>) -> CompiledAdamWConfig {
     let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)
         .unwrap()
@@ -224,6 +229,76 @@ fn learning_rate() -> TensorData {
 fn checkpoint_dropout_block_counter(checkpoint: &CompiledAdamWCheckpoint) -> u64 {
     let (state, _) = load_safetensors(checkpoint.as_bytes()).unwrap();
     state["dropout_block_counter"].scalar_at(0).as_u64()
+}
+
+#[cfg(target_os = "macos")]
+fn assert_frozen_embedding_checkpoint_inventory(
+    checkpoint: &CompiledAdamWCheckpoint,
+    expected_parameters: &BTreeMap<String, TensorData>,
+    expected_dropout_block_counter: u64,
+) {
+    const EXPECTED_NAMES: [&str; 18] = [
+        "block.ff1.0",
+        "block.ff1.1",
+        "block.ff2.0",
+        "block.ff2.1",
+        "block.key.0",
+        "block.key.1",
+        "block.ln1.0",
+        "block.ln1.1",
+        "block.ln2.0",
+        "block.ln2.1",
+        "block.out.0",
+        "block.out.1",
+        "block.query.0",
+        "block.query.1",
+        "block.value.0",
+        "block.value.1",
+        "norm.bias",
+        "norm.weight",
+    ];
+    let expected_names = EXPECTED_NAMES.map(str::to_owned).to_vec();
+    assert_eq!(
+        expected_parameters.keys().cloned().collect::<Vec<_>>(),
+        expected_names
+    );
+    let (state, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+    let parameter_names = serde_json::from_str::<Vec<String>>(&metadata["parameter_names"])
+        .expect("checkpoint parameter names must be valid JSON");
+    assert_eq!(parameter_names, expected_names);
+    assert!(
+        !parameter_names
+            .iter()
+            .any(|name| { matches!(name.as_str(), "tokens.weight" | "lm_head.weight") })
+    );
+
+    let mut expected_tensor_names = BTreeSet::from(["dropout_block_counter".to_owned()]);
+    for (ordinal, name) in parameter_names.iter().enumerate() {
+        let parameter = &expected_parameters[name];
+        for family in [
+            "parameter",
+            "first_moment",
+            "second_moment",
+            "gradient_accumulator",
+        ] {
+            let tensor_name = format!("{family}.{ordinal}");
+            let tensor = &state[tensor_name.as_str()];
+            assert_eq!(tensor.shape(), parameter.shape(), "{tensor_name} shape");
+            assert_eq!(tensor.dtype(), parameter.dtype(), "{tensor_name} dtype");
+            assert!(expected_tensor_names.insert(tensor_name));
+        }
+    }
+    assert_eq!(
+        state.keys().cloned().collect::<BTreeSet<_>>(),
+        expected_tensor_names
+    );
+    let dropout = &state["dropout_block_counter"];
+    assert_eq!(dropout.shape(), &Shape::new([]));
+    assert_eq!(dropout.dtype(), DType::U64);
+    assert_eq!(
+        dropout.scalar_at(0).as_u64(),
+        expected_dropout_block_counter
+    );
 }
 
 #[test]
@@ -2100,7 +2175,7 @@ fn protected_live_metal_workflow_runs_the_exact_compiled_training_acceptance() {
     let workflow = include_str!("../.github/workflows/metal-live.yml");
     for required in [
         "RUSTGRAD_METAL_TRAINING_EVIDENCE_PATH:",
-        "metal-live-compiled-training-v6.json",
+        "metal-live-compiled-training-v7.json",
         "Train and resume the compiled causal Transformer on Metal",
         "cargo test --release --test compiled_transformer_training",
         "live_metal_compiled_causal_transformer_training_resumes_exactly",
@@ -2199,6 +2274,45 @@ impl LiveTrainingTotals {
 }
 
 #[cfg(target_os = "macos")]
+fn assert_live_scalar_close(label: &str, actual: f64, expected: f64) -> f64 {
+    let absolute_error = (actual - expected).abs();
+    let tolerance = 1e-5 + 1e-4 * actual.abs().max(expected.abs());
+    assert!(
+        absolute_error <= tolerance,
+        "{label} mismatch: actual={actual}, expected={expected}, error={absolute_error}, tolerance={tolerance}"
+    );
+    absolute_error
+}
+
+#[cfg(target_os = "macos")]
+fn assert_live_tensor_maps_close(
+    label: &str,
+    actual: &BTreeMap<String, TensorData>,
+    expected: &BTreeMap<String, TensorData>,
+) -> (usize, f64) {
+    assert_eq!(
+        actual.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>()
+    );
+    let mut lanes = 0;
+    let mut max_absolute_error = 0.0_f64;
+    for (name, actual) in actual {
+        let expected = &expected[name];
+        assert_eq!(actual.shape(), expected.shape(), "{label} {name} shape");
+        assert_eq!(actual.dtype(), expected.dtype(), "{label} {name} dtype");
+        for index in 0..actual.len() {
+            let actual = actual.scalar_at(index).as_f64();
+            let expected = expected.scalar_at(index).as_f64();
+            let absolute_error =
+                assert_live_scalar_close(&format!("{label} {name}[{index}]"), actual, expected);
+            max_absolute_error = max_absolute_error.max(absolute_error);
+            lanes += 1;
+        }
+    }
+    (lanes, max_absolute_error)
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires the manual self-hosted Apple-GPU lane"]
 fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
@@ -2231,10 +2345,32 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let device = devices.remove(0);
     let device_info = device.info().clone();
 
+    let policy = frozen_embedding_config();
     let model = TinyCausalTransformer::new(7).unwrap();
     let initial_mean_sparse_loss = evaluate_mean_sparse_loss(&model);
-    let seed = owned_compiled_transformer(model);
+    let initial_module_state = model.state_dict().unwrap();
+    let seed = CompiledModuleAdamWPlan::compile_with_dropout(
+        policy.clone(),
+        dropout_config(),
+        model,
+        build,
+    )
+    .unwrap()
+    .with_evaluation(build_evaluation)
+    .unwrap();
     let capture_identity = seed.capture_identity();
+    let cpu_model = TinyCausalTransformer::new(7).unwrap();
+    let cpu_seed = CompiledModuleAdamWPlan::compile_with_dropout(
+        policy.clone(),
+        dropout_config(),
+        cpu_model,
+        build,
+    )
+    .unwrap()
+    .with_evaluation(build_evaluation)
+    .unwrap();
+    assert_eq!(cpu_seed.capture_identity(), capture_identity);
+    let mut cpu_primary = cpu_seed.prepare(&CpuSessionTarget::new()).unwrap();
     let target = MetalSessionTarget::new(device.clone(), 64)
         .expect("selected device must produce its exact renderer identity")
         .with_scoreboard(
@@ -2252,10 +2388,10 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert!(summary.nonzero_item_count > 0);
     let state_pair_count = summary.state_pair_count;
     let logical_state_bytes = summary.logical_state_bytes;
-    assert_eq!(state_pair_count, 79);
-    assert_eq!(logical_state_bytes, 1_048);
+    assert_eq!(state_pair_count, 75);
+    assert_eq!(logical_state_bytes, 952);
     assert_eq!(summary.state_bank_count, 2);
-    assert_eq!(summary.state_device_bytes, 2_096);
+    assert_eq!(summary.state_device_bytes, 1_904);
     let planned_kernel_count = summary.nonzero_item_count;
     let command_count_per_invocation = 1;
     let mut uninterrupted = seed
@@ -2284,7 +2420,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         .iter()
         .map(|input| input.desc.shape.numel().unwrap())
         .sum::<usize>();
-    assert_eq!(state_work_items, 259);
+    assert_eq!(state_work_items, 235);
     let deployment_identity = uninterrupted
         .execution_scoreboard_report()
         .unwrap()
@@ -2295,7 +2431,13 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         .compiled_kernels()
         .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
         .count();
-    assert_eq!(authenticated_host_indexed_movement_item_count, 4);
+    assert_eq!(authenticated_host_indexed_movement_item_count, 2);
+    let authenticated_frozen_host_gather_item_count = uninterrupted
+        .metal_session()
+        .compiled_kernels()
+        .filter(|item| item.entry == "rg_metal_host_gather_fixed_f32_i32")
+        .count();
+    assert_eq!(authenticated_frozen_host_gather_item_count, 1);
     assert!(
         uninterrupted
             .metal_session()
@@ -2363,10 +2505,36 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(uninterrupted.step_count(), 0);
     assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
     assert_eq!(uninterrupted.accumulation_index().unwrap(), 0);
+    let initial_parameters = uninterrupted.parameter_snapshots().unwrap();
+    assert_eq!(initial_parameters.len(), 18);
+    assert!(!initial_parameters.contains_key("tokens.weight"));
+    assert!(!initial_parameters.contains_key("lm_head.weight"));
+    assert_eq!(
+        cpu_primary.parameter_snapshots().unwrap(),
+        initial_parameters
+    );
+    assert!(
+        !uninterrupted
+            .first_moment_snapshots()
+            .unwrap()
+            .contains_key("tokens.weight")
+    );
+    assert!(
+        !uninterrupted
+            .second_moment_snapshots()
+            .unwrap()
+            .contains_key("tokens.weight")
+    );
     let empty_accumulators = uninterrupted.gradient_accumulator_snapshots().unwrap();
+    assert!(!empty_accumulators.contains_key("tokens.weight"));
+    assert_eq!(
+        cpu_primary.gradient_accumulator_snapshots().unwrap(),
+        empty_accumulators
+    );
 
     let mut totals = LiveTrainingTotals::default();
     for index in 0..4u64 {
+        let cpu_result = cpu_primary.step(batch(index + 1), learning_rate()).unwrap();
         if matches!(index, 1 | 2) {
             let result = uninterrupted
                 .step_without_host_outputs(batch(index + 1), learning_rate())
@@ -2395,6 +2563,9 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
             let result = uninterrupted
                 .step(batch(index + 1), learning_rate())
                 .unwrap();
+            let actual_loss = result.loss().scalar_at(0).as_f64();
+            let expected_loss = cpu_result.loss().scalar_at(0).as_f64();
+            assert_live_scalar_close("observed training loss", actual_loss, expected_loss);
             assert_eq!(result.step(), index + 1);
             assert_eq!(result.capture_identity(), capture_identity);
             assert_eq!(result.report().successful_invocation, index + 1);
@@ -2416,6 +2587,15 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                 transient_h2d_bytes_per_invocation,
             );
         }
+        assert_eq!(cpu_primary.step_count(), uninterrupted.step_count());
+        assert_eq!(
+            cpu_primary.optimizer_step().unwrap(),
+            uninterrupted.optimizer_step().unwrap()
+        );
+        assert_eq!(
+            cpu_primary.accumulation_index().unwrap(),
+            uninterrupted.accumulation_index().unwrap()
+        );
         if index == 1 {
             let parameters_before_reset = uninterrupted.parameter_snapshots().unwrap();
             let first_moments_before_reset = uninterrupted.first_moment_snapshots().unwrap();
@@ -2446,7 +2626,9 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
                 scoreboard_before_reset
             );
             let reset = uninterrupted.zero_grad().unwrap();
+            let cpu_reset = cpu_primary.zero_grad().unwrap();
             assert_eq!(reset.discarded_microbatches(), 2);
+            assert_eq!(cpu_reset.discarded_microbatches(), 2);
             assert_eq!(uninterrupted.step_count(), 2);
             assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
             assert_eq!(uninterrupted.accumulation_index().unwrap(), 0);
@@ -2494,6 +2676,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
             let checkpoint_after_reset = uninterrupted.checkpoint().unwrap();
             let state_epoch = uninterrupted.metal_session().state_epoch();
             assert!(!uninterrupted.zero_grad().unwrap().did_discard());
+            assert!(!cpu_primary.zero_grad().unwrap().did_discard());
             assert_eq!(uninterrupted.metal_session().state_epoch(), state_epoch);
             assert_eq!(uninterrupted.checkpoint().unwrap(), checkpoint_after_reset);
             assert_eq!(
@@ -2512,6 +2695,19 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
     assert_eq!(uninterrupted.accumulation_index().unwrap(), 2);
     let checkpoint = uninterrupted.checkpoint().unwrap();
+    let cpu_checkpoint = cpu_primary.checkpoint().unwrap();
+    let (partial_parameter_lanes, partial_parameter_error) = assert_live_tensor_maps_close(
+        "partial parameters",
+        &uninterrupted.parameter_snapshots().unwrap(),
+        &cpu_primary.parameter_snapshots().unwrap(),
+    );
+    let (partial_accumulator_lanes, partial_accumulator_error) = assert_live_tensor_maps_close(
+        "partial accumulators",
+        &uninterrupted.gradient_accumulator_snapshots().unwrap(),
+        &cpu_primary.gradient_accumulator_snapshots().unwrap(),
+    );
+    assert_eq!(partial_parameter_lanes, 58);
+    assert_eq!(partial_accumulator_lanes, 58);
     let (checkpoint_state, checkpoint_metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
     assert_eq!(checkpoint_metadata["format"], "rustgrad-compiled-adamw-v4");
     assert_eq!(checkpoint_metadata["replay_step"], "4");
@@ -2519,6 +2715,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(checkpoint_metadata["gradient_accumulation_steps"], "3");
     assert_eq!(checkpoint_metadata["accumulation_index"], "2");
     assert_eq!(checkpoint_metadata["discarded_microbatch_count"], "2");
+    assert_frozen_embedding_checkpoint_inventory(&checkpoint, &initial_parameters, 48);
     assert_eq!(
         checkpoint_state["dropout_block_counter"]
             .scalar_at(0)
@@ -2527,8 +2724,8 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     );
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
     let tied = resumed_model.tokens.weight.clone();
+    let tied_before = tied.snapshot().unwrap();
     let frozen = resumed_model.frozen_scale.clone();
-    let tied_version = tied.version().unwrap();
     let frozen_before = frozen.snapshot().unwrap();
     let before_versions = resumed_model
         .trainable_parameters()
@@ -2537,7 +2734,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         .map(|(name, parameter)| (name, parameter.version().unwrap()))
         .collect::<BTreeMap<_, _>>();
     let resumed_seed = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
-        config(),
+        policy.clone(),
         dropout_config(),
         resumed_model,
         &checkpoint,
@@ -2546,6 +2743,21 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     .unwrap()
     .with_evaluation(build_evaluation)
     .unwrap();
+    let cpu_resumed_model = TinyCausalTransformer::new(7).unwrap();
+    let cpu_tied = cpu_resumed_model.tokens.weight.clone();
+    let cpu_tied_before = cpu_tied.snapshot().unwrap();
+    let cpu_resumed_seed = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
+        policy.clone(),
+        dropout_config(),
+        cpu_resumed_model,
+        &cpu_checkpoint,
+        build,
+    )
+    .unwrap()
+    .with_evaluation(build_evaluation)
+    .unwrap();
+    assert_eq!(cpu_resumed_seed.capture_identity(), capture_identity);
+    let mut cpu_resumed = cpu_resumed_seed.prepare(&CpuSessionTarget::new()).unwrap();
     assert_eq!(resumed_seed.step_count(), 4);
     let resumed_target = MetalSessionTarget::new(device, 64)
         .expect("selected device must retain its renderer identity")
@@ -2597,125 +2809,257 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(resumed.optimizer_step().unwrap(), 0);
     assert_eq!(resumed.accumulation_index().unwrap(), 2);
     assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+    assert_eq!(cpu_resumed.step_count(), 4);
+    assert_eq!(cpu_resumed.optimizer_step().unwrap(), 0);
+    assert_eq!(cpu_resumed.accumulation_index().unwrap(), 2);
+    assert_eq!(cpu_resumed.checkpoint().unwrap(), cpu_checkpoint);
 
-    for resumed_index in 0..4u64 {
-        let replay = resumed_index + 5;
-        if resumed_index < 3 {
-            let expected = uninterrupted
-                .step_without_host_outputs(batch(replay), learning_rate())
-                .unwrap();
-            let actual = resumed
-                .step_without_host_outputs(batch(replay), learning_rate())
-                .unwrap();
-            assert_eq!(actual.step(), expected.step());
-            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
-            assert_eq!(actual.accumulation_index(), expected.accumulation_index());
-            assert_eq!(actual.did_update(), expected.did_update());
-            let (optimizer_step, accumulation_index, did_update) = match replay {
-                5 => (1, 0, true),
-                6 => (1, 1, false),
-                7 => (1, 2, false),
-                _ => unreachable!(),
-            };
-            assert_eq!(actual.optimizer_step(), optimizer_step);
-            assert_eq!(actual.accumulation_index(), accumulation_index);
-            assert_eq!(actual.did_update(), did_update);
-            assert_eq!(actual.report().successful_invocation, resumed_index + 1);
-            for report in [expected.report(), actual.report()] {
-                totals.record(
-                    report,
-                    false,
-                    state_pair_count,
-                    logical_state_bytes,
-                    state_work_items,
-                    planned_kernel_count,
-                    command_count_per_invocation,
-                    transient_h2d_calls_per_invocation,
-                    transient_h2d_bytes_per_invocation,
-                );
-            }
-        } else {
-            let expected = uninterrupted.step(batch(replay), learning_rate()).unwrap();
-            let actual = resumed.step(batch(replay), learning_rate()).unwrap();
-            assert_eq!(actual.loss(), expected.loss());
-            assert_eq!(actual.outputs(), expected.outputs());
-            assert_eq!(actual.step(), expected.step());
-            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
-            assert_eq!(actual.accumulation_index(), expected.accumulation_index());
-            assert_eq!(actual.did_update(), expected.did_update());
-            assert_eq!(actual.optimizer_step(), 2);
-            assert_eq!(actual.accumulation_index(), 0);
-            assert!(actual.did_update());
-            assert_eq!(actual.report().successful_invocation, resumed_index + 1);
-            for report in [expected.report(), actual.report()] {
-                totals.record(
-                    report,
-                    true,
-                    state_pair_count,
-                    logical_state_bytes,
-                    state_work_items,
-                    planned_kernel_count,
-                    command_count_per_invocation,
-                    transient_h2d_calls_per_invocation,
-                    transient_h2d_bytes_per_invocation,
-                );
-            }
-        }
-    }
-
-    assert_eq!(resumed.step_count(), 8);
-    assert_eq!(uninterrupted.step_count(), 8);
-    assert_eq!(resumed.optimizer_step().unwrap(), 2);
-    assert_eq!(uninterrupted.optimizer_step().unwrap(), 2);
-    assert_eq!(resumed.accumulation_index().unwrap(), 0);
-    assert_eq!(uninterrupted.accumulation_index().unwrap(), 0);
+    let scoreboard_before_flush = resumed.execution_scoreboard_report().unwrap().unwrap();
+    let epoch_before_flush = resumed.metal_session().state_epoch();
+    let dropout_before_flush = checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap());
+    let flush_capture_identity = resumed.flush_capture_identity().unwrap();
     assert_eq!(
-        resumed.gradient_accumulator_snapshots().unwrap(),
-        uninterrupted.gradient_accumulator_snapshots().unwrap()
+        cpu_resumed.flush_capture_identity(),
+        Some(flush_capture_identity)
     );
+    assert_eq!(
+        cpu_primary.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
+    let cpu_primary_flush = cpu_primary.flush_partial_window(learning_rate()).unwrap();
+    let cpu_flush = cpu_resumed.flush_partial_window(learning_rate()).unwrap();
+    let metal_flush = resumed.flush_partial_window(learning_rate()).unwrap();
+    assert!(cpu_primary_flush.did_update());
+    assert!(cpu_flush.did_update());
+    assert!(metal_flush.did_update());
+    assert_eq!(cpu_primary_flush.flushed_microbatches(), 2);
+    assert_eq!(cpu_flush.flushed_microbatches(), 2);
+    assert_eq!(metal_flush.flushed_microbatches(), 2);
+    assert_eq!(cpu_flush.optimizer_step(), 1);
+    assert_eq!(metal_flush.optimizer_step(), 1);
+    let flush_report = metal_flush.report().unwrap().clone();
+    assert_eq!(flush_report.successful_invocation, 1);
+    assert_eq!(flush_report.transient_h2d_calls, 1);
+    assert_eq!(flush_report.transient_h2d_bytes, 4);
+    assert_eq!(flush_report.runtime_control_h2d_calls, 0);
+    assert_eq!(flush_report.runtime_control_h2d_bytes, 0);
+    assert_eq!(flush_report.retained_d2h_calls, 0);
+    assert_eq!(flush_report.retained_d2h_bytes, 0);
+    assert_eq!(flush_report.output_count, 0);
+    assert!(flush_report.kernel_launch_count > 0);
+    assert_eq!(flush_report.command_submission_count, 1);
+    assert_eq!(flush_report.command_wait_count, 1);
+    assert_eq!(flush_report.committed_state_pair_count, state_pair_count);
+    assert_eq!(flush_report.committed_state_bytes, logical_state_bytes);
+    assert_eq!(flush_report.committed_state_work_items, state_work_items);
+    assert_eq!(resumed.metal_session().state_epoch(), !epoch_before_flush);
+    assert_eq!(resumed.step_count(), 4);
+    assert_eq!(cpu_resumed.step_count(), 4);
+    assert_eq!(resumed.optimizer_step().unwrap(), 1);
+    assert_eq!(cpu_resumed.optimizer_step().unwrap(), 1);
+    assert_eq!(resumed.accumulation_index().unwrap(), 0);
+    assert_eq!(cpu_resumed.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        cpu_primary.checkpoint().unwrap(),
+        cpu_resumed.checkpoint().unwrap()
+    );
+    assert_eq!(
+        checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
+        dropout_before_flush
+    );
+    assert_eq!(
+        resumed.execution_scoreboard_report().unwrap().unwrap(),
+        scoreboard_before_flush
+    );
+    let (parameter_lanes, parameter_max_absolute_error) = assert_live_tensor_maps_close(
+        "flushed parameters",
+        &resumed.parameter_snapshots().unwrap(),
+        &cpu_resumed.parameter_snapshots().unwrap(),
+    );
+    let (first_moment_lanes, first_moment_max_absolute_error) = assert_live_tensor_maps_close(
+        "flushed first moments",
+        &resumed.first_moment_snapshots().unwrap(),
+        &cpu_resumed.first_moment_snapshots().unwrap(),
+    );
+    let (second_moment_lanes, second_moment_max_absolute_error) = assert_live_tensor_maps_close(
+        "flushed second moments",
+        &resumed.second_moment_snapshots().unwrap(),
+        &cpu_resumed.second_moment_snapshots().unwrap(),
+    );
+    let (accumulator_lanes, accumulator_max_absolute_error) = assert_live_tensor_maps_close(
+        "flushed accumulators",
+        &resumed.gradient_accumulator_snapshots().unwrap(),
+        &cpu_resumed.gradient_accumulator_snapshots().unwrap(),
+    );
+    assert_eq!(parameter_lanes, 58);
+    assert_eq!(first_moment_lanes, 58);
+    assert_eq!(second_moment_lanes, 58);
+    assert_eq!(accumulator_lanes, 58);
     assert_eq!(
         resumed.gradient_accumulator_snapshots().unwrap(),
         empty_accumulators
     );
-    assert_eq!(totals.observed_training_invocations, 4);
-    assert_eq!(totals.device_only_training_invocations, 8);
-    assert_eq!(totals.command_submission_count, 12);
-    assert_eq!(totals.command_wait_count, 12);
-    assert_eq!(totals.kernel_launch_count, planned_kernel_count * 12);
+
+    let checkpoint_after_flush = resumed.checkpoint().unwrap();
+    let (_, flush_metadata) = load_safetensors(checkpoint_after_flush.as_bytes()).unwrap();
+    assert_eq!(flush_metadata["format"], "rustgrad-compiled-adamw-v5");
+    assert_eq!(flush_metadata["replay_step"], "4");
+    assert_eq!(flush_metadata["optimizer_step"], "1");
+    assert_eq!(flush_metadata["accumulation_index"], "0");
+    assert_eq!(flush_metadata["discarded_microbatch_count"], "2");
+    assert_eq!(flush_metadata["flushed_window_count"], "1");
+    assert_eq!(flush_metadata["flushed_microbatch_count"], "2");
+    assert_frozen_embedding_checkpoint_inventory(&checkpoint_after_flush, &initial_parameters, 48);
+    let epoch_after_flush = resumed.metal_session().state_epoch();
+    let scoreboard_after_flush = resumed.execution_scoreboard_report().unwrap().unwrap();
+    let empty_metal_flush = resumed.flush_partial_window(learning_rate()).unwrap();
+    let empty_cpu_primary_flush = cpu_primary.flush_partial_window(learning_rate()).unwrap();
+    let empty_cpu_flush = cpu_resumed.flush_partial_window(learning_rate()).unwrap();
+    assert!(!empty_metal_flush.did_update());
+    assert!(empty_metal_flush.report().is_none());
+    assert!(!empty_cpu_flush.did_update());
+    assert!(!empty_cpu_primary_flush.did_update());
+    assert_eq!(resumed.metal_session().state_epoch(), epoch_after_flush);
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint_after_flush);
     assert_eq!(
-        totals.transient_h2d_calls,
-        transient_h2d_calls_per_invocation * 12
+        resumed.execution_scoreboard_report().unwrap().unwrap(),
+        scoreboard_after_flush
     );
-    assert_eq!(totals.transient_h2d_calls, 36);
+    for replay in 5..=7 {
+        let cpu_primary_result = cpu_primary.step(batch(replay), learning_rate()).unwrap();
+        let cpu_resumed_result = cpu_resumed.step(batch(replay), learning_rate()).unwrap();
+        assert_eq!(cpu_primary_result.loss(), cpu_resumed_result.loss());
+        let metal_result = resumed
+            .step_without_host_outputs(batch(replay), learning_rate())
+            .unwrap();
+        assert_eq!(metal_result.step(), replay);
+        assert_eq!(metal_result.capture_identity(), capture_identity);
+        totals.record(
+            metal_result.report(),
+            false,
+            state_pair_count,
+            logical_state_bytes,
+            state_work_items,
+            planned_kernel_count,
+            command_count_per_invocation,
+            transient_h2d_calls_per_invocation,
+            transient_h2d_bytes_per_invocation,
+        );
+        assert_eq!(
+            cpu_primary.checkpoint().unwrap(),
+            cpu_resumed.checkpoint().unwrap()
+        );
+        assert_eq!(cpu_resumed.step_count(), resumed.step_count());
+        assert_eq!(
+            cpu_resumed.optimizer_step().unwrap(),
+            resumed.optimizer_step().unwrap()
+        );
+        assert_eq!(
+            cpu_resumed.accumulation_index().unwrap(),
+            resumed.accumulation_index().unwrap()
+        );
+    }
+    assert_eq!(resumed.step_count(), 7);
+    assert_eq!(resumed.optimizer_step().unwrap(), 2);
+    assert_eq!(resumed.accumulation_index().unwrap(), 0);
+    assert_eq!(resumed.metal_session().state_epoch(), epoch_before_flush);
     assert_eq!(
-        totals.transient_h2d_bytes,
-        transient_h2d_bytes_per_invocation * 12
+        cpu_primary.checkpoint().unwrap(),
+        cpu_resumed.checkpoint().unwrap()
     );
-    assert_eq!(totals.transient_h2d_bytes, 624);
-    assert_eq!(totals.retained_d2h_calls, 4);
-    assert_eq!(totals.retained_d2h_bytes, 16);
+    let final_metal_parameters = resumed.parameter_snapshots().unwrap();
+    assert!(
+        final_metal_parameters
+            .iter()
+            .any(|(name, value)| value != &initial_parameters[name])
+    );
+    let (final_parameter_lanes, final_parameter_max_absolute_error) = assert_live_tensor_maps_close(
+        "final parameters",
+        &final_metal_parameters,
+        &cpu_resumed.parameter_snapshots().unwrap(),
+    );
+    let (final_first_moment_lanes, final_first_moment_max_absolute_error) =
+        assert_live_tensor_maps_close(
+            "final first moments",
+            &resumed.first_moment_snapshots().unwrap(),
+            &cpu_resumed.first_moment_snapshots().unwrap(),
+        );
+    let (final_second_moment_lanes, final_second_moment_max_absolute_error) =
+        assert_live_tensor_maps_close(
+            "final second moments",
+            &resumed.second_moment_snapshots().unwrap(),
+            &cpu_resumed.second_moment_snapshots().unwrap(),
+        );
+    assert_eq!(final_parameter_lanes, 58);
+    assert_eq!(final_first_moment_lanes, 58);
+    assert_eq!(final_second_moment_lanes, 58);
     assert_eq!(
-        resumed.checkpoint().unwrap(),
-        uninterrupted.checkpoint().unwrap()
+        resumed.gradient_accumulator_snapshots().unwrap(),
+        empty_accumulators
     );
+    assert_eq!(
+        cpu_resumed.gradient_accumulator_snapshots().unwrap(),
+        empty_accumulators
+    );
+    assert_eq!(totals.observed_training_invocations, 2);
+    assert_eq!(totals.device_only_training_invocations, 5);
+    assert_eq!(totals.command_submission_count, 7);
+    assert_eq!(totals.command_wait_count, 7);
+    assert_eq!(totals.kernel_launch_count, planned_kernel_count * 7);
+    assert_eq!(totals.transient_h2d_calls, 21);
+    assert_eq!(totals.transient_h2d_bytes, 364);
+    assert_eq!(totals.retained_d2h_calls, 2);
+    assert_eq!(totals.retained_d2h_bytes, 8);
     let checkpoint_before_evaluation = resumed.checkpoint().unwrap();
     let scoreboard_before_evaluation = resumed.execution_scoreboard_report().unwrap().unwrap();
     let epoch_before_evaluation = resumed.metal_session().state_epoch();
     let dropout_before_evaluation = checkpoint_dropout_block_counter(&checkpoint_before_evaluation);
     let evaluation_identity = resumed.evaluation_capture_identity().unwrap();
+    assert_eq!(
+        cpu_resumed.evaluation_capture_identity(),
+        Some(evaluation_identity)
+    );
     let mut compiled_final_mean_sparse_loss = 0.0;
+    let mut cpu_final_mean_sparse_loss = 0.0;
+    let mut evaluation_lanes = 0;
+    let mut evaluation_max_absolute_error = 0.0_f64;
     let mut evaluation_reports = Vec::new();
     for replay in 1..=ACCUMULATION_STEPS {
         let evaluated = resumed.evaluate(batch(replay)).unwrap();
+        let cpu_evaluated = cpu_resumed.evaluate(batch(replay)).unwrap();
         assert_eq!(evaluated.capture_identity(), evaluation_identity);
+        assert_eq!(cpu_evaluated.capture_identity(), evaluation_identity);
         assert_eq!(
             evaluated.output("logits").unwrap().shape(),
             &Shape::new([BATCH, TIME, VOCAB])
         );
+        let actual_loss = evaluated.loss().scalar_at(0).as_f64();
+        let expected_loss = cpu_evaluated.loss().scalar_at(0).as_f64();
+        let loss_error = assert_live_scalar_close("evaluation loss", actual_loss, expected_loss);
+        evaluation_max_absolute_error = evaluation_max_absolute_error.max(loss_error);
+        evaluation_lanes += 1;
+        for index in 0..TOKEN_COUNT * VOCAB {
+            let actual = evaluated
+                .output("logits")
+                .unwrap()
+                .scalar_at(index)
+                .as_f64();
+            let expected = cpu_evaluated
+                .output("logits")
+                .unwrap()
+                .scalar_at(index)
+                .as_f64();
+            let error = assert_live_scalar_close("evaluation logit", actual, expected);
+            evaluation_max_absolute_error = evaluation_max_absolute_error.max(error);
+            evaluation_lanes += 1;
+        }
         compiled_final_mean_sparse_loss += evaluated.loss().scalar_at(0).as_f64();
+        cpu_final_mean_sparse_loss += cpu_evaluated.loss().scalar_at(0).as_f64();
         evaluation_reports.push(evaluated.report().clone());
     }
     compiled_final_mean_sparse_loss /= ACCUMULATION_STEPS as f64;
+    cpu_final_mean_sparse_loss /= ACCUMULATION_STEPS as f64;
+    assert_eq!(evaluation_lanes, 3 * (1 + TOKEN_COUNT * VOCAB));
     assert_eq!(resumed.checkpoint().unwrap(), checkpoint_before_evaluation);
     assert_eq!(
         resumed.execution_scoreboard_report().unwrap().unwrap(),
@@ -2751,21 +3095,30 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     }
     let (final_state, final_metadata) =
         load_safetensors(resumed.checkpoint().unwrap().as_bytes()).unwrap();
-    assert_eq!(final_metadata["replay_step"], "8");
+    assert_eq!(final_metadata["format"], "rustgrad-compiled-adamw-v5");
+    assert_eq!(final_metadata["replay_step"], "7");
     assert_eq!(final_metadata["optimizer_step"], "2");
     assert_eq!(final_metadata["accumulation_index"], "0");
     assert_eq!(final_metadata["discarded_microbatch_count"], "2");
+    assert_eq!(final_metadata["flushed_window_count"], "1");
+    assert_eq!(final_metadata["flushed_microbatch_count"], "2");
+    assert_frozen_embedding_checkpoint_inventory(
+        &resumed.checkpoint().unwrap(),
+        &initial_parameters,
+        84,
+    );
     assert_eq!(
         final_state["dropout_block_counter"].scalar_at(0).as_u64(),
-        96
+        84
     );
     let published = resumed.parameter_snapshots().unwrap();
     let published_bytes = published
         .values()
         .map(|value| value.shape().numel().unwrap() * value.dtype().itemsize())
         .sum::<usize>();
-    assert_eq!(published.len(), 19);
-    assert_eq!(published_bytes, 256);
+    assert_eq!(published.len(), 18);
+    assert_eq!(published_bytes, 232);
+    assert!(!published.contains_key("tokens.weight"));
     let initial_scoreboard = uninterrupted
         .execution_scoreboard_report()
         .unwrap()
@@ -2774,23 +3127,23 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         .execution_scoreboard_report()
         .unwrap()
         .expect("live resumed training scoreboard must be enabled");
-    assert_eq!(initial_scoreboard.successful_run_count, 8);
-    assert_eq!(resumed_scoreboard.successful_run_count, 4);
+    assert_eq!(initial_scoreboard.successful_run_count, 4);
+    assert_eq!(resumed_scoreboard.successful_run_count, 3);
     assert_eq!(initial_scoreboard.fallback_count, 0);
     assert_eq!(resumed_scoreboard.fallback_count, 0);
     assert!(uninterrupted.scoreboard_recording_error().is_none());
     assert!(resumed.scoreboard_recording_error().is_none());
-    assert_eq!(initial_scoreboard.retained_host_api_d2h_calls, 3);
-    assert_eq!(initial_scoreboard.retained_host_api_d2h_bytes, 12);
-    assert_eq!(resumed_scoreboard.retained_host_api_d2h_calls, 1);
-    assert_eq!(resumed_scoreboard.retained_host_api_d2h_bytes, 4);
+    assert_eq!(initial_scoreboard.retained_host_api_d2h_calls, 2);
+    assert_eq!(initial_scoreboard.retained_host_api_d2h_bytes, 8);
+    assert_eq!(resumed_scoreboard.retained_host_api_d2h_calls, 0);
+    assert_eq!(resumed_scoreboard.retained_host_api_d2h_bytes, 0);
     assert_eq!(
         initial_scoreboard
             .successful_runs
             .iter()
             .filter(|run| run.output_count == 0)
             .count(),
-        5
+        2
     );
     assert_eq!(
         resumed_scoreboard
@@ -2820,9 +3173,21 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
             )
     );
     let loss_scale = uninterrupted.loss_scale();
-    let _uninterrupted_model = uninterrupted
+    let partial_metal_model = uninterrupted.into_module_without_publication();
+    assert_eq!(
+        partial_metal_model.state_dict().unwrap(),
+        initial_module_state
+    );
+    let cpu_primary_model = cpu_primary
         .finish()
-        .expect("the uninterrupted owned module must finish atomically");
+        .expect("the uninterrupted CPU reference must finish atomically");
+    let cpu_resumed_model = cpu_resumed
+        .finish()
+        .expect("the checkpoint-restored CPU reference must finish atomically");
+    assert_eq!(
+        cpu_primary_model.state_dict().unwrap(),
+        cpu_resumed_model.state_dict().unwrap()
+    );
     let resumed_model = resumed
         .finish()
         .expect("the resumed owned module must finish atomically");
@@ -2832,12 +3197,20 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     }
     assert!(!live.tensors().contains_key("lm_head.weight"));
     assert_eq!(resumed_model.tokens.weight.id(), tied.id());
-    assert_eq!(
-        resumed_model.tokens.weight.version().unwrap(),
-        tied_version + 1
-    );
+    let tied_after = resumed_model.tokens.weight.snapshot().unwrap();
+    assert_eq!(tied_after.data, tied_before.data);
+    assert_eq!(tied_after.version, tied_before.version);
+    assert_eq!(tied_after.trainable, tied_before.trainable);
+    let cpu_tied_after = cpu_resumed_model.tokens.weight.snapshot().unwrap();
+    assert_eq!(cpu_tied_after.data, cpu_tied_before.data);
+    assert_eq!(cpu_tied_after.version, cpu_tied_before.version);
+    assert_eq!(cpu_tied_after.trainable, cpu_tied_before.trainable);
     for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
-        assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
+        if name == "tokens.weight" {
+            assert_eq!(parameter.version().unwrap(), before_versions[&name]);
+        } else {
+            assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
+        }
     }
     let frozen_after = resumed_model.frozen_scale.snapshot().unwrap();
     assert_eq!(frozen_after.data, frozen_before.data);
@@ -2845,6 +3218,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let first_eval = evaluate(&resumed_model);
     let second_eval = evaluate(&resumed_model);
     let final_mean_sparse_loss = evaluate_mean_sparse_loss(&resumed_model);
+    let cpu_published_mean_sparse_loss = evaluate_mean_sparse_loss(&cpu_resumed_model);
     assert_eq!(first_eval.shape(), &Shape::new([BATCH, TIME, VOCAB]));
     assert_eq!(first_eval, second_eval);
     assert!(
@@ -2852,13 +3226,37 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
             .all(|index| first_eval.scalar_at(index).as_f64().is_finite())
     );
     for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
-        assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
+        if name == "tokens.weight" {
+            assert_eq!(parameter.version().unwrap(), before_versions[&name]);
+        } else {
+            assert_eq!(parameter.version().unwrap(), before_versions[&name] + 1);
+        }
     }
     assert!(
         final_mean_sparse_loss < initial_mean_sparse_loss,
         "live compiled causal Transformer eval loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
     );
-    assert!((compiled_final_mean_sparse_loss - final_mean_sparse_loss).abs() < 1e-5);
+    assert_live_scalar_close(
+        "compiled Metal versus published loss",
+        compiled_final_mean_sparse_loss,
+        final_mean_sparse_loss,
+    );
+    assert_live_scalar_close(
+        "compiled Metal versus CPU reference loss",
+        compiled_final_mean_sparse_loss,
+        cpu_final_mean_sparse_loss,
+    );
+    assert!(
+        cpu_published_mean_sparse_loss < initial_mean_sparse_loss,
+        "CPU reference causal Transformer eval loss did not decrease: {initial_mean_sparse_loss} -> {cpu_published_mean_sparse_loss}"
+    );
+    assert!((cpu_final_mean_sparse_loss - cpu_published_mean_sparse_loss).abs() < 1e-5);
+    let (final_module_lanes, final_module_max_absolute_error) = assert_live_tensor_maps_close(
+        "finished module parameters",
+        live.tensors(),
+        cpu_resumed_model.state_dict().unwrap().tensors(),
+    );
+    assert_eq!(final_module_lanes, 65);
 
     let device_evidence = serde_json::json!({
         "name": device_info.name,
@@ -2882,14 +3280,17 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "planned_kernel_count": planned_kernel_count,
         "indexed_movement_item_count": 0,
         "authenticated_host_indexed_movement_item_count": authenticated_host_indexed_movement_item_count,
+        "authenticated_frozen_host_gather_item_count": authenticated_frozen_host_gather_item_count,
         "command_count_per_invocation": command_count_per_invocation,
     });
     let invocation_evidence = serde_json::json!({
-        "primary_training_steps": 8,
+        "primary_training_steps": 7,
         "primary_optimizer_steps": 2,
         "final_accumulation_index": 0,
-        "resume_replay_steps": 4,
-        "total_device_invocations": 12,
+        "resume_replay_steps": 3,
+        "nonempty_flush_invocations": 1,
+        "empty_flush_invocations": 1,
+        "total_device_invocations": 11,
         "observed_training_invocations": totals.observed_training_invocations,
         "device_only_training_invocations": totals.device_only_training_invocations,
     });
@@ -2901,8 +3302,11 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "zero_grad_nonempty_calls": 1,
         "zero_grad_empty_calls": 1,
         "checkpoint_dropout_block_counter": 48,
-        "final_dropout_block_counter": 96,
+        "final_dropout_block_counter": 84,
         "checkpoint_resume_exact": true,
+        "cpu_checkpoint_resume_exact": true,
+        "flushed_window_count": 1,
+        "flushed_microbatch_count": 2,
         "published_parameter_count": published.len(),
         "published_parameter_bytes": published_bytes,
         "publication_native_read_count": serde_json::Value::Null,
@@ -2911,7 +3315,10 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "initial_eval_mean_sparse_loss": initial_mean_sparse_loss,
         "final_eval_mean_sparse_loss": final_mean_sparse_loss,
         "compiled_in_session_eval_mean_sparse_loss": compiled_final_mean_sparse_loss,
+        "cpu_in_session_eval_mean_sparse_loss": cpu_final_mean_sparse_loss,
+        "cpu_published_eval_mean_sparse_loss": cpu_published_mean_sparse_loss,
         "compiled_in_session_eval_calls": evaluation_reports.len(),
+        "fixed_dataset_loss_decreased": true,
     });
     let accounting_evidence = serde_json::json!({
         "kernel_launch_count": totals.kernel_launch_count,
@@ -2925,6 +3332,24 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "device_only_retained_host_api_d2h_bytes": 0,
         "observed_retained_host_api_d2h_calls": totals.retained_d2h_calls,
         "observed_retained_host_api_d2h_bytes": totals.retained_d2h_bytes,
+    });
+    let flush_evidence = serde_json::json!({
+        "flush_capture_identity": flush_capture_identity,
+        "flush_transient_host_api_h2d_calls": flush_report.transient_h2d_calls,
+        "flush_transient_host_api_h2d_bytes": flush_report.transient_h2d_bytes,
+        "flush_retained_host_api_d2h_calls": flush_report.retained_d2h_calls,
+        "flush_retained_host_api_d2h_bytes": flush_report.retained_d2h_bytes,
+        "flush_output_count": flush_report.output_count,
+        "flush_kernel_launch_count": flush_report.kernel_launch_count,
+        "flush_command_submission_count": flush_report.command_submission_count,
+        "flush_command_wait_count": flush_report.command_wait_count,
+        "flush_committed_state_pair_count": flush_report.committed_state_pair_count,
+        "flush_committed_state_bytes": flush_report.committed_state_bytes,
+        "flush_committed_state_work_items": flush_report.committed_state_work_items,
+        "flush_epoch_before": epoch_before_flush,
+        "flush_epoch_after": epoch_after_flush,
+        "empty_flush_submitted_commands": false,
+        "empty_flush_changed_epoch": false,
     });
     let evaluation_evidence = serde_json::json!({
         "evaluation_parameter_resident_h2d_calls": 0,
@@ -2943,12 +3368,53 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         "evaluation_committed_state_bytes": 0,
         "evaluation_committed_state_work_items": 0,
     });
+    let agreement_evidence = serde_json::json!({
+        "absolute_tolerance": 1e-5,
+        "relative_tolerance": 1e-4,
+        "partial_parameter_lanes": partial_parameter_lanes,
+        "partial_parameter_max_absolute_error": partial_parameter_error,
+        "partial_accumulator_lanes": partial_accumulator_lanes,
+        "partial_accumulator_max_absolute_error": partial_accumulator_error,
+        "post_flush_parameter_lanes": parameter_lanes,
+        "post_flush_parameter_max_absolute_error": parameter_max_absolute_error,
+        "post_flush_first_moment_lanes": first_moment_lanes,
+        "post_flush_first_moment_max_absolute_error": first_moment_max_absolute_error,
+        "post_flush_second_moment_lanes": second_moment_lanes,
+        "post_flush_second_moment_max_absolute_error": second_moment_max_absolute_error,
+        "post_flush_accumulator_lanes": accumulator_lanes,
+        "post_flush_accumulator_max_absolute_error": accumulator_max_absolute_error,
+        "final_parameter_lanes": final_parameter_lanes,
+        "final_parameter_max_absolute_error": final_parameter_max_absolute_error,
+        "final_first_moment_lanes": final_first_moment_lanes,
+        "final_first_moment_max_absolute_error": final_first_moment_max_absolute_error,
+        "final_second_moment_lanes": final_second_moment_lanes,
+        "final_second_moment_max_absolute_error": final_second_moment_max_absolute_error,
+        "evaluation_lanes": evaluation_lanes,
+        "evaluation_max_absolute_error": evaluation_max_absolute_error,
+        "finished_module_max_absolute_error": final_module_max_absolute_error,
+    });
+    let frozen_evidence = serde_json::json!({
+        "policy_frozen_parameters": ["tokens.weight"],
+        "tied_alias": "lm_head.weight",
+        "effective_trainable_parameter_count": published.len(),
+        "effective_trainable_parameter_lanes": final_parameter_lanes,
+        "frozen_tied_parameter_lanes": tied_after.data.len(),
+        "total_trainable_parameter_lanes": final_parameter_lanes + tied_after.data.len(),
+        "frozen_recurrent_state_absent": true,
+        "frozen_checkpoint_state_absent": true,
+        "frozen_module_bytes_unchanged": true,
+        "frozen_module_version_unchanged": true,
+        "frozen_module_trainable_flag_unchanged": true,
+        "original_module_state_unchanged": true,
+        "unfrozen_parameter_changed": true,
+        "finished_module_lanes": final_module_lanes,
+    });
     let scoreboard_evidence = serde_json::json!({
         "initial_scoreboard": initial_scoreboard,
         "resumed_scoreboard": resumed_scoreboard,
     });
     let mut evidence = serde_json::json!({
-        "format_version": 6,
+        "format_version": 7,
         "workload": "tiny-causal-transformer-compiled-adamw",
         "implementation_revision": expected_sha,
         "device": device_evidence,
@@ -2963,7 +3429,10 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         checkpoint_evidence,
         loss_evidence,
         accounting_evidence,
+        flush_evidence,
         evaluation_evidence,
+        agreement_evidence,
+        frozen_evidence,
         scoreboard_evidence,
     ] {
         let serde_json::Value::Object(fragment) = fragment else {
@@ -2971,7 +3440,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         };
         evidence_object.extend(fragment);
     }
-    evidence_object.insert("weight_decay".into(), config().weight_decay().into());
+    evidence_object.insert("weight_decay".into(), policy.weight_decay().into());
     evidence_object.insert(
         "gradient_accumulation_steps".into(),
         ACCUMULATION_STEPS.into(),

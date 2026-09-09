@@ -130,43 +130,53 @@ of silently testing the newer revision.
 
 ## Evidence boundary
 
-The compiled-Transformer artifact uses schema v6 and executes the same
-dropout-bearing capture twelve times: eight invocations on the uninterrupted
-session and four after checkpoint restoration. Four observed invocations
-download only the scalar loss; eight device-only invocations
+The compiled-Transformer artifact uses schema v7 and executes the same
+dropout-bearing capture seven times: four invocations before checkpoint
+restoration and three afterward. Two observed invocations download only the
+scalar loss; five device-only invocations
 commit the complete fixed-state successor with zero outputs and zero retained
 D2H calls or bytes. Training progress is measured separately as the
 deterministic eval-mode mean sparse loss over the same three fixed microbatches
 before module ownership and after final parameter publication; replay-loss
 endpoints are not compared across different microbatches or dropout masks. A
-three-microbatch accumulation window adds one gradient sum per canonical
-trainable parameter plus its cursor, so every invocation must commit 79 state
-pairs, 1,048 logical state bytes, and 259 descriptor-derived work items. A
+three-microbatch accumulation window adds one gradient sum per effective
+trainable parameter plus its cursor. The policy-frozen tied token
+embedding/output head is absent from the optimizer frontier, so every
+invocation must commit 75 state pairs, 952 logical state bytes, and 235
+descriptor-derived work items. A
 finite 0.25 global norm limit clips the complete averaged gradient set
 immediately before each AdamW update. Its
 declared fixed `[2,3]` I32 input and target
 token matrices are capture-authenticated through separate autograd-recorded
-proofs binding the embedding and axis-one log-probability Gathers to their exact
-F32-zero-base first-order ScatterAdds, shared flattened index/axis/domain, and
-update cotangents. Every token and target lane is range-checked on the host
-before driver work; only those two proven pairs use distinct status-free Metal
-kernels, while ordinary indexed movement remains guarded. With no
+proofs. The trainable target-selection Gather remains bound to its exact
+F32-zero-base first-order ScatterAdd, shared flattened index/axis/domain, and
+update cotangent. The frozen embedding has no reverse owner and instead uses
+the disjoint authenticated forward-only fixed-host Gather proof. Every token
+and target lane is range-checked on the host before driver work; only those
+three proven owners use distinct status-free Metal kernels, while ordinary
+indexed movement remains guarded. With no
 transactional/indexed owners left, each replay submits and waits for exactly
-one command buffer. The artifact records the four authenticated owners, zero
-guarded indexed owners, planned kernel count, and exactly twelve aggregate
-submissions/waits. The prepared input descriptors prove three
+one command buffer. The artifact records the paired target owners, one frozen
+forward Gather, zero guarded indexed owners, planned kernel count, and exactly
+seven replay submissions/waits. The prepared input descriptors prove three
 transient writes totaling 52 bytes per replay, so the artifact separately
-requires 624 transient H2D bytes and
-exactly 4 retained-output D2H calls totaling 16 bytes. The first two distinct
+requires 364 transient H2D bytes and exactly two retained-output D2H calls
+totaling eight bytes. The first two distinct
 microbatches populate a nonempty window; `zero_grad` discards both without a
 training replay, compute-command report, successful scoreboard run,
 parameter/moment change, or dropout draw. The inactive-bank reset still submits
 synchronous copy commands before the atomic epoch flip. Repeating `zero_grad`
 on that empty window is an exact epoch/checkpoint no-op. Midpoint checkpointing
 and final parameter publication remain explicit host-observation boundaries
-outside these per-step transfer totals.
+outside these per-step transfer totals. After fresh restoration, a nonempty
+two-microbatch flush uploads only the four-byte F32 learning rate, retains no
+output, downloads no bytes, submits and waits once, commits the full shared
+frontier, and leaves replay, dropout, and training-scoreboard progress
+unchanged. A following empty flush is an exact command/epoch/checkpoint no-op.
 
-Training evidence format v6 also records the compiled evaluation aggregate.
+Training evidence format v7 also records the compiled evaluation aggregate and
+a same-seed CPU reference for every batch, cancellation, checkpoint, flush,
+replay, evaluation, and finish boundary.
 The owned plan prepares a read-only evaluation capture against both
 physical parameter banks. Three final fixed-dataset evaluations select the
 currently active bank, upload only tokens/targets, and retain loss/logits; they
@@ -175,21 +185,27 @@ checkpoint, dropout counter, successful-run count, or complete scoreboard
 report. Each evaluation is a separate stateless one-submit/one-wait invocation,
 not a training replay or throughput claim.
 
-A successful compiled-Transformer job trains through step eight, resumes the
+A successful compiled-Transformer job trains through step seven, resumes the
 same Metal capture exactly from a partial step-four frontier (optimizer step
-zero, accumulation index two), commits optimizer steps one and two at replays
-five and eight, and consumes the owned resumed
+zero, accumulation index two), commits optimizer step one through the partial
+flush and step two at replay seven, and consumes the owned resumed
 session to atomically publish the final trainable frontier and return the fresh
-reconstruction module. It checks 19
-canonical tensors totaling 256 logical bytes, tied-head canonicalization,
-one host-version advance per unique parameter, and exact final checkpoint
-equality before the consuming finish. The current public Metal scoreboard observes
+reconstruction module. It checks 18 effective-trainable canonical tensors
+totaling 232 logical bytes, bounded CPU/Metal agreement for parameters, both
+moment sets, accumulators, evaluation, and finished module state, plus exact
+uninterrupted-versus-restored CPU checkpoint/state equality. The tied
+`tokens.weight`/`lm_head.weight` remains byte-, version-, and trainable-flag
+identical and absent from recurrent, checkpoint, and publication state, while
+at least one unfrozen parameter changes and fixed-dataset loss decreases. The
+current public Metal scoreboard observes
 training invocations but does not meter standalone state-snapshot reads, so the
-live artifact records the 19-tensor/256-byte logical payload and leaves native
-read count null rather than claiming 19 measured driver reads. The semantic
+live artifact records the 18-tensor/232-byte logical payload and leaves native
+read count null rather than claiming 18 measured driver reads. The semantic
 mock separately proves one read per nonempty requested parameter, no read for a
 zero-byte parameter, no non-parameter state reads, and retry after a partial
-read failure.
+read failure. These are the fail-closed requirements for the next protected
+Apple run; this document does not claim schema-v7 live-hardware validation
+until that exact-revision job is green.
 
 A successful Linear/ResNet job uploads two v8 scoreboards plus the normalized
 ResNet `BenchmarkObservation` v1. A successful Llama job uploads its

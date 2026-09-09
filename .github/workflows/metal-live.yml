@@ -30,7 +30,7 @@ jobs:
       EXPECTED_SHA: ${{ inputs.expected_sha }}
       RUSTGRAD_METAL_EXPECTED_SHA: ${{ inputs.expected_sha }}
       RUSTGRAD_METAL_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-linear-scoreboard.json
-      RUSTGRAD_METAL_TRAINING_EVIDENCE_PATH: ${{ github.workspace }}/metal-live-compiled-training-v6.json
+      RUSTGRAD_METAL_TRAINING_EVIDENCE_PATH: ${{ github.workspace }}/metal-live-compiled-training-v7.json
       RUSTGRAD_METAL_RESNET_SCOREBOARD_PATH: ${{ github.workspace }}/metal-live-resnet18-scoreboard.json
       RUSTGRAD_METAL_RESNET_OBSERVATION_PATH: ${{ github.workspace }}/metal-live-resnet18-observation-v1.json
       RUSTGRAD_METAL_RESNET_RUNS: "10"

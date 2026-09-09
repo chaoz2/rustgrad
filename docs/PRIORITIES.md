@@ -72,12 +72,13 @@ likelihood, one batched reverse traversal, and captured AdamW. One resource-free
 `CompiledAdamWPlan` prepares
 through `CpuSessionTarget` or an explicitly selected strict
 `MetalSessionTarget`; the optimizer-neutral loop is shared without a backend
-enum. Eight CPU replays use deterministic distinct `[2,3]` microbatches under a
+enum. Seven CPU replays use deterministic distinct `[2,3]` microbatches under a
 three-replay accumulation window and active finite global clipping. After two
 replays, a nonempty `zero_grad` cancellation preserves replay/dropout progress
 while discarding the partial window; two subsequent replays are checkpointed
 and authenticated recompilation into a fresh owned module continues the exact
-partial frontier through optimizer updates at replays five and eight. Exact
+partial frontier through a two-microbatch flush and a complete second update at
+replay seven. Exact
 outputs and complete recurrent parameter/moment/accumulator state match the
 uninterrupted run. In-session evaluation observes that same live parameter
 frontier before publication: CPU binds current runtime snapshots, while strict
@@ -128,7 +129,8 @@ second state upload, and encodes preservation copies plus the update kernels in
 one synchronous command buffer. It flips the shared epoch only after success,
 downloads no output, and does not advance replay, dropout, or training
 scoreboard state. Semantic mock coverage is retained; live Apple-hardware flush
-validation is not claimed here. The same
+validation is required by the pending schema-v7 protected evidence and is not
+claimed until that exact-revision Apple job is green. The same
 module-bound compile traversal now validates an explicit canonical set of
 AdamW decay exclusions before graph construction. The maintained Transformer
 uses nonzero decoupled decay for embedding/projection matrices while excluding
@@ -154,12 +156,13 @@ compiled AdamW config. Its causal loss selects one log probability per target
 with a raw axis-one Gather before negation and mean, avoiding the general
 cross-entropy helper's dense `[B*T, V]` one-hot selection without changing that
 public helper.
-The public policy accepts any exact nonempty fixed rank-two `[B, T]` schema;
-strict Metal reauthenticates the exact
-autograd-recorded Gather/first-order ScatterAdd relationships for embedding and
-target selection, including each exact data target, F32-zero base, flattened
-`[B*T, E]` or `[B*T, 1]` index, axis/domain, and update cotangent, before
-selecting private status-free renderers. Host validation
+The public policy accepts any exact nonempty fixed rank-two `[B, T]` schema.
+Strict Metal reauthenticates either the exact autograd-recorded
+Gather/first-order ScatterAdd relationship or, when the embedding is
+policy-frozen, a disjoint forward-only Gather proof. The maintained frozen
+embedding uses the latter while target selection proves its exact data target,
+F32-zero base, flattened `[B*T, 1]` index, axis/domain, and update cotangent
+before selecting private status-free renderers. Host validation
 checks every lane before driver work, leaving no transactional/indexed owner in
 that workload and reducing each prepared replay to one submission and one wait.
 Ordinary untrusted indexed movement remains guarded, and this transient policy
@@ -173,14 +176,19 @@ with zero fallback and initializes parameter, first/second-moment, and U64-step
 state in failure-atomic epoch-swapped device banks. The checked-in protected
 Apple-GPU acceptance now enters through the same public `CompiledAdamWPlan` and
 scoreboard-bound `MetalSessionTarget` path as the maintained example. It
-executes eight tiny-Transformer steps, proves decreasing deterministic
+requires seven tiny-Transformer replays, proves decreasing deterministic
 eval-mode mean sparse loss over the same three fixed microbatches, checkpoints
-at step four, prepares a second Metal session from those bytes, and requires
-exact continued outputs and final checkpoint equality. Its create-new evidence
+at step four, prepares a second Metal session from those bytes, executes the
+shared-state nonempty flush followed by a complete accumulation window, and
+requires bounded agreement with the same-seed CPU reference. The reference
+also proves exact uninterrupted-versus-restored checkpoint and module state.
+The frozen tied embedding/output remains absent from optimizer/checkpoint state
+and byte/version/flag unchanged through finish while another parameter changes.
+Its create-new schema-v7 evidence
 records the selected device, capture/deployment identities,
-kernel/command/transfer counts, controlled evaluation endpoints, and resume
-result. Running that manual exact-SHA lane on provisioned Apple hardware is the
-remaining proof;
+kernel/command/transfer counts, LR-only zero-output flush, controlled evaluation
+endpoints, and resume result. Running that manual exact-SHA lane on provisioned
+Apple hardware is the remaining proof;
 the shared scoreboard now records this epoch-swapped training session directly,
 and `MetalSessionTarget::with_scoreboard` binds fail-soft observation before the
 first step rather than introducing a parallel training API.
