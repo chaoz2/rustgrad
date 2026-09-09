@@ -1,5 +1,10 @@
 //! Graph-free CPU replay for static training programs with recurrent state.
 
+mod state_schema;
+
+use self::state_schema::{
+    AdamWGlobalState, AdamWParameterState, INTERNAL_PREFIX, RecurrentStateKey, StateSpec,
+};
 use super::target::{CpuSessionTarget, MetalSessionTarget, SessionTarget};
 use crate::nn::{
     Parameter, ParameterRestore, ParameterSnapshot, StateKind, TrainingDropoutProvider,
@@ -20,195 +25,12 @@ use crate::{
     combine_mixed_schedules, load_safetensors, save_safetensors, schedule_effects, schedule_many,
 };
 use std::{
-    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fmt,
-    ops::Range,
 };
 
-const INTERNAL_PREFIX: &str = "__rustgrad_compiled_training_";
 const LEARNING_RATE_INPUT: &str = "__rustgrad_compiled_training_learning_rate";
 const STATE_BUFFER_BASE: u64 = 1_u64 << 62;
-const DROPOUT_COUNTER_INPUT: &str = "__rustgrad_compiled_training_dropout_block_counter";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdamWParameterState {
-    FirstMoment,
-    SecondMoment,
-    GradientAccumulator,
-}
-
-impl AdamWParameterState {
-    const fn canonical_suffix(self) -> &'static str {
-        match self {
-            Self::FirstMoment => "first_moment",
-            Self::SecondMoment => "second_moment",
-            Self::GradientAccumulator => "gradient_accumulator",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdamWGlobalState {
-    Step,
-    AccumulationIndex,
-}
-
-impl AdamWGlobalState {
-    const fn canonical_suffix(self) -> &'static str {
-        match self {
-            Self::Step => "step",
-            Self::AccumulationIndex => "accumulation_index",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RecurrentStateSemantic {
-    Parameter(Range<usize>),
-    Momentum(Range<usize>),
-    AdamWParameter {
-        parameter: Range<usize>,
-        state: AdamWParameterState,
-    },
-    AdamWGlobal(AdamWGlobalState),
-    DropoutCounter,
-}
-
-/// Private semantic identity for every compiled-optimizer recurrent value.
-///
-/// Each constructor materializes the exact legacy spelling once. Equality and
-/// ordering use those stored bytes, so arbitrary parameter punctuation cannot
-/// change capture, checkpoint, or state-bank order. Parameter-bearing kinds
-/// retain only a byte range into that same allocation.
-#[derive(Clone, Debug)]
-struct RecurrentStateKey {
-    canonical: Box<str>,
-    semantic: RecurrentStateSemantic,
-}
-
-impl RecurrentStateKey {
-    fn parameter(name: impl AsRef<str>) -> Self {
-        let (canonical, parameter) = Self::parameterized("parameter:", name.as_ref(), "", "");
-        Self {
-            canonical,
-            semantic: RecurrentStateSemantic::Parameter(parameter),
-        }
-    }
-
-    fn momentum(name: impl AsRef<str>) -> Self {
-        let (canonical, parameter) = Self::parameterized("slot:", name.as_ref(), ":", "momentum");
-        Self {
-            canonical,
-            semantic: RecurrentStateSemantic::Momentum(parameter),
-        }
-    }
-
-    fn adamw_parameter(name: impl AsRef<str>, state: AdamWParameterState) -> Self {
-        let (canonical, parameter) =
-            Self::parameterized("slot:", name.as_ref(), ":", state.canonical_suffix());
-        Self {
-            canonical,
-            semantic: RecurrentStateSemantic::AdamWParameter { parameter, state },
-        }
-    }
-
-    fn adamw_global(state: AdamWGlobalState) -> Self {
-        Self {
-            canonical: format!("global:{}", state.canonical_suffix()).into_boxed_str(),
-            semantic: RecurrentStateSemantic::AdamWGlobal(state),
-        }
-    }
-
-    fn dropout_counter() -> Self {
-        Self {
-            canonical: Box::from("workload:dropout_block_counter"),
-            semantic: RecurrentStateSemantic::DropoutCounter,
-        }
-    }
-
-    fn parameterized(
-        prefix: &str,
-        parameter: &str,
-        separator: &str,
-        suffix: &str,
-    ) -> (Box<str>, Range<usize>) {
-        let start = prefix.len();
-        let end = start + parameter.len();
-        let mut canonical = String::with_capacity(end + separator.len() + suffix.len());
-        canonical.push_str(prefix);
-        canonical.push_str(parameter);
-        canonical.push_str(separator);
-        canonical.push_str(suffix);
-        (canonical.into_boxed_str(), start..end)
-    }
-
-    fn canonical_name(&self) -> &str {
-        &self.canonical
-    }
-
-    fn stored_parameter_name(&self, range: &Range<usize>) -> &str {
-        &self.canonical[range.clone()]
-    }
-
-    fn parameter_name(&self) -> Option<&str> {
-        match &self.semantic {
-            RecurrentStateSemantic::Parameter(parameter) => {
-                Some(self.stored_parameter_name(parameter))
-            }
-            _ => None,
-        }
-    }
-
-    fn momentum_parameter_name(&self) -> Option<&str> {
-        match &self.semantic {
-            RecurrentStateSemantic::Momentum(parameter) => {
-                Some(self.stored_parameter_name(parameter))
-            }
-            _ => None,
-        }
-    }
-
-    fn parameter_for_adamw_state(&self, expected: AdamWParameterState) -> Option<&str> {
-        match &self.semantic {
-            RecurrentStateSemantic::AdamWParameter { parameter, state } if *state == expected => {
-                Some(self.stored_parameter_name(parameter))
-            }
-            _ => None,
-        }
-    }
-
-    fn is_accumulation_reset_state(&self) -> bool {
-        matches!(
-            &self.semantic,
-            RecurrentStateSemantic::AdamWGlobal(AdamWGlobalState::AccumulationIndex)
-                | RecurrentStateSemantic::AdamWParameter {
-                    state: AdamWParameterState::GradientAccumulator,
-                    ..
-                }
-        )
-    }
-}
-
-impl PartialEq for RecurrentStateKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.canonical_name() == other.canonical_name()
-    }
-}
-
-impl Eq for RecurrentStateKey {}
-
-impl Ord for RecurrentStateKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.canonical_name().cmp(other.canonical_name())
-    }
-}
-
-impl PartialOrd for RecurrentStateKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
 
 /// Immutable two-word key for compiled Transformer residual dropout.
 ///
@@ -1370,14 +1192,6 @@ struct AdamWCheckpointTensors {
     gradient_accumulators: BTreeMap<String, TensorData>,
 }
 
-#[derive(Clone, Debug)]
-struct StateSpec {
-    key: RecurrentStateKey,
-    input_name: String,
-    value: TensorData,
-    requires_grad: bool,
-}
-
 trait CompiledOptimizerProgram {
     fn name(&self) -> &'static str;
     fn inputs(&self) -> &BTreeMap<String, (Shape, DType)>;
@@ -1420,18 +1234,8 @@ impl CompiledOptimizerProgram for MomentumProgram {
     fn state_specs(&self, parameters: &BTreeMap<String, TensorData>) -> Result<Vec<StateSpec>> {
         let mut specs = Vec::with_capacity(parameters.len() * 2);
         for (ordinal, (name, value)) in parameters.iter().enumerate() {
-            specs.push(StateSpec {
-                key: RecurrentStateKey::parameter(name),
-                input_name: format!("{INTERNAL_PREFIX}parameter_{ordinal}"),
-                value: value.clone(),
-                requires_grad: true,
-            });
-            specs.push(StateSpec {
-                key: RecurrentStateKey::momentum(name),
-                input_name: format!("{INTERNAL_PREFIX}momentum_{ordinal}"),
-                value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
-                requires_grad: false,
-            });
+            specs.push(StateSpec::parameter(ordinal, name, value.clone()));
+            specs.push(StateSpec::momentum(ordinal, name, value)?);
         }
         Ok(specs)
     }
@@ -1477,48 +1281,27 @@ impl CompiledOptimizerProgram for AdamWProgram {
         let mut specs =
             Vec::with_capacity(parameters.len() * per_parameter + 1 + accumulating as usize);
         for (ordinal, (name, value)) in parameters.iter().enumerate() {
-            specs.push(StateSpec {
-                key: RecurrentStateKey::parameter(name),
-                input_name: format!("{INTERNAL_PREFIX}parameter_{ordinal}"),
-                value: value.clone(),
-                requires_grad: true,
-            });
+            specs.push(StateSpec::parameter(ordinal, name, value.clone()));
             for state in [
                 AdamWParameterState::FirstMoment,
                 AdamWParameterState::SecondMoment,
             ] {
-                specs.push(StateSpec {
-                    key: RecurrentStateKey::adamw_parameter(name, state),
-                    input_name: format!("{INTERNAL_PREFIX}{}_{ordinal}", state.canonical_suffix()),
-                    value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
-                    requires_grad: false,
-                });
+                specs.push(StateSpec::adamw_parameter(ordinal, name, value, state)?);
             }
             if accumulating {
-                specs.push(StateSpec {
-                    key: RecurrentStateKey::adamw_parameter(
-                        name,
-                        AdamWParameterState::GradientAccumulator,
-                    ),
-                    input_name: format!("{INTERNAL_PREFIX}gradient_accumulator_{ordinal}"),
-                    value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
-                    requires_grad: false,
-                });
+                specs.push(StateSpec::adamw_parameter(
+                    ordinal,
+                    name,
+                    value,
+                    AdamWParameterState::GradientAccumulator,
+                )?);
             }
         }
-        specs.push(StateSpec {
-            key: RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
-            input_name: format!("{INTERNAL_PREFIX}adamw_step"),
-            value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
-            requires_grad: false,
-        });
+        specs.push(StateSpec::adamw_global(AdamWGlobalState::Step)?);
         if accumulating {
-            specs.push(StateSpec {
-                key: RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
-                input_name: format!("{INTERNAL_PREFIX}adamw_accumulation_index"),
-                value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
-                requires_grad: false,
-            });
+            specs.push(StateSpec::adamw_global(
+                AdamWGlobalState::AccumulationIndex,
+            )?);
         }
         Ok(specs)
     }
@@ -3290,12 +3073,7 @@ impl CompiledAdamWPlan {
         let max_gradient_norm = config.max_gradient_norm;
         let loss_scale = config.loss_scale;
         let host_token_inputs = config.host_token_inputs.clone();
-        let workload = StateSpec {
-            key: RecurrentStateKey::dropout_counter(),
-            input_name: DROPOUT_COUNTER_INPUT.into(),
-            value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
-            requires_grad: false,
-        };
+        let workload = StateSpec::dropout_counter()?;
         let mut dropout_state = None;
         let inner = CompiledTrainingPlan::compile_with_workload(
             AdamWProgram { config },
@@ -5802,113 +5580,6 @@ mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, LossOptions, Op, Parameter, cross_entropy};
     use std::collections::HashMap;
-
-    #[test]
-    fn recurrent_state_keys_preserve_canonical_names_and_lexical_order() {
-        let parameter_names = [
-            "a",
-            "a0",
-            "block:weight",
-            "parameter:weight:momentum",
-            "slot:block:first_moment",
-            "global:step:second_moment",
-            "workload:dropout_block_counter:gradient_accumulator",
-        ];
-        let mut keys = vec![
-            RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
-            RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
-            RecurrentStateKey::dropout_counter(),
-        ];
-        for parameter in parameter_names {
-            let parameter_key = RecurrentStateKey::parameter(parameter);
-            assert_eq!(
-                parameter_key.canonical_name(),
-                format!("parameter:{parameter}")
-            );
-            assert_eq!(parameter_key.parameter_name(), Some(parameter));
-            assert_eq!(parameter_key.momentum_parameter_name(), None);
-            assert_eq!(
-                parameter_key.parameter_for_adamw_state(AdamWParameterState::FirstMoment),
-                None
-            );
-            keys.push(parameter_key);
-
-            let momentum = RecurrentStateKey::momentum(parameter);
-            assert_eq!(
-                momentum.canonical_name(),
-                format!("slot:{parameter}:momentum")
-            );
-            assert_eq!(momentum.parameter_name(), None);
-            assert_eq!(momentum.momentum_parameter_name(), Some(parameter));
-            assert_eq!(
-                momentum.parameter_for_adamw_state(AdamWParameterState::FirstMoment),
-                None
-            );
-            keys.push(momentum);
-
-            for state in [
-                AdamWParameterState::FirstMoment,
-                AdamWParameterState::SecondMoment,
-                AdamWParameterState::GradientAccumulator,
-            ] {
-                let key = RecurrentStateKey::adamw_parameter(parameter, state);
-                assert_eq!(
-                    key.canonical_name(),
-                    format!("slot:{parameter}:{}", state.canonical_suffix())
-                );
-                assert_eq!(key.parameter_name(), None);
-                assert_eq!(key.momentum_parameter_name(), None);
-                assert_eq!(key.parameter_for_adamw_state(state), Some(parameter));
-                for other in [
-                    AdamWParameterState::FirstMoment,
-                    AdamWParameterState::SecondMoment,
-                    AdamWParameterState::GradientAccumulator,
-                ] {
-                    assert_eq!(
-                        key.parameter_for_adamw_state(other).is_some(),
-                        other == state
-                    );
-                }
-                keys.push(key);
-            }
-        }
-        assert_eq!(
-            keys[0].canonical_name(),
-            "global:step",
-            "global spelling changed"
-        );
-        assert_eq!(
-            keys[1].canonical_name(),
-            "global:accumulation_index",
-            "global spelling changed"
-        );
-        assert_eq!(
-            keys[2].canonical_name(),
-            "workload:dropout_block_counter",
-            "workload spelling changed"
-        );
-
-        let canonical = keys
-            .iter()
-            .map(|key| key.canonical_name().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            canonical.iter().collect::<BTreeSet<_>>().len(),
-            canonical.len(),
-            "typed key constructors collided"
-        );
-
-        let typed_order = keys
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|key| key.canonical_name().to_owned())
-            .collect::<Vec<_>>();
-        let mut lexical_order = canonical;
-        lexical_order.sort();
-        assert_eq!(typed_order, lexical_order);
-    }
 
     #[test]
     fn compiled_dropout_reserves_source_order_blocks_only_for_active_f32_draws() {
