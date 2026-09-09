@@ -1339,14 +1339,22 @@ impl CompiledAdamWFlush for CompiledAdamWFlushResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledAdamWCheckpoint {
     bytes: Vec<u8>,
+    info: CompiledAdamWCheckpointInfo,
 }
 
 impl CompiledAdamWCheckpoint {
     /// Validates and owns deterministic checkpoint bytes.
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Result<Self> {
         let bytes = bytes.into();
-        decode_adamw_checkpoint(&bytes)?;
-        Ok(Self { bytes })
+        let decoded = decode_adamw_checkpoint(&bytes)?;
+        let info = CompiledAdamWCheckpointInfo::from_decoded(&decoded);
+        Ok(Self { bytes, info })
+    }
+
+    /// Returns validated program identity and training progress without exposing
+    /// or reparsing the checkpoint's wire representation.
+    pub fn info(&self) -> &CompiledAdamWCheckpointInfo {
+        &self.info
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -1355,6 +1363,94 @@ impl CompiledAdamWCheckpoint {
 
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+}
+
+/// Validated, read-only progress carried by a compiled AdamW checkpoint.
+///
+/// Legacy v1--v4 checkpoints expose zero or `None` for progress fields that
+/// predate their wire formats. These values are suitable for selecting the next
+/// workload batch or learning-rate schedule before recompiling the saved
+/// program; executable capture and tensor payloads remain private checkpoint
+/// details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledAdamWCheckpointInfo {
+    capture_identity: u64,
+    replay_step: u64,
+    optimizer_step: u64,
+    gradient_accumulation_steps: u64,
+    accumulation_index: u64,
+    discarded_microbatches: u64,
+    flushed_window_count: u64,
+    flushed_microbatch_count: u64,
+    flush_capture_identity: Option<u64>,
+    dropout_block_counter: Option<u64>,
+}
+
+impl CompiledAdamWCheckpointInfo {
+    fn from_decoded(decoded: &DecodedAdamWCheckpoint) -> Self {
+        Self {
+            capture_identity: decoded.capture_identity,
+            replay_step: decoded.replay_step,
+            optimizer_step: decoded.optimizer_step,
+            gradient_accumulation_steps: decoded.accumulation_steps,
+            accumulation_index: decoded.accumulation_index,
+            discarded_microbatches: decoded.discarded_microbatches,
+            flushed_window_count: decoded.flushed_window_count,
+            flushed_microbatch_count: decoded.flushed_microbatch_count,
+            flush_capture_identity: decoded.flush_capture_identity,
+            dropout_block_counter: decoded.dropout_block_counter,
+        }
+    }
+
+    /// Stable identity of the compiled training capture required for restore.
+    pub fn capture_identity(&self) -> u64 {
+        self.capture_identity
+    }
+
+    /// Number of successfully committed training replays.
+    pub fn replay_step(&self) -> u64 {
+        self.replay_step
+    }
+
+    /// Number of committed full or explicitly flushed AdamW updates.
+    pub fn optimizer_step(&self) -> u64 {
+        self.optimizer_step
+    }
+
+    /// Fixed number of microbatches in each complete accumulation window.
+    pub fn gradient_accumulation_steps(&self) -> u64 {
+        self.gradient_accumulation_steps
+    }
+
+    /// Number of retained microbatches in the current partial window.
+    pub fn accumulation_index(&self) -> u64 {
+        self.accumulation_index
+    }
+
+    /// Total retained microbatches discarded by successful `zero_grad` calls.
+    pub fn discarded_microbatches(&self) -> u64 {
+        self.discarded_microbatches
+    }
+
+    /// Total partial accumulation windows committed by explicit flushes.
+    pub fn flushed_window_count(&self) -> u64 {
+        self.flushed_window_count
+    }
+
+    /// Total microbatches consumed by explicit partial-window flushes.
+    pub fn flushed_microbatch_count(&self) -> u64 {
+        self.flushed_microbatch_count
+    }
+
+    /// Authenticated auxiliary flush identity when v5 progress is present.
+    pub fn flush_capture_identity(&self) -> Option<u64> {
+        self.flush_capture_identity
+    }
+
+    /// Next Threefry block counter for checkpoints carrying dropout state.
+    pub fn dropout_block_counter(&self) -> Option<u64> {
+        self.dropout_block_counter
     }
 }
 
@@ -7260,6 +7356,21 @@ mod tests {
         let checkpoint = runtime.checkpoint().unwrap();
         let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
         assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V4);
+        assert_eq!(
+            *checkpoint.info(),
+            CompiledAdamWCheckpointInfo {
+                capture_identity: runtime.capture_identity(),
+                replay_step: 1,
+                optimizer_step: 1,
+                gradient_accumulation_steps: 1,
+                accumulation_index: 0,
+                discarded_microbatches: 0,
+                flushed_window_count: 0,
+                flushed_microbatch_count: 0,
+                flush_capture_identity: None,
+                dropout_block_counter: Some(1),
+            }
+        );
 
         let fresh = TiedFrozenModule::new([0.1, -0.2]);
         assert!(
@@ -7334,6 +7445,16 @@ mod tests {
             .unwrap();
         let (_, metadata) = load_safetensors(ordinary.as_bytes()).unwrap();
         assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V1);
+        let ordinary_info = ordinary.info();
+        assert_eq!(ordinary_info.replay_step(), 0);
+        assert_eq!(ordinary_info.optimizer_step(), 0);
+        assert_eq!(ordinary_info.gradient_accumulation_steps(), 1);
+        assert_eq!(ordinary_info.accumulation_index(), 0);
+        assert_eq!(ordinary_info.discarded_microbatches(), 0);
+        assert_eq!(ordinary_info.flushed_window_count(), 0);
+        assert_eq!(ordinary_info.flushed_microbatch_count(), 0);
+        assert_eq!(ordinary_info.flush_capture_identity(), None);
+        assert_eq!(ordinary_info.dropout_block_counter(), None);
         assert!(
             CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
                 module_config(),
@@ -7359,12 +7480,22 @@ mod tests {
         let v2 = accumulated.checkpoint().unwrap();
         accumulated.zero_grad().unwrap();
         let v3 = accumulated.checkpoint().unwrap();
-        for (legacy, format) in [
-            (v2, ADAMW_CHECKPOINT_FORMAT_V2),
-            (v3, ADAMW_CHECKPOINT_FORMAT_V3),
+        for (legacy, format, accumulation_index, discarded_microbatches) in [
+            (v2, ADAMW_CHECKPOINT_FORMAT_V2, 1, 0),
+            (v3, ADAMW_CHECKPOINT_FORMAT_V3, 0, 1),
         ] {
             let (_, metadata) = load_safetensors(legacy.as_bytes()).unwrap();
             assert_eq!(metadata["format"], format);
+            let info = legacy.info();
+            assert_eq!(info.replay_step(), 1);
+            assert_eq!(info.optimizer_step(), 0);
+            assert_eq!(info.gradient_accumulation_steps(), 2);
+            assert_eq!(info.accumulation_index(), accumulation_index);
+            assert_eq!(info.discarded_microbatches(), discarded_microbatches);
+            assert_eq!(info.flushed_window_count(), 0);
+            assert_eq!(info.flushed_microbatch_count(), 0);
+            assert_eq!(info.flush_capture_identity(), None);
+            assert_eq!(info.dropout_block_counter(), None);
             assert!(
                 CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
                     module_config().with_gradient_accumulation(2).unwrap(),
@@ -8623,6 +8754,20 @@ mod tests {
             metadata["flush_capture_identity"],
             flushed.flush_capture_identity().unwrap().to_string()
         );
+        let info = checkpoint.info();
+        assert_eq!(info.capture_identity(), flushed.capture_identity());
+        assert_eq!(info.replay_step(), 2);
+        assert_eq!(info.optimizer_step(), 1);
+        assert_eq!(info.gradient_accumulation_steps(), 3);
+        assert_eq!(info.accumulation_index(), 0);
+        assert_eq!(info.discarded_microbatches(), 0);
+        assert_eq!(info.flushed_window_count(), 1);
+        assert_eq!(info.flushed_microbatch_count(), 2);
+        assert_eq!(
+            info.flush_capture_identity(),
+            flushed.flush_capture_identity()
+        );
+        assert_eq!(info.dropout_block_counter(), None);
         assert!(
             flushed
                 .parameter_versions()

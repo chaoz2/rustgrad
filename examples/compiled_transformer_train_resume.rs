@@ -318,6 +318,22 @@ where
 
     let saved = uninterrupted.checkpoint()?;
     let checkpoint = CompiledAdamWCheckpoint::from_bytes(saved.into_bytes())?;
+    let checkpoint_info = checkpoint.info();
+    assert_eq!(checkpoint_info.capture_identity(), capture_identity);
+    assert_eq!(checkpoint_info.replay_step(), INITIAL_STEPS as u64);
+    assert_eq!(checkpoint_info.optimizer_step(), 0);
+    assert_eq!(
+        checkpoint_info.gradient_accumulation_steps(),
+        ACCUMULATION_STEPS
+    );
+    assert_eq!(checkpoint_info.accumulation_index(), 2);
+    assert_eq!(checkpoint_info.discarded_microbatches(), 2);
+    assert_eq!(checkpoint_info.flushed_window_count(), 0);
+    assert_eq!(checkpoint_info.flushed_microbatch_count(), 0);
+    assert_eq!(checkpoint_info.flush_capture_identity(), None);
+    assert_eq!(checkpoint_info.dropout_block_counter(), Some(48));
+    let resumed_first_replay = checkpoint_info.replay_step() + 1;
+    let resumed_last_replay = checkpoint_info.replay_step() + RESUMED_STEPS as u64;
     let restored_model = TinyCausalTransformer::new(7)?;
     let tied = restored_model.tokens.weight.clone();
     let frozen = restored_model.frozen_scale.clone();
@@ -338,7 +354,7 @@ where
     assert_eq!(resumed.accumulation_index()?, 2);
     assert_eq!(resumed.checkpoint()?, checkpoint);
 
-    for replay in (INITIAL_STEPS as u64 + 1)..=(INITIAL_STEPS + RESUMED_STEPS) as u64 {
+    for replay in resumed_first_replay..=resumed_last_replay {
         let expected = uninterrupted.step_batch(batch(replay)?, 0.05)?;
         let actual = resumed.step_batch(batch(replay)?, 0.05)?;
         assert_eq!(actual.loss(), expected.loss());

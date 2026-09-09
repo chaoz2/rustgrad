@@ -227,8 +227,10 @@ fn learning_rate() -> TensorData {
 }
 
 fn checkpoint_dropout_block_counter(checkpoint: &CompiledAdamWCheckpoint) -> u64 {
-    let (state, _) = load_safetensors(checkpoint.as_bytes()).unwrap();
-    state["dropout_block_counter"].scalar_at(0).as_u64()
+    checkpoint
+        .info()
+        .dropout_block_counter()
+        .expect("compiled Transformer checkpoints retain dropout state")
 }
 
 #[cfg(target_os = "macos")]
@@ -1330,19 +1332,19 @@ where
     }
     let saved = uninterrupted.checkpoint().unwrap();
     let checkpoint = CompiledAdamWCheckpoint::from_bytes(saved.into_bytes()).unwrap();
-    let (checkpoint_state, checkpoint_metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+    let (_, checkpoint_metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
     assert_eq!(checkpoint_metadata["format"], "rustgrad-compiled-adamw-v4");
-    assert_eq!(checkpoint_metadata["replay_step"], "4");
-    assert_eq!(checkpoint_metadata["optimizer_step"], "0");
-    assert_eq!(checkpoint_metadata["gradient_accumulation_steps"], "3");
-    assert_eq!(checkpoint_metadata["accumulation_index"], "2");
-    assert_eq!(checkpoint_metadata["discarded_microbatch_count"], "2");
-    assert_eq!(
-        checkpoint_state["dropout_block_counter"]
-            .scalar_at(0)
-            .as_u64(),
-        48
-    );
+    let checkpoint_info = *checkpoint.info();
+    assert_eq!(checkpoint_info.capture_identity(), capture_identity);
+    assert_eq!(checkpoint_info.replay_step(), 4);
+    assert_eq!(checkpoint_info.optimizer_step(), 0);
+    assert_eq!(checkpoint_info.gradient_accumulation_steps(), 3);
+    assert_eq!(checkpoint_info.accumulation_index(), 2);
+    assert_eq!(checkpoint_info.discarded_microbatches(), 2);
+    assert_eq!(checkpoint_info.flushed_window_count(), 0);
+    assert_eq!(checkpoint_info.flushed_microbatch_count(), 0);
+    assert_eq!(checkpoint_info.flush_capture_identity(), None);
+    assert_eq!(checkpoint_info.dropout_block_counter(), Some(48));
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
     let tied = resumed_model.tokens.weight.clone();
     let frozen = resumed_model.frozen_scale.clone();
@@ -1363,7 +1365,7 @@ where
     assert_eq!(resumed.accumulation_index().unwrap(), 2);
     assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
 
-    for replay in 5..=8 {
+    for replay in (checkpoint_info.replay_step() + 1)..=8 {
         let expected = uninterrupted.step(batch(replay), learning_rate()).unwrap();
         let actual = resumed.step(batch(replay), learning_rate()).unwrap();
         assert_eq!(actual.loss(), expected.loss());
@@ -1410,16 +1412,13 @@ where
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
     );
-    let (final_state, final_metadata) =
-        load_safetensors(resumed.checkpoint().unwrap().as_bytes()).unwrap();
-    assert_eq!(final_metadata["replay_step"], "8");
-    assert_eq!(final_metadata["optimizer_step"], "2");
-    assert_eq!(final_metadata["accumulation_index"], "0");
-    assert_eq!(final_metadata["discarded_microbatch_count"], "2");
-    assert_eq!(
-        final_state["dropout_block_counter"].scalar_at(0).as_u64(),
-        96
-    );
+    let final_checkpoint = resumed.checkpoint().unwrap();
+    let final_info = final_checkpoint.info();
+    assert_eq!(final_info.replay_step(), 8);
+    assert_eq!(final_info.optimizer_step(), 2);
+    assert_eq!(final_info.accumulation_index(), 0);
+    assert_eq!(final_info.discarded_microbatches(), 2);
+    assert_eq!(final_info.dropout_block_counter(), Some(96));
     let before_evaluation = resumed.checkpoint().unwrap();
     let evaluation_identity = resumed.evaluation_capture_identity().unwrap();
     let mut final_mean_sparse_loss = 0.0;
@@ -1832,15 +1831,19 @@ fn owned_compiled_transformer_flushes_a_partial_window_and_resumes_exactly() {
     let checkpoint = session.checkpoint().unwrap();
     let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
     assert_eq!(metadata["format"], "rustgrad-compiled-adamw-v5");
-    assert_eq!(metadata["replay_step"], "2");
-    assert_eq!(metadata["optimizer_step"], "1");
-    assert_eq!(metadata["flushed_window_count"], "1");
-    assert_eq!(metadata["flushed_microbatch_count"], "2");
-    assert_eq!(metadata["dropout_state_present"], "true");
+    let checkpoint_info = checkpoint.info();
+    assert_eq!(checkpoint_info.replay_step(), 2);
+    assert_eq!(checkpoint_info.optimizer_step(), 1);
+    assert_eq!(checkpoint_info.gradient_accumulation_steps(), 3);
+    assert_eq!(checkpoint_info.accumulation_index(), 0);
+    assert_eq!(checkpoint_info.discarded_microbatches(), 0);
+    assert_eq!(checkpoint_info.flushed_window_count(), 1);
+    assert_eq!(checkpoint_info.flushed_microbatch_count(), 2);
     assert_eq!(
-        metadata["flush_capture_identity"],
-        flush_identity.to_string()
+        checkpoint_info.flush_capture_identity(),
+        Some(flush_identity)
     );
+    assert_eq!(checkpoint_info.dropout_block_counter(), Some(24));
 
     let fresh = TinyCausalTransformer::new(7).unwrap();
     let tied_identity = fresh.tokens.weight.id();
