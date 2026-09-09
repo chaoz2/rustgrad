@@ -158,8 +158,15 @@ pub struct Graph {
     id: u64,
     pub(crate) grad_enabled: bool,
     parameter_bindings: BTreeMap<(ParameterId, u64), ParameterBinding>,
-    parameter_overrides: BTreeMap<ParameterId, NodeId>,
+    parameter_overrides: BTreeMap<ParameterId, ParameterOverride>,
     pub(crate) gather_vjp_provenance: Vec<GatherVjpProvenance>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParameterOverride {
+    node: NodeId,
+    source_trainable: bool,
+    effective_trainable: bool,
 }
 
 /// One heterogeneous source `Tensor.sequential` transform.
@@ -2430,15 +2437,16 @@ impl Graph {
     }
 
     pub(crate) fn bind_parameter(&mut self, snapshot: ParameterSnapshot) -> Result<NodeId> {
-        if let Some(&node) = self.parameter_overrides.get(&snapshot.identity) {
-            let bound = self.node(node)?;
+        if let Some(override_binding) = self.parameter_overrides.get(&snapshot.identity) {
+            let bound = self.node(override_binding.node)?;
             if bound.shape != snapshot.shape
                 || bound.dtype != snapshot.dtype
-                || bound.requires_grad != snapshot.trainable
+                || snapshot.trainable != override_binding.source_trainable
+                || bound.requires_grad != override_binding.effective_trainable
             {
                 return Err(Error::ParameterGraphMismatch);
             }
-            return Ok(node);
+            return Ok(override_binding.node);
         }
         let key = (snapshot.identity, snapshot.version);
         if let Some(binding) = self.parameter_bindings.get(&key) {
@@ -2468,15 +2476,31 @@ impl Graph {
     /// forwards without snapshotting trainable values into fresh graph inputs.
     pub(crate) fn with_parameter_overrides<T>(
         &mut self,
-        overrides: BTreeMap<ParameterId, NodeId>,
+        overrides: BTreeMap<ParameterId, (NodeId, bool, bool)>,
         lower: impl FnOnce(&mut Graph) -> Result<T>,
     ) -> Result<T> {
         if !self.parameter_overrides.is_empty() {
             return Err(Error::ParameterGraphMismatch);
         }
-        for &node in overrides.values() {
-            self.node(node)?;
-        }
+        let overrides = overrides
+            .into_iter()
+            .map(
+                |(identity, (node, source_trainable, effective_trainable))| {
+                    let bound = self.node(node)?;
+                    if bound.requires_grad != effective_trainable {
+                        return Err(Error::ParameterGraphMismatch);
+                    }
+                    Ok((
+                        identity,
+                        ParameterOverride {
+                            node,
+                            source_trainable,
+                            effective_trainable,
+                        },
+                    ))
+                },
+            )
+            .collect::<Result<BTreeMap<_, _>>>()?;
         let mut candidate = self.clone();
         candidate.parameter_overrides = overrides;
         let output = lower(&mut candidate)?;
@@ -2492,7 +2516,7 @@ impl Graph {
     ) -> Option<NodeId> {
         self.parameter_overrides
             .get(&identity)
-            .copied()
+            .map(|binding| binding.node)
             .or_else(|| {
                 self.parameter_bindings
                     .get(&(identity, version))

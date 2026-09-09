@@ -1383,6 +1383,244 @@ fn host_token_and_target_batch(targets: [i32; 6]) -> BTreeMap<String, TensorData
     ])
 }
 
+struct FrozenHostTokenModule {
+    table: Parameter,
+    log_probabilities: Parameter,
+}
+
+impl FrozenHostTokenModule {
+    fn new() -> Self {
+        Self {
+            table: Parameter::new(
+                TensorData::new([4, 2], vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]).unwrap(),
+                true,
+            ),
+            log_probabilities: Parameter::new(
+                TensorData::new(
+                    [6, 4],
+                    (0..24)
+                        .map(|index| index as f32 * 0.01 - 0.1)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap(),
+                true,
+            ),
+        }
+    }
+}
+
+impl Module for FrozenHostTokenModule {
+    fn visit(&self, _: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        visitor("table".into(), &self.table, StateKind::Parameter);
+        visitor(
+            "log_probabilities".into(),
+            &self.log_probabilities,
+            StateKind::Parameter,
+        );
+    }
+}
+
+fn compiled_frozen_host_token_plan(module: &FrozenHostTokenModule) -> CompiledAdamWPlan {
+    let config = compiled_host_token_and_target_config(true)
+        .with_frozen_parameters(["table"])
+        .unwrap();
+    CompiledAdamWPlan::compile_module(config, module, |module, graph, inputs| {
+        let table = module.table.bind(graph)?;
+        let log_probabilities = module.log_probabilities.bind(graph)?;
+        let token_rows = graph.reshape(inputs["tokens"], [6, 1])?;
+        let token_indices = graph.expand(token_rows, [6, 2])?;
+        let embeddings = graph.gather(table, token_indices, 0)?;
+        let target_indices = graph.reshape(inputs["targets"], [6, 1])?;
+        let selected = graph.gather(log_probabilities, target_indices, 1)?;
+        let embedding_loss = graph.sum_all(embeddings)?;
+        let target_loss = graph.sum_all(selected)?;
+        Ok((graph.add(embedding_loss, target_loss)?, BTreeMap::new()))
+    })
+    .unwrap()
+}
+
+#[test]
+fn frozen_host_token_gather_is_status_free_prevalidated_and_retryable() {
+    let raw_constant = CompiledAdamWPlan::compile(
+        CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_host_token_input("tokens", [2, 3])
+            .unwrap(),
+        [TrainingParameterInit::new("scale", TensorData::scalar(1.0)).unwrap()],
+        |graph, inputs, parameters| {
+            let table = graph.constant(
+                TensorData::new([4, 2], vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]).unwrap(),
+            );
+            let token_rows = graph.reshape(inputs["tokens"], [6, 1])?;
+            let indices = graph.expand(token_rows, [6, 2])?;
+            let gathered = graph.gather(table, indices, 0)?;
+            let gathered = graph.sum_all(gathered)?;
+            let scale = graph.square(parameters["scale"])?;
+            Ok((graph.add(gathered, scale)?, BTreeMap::new()))
+        },
+    )
+    .unwrap();
+    assert!(
+        raw_constant
+            .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+            .is_err(),
+        "an arbitrary raw-program constant must not authorize a forward-only Gather"
+    );
+
+    let module = FrozenHostTokenModule::new();
+    let multiple = CompiledAdamWPlan::compile_module(
+        CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_host_token_input("tokens", [2, 3])
+            .unwrap()
+            .with_frozen_parameters(["table"])
+            .unwrap(),
+        &module,
+        |module, graph, inputs| {
+            let table = module.table.bind(graph)?;
+            let first_rows = graph.reshape(inputs["tokens"], [6, 1])?;
+            let first_indices = graph.expand(first_rows, [6, 2])?;
+            let first = graph.gather(table, first_indices, 0)?;
+            let second_rows = graph.reshape(inputs["tokens"], [6, 1])?;
+            let second_indices = graph.expand(second_rows, [6, 2])?;
+            let second = graph.gather(table, second_indices, 0)?;
+            let first = graph.sum_all(first)?;
+            let second = graph.sum_all(second)?;
+            let gathered = graph.add(first, second)?;
+            let trained = module.log_probabilities.bind(graph)?;
+            let trained = graph.square(trained)?;
+            let trained = graph.sum_all(trained)?;
+            Ok((graph.add(gathered, trained)?, BTreeMap::new()))
+        },
+    )
+    .unwrap();
+    assert!(
+        multiple
+            .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+            .is_err(),
+        "multiple compatible frozen-parameter Gathers must remain ambiguous"
+    );
+
+    let paired_and_frozen = CompiledAdamWPlan::compile_module(
+        CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_host_token_input("tokens", [2, 3])
+            .unwrap()
+            .with_frozen_parameters(["table"])
+            .unwrap(),
+        &module,
+        |module, graph, inputs| {
+            let table = module.table.bind(graph)?;
+            let frozen_rows = graph.reshape(inputs["tokens"], [6, 1])?;
+            let frozen_indices = graph.expand(frozen_rows, [6, 2])?;
+            let frozen = graph.gather(table, frozen_indices, 0)?;
+            let log_probabilities = module.log_probabilities.bind(graph)?;
+            let paired_indices = graph.reshape(inputs["tokens"], [6, 1])?;
+            let paired = graph.gather(log_probabilities, paired_indices, 1)?;
+            let frozen = graph.sum_all(frozen)?;
+            let paired = graph.sum_all(paired)?;
+            Ok((graph.add(frozen, paired)?, BTreeMap::new()))
+        },
+    )
+    .unwrap();
+    assert!(
+        paired_and_frozen
+            .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+            .is_err(),
+        "one declaration must not select between eligible paired and frozen-forward proofs"
+    );
+
+    let table_before = module.table.snapshot().unwrap();
+    let plan = compiled_frozen_host_token_plan(&module);
+    let cpu_checkpoint = plan.prepare_cpu().unwrap().checkpoint().unwrap();
+    let metal_plan = plan
+        .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())
+        .unwrap();
+    assert_eq!(metal_plan.summary().fallback_count, 0);
+    assert_eq!(
+        metal_plan
+            .rendered_items()
+            .filter(|item| item.entry == "rg_metal_host_gather_fixed_f32_i32")
+            .count(),
+        1,
+        "the frozen table must own exactly one forward-only Gather"
+    );
+    assert_eq!(
+        metal_plan
+            .rendered_items()
+            .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
+            .count(),
+        2,
+        "the trainable target table must retain its exact Gather/VJP pair"
+    );
+    assert!(metal_plan.rendered_items().all(|item| {
+        item.transaction.is_none()
+            && item.indexed_movement().is_none()
+            && !item.source.contains("rg_status")
+    }));
+
+    let mock = Arc::new(MockDispatch::default());
+    let context = MetalScoreboardContext::new(
+        "compiled-frozen-host-token",
+        "test-revision",
+        "semantic mock",
+    )
+    .unwrap();
+    let mut metal = metal_plan
+        .prepare_with_scoreboard(test_device(mock.clone()), context)
+        .unwrap();
+    mock.clear_calls();
+    let initial_checkpoint = metal.checkpoint().unwrap();
+    let initial_scoreboard = metal.execution_scoreboard_report().unwrap();
+    assert_eq!(initial_checkpoint, cpu_checkpoint);
+    mock.clear_calls();
+    for position in 0..6 {
+        for invalid in [-1, 4] {
+            let mut tokens = [0, 1, 2, 2, 0, 1];
+            tokens[position] = invalid;
+            let mut inputs = host_token_and_target_batch([0, 1, 2, 3, 2, 1]);
+            inputs.insert(
+                "tokens".into(),
+                TensorData::from_scalars(
+                    [2, 3],
+                    DType::I32,
+                    tokens.into_iter().map(|value| Scalar::I(i64::from(value))),
+                )
+                .unwrap(),
+            );
+            assert!(
+                metal.step(inputs, TensorData::scalar(0.01)).is_err(),
+                "every invalid frozen-table token lane must reject before driver work"
+            );
+            assert!(mock.calls().is_empty());
+            assert_eq!(metal.step_count(), 0);
+            assert_eq!(metal.optimizer_step().unwrap(), 0);
+            assert!(!metal.metal_session().state_epoch());
+            assert_eq!(metal.checkpoint().unwrap(), initial_checkpoint);
+            assert_eq!(
+                metal.execution_scoreboard_report().unwrap(),
+                initial_scoreboard
+            );
+            mock.clear_calls();
+        }
+    }
+
+    let valid = host_token_and_target_batch([0, 1, 2, 3, 2, 1]);
+    let mut cpu = plan.prepare_cpu().unwrap();
+    let expected = cpu.step(valid.clone(), TensorData::scalar(0.01)).unwrap();
+    let actual = metal.step(valid, TensorData::scalar(0.01)).unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+    assert_eq!(actual.report().command_submission_count, 1);
+    assert_eq!(actual.report().command_wait_count, 1);
+    assert!(mock.calls().iter().all(|call| !call.contains("status")));
+    let table_after = module.table.snapshot().unwrap();
+    assert_eq!(table_after.data, table_before.data);
+    assert_eq!(table_after.version, table_before.version);
+    assert_eq!(table_after.identity, table_before.identity);
+    assert!(table_after.trainable);
+}
+
 #[test]
 fn host_token_authentication_rejects_compatible_independent_index_pair() {
     let mut graph = Graph::new();

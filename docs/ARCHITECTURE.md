@@ -997,6 +997,17 @@ optimizer-owned recurrent inputs, tied handles share that one node/state tuple,
 and frozen parameters or buffers become immutable capture constants.
 `compile_module_from_checkpoint` rebuilds the same module topology and requires
 its frozen values and graph to reproduce the authenticated capture identity.
+`CompiledAdamWConfig::with_frozen_parameters` projects a deterministic set of
+exact canonical module names out of that optimizer frontier at compile time.
+Resolution happens by `ParameterId`, so a canonical tied weight and every alias
+become one immutable capture constant without changing the module's trainable
+flags. Policy-frozen identities are absent from reverse-mode targets and the
+shared global clip norm, moments, gradient accumulators, recurrent state,
+checkpoints, and publication. Unknown names, later tied aliases, already-frozen
+parameters, buffers, duplicates, and
+an all-frozen module reject before graph construction. Detached
+`TrainingParameterInit` compilation rejects a nonempty name policy because it
+has no module traversal with which to authenticate canonical identity.
 `CompiledAdamWConfig::with_weight_decay_exclusions` accumulates a deterministic
 set of exact canonical trainable names. The existing `ModuleParameterPlan`
 traversal validates that set before graph construction, rejecting unknown

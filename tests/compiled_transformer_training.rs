@@ -1921,6 +1921,181 @@ fn compiled_transformer_plan_is_strictly_renderable_for_metal() {
 }
 
 #[test]
+fn compiled_transformer_freezing_reduces_the_authenticated_cpu_and_metal_frontier() {
+    let policy = config().with_frozen_parameters(["block.ff1.0"]).unwrap();
+    assert_eq!(
+        policy.frozen_parameters().collect::<Vec<_>>(),
+        ["block.ff1.0"]
+    );
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let frozen_weight = model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .find_map(|(name, parameter)| (name == "block.ff1.0").then_some(parameter))
+        .unwrap();
+    let frozen_before = frozen_weight.snapshot().unwrap();
+    let compiled = CompiledAdamWPlan::compile_module_with_dropout(
+        policy.clone(),
+        dropout_config(),
+        &model,
+        build,
+    )
+    .unwrap();
+    let mut cpu = compiled.prepare_cpu().unwrap();
+    let parameters = cpu.parameter_snapshots().unwrap();
+    assert_eq!(parameters.len(), 18);
+    assert!(!parameters.contains_key("block.ff1.0"));
+    assert!(parameters.contains_key("tokens.weight"));
+    assert!(!parameters.contains_key("lm_head.weight"));
+    assert!(
+        !cpu.first_moment_snapshots()
+            .unwrap()
+            .contains_key("block.ff1.0")
+    );
+    assert!(
+        !cpu.second_moment_snapshots()
+            .unwrap()
+            .contains_key("block.ff1.0")
+    );
+    assert!(
+        !cpu.gradient_accumulator_snapshots()
+            .unwrap()
+            .contains_key("block.ff1.0")
+    );
+    cpu.step(batch(1), learning_rate()).unwrap();
+    let checkpoint = cpu.checkpoint().unwrap();
+    let frozen_after = frozen_weight.snapshot().unwrap();
+    assert_eq!(frozen_after.data, frozen_before.data);
+    assert_eq!(frozen_after.version, frozen_before.version);
+    assert_eq!(frozen_after.identity, frozen_before.identity);
+    assert!(frozen_after.trainable);
+
+    let fresh = TinyCausalTransformer::new(7).unwrap();
+    let resumed = CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+        policy,
+        dropout_config(),
+        &fresh,
+        &checkpoint,
+        build,
+    )
+    .unwrap()
+    .prepare_cpu()
+    .unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+    assert!(
+        CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+            config(),
+            dropout_config(),
+            &fresh,
+            &checkpoint,
+            build,
+        )
+        .is_err(),
+        "restore must authenticate the reduced parameter topology"
+    );
+
+    let metal = compiled.metal_plan(metal_renderer()).unwrap();
+    assert_eq!(metal.summary().fallback_count, 0);
+    assert_eq!(metal.summary().state_pair_count, 75);
+    assert_eq!(metal.summary().logical_state_bytes, 920);
+    assert_eq!(metal.summary().state_device_bytes, 1_840);
+}
+
+#[test]
+fn compiled_transformer_frozen_embedding_uses_one_forward_only_host_gather() {
+    let policy = config().with_frozen_parameters(["tokens.weight"]).unwrap();
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let tied_identity = model.tokens.weight.id();
+    let frozen_before = model.tokens.weight.snapshot().unwrap();
+    let compiled = CompiledAdamWPlan::compile_module_with_dropout(
+        policy.clone(),
+        dropout_config(),
+        &model,
+        build,
+    )
+    .unwrap();
+    let mut cpu = compiled.prepare_cpu().unwrap();
+    assert_eq!(cpu.parameter_snapshots().unwrap().len(), 18);
+    assert!(
+        !cpu.parameter_snapshots()
+            .unwrap()
+            .contains_key("tokens.weight")
+    );
+    assert!(
+        !cpu.first_moment_snapshots()
+            .unwrap()
+            .contains_key("tokens.weight")
+    );
+    assert!(
+        !cpu.second_moment_snapshots()
+            .unwrap()
+            .contains_key("tokens.weight")
+    );
+    assert!(
+        !cpu.gradient_accumulator_snapshots()
+            .unwrap()
+            .contains_key("tokens.weight")
+    );
+    cpu.step(batch(1), learning_rate()).unwrap();
+    let checkpoint = cpu.checkpoint().unwrap();
+    assert_eq!(model.tokens.weight.id(), tied_identity);
+    let frozen_after = model.tokens.weight.snapshot().unwrap();
+    assert_eq!(frozen_after.data, frozen_before.data);
+    assert_eq!(frozen_after.version, frozen_before.version);
+    assert_eq!(frozen_after.identity, frozen_before.identity);
+    assert!(frozen_after.trainable);
+
+    let metal = compiled.metal_plan(metal_renderer()).unwrap();
+    assert_eq!(metal.summary().fallback_count, 0);
+    assert_eq!(metal.summary().state_pair_count, 75);
+    assert_eq!(metal.summary().logical_state_bytes, 952);
+    assert_eq!(metal.summary().state_device_bytes, 1_904);
+    assert_eq!(
+        metal
+            .rendered_items()
+            .filter(|item| item.entry == "rg_metal_host_gather_fixed_f32_i32")
+            .count(),
+        1,
+        "the frozen embedding must retain exactly its forward Gather"
+    );
+    assert_eq!(
+        metal
+            .rendered_items()
+            .filter(|item| item.entry.starts_with("rg_metal_training_host_"))
+            .count(),
+        2,
+        "the target loss must retain its trainable Gather/ScatterAdd pair"
+    );
+    assert!(metal.rendered_items().all(|item| {
+        item.transaction.is_none()
+            && item.indexed_movement().is_none()
+            && !item.source.contains("rg_status")
+    }));
+
+    let fresh = TinyCausalTransformer::new(7).unwrap();
+    let resumed = CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+        policy,
+        dropout_config(),
+        &fresh,
+        &checkpoint,
+        build,
+    )
+    .unwrap();
+    let resumed_metal = resumed.metal_plan(metal_renderer()).unwrap();
+    assert_eq!(resumed_metal.summary().fallback_count, 0);
+    assert_eq!(resumed_metal.summary().state_pair_count, 75);
+    assert_eq!(
+        resumed.prepare_cpu().unwrap().checkpoint().unwrap(),
+        checkpoint
+    );
+    let restored_frozen = fresh.tokens.weight.snapshot().unwrap();
+    assert_eq!(restored_frozen.data, frozen_before.data);
+    assert_eq!(restored_frozen.version, frozen_before.version);
+    assert!(restored_frozen.trainable);
+}
+
+#[test]
 fn protected_live_metal_workflow_runs_the_exact_compiled_training_acceptance() {
     let workflow = include_str!("../.github/workflows/metal-live.yml");
     for required in [

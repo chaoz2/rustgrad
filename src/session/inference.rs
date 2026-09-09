@@ -64,6 +64,14 @@ pub(crate) struct CapturedHostIndexedMovement {
     pub(crate) provenance: crate::ir::GatherVjpProvenance,
 }
 
+/// Training-only proof selected independently for each fixed host-token
+/// declaration. A policy-frozen embedding owns only its forward Gather;
+/// trainable indexed data must retain the exact first-order VJP pair.
+enum CapturedTrainingHostIndexProofMode {
+    FrozenForwardGather(CapturedHostGather),
+    PairedVjp(Vec<CapturedHostIndexedMovement>),
+}
+
 fn captured_vjp_zero_is_exact(
     capture: &CapturedSchedule,
     provenance: &crate::ir::GatherVjpProvenance,
@@ -704,6 +712,122 @@ impl CapturedInference {
         Ok(self)
     }
 
+    /// Adds the compiled-training-only union of exact host-index proofs.
+    /// Ordinary trainable data requires its authenticated Gather/ScatterAdd
+    /// VJP pair. A forward-only Gather is admitted only when its data operand
+    /// is the exact graph constant created for a policy-frozen module
+    /// parameter; arbitrary constant and raw-parameter programs remain
+    /// ineligible.
+    pub(crate) fn with_authenticated_training_host_indices(
+        mut self,
+        declarations: &BTreeMap<String, Shape>,
+        frozen_parameter_nodes: &BTreeSet<NodeId>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        if declarations.is_empty() {
+            return Ok(self);
+        }
+        if !self.host_gathers.is_empty() || !self.host_indexed_movements.is_empty() {
+            return Err(CapturedInferenceError::Binding(
+                "training host-index policy is already authenticated".into(),
+            ));
+        }
+
+        // Retain the released all-trainable candidate, but inspect every
+        // declaration for a competing frozen-forward proof before returning
+        // it with its unchanged deployment identity.
+        let legacy_paired = self
+            .clone()
+            .with_authenticated_host_indexed_movements(declarations)
+            .ok();
+
+        let mut proofs = Vec::with_capacity(declarations.len());
+        let mut all_paired_only = true;
+        for (name, shape) in declarations {
+            let declaration = BTreeMap::from([(name.clone(), shape.clone())]);
+            let paired = self
+                .clone()
+                .with_authenticated_host_indexed_movements(&declaration)
+                .ok()
+                .map(|capture| {
+                    CapturedTrainingHostIndexProofMode::PairedVjp(capture.host_indexed_movements)
+                });
+            let frozen_forward = self
+                .clone()
+                .with_authenticated_fixed_host_gathers(&declaration)
+                .ok()
+                .and_then(|capture| {
+                    let [link] = capture.host_gathers.as_slice() else {
+                        return None;
+                    };
+                    let owners = self
+                        .capture
+                        .items
+                        .iter()
+                        .filter(|item| item.outputs.iter().any(|output| output.id == link.output))
+                        .collect::<Vec<_>>();
+                    let [owner] = owners.as_slice() else {
+                        return None;
+                    };
+                    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) =
+                        owner.kernel.operation()
+                    else {
+                        return None;
+                    };
+                    let crate::MovementKernelKind::Gather { input, .. } = &plan.kind else {
+                        return None;
+                    };
+                    frozen_parameter_nodes.contains(&input.node).then_some(
+                        CapturedTrainingHostIndexProofMode::FrozenForwardGather(link.clone()),
+                    )
+                });
+            match (paired, frozen_forward) {
+                (Some(_), Some(_)) => {
+                    return Err(CapturedInferenceError::Binding(format!(
+                        "training host-index input {name} has ambiguous authenticated proof modes"
+                    )));
+                }
+                (Some(proof), None) => proofs.push(proof),
+                (None, Some(proof)) => {
+                    all_paired_only = false;
+                    proofs.push(proof);
+                }
+                (None, None) => {
+                    return Err(CapturedInferenceError::Binding(format!(
+                        "training host-index input {name} has no authenticated proof mode"
+                    )));
+                }
+            }
+        }
+
+        if all_paired_only {
+            return legacy_paired.ok_or_else(|| {
+                CapturedInferenceError::Binding(
+                    "training host-index paired proof inventory is inconsistent".into(),
+                )
+            });
+        }
+
+        for proof in proofs {
+            match proof {
+                CapturedTrainingHostIndexProofMode::FrozenForwardGather(link) => {
+                    self.host_gathers.push(link);
+                }
+                CapturedTrainingHostIndexProofMode::PairedVjp(links) => {
+                    self.host_indexed_movements.extend(links);
+                }
+            }
+        }
+        self.host_gathers.sort_by_key(|link| link.output);
+        self.host_indexed_movements.sort_by_key(|link| link.output);
+        let mut hasher = DefaultHasher::new();
+        "rustgrad-captured-training-host-index-proof-v1".hash(&mut hasher);
+        self.identity.hash(&mut hasher);
+        self.host_gathers.hash(&mut hasher);
+        self.host_indexed_movements.hash(&mut hasher);
+        self.identity = hasher.finish();
+        Ok(self)
+    }
+
     /// Returns the deterministic capture plus resident-payload identity.
     pub const fn deployment_identity(&self) -> u64 {
         self.identity
@@ -917,13 +1041,14 @@ impl CapturedStatefulInference {
         Ok(self)
     }
 
-    pub(crate) fn with_authenticated_host_indexed_movements(
+    pub(crate) fn with_authenticated_training_host_indices(
         mut self,
         declarations: &BTreeMap<String, Shape>,
+        frozen_parameter_nodes: &BTreeSet<NodeId>,
     ) -> std::result::Result<Self, CapturedInferenceError> {
         self.inference = self
             .inference
-            .with_authenticated_host_indexed_movements(declarations)?;
+            .with_authenticated_training_host_indices(declarations, frozen_parameter_nodes)?;
         self.identity = captured_stateful_identity(
             self.inference.identity,
             self.public_output_count,
