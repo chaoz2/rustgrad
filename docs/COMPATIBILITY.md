@@ -118,6 +118,10 @@ PTX, OpenCL, Metal, and WebGPU consume validated signed `AffineView` reads direc
 
 | Capability | Status | Acceptance requirement |
 |---|---:|---|
+| Captured MultiStep learning rate for compiled AdamW | 🚧 | Opt-in immutable `CompiledMultiStepLr` derives each candidate update rate inside the graph from the existing recurrent completed-update Step. Interpreter/native CPU expose explicit no-LR scheduled step and partial-flush entrypoints through `CompiledScheduledAdamWRuntime`; wrong-mode calls reject atomically, capture identity authenticates checkpoint restoration policy, and strict Metal rejects scheduled planning before rendering or resources. It adds no recurrent state or checkpoint fields, while the default external-LR capture and APIs remain unchanged. |
+
+| Capability | Status | Acceptance requirement |
+|---|---:|---|
 | Compiled in-session evaluation | 🚧 | `CompiledModuleAdamWPlan::with_evaluation` attaches one pure fixed-shape evaluation capture to the exact owned training/module lifecycle. CPU evaluation binds current runtime parameter snapshots; strict Metal aliases the active epoch parameter bank with no trainable-parameter H2D/D2H. Evaluation changes no replay, optimizer, accumulator, dropout, checkpoint, module-version, epoch, or training-scoreboard state, and invalid inputs/device failures remain retryable. The maintained two-row Transformer evaluates its three fixed microbatches before consuming finish and checks the published module against that result. Dynamic evaluation shapes, independent evaluator ownership, validation dataloaders, distributed metrics, and asynchronous overlap remain out of scope. |
 
 | Capability | Status | Acceptance requirement |

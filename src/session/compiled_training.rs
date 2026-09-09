@@ -670,6 +670,94 @@ impl CompiledMomentumSgdConfig {
     }
 }
 
+/// An immutable learning-rate schedule captured by a compiled AdamW program.
+///
+/// The rate starts at `base` and is multiplied by `gamma` once for each
+/// milestone less than or equal to the number of already completed optimizer
+/// updates. Milestones are completed-update boundaries:
+/// milestone one first changes the second update, independently of microbatch
+/// accumulation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledMultiStepLr {
+    base: f32,
+    gamma: f32,
+    milestones: Vec<u64>,
+}
+
+impl CompiledMultiStepLr {
+    pub fn new(base: f32, gamma: f32, milestones: impl IntoIterator<Item = u64>) -> Result<Self> {
+        if !base.is_finite() || base < 0.0 {
+            return Err(training(
+                "compiled MultiStep learning-rate base must be finite and nonnegative",
+            ));
+        }
+        if !gamma.is_finite() || gamma < 0.0 {
+            return Err(training(
+                "compiled MultiStep learning-rate gamma must be finite and nonnegative",
+            ));
+        }
+        let milestones = milestones.into_iter().collect::<Vec<_>>();
+        if milestones
+            .iter()
+            .any(|milestone| *milestone == 0 || *milestone == u64::MAX)
+        {
+            return Err(training(
+                "compiled MultiStep learning-rate milestones must be positive and below u64::MAX",
+            ));
+        }
+        if milestones.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(training(
+                "compiled MultiStep learning-rate milestones must be strictly increasing",
+            ));
+        }
+        Ok(Self {
+            base,
+            gamma,
+            milestones,
+        })
+    }
+
+    pub fn base(&self) -> f32 {
+        self.base
+    }
+
+    pub fn gamma(&self) -> f32 {
+        self.gamma
+    }
+
+    pub fn milestones(&self) -> &[u64] {
+        &self.milestones
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum CompiledLearningRatePolicy {
+    External,
+    MultiStep(CompiledMultiStepLr),
+}
+
+impl CompiledLearningRatePolicy {
+    fn require_external(&self) -> Result<()> {
+        if matches!(self, Self::External) {
+            Ok(())
+        } else {
+            Err(training(
+                "compiled AdamW external learning-rate entrypoint requires external policy",
+            ))
+        }
+    }
+
+    fn require_scheduled(&self) -> Result<()> {
+        if matches!(self, Self::MultiStep(_)) {
+            Ok(())
+        } else {
+            Err(training(
+                "compiled AdamW scheduled learning-rate entrypoint requires compiled MultiStep policy",
+            ))
+        }
+    }
+}
+
 /// Static compilation policy for [`CpuCompiledAdamW`].
 #[derive(Clone, Debug)]
 pub struct CompiledAdamWConfig {
@@ -684,6 +772,7 @@ pub struct CompiledAdamWConfig {
     weight_decay_exclusions: BTreeSet<String>,
     inputs: BTreeMap<String, (Shape, DType)>,
     host_token_inputs: BTreeMap<String, Shape>,
+    learning_rate: CompiledLearningRatePolicy,
 }
 
 impl CompiledAdamWConfig {
@@ -711,6 +800,7 @@ impl CompiledAdamWConfig {
             weight_decay_exclusions: BTreeSet::new(),
             inputs: BTreeMap::new(),
             host_token_inputs: BTreeMap::new(),
+            learning_rate: CompiledLearningRatePolicy::External,
         })
     }
 
@@ -754,6 +844,14 @@ impl CompiledAdamWConfig {
         }
         self.loss_scale = scale;
         Ok(self)
+    }
+
+    /// Captures an immutable MultiStep learning-rate policy in the program.
+    /// Scheduled CPU replay then uses the explicit no-learning-rate methods;
+    /// the default remains a caller-supplied scalar on every replay.
+    pub fn with_captured_multi_step_lr(mut self, schedule: CompiledMultiStepLr) -> Self {
+        self.learning_rate = CompiledLearningRatePolicy::MultiStep(schedule);
+        self
     }
 
     /// Freezes exact canonical module parameter names for this compilation.
@@ -895,6 +993,13 @@ impl CompiledAdamWConfig {
 
     pub fn loss_scale(&self) -> f32 {
         self.loss_scale
+    }
+
+    pub fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
+        match &self.learning_rate {
+            CompiledLearningRatePolicy::External => None,
+            CompiledLearningRatePolicy::MultiStep(schedule) => Some(schedule),
+        }
     }
 
     pub fn inputs(&self) -> impl Iterator<Item = (&str, &Shape, DType)> {
@@ -2035,6 +2140,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
         gradients: &BTreeMap<String, NodeId>,
         states: &BTreeMap<RecurrentStateKey, NodeId>,
     ) -> Result<BTreeMap<RecurrentStateKey, NodeId>> {
+        let learning_rate = lower_adamw_learning_rate(&self.config, graph, learning_rate, states)?;
         if self.config.gradient_accumulation_steps == 1 {
             let gradients = clip_gradients_by_global_norm(&self.config, graph, gradients)?;
             return lower_adamw_update_candidates(
@@ -2118,6 +2224,35 @@ impl CompiledOptimizerProgram for AdamWProgram {
         }
         Ok(updates)
     }
+}
+
+fn lower_adamw_learning_rate(
+    config: &CompiledAdamWConfig,
+    graph: &mut Graph,
+    external_learning_rate: NodeId,
+    states: &BTreeMap<RecurrentStateKey, NodeId>,
+) -> Result<NodeId> {
+    let CompiledLearningRatePolicy::MultiStep(schedule) = &config.learning_rate else {
+        return Ok(external_learning_rate);
+    };
+    let step_key = RecurrentStateKey::adamw_global(AdamWGlobalState::Step);
+    let completed_step = states
+        .get(&step_key)
+        .copied()
+        .ok_or_else(|| training("compiled AdamW optimizer step state is absent"))?;
+    let mut learning_rate = scalar_f32(graph, schedule.base)?;
+    if schedule.milestones.is_empty() {
+        return Ok(learning_rate);
+    }
+    let gamma = scalar_f32(graph, schedule.gamma)?;
+    for milestone in &schedule.milestones {
+        let milestone =
+            graph.full_with_dtype(Shape::from([]), Scalar::U(*milestone), DType::U64)?;
+        let reached = graph.compare(CompareOp::Ge, completed_step, milestone)?;
+        let decayed = graph.mul(learning_rate, gamma)?;
+        learning_rate = graph.select(reached, decayed, learning_rate)?;
+    }
+    Ok(learning_rate)
 }
 
 fn clip_gradients_by_global_norm(
@@ -2250,6 +2385,7 @@ pub struct CompiledAdamWPlan {
     host_token_inputs: BTreeMap<String, Shape>,
     frozen_parameters: BTreeSet<String>,
     evaluation: Option<CompiledEvaluationPlan>,
+    learning_rate: CompiledLearningRatePolicy,
 }
 
 /// Resource-free AdamW plan paired with the exact module value used to build it.
@@ -2532,6 +2668,7 @@ pub struct CpuCompiledAdamW {
     host_token_inputs: BTreeMap<String, Shape>,
     frozen_parameters: BTreeSet<String>,
     evaluation: Option<CpuCompiledEvaluation>,
+    learning_rate: CompiledLearningRatePolicy,
 }
 
 /// Strict-native CPU AdamW session prepared from the same authenticated plan
@@ -2879,6 +3016,28 @@ pub trait CompiledAdamWFlushRuntime: CompiledAdamWRuntime {
 
     /// Stable identity of the authenticated auxiliary state transition.
     fn flush_capture_identity(&self) -> Option<u64>;
+}
+
+/// CPU capability for replaying AdamW with a captured learning-rate policy.
+///
+/// Metal deliberately does not implement this capability until it can admit
+/// the same policy without weakening strict planning.
+pub trait CompiledScheduledAdamWRuntime: CompiledAdamWRuntime {
+    type ScheduledFlush: CompiledAdamWFlush;
+
+    fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr>;
+
+    fn step_scheduled(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Step>;
+
+    fn step_batch_scheduled<B>(&mut self, batch: B) -> Result<Self::Step>
+    where
+        Self: Sized,
+        B: CompiledInputBatch,
+    {
+        self.step_scheduled(batch.into_compiled_inputs()?)
+    }
+
+    fn flush_partial_window_scheduled(&mut self) -> Result<Self::ScheduledFlush>;
 }
 
 /// Resource-free output of compiled training graph construction.
@@ -3566,6 +3725,8 @@ impl CompiledAdamWPartialFlushPlan {
             gradients.insert(name.clone(), graph.div(accumulator, divisor)?);
         }
         let gradients = clip_gradients_by_global_norm(config, &mut graph, &gradients)?;
+        let learning_rate =
+            lower_adamw_learning_rate(config, &mut graph, learning_rate, &state_nodes)?;
         let mut updates = lower_adamw_update_candidates(
             config,
             &mut graph,
@@ -3994,13 +4155,16 @@ impl CpuCompiledTrainingProgram {
         &self,
         executor: &CapturedReplayExecutor,
         vectorized: bool,
+        external_learning_rate: bool,
     ) -> Result<NativeCpuProgramPreparationReport> {
         let started = Instant::now();
         let mut provided = zero_inputs(&self.inputs)?;
-        provided.insert(
-            LEARNING_RATE_INPUT.to_owned(),
-            TensorData::zeros_with_dtype(Shape::from([]), DType::F32)?,
-        );
+        if external_learning_rate {
+            provided.insert(
+                LEARNING_RATE_INPUT.to_owned(),
+                TensorData::zeros_with_dtype(Shape::from([]), DType::F32)?,
+            );
+        }
         let trace = self
             .capture
             .prepare_recurrent_native(&self.runtime, &self.cursor, &provided, executor, vectorized)
@@ -4033,13 +4197,27 @@ impl CpuCompiledTrainingProgram {
         learning_rate: TensorData,
         injected_failure: Option<u64>,
     ) -> Result<CompiledTrainingStepResult> {
-        validate_step_inputs(&self.inputs, &inputs, &learning_rate)?;
+        self.step_inner_with_learning_rate(inputs, Some(learning_rate), injected_failure)
+    }
+
+    fn step_inner_with_learning_rate(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: Option<TensorData>,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledTrainingStepResult> {
+        validate_training_inputs(&self.inputs, &inputs)?;
+        if let Some(learning_rate) = &learning_rate {
+            validate_learning_rate(learning_rate)?;
+        }
         let next_step = self
             .step
             .checked_add(1)
             .ok_or_else(|| training("compiled training step overflow"))?;
         let mut provided = inputs;
-        provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
+        if let Some(learning_rate) = learning_rate {
+            provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
+        }
         let replay = self
             .capture
             .replay_recurrent(
@@ -4069,21 +4247,26 @@ impl CpuCompiledTrainingProgram {
         })
     }
 
-    fn step_native_inner(
+    fn step_native_inner_with_learning_rate(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
-        learning_rate: TensorData,
+        learning_rate: Option<TensorData>,
         executor: &CapturedReplayExecutor,
         vectorized: bool,
         injected_failure: Option<u64>,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
-        validate_step_inputs(&self.inputs, &inputs, &learning_rate)?;
+        validate_training_inputs(&self.inputs, &inputs)?;
+        if let Some(learning_rate) = &learning_rate {
+            validate_learning_rate(learning_rate)?;
+        }
         let next_step = self
             .step
             .checked_add(1)
             .ok_or_else(|| training("compiled training step overflow"))?;
         let mut provided = inputs;
-        provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
+        if let Some(learning_rate) = learning_rate {
+            provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
+        }
         let started = Instant::now();
         let replay = self
             .capture
@@ -4344,9 +4527,11 @@ impl CpuCompiledTrainingProgram {
     fn prepare_auxiliary_replay(
         &self,
         transition: &CompiledAdamWPartialFlushPlan,
-        learning_rate: TensorData,
+        learning_rate: Option<TensorData>,
     ) -> Result<CpuAuxiliaryReplay> {
-        validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
+        if let Some(learning_rate) = &learning_rate {
+            validate_learning_rate(learning_rate)?;
+        }
         let selected_buffers = transition
             .state_buffers
             .values()
@@ -4381,17 +4566,21 @@ impl CpuCompiledTrainingProgram {
         let next_main_cursor =
             MixedReplayCursor::resume(&self.capture, next_frontier).map_err(replay_error)?;
 
+        let mut provided = BTreeMap::new();
+        if let Some(learning_rate) = learning_rate {
+            provided.insert(LEARNING_RATE_INPUT.to_owned(), learning_rate);
+        }
         Ok(CpuAuxiliaryReplay {
             cursor,
             next_main_cursor,
-            provided: BTreeMap::from([(LEARNING_RATE_INPUT.to_owned(), learning_rate)]),
+            provided,
         })
     }
 
     fn replay_auxiliary_transition(
         &mut self,
         transition: &CompiledAdamWPartialFlushPlan,
-        learning_rate: TensorData,
+        learning_rate: Option<TensorData>,
         injected_failure: Option<u64>,
     ) -> Result<()> {
         let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
@@ -4420,12 +4609,13 @@ impl CpuCompiledTrainingProgram {
         transition: &CompiledAdamWPartialFlushPlan,
         executor: &CapturedReplayExecutor,
         vectorized: bool,
+        external_learning_rate: bool,
     ) -> Result<NativeCpuProgramPreparationReport> {
         let started = Instant::now();
-        let prepared = self.prepare_auxiliary_replay(
-            transition,
-            TensorData::zeros_with_dtype(Shape::from([]), DType::F32)?,
-        )?;
+        let learning_rate = external_learning_rate
+            .then(|| TensorData::zeros_with_dtype(Shape::from([]), DType::F32))
+            .transpose()?;
+        let prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
         let trace = transition
             .capture
             .prepare_recurrent_native(
@@ -4451,7 +4641,7 @@ impl CpuCompiledTrainingProgram {
     fn replay_auxiliary_transition_native(
         &mut self,
         transition: &CompiledAdamWPartialFlushPlan,
-        learning_rate: TensorData,
+        learning_rate: Option<TensorData>,
         executor: &CapturedReplayExecutor,
         vectorized: bool,
         successful_invocation: u64,
@@ -4653,6 +4843,7 @@ impl CompiledAdamWPlan {
         let loss_scale = config.loss_scale;
         let host_token_inputs = config.host_token_inputs.clone();
         let frozen_parameters = config.frozen_parameters.clone();
+        let learning_rate = config.learning_rate.clone();
         let inner = CompiledTrainingPlan::compile(
             AdamWProgram {
                 config: config.clone(),
@@ -4676,6 +4867,7 @@ impl CompiledAdamWPlan {
             host_token_inputs,
             frozen_parameters,
             evaluation: None,
+            learning_rate,
         })
     }
 
@@ -4758,6 +4950,7 @@ impl CompiledAdamWPlan {
         let loss_scale = config.loss_scale;
         let host_token_inputs = config.host_token_inputs.clone();
         let frozen_parameters = config.frozen_parameters.clone();
+        let learning_rate = config.learning_rate.clone();
         let workload = StateSpec::dropout_counter()?;
         let mut dropout_state = None;
         let mut frozen_parameter_nodes = BTreeSet::new();
@@ -4801,6 +4994,7 @@ impl CompiledAdamWPlan {
             host_token_inputs,
             frozen_parameters,
             evaluation: None,
+            learning_rate,
         })
     }
 
@@ -5029,6 +5223,7 @@ impl CompiledAdamWPlan {
                 .evaluation
                 .clone()
                 .map(|plan| CpuCompiledEvaluation { plan }),
+            learning_rate: self.learning_rate.clone(),
         })
     }
 
@@ -5063,6 +5258,14 @@ impl CompiledAdamWPlan {
     /// Renders the compiled program for strict Metal admission without
     /// creating device resources.
     pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
+        if matches!(
+            &self.learning_rate,
+            CompiledLearningRatePolicy::MultiStep(_)
+        ) {
+            return Err(training(
+                "compiled MultiStep learning-rate policy is currently CPU-only",
+            ));
+        }
         let inner = self.inner.metal_plan(
             renderer.clone(),
             &self.host_token_inputs,
@@ -5111,6 +5314,13 @@ impl CompiledAdamWPlan {
 
     pub fn loss_scale(&self) -> f32 {
         self.loss_scale
+    }
+
+    pub fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
+        match &self.learning_rate {
+            CompiledLearningRatePolicy::External => None,
+            CompiledLearningRatePolicy::MultiStep(schedule) => Some(schedule),
+        }
     }
 
     /// Returns the explicit compiled dropout policy, when present.
@@ -5341,6 +5551,10 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         self.plan.dropout_config()
     }
 
+    pub fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
+        self.plan.captured_multi_step_lr()
+    }
+
     pub fn evaluation_capture_identity(&self) -> Option<u64> {
         self.plan
             .evaluation
@@ -5361,6 +5575,27 @@ impl<M, R> CompiledModuleAdamWSession<M, R> {
     /// module without publishing any trained parameter values.
     pub fn into_module_without_publication(self) -> M {
         self.module
+    }
+}
+
+impl<M: Module, R: CompiledScheduledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
+    pub fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
+        self.runtime.captured_multi_step_lr()
+    }
+
+    pub fn step_scheduled(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<R::Step> {
+        self.runtime.step_scheduled(inputs)
+    }
+
+    pub fn step_batch_scheduled<B>(&mut self, batch: B) -> Result<R::Step>
+    where
+        B: CompiledInputBatch,
+    {
+        self.runtime.step_batch_scheduled(batch)
+    }
+
+    pub fn flush_partial_window_scheduled(&mut self) -> Result<R::ScheduledFlush> {
+        self.runtime.flush_partial_window_scheduled()
     }
 }
 
@@ -5589,16 +5824,45 @@ impl CpuCompiledAdamW {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<CompiledAdamWStepResult> {
+        self.learning_rate.require_external()?;
+        self.step_with_learning_rate(inputs, Some(learning_rate), None)
+    }
+
+    /// Replays one batch using the immutable MultiStep rate captured in the
+    /// program. This method accepts no host learning-rate value.
+    pub fn step_scheduled(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<CompiledAdamWStepResult> {
+        self.learning_rate.require_scheduled()?;
+        self.step_with_learning_rate(inputs, None, None)
+    }
+
+    fn step_with_learning_rate(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: Option<TensorData>,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledAdamWStepResult> {
         let next = self
             .progress
             .advance_replay(self.gradient_accumulation_steps)?;
         if let Some(dropout) = self.dropout {
             expected_dropout_counter(dropout, next.replay_step)?;
         }
-        let mut result = self.inner.step(inputs, learning_rate)?;
+        let mut result =
+            self.inner
+                .step_inner_with_learning_rate(inputs, learning_rate, injected_failure)?;
         result.step = next.replay_step;
         self.progress = next;
         Ok(adamw_step_result(result, next))
+    }
+
+    pub fn step_batch_scheduled<B>(&mut self, batch: B) -> Result<CompiledAdamWStepResult>
+    where
+        B: CompiledInputBatch,
+    {
+        self.step_scheduled(batch.into_compiled_inputs()?)
     }
 
     pub fn evaluate(
@@ -5634,6 +5898,13 @@ impl CpuCompiledAdamW {
 
     pub fn loss_scale(&self) -> f32 {
         self.loss_scale
+    }
+
+    pub fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
+        match &self.learning_rate {
+            CompiledLearningRatePolicy::External => None,
+            CompiledLearningRatePolicy::MultiStep(schedule) => Some(schedule),
+        }
     }
 
     /// Explicit diagnostic snapshot of the recurrent dropout counter.
@@ -5721,7 +5992,23 @@ impl CpuCompiledAdamW {
         &mut self,
         learning_rate: TensorData,
     ) -> Result<CompiledAdamWFlushResult> {
-        validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
+        self.learning_rate.require_external()?;
+        self.flush_partial_window_with_learning_rate(Some(learning_rate), None)
+    }
+
+    pub fn flush_partial_window_scheduled(&mut self) -> Result<CompiledAdamWFlushResult> {
+        self.learning_rate.require_scheduled()?;
+        self.flush_partial_window_with_learning_rate(None, None)
+    }
+
+    fn flush_partial_window_with_learning_rate(
+        &mut self,
+        learning_rate: Option<TensorData>,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledAdamWFlushResult> {
+        if let Some(learning_rate) = &learning_rate {
+            validate_learning_rate(learning_rate)?;
+        }
         let (next, result) = self
             .progress
             .flush_partial(self.gradient_accumulation_steps)?;
@@ -5733,7 +6020,7 @@ impl CpuCompiledAdamW {
             .as_ref()
             .ok_or_else(|| training("compiled AdamW partial flush capture is absent"))?;
         self.inner
-            .replay_auxiliary_transition(transition, learning_rate, None)?;
+            .replay_auxiliary_transition(transition, learning_rate, injected_failure)?;
         self.progress = next;
         Ok(result)
     }
@@ -5785,6 +6072,7 @@ impl CpuCompiledAdamW {
                 .evaluation
                 .as_ref()
                 .map(|evaluation| evaluation.plan.clone()),
+            learning_rate: self.learning_rate.clone(),
         }
         .metal_plan(renderer)
     }
@@ -5840,18 +6128,7 @@ impl CpuCompiledAdamW {
         learning_rate: TensorData,
         injected_failure: Option<u64>,
     ) -> Result<CompiledAdamWStepResult> {
-        let next = self
-            .progress
-            .advance_replay(self.gradient_accumulation_steps)?;
-        if let Some(dropout) = self.dropout {
-            expected_dropout_counter(dropout, next.replay_step)?;
-        }
-        let mut result = self
-            .inner
-            .step_inner(inputs, learning_rate, injected_failure)?;
-        result.step = next.replay_step;
-        self.progress = next;
-        Ok(adamw_step_result(result, next))
+        self.step_with_learning_rate(inputs, Some(learning_rate), injected_failure)
     }
 
     #[cfg(test)]
@@ -5860,21 +6137,7 @@ impl CpuCompiledAdamW {
         learning_rate: TensorData,
         injected_failure: Option<u64>,
     ) -> Result<CompiledAdamWFlushResult> {
-        validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
-        let (next, result) = self
-            .progress
-            .flush_partial(self.gradient_accumulation_steps)?;
-        if !result.did_update() {
-            return Ok(result);
-        }
-        let transition = self
-            .partial_flush
-            .as_ref()
-            .ok_or_else(|| training("compiled AdamW partial flush capture is absent"))?;
-        self.inner
-            .replay_auxiliary_transition(transition, learning_rate, injected_failure)?;
-        self.progress = next;
-        Ok(result)
+        self.flush_partial_window_with_learning_rate(Some(learning_rate), injected_failure)
     }
 }
 
@@ -5884,14 +6147,21 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         executor: &'a CapturedReplayExecutor,
         vectorized: bool,
     ) -> Result<Self> {
-        let main = inner.inner.prepare_native(executor, vectorized)?;
+        let external_learning_rate =
+            matches!(&inner.learning_rate, CompiledLearningRatePolicy::External);
+        let main = inner
+            .inner
+            .prepare_native(executor, vectorized, external_learning_rate)?;
         let partial_flush = inner
             .partial_flush
             .as_ref()
             .map(|transition| {
-                inner
-                    .inner
-                    .prepare_native_auxiliary_transition(transition, executor, vectorized)
+                inner.inner.prepare_native_auxiliary_transition(
+                    transition,
+                    executor,
+                    vectorized,
+                    external_learning_rate,
+                )
             })
             .transpose()?;
         let evaluation = inner
@@ -5937,13 +6207,22 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
-        self.step_inner(inputs, learning_rate, None)
+        self.inner.learning_rate.require_external()?;
+        self.step_with_learning_rate(inputs, Some(learning_rate), None)
     }
 
-    fn step_inner(
+    pub fn step_scheduled(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
-        learning_rate: TensorData,
+    ) -> Result<NativeCpuCompiledAdamWStepResult> {
+        self.inner.learning_rate.require_scheduled()?;
+        self.step_with_learning_rate(inputs, None, None)
+    }
+
+    fn step_with_learning_rate(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: Option<TensorData>,
         injected_failure: Option<u64>,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
         let next = self
@@ -5957,7 +6236,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .successful_steps
             .checked_add(1)
             .ok_or_else(|| training("compiled native CPU run count overflow"))?;
-        let (mut result, mut report) = self.inner.inner.step_native_inner(
+        let (mut result, mut report) = self.inner.inner.step_native_inner_with_learning_rate(
             inputs,
             learning_rate,
             self.executor,
@@ -5972,6 +6251,23 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             inner: adamw_step_result(result, next),
             report,
         })
+    }
+
+    pub fn step_batch_scheduled<B>(&mut self, batch: B) -> Result<NativeCpuCompiledAdamWStepResult>
+    where
+        B: CompiledInputBatch,
+    {
+        self.step_scheduled(batch.into_compiled_inputs()?)
+    }
+
+    #[cfg(test)]
+    fn step_inner(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<NativeCpuCompiledAdamWStepResult> {
+        self.step_with_learning_rate(inputs, Some(learning_rate), injected_failure)
     }
 
     pub fn evaluate(
@@ -6002,15 +6298,23 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         &mut self,
         learning_rate: TensorData,
     ) -> Result<NativeCpuCompiledAdamWFlushResult> {
-        self.flush_partial_window_impl(learning_rate, None)
+        self.inner.learning_rate.require_external()?;
+        self.flush_partial_window_impl(Some(learning_rate), None)
+    }
+
+    pub fn flush_partial_window_scheduled(&mut self) -> Result<NativeCpuCompiledAdamWFlushResult> {
+        self.inner.learning_rate.require_scheduled()?;
+        self.flush_partial_window_impl(None, None)
     }
 
     fn flush_partial_window_impl(
         &mut self,
-        learning_rate: TensorData,
+        learning_rate: Option<TensorData>,
         injected_failure: Option<u64>,
     ) -> Result<NativeCpuCompiledAdamWFlushResult> {
-        validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
+        if let Some(learning_rate) = &learning_rate {
+            validate_learning_rate(learning_rate)?;
+        }
         let (next, result) = self
             .inner
             .progress
@@ -6052,7 +6356,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         learning_rate: TensorData,
         injected_failure: u64,
     ) -> Result<NativeCpuCompiledAdamWFlushResult> {
-        self.flush_partial_window_impl(learning_rate, Some(injected_failure))
+        self.flush_partial_window_impl(Some(learning_rate), Some(injected_failure))
     }
 
     pub fn evaluation_capture_identity(&self) -> Option<u64> {
@@ -6069,6 +6373,10 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
 
     pub fn capture_identity(&self) -> u64 {
         self.inner.capture_identity()
+    }
+
+    pub fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
+        self.inner.captured_multi_step_lr()
     }
 
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
@@ -6189,6 +6497,22 @@ impl CompiledAdamWFlushRuntime for CpuCompiledAdamW {
     }
 }
 
+impl CompiledScheduledAdamWRuntime for CpuCompiledAdamW {
+    type ScheduledFlush = CompiledAdamWFlushResult;
+
+    fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
+        CpuCompiledAdamW::captured_multi_step_lr(self)
+    }
+
+    fn step_scheduled(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Step> {
+        CpuCompiledAdamW::step_scheduled(self, inputs)
+    }
+
+    fn flush_partial_window_scheduled(&mut self) -> Result<Self::ScheduledFlush> {
+        CpuCompiledAdamW::flush_partial_window_scheduled(self)
+    }
+}
+
 impl CompiledTrainingRuntime for NativeCpuCompiledAdamW<'_> {
     type Step = NativeCpuCompiledAdamWStepResult;
 
@@ -6288,6 +6612,22 @@ impl CompiledAdamWFlushRuntime for NativeCpuCompiledAdamW<'_> {
 
     fn flush_capture_identity(&self) -> Option<u64> {
         self.inner.flush_capture_identity()
+    }
+}
+
+impl CompiledScheduledAdamWRuntime for NativeCpuCompiledAdamW<'_> {
+    type ScheduledFlush = NativeCpuCompiledAdamWFlushResult;
+
+    fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
+        self.inner.captured_multi_step_lr()
+    }
+
+    fn step_scheduled(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Step> {
+        NativeCpuCompiledAdamW::step_scheduled(self, inputs)
+    }
+
+    fn flush_partial_window_scheduled(&mut self) -> Result<Self::ScheduledFlush> {
+        NativeCpuCompiledAdamW::flush_partial_window_scheduled(self)
     }
 }
 
@@ -6401,6 +6741,25 @@ where
 
     fn flush_capture_identity(&self) -> Option<u64> {
         self.runtime.flush_capture_identity()
+    }
+}
+
+impl<M, R> CompiledScheduledAdamWRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledScheduledAdamWRuntime,
+{
+    type ScheduledFlush = R::ScheduledFlush;
+
+    fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
+        self.runtime.captured_multi_step_lr()
+    }
+
+    fn step_scheduled(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Step> {
+        self.runtime.step_scheduled(inputs)
+    }
+
+    fn flush_partial_window_scheduled(&mut self) -> Result<Self::ScheduledFlush> {
+        self.runtime.flush_partial_window_scheduled()
     }
 }
 
@@ -8037,6 +8396,14 @@ fn validate_step_inputs(
     actual: &BTreeMap<String, TensorData>,
     learning_rate: &TensorData,
 ) -> Result<()> {
+    validate_training_inputs(expected, actual)?;
+    validate_learning_rate(learning_rate)
+}
+
+fn validate_training_inputs(
+    expected: &BTreeMap<String, (Shape, DType)>,
+    actual: &BTreeMap<String, TensorData>,
+) -> Result<()> {
     if actual.len() != expected.len() || actual.keys().ne(expected.keys()) {
         return Err(training("compiled training input names do not match"));
     }
@@ -8047,6 +8414,10 @@ fn validate_step_inputs(
         }
         checked_bytes(value)?;
     }
+    Ok(())
+}
+
+fn validate_learning_rate(learning_rate: &TensorData) -> Result<()> {
     if learning_rate.shape() != &Shape::from([]) || learning_rate.dtype() != DType::F32 {
         return Err(training(
             "compiled training learning rate must be rank-zero F32",
@@ -8942,6 +9313,39 @@ mod tests {
         let empty = native.flush_partial_window(lr()).unwrap();
         assert!(!empty.did_update());
         assert!(empty.report().is_none());
+    }
+
+    #[test]
+    fn native_cpu_compiled_multi_step_lr_matches_interpreter() {
+        let config = accumulated_adamw_config(3)
+            .with_captured_multi_step_lr(CompiledMultiStepLr::new(0.05, 0.5, [1]).unwrap());
+        let plan = CompiledAdamWPlan::compile(config, initial_parameters(), build_tinybob).unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut native = target.prepare(&plan).unwrap();
+        let mut interpreted = plan.prepare_cpu().unwrap();
+
+        let before = native.checkpoint().unwrap();
+        assert!(native.step(batch(), lr()).is_err());
+        assert_eq!(native.checkpoint().unwrap(), before);
+        for _ in 0..2 {
+            let actual = native.step_scheduled(batch()).unwrap();
+            let expected = interpreted.step_scheduled(batch()).unwrap();
+            assert_cross_engine_tensor_close("scheduled loss", actual.loss(), expected.loss());
+            assert_cross_engine_tensor_maps_close(
+                "scheduled outputs",
+                actual.outputs(),
+                expected.outputs(),
+            );
+        }
+        let actual = native.flush_partial_window_scheduled().unwrap();
+        let expected = interpreted.flush_partial_window_scheduled().unwrap();
+        assert_eq!(
+            actual.flushed_microbatches(),
+            expected.flushed_microbatches()
+        );
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_native_adamw_state_close(&native, &interpreted);
     }
 
     #[test]
@@ -11227,5 +11631,176 @@ mod tests {
             CpuCompiledAdamW::compile_from_checkpoint(adamw_config(), &checkpoint, build_tinybob,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn compiled_multi_step_lr_validates_immutable_schedule() {
+        let schedule = CompiledMultiStepLr::new(0.05, 0.25, [1, 3, 8]).unwrap();
+        assert_eq!(schedule.base(), 0.05);
+        assert_eq!(schedule.gamma(), 0.25);
+        assert_eq!(schedule.milestones(), &[1, 3, 8]);
+        assert!(CompiledMultiStepLr::new(f32::NAN, 0.5, []).is_err());
+        assert!(CompiledMultiStepLr::new(-0.1, 0.5, []).is_err());
+        assert!(CompiledMultiStepLr::new(0.1, f32::INFINITY, []).is_err());
+        assert!(CompiledMultiStepLr::new(0.1, -0.5, []).is_err());
+        assert!(CompiledMultiStepLr::new(0.1, 0.5, [0]).is_err());
+        assert!(CompiledMultiStepLr::new(0.1, 0.5, [1, 1]).is_err());
+        assert!(CompiledMultiStepLr::new(0.1, 0.5, [2, 1]).is_err());
+        assert!(CompiledMultiStepLr::new(0.1, 0.5, [u64::MAX]).is_err());
+    }
+
+    #[test]
+    fn compiled_multi_step_lr_matches_external_updates_flush_and_restore() {
+        let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1, 2]).unwrap();
+        let scheduled_config =
+            accumulated_adamw_config(2).with_captured_multi_step_lr(schedule.clone());
+        assert_eq!(scheduled_config.captured_multi_step_lr(), Some(&schedule));
+        let mut scheduled = CpuCompiledAdamW::compile(
+            scheduled_config.clone(),
+            initial_parameters(),
+            build_tinybob,
+        )
+        .unwrap();
+        let mut external = CpuCompiledAdamW::compile(
+            accumulated_adamw_config(2),
+            initial_parameters(),
+            build_tinybob,
+        )
+        .unwrap();
+        assert_eq!(scheduled.captured_multi_step_lr(), Some(&schedule));
+        assert_eq!(external.captured_multi_step_lr(), None);
+        assert_ne!(scheduled.capture_identity(), external.capture_identity());
+        assert!(
+            !scheduled
+                .inner
+                .capture
+                .schedule
+                .inputs
+                .iter()
+                .any(|input| input.name == LEARNING_RATE_INPUT)
+        );
+        assert!(
+            external
+                .inner
+                .capture
+                .schedule
+                .inputs
+                .iter()
+                .any(|input| input.name == LEARNING_RATE_INPUT)
+        );
+        assert!(
+            !scheduled
+                .partial_flush
+                .as_ref()
+                .unwrap()
+                .capture
+                .schedule
+                .inputs
+                .iter()
+                .any(|input| input.name == LEARNING_RATE_INPUT)
+        );
+        assert!(
+            external
+                .partial_flush
+                .as_ref()
+                .unwrap()
+                .capture
+                .schedule
+                .inputs
+                .iter()
+                .any(|input| input.name == LEARNING_RATE_INPUT)
+        );
+
+        let scheduled_before = scheduled.checkpoint().unwrap();
+        assert!(scheduled.step(batch(), TensorData::scalar(0.05)).is_err());
+        assert_eq!(scheduled.checkpoint().unwrap(), scheduled_before);
+        let external_before = external.checkpoint().unwrap();
+        assert!(external.step_scheduled(batch()).is_err());
+        assert_eq!(external.checkpoint().unwrap(), external_before);
+
+        for external_rate in [0.05, 0.05, 0.025] {
+            let actual = scheduled.step_scheduled(batch()).unwrap();
+            let expected = external
+                .step(batch(), TensorData::scalar(external_rate))
+                .unwrap();
+            assert_eq!(actual.loss(), expected.loss());
+            assert_eq!(actual.outputs(), expected.outputs());
+            assert_eq!(actual.did_update(), expected.did_update());
+        }
+        let scheduled_before_wrong_flush = scheduled.checkpoint().unwrap();
+        assert!(
+            scheduled
+                .flush_partial_window(TensorData::scalar(0.025))
+                .is_err()
+        );
+        assert_eq!(
+            scheduled.checkpoint().unwrap(),
+            scheduled_before_wrong_flush
+        );
+        let actual = scheduled.flush_partial_window_scheduled().unwrap();
+        let expected = external
+            .flush_partial_window(TensorData::scalar(0.025))
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(scheduled.checkpoint().unwrap().info().optimizer_step(), 2);
+        assert_eq!(
+            scheduled.parameter_snapshots().unwrap(),
+            external.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            scheduled.first_moment_snapshots().unwrap(),
+            external.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            scheduled.second_moment_snapshots().unwrap(),
+            external.second_moment_snapshots().unwrap()
+        );
+
+        let checkpoint = scheduled.checkpoint().unwrap();
+        let mut resumed = CpuCompiledAdamW::compile_from_checkpoint(
+            scheduled_config.clone(),
+            &checkpoint,
+            build_tinybob,
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let expected = scheduled.step_scheduled(batch()).unwrap();
+            let actual = resumed.step_scheduled(batch()).unwrap();
+            assert_eq!(actual.loss(), expected.loss());
+            assert_eq!(actual.outputs(), expected.outputs());
+        }
+        assert_eq!(
+            resumed.checkpoint().unwrap(),
+            scheduled.checkpoint().unwrap()
+        );
+        assert!(
+            CpuCompiledAdamW::compile_from_checkpoint(
+                accumulated_adamw_config(2),
+                &checkpoint,
+                build_tinybob,
+            )
+            .is_err()
+        );
+        let wrong_schedule = accumulated_adamw_config(2)
+            .with_captured_multi_step_lr(CompiledMultiStepLr::new(0.05, 0.5, [1, 3]).unwrap());
+        assert!(
+            CpuCompiledAdamW::compile_from_checkpoint(wrong_schedule, &checkpoint, build_tinybob)
+                .is_err()
+        );
+
+        let scheduled_plan =
+            CompiledAdamWPlan::compile(scheduled_config, initial_parameters(), build_tinybob)
+                .unwrap();
+        assert_eq!(scheduled_plan.captured_multi_step_lr(), Some(&schedule));
+        let renderer = MetalRenderer::new(
+            8,
+            crate::runtime::metal::MetalCapabilities {
+                max_buffer_length: 1 << 30,
+                unified_memory: true,
+                family: "Apple9".into(),
+            },
+        )
+        .unwrap();
+        assert!(scheduled_plan.metal_plan(renderer).is_err());
     }
 }

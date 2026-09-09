@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:9d85ed64549dca2e",
+  "source_fingerprint": "fnv1a64:4426a1b24c5c5dec",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -415,6 +415,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "Smooth unary/binary expressions, broadcasting, ordinary movement, sum/mean/product/max/min, gather/scatter-add, select value branches, generalized matmul/einsum, convolution, transpose convolution, compositional pooling, and fixed-size masked-select seed routing support graph-on-graph second derivatives. Third-order dedicated contractions/reductions/movement/convolution, broader masked-select differentiation, and replacement scatter remain explicit boundaries."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "Captured MultiStep learning rate for compiled AdamW",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "Opt-in immutable `CompiledMultiStepLr` derives each candidate update rate inside the graph from the existing recurrent completed-update Step. Interpreter/native CPU expose explicit no-LR scheduled step and partial-flush entrypoints through `CompiledScheduledAdamWRuntime`; wrong-mode calls reject atomically, capture identity authenticates checkpoint restoration policy, and strict Metal rejects scheduled planning before rendering or resources. It adds no recurrent state or checkpoint fields, while the default external-LR capture and APIs remain unchanged."
       }
     },
     {

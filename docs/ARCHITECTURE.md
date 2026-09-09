@@ -967,9 +967,19 @@ weight dropout remain unchanged.
 The Graph is discarded after compilation. `EffectRuntime` then solely owns the
 parameter and optimizer-state bytes, while `MixedReplayCursor` proves and advances the
 exact recurrent state frontier only after the complete effect batch commits.
-Every step accepts exact declared inputs plus one rank-zero F32 learning rate;
-all user input order is canonicalized by name before graph-free interpreter
-replay. Owned snapshots remain detached copies. The explicit, optimizer-neutral
+By default every step accepts exact declared inputs plus one rank-zero F32
+learning rate, preserving the historical capture byte-for-byte. AdamW may
+instead opt into immutable `CompiledMultiStepLr` policy: the graph derives the
+candidate update rate from its existing recurrent completed-update Step, with
+each strictly increasing positive milestone scaling the following update.
+Interpreter/native CPU expose the `CompiledScheduledAdamWRuntime` capability
+and explicit `step_scheduled`/`flush_partial_window_scheduled` entrypoints with
+no learning-rate argument; wrong-mode calls reject before state or progress can
+change. The schedule adds no recurrent state or checkpoint fields, and capture
+identity authenticates the complete policy on restore. Scheduled Metal
+planning rejects before rendering or resource preparation. All user input
+order is canonicalized by name before graph-free interpreter replay. Owned
+snapshots remain detached copies. The explicit, optimizer-neutral
 `CompiledTrainingRuntime::publish_parameters` composition takes only the
 canonical trainable snapshot and calls
 `Module::load_trainable_parameters_exact`: one complete traversal rejects
