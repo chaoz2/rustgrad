@@ -445,6 +445,245 @@ fn maintained_transformer_analytic_gradients(
         .collect()
 }
 
+struct AdamWOracleState {
+    parameters: BTreeMap<String, TensorData>,
+    first_moments: BTreeMap<String, TensorData>,
+    second_moments: BTreeMap<String, TensorData>,
+}
+
+struct AdamWOracleUpdate {
+    state: AdamWOracleState,
+    excluded_decay_counterfactuals: usize,
+    included_decay_counterfactuals: usize,
+}
+
+fn average_gradient_window(
+    gradients: &[BTreeMap<String, TensorData>],
+) -> BTreeMap<String, Vec<f32>> {
+    assert_eq!(gradients.len(), ACCUMULATION_STEPS as usize);
+    let names = gradients[0].keys().collect::<Vec<_>>();
+    for gradient in gradients.iter().skip(1) {
+        assert_eq!(gradient.keys().collect::<Vec<_>>(), names);
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let descriptor = &gradients[0][name];
+            assert_eq!(descriptor.dtype(), DType::F32);
+            for gradient in gradients.iter().skip(1) {
+                assert_eq!(gradient[name].shape(), descriptor.shape());
+                assert_eq!(gradient[name].dtype(), DType::F32);
+            }
+            let averaged = (0..descriptor.len())
+                .map(|coordinate| {
+                    let first = gradients[0][name].scalar_at(coordinate).as_f64() as f32;
+                    let second = gradients[1][name].scalar_at(coordinate).as_f64() as f32;
+                    let third = gradients[2][name].scalar_at(coordinate).as_f64() as f32;
+                    // Recurrent accumulation stores each F32 sum before the
+                    // next replay adds to it.
+                    ((first + second) + third) / ACCUMULATION_STEPS as f32
+                })
+                .collect();
+            (name.clone(), averaged)
+        })
+        .collect()
+}
+
+fn clip_gradient_window(
+    averaged: &BTreeMap<String, Vec<f32>>,
+    max_norm: f32,
+) -> (BTreeMap<String, Vec<f32>>, f32) {
+    let mut squared_norm = 0.0f32;
+    // Production first reduces each canonical parameter in lane order, then
+    // adds those subtotals in canonical parameter order.
+    for gradient in averaged.values() {
+        let parameter_squared_norm = gradient
+            .iter()
+            .fold(0.0f32, |subtotal, gradient| subtotal + gradient * gradient);
+        squared_norm += parameter_squared_norm;
+    }
+    let gradient_norm = squared_norm.sqrt();
+    let scale = max_norm / gradient_norm.max(max_norm);
+    let clipped = averaged
+        .iter()
+        .map(|(name, gradient)| {
+            (
+                name.clone(),
+                gradient.iter().map(|gradient| gradient * scale).collect(),
+            )
+        })
+        .collect();
+    (clipped, gradient_norm)
+}
+
+fn tensor_from_f32_lanes(
+    template: &TensorData,
+    lanes: impl IntoIterator<Item = f32>,
+) -> TensorData {
+    TensorData::from_scalars(
+        template.shape().clone(),
+        DType::F32,
+        lanes.into_iter().map(|value| Scalar::F(f64::from(value))),
+    )
+    .unwrap()
+}
+
+fn apply_adamw_oracle_recurrence(
+    previous: &AdamWOracleState,
+    gradients: &BTreeMap<String, Vec<f32>>,
+    optimizer: &CompiledAdamWConfig,
+    optimizer_step: u64,
+    learning_rate: f32,
+) -> AdamWOracleUpdate {
+    assert!(optimizer_step > 0);
+    assert_eq!(
+        previous.parameters.keys().collect::<Vec<_>>(),
+        gradients.keys().collect::<Vec<_>>()
+    );
+    let beta1 = optimizer.beta1();
+    let beta2 = optimizer.beta2();
+    let first_correction = 1.0 - beta1.powf(optimizer_step as f32);
+    let second_correction = 1.0 - beta2.powf(optimizer_step as f32);
+    let decay_factor = 1.0 - learning_rate * optimizer.weight_decay();
+    let exclusions = optimizer.weight_decay_exclusions().collect::<BTreeSet<_>>();
+    let mut parameters = BTreeMap::new();
+    let mut first_moments = BTreeMap::new();
+    let mut second_moments = BTreeMap::new();
+    let mut excluded_decay_counterfactuals = 0;
+    let mut included_decay_counterfactuals = 0;
+
+    for (name, previous_parameter) in &previous.parameters {
+        let previous_first = &previous.first_moments[name];
+        let previous_second = &previous.second_moments[name];
+        let excluded = exclusions.contains(name.as_str());
+        let mut next_parameters = Vec::with_capacity(previous_parameter.len());
+        let mut next_first_moments = Vec::with_capacity(previous_parameter.len());
+        let mut next_second_moments = Vec::with_capacity(previous_parameter.len());
+        for (coordinate, gradient) in gradients[name].iter().copied().enumerate() {
+            let retained_first = beta1 * previous_first.scalar_at(coordinate).as_f64() as f32;
+            let fresh_first = (1.0 - beta1) * gradient;
+            let next_first = retained_first + fresh_first;
+            let retained_second = beta2 * previous_second.scalar_at(coordinate).as_f64() as f32;
+            let gradient_squared = gradient * gradient;
+            let fresh_second = (1.0 - beta2) * gradient_squared;
+            let next_second = retained_second + fresh_second;
+            let corrected_first = next_first / first_correction;
+            let corrected_second = next_second / second_correction;
+            let root = corrected_second.sqrt();
+            let denominator = root + optimizer.eps();
+            let normalized = corrected_first / denominator;
+            let previous_parameter = previous_parameter.scalar_at(coordinate).as_f64() as f32;
+            let decayed = previous_parameter * decay_factor;
+            let scaled = learning_rate * normalized;
+            let without_decay = previous_parameter - scaled;
+            let with_decay = decayed - scaled;
+            if with_decay != without_decay {
+                if excluded {
+                    excluded_decay_counterfactuals += 1;
+                } else {
+                    included_decay_counterfactuals += 1;
+                }
+            }
+            next_parameters.push(if excluded { without_decay } else { with_decay });
+            next_first_moments.push(next_first);
+            next_second_moments.push(next_second);
+        }
+        parameters.insert(
+            name.clone(),
+            tensor_from_f32_lanes(previous_parameter, next_parameters),
+        );
+        first_moments.insert(
+            name.clone(),
+            tensor_from_f32_lanes(previous_first, next_first_moments),
+        );
+        second_moments.insert(
+            name.clone(),
+            tensor_from_f32_lanes(previous_second, next_second_moments),
+        );
+    }
+    AdamWOracleUpdate {
+        state: AdamWOracleState {
+            parameters,
+            first_moments,
+            second_moments,
+        },
+        excluded_decay_counterfactuals,
+        included_decay_counterfactuals,
+    }
+}
+
+fn assert_adamw_oracle_state(
+    window: u64,
+    expected: &AdamWOracleState,
+    actual_parameters: &BTreeMap<String, TensorData>,
+    actual_first_moments: &BTreeMap<String, TensorData>,
+    actual_second_moments: &BTreeMap<String, TensorData>,
+) {
+    const FIRST_MOMENT_TOLERANCE: f64 = 2e-6;
+    const SECOND_MOMENT_TOLERANCE: f64 = 2e-7;
+    const PARAMETER_TOLERANCE: f64 = 2e-5;
+
+    let parameter_names = expected.parameters.keys().collect::<Vec<_>>();
+    assert_eq!(
+        actual_parameters.keys().collect::<Vec<_>>(),
+        parameter_names
+    );
+    assert_eq!(
+        actual_first_moments.keys().collect::<Vec<_>>(),
+        parameter_names
+    );
+    assert_eq!(
+        actual_second_moments.keys().collect::<Vec<_>>(),
+        parameter_names
+    );
+    let mut coordinates_checked = 0;
+    for (name, expected_parameter) in &expected.parameters {
+        let expected_first = &expected.first_moments[name];
+        let expected_second = &expected.second_moments[name];
+        let actual_parameter = &actual_parameters[name];
+        let actual_first = &actual_first_moments[name];
+        let actual_second = &actual_second_moments[name];
+        for (actual, expected) in [
+            (actual_parameter, expected_parameter),
+            (actual_first, expected_first),
+            (actual_second, expected_second),
+        ] {
+            assert_eq!(actual.shape(), expected.shape());
+            assert_eq!(actual.dtype(), DType::F32);
+            assert_eq!(expected.dtype(), DType::F32);
+        }
+        for coordinate in 0..expected_parameter.len() {
+            for (kind, actual, expected, tolerance) in [
+                (
+                    "first moment",
+                    actual_first.scalar_at(coordinate).as_f64(),
+                    expected_first.scalar_at(coordinate).as_f64(),
+                    FIRST_MOMENT_TOLERANCE,
+                ),
+                (
+                    "second moment",
+                    actual_second.scalar_at(coordinate).as_f64(),
+                    expected_second.scalar_at(coordinate).as_f64(),
+                    SECOND_MOMENT_TOLERANCE,
+                ),
+                (
+                    "parameter",
+                    actual_parameter.scalar_at(coordinate).as_f64(),
+                    expected_parameter.scalar_at(coordinate).as_f64(),
+                    PARAMETER_TOLERANCE,
+                ),
+            ] {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "window {window} {name}[{coordinate}] {kind} mismatch: actual={actual}, expected={expected}"
+                );
+            }
+            coordinates_checked += 1;
+        }
+    }
+    assert_eq!(coordinates_checked, 64);
+}
+
 fn perturbed_parameter_bindings(
     bindings: &HashMap<String, TensorData>,
     input_name: &str,
@@ -1290,21 +1529,14 @@ fn compiled_transformer_active_global_clip_changes_the_first_window_update() {
 }
 
 #[test]
-fn compiled_transformer_first_accumulated_adamw_update_matches_analytic_reference() {
-    const FIRST_MOMENT_TOLERANCE: f64 = 2e-6;
-    const SECOND_MOMENT_TOLERANCE: f64 = 2e-7;
-    const PARAMETER_TOLERANCE: f64 = 2e-5;
-
+fn compiled_transformer_recurrent_adamw_updates_match_analytic_reference() {
     let model = TinyCausalTransformer::new(7).unwrap();
     let state_before = model.state_dict().unwrap();
     let parameter_state_before = module_parameter_state(&model);
     let tied_identity = model.tokens.weight.id();
     let frozen_before = model.frozen_scale.snapshot().unwrap();
     let optimizer = config();
-    let beta1 = optimizer.beta1();
-    let beta2 = optimizer.beta2();
-    let eps = optimizer.eps();
-    let weight_decay = optimizer.weight_decay();
+    assert_eq!(optimizer.loss_scale(), 128.0);
     let max_norm = optimizer.max_gradient_norm().unwrap();
     let exclusions = optimizer
         .weight_decay_exclusions()
@@ -1317,7 +1549,7 @@ fn compiled_transformer_first_accumulated_adamw_update_matches_analytic_referenc
     assert_eq!(exclusions, expected_exclusions);
 
     let plan = CompiledAdamWPlan::compile_module_with_dropout(
-        optimizer,
+        optimizer.clone(),
         dropout_config(),
         &model,
         build_with_dropout_observations,
@@ -1331,132 +1563,83 @@ fn compiled_transformer_first_accumulated_adamw_update_matches_analytic_referenc
     assert!(!initial_parameters.contains_key("lm_head.weight"));
     assert!(!initial_parameters.contains_key("frozen_scale"));
 
-    let mut masks = Vec::with_capacity(ACCUMULATION_STEPS as usize);
-    for replay in 1..=ACCUMULATION_STEPS {
-        let step = runtime.step(batch(replay), learning_rate()).unwrap();
-        masks.push(observed_dropout_masks(step.outputs()));
-        assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
-    }
-    assert_eq!(runtime.optimizer_step().unwrap(), 1);
-    assert_eq!(runtime.accumulation_index().unwrap(), 0);
-    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(36));
-
-    let gradients = masks
-        .into_iter()
-        .enumerate()
-        .map(|(index, masks)| {
-            maintained_transformer_analytic_gradients(&model, batch(index as u64 + 1), masks)
-        })
-        .collect::<Vec<_>>();
-    let mut averaged_gradients = BTreeMap::new();
-    let mut squared_norm = 0.0f32;
-    for name in initial_parameters.keys() {
-        let value = &gradients[0][name];
-        let averaged = (0..value.len())
-            .map(|coordinate| {
-                let first = gradients[0][name].scalar_at(coordinate).as_f64() as f32;
-                let second = gradients[1][name].scalar_at(coordinate).as_f64() as f32;
-                let third = gradients[2][name].scalar_at(coordinate).as_f64() as f32;
-                ((first + second) + third) / ACCUMULATION_STEPS as f32
-            })
-            .collect::<Vec<_>>();
-        let parameter_squared_norm = averaged
-            .iter()
-            .fold(0.0f32, |subtotal, gradient| subtotal + gradient * gradient);
-        squared_norm += parameter_squared_norm;
-        averaged_gradients.insert(name.clone(), averaged);
-    }
-    let gradient_norm = squared_norm.sqrt();
-    assert!(
-        gradient_norm > max_norm,
-        "the maintained fixture must activate clipping"
-    );
-    let clip_scale = max_norm / gradient_norm.max(max_norm);
-
-    let actual_parameters = runtime.parameter_snapshots().unwrap();
-    let actual_first_moments = runtime.first_moment_snapshots().unwrap();
-    let actual_second_moments = runtime.second_moment_snapshots().unwrap();
-    let parameter_names = initial_parameters.keys().collect::<Vec<_>>();
-    assert_eq!(
-        actual_parameters.keys().collect::<Vec<_>>(),
-        parameter_names
-    );
-    assert_eq!(
-        actual_first_moments.keys().collect::<Vec<_>>(),
-        parameter_names
-    );
-    assert_eq!(
-        actual_second_moments.keys().collect::<Vec<_>>(),
-        parameter_names
-    );
-    let learning_rate = learning_rate().scalar_at(0).as_f64() as f32;
-    let first_correction = 1.0 - beta1.powf(1.0);
-    let second_correction = 1.0 - beta2.powf(1.0);
-    let decay_factor = 1.0 - learning_rate * weight_decay;
-    let mut coordinates_checked = 0;
+    let learning_rate_value = learning_rate().scalar_at(0).as_f64() as f32;
     let mut excluded_decay_counterfactuals = 0;
     let mut included_decay_counterfactuals = 0;
-    for (name, initial) in &initial_parameters {
-        let excluded = exclusions.contains(name);
-        let actual_parameter = &actual_parameters[name];
-        let actual_first = &actual_first_moments[name];
-        let actual_second = &actual_second_moments[name];
-        for coordinate in 0..initial.len() {
-            let gradient = averaged_gradients[name][coordinate] * clip_scale;
-            let expected_first = (1.0 - beta1) * gradient;
-            let gradient_squared = gradient * gradient;
-            let expected_second = (1.0 - beta2) * gradient_squared;
-            let corrected_first = expected_first / first_correction;
-            let corrected_second = expected_second / second_correction;
-            let normalized = corrected_first / (corrected_second.sqrt() + eps);
-            let initial = initial.scalar_at(coordinate).as_f64() as f32;
-            let without_decay = initial - learning_rate * normalized;
-            let with_decay = initial * decay_factor - learning_rate * normalized;
-            let expected_parameter = if excluded { without_decay } else { with_decay };
-            let assert_close = |kind: &str, actual: f64, expected: f32, tolerance: f64| {
-                assert!(
-                    (actual - f64::from(expected)).abs() <= tolerance,
-                    "{name}[{coordinate}] {kind} mismatch: actual={actual}, expected={expected}"
-                );
-            };
-            assert_close(
-                "first moment",
-                actual_first.scalar_at(coordinate).as_f64(),
-                expected_first,
-                FIRST_MOMENT_TOLERANCE,
-            );
-            assert_close(
-                "second moment",
-                actual_second.scalar_at(coordinate).as_f64(),
-                expected_second,
-                SECOND_MOMENT_TOLERANCE,
-            );
-            assert_close(
-                "parameter",
-                actual_parameter.scalar_at(coordinate).as_f64(),
-                expected_parameter,
-                PARAMETER_TOLERANCE,
-            );
-            if with_decay != without_decay {
-                if excluded {
-                    excluded_decay_counterfactuals += 1;
-                } else {
-                    included_decay_counterfactuals += 1;
-                }
-            }
-            coordinates_checked += 1;
+    let oracle_model = TinyCausalTransformer::new(7).unwrap();
+    assert_eq!(oracle_model.state_dict().unwrap(), state_before);
+
+    for window in 1..=2 {
+        let previous = AdamWOracleState {
+            parameters: runtime.parameter_snapshots().unwrap(),
+            first_moments: runtime.first_moment_snapshots().unwrap(),
+            second_moments: runtime.second_moment_snapshots().unwrap(),
+        };
+        oracle_model
+            .load_trainable_parameters_exact(&previous.parameters)
+            .unwrap();
+        let first_replay = (window - 1) * ACCUMULATION_STEPS + 1;
+        let mut masks = Vec::with_capacity(ACCUMULATION_STEPS as usize);
+        for replay in first_replay..first_replay + ACCUMULATION_STEPS {
+            let step = runtime.step(batch(replay), learning_rate()).unwrap();
+            masks.push(observed_dropout_masks(step.outputs()));
+            assert_eq!(step.did_update(), replay == window * ACCUMULATION_STEPS);
         }
+        assert_eq!(runtime.step_count(), window * ACCUMULATION_STEPS);
+        assert_eq!(runtime.optimizer_step().unwrap(), window);
+        assert_eq!(runtime.accumulation_index().unwrap(), 0);
+        assert_eq!(runtime.dropout_block_counter().unwrap(), Some(window * 36));
+
+        let gradients = masks
+            .into_iter()
+            .enumerate()
+            .map(|(index, masks)| {
+                let replay = first_replay + index as u64;
+                maintained_transformer_analytic_gradients(&oracle_model, batch(replay), masks)
+            })
+            .collect::<Vec<_>>();
+        let averaged = average_gradient_window(&gradients);
+        let (clipped, gradient_norm) = clip_gradient_window(&averaged, max_norm);
+        assert!(gradient_norm.is_finite());
+        if window == 1 {
+            assert!(
+                gradient_norm > max_norm,
+                "the maintained first window must activate clipping"
+            );
+        }
+        let update = apply_adamw_oracle_recurrence(
+            &previous,
+            &clipped,
+            &optimizer,
+            window,
+            learning_rate_value,
+        );
+        excluded_decay_counterfactuals += update.excluded_decay_counterfactuals;
+        included_decay_counterfactuals += update.included_decay_counterfactuals;
+        assert_adamw_oracle_state(
+            window,
+            &update.state,
+            &runtime.parameter_snapshots().unwrap(),
+            &runtime.first_moment_snapshots().unwrap(),
+            &runtime.second_moment_snapshots().unwrap(),
+        );
+        assert!(
+            runtime
+                .gradient_accumulator_snapshots()
+                .unwrap()
+                .values()
+                .all(|value| value.to_vec_f64().into_iter().all(|lane| lane == 0.0))
+        );
     }
-    assert_eq!(coordinates_checked, 64);
+
+    assert_eq!(runtime.step_count(), 2 * ACCUMULATION_STEPS);
+    assert_eq!(runtime.optimizer_step().unwrap(), 2);
+    assert_eq!(runtime.accumulation_index().unwrap(), 0);
+    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(72));
     assert!(excluded_decay_counterfactuals > 0);
     assert!(included_decay_counterfactuals > 0);
-    assert!(
-        runtime
-            .gradient_accumulator_snapshots()
-            .unwrap()
-            .values()
-            .all(|value| value.to_vec_f64().into_iter().all(|lane| lane == 0.0))
-    );
+    assert!(!initial_parameters.contains_key("lm_head.weight"));
+    assert!(!initial_parameters.contains_key("frozen_scale"));
     assert_eq!(model.tokens.weight.id(), tied_identity);
     let frozen_after = model.frozen_scale.snapshot().unwrap();
     assert_eq!(frozen_after.data, frozen_before.data);
