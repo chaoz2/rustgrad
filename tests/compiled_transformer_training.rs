@@ -14,8 +14,9 @@ use rustgrad::{
     CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
     LossOptions, MetalCompiledAdamWPlan, Module, NativeCpuSessionTarget, NodeId, Op, Parameter,
     Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
-    cross_entropy, load_safetensors,
+    cross_entropy, load_safetensors, save_safetensors,
 };
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(target_os = "macos")]
 use std::{env, fs::OpenOptions, io::Write, path::PathBuf};
@@ -1508,16 +1509,28 @@ where
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
     let tied = resumed_model.tokens.weight.clone();
     let frozen = resumed_model.frozen_scale.clone();
-    let resumed_plan = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
+    let training_builds = Cell::new(0);
+    let evaluation_builds = Cell::new(0);
+    let resumed_plan = CompiledModuleAdamWPlan::compile_with_dropout(
         config(),
         dropout_config(),
         resumed_model,
-        &checkpoint,
-        build,
+        |model, graph, inputs, dropout| {
+            training_builds.set(training_builds.get() + 1);
+            build(model, graph, inputs, dropout)
+        },
     )
     .unwrap()
-    .with_evaluation(build_evaluation)
+    .with_evaluation(|model, graph, inputs| {
+        evaluation_builds.set(evaluation_builds.get() + 1);
+        build_evaluation(model, graph, inputs)
+    })
     .unwrap();
+    assert_eq!(training_builds.get(), 1);
+    assert_eq!(evaluation_builds.get(), 1);
+    let resumed_plan = resumed_plan.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(training_builds.get(), 1);
+    assert_eq!(evaluation_builds.get(), 1);
     assert_eq!(resumed_plan.capture_identity(), capture_identity);
     assert_eq!(resumed_plan.step_count(), 4);
     let mut resumed = prepare(resumed_plan).unwrap();
@@ -1721,6 +1734,127 @@ fn compiled_transformer_plan_cpu_target_decreases_loss_and_resumes_exactly() {
     assert!(
         evaluation.final_mean_sparse_loss < evaluation.initial_mean_sparse_loss,
         "compiled causal Transformer eval loss did not decrease: {evaluation:?}"
+    );
+}
+
+#[test]
+fn compiled_transformer_checkpoint_rebase_is_independent_and_owned_failure_is_recoverable() {
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let plan = compiled_transformer(&model);
+    let capture_identity = plan.capture_identity();
+    let flush_capture_identity = plan.flush_capture_identity();
+    let mut source = plan.prepare_cpu().unwrap();
+    for replay in 1..=2 {
+        source.step(batch(replay), learning_rate()).unwrap();
+    }
+    assert_eq!(source.zero_grad().unwrap().discarded_microbatches(), 2);
+    for replay in 3..=4 {
+        source.step(batch(replay), learning_rate()).unwrap();
+    }
+    let checkpoint_parameters = source.parameter_snapshots().unwrap();
+    let checkpoint = source.checkpoint().unwrap();
+
+    let first = plan.restore_checkpoint(&checkpoint).unwrap();
+    let second = plan.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(
+        plan.step_count(),
+        0,
+        "the source plan must remain unchanged"
+    );
+    for restored in [&first, &second] {
+        assert_eq!(restored.capture_identity(), capture_identity);
+        assert_eq!(restored.flush_capture_identity(), flush_capture_identity);
+        assert_eq!(restored.dropout_config(), Some(dropout_config()));
+        assert_eq!(restored.gradient_accumulation_steps(), ACCUMULATION_STEPS);
+        assert_eq!(restored.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
+        assert_eq!(restored.loss_scale(), 128.0);
+        assert_eq!(restored.step_count(), 4);
+    }
+
+    let mut first = first.prepare_cpu().unwrap();
+    let mut second = second.prepare_cpu().unwrap();
+    assert_eq!(first.checkpoint().unwrap(), checkpoint);
+    assert_eq!(second.checkpoint().unwrap(), checkpoint);
+    assert!(first.zero_grad().unwrap().did_discard());
+    assert_ne!(first.checkpoint().unwrap(), checkpoint);
+    assert_eq!(second.checkpoint().unwrap(), checkpoint);
+
+    let expected_flush = source.flush_partial_window(learning_rate()).unwrap();
+    let actual_flush = second.flush_partial_window(learning_rate()).unwrap();
+    assert_eq!(actual_flush.flushed_microbatches(), 2);
+    assert_eq!(
+        actual_flush.optimizer_step(),
+        expected_flush.optimizer_step()
+    );
+    assert_eq!(second.checkpoint().unwrap(), source.checkpoint().unwrap());
+
+    let (state, mut metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+    metadata.insert(
+        "capture_identity".into(),
+        capture_identity.wrapping_add(1).to_string(),
+    );
+    let malformed_identity =
+        CompiledAdamWCheckpoint::from_bytes(save_safetensors(&state, &metadata).unwrap()).unwrap();
+    let owned_model = TinyCausalTransformer::new(41).unwrap();
+    let tied = owned_model.tokens.weight.clone();
+    let tied_version = tied.version().unwrap();
+    let frozen = owned_model.frozen_scale.clone();
+    let frozen_before = frozen.snapshot().unwrap();
+    assert_ne!(
+        owned_model.tokens.weight.value().unwrap(),
+        checkpoint_parameters["tokens.weight"],
+        "the owned candidate must be initialized differently from the checkpoint"
+    );
+    let owned = owned_compiled_transformer(owned_model);
+    let evaluation_identity = owned.evaluation_capture_identity().unwrap();
+    let error = match owned.restore_checkpoint(&malformed_identity) {
+        Ok(_) => panic!("a mismatched capture identity restored"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .source_error()
+            .to_string()
+            .contains("capture identity mismatch")
+    );
+    assert_eq!(error.plan().capture_identity(), capture_identity);
+    assert_eq!(
+        error.plan().evaluation_capture_identity(),
+        Some(evaluation_identity)
+    );
+    let restored = error.into_plan().restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(
+        restored.evaluation_capture_identity(),
+        Some(evaluation_identity)
+    );
+    let mut restored = restored.prepare(&CpuSessionTarget::new()).unwrap();
+    assert_eq!(restored.checkpoint().unwrap(), checkpoint);
+    let before_evaluation = restored.checkpoint().unwrap();
+    let evaluated = restored.evaluate(batch(1)).unwrap();
+    assert_eq!(evaluated.capture_identity(), evaluation_identity);
+    assert_eq!(restored.checkpoint().unwrap(), before_evaluation);
+    let (restored_model, finished_checkpoint) = restored.finish_with_checkpoint().unwrap();
+    assert_eq!(finished_checkpoint, checkpoint);
+    assert_eq!(restored_model.tokens.weight.id(), tied.id());
+    assert_eq!(
+        restored_model.tokens.weight.version().unwrap(),
+        tied_version + 1
+    );
+    assert_eq!(
+        restored_model.tokens.weight.value().unwrap(),
+        checkpoint_parameters["tokens.weight"]
+    );
+    let frozen_after = restored_model.frozen_scale.snapshot().unwrap();
+    assert_eq!(frozen_after.data, frozen_before.data);
+    assert_eq!(frozen_after.version, frozen_before.version);
+    assert_eq!(frozen_after.identity, frozen_before.identity);
+    assert_eq!(frozen_after.trainable, frozen_before.trainable);
+    assert!(
+        !restored_model
+            .state_dict()
+            .unwrap()
+            .tensors()
+            .contains_key("lm_head.weight")
     );
 }
 
