@@ -17,6 +17,20 @@ pub trait SessionTarget<P> {
     fn prepare(&self, plan: P) -> std::result::Result<Self::Session, Self::Error>;
 }
 
+/// CPU admission policy for non-finite compiled-training transitions.
+///
+/// This is a runtime safety boundary rather than part of the captured program:
+/// accepted transitions, capture identities, and checkpoint bytes are identical
+/// under both policies.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CpuNonFinitePolicy {
+    /// Preserve historical IEEE propagation behavior.
+    #[default]
+    Propagate,
+    /// Reject a non-finite loss or F32 recurrent successor before state commit.
+    RejectTransition,
+}
+
 /// Graph-free CPU replay target for compiled training plans.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CpuSessionTarget;
@@ -26,7 +40,40 @@ impl CpuSessionTarget {
         Self
     }
 
+    /// Returns a configured CPU target without changing this historical unit
+    /// target's propagation behavior or source-compatible construction.
+    pub const fn with_non_finite_policy(
+        self,
+        policy: CpuNonFinitePolicy,
+    ) -> ConfiguredCpuSessionTarget {
+        ConfiguredCpuSessionTarget {
+            non_finite_policy: policy,
+        }
+    }
+
     /// Prepares a plan implemented for the CPU target.
+    pub fn prepare<P>(
+        &self,
+        plan: P,
+    ) -> std::result::Result<<Self as SessionTarget<P>>::Session, <Self as SessionTarget<P>>::Error>
+    where
+        Self: SessionTarget<P>,
+    {
+        <Self as SessionTarget<P>>::prepare(self, plan)
+    }
+}
+
+/// CPU session target carrying an explicit compiled-transition admission policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfiguredCpuSessionTarget {
+    non_finite_policy: CpuNonFinitePolicy,
+}
+
+impl ConfiguredCpuSessionTarget {
+    pub const fn non_finite_policy(&self) -> CpuNonFinitePolicy {
+        self.non_finite_policy
+    }
+
     pub fn prepare<P>(
         &self,
         plan: P,
@@ -48,6 +95,7 @@ impl CpuSessionTarget {
 pub struct NativeCpuSessionTarget<'a> {
     executor: &'a CapturedReplayExecutor,
     vectorized: bool,
+    non_finite_policy: CpuNonFinitePolicy,
 }
 
 impl<'a> NativeCpuSessionTarget<'a> {
@@ -55,6 +103,7 @@ impl<'a> NativeCpuSessionTarget<'a> {
         Self {
             executor,
             vectorized: false,
+            non_finite_policy: CpuNonFinitePolicy::Propagate,
         }
     }
 
@@ -69,6 +118,16 @@ impl<'a> NativeCpuSessionTarget<'a> {
 
     pub const fn is_vectorized(&self) -> bool {
         self.vectorized
+    }
+
+    /// Selects CPU-only admission for non-finite compiled-training transitions.
+    pub const fn with_non_finite_policy(mut self, policy: CpuNonFinitePolicy) -> Self {
+        self.non_finite_policy = policy;
+        self
+    }
+
+    pub const fn non_finite_policy(&self) -> CpuNonFinitePolicy {
+        self.non_finite_policy
     }
 
     pub fn prepare<P>(
@@ -87,6 +146,7 @@ impl std::fmt::Debug for NativeCpuSessionTarget<'_> {
         formatter
             .debug_struct("NativeCpuSessionTarget")
             .field("vectorized", &self.vectorized)
+            .field("non_finite_policy", &self.non_finite_policy)
             .finish_non_exhaustive()
     }
 }
@@ -176,7 +236,9 @@ mod tests {
     #[test]
     fn cpu_target_prepares_independent_sessions_from_one_plan() {
         let plan = scalar_plan();
+        let unit_compatible: CpuSessionTarget = CpuSessionTarget;
         let target = CpuSessionTarget::new();
+        assert_eq!(target, unit_compatible);
         let first = target.prepare(&plan).unwrap();
         let second = target.prepare(&plan).unwrap();
 
@@ -184,5 +246,15 @@ mod tests {
         assert_eq!(second.capture_identity(), plan.capture_identity());
         assert_eq!(first.step_count(), 0);
         assert_eq!(second.step_count(), 0);
+
+        let guarded = target
+            .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition)
+            .prepare(&plan)
+            .unwrap();
+        assert_eq!(guarded.capture_identity(), plan.capture_identity());
+        assert_eq!(
+            guarded.non_finite_policy(),
+            CpuNonFinitePolicy::RejectTransition
+        );
     }
 }

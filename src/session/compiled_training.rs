@@ -5,7 +5,11 @@ mod state_schema;
 use self::state_schema::{
     AdamWGlobalState, AdamWParameterState, INTERNAL_PREFIX, RecurrentStateKey, StateSpec,
 };
-use super::target::{CpuSessionTarget, MetalSessionTarget, NativeCpuSessionTarget, SessionTarget};
+use super::target::{
+    ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,
+    NativeCpuSessionTarget, SessionTarget,
+};
+use crate::engine::mixed_capture::NativeReplayContext;
 use crate::nn::{
     Parameter, ParameterRestore, ParameterSnapshot, StateKind, TrainingDropoutProvider,
     next_version, restore_parameters,
@@ -709,6 +713,15 @@ impl CompiledMultiStepLr {
             return Err(training(
                 "compiled MultiStep learning-rate milestones must be strictly increasing",
             ));
+        }
+        let mut rate = base;
+        for _ in &milestones {
+            rate *= gamma;
+            if !rate.is_finite() {
+                return Err(training(
+                    "compiled MultiStep learning-rate values must remain finite",
+                ));
+            }
         }
         Ok(Self {
             base,
@@ -2669,6 +2682,7 @@ pub struct CpuCompiledAdamW {
     frozen_parameters: BTreeSet<String>,
     evaluation: Option<CpuCompiledEvaluation>,
     learning_rate: CompiledLearningRatePolicy,
+    non_finite_policy: CpuNonFinitePolicy,
 }
 
 /// Strict-native CPU AdamW session prepared from the same authenticated plan
@@ -3602,6 +3616,16 @@ impl CompiledTrainingPlan {
     }
 
     fn prepare_cpu(&self) -> Result<CpuCompiledTrainingProgram> {
+        self.prepare_cpu_with_non_finite_policy(CpuNonFinitePolicy::Propagate)
+    }
+
+    fn prepare_cpu_with_non_finite_policy(
+        &self,
+        non_finite_policy: CpuNonFinitePolicy,
+    ) -> Result<CpuCompiledTrainingProgram> {
+        if non_finite_policy == CpuNonFinitePolicy::RejectTransition {
+            validate_finite_tensors(self.state_values.values(), "prepared recurrent state")?;
+        }
         let initial_states = self
             .state_input_buffers
             .iter()
@@ -4197,18 +4221,24 @@ impl CpuCompiledTrainingProgram {
         learning_rate: TensorData,
         injected_failure: Option<u64>,
     ) -> Result<CompiledTrainingStepResult> {
-        self.step_inner_with_learning_rate(inputs, Some(learning_rate), injected_failure)
+        self.step_inner_with_learning_rate(
+            inputs,
+            Some(learning_rate),
+            CpuNonFinitePolicy::Propagate,
+            injected_failure,
+        )
     }
 
     fn step_inner_with_learning_rate(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
         learning_rate: Option<TensorData>,
+        non_finite_policy: CpuNonFinitePolicy,
         injected_failure: Option<u64>,
     ) -> Result<CompiledTrainingStepResult> {
         validate_training_inputs(&self.inputs, &inputs)?;
         if let Some(learning_rate) = &learning_rate {
-            validate_learning_rate(learning_rate)?;
+            validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
         }
         let next_step = self
             .step
@@ -4220,11 +4250,14 @@ impl CpuCompiledTrainingProgram {
         }
         let replay = self
             .capture
-            .replay_recurrent(
+            .replay_recurrent_checked(
                 &mut self.runtime,
                 &mut self.cursor,
                 &provided,
                 injected_failure,
+                |outputs, successors| {
+                    validate_staged_transition(outputs, successors, non_finite_policy, true)
+                },
             )
             .map_err(replay_error)?;
         debug_assert_eq!(replay.outputs.len(), 1 + self.output_names.len());
@@ -4251,13 +4284,14 @@ impl CpuCompiledTrainingProgram {
         &mut self,
         inputs: BTreeMap<String, TensorData>,
         learning_rate: Option<TensorData>,
+        non_finite_policy: CpuNonFinitePolicy,
         executor: &CapturedReplayExecutor,
         vectorized: bool,
         injected_failure: Option<u64>,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
         validate_training_inputs(&self.inputs, &inputs)?;
         if let Some(learning_rate) = &learning_rate {
-            validate_learning_rate(learning_rate)?;
+            validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
         }
         let next_step = self
             .step
@@ -4270,13 +4304,15 @@ impl CpuCompiledTrainingProgram {
         let started = Instant::now();
         let replay = self
             .capture
-            .replay_recurrent_native(
+            .replay_recurrent_native_checked(
                 &mut self.runtime,
                 &mut self.cursor,
                 &provided,
-                executor,
-                vectorized,
+                NativeReplayContext::new(executor, vectorized),
                 injected_failure,
+                |outputs, successors| {
+                    validate_staged_transition(outputs, successors, non_finite_policy, true)
+                },
             )
             .map_err(replay_error)?;
         let native = replay
@@ -4581,16 +4617,20 @@ impl CpuCompiledTrainingProgram {
         &mut self,
         transition: &CompiledAdamWPartialFlushPlan,
         learning_rate: Option<TensorData>,
+        non_finite_policy: CpuNonFinitePolicy,
         injected_failure: Option<u64>,
     ) -> Result<()> {
         let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
         let replay = transition
             .capture
-            .replay_recurrent(
+            .replay_recurrent_checked(
                 &mut self.runtime,
                 &mut prepared.cursor,
                 &prepared.provided,
                 injected_failure,
+                |outputs, successors| {
+                    validate_staged_transition(outputs, successors, non_finite_policy, false)
+                },
             )
             .map_err(replay_error)?;
         debug_assert!(replay.outputs.is_empty());
@@ -4642,8 +4682,8 @@ impl CpuCompiledTrainingProgram {
         &mut self,
         transition: &CompiledAdamWPartialFlushPlan,
         learning_rate: Option<TensorData>,
-        executor: &CapturedReplayExecutor,
-        vectorized: bool,
+        non_finite_policy: CpuNonFinitePolicy,
+        native: NativeReplayContext<'_>,
         successful_invocation: u64,
         injected_failure: Option<u64>,
     ) -> Result<NativeCpuRunReport> {
@@ -4651,13 +4691,15 @@ impl CpuCompiledTrainingProgram {
         let started = Instant::now();
         let replay = transition
             .capture
-            .replay_recurrent_native(
+            .replay_recurrent_native_checked(
                 &mut self.runtime,
                 &mut prepared.cursor,
                 &prepared.provided,
-                executor,
-                vectorized,
+                native,
                 injected_failure,
+                |outputs, successors| {
+                    validate_staged_transition(outputs, successors, non_finite_policy, false)
+                },
             )
             .map_err(replay_error)?;
         debug_assert!(replay.outputs.is_empty());
@@ -5209,8 +5251,17 @@ impl CompiledAdamWPlan {
 
     /// Prepares graph-free CPU replay from this plan's exact frontier.
     pub fn prepare_cpu(&self) -> Result<CpuCompiledAdamW> {
+        self.prepare_cpu_with_non_finite_policy(CpuNonFinitePolicy::Propagate)
+    }
+
+    fn prepare_cpu_with_non_finite_policy(
+        &self,
+        non_finite_policy: CpuNonFinitePolicy,
+    ) -> Result<CpuCompiledAdamW> {
         Ok(CpuCompiledAdamW {
-            inner: self.inner.prepare_cpu()?,
+            inner: self
+                .inner
+                .prepare_cpu_with_non_finite_policy(non_finite_policy)?,
             partial_flush: self.partial_flush.clone(),
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
@@ -5224,6 +5275,7 @@ impl CompiledAdamWPlan {
                 .clone()
                 .map(|plan| CpuCompiledEvaluation { plan }),
             learning_rate: self.learning_rate.clone(),
+            non_finite_policy,
         })
     }
 
@@ -5233,7 +5285,7 @@ impl CompiledAdamWPlan {
         &self,
         target: &NativeCpuSessionTarget<'a>,
     ) -> Result<NativeCpuCompiledAdamW<'a>> {
-        let inner = self.prepare_cpu()?;
+        let inner = self.prepare_cpu_with_non_finite_policy(target.non_finite_policy())?;
         NativeCpuCompiledAdamW::prepare(inner, target.executor(), target.is_vectorized())
     }
 
@@ -5850,9 +5902,12 @@ impl CpuCompiledAdamW {
         if let Some(dropout) = self.dropout {
             expected_dropout_counter(dropout, next.replay_step)?;
         }
-        let mut result =
-            self.inner
-                .step_inner_with_learning_rate(inputs, learning_rate, injected_failure)?;
+        let mut result = self.inner.step_inner_with_learning_rate(
+            inputs,
+            learning_rate,
+            self.non_finite_policy,
+            injected_failure,
+        )?;
         result.step = next.replay_step;
         self.progress = next;
         Ok(adamw_step_result(result, next))
@@ -5905,6 +5960,11 @@ impl CpuCompiledAdamW {
             CompiledLearningRatePolicy::External => None,
             CompiledLearningRatePolicy::MultiStep(schedule) => Some(schedule),
         }
+    }
+
+    /// CPU-only admission policy selected when this runtime was prepared.
+    pub const fn non_finite_policy(&self) -> CpuNonFinitePolicy {
+        self.non_finite_policy
     }
 
     /// Explicit diagnostic snapshot of the recurrent dropout counter.
@@ -6015,12 +6075,19 @@ impl CpuCompiledAdamW {
         if !result.did_update() {
             return Ok(result);
         }
+        if let Some(learning_rate) = &learning_rate {
+            validate_learning_rate_for_policy(learning_rate, self.non_finite_policy)?;
+        }
         let transition = self
             .partial_flush
             .as_ref()
             .ok_or_else(|| training("compiled AdamW partial flush capture is absent"))?;
-        self.inner
-            .replay_auxiliary_transition(transition, learning_rate, injected_failure)?;
+        self.inner.replay_auxiliary_transition(
+            transition,
+            learning_rate,
+            self.non_finite_policy,
+            injected_failure,
+        )?;
         self.progress = next;
         Ok(result)
     }
@@ -6239,6 +6306,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         let (mut result, mut report) = self.inner.inner.step_native_inner_with_learning_rate(
             inputs,
             learning_rate,
+            self.inner.non_finite_policy,
             self.executor,
             self.vectorized,
             injected_failure,
@@ -6325,6 +6393,9 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 report: None,
             });
         }
+        if let Some(learning_rate) = &learning_rate {
+            validate_learning_rate_for_policy(learning_rate, self.inner.non_finite_policy)?;
+        }
         let successful_invocation = self
             .successful_flushes
             .checked_add(1)
@@ -6337,8 +6408,8 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         let report = self.inner.inner.replay_auxiliary_transition_native(
             transition,
             learning_rate,
-            self.executor,
-            self.vectorized,
+            self.inner.non_finite_policy,
+            NativeReplayContext::new(self.executor, self.vectorized),
             successful_invocation,
             injected_failure,
         )?;
@@ -6377,6 +6448,11 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
 
     pub fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
         self.inner.captured_multi_step_lr()
+    }
+
+    /// CPU-only admission policy selected when this runtime was prepared.
+    pub const fn non_finite_policy(&self) -> CpuNonFinitePolicy {
+        self.inner.non_finite_policy
     }
 
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
@@ -6783,6 +6859,15 @@ impl<'a> SessionTarget<&'a CompiledAdamWPlan> for CpuSessionTarget {
     }
 }
 
+impl<'a> SessionTarget<&'a CompiledAdamWPlan> for ConfiguredCpuSessionTarget {
+    type Session = CpuCompiledAdamW;
+    type Error = Error;
+
+    fn prepare(&self, plan: &'a CompiledAdamWPlan) -> Result<Self::Session> {
+        plan.prepare_cpu_with_non_finite_policy(self.non_finite_policy())
+    }
+}
+
 impl<'executor> SessionTarget<&CompiledAdamWPlan> for NativeCpuSessionTarget<'executor> {
     type Session = NativeCpuCompiledAdamW<'executor>;
     type Error = Error;
@@ -6819,6 +6904,37 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for CpuSessionTarget {
             return Err(CompiledModuleAdamWPrepareError { plan, source });
         }
         let runtime = match plan.plan.prepare_cpu() {
+            Ok(runtime) => runtime,
+            Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
+        };
+        let CompiledModuleAdamWPlan {
+            module,
+            seal,
+            plan: _,
+        } = plan;
+        Ok(CompiledModuleAdamWSession {
+            module,
+            runtime,
+            seal,
+        })
+    }
+}
+
+impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for ConfiguredCpuSessionTarget {
+    type Session = CompiledModuleAdamWSession<M, CpuCompiledAdamW>;
+    type Error = CompiledModuleAdamWPrepareError<M, Error>;
+
+    fn prepare(
+        &self,
+        plan: CompiledModuleAdamWPlan<M>,
+    ) -> std::result::Result<Self::Session, Self::Error> {
+        if let Err(source) = plan.seal.validate_unchanged(&plan.module) {
+            return Err(CompiledModuleAdamWPrepareError { plan, source });
+        }
+        let runtime = match plan
+            .plan
+            .prepare_cpu_with_non_finite_policy(self.non_finite_policy())
+        {
             Ok(runtime) => runtime,
             Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
         };
@@ -8427,6 +8543,61 @@ fn validate_learning_rate(learning_rate: &TensorData) -> Result<()> {
     Ok(())
 }
 
+fn validate_learning_rate_for_policy(
+    learning_rate: &TensorData,
+    policy: CpuNonFinitePolicy,
+) -> Result<()> {
+    validate_learning_rate(learning_rate)?;
+    if policy == CpuNonFinitePolicy::RejectTransition {
+        validate_finite_tensors(std::iter::once(learning_rate), "external learning rate")?;
+    }
+    Ok(())
+}
+
+fn validate_staged_transition(
+    outputs: &[TensorData],
+    successors: &[TensorData],
+    policy: CpuNonFinitePolicy,
+    require_loss: bool,
+) -> std::result::Result<(), String> {
+    if policy == CpuNonFinitePolicy::Propagate {
+        return Ok(());
+    }
+    if require_loss {
+        let loss = outputs
+            .first()
+            .ok_or_else(|| "compiled CPU transition loss is absent".to_owned())?;
+        if loss.shape() != &Shape::from([]) || loss.dtype() != DType::F32 {
+            return Err("compiled CPU transition loss must be rank-zero F32".to_owned());
+        }
+        if has_non_finite_f32(std::iter::once(loss)) {
+            return Err("compiled CPU transition has a non-finite loss".to_owned());
+        }
+    }
+    if has_non_finite_f32(successors) {
+        return Err("compiled CPU transition has a non-finite recurrent successor".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_finite_tensors<'a>(
+    tensors: impl IntoIterator<Item = &'a TensorData>,
+    role: &str,
+) -> Result<()> {
+    if has_non_finite_f32(tensors) {
+        return Err(training(format!(
+            "compiled CPU transition has a non-finite {role}"
+        )));
+    }
+    Ok(())
+}
+
+fn has_non_finite_f32<'a>(tensors: impl IntoIterator<Item = &'a TensorData>) -> bool {
+    tensors.into_iter().any(|tensor| {
+        tensor.dtype() == DType::F32 && tensor.values().iter().any(|value| !value.is_finite())
+    })
+}
+
 fn schedule_error(error: impl std::fmt::Display) -> Error {
     training(format!("compiled schedule: {error}"))
 }
@@ -8724,6 +8895,18 @@ mod tests {
         let output = graph.mul(second, shared)?;
         let loss = graph.sum_all(output)?;
         Ok((loss, BTreeMap::from([("output".into(), output)])))
+    }
+
+    fn build_tied_dropout_with_input_guard(
+        module: &TiedFrozenModule,
+        graph: &mut Graph,
+        inputs: &BTreeMap<String, NodeId>,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+        let (loss, outputs) = build_tied_dropout(module, graph, inputs, dropout)?;
+        let reciprocal = graph.reciprocal(inputs["x"])?;
+        let reciprocal_sum = graph.sum_all(reciprocal)?;
+        Ok((graph.add(loss, reciprocal_sum)?, outputs))
     }
 
     #[test]
@@ -9132,6 +9315,357 @@ mod tests {
 
     fn compiled_adamw() -> CpuCompiledAdamW {
         CpuCompiledAdamW::compile(adamw_config(), initial_parameters(), build_tinybob).unwrap()
+    }
+
+    fn non_finite_config(accumulation_steps: u64) -> CompiledAdamWConfig {
+        CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_gradient_accumulation(accumulation_steps)
+            .unwrap()
+            .with_input("x", [], DType::F32)
+            .unwrap()
+    }
+
+    fn non_finite_plan(accumulation_steps: u64) -> CompiledAdamWPlan {
+        let parameter = TrainingParameterInit::new("weight", TensorData::scalar(0.0)).unwrap();
+        CompiledAdamWPlan::compile(
+            non_finite_config(accumulation_steps),
+            [parameter],
+            |graph, inputs, parameters| {
+                let radicand = graph.add(parameters["weight"], inputs["x"])?;
+                let loss = graph.sqrt(radicand)?;
+                Ok((loss, BTreeMap::new()))
+            },
+        )
+        .unwrap()
+    }
+
+    fn non_finite_flush_plan() -> CompiledAdamWPlan {
+        let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 2.0)
+            .unwrap()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_input("x", [], DType::F32)
+            .unwrap();
+        let parameter = TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap();
+        CompiledAdamWPlan::compile(config, [parameter], |graph, inputs, parameters| {
+            let loss = graph.mul(parameters["weight"], inputs["x"])?;
+            Ok((loss, BTreeMap::new()))
+        })
+        .unwrap()
+    }
+
+    fn scalar_batch(value: f32) -> BTreeMap<String, TensorData> {
+        BTreeMap::from([("x".into(), TensorData::scalar(value))])
+    }
+
+    fn rejecting_cpu_target() -> ConfiguredCpuSessionTarget {
+        CpuSessionTarget.with_non_finite_policy(CpuNonFinitePolicy::RejectTransition)
+    }
+
+    #[test]
+    fn cpu_non_finite_validation_admits_empty_signed_zero_and_subnormal() {
+        let empty = TensorData::new([0], Vec::<f32>::new()).unwrap();
+        let finite = TensorData::new([2], vec![-0.0, f32::from_bits(1)]).unwrap();
+        assert!(validate_finite_tensors([&empty, &finite], "fixture").is_ok());
+        assert!(validate_finite_tensors([&TensorData::scalar(f32::INFINITY)], "fixture",).is_err());
+    }
+
+    #[test]
+    fn guarded_cpu_preparation_rejects_non_finite_initial_and_restored_frontiers() {
+        let initial = CompiledAdamWPlan::compile(
+            non_finite_config(1),
+            [TrainingParameterInit::new("weight", TensorData::scalar(f32::INFINITY)).unwrap()],
+            |graph, _, parameters| {
+                let loss = graph.square(parameters["weight"])?;
+                Ok((loss, BTreeMap::new()))
+            },
+        )
+        .unwrap();
+        let error = initial
+            .prepare(&rejecting_cpu_target())
+            .err()
+            .expect("guarded preparation must reject a non-finite initial frontier");
+        assert!(
+            error
+                .to_string()
+                .contains("non-finite prepared recurrent state")
+        );
+
+        let plan = non_finite_plan(1);
+        let mut propagating = plan.prepare(&CpuSessionTarget).unwrap();
+        propagating
+            .step(scalar_batch(0.0), TensorData::scalar(0.01))
+            .unwrap();
+        let restored = plan
+            .restore_checkpoint(&propagating.checkpoint().unwrap())
+            .unwrap();
+        let error = restored
+            .prepare(&rejecting_cpu_target())
+            .err()
+            .expect("guarded preparation must reject a non-finite restored frontier");
+        assert!(
+            error
+                .to_string()
+                .contains("non-finite prepared recurrent state")
+        );
+    }
+
+    #[test]
+    fn cpu_non_finite_policy_preserves_default_identity_and_rejects_before_commit() {
+        let plan = non_finite_plan(1);
+        let legacy = plan.prepare(&CpuSessionTarget).unwrap();
+        let explicit = plan
+            .prepare(&CpuSessionTarget.with_non_finite_policy(CpuNonFinitePolicy::Propagate))
+            .unwrap();
+        let mut guarded = plan.prepare(&rejecting_cpu_target()).unwrap();
+        assert_eq!(legacy.capture_identity(), plan.capture_identity());
+        assert_eq!(explicit.capture_identity(), plan.capture_identity());
+        assert_eq!(legacy.checkpoint().unwrap(), explicit.checkpoint().unwrap());
+        assert_eq!(legacy.checkpoint().unwrap(), guarded.checkpoint().unwrap());
+        assert_eq!(legacy.non_finite_policy(), CpuNonFinitePolicy::Propagate);
+        assert_eq!(
+            guarded.non_finite_policy(),
+            CpuNonFinitePolicy::RejectTransition
+        );
+
+        let before = guarded.checkpoint().unwrap();
+        let error = guarded
+            .step(scalar_batch(0.0), TensorData::scalar(0.01))
+            .unwrap_err();
+        assert!(error.to_string().contains("non-finite recurrent successor"));
+        assert_eq!(guarded.checkpoint().unwrap(), before);
+        assert_eq!(guarded.step_count(), 0);
+
+        for invalid_rate in [f32::NAN, f32::INFINITY] {
+            let error = guarded
+                .step(scalar_batch(1.0), TensorData::scalar(invalid_rate))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("non-finite external learning rate")
+            );
+            assert_eq!(guarded.checkpoint().unwrap(), before);
+        }
+        let mut reference = plan.prepare(&rejecting_cpu_target()).unwrap();
+        let expected = reference
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = guarded
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(
+            guarded.checkpoint().unwrap(),
+            reference.checkpoint().unwrap()
+        );
+    }
+
+    #[test]
+    fn cpu_non_finite_policy_checks_loss_but_not_named_outputs() {
+        let parameter = TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap();
+        let plan = CompiledAdamWPlan::compile(
+            non_finite_config(1),
+            [parameter],
+            |graph, inputs, parameters| {
+                let loss = graph.square(parameters["weight"])?;
+                let one = scalar_f32(graph, 1.0)?;
+                let diagnostic = graph.div(one, inputs["x"])?;
+                Ok((loss, BTreeMap::from([("diagnostic".into(), diagnostic)])))
+            },
+        )
+        .unwrap();
+        let mut guarded = plan.prepare(&rejecting_cpu_target()).unwrap();
+        let result = guarded
+            .step(scalar_batch(0.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert!(result.output("diagnostic").unwrap().values()[0].is_infinite());
+
+        let mut guarded = non_finite_plan(1).prepare(&rejecting_cpu_target()).unwrap();
+        let before = guarded.checkpoint().unwrap();
+        let error = guarded
+            .step(scalar_batch(f32::NAN), TensorData::scalar(0.01))
+            .unwrap_err();
+        assert!(error.to_string().contains("non-finite loss"));
+        assert_eq!(guarded.checkpoint().unwrap(), before);
+    }
+
+    #[test]
+    fn cpu_non_finite_rejection_preserves_partial_dropout_window_and_flush() {
+        let config = module_config().with_gradient_accumulation(2).unwrap();
+        let dropout = CompiledDropoutConfig::new(CompiledDropoutKey([41, 43]));
+        let module = TiedFrozenModule::new([0.1, -0.2]);
+        let plan = CompiledAdamWPlan::compile_module_with_dropout(
+            config,
+            dropout,
+            &module,
+            build_tied_dropout_with_input_guard,
+        )
+        .unwrap();
+        let mut guarded = plan.prepare(&rejecting_cpu_target()).unwrap();
+        let mut reference = plan.prepare(&rejecting_cpu_target()).unwrap();
+        let finite =
+            || BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 2.0]).unwrap())]);
+        guarded.step(finite(), TensorData::scalar(0.01)).unwrap();
+        reference.step(finite(), TensorData::scalar(0.01)).unwrap();
+        let partial = guarded.checkpoint().unwrap();
+        assert_eq!(guarded.dropout_block_counter().unwrap(), Some(1));
+        let error = guarded
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![0.0, 2.0]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("non-finite loss"));
+        assert_eq!(guarded.checkpoint().unwrap(), partial);
+        assert_eq!(guarded.dropout_block_counter().unwrap(), Some(1));
+        let expected = reference.step(finite(), TensorData::scalar(0.01)).unwrap();
+        let actual = guarded.step(finite(), TensorData::scalar(0.01)).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(
+            guarded.checkpoint().unwrap(),
+            reference.checkpoint().unwrap()
+        );
+
+        let flush_plan = CompiledAdamWPlan::compile(
+            accumulated_adamw_config(2),
+            initial_parameters(),
+            build_tinybob,
+        )
+        .unwrap();
+        let mut guarded = flush_plan.prepare(&rejecting_cpu_target()).unwrap();
+        let mut reference = flush_plan.prepare(&rejecting_cpu_target()).unwrap();
+        guarded.step(batch(), lr()).unwrap();
+        reference.step(batch(), lr()).unwrap();
+        let partial = guarded.checkpoint().unwrap();
+        assert!(
+            guarded
+                .flush_partial_window(TensorData::scalar(f32::NAN))
+                .is_err()
+        );
+        assert_eq!(guarded.checkpoint().unwrap(), partial);
+        assert_eq!(
+            guarded.flush_partial_window(lr()).unwrap().optimizer_step(),
+            1
+        );
+        reference.flush_partial_window(lr()).unwrap();
+        assert_eq!(
+            guarded.checkpoint().unwrap(),
+            reference.checkpoint().unwrap()
+        );
+    }
+
+    #[test]
+    fn non_finite_partial_flush_successors_reject_atomically_on_both_cpu_paths() {
+        let plan = non_finite_flush_plan();
+        let mut guarded = plan.prepare(&rejecting_cpu_target()).unwrap();
+        let mut reference = plan.prepare(&rejecting_cpu_target()).unwrap();
+        guarded
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        reference
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        let before = guarded.checkpoint().unwrap();
+        let error = guarded
+            .flush_partial_window(TensorData::scalar(f32::MAX))
+            .unwrap_err();
+        assert!(error.to_string().contains("non-finite recurrent successor"));
+        assert_eq!(guarded.checkpoint().unwrap(), before);
+        assert_eq!(guarded.optimizer_step().unwrap(), 0);
+        assert_eq!(guarded.accumulation_index().unwrap(), 1);
+        let actual = guarded
+            .flush_partial_window(TensorData::scalar(0.01))
+            .unwrap();
+        let expected = reference
+            .flush_partial_window(TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            guarded.checkpoint().unwrap(),
+            reference.checkpoint().unwrap()
+        );
+
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor)
+            .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+        let mut native = target.prepare(&plan).unwrap();
+        let mut native_reference = target.prepare(&plan).unwrap();
+        native
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        native_reference
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        let before = native.checkpoint().unwrap();
+        let error = native
+            .flush_partial_window(TensorData::scalar(f32::MAX))
+            .err()
+            .expect("non-finite native partial flush must reject");
+        assert!(error.to_string().contains("non-finite recurrent successor"));
+        assert_eq!(native.checkpoint().unwrap(), before);
+        assert_eq!(native.inner.optimizer_step().unwrap(), 0);
+        assert_eq!(native.inner.accumulation_index().unwrap(), 1);
+        assert_eq!(native.successful_flushes, 0);
+        let actual = native
+            .flush_partial_window(TensorData::scalar(0.01))
+            .unwrap();
+        let expected = native_reference
+            .flush_partial_window(TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(
+            actual.flushed_microbatches(),
+            expected.flushed_microbatches()
+        );
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.report().unwrap().successful_invocation(), 1);
+        assert_eq!(native.successful_flushes, 1);
+        assert_eq!(
+            native.checkpoint().unwrap(),
+            native_reference.checkpoint().unwrap()
+        );
+    }
+
+    #[test]
+    fn native_cpu_non_finite_rejection_is_atomic_and_retryable() {
+        let plan = non_finite_plan(1);
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor)
+            .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+        let mut native = target.prepare(&plan).unwrap();
+        assert_eq!(
+            native.non_finite_policy(),
+            CpuNonFinitePolicy::RejectTransition
+        );
+        let before = native.checkpoint().unwrap();
+        assert!(
+            native
+                .step(scalar_batch(0.0), TensorData::scalar(0.01))
+                .is_err()
+        );
+        assert_eq!(native.checkpoint().unwrap(), before);
+        assert_eq!(native.successful_steps, 0);
+        assert!(
+            native
+                .step(scalar_batch(1.0), TensorData::scalar(f32::INFINITY))
+                .is_err()
+        );
+        assert_eq!(native.checkpoint().unwrap(), before);
+        assert_eq!(native.successful_steps, 0);
+
+        let mut interpreted = plan.prepare(&rejecting_cpu_target()).unwrap();
+        let expected = interpreted
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = native
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_cross_engine_tensor_close("guarded retry loss", actual.loss(), expected.loss());
+        assert_eq!(actual.report().successful_invocation(), 1);
+        assert_eq!(native.successful_steps, 1);
+        assert_native_adamw_state_close(&native, &interpreted);
     }
 
     fn assert_cross_engine_tensor_close(label: &str, actual: &TensorData, expected: &TensorData) {
@@ -11647,6 +12181,8 @@ mod tests {
         assert!(CompiledMultiStepLr::new(0.1, 0.5, [1, 1]).is_err());
         assert!(CompiledMultiStepLr::new(0.1, 0.5, [2, 1]).is_err());
         assert!(CompiledMultiStepLr::new(0.1, 0.5, [u64::MAX]).is_err());
+        assert!(CompiledMultiStepLr::new(f32::MAX, 2.0, [1]).is_err());
+        assert!(CompiledMultiStepLr::new(f32::MAX / 2.0, 1.5, [1, 2]).is_err());
     }
 
     #[test]
