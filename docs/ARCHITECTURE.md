@@ -920,6 +920,18 @@ lowering, an optimizer-neutral Metal plan/runtime core likewise owns recurrent
 rendering, resource preparation, input validation, output projection,
 evaluation, scoreboard observation, and semantic state snapshots; the AdamW
 facade adds only its progress/policy interpretation and portable checkpoint.
+AdamW compilation with a multi-replay accumulation window also produces a
+separate authenticated state-only transition over the exact parameter,
+moment, accumulator, optimizer-step, and accumulation-index schema. The
+backend-neutral `CompiledAdamWFlushRuntime` capability is implemented by CPU
+only in this slice: a nonempty flush consumes that live frontier plus an
+explicit scalar learning rate, averages by the retained microbatch count,
+clips once, commits AdamW, and clears the window without making the training
+batch, forward/backward graph, or dropout counter reachable. Its one
+`EffectRuntime` transaction and precomputed successor cursor make failures
+retryable. Flush count and flushed-microbatch count authenticate progress and
+reconstruct the distinct optimizer/workload logical versions on checkpoint
+restore; Metal deliberately does not yet advertise the capability.
 `CpuCompiledMomentumSgd` and `CpuCompiledAdamW` consume detached named F32
 parameter values, build one private Graph with one batched reverse traversal,
 and capture the pure loss/output/update prefix together with ordered parameter
