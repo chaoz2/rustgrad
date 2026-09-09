@@ -15,9 +15,9 @@ use crate::runtime::static_schedule::{
     InitializedStaticSchedule, PreparedStaticSchedule, Sealed, StaticAppendStateLink,
     StaticBufferAllocation, StaticCommandReport, StaticDeviceAdapter, StaticExecutionReport,
     StaticHostGather, StaticHostIndexedMovement, StaticHostOutputSelection, StaticPlanAdapter,
-    StaticPreparedLaunch, StaticQuantizedBufferPlan, StaticRendered, StaticRenderedBuffer,
-    StaticRenderedQuantizedBuffer, StaticSchedulePlan, StaticSharedResources, StaticStateLink,
-    bind_rendered_buffers,
+    StaticPreparedCopy, StaticPreparedLaunch, StaticQuantizedBufferPlan, StaticRendered,
+    StaticRenderedBuffer, StaticRenderedQuantizedBuffer, StaticSchedulePlan, StaticSharedResources,
+    StaticStateLink, bind_rendered_buffers,
 };
 
 struct MetalStaticAdapter {
@@ -410,6 +410,52 @@ impl StaticDeviceAdapter for MetalStaticAdapter {
             gpu_command_execution_time,
         })
     }
+    fn copy_launch_batch_and_wait(
+        &self,
+        queue: &Self::Queue,
+        copies: &[StaticPreparedCopy<'_, Self::Buffer>],
+        launches: &[StaticPreparedLaunch<'_, Self::Kernel, Self::Buffer>],
+    ) -> Result<StaticCommandReport, Self::Error> {
+        if launches.iter().any(|launch| {
+            launch.kernel.rendered().transaction.is_some()
+                || launch.kernel.rendered().indexed_movement.is_some()
+        }) {
+            return Err(MetalError::InvalidBinding(
+                "shared fixed-state transitions require batch-safe kernels".into(),
+            ));
+        }
+        let copies = copies
+            .iter()
+            .map(|copy| super::resource::MetalBatchCopy {
+                source: copy.source,
+                target: copy.target,
+                bytes: copy.bytes,
+            })
+            .collect::<Vec<_>>();
+        let batch = launches
+            .iter()
+            .map(|launch| super::resource::MetalBatchItem {
+                pipeline: launch.kernel.as_ref(),
+                bindings: &launch.buffers,
+                local_size: self.renderer.local_size,
+                capture_initialized: !launch.kernel.rendered().quantized_buffers.is_empty(),
+            })
+            .collect::<Vec<_>>();
+        let mut gpu_command_execution_time = None;
+        let (submissions, waits) = match queue.copy_launch_batch(&copies, &batch)? {
+            Some(command) => {
+                let completion = command.collect()?;
+                gpu_command_execution_time = completion.gpu_command_execution_time;
+                (1, 1)
+            }
+            None => (0, 0),
+        };
+        Ok(StaticCommandReport {
+            submissions,
+            waits,
+            gpu_command_execution_time,
+        })
+    }
     fn read(
         &self,
         queue: &Self::Queue,
@@ -693,11 +739,16 @@ impl PreparedMetalPrefix {
         resident_ids: &std::collections::BTreeSet<u64>,
         quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
     ) -> Result<(InitializedMetalPrefix, StaticExecutionReport), MetalError> {
+        let imported_resident_dense = self
+            .imported_dense
+            .intersection(resident_ids)
+            .copied()
+            .collect();
         let (inner, report) = self.inner.initialize_resident_with_quantized_skipping(
             values,
             resident_ids,
             quantized,
-            &self.imported_dense,
+            &imported_resident_dense,
             &self.imported_quantized,
         )?;
         Ok((InitializedMetalPrefix { inner }, report))
@@ -779,6 +830,48 @@ impl InitializedMetalPrefix {
     ) -> Result<StaticExecutionReport, MetalError> {
         self.inner
             .execute_stateful(values, alternate_state_bank, host_outputs)
+    }
+
+    pub(super) fn execute_shared_state_transition(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+        alternate_state_bank: bool,
+        source: &Self,
+        preserved_state: &[(u64, usize)],
+    ) -> Result<StaticExecutionReport, MetalError> {
+        let copies = preserved_state
+            .iter()
+            .filter(|(_, bytes)| *bytes != 0)
+            .map(|(input, bytes)| {
+                let source_buffer = source
+                    .inner
+                    .shared_buffer_for_epoch(*input, alternate_state_bank)
+                    .ok_or_else(|| {
+                        MetalError::InvalidBinding(
+                            "shared Metal transition source state is absent".into(),
+                        )
+                    })?;
+                let target_buffer = source
+                    .inner
+                    .shared_buffer_for_epoch(*input, !alternate_state_bank)
+                    .ok_or_else(|| {
+                        MetalError::InvalidBinding(
+                            "shared Metal transition target state is absent".into(),
+                        )
+                    })?;
+                Ok(StaticPreparedCopy {
+                    source: source_buffer,
+                    target: target_buffer,
+                    bytes: *bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, MetalError>>()?;
+        self.inner.execute_stateful_with_copies(
+            values,
+            alternate_state_bank,
+            StaticHostOutputSelection::None,
+            &copies,
+        )
     }
 
     pub(super) fn snapshot_state(

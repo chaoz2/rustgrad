@@ -43,7 +43,7 @@ pub use session::{
 };
 pub(crate) use session::{
     MetalCausalOverwriteRewindProof, MetalFixedStateReadPlan, MetalFixedStateReadSession,
-    MetalSharedAppendSession,
+    MetalFixedStateTransitionPlan, MetalFixedStateTransitionSession, MetalSharedAppendSession,
 };
 pub use transaction::{
     GuardedIntegerOp, METAL_INDEXED_MOVEMENT_ABI_VERSION, METAL_TRANSACTION_ABI_VERSION,

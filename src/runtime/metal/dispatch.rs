@@ -61,6 +61,14 @@ pub(super) struct BatchLaunch {
     pub geometry: LaunchGeometry,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(super) struct BatchCopy {
+    pub src: RawBuffer,
+    pub dst: RawBuffer,
+    pub region: CopyRegion,
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) struct KernelSemantics {
@@ -150,6 +158,13 @@ pub(super) trait Dispatch: Send + Sync + 'static {
     fn launch_batch(
         &self,
         queue: RawQueue,
+        launches: &[BatchLaunch],
+        owner: u64,
+    ) -> Result<RawCommand, MetalError>;
+    fn copy_launch_batch(
+        &self,
+        queue: RawQueue,
+        copies: &[BatchCopy],
         launches: &[BatchLaunch],
         owner: u64,
     ) -> Result<RawCommand, MetalError>;

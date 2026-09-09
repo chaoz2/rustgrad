@@ -6,8 +6,8 @@
 use super::{
     MetalDeviceInfo, MetalError,
     dispatch::{
-        BatchLaunch, CopyRegion, Dispatch, LaunchGeometry, RawBuffer, RawCommand, RawDevice,
-        RawLibrary, RawPipeline, RawQueue,
+        BatchCopy, BatchLaunch, CopyRegion, Dispatch, LaunchGeometry, RawBuffer, RawCommand,
+        RawDevice, RawLibrary, RawPipeline, RawQueue,
     },
 };
 
@@ -405,15 +405,60 @@ mod platform {
             unsafe { self.objc.msg0_void(command, "commit") };
         }
 
-        fn encode_launch_batch(
+        fn encode_copy_launch_batch(
             &self,
             queue: RawQueue,
+            copies: &[BatchCopy],
             launches: &[BatchLaunch],
         ) -> Result<RawCommand, MetalError> {
-            if launches.is_empty() {
-                return Err(MetalError::InvalidArgument("empty Metal launch batch"));
+            if copies.is_empty() && launches.is_empty() {
+                return Err(MetalError::InvalidArgument("empty Metal command batch"));
             }
             let command = self.command_buffer(queue)?;
+            if !copies.is_empty() {
+                // SAFETY: command buffer implements -blitCommandEncoder.
+                let encoder = unsafe { self.objc.msg0_obj(command, "blitCommandEncoder") };
+                if encoder.is_null() {
+                    self.objc.release(command);
+                    return Err(MetalError::Driver {
+                        operation: "blitCommandEncoder",
+                        detail: "returned nil".into(),
+                    });
+                }
+                let encoder = self.objc.retain(encoder);
+                // SAFETY: selector ABI is the documented MTLBlitCommandEncoder copy operation.
+                let copy: unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    usize,
+                    *mut c_void,
+                    usize,
+                    usize,
+                ) = unsafe { std::mem::transmute(self.objc.msg_send) };
+                for item in copies {
+                    unsafe {
+                        copy(
+                            encoder,
+                            self.objc.selector(
+                                "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:",
+                            ),
+                            item.src.0 as *mut c_void,
+                            item.region.src_offset,
+                            item.dst.0 as *mut c_void,
+                            item.region.dst_offset,
+                            item.region.bytes,
+                        );
+                    }
+                }
+                // SAFETY: every encoded copy is complete.
+                unsafe { self.objc.msg0_void(encoder, "endEncoding") };
+                self.objc.release(encoder);
+            }
+            if launches.is_empty() {
+                self.commit(command);
+                return Ok(RawCommand(command as usize));
+            }
             // SAFETY: command buffer implements -computeCommandEncoder.
             let encoder = unsafe { self.objc.msg0_obj(command, "computeCommandEncoder") };
             if encoder.is_null() {
@@ -877,8 +922,9 @@ mod platform {
             geometry: LaunchGeometry,
             _owner: u64,
         ) -> Result<RawCommand, MetalError> {
-            self.encode_launch_batch(
+            self.encode_copy_launch_batch(
                 queue,
+                &[],
                 &[BatchLaunch {
                     pipeline,
                     buffers: buffers.to_vec(),
@@ -893,7 +939,17 @@ mod platform {
             launches: &[BatchLaunch],
             _owner: u64,
         ) -> Result<RawCommand, MetalError> {
-            self.encode_launch_batch(queue, launches)
+            self.encode_copy_launch_batch(queue, &[], launches)
+        }
+
+        fn copy_launch_batch(
+            &self,
+            queue: RawQueue,
+            copies: &[BatchCopy],
+            launches: &[BatchLaunch],
+            _owner: u64,
+        ) -> Result<RawCommand, MetalError> {
+            self.encode_copy_launch_batch(queue, copies, launches)
         }
 
         fn command_query(&self, command: RawCommand, _owner: u64) -> Result<bool, MetalError> {
@@ -1033,6 +1089,15 @@ impl Dispatch for NativeDispatch {
     fn launch_batch(
         &self,
         _: RawQueue,
+        _: &[BatchLaunch],
+        _: u64,
+    ) -> Result<RawCommand, MetalError> {
+        Err(MetalError::PlatformUnsupported)
+    }
+    fn copy_launch_batch(
+        &self,
+        _: RawQueue,
+        _: &[BatchCopy],
         _: &[BatchLaunch],
         _: u64,
     ) -> Result<RawCommand, MetalError> {

@@ -113,14 +113,19 @@ exact schema. One atomic host transaction preserves ties, frozen parameters,
 and buffers while advancing every unique published `Parameter` version once;
 publication changes no runtime progress or checkpoint state.
 
-CPU additionally implements the backend-neutral `CompiledAdamWFlushRuntime`:
+CPU and strict Metal implement the backend-neutral `CompiledAdamWFlushRuntime`:
 a nonempty `k < N` partial window is averaged by `k`, globally clipped once,
 and committed through a separately authenticated state-only capture without
 replaying a batch or advancing replay/dropout progress. Empty flushes are exact
 no-ops. Checkpoint v5 records the exact mixed-transition capture identity plus
 explicit flushed-window and flushed-microbatch counts; checkpoints without a
-flush retain their existing v1--v4 bytes. Strict Metal flush execution is the
-next backend implementation and is not claimed here. The same
+flush retain their existing v1--v4 bytes. Metal renders the retained recurrent
+projection once, imports both existing epoch banks and the queue without a
+second state upload, and encodes preservation copies plus the update kernels in
+one synchronous command buffer. It flips the shared epoch only after success,
+downloads no output, and does not advance replay, dropout, or training
+scoreboard state. Semantic mock coverage is retained; live Apple-hardware flush
+validation is not claimed here. The same
 module-bound compile traversal now validates an explicit canonical set of
 AdamW decay exclusions before graph construction. The maintained Transformer
 uses nonzero decoupled decay for embedding/projection matrices while excluding
