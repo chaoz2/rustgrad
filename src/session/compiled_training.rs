@@ -211,7 +211,9 @@ struct ModuleParameterEntry {
     identity: ParameterId,
     name: String,
     value: TensorData,
+    source_trainable: bool,
     trainable: bool,
+    policy_frozen: bool,
 }
 
 /// Frozen snapshot of one module's parameter topology for compilation.
@@ -250,10 +252,14 @@ struct SealedModuleState {
 struct CompiledModuleSeal {
     visits: Vec<SealedModuleVisit>,
     states: BTreeMap<ParameterId, SealedModuleState>,
+    frozen_parameters: BTreeSet<String>,
 }
 
 impl CompiledModuleSeal {
-    fn capture(module: &(impl Module + ?Sized)) -> Result<Self> {
+    fn capture(
+        module: &(impl Module + ?Sized),
+        frozen_parameters: &BTreeSet<String>,
+    ) -> Result<Self> {
         let mut names = BTreeSet::new();
         let mut visits = Vec::new();
         let mut states = BTreeMap::<ParameterId, SealedModuleState>::new();
@@ -314,16 +320,55 @@ impl CompiledModuleSeal {
         match error {
             Some(error) => Err(error),
             None => {
-                for state in states.values().filter(|state| state.trainable) {
+                let mut seal = Self {
+                    visits,
+                    states,
+                    frozen_parameters: frozen_parameters.clone(),
+                };
+                seal.apply_frozen_parameters()?;
+                for state in seal.states.values().filter(|state| state.trainable) {
                     next_version(state.snapshot.version)?;
                 }
-                Ok(Self { visits, states })
+                Ok(seal)
             }
         }
     }
 
+    fn apply_frozen_parameters(&mut self) -> Result<()> {
+        let noncanonical_names = self
+            .visits
+            .iter()
+            .filter(|visit| self.states[&visit.identity].name != visit.name)
+            .map(|visit| visit.name.clone())
+            .collect::<BTreeSet<_>>();
+        for name in &self.frozen_parameters {
+            if noncanonical_names.contains(name) {
+                return Err(training(
+                    "compiled AdamW frozen parameter is a noncanonical tied alias",
+                ));
+            }
+            match self.states.values_mut().find(|state| state.name == *name) {
+                Some(state) if state.trainable => state.trainable = false,
+                Some(_) => {
+                    return Err(training(
+                        "compiled AdamW frozen parameter is not a trainable parameter",
+                    ));
+                }
+                None => {
+                    return Err(training("compiled AdamW frozen parameter name is unknown"));
+                }
+            }
+        }
+        if self.states.values().all(|state| !state.trainable) {
+            return Err(training(
+                "compiled module needs at least one effectively trainable parameter",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_unchanged(&self, module: &(impl Module + ?Sized)) -> Result<()> {
-        let current = Self::capture(module)?;
+        let current = Self::capture(module, &self.frozen_parameters)?;
         if current.visits != self.visits || current.states.keys().ne(self.states.keys()) {
             return Err(training("owned compiled module topology changed"));
         }
@@ -399,7 +444,7 @@ impl CompiledModuleSeal {
 }
 
 impl ModuleParameterPlan {
-    fn new(module: &(impl Module + ?Sized)) -> Result<Self> {
+    fn new(module: &(impl Module + ?Sized), frozen_parameters: &BTreeSet<String>) -> Result<Self> {
         let mut entries = Vec::<ModuleParameterEntry>::new();
         let mut identities = BTreeMap::<ParameterId, usize>::new();
         let mut names = BTreeSet::new();
@@ -416,7 +461,7 @@ impl ModuleParameterPlan {
             let identity = parameter.id();
             if let Some(&index) = identities.get(&identity) {
                 let is_parameter = matches!(kind, StateKind::Parameter);
-                if entries[index].trainable != (parameter.is_trainable() && is_parameter) {
+                if entries[index].source_trainable != (parameter.is_trainable() && is_parameter) {
                     error = Some(training(
                         "tied compiled module state has inconsistent trainability",
                     ));
@@ -433,7 +478,9 @@ impl ModuleParameterPlan {
                         identity,
                         name,
                         value: snapshot.data,
+                        source_trainable: trainable,
                         trainable,
+                        policy_frozen: false,
                     });
                 }
                 Err(err) => error = Some(err),
@@ -442,9 +489,30 @@ impl ModuleParameterPlan {
         if let Some(error) = error {
             return Err(error);
         }
+        for name in frozen_parameters {
+            if noncanonical_names.contains(name) {
+                return Err(training(
+                    "compiled AdamW frozen parameter is a noncanonical tied alias",
+                ));
+            }
+            match entries.iter_mut().find(|entry| entry.name == *name) {
+                Some(entry) if entry.trainable => {
+                    entry.trainable = false;
+                    entry.policy_frozen = true;
+                }
+                Some(_) => {
+                    return Err(training(
+                        "compiled AdamW frozen parameter is not a trainable parameter",
+                    ));
+                }
+                None => {
+                    return Err(training("compiled AdamW frozen parameter name is unknown"));
+                }
+            }
+        }
         if entries.iter().all(|entry| !entry.trainable) {
             return Err(training(
-                "compiled module needs at least one trainable parameter",
+                "compiled module needs at least one effectively trainable parameter",
             ));
         }
         Ok(Self {
@@ -495,6 +563,26 @@ impl ModuleParameterPlan {
         parameters: &BTreeMap<String, NodeId>,
         build: impl FnOnce(&mut Graph) -> Result<T>,
     ) -> Result<T> {
+        self.lower_impl(graph, parameters, None, build)
+    }
+
+    fn lower_with_frozen_parameter_nodes<T>(
+        &self,
+        graph: &mut Graph,
+        parameters: &BTreeMap<String, NodeId>,
+        frozen_parameter_nodes: &mut BTreeSet<NodeId>,
+        build: impl FnOnce(&mut Graph) -> Result<T>,
+    ) -> Result<T> {
+        self.lower_impl(graph, parameters, Some(frozen_parameter_nodes), build)
+    }
+
+    fn lower_impl<T>(
+        &self,
+        graph: &mut Graph,
+        parameters: &BTreeMap<String, NodeId>,
+        mut frozen_parameter_nodes: Option<&mut BTreeSet<NodeId>>,
+        build: impl FnOnce(&mut Graph) -> Result<T>,
+    ) -> Result<T> {
         let mut overrides = BTreeMap::new();
         for entry in &self.entries {
             let node = if entry.trainable {
@@ -503,7 +591,13 @@ impl ModuleParameterPlan {
                     .copied()
                     .ok_or_else(|| training("compiled module parameter set mismatch"))?
             } else {
-                graph.constant(entry.value.clone())
+                let node = graph.constant(entry.value.clone());
+                if entry.policy_frozen
+                    && let Some(nodes) = frozen_parameter_nodes.as_deref_mut()
+                {
+                    nodes.insert(node);
+                }
+                node
             };
             if graph.shape(node)? != entry.value.shape()
                 || graph.dtype(node)? != entry.value.dtype()
@@ -511,7 +605,10 @@ impl ModuleParameterPlan {
             {
                 return Err(training("compiled module parameter descriptor mismatch"));
             }
-            overrides.insert(entry.identity, node);
+            overrides.insert(
+                entry.identity,
+                (node, entry.source_trainable, entry.trainable),
+            );
         }
         graph.with_parameter_overrides(overrides, build)
     }
@@ -580,6 +677,7 @@ pub struct CompiledAdamWConfig {
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
+    frozen_parameters: BTreeSet<String>,
     weight_decay_exclusions: BTreeSet<String>,
     inputs: BTreeMap<String, (Shape, DType)>,
     host_token_inputs: BTreeMap<String, Shape>,
@@ -606,6 +704,7 @@ impl CompiledAdamWConfig {
             gradient_accumulation_steps: 1,
             max_gradient_norm: None,
             loss_scale: 1.0,
+            frozen_parameters: BTreeSet::new(),
             weight_decay_exclusions: BTreeSet::new(),
             inputs: BTreeMap::new(),
             host_token_inputs: BTreeMap::new(),
@@ -654,6 +753,25 @@ impl CompiledAdamWConfig {
         Ok(self)
     }
 
+    /// Freezes exact canonical module parameter names for this compilation.
+    /// The policy is resolved by parameter identity without mutating the
+    /// source module. Raw [`TrainingParameterInit`] compilation rejects a
+    /// nonempty policy because it has no module topology to authenticate.
+    pub fn with_frozen_parameters<I, S>(mut self, names: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for name in names {
+            let name = name.into();
+            validate_user_name(&name, "AdamW frozen parameter")?;
+            if !self.frozen_parameters.insert(name) {
+                return Err(training("duplicate compiled AdamW frozen parameter name"));
+            }
+        }
+        Ok(self)
+    }
+
     /// Excludes exact canonical trainable parameter names from decoupled
     /// weight decay. Names are accumulated across calls and duplicates are
     /// rejected; module compilation also rejects frozen state, buffers, tied
@@ -693,8 +811,10 @@ impl CompiledAdamWConfig {
 
     /// Declares one nonempty fixed-shape rank-two I32 token batch whose exact
     /// raw F32 Gather and first-order ScatterAdd VJP may be authenticated for
-    /// status-free Metal replay. The input name is declared atomically, so it
-    /// collides with [`Self::with_input`] in either call order.
+    /// status-free Metal replay. Module compilation may instead authenticate
+    /// a sole forward Gather when its data is an exact policy-frozen parameter.
+    /// The input name is declared atomically, so it collides with
+    /// [`Self::with_input`] in either call order.
     pub fn with_host_token_input(
         mut self,
         name: impl Into<String>,
@@ -752,6 +872,11 @@ impl CompiledAdamWConfig {
         self.weight_decay
     }
 
+    /// Returns canonical frozen parameter names in deterministic sorted order.
+    pub fn frozen_parameters(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.frozen_parameters.iter().map(String::as_str)
+    }
+
     /// Returns canonical exclusion names in deterministic sorted order.
     pub fn weight_decay_exclusions(&self) -> impl ExactSizeIterator<Item = &str> {
         self.weight_decay_exclusions.iter().map(String::as_str)
@@ -780,6 +905,11 @@ impl CompiledAdamWConfig {
         self.host_token_inputs
             .iter()
             .map(|(name, shape)| (name.as_str(), shape))
+    }
+
+    fn without_frozen_parameters(mut self) -> Self {
+        self.frozen_parameters.clear();
+        self
     }
 }
 
@@ -1732,6 +1862,7 @@ pub struct CompiledAdamWPlan {
     progress: AdamWProgress,
     dropout: Option<CompiledDropoutState>,
     host_token_inputs: BTreeMap<String, Shape>,
+    frozen_parameters: BTreeSet<String>,
     evaluation: Option<CompiledEvaluationPlan>,
 }
 
@@ -1895,7 +2026,7 @@ impl<M, E: std::error::Error + 'static> std::error::Error
 
 /// Publication failure retaining the intact owned module/session pair.
 pub struct CompiledModuleAdamWFinishError<M, R> {
-    session: CompiledModuleAdamWSession<M, R>,
+    session: Box<CompiledModuleAdamWSession<M, R>>,
     source: Error,
 }
 
@@ -1909,17 +2040,17 @@ impl<M, R> CompiledModuleAdamWFinishError<M, R> {
     }
 
     pub fn into_session(self) -> CompiledModuleAdamWSession<M, R> {
-        self.session
+        *self.session
     }
 
     pub fn into_parts(self) -> (CompiledModuleAdamWSession<M, R>, Error) {
-        (self.session, self.source)
+        (*self.session, self.source)
     }
 
     /// Discards the failed runtime frontier and returns the sealed host module
     /// exactly as it currently exists, without attempting publication again.
     pub fn into_module_without_publication(self) -> M {
-        self.session.into_module_without_publication()
+        (*self.session).into_module_without_publication()
     }
 }
 
@@ -1959,6 +2090,7 @@ pub struct CpuCompiledAdamW {
     progress: AdamWProgress,
     dropout: Option<CompiledDropoutState>,
     host_token_inputs: BTreeMap<String, Shape>,
+    frozen_parameters: BTreeSet<String>,
     evaluation: Option<CpuCompiledEvaluation>,
 }
 
@@ -1974,6 +2106,7 @@ pub struct MetalCompiledAdamWPlan {
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
     dropout: Option<CompiledDropoutState>,
+    frozen_parameters: BTreeSet<String>,
 }
 
 /// Optimizer-neutral strict-Metal rendering of one compiled training program.
@@ -2002,6 +2135,7 @@ pub struct MetalCompiledAdamW {
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
     dropout: Option<CompiledDropoutState>,
+    frozen_parameters: BTreeSet<String>,
 }
 
 /// Optimizer-neutral owner of one prepared strict-Metal training program.
@@ -2210,10 +2344,24 @@ pub trait CompiledTrainingRuntime {
     /// This does not synchronize frozen state, buffers, optimizer state, replay
     /// progress, or checkpoints. The source runtime remains unchanged if the
     /// snapshot or the module's one atomic replacement transaction fails.
+    /// Optimizer runtimes with an authenticated compile-time freeze policy
+    /// publish only their effective trainable frontier and preserve those
+    /// policy-frozen host identities as well.
     fn publish_parameters(&self, module: &dyn Module) -> Result<LoadReport> {
         let parameters = self.parameter_snapshots()?;
         module.load_trainable_parameters_exact(&parameters)
     }
+}
+
+fn publish_parameters_with_freeze_policy(
+    module: &dyn Module,
+    parameters: BTreeMap<String, TensorData>,
+    frozen_parameters: &BTreeSet<String>,
+) -> Result<LoadReport> {
+    if frozen_parameters.is_empty() {
+        return module.load_trainable_parameters_exact(&parameters);
+    }
+    CompiledModuleSeal::capture(module, frozen_parameters)?.publish(module, &parameters)
 }
 
 /// Portable checkpoint capability for a compiled training runtime.
@@ -2293,6 +2441,7 @@ struct CompiledTrainingPlan {
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
     state_values: BTreeMap<RecurrentStateKey, TensorData>,
     state_versions: BTreeMap<RecurrentStateKey, u64>,
+    frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
 }
 
@@ -2332,6 +2481,7 @@ struct CpuCompiledTrainingProgram {
     workload_buffers: BTreeMap<RecurrentStateKey, u64>,
     state_input_buffers: BTreeMap<String, u64>,
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
+    frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
 }
 
@@ -2671,6 +2821,7 @@ impl CompiledTrainingPlan {
                 .map(|spec| (spec.key.clone(), spec.value.clone()))
                 .collect(),
             state_versions: specs.iter().map(|spec| (spec.key.clone(), 0)).collect(),
+            frozen_parameter_nodes: BTreeSet::new(),
             step: 0,
         })
     }
@@ -2710,7 +2861,10 @@ impl CompiledTrainingPlan {
     ) -> Result<MetalCompiledTrainingPlan> {
         let recurrent = self.recurrent_capture()?;
         let recurrent = recurrent
-            .with_authenticated_host_indexed_movements(host_token_inputs)
+            .with_authenticated_training_host_indices(
+                host_token_inputs,
+                &self.frozen_parameter_nodes,
+            )
             .map_err(captured_inference_error)?;
         let inner = MetalStatefulInferencePlan::new(recurrent.clone(), renderer.clone()).map_err(
             |error| {
@@ -2865,6 +3019,7 @@ impl CompiledTrainingPlan {
             workload_buffers: self.workload_buffers.clone(),
             state_input_buffers: self.state_input_buffers.clone(),
             state_input_keys: self.state_input_keys.clone(),
+            frozen_parameter_nodes: self.frozen_parameter_nodes.clone(),
             step: 0,
         };
         if self.step != 0 || self.state_versions.values().any(|version| *version != 0) {
@@ -3107,7 +3262,7 @@ impl CompiledEvaluationPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let parameter_plan = ModuleParameterPlan::new(module)?;
+        let parameter_plan = ModuleParameterPlan::new(module, &training_plan.frozen_parameters)?;
         let mut graph = Graph::new();
         let inputs = training_plan
             .inner
@@ -3336,6 +3491,7 @@ impl CpuCompiledTrainingProgram {
                 .into_iter()
                 .map(|(key, (_, version))| (key, version))
                 .collect(),
+            frozen_parameter_nodes: self.frozen_parameter_nodes.clone(),
             step: self.step,
         })
     }
@@ -3704,6 +3860,26 @@ impl CompiledAdamWPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
+        if !config.frozen_parameters.is_empty() {
+            return Err(training(
+                "compiled AdamW raw parameters cannot resolve frozen parameter names",
+            ));
+        }
+        Self::compile_parameters(config, parameters, build)
+    }
+
+    fn compile_parameters<F>(
+        config: CompiledAdamWConfig,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        build: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
         let parameters = parameters.into_iter().collect::<Vec<_>>();
         validate_weight_decay_exclusion_names(
             &config,
@@ -3713,6 +3889,7 @@ impl CompiledAdamWPlan {
         let max_gradient_norm = config.max_gradient_norm;
         let loss_scale = config.loss_scale;
         let host_token_inputs = config.host_token_inputs.clone();
+        let frozen_parameters = config.frozen_parameters.clone();
         let inner = CompiledTrainingPlan::compile(
             AdamWProgram {
                 config: config.clone(),
@@ -3734,6 +3911,7 @@ impl CompiledAdamWPlan {
             progress: AdamWProgress::INITIAL,
             dropout: None,
             host_token_inputs,
+            frozen_parameters,
             evaluation: None,
         })
     }
@@ -3748,12 +3926,21 @@ impl CompiledAdamWPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let parameter_plan = ModuleParameterPlan::new(module)?;
+        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
         parameter_plan.validate_weight_decay_exclusions(&config)?;
         let parameters = parameter_plan.initial_parameters()?;
-        Self::compile(config, parameters, move |graph, inputs, parameters| {
-            parameter_plan.lower(graph, parameters, |graph| build(module, graph, inputs))
-        })
+        let mut frozen_parameter_nodes = BTreeSet::new();
+        let mut plan =
+            Self::compile_parameters(config, parameters, |graph, inputs, parameters| {
+                parameter_plan.lower_with_frozen_parameter_nodes(
+                    graph,
+                    parameters,
+                    &mut frozen_parameter_nodes,
+                    |graph| build(module, graph, inputs),
+                )
+            })?;
+        plan.inner.frozen_parameter_nodes = frozen_parameter_nodes;
+        Ok(plan)
     }
 
     /// Compiles module-bound AdamW with one device-resident Threefry block
@@ -3773,7 +3960,7 @@ impl CompiledAdamWPlan {
             &mut dyn TrainingDropoutProvider,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let parameter_plan = ModuleParameterPlan::new(module)?;
+        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
         let parameters = parameter_plan.initial_parameters()?;
         Self::compile_module_with_dropout_parameters(
             config,
@@ -3807,9 +3994,11 @@ impl CompiledAdamWPlan {
         let max_gradient_norm = config.max_gradient_norm;
         let loss_scale = config.loss_scale;
         let host_token_inputs = config.host_token_inputs.clone();
+        let frozen_parameters = config.frozen_parameters.clone();
         let workload = StateSpec::dropout_counter()?;
         let mut dropout_state = None;
-        let inner = CompiledTrainingPlan::compile_with_workload(
+        let mut frozen_parameter_nodes = BTreeSet::new();
+        let mut inner = CompiledTrainingPlan::compile_with_workload(
             AdamWProgram {
                 config: config.clone(),
             },
@@ -3819,14 +4008,18 @@ impl CompiledAdamWPlan {
                 let counter =
                     counter.ok_or_else(|| training("compiled dropout state is absent"))?;
                 let mut provider = CompiledDropoutStream::new(counter, dropout);
-                let (loss, outputs) = parameter_plan.lower(graph, parameters, |graph| {
-                    build(module, graph, inputs, &mut provider)
-                })?;
+                let (loss, outputs) = parameter_plan.lower_with_frozen_parameter_nodes(
+                    graph,
+                    parameters,
+                    &mut frozen_parameter_nodes,
+                    |graph| build(module, graph, inputs, &mut provider),
+                )?;
                 let (successor, state) = provider.finish(graph)?;
                 dropout_state = Some(state);
                 Ok((loss, outputs, Some(successor)))
             },
         )?;
+        inner.frozen_parameter_nodes = frozen_parameter_nodes;
         let dropout = dropout_state
             .ok_or_else(|| training("compiled dropout configuration produced no state"))?;
         let partial_flush = (gradient_accumulation_steps > 1)
@@ -3843,6 +4036,7 @@ impl CompiledAdamWPlan {
             progress: AdamWProgress::INITIAL,
             dropout: Some(dropout),
             host_token_inputs,
+            frozen_parameters,
             evaluation: None,
         })
     }
@@ -3861,6 +4055,11 @@ impl CompiledAdamWPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
+        if !config.frozen_parameters.is_empty() {
+            return Err(training(
+                "compiled AdamW raw parameters cannot resolve frozen parameter names",
+            ));
+        }
         let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
         if decoded.dropout_block_counter.is_some() {
             return Err(training(
@@ -3982,11 +4181,25 @@ impl CompiledAdamWPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let parameter_plan = ModuleParameterPlan::new(module)?;
+        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
         parameter_plan.validate_weight_decay_exclusions(&config)?;
-        Self::compile_from_checkpoint(config, checkpoint, move |graph, inputs, parameters| {
-            parameter_plan.lower(graph, parameters, |graph| build(module, graph, inputs))
-        })
+        let frozen_parameters = config.frozen_parameters.clone();
+        let mut frozen_parameter_nodes = BTreeSet::new();
+        let mut plan = Self::compile_from_checkpoint(
+            config.without_frozen_parameters(),
+            checkpoint,
+            |graph, inputs, parameters| {
+                parameter_plan.lower_with_frozen_parameter_nodes(
+                    graph,
+                    parameters,
+                    &mut frozen_parameter_nodes,
+                    |graph| build(module, graph, inputs),
+                )
+            },
+        )?;
+        plan.inner.frozen_parameter_nodes = frozen_parameter_nodes;
+        plan.frozen_parameters = frozen_parameters;
+        Ok(plan)
     }
 
     /// Recompiles the same explicit residual-dropout program and restores its
@@ -4016,7 +4229,7 @@ impl CompiledAdamWPlan {
                 "compiled AdamW checkpoint accumulation policy mismatch",
             ));
         }
-        let parameter_plan = ModuleParameterPlan::new(module)?;
+        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
         let parameters = decoded
             .parameters
             .iter()
@@ -4146,6 +4359,7 @@ impl CompiledAdamWPlan {
             progress: self.progress,
             dropout: self.dropout,
             host_token_inputs: self.host_token_inputs.clone(),
+            frozen_parameters: self.frozen_parameters.clone(),
             evaluation: self
                 .evaluation
                 .clone()
@@ -4200,6 +4414,7 @@ impl CompiledAdamWPlan {
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
             dropout: self.dropout,
+            frozen_parameters: self.frozen_parameters.clone(),
         })
     }
 
@@ -4245,13 +4460,14 @@ impl CompiledAdamWPlan {
 impl<M: Module> CompiledModuleAdamWPlan<M> {
     fn build_owned<F>(
         module: M,
+        frozen_parameters: &BTreeSet<String>,
         build: F,
     ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
     where
         F: FnOnce(&M) -> Result<CompiledAdamWPlan>,
     {
         let result: Result<(CompiledAdamWPlan, CompiledModuleSeal)> = (|| {
-            let seal = CompiledModuleSeal::capture(&module)?;
+            let seal = CompiledModuleSeal::capture(&module, frozen_parameters)?;
             let plan = build(&module)?;
             seal.validate_unchanged(&module)?;
             Ok((plan, seal))
@@ -4275,7 +4491,8 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        Self::build_owned(module, |module| {
+        let frozen_parameters = config.frozen_parameters.clone();
+        Self::build_owned(module, &frozen_parameters, |module| {
             CompiledAdamWPlan::compile_module(config, module, build)
         })
     }
@@ -4296,7 +4513,8 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             &mut dyn TrainingDropoutProvider,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        Self::build_owned(module, |module| {
+        let frozen_parameters = config.frozen_parameters.clone();
+        Self::build_owned(module, &frozen_parameters, |module| {
             CompiledAdamWPlan::compile_module_with_dropout(config, dropout, module, build)
         })
     }
@@ -4316,7 +4534,8 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        Self::build_owned(module, |module| {
+        let frozen_parameters = config.frozen_parameters.clone();
+        Self::build_owned(module, &frozen_parameters, |module| {
             CompiledAdamWPlan::compile_module_from_checkpoint(config, module, checkpoint, build)
         })
     }
@@ -4338,7 +4557,8 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             &mut dyn TrainingDropoutProvider,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        Self::build_owned(module, |module| {
+        let frozen_parameters = config.frozen_parameters.clone();
+        Self::build_owned(module, &frozen_parameters, |module| {
             CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
                 config, dropout, module, checkpoint, build,
             )
@@ -4441,7 +4661,7 @@ impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleAdamWSession<M, R> {
     pub fn finish(self) -> std::result::Result<M, CompiledModuleAdamWFinishError<M, R>> {
         if let Err(source) = self.seal.validate_unchanged(&self.module) {
             return Err(CompiledModuleAdamWFinishError {
-                session: self,
+                session: Box::new(self),
                 source,
             });
         }
@@ -4449,14 +4669,14 @@ impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleAdamWSession<M, R> {
             Ok(parameters) => parameters,
             Err(source) => {
                 return Err(CompiledModuleAdamWFinishError {
-                    session: self,
+                    session: Box::new(self),
                     source,
                 });
             }
         };
         if let Err(source) = self.seal.publish(&self.module, &parameters) {
             return Err(CompiledModuleAdamWFinishError {
-                session: self,
+                session: Box::new(self),
                 source,
             });
         }
@@ -4540,7 +4760,9 @@ impl CpuCompiledAdamW {
     /// [`crate::nn::Parameter::bind`] inside `module` resolve automatically to
     /// the compiled state frontier. Frozen parameters and buffers are captured
     /// as immutable constants, while tied parameter handles share one graph
-    /// node and one AdamW state tuple.
+    /// node and one AdamW state tuple. Names selected by
+    /// [`CompiledAdamWConfig::with_frozen_parameters`] receive that same
+    /// constant treatment without changing their host trainable flags.
     pub fn compile_module<M, F>(config: CompiledAdamWConfig, module: &M, build: F) -> Result<Self>
     where
         M: Module + ?Sized,
@@ -4789,6 +5011,7 @@ impl CpuCompiledAdamW {
             progress: self.progress,
             dropout: self.dropout,
             host_token_inputs: self.host_token_inputs.clone(),
+            frozen_parameters: self.frozen_parameters.clone(),
             evaluation: self
                 .evaluation
                 .as_ref()
@@ -4908,6 +5131,14 @@ impl CompiledTrainingRuntime for CpuCompiledAdamW {
     fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         CpuCompiledAdamW::parameter_snapshots(self)
     }
+
+    fn publish_parameters(&self, module: &dyn Module) -> Result<LoadReport> {
+        publish_parameters_with_freeze_policy(
+            module,
+            self.parameter_snapshots()?,
+            &self.frozen_parameters,
+        )
+    }
 }
 
 impl CompiledEvaluationRuntime for CpuCompiledAdamW {
@@ -5007,6 +5238,10 @@ where
 
     fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         self.runtime.parameter_snapshots()
+    }
+
+    fn publish_parameters(&self, module: &dyn Module) -> Result<LoadReport> {
+        self.runtime.publish_parameters(module)
     }
 }
 
@@ -5269,6 +5504,7 @@ impl MetalCompiledAdamWPlan {
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
             dropout: self.dropout,
+            frozen_parameters: self.frozen_parameters,
         })
     }
 }
@@ -5835,6 +6071,14 @@ impl CompiledTrainingRuntime for MetalCompiledAdamW {
 
     fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         MetalCompiledAdamW::parameter_snapshots(self)
+    }
+
+    fn publish_parameters(&self, module: &dyn Module) -> Result<LoadReport> {
+        publish_parameters_with_freeze_policy(
+            module,
+            self.parameter_snapshots()?,
+            &self.frozen_parameters,
+        )
     }
 }
 
@@ -6852,6 +7096,72 @@ mod tests {
             visitor("frozen".into(), &self.frozen, StateKind::Parameter);
             visitor("buffer".into(), &self.buffer, StateKind::Buffer);
         }
+    }
+
+    struct FineTuneModule {
+        base: Parameter,
+        adapter: Parameter,
+        frozen: Parameter,
+    }
+
+    impl FineTuneModule {
+        fn new() -> Self {
+            Self {
+                base: Parameter::new(TensorData::new([2], vec![0.25, -0.5]).unwrap(), true),
+                adapter: Parameter::new(TensorData::new([2], vec![0.1, 0.2]).unwrap(), true),
+                frozen: Parameter::new(TensorData::new([2], vec![1.0, -1.0]).unwrap(), false),
+            }
+        }
+    }
+
+    impl Module for FineTuneModule {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            assert!(prefix.is_empty());
+            visitor("base".into(), &self.base, StateKind::Parameter);
+            visitor("base_alias".into(), &self.base, StateKind::Parameter);
+            visitor("adapter".into(), &self.adapter, StateKind::Parameter);
+            visitor("frozen".into(), &self.frozen, StateKind::Parameter);
+        }
+    }
+
+    fn build_fine_tune(
+        module: &FineTuneModule,
+        graph: &mut Graph,
+        inputs: &BTreeMap<String, NodeId>,
+    ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+        let base = module.base.bind(graph)?;
+        assert_eq!(module.base.bind(graph)?, base);
+        let adapter = module.adapter.bind(graph)?;
+        let frozen = module.frozen.bind(graph)?;
+        let scaled = graph.mul(inputs["x"], base)?;
+        let adapted = graph.add(scaled, adapter)?;
+        let output = graph.add(adapted, frozen)?;
+        let squared = graph.square(output)?;
+        let loss = graph.reduce(squared, crate::ReduceKind::Mean, None, false)?;
+        Ok((loss, BTreeMap::from([("output".into(), output)])))
+    }
+
+    fn build_fine_tune_clip(
+        module: &FineTuneModule,
+        graph: &mut Graph,
+        inputs: &BTreeMap<String, NodeId>,
+    ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+        let base = module.base.bind(graph)?;
+        assert_eq!(module.base.bind(graph)?, base);
+        let adapter = module.adapter.bind(graph)?;
+        let scaled = graph.mul(inputs["x"], base)?;
+        let output = graph.add(scaled, adapter)?;
+        Ok((graph.mean_default(output)?, BTreeMap::new()))
+    }
+
+    fn assert_parameter_snapshot_eq(actual: &ParameterSnapshot, expected: &ParameterSnapshot) {
+        assert_eq!(actual.data, expected.data);
+        assert_eq!(actual.shape, expected.shape);
+        assert_eq!(actual.dtype, expected.dtype);
+        assert_eq!(actual.version, expected.version);
+        assert_eq!(actual.identity, expected.identity);
+        assert_eq!(actual.trainable, expected.trainable);
+        assert_eq!(actual.input_name, expected.input_name);
     }
 
     fn build_tied_dropout(
@@ -8918,6 +9228,321 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn adamw_compile_time_freezing_is_canonical_tied_and_raw_fail_closed() {
+        let config = module_config().with_frozen_parameters(["base"]).unwrap();
+        assert_eq!(config.frozen_parameters().collect::<Vec<_>>(), ["base"]);
+        assert!(config.clone().with_frozen_parameters(["base"]).is_err());
+        let raw_parameter =
+            TrainingParameterInit::new("adapter", TensorData::zeros([2]).unwrap()).unwrap();
+        assert!(
+            CompiledAdamWPlan::compile(config.clone(), [raw_parameter], |_, _, _| panic!(
+                "raw frozen-name policy reached graph construction"
+            ),)
+            .is_err()
+        );
+
+        for name in ["base_alias", "frozen", "missing"] {
+            let module = FineTuneModule::new();
+            let invalid = module_config().with_frozen_parameters([name]).unwrap();
+            assert!(
+                CompiledAdamWPlan::compile_module(invalid, &module, |_, _, _| {
+                    panic!("invalid frozen-name policy reached graph construction")
+                })
+                .is_err()
+            );
+        }
+        let buffer = TiedFrozenModule::new([1.0, -1.0]);
+        assert!(
+            CompiledAdamWPlan::compile_module(
+                module_config().with_frozen_parameters(["buffer"]).unwrap(),
+                &buffer,
+                build_tied_frozen,
+            )
+            .is_err()
+        );
+        let all_frozen = TiedFrozenModule::new([1.0, -1.0]);
+        assert!(
+            CompiledAdamWPlan::compile_module(
+                module_config().with_frozen_parameters(["shared"]).unwrap(),
+                &all_frozen,
+                build_tied_frozen,
+            )
+            .is_err()
+        );
+        let overlap = FineTuneModule::new();
+        assert!(
+            CompiledAdamWPlan::compile_module(
+                config
+                    .clone()
+                    .with_weight_decay_exclusions(["base"])
+                    .unwrap(),
+                &overlap,
+                build_fine_tune,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parameter_override_tracks_source_and_effective_trainability_separately() {
+        let parameter = Parameter::new(TensorData::new([2], vec![1.0, 2.0]).unwrap(), true);
+        let mut graph = Graph::new();
+        let frozen = graph.constant(parameter.value().unwrap());
+        assert!(
+            graph
+                .with_parameter_overrides(
+                    BTreeMap::from([(parameter.id(), (frozen, false, false))]),
+                    |graph| parameter.bind(graph),
+                )
+                .is_err(),
+            "effective freezing must not weaken source-trainability authentication"
+        );
+        let bound = graph
+            .with_parameter_overrides(
+                BTreeMap::from([(parameter.id(), (frozen, true, false))]),
+                |graph| parameter.bind(graph),
+            )
+            .unwrap();
+        assert_eq!(bound, frozen);
+        assert!(!graph.requires_grad(bound).unwrap());
+        assert!(parameter.is_trainable());
+    }
+
+    #[test]
+    fn adamw_compile_time_freezing_reduces_state_and_resumes_accumulation_exactly() {
+        let config = module_config()
+            .with_gradient_accumulation(3)
+            .unwrap()
+            .with_frozen_parameters(["base"])
+            .unwrap();
+        let module = FineTuneModule::new();
+        let base = module.base.snapshot().unwrap();
+        let adapter = module.adapter.snapshot().unwrap();
+        let plan =
+            CompiledAdamWPlan::compile_module(config.clone(), &module, build_fine_tune).unwrap();
+        let expected_parameter_keys = vec!["adapter".to_owned()];
+        assert_eq!(
+            plan.inner
+                .state_values
+                .keys()
+                .filter_map(RecurrentStateKey::parameter_name)
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            expected_parameter_keys
+        );
+        assert!(module.base.is_trainable());
+        assert!(module.adapter.is_trainable());
+        assert_parameter_snapshot_eq(&module.base.snapshot().unwrap(), &base);
+        assert_parameter_snapshot_eq(&module.adapter.snapshot().unwrap(), &adapter);
+
+        let metal = plan
+            .metal_plan(
+                MetalRenderer::new(
+                    8,
+                    crate::runtime::metal::MetalCapabilities {
+                        max_buffer_length: 1 << 30,
+                        unified_memory: true,
+                        family: "Apple9".into(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            metal
+                .inner
+                .state_input_keys
+                .values()
+                .filter_map(RecurrentStateKey::parameter_name)
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            expected_parameter_keys
+        );
+
+        let input =
+            || BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]);
+        let mut uninterrupted = plan.prepare_cpu().unwrap();
+        uninterrupted
+            .step(input(), TensorData::scalar(0.01))
+            .unwrap();
+        let checkpoint = uninterrupted.checkpoint().unwrap();
+        let decoded = decode_adamw_checkpoint(checkpoint.as_bytes()).unwrap();
+        assert_eq!(
+            decoded.parameters.keys().cloned().collect::<Vec<_>>(),
+            expected_parameter_keys
+        );
+        assert_eq!(
+            decoded.first_moments.keys().cloned().collect::<Vec<_>>(),
+            expected_parameter_keys
+        );
+        assert_eq!(
+            decoded.second_moments.keys().cloned().collect::<Vec<_>>(),
+            expected_parameter_keys
+        );
+        assert_eq!(
+            decoded
+                .gradient_accumulators
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            expected_parameter_keys
+        );
+
+        let fresh = FineTuneModule::new();
+        let mut resumed = CompiledAdamWPlan::compile_module_from_checkpoint(
+            config,
+            &fresh,
+            &checkpoint,
+            build_fine_tune,
+        )
+        .unwrap()
+        .prepare_cpu()
+        .unwrap();
+        assert!(uninterrupted.zero_grad().unwrap().did_discard());
+        assert!(resumed.zero_grad().unwrap().did_discard());
+        uninterrupted
+            .step(input(), TensorData::scalar(0.01))
+            .unwrap();
+        resumed.step(input(), TensorData::scalar(0.01)).unwrap();
+        assert!(
+            uninterrupted
+                .flush_partial_window(TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        assert!(
+            resumed
+                .flush_partial_window(TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        assert_eq!(
+            uninterrupted.checkpoint().unwrap(),
+            resumed.checkpoint().unwrap()
+        );
+        let publication = FineTuneModule::new();
+        let publication_base = publication.base.snapshot().unwrap();
+        let publication_adapter_version = publication.adapter.version().unwrap();
+        assert!(
+            uninterrupted
+                .publish_parameters(&publication)
+                .unwrap()
+                .is_clean()
+        );
+        assert_parameter_snapshot_eq(&publication.base.snapshot().unwrap(), &publication_base);
+        assert_eq!(
+            publication.adapter.value().unwrap(),
+            uninterrupted.parameter_snapshots().unwrap()["adapter"]
+        );
+        assert_eq!(
+            publication.adapter.version().unwrap(),
+            publication_adapter_version + 1
+        );
+        assert_parameter_snapshot_eq(&module.base.snapshot().unwrap(), &base);
+        assert_parameter_snapshot_eq(&module.adapter.snapshot().unwrap(), &adapter);
+    }
+
+    #[test]
+    fn adamw_compile_time_freezing_excludes_tied_gradients_from_global_clipping() {
+        let clipped = module_config().with_max_gradient_norm(1.0).unwrap();
+        let frozen_config = clipped.clone().with_frozen_parameters(["base"]).unwrap();
+        let frozen_module = FineTuneModule::new();
+        let frozen_plan =
+            CompiledAdamWPlan::compile_module(frozen_config, &frozen_module, build_fine_tune_clip)
+                .unwrap();
+        let metal = frozen_plan
+            .metal_plan(
+                MetalRenderer::new(
+                    8,
+                    crate::runtime::metal::MetalCapabilities {
+                        max_buffer_length: 1 << 30,
+                        unified_memory: true,
+                        family: "Apple9".into(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            metal
+                .inner
+                .state_input_keys
+                .values()
+                .filter_map(RecurrentStateKey::parameter_name)
+                .collect::<Vec<_>>(),
+            ["adapter"]
+        );
+
+        let input = || {
+            BTreeMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![1_000.0, -1_000.0]).unwrap(),
+            )])
+        };
+        let mut frozen = frozen_plan.prepare_cpu().unwrap();
+        frozen.step(input(), TensorData::scalar(0.01)).unwrap();
+        let frozen_moment = frozen.first_moment_snapshots().unwrap()["adapter"].to_vec_f64();
+        assert!(
+            frozen_moment
+                .iter()
+                .all(|value| (*value - 0.05).abs() < 1e-6)
+        );
+
+        let unfrozen_module = FineTuneModule::new();
+        let mut unfrozen =
+            CompiledAdamWPlan::compile_module(clipped, &unfrozen_module, build_fine_tune_clip)
+                .unwrap()
+                .prepare_cpu()
+                .unwrap();
+        unfrozen.step(input(), TensorData::scalar(0.01)).unwrap();
+        let unfrozen_moment = unfrozen.first_moment_snapshots().unwrap()["adapter"].to_vec_f64();
+        assert!(unfrozen_moment.iter().all(|value| value.abs() < 1e-3));
+        assert_ne!(frozen_moment, unfrozen_moment);
+    }
+
+    #[test]
+    fn owned_adamw_freezing_publishes_only_the_unfrozen_frontier() {
+        let module = FineTuneModule::new();
+        let base = module.base.clone();
+        let adapter = module.adapter.clone();
+        let base_before = base.snapshot().unwrap();
+        let adapter_before = adapter.snapshot().unwrap();
+        let plan = CompiledModuleAdamWPlan::compile(
+            module_config().with_frozen_parameters(["base"]).unwrap(),
+            module,
+            build_fine_tune,
+        )
+        .unwrap();
+        let mut session = plan.prepare(&CpuSessionTarget::new()).unwrap();
+        session
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .parameter_snapshots()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["adapter"]
+        );
+        let module = session.finish().unwrap();
+        assert_parameter_snapshot_eq(&module.base.snapshot().unwrap(), &base_before);
+        assert_eq!(module.base.id(), base.id());
+        assert!(module.base.is_trainable());
+        assert_ne!(module.adapter.value().unwrap(), adapter_before.data);
+        assert_eq!(
+            module.adapter.version().unwrap(),
+            adapter_before.version + 1
+        );
+        assert_eq!(module.adapter.id(), adapter.id());
+        assert!(module.adapter.is_trainable());
     }
 
     #[test]

@@ -99,8 +99,11 @@ atomically discards a partial window without a dummy replay: CPU republishes a
 validated candidate frontier, strict Metal copies the complete successor into
 the inactive epoch bank without downloading gradients, and both preserve
 replay/optimizer progress while empty windows are exact no-ops. Checkpoint v3
-authenticates discarded microbatches while v1/v2 remain readable. Dynamic loss
-scaling and broader freezing semantics remain workload-driven follow-ups. The
+authenticates discarded microbatches while v1/v2 remain readable. Canonical
+compile-time freezing projects selected module identities out of reverse-mode,
+optimizer, recurrent, checkpoint, and publication state while retaining them
+as tied capture constants and leaving host trainable flags unchanged. Dynamic
+freezing and runtime policy changes remain out of scope. The
 same maintained workload now selects explicit compiled residual dropout: two
 source-ordered fixed-shape F32 draws share an immutable two-word Threefry key
 and one device-resident U64 block counter committed atomically with AdamW.
