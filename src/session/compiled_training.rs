@@ -1127,6 +1127,7 @@ const ADAMW_CHECKPOINT_FORMAT_V1: &str = "rustgrad-compiled-adamw-v1";
 const ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-adamw-v2";
 const ADAMW_CHECKPOINT_FORMAT_V3: &str = "rustgrad-compiled-adamw-v3";
 const ADAMW_CHECKPOINT_FORMAT_V4: &str = "rustgrad-compiled-adamw-v4";
+const ADAMW_CHECKPOINT_FORMAT_V5: &str = "rustgrad-compiled-adamw-v5";
 
 /// Outcome of explicitly discarding a compiled AdamW partial gradient window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1146,6 +1147,53 @@ impl CompiledAdamWZeroGradResult {
     }
 }
 
+/// Outcome of explicitly committing a non-full compiled AdamW window on CPU.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledAdamWFlushResult {
+    flushed_microbatches: u64,
+    optimizer_step: u64,
+}
+
+impl CompiledAdamWFlushResult {
+    /// Number of retained microbatches averaged by this call.
+    pub fn flushed_microbatches(&self) -> u64 {
+        self.flushed_microbatches
+    }
+
+    /// Whether this call published an AdamW update.
+    pub fn did_update(&self) -> bool {
+        self.flushed_microbatches != 0
+    }
+
+    /// Optimizer step after the call. Empty windows preserve the prior step.
+    pub fn optimizer_step(&self) -> u64 {
+        self.optimizer_step
+    }
+}
+
+/// Optimizer progress produced by one optional partial-window flush.
+pub trait CompiledAdamWFlush {
+    fn flushed_microbatches(&self) -> u64;
+
+    fn did_update(&self) -> bool;
+
+    fn optimizer_step(&self) -> u64;
+}
+
+impl CompiledAdamWFlush for CompiledAdamWFlushResult {
+    fn flushed_microbatches(&self) -> u64 {
+        CompiledAdamWFlushResult::flushed_microbatches(self)
+    }
+
+    fn did_update(&self) -> bool {
+        CompiledAdamWFlushResult::did_update(self)
+    }
+
+    fn optimizer_step(&self) -> u64 {
+        CompiledAdamWFlushResult::optimizer_step(self)
+    }
+}
+
 /// Deterministic, portable state for one exact compiled AdamW program.
 ///
 /// The safetensors payload contains parameter and moment tensors plus any
@@ -1155,8 +1203,9 @@ impl CompiledAdamWZeroGradResult {
 /// present. Fixed clipping and loss-scaling policy is authenticated by the
 /// capture identity rather than duplicated as mutable checkpoint state. It
 /// never serializes executable code, graphs, runtime slots, or host pointers.
-/// Dropout-bearing v4 adds its recurrent U64 block counter; legacy v1--v3
-/// bytes remain accepted.
+/// Dropout-bearing v4 adds its recurrent U64 block counter. A v5 checkpoint
+/// records progress consumed by explicit CPU partial-window flushes and
+/// whether that same counter is present; legacy v1--v4 bytes remain accepted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledAdamWCheckpoint {
     bytes: Vec<u8>,
@@ -1186,6 +1235,9 @@ struct DecodedAdamWCheckpoint {
     accumulation_steps: u64,
     accumulation_index: u64,
     discarded_microbatches: u64,
+    flushed_window_count: u64,
+    flushed_microbatch_count: u64,
+    flush_capture_identity: Option<u64>,
     dropout_block_counter: Option<u64>,
     parameters: BTreeMap<String, TensorData>,
     first_moments: BTreeMap<String, TensorData>,
@@ -1201,6 +1253,9 @@ struct AdamWCheckpointProgress {
     accumulation_steps: u64,
     accumulation_index: u64,
     discarded_microbatches: u64,
+    flushed_window_count: u64,
+    flushed_microbatch_count: u64,
+    flush_capture_identity: Option<u64>,
     dropout_block_counter: Option<u64>,
 }
 
@@ -1210,6 +1265,8 @@ struct AdamWProgress {
     optimizer_step: u64,
     accumulation_index: u64,
     discarded_microbatches: u64,
+    flushed_window_count: u64,
+    flushed_microbatch_count: u64,
 }
 
 impl AdamWProgress {
@@ -1218,6 +1275,8 @@ impl AdamWProgress {
         optimizer_step: 0,
         accumulation_index: 0,
         discarded_microbatches: 0,
+        flushed_window_count: 0,
+        flushed_microbatch_count: 0,
     };
 
     fn advance_replay(self, accumulation_steps: u64) -> Result<Self> {
@@ -1272,6 +1331,43 @@ impl AdamWProgress {
             next,
             CompiledAdamWZeroGradResult {
                 discarded_microbatches: discarded,
+            },
+        ))
+    }
+
+    fn flush_partial(self, accumulation_steps: u64) -> Result<(Self, CompiledAdamWFlushResult)> {
+        if self.accumulation_index == 0 {
+            return Ok((
+                self,
+                CompiledAdamWFlushResult {
+                    flushed_microbatches: 0,
+                    optimizer_step: self.optimizer_step,
+                },
+            ));
+        }
+        let flushed_microbatches = self.accumulation_index;
+        let next = Self {
+            optimizer_step: self
+                .optimizer_step
+                .checked_add(1)
+                .ok_or_else(|| training("compiled AdamW optimizer step overflow"))?,
+            accumulation_index: 0,
+            flushed_window_count: self
+                .flushed_window_count
+                .checked_add(1)
+                .ok_or_else(|| training("compiled AdamW partial flush count overflow"))?,
+            flushed_microbatch_count: self
+                .flushed_microbatch_count
+                .checked_add(flushed_microbatches)
+                .ok_or_else(|| training("compiled AdamW flushed microbatch count overflow"))?,
+            ..self
+        };
+        validate_adamw_progress(next, accumulation_steps)?;
+        Ok((
+            next,
+            CompiledAdamWFlushResult {
+                flushed_microbatches,
+                optimizer_step: next.optimizer_step,
             },
         ))
     }
@@ -1628,6 +1724,7 @@ pub struct CpuCompiledMomentumSgd {
 /// the authenticated program or optimizer frontier.
 pub struct CompiledAdamWPlan {
     inner: CompiledTrainingPlan,
+    partial_flush: Option<CompiledAdamWPartialFlushPlan>,
     program_identity: u64,
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
@@ -1855,6 +1952,7 @@ impl<M, R> std::error::Error for CompiledModuleAdamWFinishError<M, R> {
 /// graph-owned step counter, and capture-authenticated gradient policies.
 pub struct CpuCompiledAdamW {
     inner: CpuCompiledTrainingProgram,
+    partial_flush: Option<CompiledAdamWPartialFlushPlan>,
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
@@ -1869,7 +1967,9 @@ pub struct CpuCompiledAdamW {
 /// existing epoch-swapped Metal runtime.
 pub struct MetalCompiledAdamWPlan {
     inner: MetalCompiledTrainingPlan,
+    partial_flush: Option<CompiledAdamWPartialFlushPlan>,
     progress: AdamWProgress,
+    flush_capture_identity: Option<u64>,
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
@@ -1896,6 +1996,7 @@ struct MetalCompiledTrainingPlan {
 pub struct MetalCompiledAdamW {
     inner: MetalCompiledTrainingProgram,
     progress: AdamWProgress,
+    flush_capture_identity: Option<u64>,
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
@@ -2117,6 +2218,26 @@ pub trait CompiledAdamWRuntime:
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
 }
 
+/// Optional extension for committing an incomplete compiled AdamW window.
+///
+/// The transition consumes only the live parameter, moment, accumulator, and
+/// optimizer-cursor frontier plus the explicit learning rate. It cannot reach
+/// a training batch, forward/backward graph, or recurrent dropout state.
+/// This first implementation is exposed by CPU runtimes only; the contract is
+/// backend-neutral so a future strict Metal implementation can replay the
+/// identical authenticated transition without changing user code.
+pub trait CompiledAdamWFlushRuntime: CompiledAdamWRuntime {
+    type Flush: CompiledAdamWFlush;
+
+    /// Atomically averages the currently retained `k < N` gradients by `k`,
+    /// clips once, performs one AdamW update, and resets the partial window.
+    /// An empty window is an exact no-op.
+    fn flush_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::Flush>;
+
+    /// Stable identity of the authenticated auxiliary state transition.
+    fn flush_capture_identity(&self) -> Option<u64>;
+}
+
 /// Resource-free output of compiled training graph construction.
 #[derive(Clone)]
 struct CompiledTrainingPlan {
@@ -2130,7 +2251,17 @@ struct CompiledTrainingPlan {
     state_input_buffers: BTreeMap<String, u64>,
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
     state_values: BTreeMap<RecurrentStateKey, TensorData>,
+    state_versions: BTreeMap<RecurrentStateKey, u64>,
     step: u64,
+}
+
+#[derive(Clone)]
+struct CompiledAdamWPartialFlushPlan {
+    capture: CapturedMixedSchedule,
+    recurrent_capture: CapturedStatefulInference,
+    state_buffers: BTreeMap<RecurrentStateKey, u64>,
+    state_input_keys: BTreeMap<String, RecurrentStateKey>,
+    capture_identity: u64,
 }
 
 #[derive(Clone)]
@@ -2170,17 +2301,60 @@ fn materialize_compiled_public_aliases(
     graph: &mut Graph,
     requested: &[NodeId],
 ) -> Result<Vec<NodeId>> {
-    let preview = schedule_many(graph, requested).map_err(schedule_error)?;
-    let aliases = preview
-        .requested_passthroughs
-        .iter()
-        .map(|alias| alias.requested)
-        .collect::<BTreeSet<_>>();
+    let aliases = compiled_requested_aliases(graph, requested)?;
     requested
         .iter()
         .map(|node| {
             if aliases.contains(node) {
                 graph.contiguous(*node)
+            } else {
+                Ok(*node)
+            }
+        })
+        .collect()
+}
+
+fn compiled_requested_aliases(graph: &Graph, requested: &[NodeId]) -> Result<BTreeSet<NodeId>> {
+    Ok(schedule_many(graph, requested)
+        .map_err(schedule_error)?
+        .requested_passthroughs
+        .iter()
+        .map(|alias| alias.requested)
+        .collect())
+}
+
+fn compiled_unowned_requests(graph: &Graph, requested: &[NodeId]) -> Result<BTreeSet<NodeId>> {
+    let preview = schedule_many(graph, requested).map_err(schedule_error)?;
+    let owners = preview
+        .items
+        .iter()
+        .flat_map(|item| item.outputs.iter())
+        .map(|output| output.id)
+        .collect::<BTreeSet<_>>();
+    Ok(requested
+        .iter()
+        .copied()
+        .filter(|node| !owners.contains(&(node.index() as u64)))
+        .collect())
+}
+
+/// Recurrent outputs must name storage produced by the captured transition,
+/// even when their value is a constant or an existing buffer alias. Insert an
+/// explicit copy only for those passthroughs; ordinary computed successors
+/// retain their original identity and schedule.
+fn materialize_compiled_state_aliases(
+    graph: &mut Graph,
+    requested: &[NodeId],
+) -> Result<Vec<NodeId>> {
+    let aliases = compiled_unowned_requests(graph, requested)?;
+    requested
+        .iter()
+        .map(|node| {
+            if aliases.contains(node) {
+                let shape = graph.shape(*node)?.clone();
+                let dtype = graph.dtype(*node)?;
+                checked_descriptor(&shape, dtype)?;
+                Ok(graph.push(crate::Op::Contiguous { input: *node }, shape, dtype))
             } else {
                 Ok(*node)
             }
@@ -2455,6 +2629,7 @@ impl CompiledTrainingPlan {
                 .iter()
                 .map(|spec| (spec.key.clone(), spec.value.clone()))
                 .collect(),
+            state_versions: specs.iter().map(|spec| (spec.key.clone(), 0)).collect(),
             step: 0,
         })
     }
@@ -2547,10 +2722,21 @@ impl CompiledTrainingPlan {
         })
     }
 
+    #[cfg(test)]
     fn restore_frontier(
+        self,
+        step: u64,
+        values: BTreeMap<RecurrentStateKey, TensorData>,
+    ) -> Result<Self> {
+        let versions = values.keys().cloned().map(|key| (key, step)).collect();
+        self.restore_frontier_with_versions(step, values, versions)
+    }
+
+    fn restore_frontier_with_versions(
         mut self,
         step: u64,
         values: BTreeMap<RecurrentStateKey, TensorData>,
+        versions: BTreeMap<RecurrentStateKey, u64>,
     ) -> Result<Self> {
         let expected = self
             .parameter_buffers
@@ -2561,6 +2747,9 @@ impl CompiledTrainingPlan {
             .collect::<BTreeSet<_>>();
         if values.keys().cloned().collect::<BTreeSet<_>>() != expected {
             return Err(training("compiled checkpoint state names mismatch"));
+        }
+        if versions.keys().cloned().collect::<BTreeSet<_>>() != expected {
+            return Err(training("compiled checkpoint state versions mismatch"));
         }
         for (key, value) in &values {
             let current = self
@@ -2573,6 +2762,7 @@ impl CompiledTrainingPlan {
             checked_bytes(value)?;
         }
         self.state_values = values;
+        self.state_versions = versions;
         self.step = step;
         let frontier = self
             .capture
@@ -2582,10 +2772,17 @@ impl CompiledTrainingPlan {
             .iter()
             .cloned()
             .map(|mut state| {
-                state.version = step;
-                state
+                let key = self
+                    .state_input_buffers
+                    .iter()
+                    .find_map(|(input, buffer)| {
+                        (*buffer == state.buffer).then(|| self.state_input_keys[input].clone())
+                    })
+                    .ok_or_else(|| training("compiled checkpoint state buffer is absent"))?;
+                state.version = self.state_versions[&key];
+                Ok(state)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         MixedReplayCursor::resume(&self.capture, frontier).map_err(replay_error)?;
         Ok(self)
     }
@@ -2629,10 +2826,233 @@ impl CompiledTrainingPlan {
             state_input_keys: self.state_input_keys.clone(),
             step: 0,
         };
-        if self.step != 0 {
-            program.restore_frontier(self.step, &self.state_values)?;
+        if self.step != 0 || self.state_versions.values().any(|version| *version != 0) {
+            program.restore_frontier(self.step, &self.state_values, &self.state_versions)?;
         }
         Ok(program)
+    }
+}
+
+impl CompiledAdamWPartialFlushPlan {
+    fn compile(training_plan: &CompiledTrainingPlan, config: &CompiledAdamWConfig) -> Result<Self> {
+        if config.gradient_accumulation_steps <= 1 {
+            return Err(training(
+                "compiled AdamW partial flush requires gradient accumulation",
+            ));
+        }
+
+        let state_buffers = training_plan
+            .parameter_buffers
+            .iter()
+            .map(|(name, buffer)| (RecurrentStateKey::parameter(name), *buffer))
+            .chain(
+                training_plan
+                    .optimizer_buffers
+                    .iter()
+                    .map(|(key, buffer)| (key.clone(), *buffer)),
+            )
+            .collect::<BTreeMap<_, _>>();
+        let mut graph = Graph::new();
+        let learning_rate = graph.input_dtype_requires_grad(
+            LEARNING_RATE_INPUT,
+            Shape::from([]),
+            DType::F32,
+            false,
+        );
+        let mut state_nodes = BTreeMap::new();
+        let mut state_by_input = BTreeMap::new();
+        let mut specs = Vec::with_capacity(state_buffers.len());
+        for (input_name, key) in &training_plan.state_input_keys {
+            let Some(buffer) = state_buffers.get(key).copied() else {
+                continue;
+            };
+            let value = training_plan
+                .state_values
+                .get(key)
+                .cloned()
+                .ok_or_else(|| training("compiled partial flush state value is absent"))?;
+            let node = graph.input_dtype_requires_grad(
+                input_name.clone(),
+                value.shape().clone(),
+                value.dtype(),
+                false,
+            );
+            state_nodes.insert(key.clone(), node);
+            state_by_input.insert(node, state_for(buffer, &value)?);
+            specs.push((input_name.clone(), key.clone(), value, node, buffer));
+        }
+        if specs.len() != state_buffers.len() {
+            return Err(training("compiled partial flush state schema differs"));
+        }
+
+        let parameters = state_nodes
+            .iter()
+            .filter_map(|(key, node)| key.parameter_name().map(|name| (name.to_owned(), *node)))
+            .collect::<BTreeMap<_, _>>();
+        if parameters.len() != training_plan.parameter_buffers.len() {
+            return Err(training("compiled partial flush parameter schema differs"));
+        }
+        let accumulation_index_key =
+            RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex);
+        let index = state_nodes
+            .get(&accumulation_index_key)
+            .copied()
+            .ok_or_else(|| training("compiled partial flush accumulation index is absent"))?;
+        let divisor = graph.cast(index, DType::F32)?;
+        let mut gradients = BTreeMap::new();
+        for name in parameters.keys() {
+            let accumulator_key =
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
+            let accumulator = state_nodes
+                .get(&accumulator_key)
+                .copied()
+                .ok_or_else(|| training("compiled partial flush accumulator is absent"))?;
+            gradients.insert(name.clone(), graph.div(accumulator, divisor)?);
+        }
+        let gradients = clip_gradients_by_global_norm(config, &mut graph, &gradients)?;
+        let mut updates = lower_adamw_update_candidates(
+            config,
+            &mut graph,
+            learning_rate,
+            &parameters,
+            &gradients,
+            &state_nodes,
+        )?;
+        let zero_index = graph.full_with_dtype(Shape::from([]), Scalar::U(0), DType::U64)?;
+        updates.insert(accumulation_index_key, zero_index);
+        for (name, parameter) in &parameters {
+            let key =
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
+            let zero = graph.lazy_full_with_dtype(
+                graph.shape(*parameter)?.clone(),
+                Scalar::I(0),
+                DType::F32,
+            )?;
+            updates.insert(key, zero);
+        }
+        let successor_keys = specs
+            .iter()
+            .map(|(_, key, ..)| key.clone())
+            .collect::<Vec<_>>();
+        let successors = successor_keys
+            .iter()
+            .map(|key| updates[key])
+            .collect::<Vec<_>>();
+        let successors = materialize_compiled_state_aliases(&mut graph, &successors)?;
+        for (key, successor) in successor_keys.into_iter().zip(successors) {
+            updates.insert(key, successor);
+        }
+        if updates.len() != specs.len()
+            || specs.iter().any(|(_, key, ..)| !updates.contains_key(key))
+        {
+            return Err(training("compiled partial flush successor schema differs"));
+        }
+
+        let state_links = specs
+            .iter()
+            .map(|(_, key, _, node, _)| InferenceStateLink::new(*node, updates[key]))
+            .collect::<Vec<_>>();
+        let initial_state = specs
+            .iter()
+            .map(|(input, _, value, _, _)| (input.clone(), value.clone()))
+            .collect();
+        let recurrent_capture =
+            CapturedStatefulInference::from_graph(&graph, &[], &state_links, initial_state)
+                .map_err(captured_inference_error)?;
+
+        let requested = specs
+            .iter()
+            .map(|(_, key, ..)| updates[key])
+            .collect::<Vec<_>>();
+        for node in &requested {
+            checked_descriptor(graph.shape(*node)?, graph.dtype(*node)?)?;
+        }
+        let pure = schedule_many(&graph, &requested).map_err(schedule_error)?;
+        if let Some(item) = pure.items.iter().find(|item| item.boundary.is_some()) {
+            return Err(training(format!(
+                "compiled partial flush has an unsupported boundary at node {}",
+                item.node.index()
+            )));
+        }
+        let mut captured = CapturedSchedule::capture(&graph, &pure, &[]).map_err(replay_error)?;
+        let state_bindings = collect_state_bindings(&pure, &state_by_input)?;
+        let pure = bind_schedule_states(pure, state_bindings).map_err(schedule_error)?;
+        let mut effects = EffectGraph::default();
+        let mut effect_bindings = Vec::with_capacity(specs.len());
+        for (ordinal, (_, key, value, _, buffer)) in specs.iter().enumerate() {
+            let next = updates[key];
+            if next.index() as u64 >= STATE_BUFFER_BASE {
+                return Err(training(
+                    "graph node identity overlaps persistent state namespace",
+                ));
+            }
+            let destination = effects
+                .insert(*buffer, value.clone())
+                .map_err(effect_error)?;
+            let source = effects
+                .insert(
+                    next.index() as u64,
+                    TensorData::zeros_with_dtype(value.shape().clone(), value.dtype())?,
+                )
+                .map_err(effect_error)?;
+            effects
+                .assign(&destination, &source)
+                .map_err(effect_error)?;
+            effect_bindings.push(value_binding(
+                &pure,
+                next,
+                u64::try_from(ordinal).map_err(|_| training("effect index overflow"))?,
+            )?);
+        }
+        let mixed = combine_mixed_schedules(
+            pure,
+            schedule_effects(&effects).map_err(schedule_error)?,
+            effect_bindings,
+        )
+        .map_err(schedule_error)?;
+        captured.items = mixed.items.clone();
+        let capture = CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
+            .map_err(replay_error)?;
+        validate_external_binding_ownership(&capture, std::iter::empty::<&String>())?;
+        let capture_identity = capture
+            .initial_recurrent_cursor()
+            .map_err(replay_error)?
+            .capture_identity();
+        Ok(Self {
+            capture,
+            recurrent_capture,
+            state_buffers,
+            state_input_keys: specs
+                .into_iter()
+                .map(|(input, key, ..)| (input, key))
+                .collect(),
+            capture_identity,
+        })
+    }
+
+    fn capture_identity(&self) -> u64 {
+        self.capture_identity
+    }
+
+    fn with_frontier(mut self, values: &BTreeMap<RecurrentStateKey, TensorData>) -> Result<Self> {
+        let initial_state = self
+            .state_input_keys
+            .iter()
+            .map(|(input, key)| {
+                Ok((
+                    input.clone(),
+                    values
+                        .get(key)
+                        .cloned()
+                        .ok_or_else(|| training("compiled partial flush frontier is absent"))?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        self.recurrent_capture = self
+            .recurrent_capture
+            .with_initial_state(initial_state)
+            .map_err(captured_inference_error)?;
+        Ok(self)
     }
 }
 
@@ -2839,7 +3259,7 @@ impl CpuCompiledTrainingProgram {
     }
 
     fn plan(&self) -> Result<CompiledTrainingPlan> {
-        let state_values = self
+        let state_frontier = self
             .state_input_keys
             .iter()
             .map(|(input, key)| {
@@ -2854,7 +3274,7 @@ impl CpuCompiledTrainingProgram {
                     .map_err(runtime_error)?
                     .tensor()
                     .clone();
-                Ok((key.clone(), value))
+                Ok((key.clone(), (value, state.version)))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(CompiledTrainingPlan {
@@ -2867,7 +3287,14 @@ impl CpuCompiledTrainingProgram {
             workload_buffers: self.workload_buffers.clone(),
             state_input_buffers: self.state_input_buffers.clone(),
             state_input_keys: self.state_input_keys.clone(),
-            state_values,
+            state_values: state_frontier
+                .iter()
+                .map(|(key, (value, _))| (key.clone(), value.clone()))
+                .collect(),
+            state_versions: state_frontier
+                .into_iter()
+                .map(|(key, (_, version))| (key, version))
+                .collect(),
             step: self.step,
         })
     }
@@ -2966,6 +3393,7 @@ impl CpuCompiledTrainingProgram {
         &mut self,
         step: u64,
         values: &BTreeMap<RecurrentStateKey, TensorData>,
+        versions: &BTreeMap<RecurrentStateKey, u64>,
     ) -> Result<()> {
         let buffers = self
             .parameter_buffers
@@ -2985,6 +3413,9 @@ impl CpuCompiledTrainingProgram {
         if values.len() != buffers.len() || values.keys().ne(buffers.keys()) {
             return Err(training("compiled checkpoint state names mismatch"));
         }
+        if versions.len() != buffers.len() || versions.keys().ne(buffers.keys()) {
+            return Err(training("compiled checkpoint state versions mismatch"));
+        }
 
         let mut snapshots = Vec::with_capacity(buffers.len());
         for (name, buffer) in buffers {
@@ -2995,7 +3426,7 @@ impl CpuCompiledTrainingProgram {
             }
             checked_bytes(value)?;
             let mut state = current.clone();
-            state.version = step;
+            state.version = versions[&name];
             snapshots.push((state, value.clone()));
         }
 
@@ -3021,7 +3452,8 @@ impl CpuCompiledTrainingProgram {
         step: u64,
         replacements: BTreeMap<RecurrentStateKey, TensorData>,
     ) -> Result<()> {
-        let mut values = self.plan()?.state_values;
+        let plan = self.plan()?;
+        let mut values = plan.state_values;
         for (key, value) in replacements {
             let current = values
                 .get(&key)
@@ -3031,7 +3463,72 @@ impl CpuCompiledTrainingProgram {
             }
             values.insert(key, value);
         }
-        self.restore_frontier(step, &values)
+        self.restore_frontier(step, &values, &plan.state_versions)
+    }
+
+    fn replay_auxiliary_transition(
+        &mut self,
+        transition: &CompiledAdamWPartialFlushPlan,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<()> {
+        validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
+
+        let selected_buffers = transition
+            .state_buffers
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let selected_frontier = self
+            .cursor
+            .frontier()
+            .iter()
+            .filter(|state| selected_buffers.contains(&state.buffer))
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected_frontier.len() != selected_buffers.len() {
+            return Err(training("compiled auxiliary state frontier is incomplete"));
+        }
+        let mut auxiliary_cursor =
+            MixedReplayCursor::resume(&transition.capture, selected_frontier)
+                .map_err(replay_error)?;
+
+        let next_frontier = self
+            .cursor
+            .frontier()
+            .iter()
+            .cloned()
+            .map(|mut state| {
+                if selected_buffers.contains(&state.buffer) {
+                    state.version = state.version.checked_add(1).ok_or_else(|| {
+                        training("compiled auxiliary state version would overflow")
+                    })?;
+                }
+                Ok(state)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let next_cursor =
+            MixedReplayCursor::resume(&self.capture, next_frontier).map_err(replay_error)?;
+
+        let provided = BTreeMap::from([(LEARNING_RATE_INPUT.to_owned(), learning_rate)]);
+        let replay = transition
+            .capture
+            .replay_recurrent(
+                &mut self.runtime,
+                &mut auxiliary_cursor,
+                &provided,
+                injected_failure,
+            )
+            .map_err(replay_error)?;
+        debug_assert!(replay.outputs.is_empty());
+        #[cfg(debug_assertions)]
+        {
+            let mut committed = replay.committed.clone();
+            committed.sort_by_key(|state| state.buffer);
+            debug_assert_eq!(committed, auxiliary_cursor.frontier());
+        }
+        self.cursor = next_cursor;
+        Ok(())
     }
 
     fn snapshots(&self, buffers: &BTreeMap<String, u64>) -> Result<BTreeMap<String, TensorData>> {
@@ -3175,10 +3672,20 @@ impl CompiledAdamWPlan {
         let max_gradient_norm = config.max_gradient_norm;
         let loss_scale = config.loss_scale;
         let host_token_inputs = config.host_token_inputs.clone();
-        let inner = CompiledTrainingPlan::compile(AdamWProgram { config }, parameters, build)?;
+        let inner = CompiledTrainingPlan::compile(
+            AdamWProgram {
+                config: config.clone(),
+            },
+            parameters,
+            build,
+        )?;
+        let partial_flush = (gradient_accumulation_steps > 1)
+            .then(|| CompiledAdamWPartialFlushPlan::compile(&inner, &config))
+            .transpose()?;
         let program_identity = inner.capture_identity()?;
         Ok(Self {
             inner,
+            partial_flush,
             program_identity,
             gradient_accumulation_steps,
             max_gradient_norm,
@@ -3262,7 +3769,9 @@ impl CompiledAdamWPlan {
         let workload = StateSpec::dropout_counter()?;
         let mut dropout_state = None;
         let inner = CompiledTrainingPlan::compile_with_workload(
-            AdamWProgram { config },
+            AdamWProgram {
+                config: config.clone(),
+            },
             parameters,
             Some(workload),
             |graph, inputs, parameters, counter| {
@@ -3279,9 +3788,13 @@ impl CompiledAdamWPlan {
         )?;
         let dropout = dropout_state
             .ok_or_else(|| training("compiled dropout configuration produced no state"))?;
+        let partial_flush = (gradient_accumulation_steps > 1)
+            .then(|| CompiledAdamWPartialFlushPlan::compile(&inner, &config))
+            .transpose()?;
         let program_identity = inner.capture_identity()?;
         Ok(Self {
             inner,
+            partial_flush,
             program_identity,
             gradient_accumulation_steps,
             max_gradient_norm,
@@ -3327,6 +3840,13 @@ impl CompiledAdamWPlan {
         if plan.capture_identity() != decoded.capture_identity {
             return Err(training(
                 "compiled AdamW checkpoint capture identity mismatch",
+            ));
+        }
+        if decoded.flush_capture_identity.is_some()
+            && plan.flush_capture_identity() != decoded.flush_capture_identity
+        {
+            return Err(training(
+                "compiled AdamW checkpoint partial flush capture identity mismatch",
             ));
         }
         let mut values = decoded
@@ -3375,8 +3895,33 @@ impl CompiledAdamWPlan {
             optimizer_step: decoded.optimizer_step,
             accumulation_index: decoded.accumulation_index,
             discarded_microbatches: decoded.discarded_microbatches,
+            flushed_window_count: decoded.flushed_window_count,
+            flushed_microbatch_count: decoded.flushed_microbatch_count,
         };
-        plan.inner = plan.inner.restore_frontier(decoded.replay_step, values)?;
+        let optimizer_version = decoded
+            .replay_step
+            .checked_add(decoded.flushed_window_count)
+            .ok_or_else(|| training("compiled AdamW checkpoint state version overflows"))?;
+        let versions = values
+            .keys()
+            .cloned()
+            .map(|key| {
+                let version = if plan.inner.workload_buffers.contains_key(&key) {
+                    decoded.replay_step
+                } else {
+                    optimizer_version
+                };
+                (key, version)
+            })
+            .collect();
+        plan.inner =
+            plan.inner
+                .restore_frontier_with_versions(decoded.replay_step, values, versions)?;
+        plan.partial_flush = plan
+            .partial_flush
+            .take()
+            .map(|transition| transition.with_frontier(&plan.inner.state_values))
+            .transpose()?;
         Ok(plan)
     }
 
@@ -3449,6 +3994,13 @@ impl CompiledAdamWPlan {
                 "compiled AdamW checkpoint capture identity mismatch",
             ));
         }
+        if decoded.flush_capture_identity.is_some()
+            && plan.flush_capture_identity() != decoded.flush_capture_identity
+        {
+            return Err(training(
+                "compiled AdamW checkpoint partial flush capture identity mismatch",
+            ));
+        }
         let expected_counter = decoded
             .replay_step
             .checked_mul(
@@ -3512,8 +4064,33 @@ impl CompiledAdamWPlan {
             optimizer_step: decoded.optimizer_step,
             accumulation_index: decoded.accumulation_index,
             discarded_microbatches: decoded.discarded_microbatches,
+            flushed_window_count: decoded.flushed_window_count,
+            flushed_microbatch_count: decoded.flushed_microbatch_count,
         };
-        plan.inner = plan.inner.restore_frontier(decoded.replay_step, values)?;
+        let optimizer_version = decoded
+            .replay_step
+            .checked_add(decoded.flushed_window_count)
+            .ok_or_else(|| training("compiled AdamW checkpoint state version overflows"))?;
+        let versions = values
+            .keys()
+            .cloned()
+            .map(|key| {
+                let version = if plan.inner.workload_buffers.contains_key(&key) {
+                    decoded.replay_step
+                } else {
+                    optimizer_version
+                };
+                (key, version)
+            })
+            .collect();
+        plan.inner =
+            plan.inner
+                .restore_frontier_with_versions(decoded.replay_step, values, versions)?;
+        plan.partial_flush = plan
+            .partial_flush
+            .take()
+            .map(|transition| transition.with_frontier(&plan.inner.state_values))
+            .transpose()?;
         Ok(plan)
     }
 
@@ -3521,6 +4098,7 @@ impl CompiledAdamWPlan {
     pub fn prepare_cpu(&self) -> Result<CpuCompiledAdamW> {
         Ok(CpuCompiledAdamW {
             inner: self.inner.prepare_cpu()?,
+            partial_flush: self.partial_flush.clone(),
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
@@ -3560,7 +4138,9 @@ impl CompiledAdamWPlan {
                 .metal_plan(renderer, &self.host_token_inputs, self.evaluation.clone())?;
         Ok(MetalCompiledAdamWPlan {
             inner,
+            partial_flush: self.partial_flush.clone(),
             progress: self.progress,
+            flush_capture_identity: self.flush_capture_identity(),
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
@@ -3596,6 +4176,14 @@ impl CompiledAdamWPlan {
     /// Number of Threefry U64 blocks reserved by each successful replay.
     pub fn dropout_blocks_per_replay(&self) -> Option<u64> {
         self.dropout.map(|dropout| dropout.blocks_per_replay)
+    }
+
+    /// Stable identity of the state-only flush capture, when accumulation is
+    /// enabled.
+    pub fn flush_capture_identity(&self) -> Option<u64> {
+        self.partial_flush
+            .as_ref()
+            .map(CompiledAdamWPartialFlushPlan::capture_identity)
     }
 }
 
@@ -3756,6 +4344,10 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
 
     pub fn step_count(&self) -> u64 {
         self.plan.step_count()
+    }
+
+    pub fn flush_capture_identity(&self) -> Option<u64> {
+        self.plan.flush_capture_identity()
     }
 
     pub fn dropout_config(&self) -> Option<CompiledDropoutConfig> {
@@ -4076,6 +4668,38 @@ impl CpuCompiledAdamW {
         Ok(result)
     }
 
+    /// Atomically commits a nonempty partial accumulation window through its
+    /// separately authenticated state-only capture. Replay/dropout progress
+    /// and all workload state remain unchanged.
+    pub fn flush_partial_window(
+        &mut self,
+        learning_rate: TensorData,
+    ) -> Result<CompiledAdamWFlushResult> {
+        validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
+        let (next, result) = self
+            .progress
+            .flush_partial(self.gradient_accumulation_steps)?;
+        if !result.did_update() {
+            return Ok(result);
+        }
+        let transition = self
+            .partial_flush
+            .as_ref()
+            .ok_or_else(|| training("compiled AdamW partial flush capture is absent"))?;
+        self.inner
+            .replay_auxiliary_transition(transition, learning_rate, None)?;
+        self.progress = next;
+        Ok(result)
+    }
+
+    /// Stable identity of the state-only flush capture, when accumulation is
+    /// enabled.
+    pub fn flush_capture_identity(&self) -> Option<u64> {
+        self.partial_flush
+            .as_ref()
+            .map(CompiledAdamWPartialFlushPlan::capture_identity)
+    }
+
     pub fn parameter_versions(&self) -> Result<BTreeMap<String, u64>> {
         self.inner.parameter_versions()
     }
@@ -4094,8 +4718,15 @@ impl CpuCompiledAdamW {
     /// from this session's currently committed recurrent state. Planning is
     /// resource-free; unsupported kernels fail before a device is touched.
     pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
+        let inner = self.inner.plan()?;
+        let partial_flush = self
+            .partial_flush
+            .clone()
+            .map(|transition| transition.with_frontier(&inner.state_values))
+            .transpose()?;
         CompiledAdamWPlan {
-            inner: self.inner.plan()?,
+            inner,
+            partial_flush,
             program_identity: self.capture_identity(),
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
@@ -4140,6 +4771,9 @@ impl CpuCompiledAdamW {
                 accumulation_steps: self.gradient_accumulation_steps,
                 accumulation_index: self.progress.accumulation_index,
                 discarded_microbatches: self.progress.discarded_microbatches,
+                flushed_window_count: self.progress.flushed_window_count,
+                flushed_microbatch_count: self.progress.flushed_microbatch_count,
+                flush_capture_identity: self.flush_capture_identity(),
                 dropout_block_counter,
             },
             AdamWCheckpointTensors {
@@ -4171,6 +4805,29 @@ impl CpuCompiledAdamW {
         result.step = next.replay_step;
         self.progress = next;
         Ok(adamw_step_result(result, next))
+    }
+
+    #[cfg(test)]
+    fn flush_partial_window_inner(
+        &mut self,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledAdamWFlushResult> {
+        validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
+        let (next, result) = self
+            .progress
+            .flush_partial(self.gradient_accumulation_steps)?;
+        if !result.did_update() {
+            return Ok(result);
+        }
+        let transition = self
+            .partial_flush
+            .as_ref()
+            .ok_or_else(|| training("compiled AdamW partial flush capture is absent"))?;
+        self.inner
+            .replay_auxiliary_transition(transition, learning_rate, injected_failure)?;
+        self.progress = next;
+        Ok(result)
     }
 }
 
@@ -4253,6 +4910,21 @@ impl CompiledAdamWRuntime for CpuCompiledAdamW {
 
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         CpuCompiledAdamW::gradient_accumulator_snapshots(self)
+    }
+}
+
+impl CompiledAdamWFlushRuntime for CpuCompiledAdamW {
+    type Flush = CompiledAdamWFlushResult;
+
+    fn flush_partial_window(
+        &mut self,
+        learning_rate: TensorData,
+    ) -> Result<CompiledAdamWFlushResult> {
+        CpuCompiledAdamW::flush_partial_window(self, learning_rate)
+    }
+
+    fn flush_capture_identity(&self) -> Option<u64> {
+        CpuCompiledAdamW::flush_capture_identity(self)
     }
 }
 
@@ -4347,6 +5019,21 @@ where
 
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         self.runtime.gradient_accumulator_snapshots()
+    }
+}
+
+impl<M, R> CompiledAdamWFlushRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledAdamWFlushRuntime,
+{
+    type Flush = R::Flush;
+
+    fn flush_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::Flush> {
+        self.runtime.flush_partial_window(learning_rate)
+    }
+
+    fn flush_capture_identity(&self) -> Option<u64> {
+        self.runtime.flush_capture_identity()
     }
 }
 
@@ -4450,6 +5137,14 @@ impl MetalCompiledAdamWPlan {
         self.inner.program_identity
     }
 
+    /// Stable identity of the retained resource-free flush artifact. Metal
+    /// execution support is intentionally not exposed by this PR.
+    pub fn flush_capture_identity(&self) -> Option<u64> {
+        self.partial_flush
+            .as_ref()
+            .map(CompiledAdamWPartialFlushPlan::capture_identity)
+    }
+
     pub fn step_count(&self) -> u64 {
         self.progress.replay_step
     }
@@ -4508,6 +5203,7 @@ impl MetalCompiledAdamWPlan {
         Ok(MetalCompiledAdamW {
             inner,
             progress: self.progress,
+            flush_capture_identity: self.flush_capture_identity,
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
@@ -4994,6 +5690,9 @@ impl MetalCompiledAdamW {
                 accumulation_steps: self.gradient_accumulation_steps,
                 accumulation_index: self.progress.accumulation_index,
                 discarded_microbatches: self.progress.discarded_microbatches,
+                flushed_window_count: self.progress.flushed_window_count,
+                flushed_microbatch_count: self.progress.flushed_microbatch_count,
+                flush_capture_identity: self.flush_capture_identity,
                 dropout_block_counter,
             },
             AdamWCheckpointTensors {
@@ -5124,6 +5823,9 @@ fn encode_adamw_checkpoint(
         accumulation_steps,
         accumulation_index,
         discarded_microbatches,
+        flushed_window_count,
+        flushed_microbatch_count,
+        flush_capture_identity,
         dropout_block_counter,
     } = progress;
     let AdamWCheckpointTensors {
@@ -5139,6 +5841,8 @@ fn encode_adamw_checkpoint(
             optimizer_step,
             accumulation_index,
             discarded_microbatches,
+            flushed_window_count,
+            flushed_microbatch_count,
         },
         accumulation_steps,
     )?;
@@ -5178,7 +5882,43 @@ fn encode_adamw_checkpoint(
     }
     let parameter_names = serde_json::to_string(&names)
         .map_err(|error| training(format!("checkpoint names: {error}")))?;
-    let metadata = if dropout_block_counter.is_some() {
+    let metadata = if flushed_window_count != 0 {
+        let flush_capture_identity = flush_capture_identity.ok_or_else(|| {
+            training("compiled AdamW flushed checkpoint capture identity is absent")
+        })?;
+        Metadata::from([
+            ("format".into(), ADAMW_CHECKPOINT_FORMAT_V5.into()),
+            ("capture_identity".into(), capture_identity.to_string()),
+            (
+                "flush_capture_identity".into(),
+                flush_capture_identity.to_string(),
+            ),
+            ("replay_step".into(), replay_step.to_string()),
+            ("optimizer_step".into(), optimizer_step.to_string()),
+            (
+                "gradient_accumulation_steps".into(),
+                accumulation_steps.to_string(),
+            ),
+            ("accumulation_index".into(), accumulation_index.to_string()),
+            (
+                "discarded_microbatch_count".into(),
+                discarded_microbatches.to_string(),
+            ),
+            (
+                "flushed_window_count".into(),
+                flushed_window_count.to_string(),
+            ),
+            (
+                "flushed_microbatch_count".into(),
+                flushed_microbatch_count.to_string(),
+            ),
+            (
+                "dropout_state_present".into(),
+                dropout_block_counter.is_some().to_string(),
+            ),
+            ("parameter_names".into(), parameter_names),
+        ])
+    } else if dropout_block_counter.is_some() {
         Metadata::from([
             ("format".into(), ADAMW_CHECKPOINT_FORMAT_V4.into()),
             ("capture_identity".into(), capture_identity.to_string()),
@@ -5274,6 +6014,20 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
             "discarded_microbatch_count",
             "parameter_names",
         ]),
+        ADAMW_CHECKPOINT_FORMAT_V5 => BTreeSet::from([
+            "format",
+            "capture_identity",
+            "flush_capture_identity",
+            "replay_step",
+            "optimizer_step",
+            "gradient_accumulation_steps",
+            "accumulation_index",
+            "discarded_microbatch_count",
+            "flushed_window_count",
+            "flushed_microbatch_count",
+            "dropout_state_present",
+            "parameter_names",
+        ]),
         _ => return Err(training("compiled AdamW checkpoint format mismatch")),
     };
     if metadata.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_metadata {
@@ -5288,11 +6042,14 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
         accumulation_steps,
         accumulation_index,
         discarded_microbatches,
+        flushed_window_count,
+        flushed_microbatch_count,
+        flush_capture_identity,
     ) = if format == ADAMW_CHECKPOINT_FORMAT_V1 {
         let step = metadata["step"]
             .parse::<u64>()
             .map_err(|_| training("compiled AdamW checkpoint step is invalid"))?;
-        (step, step, 1, 0, 0)
+        (step, step, 1, 0, 0, 0, 0, None)
     } else {
         (
             parse_checkpoint_u64(&metadata, "replay_step")?,
@@ -5301,11 +6058,28 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
             parse_checkpoint_u64(&metadata, "accumulation_index")?,
             if matches!(
                 format.as_str(),
-                ADAMW_CHECKPOINT_FORMAT_V3 | ADAMW_CHECKPOINT_FORMAT_V4
+                ADAMW_CHECKPOINT_FORMAT_V3
+                    | ADAMW_CHECKPOINT_FORMAT_V4
+                    | ADAMW_CHECKPOINT_FORMAT_V5
             ) {
                 parse_checkpoint_u64(&metadata, "discarded_microbatch_count")?
             } else {
                 0
+            },
+            if format == ADAMW_CHECKPOINT_FORMAT_V5 {
+                parse_checkpoint_u64(&metadata, "flushed_window_count")?
+            } else {
+                0
+            },
+            if format == ADAMW_CHECKPOINT_FORMAT_V5 {
+                parse_checkpoint_u64(&metadata, "flushed_microbatch_count")?
+            } else {
+                0
+            },
+            if format == ADAMW_CHECKPOINT_FORMAT_V5 {
+                Some(parse_checkpoint_u64(&metadata, "flush_capture_identity")?)
+            } else {
+                None
             },
         )
     };
@@ -5314,12 +6088,19 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
             "compiled AdamW v3 checkpoint discarded progress is invalid",
         ));
     }
+    if format == ADAMW_CHECKPOINT_FORMAT_V5 && flushed_window_count == 0 {
+        return Err(training(
+            "compiled AdamW v5 checkpoint flushed progress is invalid",
+        ));
+    }
     validate_adamw_progress(
         AdamWProgress {
             replay_step,
             optimizer_step,
             accumulation_index,
             discarded_microbatches,
+            flushed_window_count,
+            flushed_microbatch_count,
         },
         accumulation_steps,
     )?;
@@ -5337,7 +6118,20 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
     }
 
     let mut tensors = state;
-    let dropout_block_counter = if format == ADAMW_CHECKPOINT_FORMAT_V4 {
+    let has_dropout = if format == ADAMW_CHECKPOINT_FORMAT_V5 {
+        match metadata["dropout_state_present"].as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(training(
+                    "compiled AdamW checkpoint dropout-state flag is invalid",
+                ));
+            }
+        }
+    } else {
+        format == ADAMW_CHECKPOINT_FORMAT_V4
+    };
+    let dropout_block_counter = if has_dropout {
         let counter = tensors
             .remove("dropout_block_counter")
             .ok_or_else(|| training("compiled AdamW dropout counter is absent"))?;
@@ -5396,6 +6190,9 @@ fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckpoint> {
         accumulation_steps,
         accumulation_index,
         discarded_microbatches,
+        flushed_window_count,
+        flushed_microbatch_count,
+        flush_capture_identity,
         dropout_block_counter,
         parameters,
         first_moments,
@@ -5416,19 +6213,44 @@ fn validate_adamw_progress(progress: AdamWProgress, accumulation_steps: u64) -> 
         optimizer_step,
         accumulation_index,
         discarded_microbatches,
+        flushed_window_count,
+        flushed_microbatch_count,
     } = progress;
     if accumulation_steps == 0 || accumulation_index >= accumulation_steps {
         return Err(training(
             "compiled AdamW checkpoint accumulation progress is invalid",
         ));
     }
-    if accumulation_steps == 1 && discarded_microbatches != 0 {
+    if accumulation_steps == 1
+        && (discarded_microbatches != 0
+            || flushed_window_count != 0
+            || flushed_microbatch_count != 0)
+    {
         return Err(training(
             "compiled AdamW checkpoint discarded progress is invalid",
         ));
     }
-    let expected_replay = optimizer_step
+    let maximum_flushed_microbatches = flushed_window_count
+        .checked_mul(
+            accumulation_steps
+                .checked_sub(1)
+                .ok_or_else(|| training("compiled AdamW checkpoint progress underflows"))?,
+        )
+        .ok_or_else(|| training("compiled AdamW checkpoint progress overflows"))?;
+    if flushed_window_count > optimizer_step
+        || (flushed_window_count == 0) != (flushed_microbatch_count == 0)
+        || (flushed_window_count != 0
+            && (flushed_microbatch_count < flushed_window_count
+                || flushed_microbatch_count > maximum_flushed_microbatches))
+    {
+        return Err(training(
+            "compiled AdamW checkpoint flushed progress is invalid",
+        ));
+    }
+    let complete_windows = optimizer_step - flushed_window_count;
+    let expected_replay = complete_windows
         .checked_mul(accumulation_steps)
+        .and_then(|step| step.checked_add(flushed_microbatch_count))
         .and_then(|step| step.checked_add(accumulation_index))
         .and_then(|step| step.checked_add(discarded_microbatches))
         .ok_or_else(|| training("compiled AdamW checkpoint progress overflows"))?;
@@ -5790,6 +6612,45 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn compiled_state_aliases_receive_explicit_capture_owners() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype_requires_grad("state", [], DType::F32, false);
+        let constant = graph
+            .full_with_dtype(Shape::from([]), Scalar::U(0), DType::U64)
+            .unwrap();
+        let expanded = graph
+            .lazy_full_with_dtype(Shape::new([2]), Scalar::I(0), DType::F32)
+            .unwrap();
+        let one = graph
+            .full_with_dtype(Shape::from([]), Scalar::F(1.0), DType::F32)
+            .unwrap();
+        let computed = graph.add(input, one).unwrap();
+        let sources = [input, constant, expanded, computed];
+        let owners = materialize_compiled_state_aliases(&mut graph, &sources).unwrap();
+
+        for (source, owner) in sources[..3].iter().zip(&owners[..3]) {
+            assert_ne!(owner, source);
+            assert!(matches!(
+                graph.op(*owner).unwrap(),
+                Op::Contiguous { input } if input == source
+            ));
+        }
+        assert_eq!(owners[3], computed);
+        let scheduled = schedule_many(&graph, &owners).unwrap();
+        let produced = scheduled
+            .items
+            .iter()
+            .flat_map(|item| item.outputs.iter())
+            .map(|output| output.id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            owners
+                .iter()
+                .all(|owner| produced.contains(&(owner.index() as u64)))
+        );
+    }
+
+    #[test]
     fn compiled_dropout_reserves_source_order_blocks_only_for_active_f32_draws() {
         let mut graph = Graph::new();
         let counter = graph.input_dtype_requires_grad("counter", [], DType::U64, false);
@@ -6010,6 +6871,9 @@ mod tests {
                     accumulation_steps: decoded.accumulation_steps,
                     accumulation_index: decoded.accumulation_index,
                     discarded_microbatches: decoded.discarded_microbatches,
+                    flushed_window_count: decoded.flushed_window_count,
+                    flushed_microbatch_count: decoded.flushed_microbatch_count,
+                    flush_capture_identity: decoded.flush_capture_identity,
                     dropout_block_counter: decoded.dropout_block_counter.map(|value| value + 1),
                 },
                 AdamWCheckpointTensors {
@@ -6116,6 +6980,8 @@ mod tests {
             optimizer_step: replay_step,
             accumulation_index: 0,
             discarded_microbatches: 0,
+            flushed_window_count: 0,
+            flushed_microbatch_count: 0,
         };
         let mut runtime = plan.prepare_cpu().unwrap();
         let before = runtime.checkpoint().unwrap();
@@ -7254,6 +8120,229 @@ mod tests {
     }
 
     #[test]
+    fn adamw_partial_flush_matches_a_complete_short_window_and_resumes_exactly() {
+        let config = accumulated_adamw_config(3);
+        let mut flushed =
+            CpuCompiledAdamW::compile(config.clone(), initial_parameters(), build_tinybob).unwrap();
+        let mut short = CpuCompiledAdamW::compile(
+            accumulated_adamw_config(2),
+            initial_parameters(),
+            build_tinybob,
+        )
+        .unwrap();
+        assert!(flushed.flush_capture_identity().is_some());
+        let transition = flushed.partial_flush.as_ref().unwrap();
+        assert_eq!(
+            flushed.flush_capture_identity(),
+            Some(
+                transition
+                    .capture
+                    .initial_recurrent_cursor()
+                    .unwrap()
+                    .capture_identity()
+            )
+        );
+        assert_ne!(
+            flushed.flush_capture_identity(),
+            Some(flushed.capture_identity())
+        );
+        for runtime in [&mut flushed, &mut short] {
+            runtime.step(batch(), lr()).unwrap();
+            runtime.step(batch(), lr()).unwrap();
+        }
+        let dropout_before = flushed.dropout_block_counter().unwrap();
+        let result = flushed.flush_partial_window(lr()).unwrap();
+        assert!(result.did_update());
+        assert_eq!(result.flushed_microbatches(), 2);
+        assert_eq!(result.optimizer_step(), 1);
+        assert_eq!(flushed.step_count(), 2);
+        assert_eq!(flushed.optimizer_step().unwrap(), 1);
+        assert_eq!(flushed.accumulation_index().unwrap(), 0);
+        assert_eq!(flushed.dropout_block_counter().unwrap(), dropout_before);
+        assert_eq!(
+            flushed.parameter_snapshots().unwrap(),
+            short.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            flushed.first_moment_snapshots().unwrap(),
+            short.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            flushed.second_moment_snapshots().unwrap(),
+            short.second_moment_snapshots().unwrap()
+        );
+        assert!(
+            flushed
+                .gradient_accumulator_snapshots()
+                .unwrap()
+                .values()
+                .all(|value| value
+                    == &TensorData::zeros_with_dtype(value.shape().clone(), DType::F32).unwrap())
+        );
+
+        let checkpoint = flushed.checkpoint().unwrap();
+        let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V5);
+        assert_eq!(metadata["replay_step"], "2");
+        assert_eq!(metadata["optimizer_step"], "1");
+        assert_eq!(metadata["flushed_window_count"], "1");
+        assert_eq!(metadata["flushed_microbatch_count"], "2");
+        assert_eq!(metadata["dropout_state_present"], "false");
+        assert_eq!(
+            metadata["flush_capture_identity"],
+            flushed.flush_capture_identity().unwrap().to_string()
+        );
+        assert!(
+            flushed
+                .parameter_versions()
+                .unwrap()
+                .values()
+                .all(|version| *version == 3)
+        );
+        assert!(
+            flushed
+                .inner
+                .plan()
+                .unwrap()
+                .state_versions
+                .values()
+                .all(|version| *version == 3),
+            "parameters, moments, accumulators, and AdamW globals advance once"
+        );
+        let (state, mut mismatched_metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+        let mut impossible_progress = mismatched_metadata.clone();
+        impossible_progress.insert("replay_step".into(), "5".into());
+        impossible_progress.insert("optimizer_step".into(), "2".into());
+        impossible_progress.insert("flushed_window_count".into(), "2".into());
+        impossible_progress.insert("flushed_microbatch_count".into(), "5".into());
+        assert!(
+            CompiledAdamWCheckpoint::from_bytes(
+                save_safetensors(&state, &impossible_progress).unwrap()
+            )
+            .is_err(),
+            "two partial N=3 windows can retain at most four microbatches"
+        );
+        mismatched_metadata.insert(
+            "flush_capture_identity".into(),
+            flushed
+                .flush_capture_identity()
+                .unwrap()
+                .wrapping_add(1)
+                .to_string(),
+        );
+        let mismatched = CompiledAdamWCheckpoint::from_bytes(
+            save_safetensors(&state, &mismatched_metadata).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            CpuCompiledAdamW::compile_from_checkpoint(config.clone(), &mismatched, build_tinybob,)
+                .is_err()
+        );
+        let mut resumed =
+            CpuCompiledAdamW::compile_from_checkpoint(config, &checkpoint, build_tinybob).unwrap();
+        assert_eq!(
+            resumed.parameter_versions().unwrap(),
+            flushed.parameter_versions().unwrap()
+        );
+        assert_eq!(
+            resumed.inner.plan().unwrap().state_versions,
+            flushed.inner.plan().unwrap().state_versions
+        );
+        assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+        for _ in 0..3 {
+            let expected = flushed.step(batch(), lr()).unwrap();
+            let actual = resumed.step(batch(), lr()).unwrap();
+            assert_eq!(actual.loss(), expected.loss());
+            assert_eq!(actual.outputs(), expected.outputs());
+            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+            assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+        }
+        assert_eq!(resumed.checkpoint().unwrap(), flushed.checkpoint().unwrap());
+    }
+
+    #[test]
+    fn adamw_partial_flush_empty_validation_and_commit_failure_are_atomic() {
+        let mut runtime = CpuCompiledAdamW::compile(
+            accumulated_adamw_config(3),
+            initial_parameters(),
+            build_tinybob,
+        )
+        .unwrap();
+        let initial = runtime.checkpoint().unwrap();
+        let noop = runtime.flush_partial_window(lr()).unwrap();
+        assert!(!noop.did_update());
+        assert_eq!(noop.flushed_microbatches(), 0);
+        assert_eq!(runtime.checkpoint().unwrap(), initial);
+        assert!(
+            runtime
+                .flush_partial_window(TensorData::new([1], vec![0.1]).unwrap())
+                .is_err()
+        );
+        assert_eq!(runtime.checkpoint().unwrap(), initial);
+
+        runtime.step(batch(), lr()).unwrap();
+        let partial = runtime.checkpoint().unwrap();
+        assert!(runtime.flush_partial_window_inner(lr(), Some(0)).is_err());
+        assert_eq!(runtime.checkpoint().unwrap(), partial);
+        assert_eq!(runtime.accumulation_index().unwrap(), 1);
+        assert_eq!(runtime.optimizer_step().unwrap(), 0);
+        assert!(runtime.flush_partial_window(lr()).unwrap().did_update());
+    }
+
+    #[test]
+    fn adamw_partial_flush_preserves_dropout_version_and_restores_split_frontier() {
+        let config = module_config().with_gradient_accumulation(3).unwrap();
+        let dropout = CompiledDropoutConfig::new(CompiledDropoutKey([41, 43]));
+        let module = TiedFrozenModule::new([0.1, -0.2]);
+        let mut runtime = CompiledAdamWPlan::compile_module_with_dropout(
+            config.clone(),
+            dropout,
+            &module,
+            build_tied_dropout,
+        )
+        .unwrap()
+        .prepare_cpu()
+        .unwrap();
+        runtime
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 2.0]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        assert_eq!(runtime.dropout_block_counter().unwrap(), Some(1));
+        assert!(
+            runtime
+                .flush_partial_window(TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        assert_eq!(runtime.dropout_block_counter().unwrap(), Some(1));
+        let versions = runtime.inner.plan().unwrap().state_versions;
+        assert_eq!(versions[&RecurrentStateKey::dropout_counter()], 1);
+        assert!(
+            versions
+                .iter()
+                .filter(|(key, _)| *key != &RecurrentStateKey::dropout_counter())
+                .all(|(_, version)| *version == 2)
+        );
+
+        let checkpoint = runtime.checkpoint().unwrap();
+        let fresh = TiedFrozenModule::new([0.1, -0.2]);
+        let resumed = CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+            config,
+            dropout,
+            &fresh,
+            &checkpoint,
+            build_tied_dropout,
+        )
+        .unwrap()
+        .prepare_cpu()
+        .unwrap();
+        assert_eq!(resumed.inner.plan().unwrap().state_versions, versions);
+        assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+    }
+
+    #[test]
     fn adamw_accumulation_failure_preserves_the_partial_frontier() {
         let mut compiled = CpuCompiledAdamW::compile(
             accumulated_adamw_config(2),
@@ -7367,6 +8456,8 @@ mod tests {
                     optimizer_step: 0,
                     accumulation_index: 0,
                     discarded_microbatches: 1,
+                    flushed_window_count: 0,
+                    flushed_microbatch_count: 0,
                 },
                 1,
             )

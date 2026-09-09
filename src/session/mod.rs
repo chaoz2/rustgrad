@@ -16,10 +16,11 @@ pub use classification::{
     summarize_classification,
 };
 pub use compiled_training::{
-    CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWZeroGradResult,
-    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
-    CompiledEvaluationResult, CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
+    CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWFlush, CompiledAdamWFlushResult,
+    CompiledAdamWFlushRuntime, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
+    CompiledAdamWStepResult, CompiledAdamWZeroGradResult, CompiledCheckpointRuntime,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationResult,
+    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
     CompiledModuleAdamWCompileError, CompiledModuleAdamWEvaluationError,
     CompiledModuleAdamWFinishError, CompiledModuleAdamWPlan, CompiledModuleAdamWPrepareError,
     CompiledModuleAdamWSession, CompiledMomentumSgdConfig, CompiledMomentumSgdStepResult,

@@ -7,12 +7,13 @@ use rustgrad::runtime::metal::{
     MetalDeviceRunReport, MetalDiscovery, MetalRuntime, MetalScoreboardContext,
 };
 use rustgrad::{
-    Backend, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWPlan,
-    CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig,
-    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledModuleAdamWPlan,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
-    LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Op, Parameter, Reduction, Result, Scalar,
-    Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy, load_safetensors,
+    Backend, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWFlushRuntime,
+    CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
+    CompiledModuleAdamWPlan, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
+    CpuSessionTarget, DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Op,
+    Parameter, Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider,
+    TransformerBlock, cross_entropy, load_safetensors,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(target_os = "macos")]
@@ -220,7 +221,6 @@ fn learning_rate() -> TensorData {
     TensorData::scalar(0.05)
 }
 
-#[cfg(target_os = "macos")]
 fn checkpoint_dropout_block_counter(checkpoint: &CompiledAdamWCheckpoint) -> u64 {
     let (state, _) = load_safetensors(checkpoint.as_bytes()).unwrap();
     state["dropout_block_counter"].scalar_at(0).as_u64()
@@ -1715,6 +1715,101 @@ fn owned_compiled_transformer_session_finishes_and_resumes_one_module_lifecycle(
         final_mean_sparse_loss < initial_mean_sparse_loss,
         "owned compiled causal Transformer eval loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
     );
+}
+
+#[test]
+fn owned_compiled_transformer_flushes_a_partial_window_and_resumes_exactly() {
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let frozen_before = model.frozen_scale.snapshot().unwrap();
+    let plan = owned_compiled_transformer(model);
+    let flush_identity = plan.flush_capture_identity().unwrap();
+    let mut session = plan.prepare(&CpuSessionTarget::new()).unwrap();
+    let initial_parameters = session.parameter_snapshots().unwrap();
+    for replay in 1..=2 {
+        let step = session.step(batch(replay), learning_rate()).unwrap();
+        assert!(!step.did_update());
+    }
+    assert_eq!(
+        checkpoint_dropout_block_counter(&session.checkpoint().unwrap()),
+        24
+    );
+    assert_eq!(session.parameter_snapshots().unwrap(), initial_parameters);
+    let flush = session.flush_partial_window(learning_rate()).unwrap();
+    assert!(flush.did_update());
+    assert_eq!(flush.flushed_microbatches(), 2);
+    assert_eq!(flush.optimizer_step(), 1);
+    assert_eq!(session.step_count(), 2);
+    assert_eq!(session.optimizer_step().unwrap(), 1);
+    assert_eq!(session.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        checkpoint_dropout_block_counter(&session.checkpoint().unwrap()),
+        24
+    );
+    assert_ne!(session.parameter_snapshots().unwrap(), initial_parameters);
+    assert!(
+        session
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .values()
+            .all(|value| value.to_vec_f64().into_iter().all(|lane| lane == 0.0))
+    );
+
+    let checkpoint = session.checkpoint().unwrap();
+    let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+    assert_eq!(metadata["format"], "rustgrad-compiled-adamw-v5");
+    assert_eq!(metadata["replay_step"], "2");
+    assert_eq!(metadata["optimizer_step"], "1");
+    assert_eq!(metadata["flushed_window_count"], "1");
+    assert_eq!(metadata["flushed_microbatch_count"], "2");
+    assert_eq!(metadata["dropout_state_present"], "true");
+    assert_eq!(
+        metadata["flush_capture_identity"],
+        flush_identity.to_string()
+    );
+
+    let fresh = TinyCausalTransformer::new(7).unwrap();
+    let tied_identity = fresh.tokens.weight.id();
+    let fresh_frozen = fresh.frozen_scale.clone();
+    let resumed = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
+        config(),
+        dropout_config(),
+        fresh,
+        &checkpoint,
+        build,
+    )
+    .unwrap();
+    assert_eq!(resumed.flush_capture_identity(), Some(flush_identity));
+    let mut resumed = resumed.prepare(&CpuSessionTarget::new()).unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+    assert_eq!(
+        checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
+        24
+    );
+    let continued = resumed.step(batch(3), learning_rate()).unwrap();
+    assert_eq!(continued.step(), 3);
+    assert_eq!(continued.optimizer_step(), 1);
+    assert_eq!(continued.accumulation_index(), 1);
+    assert_eq!(
+        checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
+        36
+    );
+    let final_parameters = resumed.parameter_snapshots().unwrap();
+    let model = resumed.finish().unwrap();
+    assert_eq!(model.tokens.weight.id(), tied_identity);
+    assert_eq!(
+        model.tokens.weight.value().unwrap(),
+        final_parameters["tokens.weight"]
+    );
+    assert!(
+        !model
+            .state_dict()
+            .unwrap()
+            .tensors()
+            .contains_key("lm_head.weight")
+    );
+    let frozen_after = fresh_frozen.snapshot().unwrap();
+    assert_eq!(frozen_after.data, frozen_before.data);
+    assert_eq!(frozen_after.version, frozen_before.version);
 }
 
 #[test]
