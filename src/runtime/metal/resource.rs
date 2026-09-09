@@ -4,8 +4,8 @@ use super::{
     RenderedMetal,
     buffer::{BufferSnapshot, PhysicalBuffer},
     dispatch::{
-        BatchLaunch, CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawCommand, RawDevice,
-        RawLibrary, RawPipeline, RawQueue,
+        BatchCopy, BatchLaunch, CopyRegion, Dispatch, KernelSemantics, LaunchGeometry, RawCommand,
+        RawDevice, RawLibrary, RawPipeline, RawQueue,
     },
     ffi::NativeDispatch,
     transaction::{CLEAN_STATUS, detail_rhs_at, logical_offset},
@@ -447,6 +447,82 @@ impl MetalCommandQueue {
             extent,
         )))
     }
+
+    pub(super) fn copy_launch_batch(
+        &self,
+        copies: &[MetalBatchCopy<'_>],
+        launches: &[MetalBatchItem<'_>],
+    ) -> Result<Option<MetalCommand>, MetalError> {
+        self.live()?;
+        let mut raw_copies = Vec::with_capacity(copies.len());
+        let mut snapshots = Vec::with_capacity(copies.len().saturating_mul(2));
+        for copy in copies {
+            if copy.source.dtype().is_none()
+                || copy.source.dtype() != copy.target.dtype()
+                || copy.source.len() != copy.bytes
+                || copy.target.len() != copy.bytes
+                || copy.source.logical_identity() == copy.target.logical_identity()
+            {
+                return Err(MetalError::InvalidBinding(
+                    "fixed-state D2D copy descriptor mismatch".into(),
+                ));
+            }
+            let source = copy.source.snapshot(&self.device, 0, copy.bytes, None)?;
+            let target = copy.target.snapshot(&self.device, 0, copy.bytes, None)?;
+            if copy.bytes != 0 {
+                raw_copies.push(BatchCopy {
+                    src: source.raw().ok_or(MetalError::Bounds)?,
+                    dst: target.raw().ok_or(MetalError::Bounds)?,
+                    region: CopyRegion {
+                        src_offset: 0,
+                        dst_offset: 0,
+                        bytes: copy.bytes,
+                    },
+                });
+                snapshots.push(source);
+                snapshots.push(target);
+            }
+        }
+        let mut validated = Vec::with_capacity(launches.len());
+        for launch in launches {
+            if let Some(launch) = launch.pipeline.validate_launch(
+                self,
+                launch.bindings,
+                launch.local_size,
+                launch.capture_initialized,
+            )? {
+                validated.push(launch);
+            }
+        }
+        if raw_copies.is_empty() && validated.is_empty() {
+            return Ok(None);
+        }
+        let extent = validated.iter().try_fold(0usize, |total, launch| {
+            total.checked_add(launch.extent).ok_or(MetalError::Overflow)
+        })?;
+        let raw_launches = validated
+            .iter()
+            .map(|launch| launch.raw.clone())
+            .collect::<Vec<_>>();
+        let raw = self.device.dispatch.copy_launch_batch(
+            self.raw,
+            &raw_copies,
+            &raw_launches,
+            self.device.owner,
+        )?;
+        let pipelines = validated
+            .iter()
+            .map(|launch| launch.pipeline.clone())
+            .collect();
+        snapshots.extend(validated.into_iter().flat_map(|launch| launch.snapshots));
+        Ok(Some(MetalCommand::new(
+            self.device.clone(),
+            raw,
+            pipelines,
+            snapshots,
+            extent,
+        )))
+    }
 }
 
 impl Drop for MetalCommandQueue {
@@ -548,6 +624,12 @@ pub(super) struct MetalBatchItem<'a> {
     pub(super) bindings: &'a [&'a MetalBuffer],
     pub(super) local_size: usize,
     pub(super) capture_initialized: bool,
+}
+
+pub(super) struct MetalBatchCopy<'a> {
+    pub(super) source: &'a MetalBuffer,
+    pub(super) target: &'a MetalBuffer,
+    pub(super) bytes: usize,
 }
 
 struct ValidatedMetalLaunch {

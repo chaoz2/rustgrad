@@ -2791,6 +2791,19 @@ pub(crate) trait StaticDeviceAdapter: StaticPlanAdapter {
             gpu_command_execution_time: None,
         })
     }
+    fn copy_launch_batch_and_wait(
+        &self,
+        queue: &Self::Queue,
+        copies: &[StaticPreparedCopy<'_, Self::Buffer>],
+        launches: &[StaticPreparedLaunch<'_, Self::Kernel, Self::Buffer>],
+    ) -> Result<StaticCommandReport, Self::Error> {
+        if !copies.is_empty() {
+            return Err(Self::unsupported(
+                "batched static copy-and-launch is unsupported by this adapter".into(),
+            ));
+        }
+        self.launch_batch_and_wait(queue, launches)
+    }
     fn read(
         &self,
         queue: &Self::Queue,
@@ -2798,6 +2811,12 @@ pub(crate) trait StaticDeviceAdapter: StaticPlanAdapter {
         bytes: &mut [u8],
     ) -> Result<(), Self::Error>;
     fn cache_len(&self) -> usize;
+}
+
+pub(crate) struct StaticPreparedCopy<'a, B> {
+    pub source: &'a B,
+    pub target: &'a B,
+    pub bytes: usize,
 }
 
 pub(crate) use sealed::Sealed;
@@ -4336,6 +4355,28 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
         alternate_state_bank: bool,
         host_outputs: StaticHostOutputSelection,
     ) -> Result<StaticExecutionReport, A::Error> {
+        self.execute_skipping_residents_at_epoch_with_copies(
+            values,
+            resident_ids,
+            alternate_state_bank,
+            host_outputs,
+            &[],
+        )
+    }
+
+    fn execute_skipping_residents_at_epoch_with_copies(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+        resident_ids: &BTreeSet<u64>,
+        alternate_state_bank: bool,
+        host_outputs: StaticHostOutputSelection,
+        copies: &[StaticPreparedCopy<'_, A::Buffer>],
+    ) -> Result<StaticExecutionReport, A::Error> {
+        if !copies.is_empty() && self.queue.is_none() {
+            return Err(A::invalid_binding(
+                "static copy-and-launch queue is absent".into(),
+            ));
+        }
         // Complete all host validation before the first driver call.
         self.validate_host_gathers(values)?;
         self.validate_host_indexed_movements(values)?;
@@ -4403,7 +4444,12 @@ impl<A: StaticDeviceAdapter> PreparedStaticSchedule<A> {
                     buffers: bindings,
                 });
             }
-            let commands = self.adapter.launch_batch_and_wait(queue, &launches)?;
+            let commands = if copies.is_empty() {
+                self.adapter.launch_batch_and_wait(queue, &launches)?
+            } else {
+                self.adapter
+                    .copy_launch_batch_and_wait(queue, copies, &launches)?
+            };
             report.command_submissions = commands.submissions;
             report.command_waits = commands.waits;
             report.gpu_command_execution_time = commands.gpu_command_execution_time;
@@ -4520,6 +4566,23 @@ impl<A: StaticDeviceAdapter> InitializedStaticSchedule<A> {
             alternate_state_bank,
             host_outputs,
         )
+    }
+
+    pub(crate) fn execute_stateful_with_copies(
+        &self,
+        values: &mut BTreeMap<u64, TensorData>,
+        alternate_state_bank: bool,
+        host_outputs: StaticHostOutputSelection,
+        copies: &[StaticPreparedCopy<'_, A::Buffer>],
+    ) -> Result<StaticExecutionReport, A::Error> {
+        self.prepared
+            .execute_skipping_residents_at_epoch_with_copies(
+                values,
+                &self.resident_ids,
+                alternate_state_bank,
+                host_outputs,
+                copies,
+            )
     }
 
     /// Downloads the currently active side of every fixed-state pair without

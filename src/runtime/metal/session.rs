@@ -256,6 +256,7 @@ pub struct MetalStatefulInferencePlan {
     execution_plan: ExecutionPlanSummary,
     resident_bindings: BTreeMap<String, TensorData>,
     initial_state: BTreeMap<String, TensorData>,
+    state_links: BTreeMap<String, StaticStateLink>,
     deployment_identity: u64,
 }
 
@@ -319,9 +320,20 @@ struct MetalSharedFixedStateReadProof {
     alternate_state_bank: bool,
 }
 
+#[derive(Clone, Debug)]
+struct MetalSharedFixedStateTransitionProof {
+    source_capture_identity: u64,
+    source_deployment_identity: u64,
+    target_capture_identity: u64,
+    target_deployment_identity: u64,
+    dense: BTreeMap<u64, u64>,
+    preserved_state: Vec<(u64, usize)>,
+}
+
 enum MetalSharedPreparation<'a> {
     Append(&'a MetalDeviceSession, MetalSharedAppendProof),
     FixedStateRead(&'a MetalDeviceSession, MetalSharedFixedStateReadProof),
+    FixedStateTransition(&'a MetalDeviceSession, MetalSharedFixedStateTransitionProof),
 }
 
 /// Private pair of stateless evaluators whose resident parameter inputs alias
@@ -334,6 +346,20 @@ pub(crate) struct MetalFixedStateReadPlan {
 /// Prepared read-only evaluators for the false/true physical state banks.
 pub(crate) struct MetalFixedStateReadSession {
     sessions: [MetalDeviceSession; 2],
+}
+
+/// Resource-free state-only transition authenticated against one exact source
+/// epoch schema. The target program reuses both physical banks and queue.
+pub(crate) struct MetalFixedStateTransitionPlan {
+    plan: MetalStatefulInferencePlan,
+    proof: MetalSharedFixedStateTransitionProof,
+}
+
+/// Prepared auxiliary state transition sharing one source session's epoch.
+pub(crate) struct MetalFixedStateTransitionSession {
+    session: MetalDeviceSession,
+    source_session_token: Rc<()>,
+    preserved_state: Vec<(u64, usize)>,
 }
 
 impl MetalFixedStateReadPlan {
@@ -458,6 +484,163 @@ impl MetalFixedStateReadSession {
         inputs: &BTreeMap<String, TensorData>,
     ) -> Result<MetalDeviceRun, MetalError> {
         self.sessions[usize::from(alternate_state_bank)].run(inputs)
+    }
+}
+
+impl MetalFixedStateTransitionPlan {
+    pub(crate) fn new(
+        inference: CapturedStatefulInference,
+        renderer: MetalRenderer,
+        source: &MetalStatefulInferencePlan,
+    ) -> Result<Self, MetalError> {
+        let plan = MetalStatefulInferencePlan::new(inference, renderer)?;
+        if plan.inner.summary.requested_output_count != 0
+            || plan.state_links.is_empty()
+            || !matches!(
+                plan.inner.state_policy,
+                MetalSessionStatePolicy::Epoch { .. }
+            )
+            || !matches!(
+                source.inner.state_policy,
+                MetalSessionStatePolicy::Epoch { .. }
+            )
+        {
+            return Err(MetalError::InvalidBinding(
+                "shared Metal transition requires private fixed state".into(),
+            ));
+        }
+        if plan
+            .rendered_items()
+            .any(|item| item.transaction.is_some() || item.indexed_movement().is_some())
+        {
+            return Err(MetalError::InvalidBinding(
+                "shared Metal transition contains a guarded kernel".into(),
+            ));
+        }
+        let mut dense = BTreeMap::new();
+        let mut selected_source_inputs = BTreeSet::new();
+        for target_input in plan.inner.state_inputs() {
+            let source_input =
+                exact_input_by_name(source.inner.state_inputs(), &target_input.name)?;
+            if !same_shared_storage_descriptor(&target_input.desc, &source_input.desc) {
+                return Err(MetalError::InvalidBinding(format!(
+                    "shared Metal transition state {} descriptor differs",
+                    target_input.name
+                )));
+            }
+            let target_value = plan.initial_state.get(&target_input.name);
+            let source_value = source.initial_state.get(&target_input.name);
+            let (Some(target_value), Some(source_value)) = (target_value, source_value) else {
+                return Err(MetalError::InvalidBinding(format!(
+                    "shared Metal transition state {} payload is absent",
+                    target_input.name
+                )));
+            };
+            if !same_tensor_payload(target_value, source_value)? {
+                return Err(MetalError::InvalidBinding(format!(
+                    "shared Metal transition state {} payload differs",
+                    target_input.name
+                )));
+            }
+            let target_link = plan.state_links.get(&target_input.name).ok_or_else(|| {
+                MetalError::InvalidBinding(
+                    "shared Metal transition target state link is absent".into(),
+                )
+            })?;
+            let source_link = source.state_links.get(&target_input.name).ok_or_else(|| {
+                MetalError::InvalidBinding(
+                    "shared Metal transition source state link is absent".into(),
+                )
+            })?;
+            dense.insert(target_link.input, source_link.input);
+            dense.insert(target_link.output, source_link.output);
+            selected_source_inputs.insert(source_link.input);
+        }
+        let preserved_state = source
+            .inner
+            .state_inputs()
+            .iter()
+            .filter(|input| !selected_source_inputs.contains(&input.desc.id))
+            .map(|input| (input.desc.id, input.desc.bytes))
+            .collect();
+        let proof = MetalSharedFixedStateTransitionProof {
+            source_capture_identity: source.capture().identity,
+            source_deployment_identity: source.deployment_identity,
+            target_capture_identity: plan.capture().identity,
+            target_deployment_identity: plan.deployment_identity,
+            dense,
+            preserved_state,
+        };
+        Ok(Self { plan, proof })
+    }
+
+    pub(crate) fn prepare(
+        self,
+        device: MetalDevice,
+        source: &MetalDeviceSession,
+    ) -> Result<MetalFixedStateTransitionSession, MetalError> {
+        let Self { plan, proof } = self;
+        let preserved_state = proof.preserved_state.clone();
+        let source_session_token = source.session_token.clone();
+        let MetalStatefulInferencePlan {
+            inner,
+            initial_state,
+            deployment_identity,
+            ..
+        } = plan;
+        let session = inner.prepare_with_shared_fixed_transition(
+            device,
+            initial_state,
+            deployment_identity,
+            source,
+            proof,
+        )?;
+        Ok(MetalFixedStateTransitionSession {
+            session,
+            source_session_token,
+            preserved_state,
+        })
+    }
+}
+
+impl MetalFixedStateTransitionSession {
+    #[cfg(test)]
+    pub(crate) fn preparation_report(&self) -> &MetalDevicePreparationReport {
+        self.session.preparation_report()
+    }
+
+    pub(crate) fn run(
+        &mut self,
+        source: &mut MetalDeviceSession,
+        inputs: &BTreeMap<String, TensorData>,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        if !Rc::ptr_eq(&self.source_session_token, &source.session_token)
+            || !matches!(source.state_policy, MetalSessionStatePolicy::Epoch { .. })
+        {
+            return Err(MetalError::InvalidBinding(
+                "shared Metal transition source session differs".into(),
+            ));
+        }
+        let run = self.session.run_shared_epoch_without_host_outputs(
+            inputs,
+            source.state_epoch,
+            &source.prepared,
+            &self.preserved_state,
+            match source.state_policy {
+                MetalSessionStatePolicy::Epoch {
+                    pair_count,
+                    bytes,
+                    work_items,
+                } => CommittedState {
+                    pair_count,
+                    bytes,
+                    work_items,
+                },
+                _ => unreachable!("source epoch policy was validated"),
+            },
+        )?;
+        source.state_epoch = !source.state_epoch;
+        Ok(run)
     }
 }
 
@@ -845,6 +1028,11 @@ impl MetalStatefulInferencePlan {
                 output: state.output.id,
             })
             .collect::<Vec<_>>();
+        let state_links_by_name = states
+            .iter()
+            .zip(&state_links)
+            .map(|(state, link)| (state.input.name.clone(), *link))
+            .collect();
         let inner = MetalDeviceSessionPlan::from_capture_policy(
             capture,
             MetalCapturePolicy {
@@ -864,6 +1052,7 @@ impl MetalStatefulInferencePlan {
             execution_plan,
             resident_bindings,
             initial_state,
+            state_links: state_links_by_name,
             deployment_identity,
         })
     }
@@ -1386,6 +1575,23 @@ impl MetalDeviceSessionPlan {
         )
     }
 
+    fn prepare_with_shared_fixed_transition(
+        self,
+        device: MetalDevice,
+        initial_state: BTreeMap<String, TensorData>,
+        inference_deployment_identity: u64,
+        source: &MetalDeviceSession,
+        proof: MetalSharedFixedStateTransitionProof,
+    ) -> Result<MetalDeviceSession, MetalError> {
+        self.prepare_impl(
+            device,
+            BTreeMap::new(),
+            initial_state,
+            Some(inference_deployment_identity),
+            Some(MetalSharedPreparation::FixedStateTransition(source, proof)),
+        )
+    }
+
     fn prepare_impl(
         self,
         device: MetalDevice,
@@ -1444,6 +1650,16 @@ impl MetalDeviceSessionPlan {
                             != Some(proof.source_deployment_identity)
                         || source.device_owner_id() != device.owner_id()
                         || !matches!(self.state_policy, MetalSessionStatePolicy::None)
+                        || !matches!(source.state_policy, MetalSessionStatePolicy::Epoch { .. })
+                }
+                MetalSharedPreparation::FixedStateTransition(source, proof) => {
+                    proof.target_capture_identity != self.capture().identity
+                        || Some(proof.target_deployment_identity) != inference_deployment_identity
+                        || proof.source_capture_identity != source.capture_identity()
+                        || source.inference_deployment_identity()
+                            != Some(proof.source_deployment_identity)
+                        || source.device_owner_id() != device.owner_id()
+                        || !matches!(self.state_policy, MetalSessionStatePolicy::Epoch { .. })
                         || !matches!(source.state_policy, MetalSessionStatePolicy::Epoch { .. })
                 }
             };
@@ -1507,6 +1723,22 @@ impl MetalDeviceSessionPlan {
                 let resources = source
                     .prepared
                     .share_resources_at_epoch(&proof.dense, proof.alternate_state_bank)?;
+                let imported_dense = proof.dense.keys().copied().collect::<BTreeSet<_>>();
+                (
+                    PreparedMetalPrefix::from_plan_with_shared(
+                        device.clone(),
+                        self.prefix,
+                        resources,
+                        &imported_dense,
+                        &BTreeSet::new(),
+                    )?,
+                    imported_dense,
+                )
+            }
+            Some(MetalSharedPreparation::FixedStateTransition(source, proof)) => {
+                let resources = source
+                    .prepared
+                    .share_resources(&proof.dense, &BTreeMap::new())?;
                 let imported_dense = proof.dense.keys().copied().collect::<BTreeSet<_>>();
                 (
                     PreparedMetalPrefix::from_plan_with_shared(
@@ -2006,6 +2238,51 @@ impl MetalDeviceSession {
         committed_position: usize,
         output_proof: Option<MetalOutputProof>,
     ) -> Result<MetalDeviceRun, MetalError> {
+        self.run_with_host_outputs_at_with_preservation(
+            transient_inputs,
+            host_outputs,
+            committed_position,
+            output_proof,
+            None,
+        )
+    }
+
+    fn run_shared_epoch_without_host_outputs(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+        alternate_state_bank: bool,
+        source: &InitializedMetalPrefix,
+        preserved_state: &[(u64, usize)],
+        committed: CommittedState,
+    ) -> Result<MetalDeviceRun, MetalError> {
+        if !matches!(self.state_policy, MetalSessionStatePolicy::Epoch { .. }) {
+            return Err(MetalError::InvalidBinding(
+                "shared Metal transition requires fixed epoch state".into(),
+            ));
+        }
+        let preservation = MetalSharedEpochPreservation {
+            source,
+            states: preserved_state,
+            committed,
+        };
+        self.state_epoch = alternate_state_bank;
+        self.run_with_host_outputs_at_with_preservation(
+            transient_inputs,
+            StaticHostOutputSelection::None,
+            self.committed_state_position,
+            None,
+            Some(preservation),
+        )
+    }
+
+    fn run_with_host_outputs_at_with_preservation(
+        &mut self,
+        transient_inputs: &BTreeMap<String, TensorData>,
+        host_outputs: StaticHostOutputSelection,
+        committed_position: usize,
+        output_proof: Option<MetalOutputProof>,
+        preservation: Option<MetalSharedEpochPreservation<'_>>,
+    ) -> Result<MetalDeviceRun, MetalError> {
         let host_output_suppression_is_sealed = match self.state_policy {
             MetalSessionStatePolicy::Epoch { .. } => self.lifetime.runtime_controls().is_empty(),
             MetalSessionStatePolicy::Append { .. } => self.lifetime.runtime_controls().len() == 1,
@@ -2068,8 +2345,22 @@ impl MetalDeviceSession {
         let transfer = match self.state_policy {
             MetalSessionStatePolicy::None => self.prepared.execute(&mut values)?,
             MetalSessionStatePolicy::Epoch { .. } => {
-                self.prepared
-                    .execute_stateful(&mut values, self.state_epoch, host_outputs)?
+                if let Some(preservation) = preservation.as_ref() {
+                    if host_outputs != StaticHostOutputSelection::None {
+                        return Err(MetalError::InvalidBinding(
+                            "shared Metal transition cannot expose outputs".into(),
+                        ));
+                    }
+                    self.prepared.execute_shared_state_transition(
+                        &mut values,
+                        self.state_epoch,
+                        preservation.source,
+                        preservation.states,
+                    )?
+                } else {
+                    self.prepared
+                        .execute_stateful(&mut values, self.state_epoch, host_outputs)?
+                }
             }
             MetalSessionStatePolicy::Append { .. } => {
                 self.prepared
@@ -2122,28 +2413,31 @@ impl MetalDeviceSession {
             runtime_control_h2d_bytes,
             zero_item_count: self.summary.zero_item_count,
             output_count: outputs.len(),
-            committed_state: match self.state_policy {
-                MetalSessionStatePolicy::None => CommittedState::default(),
-                MetalSessionStatePolicy::Epoch {
-                    pair_count,
-                    bytes,
-                    work_items,
-                } => CommittedState {
-                    pair_count,
-                    bytes,
-                    work_items,
+            committed_state: preservation.map_or_else(
+                || match self.state_policy {
+                    MetalSessionStatePolicy::None => CommittedState::default(),
+                    MetalSessionStatePolicy::Epoch {
+                        pair_count,
+                        bytes,
+                        work_items,
+                    } => CommittedState {
+                        pair_count,
+                        bytes,
+                        work_items,
+                    },
+                    MetalSessionStatePolicy::Append {
+                        pair_count,
+                        row_bytes,
+                        work_items,
+                        ..
+                    } => CommittedState {
+                        pair_count,
+                        bytes: row_bytes,
+                        work_items,
+                    },
                 },
-                MetalSessionStatePolicy::Append {
-                    pair_count,
-                    row_bytes,
-                    work_items,
-                    ..
-                } => CommittedState {
-                    pair_count,
-                    bytes: row_bytes,
-                    work_items,
-                },
-            },
+                |preservation| preservation.committed,
+            ),
             committed_state_position: next_committed_position,
         });
         self.successful_runs = successful_invocation;
@@ -2224,6 +2518,12 @@ struct CommittedState {
     pair_count: usize,
     bytes: usize,
     work_items: usize,
+}
+
+struct MetalSharedEpochPreservation<'a> {
+    source: &'a InitializedMetalPrefix,
+    states: &'a [(u64, usize)],
+    committed: CommittedState,
 }
 
 fn metal_quantized_gather_error(

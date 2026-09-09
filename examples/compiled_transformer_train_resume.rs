@@ -15,12 +15,13 @@
 use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
-    Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWRuntime, CompiledAdamWStep,
-    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
-    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan,
-    CompiledModuleAdamWSession, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
-    CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NodeId, Parameter, Result, Scalar,
-    Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
+    Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWFlush,
+    CompiledAdamWFlushRuntime, CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
+    CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan, CompiledModuleAdamWSession,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
+    MetalSessionTarget, Module, NodeId, Parameter, Result, Scalar, Shape, TensorData,
+    TrainingDropoutProvider, TransformerBlock,
 };
 use std::{collections::BTreeMap, env, error::Error};
 
@@ -46,7 +47,7 @@ const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "norm.weight",
 ];
 const INITIAL_STEPS: usize = 4;
-const RESUMED_STEPS: usize = 4;
+const RESUMED_STEPS: usize = 3;
 
 struct TinyCausalTransformer {
     tokens: Embedding,
@@ -248,7 +249,7 @@ fn evaluate_mean_sparse_loss(model: &TinyCausalTransformer) -> Result<f64> {
 
 fn run_exact_resume<R, P>(target_name: &str, mut prepare: P) -> Result<()>
 where
-    R: CompiledAdamWRuntime + CompiledEvaluationRuntime,
+    R: CompiledAdamWRuntime + CompiledAdamWFlushRuntime + CompiledEvaluationRuntime,
     P: FnMut(
         CompiledModuleAdamWPlan<TinyCausalTransformer>,
     ) -> Result<CompiledModuleAdamWSession<TinyCausalTransformer, R>>,
@@ -350,13 +351,24 @@ where
             5 => (1, 0, true),
             6 => (1, 1, false),
             7 => (1, 2, false),
-            8 => (2, 0, true),
             _ => unreachable!(),
         };
         assert_eq!(actual.optimizer_step(), optimizer_step);
         assert_eq!(actual.accumulation_index(), accumulation_index);
         assert_eq!(actual.did_update(), did_update);
     }
+    let expected_flush = uninterrupted.flush_partial_window(TensorData::scalar(0.05))?;
+    let actual_flush = resumed.flush_partial_window(TensorData::scalar(0.05))?;
+    assert_eq!(actual_flush.flushed_microbatches(), 2);
+    assert_eq!(
+        actual_flush.flushed_microbatches(),
+        expected_flush.flushed_microbatches()
+    );
+    assert_eq!(
+        actual_flush.optimizer_step(),
+        expected_flush.optimizer_step()
+    );
+    assert_eq!(actual_flush.did_update(), expected_flush.did_update());
     assert_eq!(resumed.optimizer_step()?, 2);
     assert_eq!(resumed.accumulation_index()?, 0);
 

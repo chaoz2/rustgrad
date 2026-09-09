@@ -1948,10 +1948,16 @@ impl Module for CompiledDropoutFixture {
 }
 
 fn compiled_dropout_adamw_plan() -> CompiledAdamWPlan {
+    compiled_dropout_adamw_plan_with_accumulation(1)
+}
+
+fn compiled_dropout_adamw_plan_with_accumulation(steps: u64) -> CompiledAdamWPlan {
     let module = CompiledDropoutFixture {
         weight: Parameter::new(TensorData::scalar(0.5), true),
     };
     let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_gradient_accumulation(steps)
         .unwrap()
         .with_input("x", [3], DType::F32)
         .unwrap();
@@ -2618,6 +2624,187 @@ fn compiled_dropout_counter_is_one_strict_metal_state_pair_and_matches_cpu() {
         2
     );
     assert!(mock.calls().iter().all(|call| !call.contains("status")));
+}
+
+#[test]
+fn compiled_adamw_partial_flush_shares_epoch_state_and_is_retryable() {
+    let mut cpu = compiled_dropout_adamw_plan_with_accumulation(3)
+        .prepare_cpu()
+        .unwrap();
+    let renderer = MetalRenderer::new(8, capabilities()).unwrap();
+    let plan = compiled_dropout_adamw_plan_with_accumulation(3)
+        .metal_plan(renderer)
+        .unwrap();
+    assert!(plan.flush_capture_identity().is_some());
+    let mock = Arc::new(MockDispatch::default());
+    let mut metal = plan
+        .prepare_with_scoreboard(
+            test_device(mock.clone()),
+            MetalScoreboardContext::new(
+                "compiled-partial-flush",
+                "test-revision",
+                "strict semantic mock",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let flush_preparation = metal.flush_preparation_report().unwrap();
+    assert_eq!(flush_preparation.initial_state_h2d_calls, 0);
+    assert_eq!(flush_preparation.initial_state_h2d_bytes, 0);
+    let inputs = || {
+        BTreeMap::from([(
+            "x".into(),
+            TensorData::new([3], vec![1.0, 2.0, 3.0]).unwrap(),
+        )])
+    };
+    let learning_rate = || TensorData::scalar(0.01);
+    for _ in 0..2 {
+        cpu.step(inputs(), learning_rate()).unwrap();
+        metal
+            .step_without_host_outputs(inputs(), learning_rate())
+            .unwrap();
+    }
+    let checkpoint = metal.checkpoint().unwrap();
+    let epoch = metal.metal_session().state_epoch();
+    let successful_runs = metal.metal_session().successful_run_count();
+    let scoreboard_runs = metal
+        .execution_scoreboard_report()
+        .unwrap()
+        .unwrap()
+        .successful_run_count;
+    assert_eq!(metal.dropout_block_counter().unwrap(), Some(4));
+
+    mock.clear_calls();
+    assert!(
+        metal
+            .flush_partial_window(TensorData::new([1], vec![0.01_f32]).unwrap())
+            .is_err()
+    );
+    assert!(mock.calls().is_empty());
+    assert_eq!(metal.metal_session().state_epoch(), epoch);
+    assert_eq!(
+        metal.metal_session().successful_run_count(),
+        successful_runs
+    );
+    assert_eq!(metal.checkpoint().unwrap(), checkpoint);
+    assert_eq!(
+        metal
+            .execution_scoreboard_report()
+            .unwrap()
+            .unwrap()
+            .successful_run_count,
+        scoreboard_runs
+    );
+    assert_eq!(metal.dropout_block_counter().unwrap(), Some(4));
+
+    for stage in ["copy", "write", "launch", "mid-batch", "wait"] {
+        match stage {
+            "copy" => mock.state.lock().unwrap().failures.copy = Some("flush preserve"),
+            "write" => mock.state.lock().unwrap().failures.write = Some("flush learning rate"),
+            "launch" => mock.state.lock().unwrap().failures.launch = Some("flush launch"),
+            "mid-batch" => {
+                mock.state.lock().unwrap().failures.launch_after = Some((1, "flush mid-batch"))
+            }
+            "wait" => mock.state.lock().unwrap().failures.wait = Some("flush wait"),
+            _ => unreachable!(),
+        }
+        assert!(metal.flush_partial_window(learning_rate()).is_err());
+        mock.clear_failures();
+        assert_eq!(metal.metal_session().state_epoch(), epoch);
+        assert_eq!(
+            metal.metal_session().successful_run_count(),
+            successful_runs
+        );
+        assert_eq!(
+            metal
+                .execution_scoreboard_report()
+                .unwrap()
+                .unwrap()
+                .successful_run_count,
+            scoreboard_runs
+        );
+        assert_eq!(metal.checkpoint().unwrap(), checkpoint);
+        assert_eq!(metal.dropout_block_counter().unwrap(), Some(4));
+    }
+
+    let expected = cpu.flush_partial_window(learning_rate()).unwrap();
+    mock.clear_calls();
+    let actual = metal.flush_partial_window(learning_rate()).unwrap();
+    assert_eq!(
+        actual.flushed_microbatches(),
+        expected.flushed_microbatches()
+    );
+    assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+    assert!(actual.did_update());
+    let report = actual.report().unwrap();
+    assert_eq!(report.transient_h2d_calls, 1);
+    assert_eq!(report.transient_h2d_bytes, 4);
+    assert_eq!(report.retained_d2h_calls, 0);
+    assert_eq!(report.retained_d2h_bytes, 0);
+    assert_eq!(report.output_count, 0);
+    assert_eq!(report.command_submission_count, 1);
+    assert_eq!(report.command_wait_count, 1);
+    assert_eq!(
+        report.committed_state_pair_count,
+        metal.metal_session().summary().state_pair_count
+    );
+    assert_eq!(
+        report.committed_state_bytes,
+        metal.metal_session().summary().logical_state_bytes
+    );
+    assert_eq!(report.committed_state_work_items, 7);
+    let calls = mock.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("write:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("copy:"))
+            .count(),
+        1,
+        "only the omitted dropout counter requires bank preservation"
+    );
+    assert!(calls.iter().any(|call| call.starts_with("batch_submit:")));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("wait:"))
+            .count(),
+        1
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.starts_with("read:") && !call.contains("status"))
+    );
+    assert_ne!(metal.metal_session().state_epoch(), epoch);
+    assert_eq!(
+        metal.metal_session().successful_run_count(),
+        successful_runs
+    );
+    assert_eq!(
+        metal
+            .execution_scoreboard_report()
+            .unwrap()
+            .unwrap()
+            .successful_run_count,
+        scoreboard_runs
+    );
+    assert_eq!(metal.dropout_block_counter().unwrap(), Some(4));
+    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+
+    let epoch = metal.metal_session().state_epoch();
+    mock.clear_calls();
+    let empty = metal.flush_partial_window(learning_rate()).unwrap();
+    assert!(!empty.did_update());
+    assert!(empty.report().is_none());
+    assert_eq!(metal.metal_session().state_epoch(), epoch);
+    assert!(mock.calls().is_empty());
 }
 
 #[test]
@@ -8996,6 +9183,44 @@ impl Dispatch for MockDispatch {
         Ok(Self::command(&mut state, owner))
     }
 
+    fn copy_launch_batch(
+        &self,
+        queue: RawQueue,
+        copies: &[dispatch::BatchCopy],
+        launches: &[dispatch::BatchLaunch],
+        owner: u64,
+    ) -> Result<RawCommand, MetalError> {
+        let mut encoded = Vec::with_capacity(copies.len());
+        for copy in copies {
+            match self.buffer_copy(queue, copy.src, copy.dst, copy.region, owner) {
+                Ok(command) => encoded.push(command),
+                Err(error) => {
+                    let mut state = self.state.lock().unwrap();
+                    for command in encoded {
+                        state.commands.remove(&(owner, command.0));
+                    }
+                    state.calls.push(format!("batch_abort:{owner}"));
+                    return Err(error);
+                }
+            }
+        }
+        let command = match self.launch_batch(queue, launches, owner) {
+            Ok(command) => command,
+            Err(error) => {
+                let mut state = self.state.lock().unwrap();
+                for command in encoded {
+                    state.commands.remove(&(owner, command.0));
+                }
+                return Err(error);
+            }
+        };
+        let mut state = self.state.lock().unwrap();
+        for command in encoded {
+            state.commands.remove(&(owner, command.0));
+        }
+        Ok(command)
+    }
+
     fn command_query(&self, command: RawCommand, owner: u64) -> Result<bool, MetalError> {
         let mut state = self.state.lock().unwrap();
         if let Some(detail) = state.failures.query.take() {
@@ -10033,6 +10258,10 @@ fn captured_indexed_movement_metal_is_atomic_and_projects_duplicate_outputs() {
             .calls()
             .iter()
             .any(|call| call.starts_with("batch_submit:"))
+    );
+    assert!(
+        !mock.calls().iter().any(|call| call.starts_with("copy:")),
+        "ordinary guarded indexed movement must not enter shared-state preservation"
     );
 }
 

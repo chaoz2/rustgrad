@@ -13,9 +13,9 @@ use crate::nn::{
 use crate::runtime::metal::{
     MetalDevice, MetalDeviceRun, MetalDeviceRunReport, MetalDeviceSession,
     MetalDeviceSessionSummary, MetalError, MetalFixedStateReadPlan, MetalFixedStateReadSession,
-    MetalRenderer, MetalScoreboardContext, MetalScoreboardError, MetalScoreboardObserver,
-    MetalSessionScoreboard, MetalSessionScoreboardReport, MetalStatefulInferencePlan,
-    RenderedMetal,
+    MetalFixedStateTransitionPlan, MetalFixedStateTransitionSession, MetalRenderer,
+    MetalScoreboardContext, MetalScoreboardError, MetalScoreboardObserver, MetalSessionScoreboard,
+    MetalSessionScoreboardReport, MetalStatefulInferencePlan, RenderedMetal,
 };
 use crate::{
     BufferState, CapturedMixedSchedule, CapturedSchedule, CapturedStatefulInference, CompareOp,
@@ -1967,7 +1967,7 @@ pub struct CpuCompiledAdamW {
 /// existing epoch-swapped Metal runtime.
 pub struct MetalCompiledAdamWPlan {
     inner: MetalCompiledTrainingPlan,
-    partial_flush: Option<CompiledAdamWPartialFlushPlan>,
+    partial_flush: Option<MetalFixedStateTransitionPlan>,
     progress: AdamWProgress,
     flush_capture_identity: Option<u64>,
     gradient_accumulation_steps: u64,
@@ -1995,6 +1995,7 @@ struct MetalCompiledTrainingPlan {
 /// the observed [`MetalCompiledAdamW::step`] path.
 pub struct MetalCompiledAdamW {
     inner: MetalCompiledTrainingProgram,
+    partial_flush: Option<MetalFixedStateTransitionSession>,
     progress: AdamWProgress,
     flush_capture_identity: Option<u64>,
     gradient_accumulation_steps: u64,
@@ -2033,6 +2034,46 @@ pub struct MetalCompiledAdamWCommitResult {
     progress: AdamWProgress,
     capture_identity: u64,
     report: MetalDeviceRunReport,
+}
+
+/// One committed strict-Metal partial-window flush and its exact device report.
+pub struct MetalCompiledAdamWFlushResult {
+    inner: CompiledAdamWFlushResult,
+    report: Option<MetalDeviceRunReport>,
+}
+
+impl MetalCompiledAdamWFlushResult {
+    pub fn flushed_microbatches(&self) -> u64 {
+        self.inner.flushed_microbatches()
+    }
+
+    pub fn did_update(&self) -> bool {
+        self.inner.did_update()
+    }
+
+    pub fn optimizer_step(&self) -> u64 {
+        self.inner.optimizer_step()
+    }
+
+    /// Exact device report for a committed update. Empty flushes execute no
+    /// device invocation and therefore return `None`.
+    pub fn report(&self) -> Option<&MetalDeviceRunReport> {
+        self.report.as_ref()
+    }
+}
+
+impl CompiledAdamWFlush for MetalCompiledAdamWFlushResult {
+    fn flushed_microbatches(&self) -> u64 {
+        MetalCompiledAdamWFlushResult::flushed_microbatches(self)
+    }
+
+    fn did_update(&self) -> bool {
+        MetalCompiledAdamWFlushResult::did_update(self)
+    }
+
+    fn optimizer_step(&self) -> u64 {
+        MetalCompiledAdamWFlushResult::optimizer_step(self)
+    }
 }
 
 impl MetalCompiledAdamWCommitResult {
@@ -2223,9 +2264,9 @@ pub trait CompiledAdamWRuntime:
 /// The transition consumes only the live parameter, moment, accumulator, and
 /// optimizer-cursor frontier plus the explicit learning rate. It cannot reach
 /// a training batch, forward/backward graph, or recurrent dropout state.
-/// This first implementation is exposed by CPU runtimes only; the contract is
-/// backend-neutral so a future strict Metal implementation can replay the
-/// identical authenticated transition without changing user code.
+/// CPU executes the exact retained mixed capture. Strict Metal reuses its
+/// authenticated state-only projection against the live epoch banks without
+/// changing user code or staging gradients through the host.
 pub trait CompiledAdamWFlushRuntime: CompiledAdamWRuntime {
     type Flush: CompiledAdamWFlush;
 
@@ -4133,12 +4174,26 @@ impl CompiledAdamWPlan {
     /// Renders the compiled program for strict Metal admission without
     /// creating device resources.
     pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
-        let inner =
-            self.inner
-                .metal_plan(renderer, &self.host_token_inputs, self.evaluation.clone())?;
+        let inner = self.inner.metal_plan(
+            renderer.clone(),
+            &self.host_token_inputs,
+            self.evaluation.clone(),
+        )?;
+        let partial_flush = self
+            .partial_flush
+            .as_ref()
+            .map(|transition| {
+                MetalFixedStateTransitionPlan::new(
+                    transition.recurrent_capture.clone(),
+                    renderer,
+                    &inner.inner,
+                )
+                .map_err(metal_training_error)
+            })
+            .transpose()?;
         Ok(MetalCompiledAdamWPlan {
             inner,
-            partial_flush: self.partial_flush.clone(),
+            partial_flush,
             progress: self.progress,
             flush_capture_identity: self.flush_capture_identity(),
             gradient_accumulation_steps: self.gradient_accumulation_steps,
@@ -5137,12 +5192,10 @@ impl MetalCompiledAdamWPlan {
         self.inner.program_identity
     }
 
-    /// Stable identity of the retained resource-free flush artifact. Metal
-    /// execution support is intentionally not exposed by this PR.
+    /// Stable identity of the exact mixed transition executed by CPU and
+    /// represented by this strict-Metal state-only plan.
     pub fn flush_capture_identity(&self) -> Option<u64> {
-        self.partial_flush
-            .as_ref()
-            .map(CompiledAdamWPartialFlushPlan::capture_identity)
+        self.flush_capture_identity
     }
 
     pub fn step_count(&self) -> u64 {
@@ -5199,9 +5252,17 @@ impl MetalCompiledAdamWPlan {
         device: MetalDevice,
         recorder: Option<MetalSessionScoreboard>,
     ) -> Result<MetalCompiledAdamW> {
-        let inner = self.inner.prepare(device, recorder)?;
+        let inner = self.inner.prepare(device.clone(), recorder)?;
+        let partial_flush = self
+            .partial_flush
+            .map(|plan| {
+                plan.prepare(device, &inner.session)
+                    .map_err(metal_training_error)
+            })
+            .transpose()?;
         Ok(MetalCompiledAdamW {
             inner,
+            partial_flush,
             progress: self.progress,
             flush_capture_identity: self.flush_capture_identity,
             gradient_accumulation_steps: self.gradient_accumulation_steps,
@@ -5633,6 +5694,54 @@ impl MetalCompiledAdamW {
         Ok(result)
     }
 
+    /// Commits a retained partial window through the separately rendered
+    /// state-only capture while sharing the live epoch banks and queue.
+    pub fn flush_partial_window(
+        &mut self,
+        learning_rate: TensorData,
+    ) -> Result<MetalCompiledAdamWFlushResult> {
+        validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
+        let (next, result) = self
+            .progress
+            .flush_partial(self.gradient_accumulation_steps)?;
+        if !result.did_update() {
+            return Ok(MetalCompiledAdamWFlushResult {
+                inner: result,
+                report: None,
+            });
+        }
+        let transition = self
+            .partial_flush
+            .as_mut()
+            .ok_or_else(|| training("compiled Metal partial flush transition is absent"))?;
+        let inputs = BTreeMap::from([(LEARNING_RATE_INPUT.to_owned(), learning_rate)]);
+        let run = transition
+            .run(&mut self.inner.session, &inputs)
+            .map_err(metal_training_error)?;
+        let (outputs, report) = run.into_parts();
+        debug_assert!(outputs.is_empty());
+        self.progress = next;
+        Ok(MetalCompiledAdamWFlushResult {
+            inner: result,
+            report: Some(report),
+        })
+    }
+
+    pub fn flush_capture_identity(&self) -> Option<u64> {
+        self.flush_capture_identity
+    }
+
+    /// Preparation evidence for the state-only transition. Imported recurrent
+    /// state must contribute zero initialization uploads.
+    #[cfg(test)]
+    pub(crate) fn flush_preparation_report(
+        &self,
+    ) -> Option<&crate::runtime::metal::MetalDevicePreparationReport> {
+        self.partial_flush
+            .as_ref()
+            .map(MetalFixedStateTransitionSession::preparation_report)
+    }
+
     /// Downloads one coherent active state bank and encodes the same portable
     /// checkpoint format accepted by [`CpuCompiledAdamW::compile_from_checkpoint`].
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
@@ -5784,6 +5893,18 @@ impl CompiledAdamWRuntime for MetalCompiledAdamW {
 
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         MetalCompiledAdamW::gradient_accumulator_snapshots(self)
+    }
+}
+
+impl CompiledAdamWFlushRuntime for MetalCompiledAdamW {
+    type Flush = MetalCompiledAdamWFlushResult;
+
+    fn flush_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::Flush> {
+        MetalCompiledAdamW::flush_partial_window(self, learning_rate)
+    }
+
+    fn flush_capture_identity(&self) -> Option<u64> {
+        MetalCompiledAdamW::flush_capture_identity(self)
     }
 }
 

@@ -924,14 +924,21 @@ AdamW compilation with a multi-replay accumulation window also produces a
 separate authenticated state-only transition over the exact parameter,
 moment, accumulator, optimizer-step, and accumulation-index schema. The
 backend-neutral `CompiledAdamWFlushRuntime` capability is implemented by CPU
-only in this slice: a nonempty flush consumes that live frontier plus an
+and strict Metal: a nonempty flush consumes that live frontier plus an
 explicit scalar learning rate, averages by the retained microbatch count,
 clips once, commits AdamW, and clears the window without making the training
 batch, forward/backward graph, or dropout counter reachable. Its one
 `EffectRuntime` transaction and precomputed successor cursor make failures
-retryable. Flush count and flushed-microbatch count authenticate progress and
-reconstruct the distinct optimizer/workload logical versions on checkpoint
-restore; Metal deliberately does not yet advertise the capability.
+retryable. Metal privately authenticates the retained recurrent projection
+against the complete source epoch schema, aliases both physical banks and the
+existing queue, and issues omitted-state preservation blits followed by the
+update kernels in one command buffer. It uploads only the scalar learning rate,
+retains no output, performs no D2H, and publishes the shared epoch only after a
+successful wait; failed preparation, encoding, launch, or wait leaves the
+source frontier retryable. Flush count and flushed-microbatch count authenticate
+progress and reconstruct the distinct optimizer/workload logical versions on
+checkpoint restore. No live Apple-hardware flush result is claimed by this
+semantic implementation.
 `CpuCompiledMomentumSgd` and `CpuCompiledAdamW` consume detached named F32
 parameter values, build one private Graph with one batched reverse traversal,
 and capture the pure loss/output/update prefix together with ordered parameter
