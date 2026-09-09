@@ -114,6 +114,32 @@ impl Module for TinyCausalTransformer {
     }
 }
 
+struct BufferedTinyCausalTransformer {
+    transformer: TinyCausalTransformer,
+    running_marker: Parameter,
+}
+
+impl BufferedTinyCausalTransformer {
+    fn new(seed: u64) -> Result<Self> {
+        Ok(Self {
+            transformer: TinyCausalTransformer::new(seed)?,
+            running_marker: Parameter::new(TensorData::scalar(3.0), false),
+        })
+    }
+}
+
+impl Module for BufferedTinyCausalTransformer {
+    fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        self.transformer.visit(prefix, visitor);
+        let name = if prefix.is_empty() {
+            "running_marker".to_owned()
+        } else {
+            format!("{prefix}.running_marker")
+        };
+        visitor(name, &self.running_marker, StateKind::Buffer);
+    }
+}
+
 fn config() -> CompiledAdamWConfig {
     config_with_max_gradient_norm(Some(MAX_GRADIENT_NORM))
 }
@@ -162,6 +188,15 @@ fn build(
     let logits = model.forward(graph, inputs["tokens"], dropout)?;
     let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
     Ok((loss, BTreeMap::new()))
+}
+
+fn build_buffered(
+    model: &BufferedTinyCausalTransformer,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    build_with_dropout_observations(&model.transformer, graph, inputs, dropout)
 }
 
 fn build_with_dropout_observations(
@@ -852,6 +887,56 @@ fn assert_relu_region_unchanged(base: &TensorData, perturbed: &TensorData, conte
     }
 }
 
+fn relu_region_unchanged(base: &TensorData, perturbed: &TensorData) -> bool {
+    perturbed.shape() == base.shape()
+        && (0..base.len()).all(|coordinate| {
+            (base.scalar_at(coordinate).as_f64() > 0.0)
+                == (perturbed.scalar_at(coordinate).as_f64() > 0.0)
+        })
+}
+
+fn unique_relu_input(graph: &Graph, loss: NodeId) -> NodeId {
+    let relu_inputs = graph
+        .trace(loss)
+        .unwrap()
+        .steps
+        .into_iter()
+        .filter_map(|step| {
+            let Op::Select {
+                condition,
+                on_true,
+                on_false,
+            } = graph.op(step.node).unwrap()
+            else {
+                return None;
+            };
+            let Op::Compare {
+                op: CompareOp::Lt,
+                lhs,
+                rhs,
+            } = graph.op(*condition).unwrap()
+            else {
+                return None;
+            };
+            if lhs != on_false || rhs != on_true {
+                return None;
+            }
+            match graph.op(*lhs).unwrap() {
+                Op::Constant(zero)
+                    if zero.shape() == &Shape::new([])
+                        && zero.dtype() == graph.dtype(*rhs).unwrap()
+                        && zero.scalar_at(0).as_f64() == 0.0 =>
+                {
+                    Some(*rhs)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(relu_inputs.len(), 1);
+    relu_inputs[0]
+}
+
 struct MaintainedDerivativeFixture {
     model: TinyCausalTransformer,
     state_before: StateDict,
@@ -914,44 +999,7 @@ fn maintained_derivative_fixture() -> MaintainedDerivativeFixture {
         "canonical trainable parameters must map to distinct graph leaves"
     );
 
-    let relu_inputs = graph
-        .trace(loss)
-        .unwrap()
-        .steps
-        .into_iter()
-        .filter_map(|step| {
-            let Op::Select {
-                condition,
-                on_true,
-                on_false,
-            } = graph.op(step.node).unwrap()
-            else {
-                return None;
-            };
-            let Op::Compare {
-                op: CompareOp::Lt,
-                lhs,
-                rhs,
-            } = graph.op(*condition).unwrap()
-            else {
-                return None;
-            };
-            if lhs != on_false || rhs != on_true {
-                return None;
-            }
-            match graph.op(*lhs).unwrap() {
-                Op::Constant(zero)
-                    if zero.shape() == &Shape::new([])
-                        && zero.dtype() == graph.dtype(*rhs).unwrap()
-                        && zero.scalar_at(0).as_f64() == 0.0 =>
-                {
-                    Some(*rhs)
-                }
-                _ => None,
-            }
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(relu_inputs.len(), 1);
+    let relu_input = unique_relu_input(&graph, loss);
 
     // Deliberately keep two feed-forward lanes active and two inactive. LayerNorm
     // bounds the two-element input, so these biases provide a wide fixed region
@@ -975,7 +1023,7 @@ fn maintained_derivative_fixture() -> MaintainedDerivativeFixture {
         loss,
         targets,
         target_input_names,
-        relu_input: relu_inputs[0],
+        relu_input,
         bindings,
     }
 }
@@ -1193,6 +1241,117 @@ fn maintained_causal_transformer_all_parameter_hvps_match_central_differences() 
     assert_eq!(coordinates_checked, 64);
     assert_eq!(model.state_dict().unwrap(), state_before);
     assert_eq!(module_parameter_state(&model), parameter_state_before);
+}
+
+#[derive(Clone, Copy)]
+struct TransformerGradientProbe {
+    parameter: &'static str,
+    coordinate: usize,
+    boundary: &'static str,
+}
+
+fn numerical_transformer_gradient_lanes(
+    model: &TinyCausalTransformer,
+    inputs: BTreeMap<String, TensorData>,
+    masks: [TensorData; 2],
+    probes: &[TransformerGradientProbe],
+) -> Vec<f64> {
+    const EPSILONS: [f64; 4] = [1e-3, 5e-4, 2.5e-4, 1.25e-4];
+
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let mut dropout = FixedResidualDropout::from_masks(masks);
+    let logits = model.forward(&mut graph, tokens, &mut dropout).unwrap();
+    assert_eq!(dropout.next, 2);
+    let loss = sparse_causal_loss(&mut graph, logits, targets).unwrap();
+    let relu_input = unique_relu_input(&graph, loss);
+
+    let trainable = model.trainable_parameters().unwrap();
+    let parameter_inputs = trainable
+        .iter()
+        .map(|(name, parameter)| {
+            let node = parameter.node(&graph).unwrap();
+            let Op::Input { name: input_name } = graph.op(node).unwrap() else {
+                panic!("bound trainable parameter {name} must be a graph input");
+            };
+            (name.clone(), input_name.clone())
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert!(
+        probes
+            .iter()
+            .all(|probe| parameter_inputs.contains_key(probe.parameter))
+    );
+
+    let mut bindings = model.input_bindings(&graph).unwrap();
+    bindings.extend(inputs);
+    let base_relu = CpuBackend.execute(&graph, relu_input, &bindings).unwrap();
+    probes
+        .iter()
+        .map(|probe| {
+            let input_name = &parameter_inputs[probe.parameter];
+            let parameter = &bindings[input_name];
+            assert!(
+                probe.coordinate < parameter.len(),
+                "{} probe {}[{}] is outside {} lanes",
+                probe.boundary,
+                probe.parameter,
+                probe.coordinate,
+                parameter.len()
+            );
+            let outputs = [loss, relu_input];
+            let context = format!(
+                "{} through {}[{}]",
+                probe.boundary, probe.parameter, probe.coordinate
+            );
+            EPSILONS
+                .into_iter()
+                .find_map(|epsilon| {
+                    let plus_bindings = perturbed_parameter_bindings(
+                        &bindings,
+                        input_name,
+                        parameter,
+                        probe.coordinate,
+                        epsilon,
+                    );
+                    let minus_bindings = perturbed_parameter_bindings(
+                        &bindings,
+                        input_name,
+                        parameter,
+                        probe.coordinate,
+                        -epsilon,
+                    );
+                    let plus = CpuBackend
+                        .execute_many(&graph, &outputs, &plus_bindings)
+                        .unwrap();
+                    let minus = CpuBackend
+                        .execute_many(&graph, &outputs, &minus_bindings)
+                        .unwrap();
+                    if !relu_region_unchanged(&base_relu, &plus.outputs[1])
+                        || !relu_region_unchanged(&base_relu, &minus.outputs[1])
+                    {
+                        return None;
+                    }
+                    assert_relu_region_unchanged(
+                        &base_relu,
+                        &plus.outputs[1],
+                        &format!("{context} +"),
+                    );
+                    assert_relu_region_unchanged(
+                        &base_relu,
+                        &minus.outputs[1],
+                        &format!("{context} -"),
+                    );
+                    Some(
+                        (plus.outputs[0].scalar_at(0).as_f64()
+                            - minus.outputs[0].scalar_at(0).as_f64())
+                            / (2.0 * epsilon),
+                    )
+                })
+                .unwrap_or_else(|| panic!("no bounded central difference preserved {context}"))
+        })
+        .collect()
 }
 
 fn evaluate(model: &TinyCausalTransformer) -> TensorData {
@@ -1669,6 +1828,267 @@ fn compiled_transformer_active_global_clip_changes_the_first_window_update() {
 }
 
 #[test]
+fn compiled_transformer_second_window_gradient_inputs_match_numerical_oracle() {
+    const NUMERICAL_ABSOLUTE_TOLERANCE: f64 = 6e-3;
+    const NUMERICAL_RELATIVE_TOLERANCE: f64 = 3e-3;
+    const ADAM_INPUT_TOLERANCE: f64 = 1e-5;
+    const FIRST_MOMENT_TOLERANCE: f64 = 7e-4;
+    const SECOND_MOMENT_TOLERANCE: f64 = 7e-6;
+    const PROBES: [TransformerGradientProbe; 10] = [
+        TransformerGradientProbe {
+            parameter: "tokens.weight",
+            coordinate: 4,
+            boundary: "embedding lookup, tied output transpose, gather, and mean",
+        },
+        TransformerGradientProbe {
+            parameter: "block.query.0",
+            coordinate: 3,
+            boundary: "query projection and attention views",
+        },
+        TransformerGradientProbe {
+            parameter: "block.key.0",
+            coordinate: 2,
+            boundary: "key projection and causal attention",
+        },
+        TransformerGradientProbe {
+            parameter: "block.value.0",
+            coordinate: 1,
+            boundary: "value projection and attention reduction",
+        },
+        TransformerGradientProbe {
+            parameter: "block.out.0",
+            coordinate: 0,
+            boundary: "attention output projection",
+        },
+        TransformerGradientProbe {
+            parameter: "block.ln1.0",
+            coordinate: 1,
+            boundary: "first LayerNorm affine scale",
+        },
+        TransformerGradientProbe {
+            parameter: "block.ln2.1",
+            coordinate: 0,
+            boundary: "second LayerNorm affine bias",
+        },
+        TransformerGradientProbe {
+            parameter: "block.ff1.0",
+            coordinate: 6,
+            boundary: "feed-forward expansion and ReLU",
+        },
+        TransformerGradientProbe {
+            parameter: "block.ff2.0",
+            coordinate: 5,
+            boundary: "feed-forward contraction",
+        },
+        TransformerGradientProbe {
+            parameter: "norm.bias",
+            coordinate: 1,
+            boundary: "final LayerNorm affine and logits reduction",
+        },
+    ];
+
+    // Clipping is disabled only for this focused proof so the completed
+    // window's first moment exposes the exact averaged gradient presented to
+    // AdamW. The separate clipping tests cover the intervening global policy.
+    let optimizer = config_with_max_gradient_norm(None);
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let tied_identity = model.tokens.weight.id();
+    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+        optimizer.clone(),
+        dropout_config(),
+        &model,
+        build_with_dropout_observations,
+    )
+    .unwrap();
+    let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
+
+    for replay in 1..=ACCUMULATION_STEPS {
+        let step = runtime.step(batch(replay), learning_rate()).unwrap();
+        assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
+    }
+    assert_eq!(runtime.step_count(), ACCUMULATION_STEPS);
+    assert_eq!(runtime.optimizer_step().unwrap(), 1);
+    assert_eq!(runtime.accumulation_index().unwrap(), 0);
+    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(36));
+
+    // Freeze an independent forward-only oracle at the exact recurrent
+    // parameter frontier after window one. It never calls Graph::gradient or
+    // any production reverse-mode helper.
+    let frontier_parameters = runtime.parameter_snapshots().unwrap();
+    let frontier_first_moments = runtime.first_moment_snapshots().unwrap();
+    let frontier_second_moments = runtime.second_moment_snapshots().unwrap();
+    let frontier_checkpoint = runtime.checkpoint().unwrap();
+    let oracle_model = TinyCausalTransformer::new(7).unwrap();
+    oracle_model
+        .load_trainable_parameters_exact(&frontier_parameters)
+        .unwrap();
+
+    // A checkpoint-identical sibling advances the same replay/dropout cursor,
+    // snapshots each raw gradient in the existing accumulator seam, and then
+    // discards it before the next replay. This captures all three microbatch
+    // gradients without reaching clipping or AdamW and without changing the
+    // sequential runtime whose completed-window recurrence is checked below.
+    let gradient_probe_model = TinyCausalTransformer::new(7).unwrap();
+    let mut gradient_probe_runtime =
+        CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+            optimizer.clone(),
+            dropout_config(),
+            &gradient_probe_model,
+            &frontier_checkpoint,
+            build_with_dropout_observations,
+        )
+        .unwrap()
+        .prepare_cpu()
+        .unwrap();
+    let mut masks = Vec::with_capacity(ACCUMULATION_STEPS as usize);
+    let mut raw_gradients = Vec::with_capacity(ACCUMULATION_STEPS as usize);
+    for replay in ACCUMULATION_STEPS + 1..=2 * ACCUMULATION_STEPS {
+        let step = gradient_probe_runtime
+            .step(batch(replay), learning_rate())
+            .unwrap();
+        assert!(!step.did_update());
+        masks.push(observed_dropout_masks(step.outputs()));
+        assert_eq!(gradient_probe_runtime.accumulation_index().unwrap(), 1);
+        raw_gradients.push(
+            gradient_probe_runtime
+                .gradient_accumulator_snapshots()
+                .unwrap(),
+        );
+        assert!(gradient_probe_runtime.zero_grad().unwrap().did_discard());
+    }
+    assert_eq!(raw_gradients.len(), ACCUMULATION_STEPS as usize);
+    assert_eq!(gradient_probe_runtime.optimizer_step().unwrap(), 1);
+    assert_eq!(gradient_probe_runtime.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        gradient_probe_runtime.dropout_block_counter().unwrap(),
+        Some(72)
+    );
+
+    for (index, replay) in (ACCUMULATION_STEPS + 1..=2 * ACCUMULATION_STEPS).enumerate() {
+        let step = runtime.step(batch(replay), learning_rate()).unwrap();
+        assert_eq!(observed_dropout_masks(step.outputs()), masks[index]);
+        assert_eq!(step.did_update(), replay == 2 * ACCUMULATION_STEPS);
+    }
+    assert_eq!(runtime.optimizer_step().unwrap(), 2);
+    assert_eq!(runtime.accumulation_index().unwrap(), 0);
+    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(72));
+
+    let numerical = masks
+        .into_iter()
+        .enumerate()
+        .map(|(index, masks)| {
+            numerical_transformer_gradient_lanes(
+                &oracle_model,
+                batch(ACCUMULATION_STEPS + 1 + index as u64),
+                masks,
+                &PROBES,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(numerical.len(), ACCUMULATION_STEPS as usize);
+    assert!(
+        numerical
+            .iter()
+            .all(|gradient| gradient.len() == PROBES.len())
+    );
+
+    let next_first_moments = runtime.first_moment_snapshots().unwrap();
+    let next_second_moments = runtime.second_moment_snapshots().unwrap();
+    let beta1 = optimizer.beta1();
+    let beta2 = optimizer.beta2();
+    for (probe_index, probe) in PROBES.iter().enumerate() {
+        let numerical_lanes = [
+            numerical[0][probe_index] as f32,
+            numerical[1][probe_index] as f32,
+            numerical[2][probe_index] as f32,
+        ];
+        let actual_lanes: [f32; 3] = std::array::from_fn(|replay_index| {
+            raw_gradients[replay_index][probe.parameter]
+                .scalar_at(probe.coordinate)
+                .as_f64() as f32
+        });
+        for (replay_index, (actual, expected)) in
+            actual_lanes.into_iter().zip(numerical_lanes).enumerate()
+        {
+            let error = (f64::from(actual) - f64::from(expected)).abs();
+            let tolerance = NUMERICAL_ABSOLUTE_TOLERANCE
+                + NUMERICAL_RELATIVE_TOLERANCE * f64::from(actual.abs().max(expected.abs()));
+            assert!(
+                error <= tolerance,
+                "{} raw gradient {}[{}] at second-window replay {} mismatch: actual={actual}, numerical={expected}, error={error}, tolerance={tolerance}",
+                probe.boundary,
+                probe.parameter,
+                probe.coordinate,
+                replay_index + 1
+            );
+        }
+
+        let numerical_average = ((numerical_lanes[0] + numerical_lanes[1]) + numerical_lanes[2])
+            / ACCUMULATION_STEPS as f32;
+        let average =
+            ((actual_lanes[0] + actual_lanes[1]) + actual_lanes[2]) / ACCUMULATION_STEPS as f32;
+        let average_error = (f64::from(average) - f64::from(numerical_average)).abs();
+        let average_tolerance = NUMERICAL_ABSOLUTE_TOLERANCE
+            + NUMERICAL_RELATIVE_TOLERANCE * f64::from(average.abs().max(numerical_average.abs()));
+        assert!(
+            average_error <= average_tolerance,
+            "{} averaged raw gradient {}[{}] mismatch: captured={average}, numerical={numerical_average}, error={average_error}, tolerance={average_tolerance}",
+            probe.boundary,
+            probe.parameter,
+            probe.coordinate
+        );
+        let previous_first = frontier_first_moments[probe.parameter]
+            .scalar_at(probe.coordinate)
+            .as_f64() as f32;
+        let actual_first = next_first_moments[probe.parameter]
+            .scalar_at(probe.coordinate)
+            .as_f64() as f32;
+        let captured_adam_input = (actual_first - beta1 * previous_first) / (1.0 - beta1);
+        assert!(
+            (f64::from(captured_adam_input) - f64::from(average)).abs() <= ADAM_INPUT_TOLERANCE,
+            "{} averaged AdamW input {}[{}] mismatch: captured={captured_adam_input}, raw={average}",
+            probe.boundary,
+            probe.parameter,
+            probe.coordinate
+        );
+
+        let expected_first = beta1 * previous_first + (1.0 - beta1) * average;
+        let previous_second = frontier_second_moments[probe.parameter]
+            .scalar_at(probe.coordinate)
+            .as_f64() as f32;
+        let actual_second = next_second_moments[probe.parameter]
+            .scalar_at(probe.coordinate)
+            .as_f64() as f32;
+        let expected_second = beta2 * previous_second + (1.0 - beta2) * (average * average);
+        assert!(
+            (f64::from(actual_first) - f64::from(expected_first)).abs() <= FIRST_MOMENT_TOLERANCE,
+            "{} first moment {}[{}] mismatch: actual={actual_first}, numerical={expected_first}",
+            probe.boundary,
+            probe.parameter,
+            probe.coordinate
+        );
+        assert!(
+            (f64::from(actual_second) - f64::from(expected_second)).abs()
+                <= SECOND_MOMENT_TOLERANCE,
+            "{} second moment {}[{}] mismatch: actual={actual_second}, numerical={expected_second}",
+            probe.boundary,
+            probe.parameter,
+            probe.coordinate
+        );
+    }
+
+    assert_eq!(model.tokens.weight.id(), tied_identity);
+    assert!(!frontier_parameters.contains_key("lm_head.weight"));
+    assert!(
+        runtime
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .values()
+            .all(|value| value.to_vec_f64().into_iter().all(|lane| lane == 0.0))
+    );
+}
+
+#[test]
 fn compiled_transformer_recurrent_adamw_updates_match_analytic_reference() {
     let model = TinyCausalTransformer::new(7).unwrap();
     let state_before = model.state_dict().unwrap();
@@ -1856,6 +2276,249 @@ fn owned_compiled_transformer_session_finishes_and_resumes_one_module_lifecycle(
         final_mean_sparse_loss < initial_mean_sparse_loss,
         "owned compiled causal Transformer eval loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
     );
+}
+
+#[test]
+fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly() {
+    const POLICY_FROZEN: &str = "block.ff1.0";
+
+    let policy = config().with_frozen_parameters([POLICY_FROZEN]).unwrap();
+    let source = BufferedTinyCausalTransformer::new(7).unwrap();
+    let source_policy_frozen = source
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .find_map(|(name, parameter)| (name == POLICY_FROZEN).then_some(parameter))
+        .unwrap()
+        .value()
+        .unwrap();
+    let source_plan = CompiledModuleAdamWPlan::compile_with_dropout(
+        policy.clone(),
+        dropout_config(),
+        source,
+        build_buffered,
+    )
+    .unwrap();
+    let capture_identity = source_plan.capture_identity();
+    let flush_capture_identity = source_plan.flush_capture_identity();
+    let mut uninterrupted = source_plan.prepare(&CpuSessionTarget::new()).unwrap();
+    for replay in 1..=4 {
+        uninterrupted.step(batch(replay), learning_rate()).unwrap();
+    }
+
+    let checkpoint = uninterrupted.checkpoint().unwrap();
+    let checkpoint_parameters = uninterrupted.parameter_snapshots().unwrap();
+    let checkpoint_first_moments = uninterrupted.first_moment_snapshots().unwrap();
+    let checkpoint_second_moments = uninterrupted.second_moment_snapshots().unwrap();
+    let checkpoint_accumulators = uninterrupted.gradient_accumulator_snapshots().unwrap();
+    assert!(
+        checkpoint_first_moments
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .any(|value| value != 0.0)
+    );
+    assert!(
+        checkpoint_second_moments
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .any(|value| value != 0.0)
+    );
+    assert!(
+        checkpoint_accumulators
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .any(|value| value != 0.0)
+    );
+    assert_eq!(checkpoint.info().capture_identity(), capture_identity);
+    assert_eq!(checkpoint.info().replay_step(), 4);
+    assert_eq!(checkpoint.info().optimizer_step(), 1);
+    assert_eq!(checkpoint.info().accumulation_index(), 1);
+    assert_eq!(checkpoint.info().dropout_block_counter(), Some(48));
+
+    let destination = BufferedTinyCausalTransformer::new(0xdecafbad).unwrap();
+    let tied = destination.transformer.tokens.weight.clone();
+    let tied_identity = tied.id();
+    assert_ne!(
+        tied.value().unwrap(),
+        checkpoint_parameters["tokens.weight"]
+    );
+    let policy_frozen = destination
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .find_map(|(name, parameter)| (name == POLICY_FROZEN).then_some(parameter))
+        .unwrap();
+    assert_ne!(policy_frozen.value().unwrap(), source_policy_frozen);
+    policy_frozen.replace(source_policy_frozen.clone()).unwrap();
+    let policy_frozen_before = policy_frozen.snapshot().unwrap();
+    let inherent_frozen = destination.transformer.frozen_scale.clone();
+    let inherent_frozen_before = inherent_frozen.snapshot().unwrap();
+    let running_marker = destination.running_marker.clone();
+    running_marker.replace(TensorData::scalar(29.0)).unwrap();
+    let running_marker_before = running_marker.snapshot().unwrap();
+
+    let mut destination_parameters = BTreeMap::new();
+    let mut destination_versions = BTreeMap::new();
+    for (ordinal, (name, parameter)) in destination
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .filter(|(name, _)| name != POLICY_FROZEN)
+        .enumerate()
+    {
+        let replacement = TensorData::full_with_dtype(
+            parameter.shape().unwrap(),
+            Scalar::F(20.0 + ordinal as f64),
+            parameter.dtype().unwrap(),
+        )
+        .unwrap();
+        parameter.replace(replacement.clone()).unwrap();
+        destination_versions.insert(name.clone(), parameter.version().unwrap());
+        assert!(destination_parameters.insert(name, replacement).is_none());
+    }
+    assert_eq!(
+        destination_parameters.keys().collect::<Vec<_>>(),
+        checkpoint_parameters.keys().collect::<Vec<_>>()
+    );
+    for (name, value) in &destination_parameters {
+        assert_ne!(
+            value, &checkpoint_parameters[name],
+            "{name} must be restored"
+        );
+    }
+
+    let resumed_plan = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
+        policy,
+        dropout_config(),
+        destination,
+        &checkpoint,
+        build_buffered,
+    )
+    .unwrap();
+    assert_eq!(resumed_plan.capture_identity(), capture_identity);
+    assert_eq!(
+        resumed_plan.flush_capture_identity(),
+        flush_capture_identity
+    );
+    assert_eq!(resumed_plan.step_count(), 4);
+    let mut resumed = resumed_plan.prepare(&CpuSessionTarget::new()).unwrap();
+    assert_eq!(resumed.capture_identity(), capture_identity);
+    assert_eq!(resumed.step_count(), 4);
+    assert_eq!(resumed.optimizer_step().unwrap(), 1);
+    assert_eq!(resumed.accumulation_index().unwrap(), 1);
+    assert_eq!(
+        checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
+        48
+    );
+    assert_eq!(
+        resumed.parameter_snapshots().unwrap(),
+        checkpoint_parameters
+    );
+    assert_eq!(
+        resumed.first_moment_snapshots().unwrap(),
+        checkpoint_first_moments
+    );
+    assert_eq!(
+        resumed.second_moment_snapshots().unwrap(),
+        checkpoint_second_moments
+    );
+    assert_eq!(
+        resumed.gradient_accumulator_snapshots().unwrap(),
+        checkpoint_accumulators
+    );
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+    assert_eq!(
+        policy_frozen.snapshot().unwrap().data,
+        policy_frozen_before.data
+    );
+    assert_eq!(
+        policy_frozen.version().unwrap(),
+        policy_frozen_before.version
+    );
+    assert_eq!(
+        running_marker.snapshot().unwrap().data,
+        running_marker_before.data
+    );
+    assert_eq!(
+        running_marker.version().unwrap(),
+        running_marker_before.version
+    );
+
+    for replay in 5..=6 {
+        let expected = uninterrupted.step(batch(replay), learning_rate()).unwrap();
+        let actual = resumed.step(batch(replay), learning_rate()).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(actual.step(), expected.step());
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+        assert_eq!(actual.did_update(), expected.did_update());
+        assert_eq!(actual.capture_identity(), capture_identity);
+        assert_eq!(
+            resumed.parameter_snapshots().unwrap(),
+            uninterrupted.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.first_moment_snapshots().unwrap(),
+            uninterrupted.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.second_moment_snapshots().unwrap(),
+            uninterrupted.second_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.gradient_accumulator_snapshots().unwrap(),
+            uninterrupted.gradient_accumulator_snapshots().unwrap()
+        );
+        assert_eq!(
+            resumed.checkpoint().unwrap(),
+            uninterrupted.checkpoint().unwrap()
+        );
+    }
+    assert_eq!(resumed.step_count(), 6);
+    assert_eq!(resumed.optimizer_step().unwrap(), 2);
+    assert_eq!(resumed.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
+        72
+    );
+
+    let final_parameters = resumed.parameter_snapshots().unwrap();
+    let _source = uninterrupted.finish().unwrap();
+    let destination = resumed.finish().unwrap();
+    assert_eq!(destination.transformer.tokens.weight.id(), tied_identity);
+    assert_eq!(destination.transformer.tokens.weight.id(), tied.id());
+    let mut tied_alias_identity = None;
+    destination.visit("", &mut |name, parameter, _| {
+        if name == "lm_head.weight" {
+            tied_alias_identity = Some(parameter.id());
+        }
+    });
+    assert_eq!(tied_alias_identity, Some(tied_identity));
+    for (name, parameter) in destination.trainable_parameters().unwrap() {
+        if name == POLICY_FROZEN {
+            assert_eq!(
+                parameter.snapshot().unwrap().data,
+                policy_frozen_before.data
+            );
+            assert_eq!(parameter.version().unwrap(), policy_frozen_before.version);
+        } else {
+            assert_eq!(parameter.value().unwrap(), final_parameters[&name]);
+            assert_eq!(
+                parameter.version().unwrap(),
+                destination_versions[&name] + 1
+            );
+        }
+    }
+    let inherent_frozen_after = inherent_frozen.snapshot().unwrap();
+    assert_eq!(inherent_frozen_after.data, inherent_frozen_before.data);
+    assert_eq!(
+        inherent_frozen_after.version,
+        inherent_frozen_before.version
+    );
+    let running_marker_after = running_marker.snapshot().unwrap();
+    assert_eq!(running_marker_after.data, running_marker_before.data);
+    assert_eq!(running_marker_after.version, running_marker_before.version);
 }
 
 #[test]
