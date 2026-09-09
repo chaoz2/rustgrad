@@ -909,11 +909,6 @@ impl CompiledAdamWConfig {
             .iter()
             .map(|(name, shape)| (name.as_str(), shape))
     }
-
-    fn without_frozen_parameters(mut self) -> Self {
-        self.frozen_parameters.clear();
-        self
-    }
 }
 
 /// Detached result of one successfully committed compiled training step.
@@ -2242,6 +2237,7 @@ pub struct CpuCompiledMomentumSgd {
 /// recurrent-state admission, and optional checkpoint restoration. Preparing
 /// the plan then chooses CPU replay or strict Metal rendering without changing
 /// the authenticated program or optimizer frontier.
+#[derive(Clone)]
 pub struct CompiledAdamWPlan {
     inner: CompiledTrainingPlan,
     partial_flush: Option<CompiledAdamWPartialFlushPlan>,
@@ -2281,6 +2277,55 @@ pub struct CompiledModuleAdamWSession<M, R> {
 pub struct CompiledModuleAdamWCompileError<M> {
     module: M,
     source: Error,
+}
+
+/// Recoverable checkpoint-restore failure retaining the complete owned plan.
+pub struct CompiledModuleAdamWRestoreError<M> {
+    plan: Box<CompiledModuleAdamWPlan<M>>,
+    source: Error,
+}
+
+impl<M> CompiledModuleAdamWRestoreError<M> {
+    pub fn source_error(&self) -> &Error {
+        &self.source
+    }
+
+    pub fn plan(&self) -> &CompiledModuleAdamWPlan<M> {
+        &self.plan
+    }
+
+    pub fn into_plan(self) -> CompiledModuleAdamWPlan<M> {
+        *self.plan
+    }
+
+    pub fn into_parts(self) -> (CompiledModuleAdamWPlan<M>, Error) {
+        (*self.plan, self.source)
+    }
+}
+
+impl<M> fmt::Debug for CompiledModuleAdamWRestoreError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledModuleAdamWRestoreError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> fmt::Display for CompiledModuleAdamWRestoreError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "owned compiled AdamW checkpoint restore failed: {}",
+            self.source
+        )
+    }
+}
+
+impl<M> std::error::Error for CompiledModuleAdamWRestoreError<M> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 impl<M> CompiledModuleAdamWCompileError<M> {
@@ -4759,8 +4804,148 @@ impl CompiledAdamWPlan {
         })
     }
 
-    /// Recompiles an exact program and restores its portable AdamW frontier
-    /// before any concrete runtime is prepared.
+    /// Returns an independent plan whose recurrent frontier is restored from
+    /// one checkpoint without rebuilding the Graph, derivatives, schedules,
+    /// captures, partial-flush transition, or attached evaluation program.
+    ///
+    /// The checkpoint must authenticate this exact compiled program and its
+    /// accumulation, dropout, frozen-parameter, input, clipping, loss-scaling,
+    /// and partial-flush policies. The source plan remains unchanged on both
+    /// success and failure, and each returned plan may be prepared or restored
+    /// independently.
+    pub fn restore_checkpoint(&self, checkpoint: &CompiledAdamWCheckpoint) -> Result<Self> {
+        let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
+        if self.gradient_accumulation_steps != decoded.accumulation_steps {
+            return Err(training(
+                "compiled AdamW checkpoint accumulation policy mismatch",
+            ));
+        }
+        if self.capture_identity() != decoded.capture_identity {
+            return Err(training(
+                "compiled AdamW checkpoint capture identity mismatch",
+            ));
+        }
+        if decoded.flush_capture_identity.is_some()
+            && self.flush_capture_identity() != decoded.flush_capture_identity
+        {
+            return Err(training(
+                "compiled AdamW checkpoint partial flush capture identity mismatch",
+            ));
+        }
+        match (self.dropout, decoded.dropout_block_counter) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(training(
+                    "compiled AdamW dropout checkpoint requires dropout restore",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(training(
+                    "compiled AdamW checkpoint has no dropout block counter",
+                ));
+            }
+            (Some(dropout), Some(counter)) => {
+                let expected = decoded
+                    .replay_step
+                    .checked_mul(dropout.blocks_per_replay)
+                    .ok_or_else(|| training("compiled dropout counter progress overflows"))?;
+                if counter != expected {
+                    return Err(training(
+                        "compiled dropout counter and replay progress diverged",
+                    ));
+                }
+            }
+        }
+
+        let mut values = decoded
+            .parameters
+            .into_iter()
+            .map(|(name, value)| (RecurrentStateKey::parameter(name), value))
+            .collect::<BTreeMap<_, _>>();
+        for (name, value) in decoded.first_moments {
+            values.insert(
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment),
+                value,
+            );
+        }
+        for (name, value) in decoded.second_moments {
+            values.insert(
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment),
+                value,
+            );
+        }
+        for (name, value) in decoded.gradient_accumulators {
+            values.insert(
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator),
+                value,
+            );
+        }
+        values.insert(
+            RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
+            TensorData::from_scalars(
+                Shape::from([]),
+                DType::U64,
+                [Scalar::U(decoded.optimizer_step)],
+            )?,
+        );
+        if decoded.accumulation_steps > 1 {
+            values.insert(
+                RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
+                TensorData::from_scalars(
+                    Shape::from([]),
+                    DType::U64,
+                    [Scalar::U(decoded.accumulation_index)],
+                )?,
+            );
+        }
+        if let Some(counter) = decoded.dropout_block_counter {
+            values.insert(
+                RecurrentStateKey::dropout_counter(),
+                TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(counter)])?,
+            );
+        }
+
+        let progress = AdamWProgress {
+            replay_step: decoded.replay_step,
+            optimizer_step: decoded.optimizer_step,
+            accumulation_index: decoded.accumulation_index,
+            discarded_microbatches: decoded.discarded_microbatches,
+            flushed_window_count: decoded.flushed_window_count,
+            flushed_microbatch_count: decoded.flushed_microbatch_count,
+        };
+        let optimizer_version = decoded
+            .replay_step
+            .checked_add(decoded.flushed_window_count)
+            .ok_or_else(|| training("compiled AdamW checkpoint state version overflows"))?;
+        let versions = values
+            .keys()
+            .cloned()
+            .map(|key| {
+                let version = if self.inner.workload_buffers.contains_key(&key) {
+                    decoded.replay_step
+                } else {
+                    optimizer_version
+                };
+                (key, version)
+            })
+            .collect();
+
+        let mut restored = self.clone();
+        restored.inner =
+            restored
+                .inner
+                .restore_frontier_with_versions(decoded.replay_step, values, versions)?;
+        restored.partial_flush = restored
+            .partial_flush
+            .take()
+            .map(|transition| transition.with_frontier(&restored.inner.state_values))
+            .transpose()?;
+        restored.progress = progress;
+        Ok(restored)
+    }
+
+    /// Compatibility constructor that compiles an exact program and then
+    /// restores its portable AdamW frontier before runtime preparation.
     pub fn compile_from_checkpoint<F>(
         config: CompiledAdamWConfig,
         checkpoint: &CompiledAdamWCheckpoint,
@@ -4779,112 +4964,16 @@ impl CompiledAdamWPlan {
             ));
         }
         let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
-        if decoded.dropout_block_counter.is_some() {
-            return Err(training(
-                "compiled AdamW dropout checkpoint requires dropout restore",
-            ));
-        }
-        if config.gradient_accumulation_steps != decoded.accumulation_steps {
-            return Err(training(
-                "compiled AdamW checkpoint accumulation policy mismatch",
-            ));
-        }
         let parameters = decoded
             .parameters
             .iter()
             .map(|(name, value)| TrainingParameterInit::new(name.clone(), value.clone()))
             .collect::<Result<Vec<_>>>()?;
-        let mut plan = Self::compile(config, parameters, build)?;
-        if plan.capture_identity() != decoded.capture_identity {
-            return Err(training(
-                "compiled AdamW checkpoint capture identity mismatch",
-            ));
-        }
-        if decoded.flush_capture_identity.is_some()
-            && plan.flush_capture_identity() != decoded.flush_capture_identity
-        {
-            return Err(training(
-                "compiled AdamW checkpoint partial flush capture identity mismatch",
-            ));
-        }
-        let mut values = decoded
-            .parameters
-            .into_iter()
-            .map(|(name, value)| (RecurrentStateKey::parameter(name), value))
-            .collect::<BTreeMap<_, _>>();
-        for (name, value) in decoded.first_moments {
-            values.insert(
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment),
-                value,
-            );
-        }
-        for (name, value) in decoded.second_moments {
-            values.insert(
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment),
-                value,
-            );
-        }
-        for (name, value) in decoded.gradient_accumulators {
-            values.insert(
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator),
-                value,
-            );
-        }
-        values.insert(
-            RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
-            TensorData::from_scalars(
-                Shape::from([]),
-                DType::U64,
-                [Scalar::U(decoded.optimizer_step)],
-            )?,
-        );
-        if decoded.accumulation_steps > 1 {
-            values.insert(
-                RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
-                TensorData::from_scalars(
-                    Shape::from([]),
-                    DType::U64,
-                    [Scalar::U(decoded.accumulation_index)],
-                )?,
-            );
-        }
-        plan.progress = AdamWProgress {
-            replay_step: decoded.replay_step,
-            optimizer_step: decoded.optimizer_step,
-            accumulation_index: decoded.accumulation_index,
-            discarded_microbatches: decoded.discarded_microbatches,
-            flushed_window_count: decoded.flushed_window_count,
-            flushed_microbatch_count: decoded.flushed_microbatch_count,
-        };
-        let optimizer_version = decoded
-            .replay_step
-            .checked_add(decoded.flushed_window_count)
-            .ok_or_else(|| training("compiled AdamW checkpoint state version overflows"))?;
-        let versions = values
-            .keys()
-            .cloned()
-            .map(|key| {
-                let version = if plan.inner.workload_buffers.contains_key(&key) {
-                    decoded.replay_step
-                } else {
-                    optimizer_version
-                };
-                (key, version)
-            })
-            .collect();
-        plan.inner =
-            plan.inner
-                .restore_frontier_with_versions(decoded.replay_step, values, versions)?;
-        plan.partial_flush = plan
-            .partial_flush
-            .take()
-            .map(|transition| transition.with_frontier(&plan.inner.state_values))
-            .transpose()?;
-        Ok(plan)
+        Self::compile(config, parameters, build)?.restore_checkpoint(checkpoint)
     }
 
-    /// Recompiles a module-bound program and restores its portable frontier
-    /// without creating a CPU or Metal runtime.
+    /// Compatibility constructor that compiles a module-bound program and then
+    /// restores its portable frontier without preparing a runtime.
     pub fn compile_module_from_checkpoint<M, F>(
         config: CompiledAdamWConfig,
         module: &M,
@@ -4899,29 +4988,11 @@ impl CompiledAdamWPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
-        parameter_plan.validate_weight_decay_exclusions(&config)?;
-        let frozen_parameters = config.frozen_parameters.clone();
-        let mut frozen_parameter_nodes = BTreeSet::new();
-        let mut plan = Self::compile_from_checkpoint(
-            config.without_frozen_parameters(),
-            checkpoint,
-            |graph, inputs, parameters| {
-                parameter_plan.lower_with_frozen_parameter_nodes(
-                    graph,
-                    parameters,
-                    &mut frozen_parameter_nodes,
-                    |graph| build(module, graph, inputs),
-                )
-            },
-        )?;
-        plan.inner.frozen_parameter_nodes = frozen_parameter_nodes;
-        plan.frozen_parameters = frozen_parameters;
-        Ok(plan)
+        Self::compile_module(config, module, build)?.restore_checkpoint(checkpoint)
     }
 
-    /// Recompiles the same explicit residual-dropout program and restores its
-    /// complete optimizer and Threefry-counter frontier.
+    /// Compatibility constructor that compiles the explicit residual-dropout
+    /// program and then restores its optimizer and Threefry-counter frontier.
     pub fn compile_module_with_dropout_from_checkpoint<M, F>(
         config: CompiledAdamWConfig,
         dropout: CompiledDropoutConfig,
@@ -4938,132 +5009,8 @@ impl CompiledAdamWPlan {
             &mut dyn TrainingDropoutProvider,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
-        let dropout_counter = decoded
-            .dropout_block_counter
-            .ok_or_else(|| training("compiled AdamW checkpoint has no dropout block counter"))?;
-        if config.gradient_accumulation_steps != decoded.accumulation_steps {
-            return Err(training(
-                "compiled AdamW checkpoint accumulation policy mismatch",
-            ));
-        }
-        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
-        let parameters = decoded
-            .parameters
-            .iter()
-            .map(|(name, value)| TrainingParameterInit::new(name.clone(), value.clone()))
-            .collect::<Result<Vec<_>>>()?;
-        let mut plan = Self::compile_module_with_dropout_parameters(
-            config,
-            dropout,
-            module,
-            parameter_plan,
-            parameters,
-            build,
-        )?;
-        if plan.capture_identity() != decoded.capture_identity {
-            return Err(training(
-                "compiled AdamW checkpoint capture identity mismatch",
-            ));
-        }
-        if decoded.flush_capture_identity.is_some()
-            && plan.flush_capture_identity() != decoded.flush_capture_identity
-        {
-            return Err(training(
-                "compiled AdamW checkpoint partial flush capture identity mismatch",
-            ));
-        }
-        let expected_counter = decoded
-            .replay_step
-            .checked_mul(
-                plan.dropout
-                    .expect("dropout compilation records its policy")
-                    .blocks_per_replay,
-            )
-            .ok_or_else(|| training("compiled dropout counter progress overflows"))?;
-        if dropout_counter != expected_counter {
-            return Err(training(
-                "compiled dropout counter and replay progress diverged",
-            ));
-        }
-        let mut values = decoded
-            .parameters
-            .into_iter()
-            .map(|(name, value)| (RecurrentStateKey::parameter(name), value))
-            .collect::<BTreeMap<_, _>>();
-        for (name, value) in decoded.first_moments {
-            values.insert(
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment),
-                value,
-            );
-        }
-        for (name, value) in decoded.second_moments {
-            values.insert(
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment),
-                value,
-            );
-        }
-        for (name, value) in decoded.gradient_accumulators {
-            values.insert(
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator),
-                value,
-            );
-        }
-        values.insert(
-            RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
-            TensorData::from_scalars(
-                Shape::from([]),
-                DType::U64,
-                [Scalar::U(decoded.optimizer_step)],
-            )?,
-        );
-        if decoded.accumulation_steps > 1 {
-            values.insert(
-                RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
-                TensorData::from_scalars(
-                    Shape::from([]),
-                    DType::U64,
-                    [Scalar::U(decoded.accumulation_index)],
-                )?,
-            );
-        }
-        values.insert(
-            RecurrentStateKey::dropout_counter(),
-            TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(dropout_counter)])?,
-        );
-        plan.progress = AdamWProgress {
-            replay_step: decoded.replay_step,
-            optimizer_step: decoded.optimizer_step,
-            accumulation_index: decoded.accumulation_index,
-            discarded_microbatches: decoded.discarded_microbatches,
-            flushed_window_count: decoded.flushed_window_count,
-            flushed_microbatch_count: decoded.flushed_microbatch_count,
-        };
-        let optimizer_version = decoded
-            .replay_step
-            .checked_add(decoded.flushed_window_count)
-            .ok_or_else(|| training("compiled AdamW checkpoint state version overflows"))?;
-        let versions = values
-            .keys()
-            .cloned()
-            .map(|key| {
-                let version = if plan.inner.workload_buffers.contains_key(&key) {
-                    decoded.replay_step
-                } else {
-                    optimizer_version
-                };
-                (key, version)
-            })
-            .collect();
-        plan.inner =
-            plan.inner
-                .restore_frontier_with_versions(decoded.replay_step, values, versions)?;
-        plan.partial_flush = plan
-            .partial_flush
-            .take()
-            .map(|transition| transition.with_frontier(&plan.inner.state_values))
-            .transpose()?;
-        Ok(plan)
+        Self::compile_module_with_dropout(config, dropout, module, build)?
+            .restore_checkpoint(checkpoint)
     }
 
     /// Prepares graph-free CPU replay from this plan's exact frontier.
@@ -5247,8 +5194,8 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         })
     }
 
-    /// Rebuilds an owned module program and restores its authenticated AdamW
-    /// frontier before target preparation.
+    /// Compatibility constructor that compiles an owned module program and
+    /// then restores its authenticated AdamW frontier before preparation.
     pub fn compile_from_checkpoint<F>(
         config: CompiledAdamWConfig,
         module: M,
@@ -5262,14 +5209,19 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let frozen_parameters = config.frozen_parameters.clone();
-        Self::build_owned(module, &frozen_parameters, |module| {
-            CompiledAdamWPlan::compile_module_from_checkpoint(config, module, checkpoint, build)
+        Self::compile(config, module, build).and_then(|plan| {
+            plan.restore_checkpoint(checkpoint).map_err(|error| {
+                let (plan, source) = error.into_parts();
+                CompiledModuleAdamWCompileError {
+                    module: plan.module,
+                    source,
+                }
+            })
         })
     }
 
-    /// Rebuilds the owned recurrent-dropout workload and restores its complete
-    /// optimizer/dropout frontier.
+    /// Compatibility constructor that compiles the owned recurrent-dropout
+    /// workload and then restores its complete optimizer/dropout frontier.
     pub fn compile_with_dropout_from_checkpoint<F>(
         config: CompiledAdamWConfig,
         dropout: CompiledDropoutConfig,
@@ -5285,12 +5237,44 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             &mut dyn TrainingDropoutProvider,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let frozen_parameters = config.frozen_parameters.clone();
-        Self::build_owned(module, &frozen_parameters, |module| {
-            CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
-                config, dropout, module, checkpoint, build,
-            )
+        Self::compile_with_dropout(config, dropout, module, build).and_then(|plan| {
+            plan.restore_checkpoint(checkpoint).map_err(|error| {
+                let (plan, source) = error.into_parts();
+                CompiledModuleAdamWCompileError {
+                    module: plan.module,
+                    source,
+                }
+            })
         })
+    }
+
+    /// Restores a checkpoint onto this already compiled owned program without
+    /// rebuilding the Graph, derivatives, schedules, captures, partial-flush
+    /// transition, or attached evaluation program.
+    ///
+    /// The returned owner contains an independent restored plan while keeping
+    /// the same sealed module value. Failure retains this complete owner for
+    /// inspection, retry, or preparation of its unchanged frontier.
+    pub fn restore_checkpoint(
+        mut self,
+        checkpoint: &CompiledAdamWCheckpoint,
+    ) -> std::result::Result<Self, CompiledModuleAdamWRestoreError<M>> {
+        if let Err(source) = self.seal.validate_unchanged(&self.module) {
+            return Err(CompiledModuleAdamWRestoreError {
+                plan: Box::new(self),
+                source,
+            });
+        }
+        match self.plan.restore_checkpoint(checkpoint) {
+            Ok(plan) => {
+                self.plan = plan;
+                Ok(self)
+            }
+            Err(source) => Err(CompiledModuleAdamWRestoreError {
+                plan: Box::new(self),
+                source,
+            }),
+        }
     }
 
     /// Attaches one read-only evaluation capture to this exact owned plan.
@@ -9991,6 +9975,56 @@ mod tests {
             resumed.checkpoint().unwrap(),
             uninterrupted.checkpoint().unwrap()
         );
+    }
+
+    #[test]
+    fn adamw_plan_restore_rejects_authenticated_state_schema_mismatch_atomically() {
+        let config = accumulated_adamw_config(3);
+        let plan = CompiledAdamWPlan::compile(config, initial_parameters(), build_tinybob).unwrap();
+        let initial = plan.prepare_cpu().unwrap().checkpoint().unwrap();
+        let mut runtime = plan.prepare_cpu().unwrap();
+        runtime.step(batch(), lr()).unwrap();
+        let decoded = decode_adamw_checkpoint(runtime.checkpoint().unwrap().as_bytes()).unwrap();
+        let progress = AdamWCheckpointProgress {
+            capture_identity: decoded.capture_identity,
+            replay_step: decoded.replay_step,
+            optimizer_step: decoded.optimizer_step,
+            accumulation_steps: decoded.accumulation_steps,
+            accumulation_index: decoded.accumulation_index,
+            discarded_microbatches: decoded.discarded_microbatches,
+            flushed_window_count: decoded.flushed_window_count,
+            flushed_microbatch_count: decoded.flushed_microbatch_count,
+            flush_capture_identity: decoded.flush_capture_identity,
+            dropout_block_counter: decoded.dropout_block_counter,
+        };
+        let mut tensors = AdamWCheckpointTensors {
+            parameters: decoded.parameters,
+            first_moments: decoded.first_moments,
+            second_moments: decoded.second_moments,
+            gradient_accumulators: decoded.gradient_accumulators,
+        };
+        for values in [
+            &mut tensors.parameters,
+            &mut tensors.first_moments,
+            &mut tensors.second_moments,
+            &mut tensors.gradient_accumulators,
+        ] {
+            values.insert(
+                "w1".into(),
+                TensorData::zeros_with_dtype([4, 2], DType::F32).unwrap(),
+            );
+        }
+        let malformed = CompiledAdamWCheckpoint::from_bytes(
+            encode_adamw_checkpoint(progress, tensors).unwrap(),
+        )
+        .unwrap();
+
+        let error = match plan.restore_checkpoint(&malformed) {
+            Ok(_) => panic!("an equal-byte state descriptor mismatch restored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("state descriptor mismatch"));
+        assert_eq!(plan.prepare_cpu().unwrap().checkpoint().unwrap(), initial);
     }
 
     #[test]
