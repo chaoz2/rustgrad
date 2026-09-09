@@ -308,11 +308,13 @@ independently re-proves, the workflow's prior GGUF hash check. Those IDs are
 bounded conformance evidence, not a broad cross-runtime numerical oracle. The
 release-profile lane is dormant: the current external audit found zero
 compatible runners. The `live-metal` environment exists as ID `21345725438`,
-but has empty `protection_rules`, no `deployment_branch_policy`, and no
-variables, so it is unprotected and unrestricted. The default Linear, compiled-
-Transformer, and ResNet job does not read GGUF configuration; absent GGUF
-variables block only the typed `run_gguf=true` job. The repository workflow only
-references those external controls.
+requires reviewer `chaoz2` with `prevent_self_review=false`, and permits
+deployments from protected branches only. A compatible self-hosted runner is
+the sole remaining provisioning blocker for the default Linear, compiled-
+Transformer, and ResNet job. That job does not read GGUF configuration; absent
+environment variables and runner-local model assets block only the typed
+`run_gguf=true` job. The repository workflow only references those external
+controls.
 Ordinary macOS CI remains mock-only and no live-device result is
 claimed by the workflow definition itself. Its host-wall/API-copy and compute-
 command observations remain distinct from the optional completed-command GPU

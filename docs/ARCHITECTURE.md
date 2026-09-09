@@ -3145,14 +3145,15 @@ claim. The workflow has no push or pull-request trigger. Its default manual
 dispatch runs Linear, compiled-Transformer training, and ResNet without
 consulting any GGUF path, hash, prompt, expected-ID, or oracle variable. The
 current external audit found zero compatible runners. The `live-metal`
-environment exists as ID `21345725438`, but has empty `protection_rules`, no
-`deployment_branch_policy`, and no environment variables; it is unprotected
-and unrestricted. Missing GGUF variables block only the opt-in Llama job, not
-the default training-oriented job. The workflow's presence is not live-device
-or performance evidence.
-Provisioning for every run must attach the exact runner labels and restrict
-deployment refs and reviewers on `live-metal`. Opt-in GGUF runs must also define
-protected
+environment exists as ID `21345725438`, requires reviewer `chaoz2` with
+`prevent_self_review=false`, and permits deployments from protected branches
+only. A compatible self-hosted runner is the sole remaining provisioning
+blocker for the default training-oriented job. Absent GGUF variables and
+runner-local model assets affect only the opt-in Llama job. The workflow's
+presence is not live-device or performance evidence.
+Provisioning for every run must attach the exact runner labels and preserve the
+deployment-ref and reviewer controls on `live-metal`. Opt-in GGUF runs must
+also define protected
 `RUSTGRAD_METAL_LLAMA_GGUF_PATH`, `RUSTGRAD_METAL_LLAMA_GGUF_SHA256`,
 `RUSTGRAD_METAL_LLAMA_REGISTRY_ID`, `RUSTGRAD_METAL_LLAMA_PROMPT`,
 `RUSTGRAD_METAL_LLAMA_MAX_NEW_TOKENS`, and
