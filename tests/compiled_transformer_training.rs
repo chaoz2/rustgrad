@@ -1456,9 +1456,30 @@ where
     let published = resumed.parameter_snapshots().unwrap();
     let tied_version = tied.version().unwrap();
     let frozen_before = frozen.snapshot().unwrap();
-    let _uninterrupted_model = uninterrupted.finish().unwrap();
-    let resumed_model = resumed.finish().unwrap();
+    let (uninterrupted_model, uninterrupted_checkpoint) =
+        uninterrupted.finish_with_checkpoint().unwrap();
+    let (resumed_model, finished_checkpoint) = resumed.finish_with_checkpoint().unwrap();
+    assert_eq!(finished_checkpoint, final_checkpoint);
+    assert_eq!(finished_checkpoint, uninterrupted_checkpoint);
+    let final_restore = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
+        config(),
+        dropout_config(),
+        TinyCausalTransformer::new(7).unwrap(),
+        &finished_checkpoint,
+        build,
+    )
+    .unwrap()
+    .with_evaluation(build_evaluation)
+    .unwrap();
+    let final_restore = prepare(final_restore).unwrap();
+    assert_eq!(final_restore.checkpoint().unwrap(), finished_checkpoint);
+    let final_restored_parameters = final_restore.parameter_snapshots().unwrap();
+    let _fresh_module = final_restore.into_module_without_publication();
     let live = resumed_model.state_dict().unwrap();
+    assert_eq!(live, uninterrupted_model.state_dict().unwrap());
+    for (name, value) in &final_restored_parameters {
+        assert_eq!(&live.tensors()[name], value);
+    }
     for (name, value) in &published {
         assert_eq!(&live.tensors()[name], value);
     }
@@ -1780,9 +1801,8 @@ fn owned_compiled_transformer_session_finishes_and_resumes_one_module_lifecycle(
     for replay in 1..=4 {
         session.step(batch(replay), learning_rate()).unwrap();
     }
-    let checkpoint = session.checkpoint().unwrap();
     let midpoint = session.parameter_snapshots().unwrap();
-    let model = session.finish().unwrap();
+    let (model, checkpoint) = session.finish_with_checkpoint().unwrap();
     assert_eq!(model.tokens.weight.id(), tied_identity);
     assert_eq!(
         model.tokens.weight.value().unwrap(),
@@ -1817,7 +1837,7 @@ fn owned_compiled_transformer_session_finishes_and_resumes_one_module_lifecycle(
         session.step(batch(replay), learning_rate()).unwrap();
     }
     let final_parameters = session.parameter_snapshots().unwrap();
-    let model = session.finish().unwrap();
+    let (model, final_checkpoint) = session.finish_with_checkpoint().unwrap();
     assert_eq!(model.tokens.weight.id(), tied_identity);
     assert_eq!(
         model.tokens.weight.value().unwrap(),
@@ -1829,6 +1849,8 @@ fn owned_compiled_transformer_session_finishes_and_resumes_one_module_lifecycle(
         frozen_before.data
     );
     assert_eq!(model.frozen_scale.version().unwrap(), frozen_before.version);
+    assert_eq!(final_checkpoint.info().replay_step(), 8);
+    assert_eq!(final_checkpoint.info().optimizer_step(), 2);
     let final_mean_sparse_loss = evaluate_mean_sparse_loss(&model);
     assert!(
         final_mean_sparse_loss < initial_mean_sparse_loss,
@@ -1917,7 +1939,7 @@ fn owned_compiled_transformer_flushes_a_partial_window_and_resumes_exactly() {
         36
     );
     let final_parameters = resumed.parameter_snapshots().unwrap();
-    let model = resumed.finish().unwrap();
+    let (model, finished_checkpoint) = resumed.finish_with_checkpoint().unwrap();
     assert_eq!(model.tokens.weight.id(), tied_identity);
     assert_eq!(
         model.tokens.weight.value().unwrap(),
@@ -1933,6 +1955,10 @@ fn owned_compiled_transformer_flushes_a_partial_window_and_resumes_exactly() {
     let frozen_after = fresh_frozen.snapshot().unwrap();
     assert_eq!(frozen_after.data, frozen_before.data);
     assert_eq!(frozen_after.version, frozen_before.version);
+    assert_eq!(finished_checkpoint.info().replay_step(), 3);
+    assert_eq!(finished_checkpoint.info().optimizer_step(), 1);
+    assert_eq!(finished_checkpoint.info().flushed_window_count(), 1);
+    assert_eq!(finished_checkpoint.info().dropout_block_counter(), Some(36));
 }
 
 #[test]

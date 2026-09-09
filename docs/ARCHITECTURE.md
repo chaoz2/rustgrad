@@ -991,9 +991,15 @@ resources and again at finish. Consuming `finish` downloads only the runtime's
 canonical trainable frontier, then uses the existing sorted all-lock restore
 transaction to recheck every unique module identity, advance each trainable
 version once, preserve frozen/buffer bytes and versions, and return the module.
+`finish_with_checkpoint` instead takes one coherent validated checkpoint
+snapshot, publishes the parameter values decoded from that exact snapshot, and
+returns the module together with the same resumable parameter, moment,
+accumulator, dropout, and progress frontier. Strict device runtimes therefore
+perform no second parameter-only read during checkpointed finalization.
 Compilation failure returns the exact module, including graph-build,
-checkpoint-admission, seal, and maximum-version preflight failures. Snapshot or
-publication failure returns an error that retains the intact session;
+checkpoint-admission, seal, and maximum-version preflight failures. Checkpoint
+snapshot, decode, or publication failure returns an error that retains the
+intact session;
 preparation failure likewise retains the owned plan. A caller can explicitly
 abort either a live or failed session to recover its sealed host module without
 publishing the runtime frontier. The wrapper delegates the existing
