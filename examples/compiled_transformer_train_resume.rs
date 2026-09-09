@@ -17,10 +17,10 @@ use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
     Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWRuntime, CompiledAdamWStep,
     CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
-    CompiledEvaluationRuntime, CompiledModuleAdamWPlan, CompiledModuleAdamWSession,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
-    MetalSessionTarget, Module, NodeId, Parameter, Result, Scalar, Shape, TensorData,
-    TrainingDropoutProvider, TransformerBlock,
+    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan,
+    CompiledModuleAdamWSession, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
+    CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NodeId, Parameter, Result, Scalar,
+    Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
 };
 use std::{collections::BTreeMap, env, error::Error};
 
@@ -126,8 +126,7 @@ fn config() -> Result<CompiledAdamWConfig> {
         .with_loss_scale(128.0)?
         .with_gradient_accumulation(ACCUMULATION_STEPS)?
         .with_max_gradient_norm(MAX_GRADIENT_NORM)?
-        .with_host_token_input("tokens", [BATCH, TIME])?
-        .with_host_token_input("targets", [BATCH, TIME])
+        .with_input_batch::<TransformerBatch>()
 }
 
 fn dropout_config() -> CompiledDropoutConfig {
@@ -150,8 +149,8 @@ fn build(
     inputs: &BTreeMap<String, NodeId>,
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
-    let logits = model.forward(graph, inputs["tokens"], dropout)?;
-    let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
+    let logits = model.forward(graph, inputs[TransformerBatch::TOKENS], dropout)?;
+    let loss = sparse_causal_loss(graph, logits, inputs[TransformerBatch::TARGETS])?;
     Ok((loss, BTreeMap::new()))
 }
 
@@ -160,8 +159,8 @@ fn build_evaluation(
     graph: &mut Graph,
     inputs: &BTreeMap<String, NodeId>,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
-    let logits = model.forward_eval(graph, inputs["tokens"])?;
-    let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
+    let logits = model.forward_eval(graph, inputs[TransformerBatch::TOKENS])?;
+    let loss = sparse_causal_loss(graph, logits, inputs[TransformerBatch::TARGETS])?;
     Ok((loss, BTreeMap::from([("logits".into(), logits)])))
 }
 
@@ -172,7 +171,34 @@ fn compile(model: TinyCausalTransformer) -> Result<CompiledModuleAdamWPlan<TinyC
         .map_err(|error| error.into_parts().1)
 }
 
-fn batch(replay: u64) -> Result<BTreeMap<String, TensorData>> {
+struct TransformerBatch {
+    tokens: TensorData,
+    targets: TensorData,
+}
+
+impl TransformerBatch {
+    const TOKENS: &'static str = "tokens";
+    const TARGETS: &'static str = "targets";
+    const SCHEMA: [CompiledInputSpec; 2] = [
+        CompiledInputSpec::host_token(Self::TOKENS, &[BATCH, TIME]),
+        CompiledInputSpec::host_token(Self::TARGETS, &[BATCH, TIME]),
+    ];
+}
+
+impl CompiledInputBatch for TransformerBatch {
+    fn schema() -> &'static [CompiledInputSpec] {
+        &Self::SCHEMA
+    }
+
+    fn into_compiled_inputs(self) -> Result<BTreeMap<String, TensorData>> {
+        Ok(BTreeMap::from([
+            (Self::TOKENS.into(), self.tokens),
+            (Self::TARGETS.into(), self.targets),
+        ]))
+    }
+}
+
+fn batch(replay: u64) -> Result<TransformerBatch> {
     let tensor = |values: [i32; TOKEN_COUNT]| {
         TensorData::from_scalars(
             Shape::new([BATCH, TIME]),
@@ -186,32 +212,32 @@ fn batch(replay: u64) -> Result<BTreeMap<String, TensorData>> {
         2 => ([2, 0, 1, 1, 2, 0], [0, 1, 2, 2, 0, 1]),
         _ => unreachable!(),
     };
-    Ok(BTreeMap::from([
-        ("tokens".into(), tensor(tokens)?),
-        ("targets".into(), tensor(targets)?),
-    ]))
+    Ok(TransformerBatch {
+        tokens: tensor(tokens)?,
+        targets: tensor(targets)?,
+    })
 }
 
 fn evaluate(model: &TinyCausalTransformer) -> Result<TensorData> {
     let mut graph = Graph::new();
-    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let tokens = graph.input_dtype(TransformerBatch::TOKENS, [BATCH, TIME], DType::I32);
     let logits = model.forward_eval(&mut graph, tokens)?;
     let mut bindings = model.input_bindings(&graph)?;
-    bindings.insert("tokens".into(), batch(1)?.remove("tokens").unwrap());
+    bindings.insert(TransformerBatch::TOKENS.into(), batch(1)?.tokens);
     CpuBackend.execute(&graph, logits, &bindings)
 }
 
 fn evaluate_mean_sparse_loss(model: &TinyCausalTransformer) -> Result<f64> {
     let mut graph = Graph::new();
-    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
-    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let tokens = graph.input_dtype(TransformerBatch::TOKENS, [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype(TransformerBatch::TARGETS, [BATCH, TIME], DType::I32);
     let logits = model.forward_eval(&mut graph, tokens)?;
     let loss = sparse_causal_loss(&mut graph, logits, targets)?;
     let parameter_bindings = model.input_bindings(&graph)?;
     let mut total = 0.0;
     for replay in 1..=ACCUMULATION_STEPS {
         let mut bindings = parameter_bindings.clone();
-        bindings.extend(batch(replay)?);
+        bindings.extend(batch(replay)?.into_compiled_inputs()?);
         total += CpuBackend
             .execute(&graph, loss, &bindings)?
             .scalar_at(0)
@@ -252,7 +278,7 @@ where
     let empty_accumulators = uninterrupted.gradient_accumulator_snapshots()?;
 
     for replay in 1..=2 {
-        let step = uninterrupted.step(batch(replay)?, TensorData::scalar(0.05))?;
+        let step = uninterrupted.step_batch(batch(replay)?, 0.05)?;
         assert_eq!(step.optimizer_step(), 0);
         assert_eq!(step.accumulation_index(), replay);
         assert!(!step.did_update());
@@ -283,7 +309,7 @@ where
     assert_eq!(uninterrupted.checkpoint()?, after_reset);
 
     for replay in 3..=INITIAL_STEPS as u64 {
-        let step = uninterrupted.step(batch(replay)?, TensorData::scalar(0.05))?;
+        let step = uninterrupted.step_batch(batch(replay)?, 0.05)?;
         assert_eq!(step.optimizer_step(), 0);
         assert_eq!(step.accumulation_index(), replay - 2);
         assert!(!step.did_update());
@@ -312,8 +338,8 @@ where
     assert_eq!(resumed.checkpoint()?, checkpoint);
 
     for replay in (INITIAL_STEPS as u64 + 1)..=(INITIAL_STEPS + RESUMED_STEPS) as u64 {
-        let expected = uninterrupted.step(batch(replay)?, TensorData::scalar(0.05))?;
-        let actual = resumed.step(batch(replay)?, TensorData::scalar(0.05))?;
+        let expected = uninterrupted.step_batch(batch(replay)?, 0.05)?;
+        let actual = resumed.step_batch(batch(replay)?, 0.05)?;
         assert_eq!(actual.loss(), expected.loss());
         assert_eq!(actual.outputs(), expected.outputs());
         assert_eq!(actual.step(), expected.step());
@@ -358,7 +384,7 @@ where
     let before_evaluation_checkpoint = resumed.checkpoint()?;
     let mut final_mean_sparse_loss = 0.0;
     for replay in 1..=ACCUMULATION_STEPS {
-        let evaluated = resumed.evaluate(batch(replay)?)?;
+        let evaluated = resumed.evaluate_batch(batch(replay)?)?;
         assert_eq!(evaluated.capture_identity(), evaluation_identity);
         assert_eq!(
             evaluated.output("logits").unwrap().shape(),
