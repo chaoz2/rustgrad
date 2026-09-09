@@ -1007,6 +1007,11 @@ execution contract implemented by CPU momentum-SGD, CPU AdamW, and Metal AdamW:
 one generic loop observes loss, named outputs, capture identity, replay progress,
 and parameter snapshots or explicitly publishes those snapshots into an exact
 live-module schema without selecting an optimizer or backend enum.
+`CompiledInputBatch` lets a workload declare its fixed external schema and
+binding conversion together; `with_input_batch` registers that schema once,
+`step_batch` supplies the learning rate as an F32 scalar, and `evaluate_batch`
+reuses the same domain batch. Recurrent state remains inaccessible to the
+conversion and the original exact-map methods stay intact.
 `CompiledCheckpointRuntime` is the separate persistence capability;
 `CompiledAdamWRuntime` and `CompiledAdamWStep` extend those smaller contracts
 with accumulation, clipping, loss-scaling, moment, and optimizer-step

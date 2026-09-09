@@ -718,6 +718,24 @@ impl CompiledAdamWConfig {
         Ok(self)
     }
 
+    /// Declares the complete fixed external schema of a typed workload batch.
+    pub fn with_input_batch<B>(mut self) -> Result<Self>
+    where
+        B: CompiledInputBatch,
+    {
+        for spec in B::schema() {
+            self = match spec.policy {
+                CompiledInputPolicy::External => {
+                    self.with_input(spec.name, spec.shape.to_vec(), spec.dtype)?
+                }
+                CompiledInputPolicy::HostToken => {
+                    self.with_host_token_input(spec.name, spec.shape.to_vec())?
+                }
+            };
+        }
+        Ok(self)
+    }
+
     pub fn beta1(&self) -> f32 {
         self.beta1
     }
@@ -781,6 +799,71 @@ pub struct CompiledEvaluationResult {
     loss: TensorData,
     outputs: BTreeMap<String, TensorData>,
     capture_identity: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompiledInputPolicy {
+    External,
+    HostToken,
+}
+
+/// One fixed external input declaration supplied by a [`CompiledInputBatch`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledInputSpec {
+    name: &'static str,
+    shape: &'static [usize],
+    dtype: DType,
+    policy: CompiledInputPolicy,
+}
+
+impl CompiledInputSpec {
+    /// Declares one ordinary fixed-shape external input.
+    pub const fn new(name: &'static str, shape: &'static [usize], dtype: DType) -> Self {
+        Self {
+            name,
+            shape,
+            dtype,
+            policy: CompiledInputPolicy::External,
+        }
+    }
+
+    /// Declares one fixed rank-two I32 token input eligible for the compiled
+    /// training capture's authenticated host-index policy.
+    pub const fn host_token(name: &'static str, shape: &'static [usize]) -> Self {
+        Self {
+            name,
+            shape,
+            dtype: DType::I32,
+            policy: CompiledInputPolicy::HostToken,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    pub const fn shape(self) -> &'static [usize] {
+        self.shape
+    }
+
+    pub const fn dtype(self) -> DType {
+        self.dtype
+    }
+}
+
+/// Converts one workload-owned batch into the exact named external inputs of a
+/// compiled training or evaluation capture.
+///
+/// The declarative schema is shared by compilation and replay. Implementing
+/// this trait once for a domain batch keeps names, shapes, dtypes, and host-token
+/// policy at the workload boundary. Recurrent parameter, optimizer, and
+/// workload state remain runtime-owned, and
+/// [`CompiledTrainingRuntime::step_batch`] supplies the learning rate through
+/// its separate typed scalar argument.
+pub trait CompiledInputBatch {
+    fn schema() -> &'static [CompiledInputSpec];
+
+    fn into_compiled_inputs(self) -> Result<BTreeMap<String, TensorData>>;
 }
 
 impl CompiledEvaluationResult {
@@ -877,6 +960,15 @@ pub trait CompiledEvaluationRuntime {
     type Evaluation: CompiledEvaluation;
 
     fn evaluate(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Evaluation>;
+
+    /// Evaluates a domain batch after converting only its external bindings.
+    fn evaluate_batch<B>(&mut self, batch: B) -> Result<Self::Evaluation>
+    where
+        Self: Sized,
+        B: CompiledInputBatch,
+    {
+        self.evaluate(batch.into_compiled_inputs()?)
+    }
 
     fn evaluation_capture_identity(&self) -> Option<u64>;
 }
@@ -1948,6 +2040,21 @@ pub trait CompiledTrainingRuntime {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<Self::Step>;
+
+    /// Replays one workload-owned batch with a rank-zero F32 learning rate.
+    ///
+    /// Batch conversion and the existing complete input validation both finish
+    /// before CPU or device execution can mutate recurrent state.
+    fn step_batch<B>(&mut self, batch: B, learning_rate: f32) -> Result<Self::Step>
+    where
+        Self: Sized,
+        B: CompiledInputBatch,
+    {
+        self.step(
+            batch.into_compiled_inputs()?,
+            TensorData::scalar(learning_rate),
+        )
+    }
 
     fn step_count(&self) -> u64;
 
@@ -6151,9 +6258,7 @@ mod tests {
     fn adamw_config() -> CompiledAdamWConfig {
         CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)
             .unwrap()
-            .with_input("x", [4, 2], DType::F32)
-            .unwrap()
-            .with_input("target", [4], DType::I64)
+            .with_input_batch::<TinyBobBatch>()
             .unwrap()
     }
 
@@ -6170,7 +6275,7 @@ mod tests {
     ) -> (TensorData, BTreeMap<String, TensorData>) {
         let identity = runtime.capture_identity();
         let before = runtime.parameter_snapshots().unwrap();
-        let step = runtime.step(batch(), lr()).unwrap();
+        let step = runtime.step_batch(TinyBobBatch(batch()), 0.05).unwrap();
         assert_eq!(step.step(), 1);
         assert_eq!(step.capture_identity(), identity);
         assert_eq!(step.output("logits"), step.outputs().get("logits"));
@@ -6178,6 +6283,46 @@ mod tests {
         assert_eq!(runtime.capture_identity(), identity);
         assert_ne!(runtime.parameter_snapshots().unwrap(), before);
         (step.loss().clone(), step.outputs().clone())
+    }
+
+    struct TinyBobBatch(BTreeMap<String, TensorData>);
+
+    impl TinyBobBatch {
+        const SCHEMA: [CompiledInputSpec; 2] = [
+            CompiledInputSpec::new("target", &[4], DType::I64),
+            CompiledInputSpec::new("x", &[4, 2], DType::F32),
+        ];
+    }
+
+    impl CompiledInputBatch for TinyBobBatch {
+        fn schema() -> &'static [CompiledInputSpec] {
+            &Self::SCHEMA
+        }
+
+        fn into_compiled_inputs(self) -> Result<BTreeMap<String, TensorData>> {
+            Ok(self.0)
+        }
+    }
+
+    struct RejectedBatch;
+
+    impl CompiledInputBatch for RejectedBatch {
+        fn schema() -> &'static [CompiledInputSpec] {
+            &[]
+        }
+
+        fn into_compiled_inputs(self) -> Result<BTreeMap<String, TensorData>> {
+            Err(training("rejected test batch"))
+        }
+    }
+
+    #[test]
+    fn compiled_input_batch_conversion_precedes_recurrent_mutation() {
+        let mut runtime = compiled_adamw();
+        let checkpoint = runtime.checkpoint().unwrap();
+        assert!(runtime.step_batch(RejectedBatch, 0.05).is_err());
+        assert_eq!(runtime.step_count(), 0);
+        assert_eq!(runtime.checkpoint().unwrap(), checkpoint);
     }
 
     #[test]

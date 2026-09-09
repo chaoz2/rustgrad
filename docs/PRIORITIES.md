@@ -171,8 +171,13 @@ first step rather than introducing a parallel training API.
 replay seam across CPU momentum-SGD, CPU AdamW, and Metal AdamW without an
 optimizer or backend enum. `CompiledCheckpointRuntime` isolates portable
 persistence, while the AdamW extension traits retain accumulation, clipping,
-loss-scaling, moment, and optimizer-step inspection. Backend-specific reports
-and scoreboards remain available on the concrete Metal types rather than being
+loss-scaling, moment, and optimizer-step inspection. Workloads may implement
+`CompiledInputBatch` once to share one fixed schema and conversion between
+`with_input_batch`, `step_batch`, and `evaluate_batch` in that same generic
+loop; this removes repeated string-map and rank-zero learning-rate tensor
+assembly without exposing recurrent state or changing the existing exact-map
+replay ABI. Backend-specific reports and
+scoreboards remain available on the concrete Metal types rather than being
 erased into a lowest-common-denominator result. Metal publication prevalidates
 and reads only the parameter fixed-state subset, including zero-read empty
 tensors; optimizer moments, accumulators, the optimizer step, and dropout
