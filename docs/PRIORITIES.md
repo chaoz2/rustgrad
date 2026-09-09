@@ -69,10 +69,13 @@ The maintained public example and protected acceptance build one tiny causal
 Transformer from deterministic random initialization through embedding, causal
 attention, LayerNorm, tied output weights, sparse causal negative log
 likelihood, one batched reverse traversal, and captured AdamW. One resource-free
-`CompiledAdamWPlan` prepares
-through `CpuSessionTarget` or an explicitly selected strict
+`CompiledAdamWPlan` prepares through interpreter `CpuSessionTarget`, strict
+native-JIT `NativeCpuSessionTarget`, or an explicitly selected strict
 `MetalSessionTarget`; the optimizer-neutral loop is shared without a backend
-enum. Seven CPU replays use deterministic distinct `[2,3]` microbatches under a
+enum. Native CPU preparation compiles the main, partial-flush, and evaluation
+programs before mutable replay and exposes typed cache/work/state evidence;
+unsupported items fail closed without interpreter fallback. Seven CPU replays
+use deterministic distinct `[2,3]` microbatches under a
 three-replay accumulation window and active finite global clipping. After two
 replays, a nonempty `zero_grad` cancellation preserves replay/dropout progress
 while discarding the partial window; two subsequent replays are checkpointed

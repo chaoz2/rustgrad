@@ -5,7 +5,7 @@ mod state_schema;
 use self::state_schema::{
     AdamWGlobalState, AdamWParameterState, INTERNAL_PREFIX, RecurrentStateKey, StateSpec,
 };
-use super::target::{CpuSessionTarget, MetalSessionTarget, SessionTarget};
+use super::target::{CpuSessionTarget, MetalSessionTarget, NativeCpuSessionTarget, SessionTarget};
 use crate::nn::{
     Parameter, ParameterRestore, ParameterSnapshot, StateKind, TrainingDropoutProvider,
     next_version, restore_parameters,
@@ -18,15 +18,18 @@ use crate::runtime::metal::{
     MetalSessionScoreboardReport, MetalStatefulInferencePlan, RenderedMetal,
 };
 use crate::{
-    BufferState, CapturedMixedSchedule, CapturedSchedule, CapturedStatefulInference, CompareOp,
-    DType, EffectGraph, EffectRuntime, Error, Graph, InferenceStateLink, LoadReport, Metadata,
-    MixedReplayCursor, Module, NodeId, ParameterId, ReplayError, Result, Scalar, Schedule,
-    ScheduleStateBinding, ScheduleValueBinding, Shape, StateDict, TensorData, bind_schedule_states,
-    combine_mixed_schedules, load_safetensors, save_safetensors, schedule_effects, schedule_many,
+    BufferState, CapturedBackendPolicy, CapturedMixedSchedule, CapturedReplayExecutor,
+    CapturedReplayOptions, CapturedSchedule, CapturedStatefulInference, CompareOp, DType,
+    EffectGraph, EffectRuntime, Error, ExecutionPlanSummary, Graph, InferenceStateLink, LoadReport,
+    Metadata, MixedReplayCursor, Module, NativeMixedReplayTrace, NodeId, ParameterId, ReplayError,
+    Result, Scalar, Schedule, ScheduleStateBinding, ScheduleValueBinding, Shape, StateDict,
+    TensorData, bind_schedule_states, combine_mixed_schedules, load_safetensors, save_safetensors,
+    schedule_effects, schedule_many,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    time::{Duration, Instant},
 };
 
 const LEARNING_RATE_INPUT: &str = "__rustgrad_compiled_training_learning_rate";
@@ -931,6 +934,144 @@ pub struct CompiledEvaluationResult {
     capture_identity: u64,
 }
 
+/// Preparation evidence for one strict-native CPU pure program.
+///
+/// Stable identities and cache counts describe compilation only. Wall time is
+/// deliberately observational and does not participate in either identity.
+#[derive(Clone, Debug)]
+pub struct NativeCpuProgramPreparationReport {
+    capture_identity: u64,
+    native_identity: u64,
+    vectorized: bool,
+    native_item_count: usize,
+    cache_hit_count: usize,
+    cache_miss_count: usize,
+    execution_plan: ExecutionPlanSummary,
+    wall_time: Duration,
+}
+
+impl NativeCpuProgramPreparationReport {
+    pub const fn capture_identity(&self) -> u64 {
+        self.capture_identity
+    }
+
+    pub const fn native_identity(&self) -> u64 {
+        self.native_identity
+    }
+
+    pub const fn is_vectorized(&self) -> bool {
+        self.vectorized
+    }
+
+    pub const fn native_item_count(&self) -> usize {
+        self.native_item_count
+    }
+
+    pub const fn cache_hit_count(&self) -> usize {
+        self.cache_hit_count
+    }
+
+    pub const fn cache_miss_count(&self) -> usize {
+        self.cache_miss_count
+    }
+
+    /// Strict preparation never admits an interpreter fallback item.
+    pub const fn fallback_count(&self) -> usize {
+        0
+    }
+
+    pub const fn execution_plan(&self) -> &ExecutionPlanSummary {
+        &self.execution_plan
+    }
+
+    pub const fn wall_time(&self) -> Duration {
+        self.wall_time
+    }
+}
+
+/// Complete preparation evidence for a native CPU AdamW session.
+#[derive(Clone, Debug)]
+pub struct NativeCpuCompiledAdamWPreparationReport {
+    main: NativeCpuProgramPreparationReport,
+    partial_flush: Option<NativeCpuProgramPreparationReport>,
+    evaluation: Option<NativeCpuProgramPreparationReport>,
+    recurrent_state_count: usize,
+    recurrent_state_bytes: usize,
+}
+
+impl NativeCpuCompiledAdamWPreparationReport {
+    pub const fn main(&self) -> &NativeCpuProgramPreparationReport {
+        &self.main
+    }
+
+    pub const fn partial_flush(&self) -> Option<&NativeCpuProgramPreparationReport> {
+        self.partial_flush.as_ref()
+    }
+
+    pub const fn evaluation(&self) -> Option<&NativeCpuProgramPreparationReport> {
+        self.evaluation.as_ref()
+    }
+
+    pub const fn recurrent_state_count(&self) -> usize {
+        self.recurrent_state_count
+    }
+
+    pub const fn recurrent_state_bytes(&self) -> usize {
+        self.recurrent_state_bytes
+    }
+}
+
+/// Truthful per-invocation evidence for strict-native CPU replay.
+#[derive(Clone, Debug)]
+pub struct NativeCpuRunReport {
+    capture_identity: u64,
+    native_identity: u64,
+    vectorized: bool,
+    successful_invocation: u64,
+    native_item_count: usize,
+    schedule_cache_keys: Vec<u64>,
+    wall_time: Duration,
+}
+
+impl NativeCpuRunReport {
+    pub const fn capture_identity(&self) -> u64 {
+        self.capture_identity
+    }
+
+    pub const fn native_identity(&self) -> u64 {
+        self.native_identity
+    }
+
+    pub const fn is_vectorized(&self) -> bool {
+        self.vectorized
+    }
+
+    pub const fn successful_invocation(&self) -> u64 {
+        self.successful_invocation
+    }
+
+    pub const fn first_successful_invocation(&self) -> bool {
+        self.successful_invocation == 1
+    }
+
+    pub const fn native_item_count(&self) -> usize {
+        self.native_item_count
+    }
+
+    /// Strict replay never executes an interpreter fallback item.
+    pub const fn fallback_count(&self) -> usize {
+        0
+    }
+
+    pub fn schedule_cache_keys(&self) -> &[u64] {
+        &self.schedule_cache_keys
+    }
+
+    pub const fn wall_time(&self) -> Duration {
+        self.wall_time
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompiledInputPolicy {
     External,
@@ -1080,6 +1221,48 @@ impl CompiledEvaluation for MetalCompiledEvaluationResult {
 
     fn capture_identity(&self) -> u64 {
         self.capture_identity()
+    }
+}
+
+/// Read-only strict-native CPU evaluation plus its replay evidence.
+pub struct NativeCpuCompiledEvaluationResult {
+    inner: CompiledEvaluationResult,
+    report: NativeCpuRunReport,
+}
+
+impl NativeCpuCompiledEvaluationResult {
+    pub fn loss(&self) -> &TensorData {
+        self.inner.loss()
+    }
+
+    pub fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        self.inner.outputs()
+    }
+
+    pub fn output(&self, name: &str) -> Option<&TensorData> {
+        self.inner.output(name)
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+
+    pub fn report(&self) -> &NativeCpuRunReport {
+        &self.report
+    }
+}
+
+impl CompiledEvaluation for NativeCpuCompiledEvaluationResult {
+    fn loss(&self) -> &TensorData {
+        self.inner.loss()
+    }
+
+    fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        self.inner.outputs()
+    }
+
+    fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
     }
 }
 
@@ -1253,6 +1436,78 @@ impl CompiledAdamWStep for CompiledAdamWStepResult {
     }
 }
 
+/// One committed strict-native CPU AdamW step and its replay evidence.
+pub struct NativeCpuCompiledAdamWStepResult {
+    inner: CompiledAdamWStepResult,
+    report: NativeCpuRunReport,
+}
+
+impl NativeCpuCompiledAdamWStepResult {
+    pub fn loss(&self) -> &TensorData {
+        self.inner.loss()
+    }
+
+    pub fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        self.inner.outputs()
+    }
+
+    pub fn output(&self, name: &str) -> Option<&TensorData> {
+        self.inner.output(name)
+    }
+
+    pub fn step(&self) -> u64 {
+        self.inner.step()
+    }
+
+    pub fn optimizer_step(&self) -> u64 {
+        self.inner.optimizer_step()
+    }
+
+    pub fn accumulation_index(&self) -> u64 {
+        self.inner.accumulation_index()
+    }
+
+    pub fn did_update(&self) -> bool {
+        self.inner.did_update()
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+
+    pub fn report(&self) -> &NativeCpuRunReport {
+        &self.report
+    }
+}
+
+impl CompiledTrainingStep for NativeCpuCompiledAdamWStepResult {
+    fn loss(&self) -> &TensorData {
+        self.inner.loss()
+    }
+
+    fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        self.inner.outputs()
+    }
+
+    fn step(&self) -> u64 {
+        self.inner.step()
+    }
+
+    fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+}
+
+impl CompiledAdamWStep for NativeCpuCompiledAdamWStepResult {
+    fn optimizer_step(&self) -> u64 {
+        self.inner.optimizer_step()
+    }
+
+    fn accumulation_index(&self) -> u64 {
+        self.inner.accumulation_index()
+    }
+}
+
 const ADAMW_CHECKPOINT_FORMAT_V1: &str = "rustgrad-compiled-adamw-v1";
 const ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-adamw-v2";
 const ADAMW_CHECKPOINT_FORMAT_V3: &str = "rustgrad-compiled-adamw-v3";
@@ -1321,6 +1576,45 @@ impl CompiledAdamWFlush for CompiledAdamWFlushResult {
 
     fn optimizer_step(&self) -> u64 {
         CompiledAdamWFlushResult::optimizer_step(self)
+    }
+}
+
+/// One strict-native CPU partial-window flush. Empty windows execute no
+/// native program and therefore carry no run report.
+pub struct NativeCpuCompiledAdamWFlushResult {
+    inner: CompiledAdamWFlushResult,
+    report: Option<NativeCpuRunReport>,
+}
+
+impl NativeCpuCompiledAdamWFlushResult {
+    pub fn flushed_microbatches(&self) -> u64 {
+        self.inner.flushed_microbatches()
+    }
+
+    pub fn did_update(&self) -> bool {
+        self.inner.did_update()
+    }
+
+    pub fn optimizer_step(&self) -> u64 {
+        self.inner.optimizer_step()
+    }
+
+    pub fn report(&self) -> Option<&NativeCpuRunReport> {
+        self.report.as_ref()
+    }
+}
+
+impl CompiledAdamWFlush for NativeCpuCompiledAdamWFlushResult {
+    fn flushed_microbatches(&self) -> u64 {
+        self.inner.flushed_microbatches()
+    }
+
+    fn did_update(&self) -> bool {
+        self.inner.did_update()
+    }
+
+    fn optimizer_step(&self) -> u64 {
+        self.inner.optimizer_step()
     }
 }
 
@@ -2190,6 +2484,20 @@ pub struct CpuCompiledAdamW {
     evaluation: Option<CpuCompiledEvaluation>,
 }
 
+/// Strict-native CPU AdamW session prepared from the same authenticated plan
+/// as [`CpuCompiledAdamW`]. Optimizer, progress, checkpoint, accumulation,
+/// dropout, and evaluation ownership remain in the shared CPU core; only pure
+/// schedule execution is replaced with strict native JIT replay.
+pub struct NativeCpuCompiledAdamW<'a> {
+    inner: CpuCompiledAdamW,
+    executor: &'a CapturedReplayExecutor,
+    vectorized: bool,
+    preparation: NativeCpuCompiledAdamWPreparationReport,
+    successful_steps: u64,
+    successful_flushes: u64,
+    successful_evaluations: u64,
+}
+
 /// Resource-free Metal rendering of one compiled AdamW plan. Preparing it
 /// uploads the plan's parameter, moment, and optimizer-step frontier into the
 /// existing epoch-swapped Metal runtime.
@@ -2579,6 +2887,12 @@ struct CpuCompiledTrainingProgram {
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
     frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
+}
+
+struct CpuAuxiliaryReplay {
+    cursor: MixedReplayCursor,
+    next_main_cursor: MixedReplayCursor,
+    provided: BTreeMap<String, TensorData>,
 }
 
 /// Gives only terminal public aliases a concrete schedule owner before mixed
@@ -3445,11 +3759,11 @@ impl CompiledEvaluationPlan {
         })
     }
 
-    fn evaluate(
+    fn bind(
         &self,
         mut inputs: BTreeMap<String, TensorData>,
         parameters: BTreeMap<String, TensorData>,
-    ) -> Result<CompiledEvaluationResult> {
+    ) -> Result<BTreeMap<String, TensorData>> {
         validate_evaluation_inputs(&self.inputs, &inputs)?;
         if parameters.keys().ne(self.parameter_inputs.keys()) {
             return Err(training("compiled evaluation parameter inventory differs"));
@@ -3461,12 +3775,148 @@ impl CompiledEvaluationPlan {
                 .ok_or_else(|| training("compiled evaluation parameter is absent"))?;
             inputs.insert(input.clone(), value);
         }
+        Ok(inputs)
+    }
+
+    fn evaluate(
+        &self,
+        inputs: BTreeMap<String, TensorData>,
+        parameters: BTreeMap<String, TensorData>,
+    ) -> Result<CompiledEvaluationResult> {
+        let inputs = self.bind(inputs, parameters)?;
         let values = self
             .inference
             .capture()
             .replay(&inputs)
             .map_err(replay_error)?;
         evaluation_result(values, &self.output_names, self.capture_identity)
+    }
+
+    fn prepare_native(
+        &self,
+        parameters: BTreeMap<String, TensorData>,
+        executor: &CapturedReplayExecutor,
+        vectorized: bool,
+    ) -> Result<NativeCpuProgramPreparationReport> {
+        let started = Instant::now();
+        let inputs = self.bind(zero_inputs(&self.inputs)?, parameters)?;
+        let capture = self.inference.capture();
+        let plan = executor
+            .plan_native_items(capture, &inputs, vectorized)
+            .map_err(replay_error)?;
+        let execution_plan = ExecutionPlanSummary::from_capture(capture, true)
+            .map_err(|error| training(format!("compiled native CPU summary: {error}")))?;
+        Ok(NativeCpuProgramPreparationReport {
+            capture_identity: self.capture_identity,
+            native_identity: native_cpu_identity(
+                self.capture_identity,
+                vectorized,
+                capture.items.iter().map(|item| item.cache_key),
+            ),
+            vectorized,
+            native_item_count: plan.item_count(),
+            cache_hit_count: plan.cache_hit_count(),
+            cache_miss_count: plan.cache_miss_count(),
+            execution_plan,
+            wall_time: started.elapsed(),
+        })
+    }
+
+    fn evaluate_native(
+        &self,
+        inputs: BTreeMap<String, TensorData>,
+        parameters: BTreeMap<String, TensorData>,
+        executor: &CapturedReplayExecutor,
+        vectorized: bool,
+    ) -> Result<(CompiledEvaluationResult, NativeCpuRunReport)> {
+        let inputs = self.bind(inputs, parameters)?;
+        let started = Instant::now();
+        let replay = executor
+            .replay(
+                self.inference.capture(),
+                &inputs,
+                CapturedReplayOptions {
+                    backend: CapturedBackendPolicy::NativeJit { vectorized },
+                },
+            )
+            .map_err(replay_error)?;
+        let schedule_cache_keys = replay
+            .trace
+            .items
+            .iter()
+            .map(|item| item.schedule_cache_key)
+            .collect::<Vec<_>>();
+        let report = NativeCpuRunReport {
+            capture_identity: self.capture_identity,
+            native_identity: native_cpu_identity(
+                self.capture_identity,
+                vectorized,
+                schedule_cache_keys.iter().copied(),
+            ),
+            vectorized,
+            successful_invocation: 0,
+            native_item_count: replay.trace.items.len(),
+            schedule_cache_keys,
+            wall_time: started.elapsed(),
+        };
+        Ok((
+            evaluation_result(replay.outputs, &self.output_names, self.capture_identity)?,
+            report,
+        ))
+    }
+}
+
+fn zero_inputs(inputs: &BTreeMap<String, (Shape, DType)>) -> Result<BTreeMap<String, TensorData>> {
+    inputs
+        .iter()
+        .map(|(name, (shape, dtype))| {
+            Ok((
+                name.clone(),
+                TensorData::zeros_with_dtype(shape.clone(), *dtype)?,
+            ))
+        })
+        .collect()
+}
+
+fn native_cpu_identity(
+    capture_identity: u64,
+    vectorized: bool,
+    cache_keys: impl IntoIterator<Item = u64>,
+) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in crate::cpu_jit::RENDERER_VERSION
+        .as_bytes()
+        .iter()
+        .chain(std::env::consts::ARCH.as_bytes())
+        .chain(std::env::consts::OS.as_bytes())
+    {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+    }
+    for value in std::iter::once(capture_identity)
+        .chain(std::iter::once(if vectorized { 1 } else { 0 }))
+        .chain(cache_keys)
+    {
+        for byte in value.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
+fn native_cpu_run_report(
+    capture_identity: u64,
+    trace: &NativeMixedReplayTrace,
+    successful_invocation: u64,
+    wall_time: Duration,
+) -> NativeCpuRunReport {
+    NativeCpuRunReport {
+        capture_identity,
+        native_identity: trace.identity,
+        vectorized: trace.vectorized,
+        successful_invocation,
+        native_item_count: trace.pure_item_cache_keys.len(),
+        schedule_cache_keys: trace.pure_item_cache_keys.clone(),
+        wall_time,
     }
 }
 
@@ -3490,6 +3940,33 @@ fn evaluation_result(
 }
 
 impl CpuCompiledTrainingProgram {
+    fn prepare_native(
+        &self,
+        executor: &CapturedReplayExecutor,
+        vectorized: bool,
+    ) -> Result<NativeCpuProgramPreparationReport> {
+        let started = Instant::now();
+        let mut provided = zero_inputs(&self.inputs)?;
+        provided.insert(
+            LEARNING_RATE_INPUT.to_owned(),
+            TensorData::zeros_with_dtype(Shape::from([]), DType::F32)?,
+        );
+        let trace = self
+            .capture
+            .prepare_recurrent_native(&self.runtime, &self.cursor, &provided, executor, vectorized)
+            .map_err(replay_error)?;
+        Ok(NativeCpuProgramPreparationReport {
+            capture_identity: self.capture_identity(),
+            native_identity: trace.replay.identity,
+            vectorized,
+            native_item_count: trace.item_count,
+            cache_hit_count: trace.cache_hit_count,
+            cache_miss_count: trace.cache_miss_count,
+            execution_plan: self.recurrent_capture.execution_plan().clone(),
+            wall_time: started.elapsed(),
+        })
+    }
+
     /// Executes one graph-free replay and atomically publishes every recurrent
     /// successor. The learning rate is an explicit rank-zero F32 input.
     fn step(
@@ -3540,6 +4017,61 @@ impl CpuCompiledTrainingProgram {
             step: self.step,
             capture_identity: self.cursor.capture_identity(),
         })
+    }
+
+    fn step_native_inner(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        executor: &CapturedReplayExecutor,
+        vectorized: bool,
+        injected_failure: Option<u64>,
+    ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
+        validate_step_inputs(&self.inputs, &inputs, &learning_rate)?;
+        let next_step = self
+            .step
+            .checked_add(1)
+            .ok_or_else(|| training("compiled training step overflow"))?;
+        let mut provided = inputs;
+        provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
+        let started = Instant::now();
+        let replay = self
+            .capture
+            .replay_recurrent_native(
+                &mut self.runtime,
+                &mut self.cursor,
+                &provided,
+                executor,
+                vectorized,
+                injected_failure,
+            )
+            .map_err(replay_error)?;
+        let native = replay
+            .native_trace
+            .as_ref()
+            .expect("strict-native recurrent replay returns a native trace");
+        let report = native_cpu_run_report(
+            self.capture_identity(),
+            native,
+            next_step,
+            started.elapsed(),
+        );
+        debug_assert_eq!(replay.outputs.len(), 1 + self.output_names.len());
+        let mut outputs = replay.outputs.into_iter();
+        let loss = outputs
+            .next()
+            .expect("compiled output cardinality was validated before publication");
+        let outputs = self.output_names.iter().cloned().zip(outputs).collect();
+        self.step = next_step;
+        Ok((
+            CompiledTrainingStepResult {
+                loss,
+                outputs,
+                step: self.step,
+                capture_identity: self.cursor.capture_identity(),
+            },
+            report,
+        ))
     }
 
     fn step_count(&self) -> u64 {
@@ -3759,14 +4291,12 @@ impl CpuCompiledTrainingProgram {
         self.restore_frontier(step, &values, &plan.state_versions)
     }
 
-    fn replay_auxiliary_transition(
-        &mut self,
+    fn prepare_auxiliary_replay(
+        &self,
         transition: &CompiledAdamWPartialFlushPlan,
         learning_rate: TensorData,
-        injected_failure: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<CpuAuxiliaryReplay> {
         validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
-
         let selected_buffers = transition
             .state_buffers
             .values()
@@ -3782,10 +4312,8 @@ impl CpuCompiledTrainingProgram {
         if selected_frontier.len() != selected_buffers.len() {
             return Err(training("compiled auxiliary state frontier is incomplete"));
         }
-        let mut auxiliary_cursor =
-            MixedReplayCursor::resume(&transition.capture, selected_frontier)
-                .map_err(replay_error)?;
-
+        let cursor = MixedReplayCursor::resume(&transition.capture, selected_frontier)
+            .map_err(replay_error)?;
         let next_frontier = self
             .cursor
             .frontier()
@@ -3800,16 +4328,29 @@ impl CpuCompiledTrainingProgram {
                 Ok(state)
             })
             .collect::<Result<Vec<_>>>()?;
-        let next_cursor =
+        let next_main_cursor =
             MixedReplayCursor::resume(&self.capture, next_frontier).map_err(replay_error)?;
 
-        let provided = BTreeMap::from([(LEARNING_RATE_INPUT.to_owned(), learning_rate)]);
+        Ok(CpuAuxiliaryReplay {
+            cursor,
+            next_main_cursor,
+            provided: BTreeMap::from([(LEARNING_RATE_INPUT.to_owned(), learning_rate)]),
+        })
+    }
+
+    fn replay_auxiliary_transition(
+        &mut self,
+        transition: &CompiledAdamWPartialFlushPlan,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<()> {
+        let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
         let replay = transition
             .capture
             .replay_recurrent(
                 &mut self.runtime,
-                &mut auxiliary_cursor,
-                &provided,
+                &mut prepared.cursor,
+                &prepared.provided,
                 injected_failure,
             )
             .map_err(replay_error)?;
@@ -3818,10 +4359,86 @@ impl CpuCompiledTrainingProgram {
         {
             let mut committed = replay.committed.clone();
             committed.sort_by_key(|state| state.buffer);
-            debug_assert_eq!(committed, auxiliary_cursor.frontier());
+            debug_assert_eq!(committed, prepared.cursor.frontier());
         }
-        self.cursor = next_cursor;
+        self.cursor = prepared.next_main_cursor;
         Ok(())
+    }
+
+    fn prepare_native_auxiliary_transition(
+        &self,
+        transition: &CompiledAdamWPartialFlushPlan,
+        executor: &CapturedReplayExecutor,
+        vectorized: bool,
+    ) -> Result<NativeCpuProgramPreparationReport> {
+        let started = Instant::now();
+        let prepared = self.prepare_auxiliary_replay(
+            transition,
+            TensorData::zeros_with_dtype(Shape::from([]), DType::F32)?,
+        )?;
+        let trace = transition
+            .capture
+            .prepare_recurrent_native(
+                &self.runtime,
+                &prepared.cursor,
+                &prepared.provided,
+                executor,
+                vectorized,
+            )
+            .map_err(replay_error)?;
+        Ok(NativeCpuProgramPreparationReport {
+            capture_identity: transition.capture_identity(),
+            native_identity: trace.replay.identity,
+            vectorized,
+            native_item_count: trace.item_count,
+            cache_hit_count: trace.cache_hit_count,
+            cache_miss_count: trace.cache_miss_count,
+            execution_plan: transition.recurrent_capture.execution_plan().clone(),
+            wall_time: started.elapsed(),
+        })
+    }
+
+    fn replay_auxiliary_transition_native(
+        &mut self,
+        transition: &CompiledAdamWPartialFlushPlan,
+        learning_rate: TensorData,
+        executor: &CapturedReplayExecutor,
+        vectorized: bool,
+        successful_invocation: u64,
+        injected_failure: Option<u64>,
+    ) -> Result<NativeCpuRunReport> {
+        let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
+        let started = Instant::now();
+        let replay = transition
+            .capture
+            .replay_recurrent_native(
+                &mut self.runtime,
+                &mut prepared.cursor,
+                &prepared.provided,
+                executor,
+                vectorized,
+                injected_failure,
+            )
+            .map_err(replay_error)?;
+        debug_assert!(replay.outputs.is_empty());
+        let native = replay
+            .native_trace
+            .as_ref()
+            .expect("strict-native recurrent replay returns a native trace");
+        let report = native_cpu_run_report(
+            transition.capture_identity(),
+            native,
+            successful_invocation,
+            started.elapsed(),
+        );
+        #[cfg(debug_assertions)]
+        {
+            let mut committed = replay.committed.clone();
+            committed.sort_by_key(|state| state.buffer);
+            debug_assert_eq!(committed, prepared.cursor.frontier());
+        }
+        self.cursor = prepared.next_main_cursor;
+        Ok(report)
     }
 
     fn snapshots(&self, buffers: &BTreeMap<String, u64>) -> Result<BTreeMap<String, TensorData>> {
@@ -4463,6 +5080,16 @@ impl CompiledAdamWPlan {
         })
     }
 
+    /// Prepares strict-native CPU replay and compiles every attached pure
+    /// program before exposing mutable session state.
+    pub fn prepare_native_cpu<'a>(
+        &self,
+        target: &NativeCpuSessionTarget<'a>,
+    ) -> Result<NativeCpuCompiledAdamW<'a>> {
+        let inner = self.prepare_cpu()?;
+        NativeCpuCompiledAdamW::prepare(inner, target.executor(), target.is_vectorized())
+    }
+
     /// Prepares this authenticated plan through a concrete session target.
     ///
     /// The target's associated session and error keep backend-specific
@@ -4778,6 +5405,14 @@ impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleAdamWSession<M, R> {
         }
         let Self { module, .. } = self;
         Ok(module)
+    }
+}
+
+impl<'a, M> CompiledModuleAdamWSession<M, NativeCpuCompiledAdamW<'a>> {
+    /// Returns strict-native CPU preparation evidence without exposing the
+    /// sealed module or mutable runtime internals.
+    pub fn native_cpu_preparation_report(&self) -> &NativeCpuCompiledAdamWPreparationReport {
+        self.runtime.preparation_report()
     }
 }
 
@@ -5205,6 +5840,212 @@ impl CpuCompiledAdamW {
     }
 }
 
+impl<'a> NativeCpuCompiledAdamW<'a> {
+    fn prepare(
+        inner: CpuCompiledAdamW,
+        executor: &'a CapturedReplayExecutor,
+        vectorized: bool,
+    ) -> Result<Self> {
+        let main = inner.inner.prepare_native(executor, vectorized)?;
+        let partial_flush = inner
+            .partial_flush
+            .as_ref()
+            .map(|transition| {
+                inner
+                    .inner
+                    .prepare_native_auxiliary_transition(transition, executor, vectorized)
+            })
+            .transpose()?;
+        let evaluation = inner
+            .evaluation
+            .as_ref()
+            .map(|evaluation| {
+                evaluation
+                    .plan
+                    .prepare_native(inner.parameter_snapshots()?, executor, vectorized)
+            })
+            .transpose()?;
+        let recurrent_state_count = inner.inner.cursor.frontier().len();
+        let recurrent_state_bytes = inner
+            .inner
+            .cursor
+            .frontier()
+            .iter()
+            .try_fold(0usize, |total, state| total.checked_add(state.bytes))
+            .ok_or_else(|| training("compiled native CPU state bytes overflow"))?;
+        Ok(Self {
+            inner,
+            executor,
+            vectorized,
+            preparation: NativeCpuCompiledAdamWPreparationReport {
+                main,
+                partial_flush,
+                evaluation,
+                recurrent_state_count,
+                recurrent_state_bytes,
+            },
+            successful_steps: 0,
+            successful_flushes: 0,
+            successful_evaluations: 0,
+        })
+    }
+
+    pub fn preparation_report(&self) -> &NativeCpuCompiledAdamWPreparationReport {
+        &self.preparation
+    }
+
+    pub fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<NativeCpuCompiledAdamWStepResult> {
+        self.step_inner(inputs, learning_rate, None)
+    }
+
+    fn step_inner(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<NativeCpuCompiledAdamWStepResult> {
+        let next = self
+            .inner
+            .progress
+            .advance_replay(self.inner.gradient_accumulation_steps)?;
+        if let Some(dropout) = self.inner.dropout {
+            expected_dropout_counter(dropout, next.replay_step)?;
+        }
+        let successful_invocation = self
+            .successful_steps
+            .checked_add(1)
+            .ok_or_else(|| training("compiled native CPU run count overflow"))?;
+        let (mut result, mut report) = self.inner.inner.step_native_inner(
+            inputs,
+            learning_rate,
+            self.executor,
+            self.vectorized,
+            injected_failure,
+        )?;
+        result.step = next.replay_step;
+        report.successful_invocation = successful_invocation;
+        self.inner.progress = next;
+        self.successful_steps = successful_invocation;
+        Ok(NativeCpuCompiledAdamWStepResult {
+            inner: adamw_step_result(result, next),
+            report,
+        })
+    }
+
+    pub fn evaluate(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<NativeCpuCompiledEvaluationResult> {
+        let successful_invocation = self
+            .successful_evaluations
+            .checked_add(1)
+            .ok_or_else(|| training("compiled native CPU evaluation count overflow"))?;
+        let evaluation = self
+            .inner
+            .evaluation
+            .as_ref()
+            .ok_or_else(|| training("compiled evaluation is not attached"))?;
+        let (inner, mut report) = evaluation.plan.evaluate_native(
+            inputs,
+            self.inner.inner.parameter_snapshots()?,
+            self.executor,
+            self.vectorized,
+        )?;
+        report.successful_invocation = successful_invocation;
+        self.successful_evaluations = successful_invocation;
+        Ok(NativeCpuCompiledEvaluationResult { inner, report })
+    }
+
+    pub fn flush_partial_window(
+        &mut self,
+        learning_rate: TensorData,
+    ) -> Result<NativeCpuCompiledAdamWFlushResult> {
+        self.flush_partial_window_impl(learning_rate, None)
+    }
+
+    fn flush_partial_window_impl(
+        &mut self,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<NativeCpuCompiledAdamWFlushResult> {
+        validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
+        let (next, result) = self
+            .inner
+            .progress
+            .flush_partial(self.inner.gradient_accumulation_steps)?;
+        if !result.did_update() {
+            return Ok(NativeCpuCompiledAdamWFlushResult {
+                inner: result,
+                report: None,
+            });
+        }
+        let successful_invocation = self
+            .successful_flushes
+            .checked_add(1)
+            .ok_or_else(|| training("compiled native CPU flush count overflow"))?;
+        let transition = self
+            .inner
+            .partial_flush
+            .as_ref()
+            .ok_or_else(|| training("compiled AdamW partial flush capture is absent"))?;
+        let report = self.inner.inner.replay_auxiliary_transition_native(
+            transition,
+            learning_rate,
+            self.executor,
+            self.vectorized,
+            successful_invocation,
+            injected_failure,
+        )?;
+        self.inner.progress = next;
+        self.successful_flushes = successful_invocation;
+        Ok(NativeCpuCompiledAdamWFlushResult {
+            inner: result,
+            report: Some(report),
+        })
+    }
+
+    #[cfg(test)]
+    fn flush_partial_window_with_injected_failure(
+        &mut self,
+        learning_rate: TensorData,
+        injected_failure: u64,
+    ) -> Result<NativeCpuCompiledAdamWFlushResult> {
+        self.flush_partial_window_impl(learning_rate, Some(injected_failure))
+    }
+
+    pub fn evaluation_capture_identity(&self) -> Option<u64> {
+        self.inner.evaluation_capture_identity()
+    }
+
+    pub fn flush_capture_identity(&self) -> Option<u64> {
+        self.inner.flush_capture_identity()
+    }
+
+    pub fn step_count(&self) -> u64 {
+        self.inner.step_count()
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+
+    pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
+        self.inner.checkpoint()
+    }
+
+    pub fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.parameter_snapshots()
+    }
+
+    pub fn zero_grad(&mut self) -> Result<CompiledAdamWZeroGradResult> {
+        self.inner.zero_grad()
+    }
+}
+
 impl CompiledTrainingRuntime for CpuCompiledAdamW {
     type Step = CompiledAdamWStepResult;
 
@@ -5307,6 +6148,108 @@ impl CompiledAdamWFlushRuntime for CpuCompiledAdamW {
 
     fn flush_capture_identity(&self) -> Option<u64> {
         CpuCompiledAdamW::flush_capture_identity(self)
+    }
+}
+
+impl CompiledTrainingRuntime for NativeCpuCompiledAdamW<'_> {
+    type Step = NativeCpuCompiledAdamWStepResult;
+
+    fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        NativeCpuCompiledAdamW::step(self, inputs, learning_rate)
+    }
+
+    fn step_count(&self) -> u64 {
+        self.inner.step_count()
+    }
+
+    fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+
+    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.parameter_snapshots()
+    }
+
+    fn publish_parameters(&self, module: &dyn Module) -> Result<LoadReport> {
+        publish_parameters_with_freeze_policy(
+            module,
+            self.inner.parameter_snapshots()?,
+            &self.inner.frozen_parameters,
+        )
+    }
+}
+
+impl CompiledEvaluationRuntime for NativeCpuCompiledAdamW<'_> {
+    type Evaluation = NativeCpuCompiledEvaluationResult;
+
+    fn evaluate(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Evaluation> {
+        NativeCpuCompiledAdamW::evaluate(self, inputs)
+    }
+
+    fn evaluation_capture_identity(&self) -> Option<u64> {
+        self.inner.evaluation_capture_identity()
+    }
+}
+
+impl CompiledCheckpointRuntime for NativeCpuCompiledAdamW<'_> {
+    type Checkpoint = CompiledAdamWCheckpoint;
+
+    fn checkpoint(&self) -> Result<Self::Checkpoint> {
+        self.inner.checkpoint()
+    }
+}
+
+impl CompiledAdamWRuntime for NativeCpuCompiledAdamW<'_> {
+    fn gradient_accumulation_steps(&self) -> u64 {
+        self.inner.gradient_accumulation_steps()
+    }
+
+    fn max_gradient_norm(&self) -> Option<f32> {
+        self.inner.max_gradient_norm()
+    }
+
+    fn loss_scale(&self) -> f32 {
+        self.inner.loss_scale()
+    }
+
+    fn optimizer_step(&self) -> Result<u64> {
+        self.inner.optimizer_step()
+    }
+
+    fn accumulation_index(&self) -> Result<u64> {
+        self.inner.accumulation_index()
+    }
+
+    fn zero_grad(&mut self) -> Result<CompiledAdamWZeroGradResult> {
+        self.inner.zero_grad()
+    }
+
+    fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.first_moment_snapshots()
+    }
+
+    fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.second_moment_snapshots()
+    }
+
+    fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.gradient_accumulator_snapshots()
+    }
+}
+
+impl CompiledAdamWFlushRuntime for NativeCpuCompiledAdamW<'_> {
+    type Flush = NativeCpuCompiledAdamWFlushResult;
+
+    fn flush_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::Flush> {
+        NativeCpuCompiledAdamW::flush_partial_window(self, learning_rate)
+    }
+
+    fn flush_capture_identity(&self) -> Option<u64> {
+        self.inner.flush_capture_identity()
     }
 }
 
@@ -5443,6 +6386,15 @@ impl<'a> SessionTarget<&'a CompiledAdamWPlan> for CpuSessionTarget {
     }
 }
 
+impl<'executor> SessionTarget<&CompiledAdamWPlan> for NativeCpuSessionTarget<'executor> {
+    type Session = NativeCpuCompiledAdamW<'executor>;
+    type Error = Error;
+
+    fn prepare(&self, plan: &CompiledAdamWPlan) -> Result<Self::Session> {
+        plan.prepare_native_cpu(self)
+    }
+}
+
 impl<'a> SessionTarget<&'a CompiledAdamWPlan> for MetalSessionTarget {
     type Session = MetalCompiledAdamW;
     type Error = Error;
@@ -5470,6 +6422,36 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for CpuSessionTarget {
             return Err(CompiledModuleAdamWPrepareError { plan, source });
         }
         let runtime = match plan.plan.prepare_cpu() {
+            Ok(runtime) => runtime,
+            Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
+        };
+        let CompiledModuleAdamWPlan {
+            module,
+            seal,
+            plan: _,
+        } = plan;
+        Ok(CompiledModuleAdamWSession {
+            module,
+            runtime,
+            seal,
+        })
+    }
+}
+
+impl<'executor, M: Module> SessionTarget<CompiledModuleAdamWPlan<M>>
+    for NativeCpuSessionTarget<'executor>
+{
+    type Session = CompiledModuleAdamWSession<M, NativeCpuCompiledAdamW<'executor>>;
+    type Error = CompiledModuleAdamWPrepareError<M, Error>;
+
+    fn prepare(
+        &self,
+        plan: CompiledModuleAdamWPlan<M>,
+    ) -> std::result::Result<Self::Session, Self::Error> {
+        if let Err(source) = plan.seal.validate_unchanged(&plan.module) {
+            return Err(CompiledModuleAdamWPrepareError { plan, source });
+        }
+        let runtime = match plan.plan.prepare_native_cpu(self) {
             Ok(runtime) => runtime,
             Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
         };
@@ -7696,6 +8678,237 @@ mod tests {
 
     fn compiled_adamw() -> CpuCompiledAdamW {
         CpuCompiledAdamW::compile(adamw_config(), initial_parameters(), build_tinybob).unwrap()
+    }
+
+    fn assert_cross_engine_tensor_close(label: &str, actual: &TensorData, expected: &TensorData) {
+        assert_eq!(actual.shape(), expected.shape(), "{label} shape");
+        assert_eq!(actual.dtype(), expected.dtype(), "{label} dtype");
+        assert_eq!(actual.dtype(), DType::F32, "{label} comparison dtype");
+        for index in 0..actual.len() {
+            let actual = actual.scalar_at(index).as_f64();
+            let expected = expected.scalar_at(index).as_f64();
+            let error = (actual - expected).abs();
+            assert!(
+                error <= 1e-5,
+                "{label}[{index}] mismatch: actual={actual}, expected={expected}, error={error}"
+            );
+        }
+    }
+
+    fn assert_cross_engine_tensor_maps_close(
+        label: &str,
+        actual: &BTreeMap<String, TensorData>,
+        expected: &BTreeMap<String, TensorData>,
+    ) {
+        assert_eq!(actual.len(), expected.len(), "{label} key count");
+        for (name, expected) in expected {
+            let actual = actual
+                .get(name)
+                .unwrap_or_else(|| panic!("{label} missing {name}"));
+            assert_cross_engine_tensor_close(&format!("{label} {name}"), actual, expected);
+        }
+    }
+
+    fn assert_native_adamw_state_close(
+        native: &NativeCpuCompiledAdamW<'_>,
+        interpreted: &CpuCompiledAdamW,
+    ) {
+        assert_cross_engine_tensor_maps_close(
+            "parameters",
+            &native.parameter_snapshots().unwrap(),
+            &interpreted.parameter_snapshots().unwrap(),
+        );
+        assert_cross_engine_tensor_maps_close(
+            "first moments",
+            &native.first_moment_snapshots().unwrap(),
+            &interpreted.first_moment_snapshots().unwrap(),
+        );
+        assert_cross_engine_tensor_maps_close(
+            "second moments",
+            &native.second_moment_snapshots().unwrap(),
+            &interpreted.second_moment_snapshots().unwrap(),
+        );
+        assert_cross_engine_tensor_maps_close(
+            "gradient accumulators",
+            &native.gradient_accumulator_snapshots().unwrap(),
+            &interpreted.gradient_accumulator_snapshots().unwrap(),
+        );
+        let native_checkpoint = native.checkpoint().unwrap();
+        let interpreted_checkpoint = interpreted.checkpoint().unwrap();
+        assert_eq!(native_checkpoint.info(), interpreted_checkpoint.info());
+    }
+
+    #[test]
+    fn native_cpu_adamw_prepares_strictly_reuses_cache_and_commits_atomically() {
+        let plan = CompiledAdamWPlan::compile(adamw_config(), initial_parameters(), build_tinybob)
+            .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+        let mut native = target.prepare(&plan).unwrap();
+        let preparation = native.preparation_report();
+        assert_eq!(
+            preparation.main().capture_identity(),
+            plan.capture_identity()
+        );
+        assert!(preparation.main().native_item_count() > 0);
+        assert_eq!(
+            preparation.main().cache_hit_count() + preparation.main().cache_miss_count(),
+            preparation.main().native_item_count()
+        );
+        assert!(preparation.main().cache_miss_count() > 0);
+        assert!(preparation.partial_flush().is_none());
+        assert!(preparation.evaluation().is_none());
+        assert!(preparation.recurrent_state_count() > 0);
+        assert!(preparation.recurrent_state_bytes() > 0);
+        let prepared_native_identity = preparation.main().native_identity();
+
+        let cached = target.prepare(&plan).unwrap();
+        assert_eq!(cached.preparation_report().main().cache_miss_count(), 0);
+        assert_eq!(
+            cached.preparation_report().main().native_identity(),
+            prepared_native_identity
+        );
+
+        let mut interpreted = plan.prepare_cpu().unwrap();
+        let expected = interpreted.step(batch(), lr()).unwrap();
+        let actual = native.step(batch(), lr()).unwrap();
+        assert_cross_engine_tensor_close("first loss", actual.loss(), expected.loss());
+        assert_cross_engine_tensor_maps_close(
+            "first outputs",
+            actual.outputs(),
+            expected.outputs(),
+        );
+        assert_eq!(actual.step(), expected.step());
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+        assert_eq!(actual.report().successful_invocation(), 1);
+        assert!(actual.report().first_successful_invocation());
+        assert_eq!(actual.report().native_identity(), prepared_native_identity);
+        assert_native_adamw_state_close(&native, &interpreted);
+
+        let before_failure = native.checkpoint().unwrap();
+        assert!(native.step_inner(batch(), lr(), Some(0)).is_err());
+        assert_eq!(native.checkpoint().unwrap(), before_failure);
+        let expected = interpreted.step(batch(), lr()).unwrap();
+        let actual = native.step(batch(), lr()).unwrap();
+        assert_cross_engine_tensor_close("retry loss", actual.loss(), expected.loss());
+        assert_cross_engine_tensor_maps_close(
+            "retry outputs",
+            actual.outputs(),
+            expected.outputs(),
+        );
+        assert_eq!(actual.report().successful_invocation(), 2);
+        assert_native_adamw_state_close(&native, &interpreted);
+    }
+
+    #[test]
+    fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
+        let plan = CompiledAdamWPlan::compile(
+            accumulated_adamw_config(3),
+            initial_parameters(),
+            build_tinybob,
+        )
+        .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut native = target.prepare(&plan).unwrap();
+        let mut interpreted = plan.prepare_cpu().unwrap();
+        assert!(native.preparation_report().partial_flush().is_some());
+
+        let actual = native.step(batch(), lr()).unwrap();
+        let expected = interpreted.step(batch(), lr()).unwrap();
+        assert_cross_engine_tensor_close("cancelled-window loss", actual.loss(), expected.loss());
+        assert_cross_engine_tensor_maps_close(
+            "cancelled-window outputs",
+            actual.outputs(),
+            expected.outputs(),
+        );
+        assert_eq!(
+            native.zero_grad().unwrap(),
+            interpreted.zero_grad().unwrap()
+        );
+        assert_native_adamw_state_close(&native, &interpreted);
+
+        let actual = native.step(batch(), lr()).unwrap();
+        let expected = interpreted.step(batch(), lr()).unwrap();
+        assert_cross_engine_tensor_close("partial-window loss", actual.loss(), expected.loss());
+        assert_cross_engine_tensor_maps_close(
+            "partial-window outputs",
+            actual.outputs(),
+            expected.outputs(),
+        );
+        let before_failed_flush = native.checkpoint().unwrap();
+        assert_eq!(native.successful_flushes, 0);
+        assert!(
+            native
+                .flush_partial_window_with_injected_failure(lr(), 0)
+                .is_err()
+        );
+        assert_eq!(native.checkpoint().unwrap(), before_failed_flush);
+        assert_eq!(native.successful_flushes, 0);
+        let actual = native.flush_partial_window(lr()).unwrap();
+        let expected = interpreted.flush_partial_window(lr()).unwrap();
+        assert_eq!(
+            actual.flushed_microbatches(),
+            expected.flushed_microbatches()
+        );
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.report().unwrap().successful_invocation(), 1);
+        assert_native_adamw_state_close(&native, &interpreted);
+
+        let empty = native.flush_partial_window(lr()).unwrap();
+        assert!(!empty.did_update());
+        assert!(empty.report().is_none());
+    }
+
+    #[test]
+    fn native_cpu_adamw_evaluation_input_failure_is_atomic_and_retryable() {
+        let plan = CompiledModuleAdamWPlan::compile(
+            module_config(),
+            TiedFrozenModule::new([0.1, -0.2]),
+            build_tied_frozen,
+        )
+        .unwrap()
+        .with_evaluation(build_tied_frozen)
+        .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut session = target.prepare(plan).unwrap();
+        let checkpoint = session.checkpoint().unwrap();
+
+        assert!(session.evaluate(BTreeMap::new()).is_err());
+        assert_eq!(session.checkpoint().unwrap(), checkpoint);
+        assert_eq!(session.runtime.successful_evaluations, 0);
+
+        let evaluation = session
+            .evaluate(BTreeMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![1.0, 2.0]).unwrap(),
+            )]))
+            .unwrap();
+        assert_eq!(evaluation.report().successful_invocation(), 1);
+        assert!(evaluation.report().first_successful_invocation());
+        assert_eq!(session.checkpoint().unwrap(), checkpoint);
+    }
+
+    #[test]
+    fn native_cpu_adamw_rejects_unsupported_pure_items_during_preparation() {
+        let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_input("x", [4], DType::F32)
+            .unwrap();
+        let parameter = TrainingParameterInit::new("weight", TensorData::scalar(2.0)).unwrap();
+        let plan = CompiledAdamWPlan::compile(config, [parameter], |graph, inputs, parameters| {
+            let loss = graph.square(parameters["weight"])?;
+            let unsupported = graph.binary(crate::BinaryOp::Atan2, inputs["x"], inputs["x"])?;
+            Ok((loss, BTreeMap::from([("unsupported".into(), unsupported)])))
+        })
+        .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        assert!(target.prepare(&plan).is_err());
+        assert_eq!(executor.compile_cache_len(false), 0);
+        assert_eq!(plan.step_count(), 0);
     }
 
     fn run_core_training_step<R: CompiledTrainingRuntime>(

@@ -26,7 +26,7 @@ pub(crate) mod symbolic_runtime;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v33";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v34";
 const MOVEMENT_RENDERER_VERSION: &str = "rustgrad-c11-movement-v2";
 const STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-c11-static-position-v1";
 const THREEFRY_RENDERER_VERSION: &str = "rustgrad-c11-live-threefry-v1";
@@ -3439,6 +3439,9 @@ pub(crate) fn emit_with_substitution(
                     float8_encode_expr(ty, &value).expect("guarded Float8 binary output dtype")
                 );
             }
+            if *op == crate::BinaryOp::Pow && ty == DType::F32 {
+                return Ok(format!("pow((double)({a}),(double)({b}))"));
+            }
             let x = match op {
                 crate::BinaryOp::Add => "+",
                 crate::BinaryOp::Sub => "-",
@@ -4372,7 +4375,7 @@ mod tests {
 
     #[test]
     fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v33");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v34");
 
         let execute = |graph: &Graph,
                        output,
@@ -4540,7 +4543,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v33");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v34");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -6865,6 +6868,62 @@ mod tests {
             ),
             Err(JitError::Symbolic(_))
         ));
+    }
+
+    #[test]
+    fn native_f32_pow_matches_cpu_with_strict_vector_fallback() {
+        let mut graph = Graph::new();
+        let base = graph.input_dtype("base", Shape::from([5]), DType::F32);
+        let exponent = graph.input_dtype("exponent", Shape::from([5]), DType::F32);
+        let output = graph.pow(base, exponent).unwrap();
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        let scalar_rendered = CpuJit::render(&uop).unwrap();
+        let vector_rendered = CpuJit::render_vectorized(&uop).unwrap();
+        assert!(scalar_rendered.source.contains("pow((double)"));
+        assert!(!vector_rendered.source.contains("B2 VectorProgram"));
+        assert!(vector_rendered.source.contains("vector lanes=4"));
+        assert!(vector_rendered.source.contains("pow((double)"));
+
+        let base_values = TensorData::new([5], vec![0.5, 2.0, 4.0, 1.0, 0.25]).unwrap();
+        let exponent_values = TensorData::new([5], vec![2.0, 3.0, 0.5, 7.0, -1.0]).unwrap();
+        let scalar = CpuJit::compile(&uop).unwrap();
+        let vector = CpuJit::compile_vectorized(&uop).unwrap();
+        let mut scalar_buffers = [
+            JitBuffer::from_tensor(&base_values, false),
+            JitBuffer::from_tensor(&exponent_values, false),
+            JitBuffer::zeroed(DType::F32, 5, true),
+        ];
+        let mut vector_buffers = [
+            JitBuffer::from_tensor(&base_values, false),
+            JitBuffer::from_tensor(&exponent_values, false),
+            JitBuffer::zeroed(DType::F32, 5, true),
+        ];
+        scalar.call(&mut scalar_buffers, &[]).unwrap();
+        vector.call(&mut vector_buffers, &[]).unwrap();
+        let scalar_output = scalar_buffers
+            .into_iter()
+            .nth(2)
+            .unwrap()
+            .into_tensor(Shape::from([5]))
+            .unwrap();
+        let vector_output = vector_buffers
+            .into_iter()
+            .nth(2)
+            .unwrap()
+            .into_tensor(Shape::from([5]))
+            .unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([
+                    ("base".into(), base_values),
+                    ("exponent".into(), exponent_values),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(scalar_output.storage(), expected.storage());
+        assert_eq!(vector_output.storage(), expected.storage());
     }
 
     #[test]

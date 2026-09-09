@@ -1,5 +1,6 @@
 //! Typed runtime selection for resource-free session plans.
 
+use crate::CapturedReplayExecutor;
 use crate::runtime::metal::{
     MetalDevice, MetalError, MetalPlanOptions, MetalRenderer, MetalScoreboardContext,
 };
@@ -34,6 +35,59 @@ impl CpuSessionTarget {
         Self: SessionTarget<P>,
     {
         <Self as SessionTarget<P>>::prepare(self, plan)
+    }
+}
+
+/// Strict native-JIT CPU target for compiled training plans.
+///
+/// Preparation compiles every pure main, flush, and evaluation schedule before
+/// returning a mutable session. Replay uses the supplied executor with
+/// [`crate::JitFallback::Error`]'s strict admission contract; it never falls
+/// back to the captured interpreter.
+#[derive(Clone, Copy)]
+pub struct NativeCpuSessionTarget<'a> {
+    executor: &'a CapturedReplayExecutor,
+    vectorized: bool,
+}
+
+impl<'a> NativeCpuSessionTarget<'a> {
+    pub const fn new(executor: &'a CapturedReplayExecutor) -> Self {
+        Self {
+            executor,
+            vectorized: false,
+        }
+    }
+
+    pub const fn vectorized(mut self, vectorized: bool) -> Self {
+        self.vectorized = vectorized;
+        self
+    }
+
+    pub const fn executor(&self) -> &'a CapturedReplayExecutor {
+        self.executor
+    }
+
+    pub const fn is_vectorized(&self) -> bool {
+        self.vectorized
+    }
+
+    pub fn prepare<P>(
+        &self,
+        plan: P,
+    ) -> std::result::Result<<Self as SessionTarget<P>>::Session, <Self as SessionTarget<P>>::Error>
+    where
+        Self: SessionTarget<P>,
+    {
+        <Self as SessionTarget<P>>::prepare(self, plan)
+    }
+}
+
+impl std::fmt::Debug for NativeCpuSessionTarget<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeCpuSessionTarget")
+            .field("vectorized", &self.vectorized)
+            .finish_non_exhaustive()
     }
 }
 

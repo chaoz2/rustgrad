@@ -6,6 +6,12 @@
 //! cargo run --example compiled_transformer_train_resume -- cpu
 //! ```
 //!
+//! Run the identical capture through strict native CPU JIT replay:
+//!
+//! ```text
+//! cargo run --release --example compiled_transformer_train_resume -- native-cpu
+//! ```
+//!
 //! Run the identical capture on the first visible Metal device, with no CPU fallback:
 //!
 //! ```text
@@ -15,13 +21,13 @@
 use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
-    Backend, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWFlush,
-    CompiledAdamWFlushRuntime, CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
-    CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan, CompiledModuleAdamWSession,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
-    MetalSessionTarget, Module, NodeId, Parameter, Result, Scalar, Shape, TensorData,
-    TrainingDropoutProvider, TransformerBlock,
+    Backend, CapturedReplayExecutor, CompiledAdamWCheckpoint, CompiledAdamWConfig,
+    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWRuntime, CompiledAdamWStep,
+    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
+    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan,
+    CompiledModuleAdamWSession, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
+    CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NativeCpuSessionTarget, NodeId,
+    Parameter, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
 };
 use std::{collections::BTreeMap, env, error::Error};
 
@@ -481,6 +487,13 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
                 plan.prepare(&target).map_err(|error| error.into_parts().1)
             })?;
         }
+        "native-cpu" => {
+            let executor = CapturedReplayExecutor::default();
+            let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+            run_exact_resume("native CPU", |plan| {
+                plan.prepare(&target).map_err(|error| error.into_parts().1)
+            })?;
+        }
         "metal" => {
             let device = MetalRuntime::load()?.device(0)?;
             let target = MetalSessionTarget::new(device, 64)?;
@@ -494,7 +507,10 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
             })?;
         }
         other => {
-            return Err(format!("unknown target {other:?}; expected `cpu` or `metal`").into());
+            return Err(format!(
+                "unknown target {other:?}; expected `cpu`, `native-cpu`, or `metal`"
+            )
+            .into());
         }
     }
     Ok(())

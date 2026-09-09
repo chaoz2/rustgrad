@@ -7,13 +7,14 @@ use rustgrad::runtime::metal::{
     MetalDeviceRunReport, MetalDiscovery, MetalRuntime, MetalScoreboardContext,
 };
 use rustgrad::{
-    Backend, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWFlushRuntime,
-    CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
-    CompiledModuleAdamWPlan, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
-    CpuSessionTarget, DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module, NodeId, Op,
-    Parameter, Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider,
-    TransformerBlock, cross_entropy, load_safetensors,
+    Backend, CapturedReplayExecutor, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig,
+    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWPlan, CompiledAdamWRuntime,
+    CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
+    CompiledEvaluation, CompiledEvaluationRuntime, CompiledModuleAdamWPlan,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
+    LossOptions, MetalCompiledAdamWPlan, Module, NativeCpuSessionTarget, NodeId, Op, Parameter,
+    Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
+    cross_entropy, load_safetensors,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(target_os = "macos")]
@@ -1244,9 +1245,9 @@ fn owned_compiled_transformer(
         .unwrap()
 }
 
-fn run_exact_resume<R, P>(mut prepare: P) -> ExactResumeEvaluation
+fn run_exact_resume<R, P>(evaluation_tolerance: f64, mut prepare: P) -> ExactResumeEvaluation
 where
-    R: CompiledAdamWRuntime + CompiledEvaluationRuntime,
+    R: CompiledAdamWRuntime + CompiledAdamWFlushRuntime + CompiledEvaluationRuntime,
     P: FnMut(
         CompiledModuleAdamWPlan<TinyCausalTransformer>,
     ) -> Result<rustgrad::CompiledModuleAdamWSession<TinyCausalTransformer, R>>,
@@ -1365,7 +1366,7 @@ where
     assert_eq!(resumed.accumulation_index().unwrap(), 2);
     assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
 
-    for replay in (checkpoint_info.replay_step() + 1)..=8 {
+    for replay in (checkpoint_info.replay_step() + 1)..=7 {
         let expected = uninterrupted.step(batch(replay), learning_rate()).unwrap();
         let actual = resumed.step(batch(replay), learning_rate()).unwrap();
         assert_eq!(actual.loss(), expected.loss());
@@ -1378,14 +1379,27 @@ where
             5 => (1, 0, true),
             6 => (1, 1, false),
             7 => (1, 2, false),
-            8 => (2, 0, true),
             _ => unreachable!(),
         };
         assert_eq!(actual.optimizer_step(), optimizer_step);
         assert_eq!(actual.accumulation_index(), accumulation_index);
         assert_eq!(actual.did_update(), did_update);
     }
-    assert_eq!(resumed.step_count(), 8);
+    let expected_flush = uninterrupted.flush_partial_window(learning_rate()).unwrap();
+    let actual_flush = resumed.flush_partial_window(learning_rate()).unwrap();
+    assert_eq!(actual_flush.flushed_microbatches(), 2);
+    assert_eq!(
+        actual_flush.flushed_microbatches(),
+        expected_flush.flushed_microbatches()
+    );
+    assert_eq!(
+        actual_flush.optimizer_step(),
+        expected_flush.optimizer_step()
+    );
+    assert_eq!(actual_flush.did_update(), expected_flush.did_update());
+    assert!(actual_flush.did_update());
+
+    assert_eq!(resumed.step_count(), 7);
     assert_eq!(resumed.optimizer_step().unwrap(), 2);
     assert_eq!(resumed.accumulation_index().unwrap(), 0);
     assert_eq!(
@@ -1414,11 +1428,17 @@ where
     );
     let final_checkpoint = resumed.checkpoint().unwrap();
     let final_info = final_checkpoint.info();
-    assert_eq!(final_info.replay_step(), 8);
+    assert_eq!(final_info.replay_step(), 7);
     assert_eq!(final_info.optimizer_step(), 2);
     assert_eq!(final_info.accumulation_index(), 0);
     assert_eq!(final_info.discarded_microbatches(), 2);
-    assert_eq!(final_info.dropout_block_counter(), Some(96));
+    assert_eq!(final_info.flushed_window_count(), 1);
+    assert_eq!(final_info.flushed_microbatch_count(), 2);
+    assert_eq!(
+        final_info.flush_capture_identity(),
+        resumed.flush_capture_identity()
+    );
+    assert_eq!(final_info.dropout_block_counter(), Some(84));
     let before_evaluation = resumed.checkpoint().unwrap();
     let evaluation_identity = resumed.evaluation_capture_identity().unwrap();
     let mut final_mean_sparse_loss = 0.0;
@@ -1469,7 +1489,10 @@ where
     for (name, parameter) in resumed_model.trainable_parameters().unwrap() {
         assert_eq!(parameter.version().unwrap(), versions_before_eval[&name]);
     }
-    assert_eq!(final_mean_sparse_loss, published_mean_sparse_loss);
+    assert!(
+        (final_mean_sparse_loss - published_mean_sparse_loss).abs() <= evaluation_tolerance,
+        "compiled evaluation differs from published CPU evaluation: {final_mean_sparse_loss} vs {published_mean_sparse_loss}"
+    );
     ExactResumeEvaluation {
         initial_mean_sparse_loss,
         final_mean_sparse_loss,
@@ -1511,12 +1534,34 @@ fn assert_strict_dropout_kernels(plan: &MetalCompiledAdamWPlan) {
 #[test]
 fn compiled_transformer_plan_cpu_target_decreases_loss_and_resumes_exactly() {
     let target = CpuSessionTarget::new();
-    let evaluation =
-        run_exact_resume(|plan| plan.prepare(&target).map_err(|error| error.into_parts().1));
+    let evaluation = run_exact_resume(0.0, |plan| {
+        plan.prepare(&target).map_err(|error| error.into_parts().1)
+    });
 
     assert!(
         evaluation.final_mean_sparse_loss < evaluation.initial_mean_sparse_loss,
         "compiled causal Transformer eval loss did not decrease: {evaluation:?}"
+    );
+}
+
+#[test]
+fn compiled_transformer_native_cpu_target_is_strict_precompiled_and_resumes_exactly() {
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let evaluation = run_exact_resume(1e-5, |plan| {
+        let session = plan
+            .prepare(&target)
+            .map_err(|error| error.into_parts().1)?;
+        let preparation = session.native_cpu_preparation_report();
+        assert!(preparation.main().native_item_count() > 0);
+        assert!(preparation.partial_flush().is_some());
+        assert!(preparation.evaluation().is_some());
+        Ok(session)
+    });
+
+    assert!(
+        evaluation.final_mean_sparse_loss < evaluation.initial_mean_sparse_loss,
+        "strict-native compiled causal Transformer eval loss did not decrease: {evaluation:?}"
     );
 }
 
