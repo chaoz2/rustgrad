@@ -126,6 +126,16 @@ pub struct NativeMixedReplayTrace {
     pub pure_item_cache_keys: Vec<u64>,
 }
 
+/// Preparation-only evidence for one strict-native mixed pure prefix.
+/// No persistent state is executed or mutated while producing this value.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeMixedPreparationTrace {
+    pub(crate) replay: NativeMixedReplayTrace,
+    pub(crate) item_count: usize,
+    pub(crate) cache_hit_count: usize,
+    pub(crate) cache_miss_count: usize,
+}
+
 /// Validated, detached input binding for one mixed capture. It has no runtime
 /// lease and performs neither pure execution nor persistent mutation.
 #[allow(dead_code)]
@@ -248,6 +258,18 @@ impl<'a> PlannedBoundMixedCapture<'a> {
             .take_while(|item| !item.is_effect())
             .map(|item| item.cache_key)
             .collect()
+    }
+
+    pub(crate) fn item_count(&self) -> usize {
+        self.plan.item_count()
+    }
+
+    pub(crate) fn cache_hit_count(&self) -> usize {
+        self.plan.cache_hit_count()
+    }
+
+    pub(crate) fn cache_miss_count(&self) -> usize {
+        self.plan.cache_miss_count()
     }
     pub(crate) fn execute(
         &self,
@@ -460,6 +482,89 @@ impl CapturedMixedSchedule {
             outputs: staged.outputs,
             committed,
             native_trace: None,
+        })
+    }
+
+    /// Compiles the exact recurrent pure prefix without executing it or
+    /// publishing any persistent state. The supplied values are descriptor
+    /// witnesses only; native cache identity never depends on their bytes.
+    pub(crate) fn prepare_recurrent_native(
+        &self,
+        runtime: &crate::EffectRuntime,
+        cursor: &MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        executor: &super::captured_replay::CapturedReplayExecutor,
+        vectorized: bool,
+    ) -> Result<NativeMixedPreparationTrace, ReplayError> {
+        validate(self, true)?;
+        validate_recurrent_cursor(self, cursor)?;
+        let starts = recurrent_rebase_starts(self, cursor)?;
+        let mut candidates = BTreeMap::new();
+        for state in &cursor.frontier {
+            let value = runtime
+                .snapshot(state)
+                .map_err(|error| ReplayError::Execute(format!("recurrent preflight: {error:?}")))?
+                .tensor()
+                .clone();
+            candidates.insert(state.clone(), value);
+        }
+        let planned = BoundMixedCapture::bind(self, &candidates, starts, provided)?
+            .plan_native(executor, vectorized)?;
+        Ok(NativeMixedPreparationTrace {
+            replay: self.native_replay_trace(vectorized)?,
+            item_count: planned.item_count(),
+            cache_hit_count: planned.cache_hit_count(),
+            cache_miss_count: planned.cache_miss_count(),
+        })
+    }
+
+    /// Strict-native counterpart to [`Self::replay_recurrent`]. All pure
+    /// items are planned before any is executed, and persistent publication
+    /// remains the same single atomic effect batch and cursor transition.
+    pub(crate) fn replay_recurrent_native(
+        &self,
+        runtime: &mut crate::EffectRuntime,
+        cursor: &mut MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        executor: &super::captured_replay::CapturedReplayExecutor,
+        vectorized: bool,
+        injected_failure: Option<u64>,
+    ) -> Result<MixedReplayResult, ReplayError> {
+        validate(self, true)?;
+        validate_recurrent_cursor(self, cursor)?;
+        let native_trace = self.native_replay_trace(vectorized)?;
+
+        let starts = recurrent_rebase_starts(self, cursor)?;
+        let mut candidates = BTreeMap::new();
+        for state in &cursor.frontier {
+            let value = runtime
+                .snapshot(state)
+                .map_err(|error| ReplayError::Execute(format!("recurrent preflight: {error:?}")))?
+                .tensor()
+                .clone();
+            candidates.insert(state.clone(), value);
+        }
+
+        let staged = self.stage(
+            &mut candidates,
+            starts,
+            provided,
+            Some((executor, vectorized)),
+            true,
+        )?;
+        let batch = crate::EffectBatch::new(vec![staged.entry])
+            .map_err(|error| ReplayError::Execute(format!("recurrent stage: {error:?}")))?;
+        let next_frontier = recurrent_advanced_frontier(&cursor.frontier, &batch)?;
+        let injected_failure =
+            injected_failure.map(|step| crate::EffectBatchStep { entry: 0, step });
+        let committed = runtime
+            .execute_batch(&batch, injected_failure)
+            .map_err(|error| ReplayError::Execute(format!("recurrent commit: {error:?}")))?;
+        cursor.frontier = next_frontier;
+        Ok(MixedReplayResult {
+            outputs: staged.outputs,
+            committed,
+            native_trace: Some(native_trace),
         })
     }
 

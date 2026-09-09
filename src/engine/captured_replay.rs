@@ -784,6 +784,20 @@ pub(crate) struct PlannedNativeItems {
     vectorized: bool,
 }
 
+impl PlannedNativeItems {
+    pub(crate) fn item_count(&self) -> usize {
+        self.items.len()
+    }
+
+    pub(crate) fn cache_hit_count(&self) -> usize {
+        self.items.iter().filter(|item| item.cache_hit).count()
+    }
+
+    pub(crate) fn cache_miss_count(&self) -> usize {
+        self.items.iter().filter(|item| !item.cache_hit).count()
+    }
+}
+
 impl CapturedReplayExecutor {
     pub(crate) fn plan_native_items(
         &self,
@@ -2827,9 +2841,9 @@ mod tests {
         let mut graph = Graph::new();
         let x = graph.input_dtype("x", Shape::from([2]), DType::F32);
         let y = graph.input_dtype("y", Shape::from([2]), DType::F32);
-        // Raw Pow remains captured-interpreter-complete but outside the native
+        // Raw Atan2 remains captured-interpreter-complete but outside the native
         // C renderer's deliberately bounded GraphBinary subset.
-        let output = graph.binary(crate::BinaryOp::Pow, x, y).unwrap();
+        let output = graph.binary(crate::BinaryOp::Atan2, x, y).unwrap();
         let capture = captured(&graph, &[output]);
         let values = BTreeMap::from([
             ("x".into(), TensorData::new([2], vec![2.0, 3.0]).unwrap()),

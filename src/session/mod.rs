@@ -27,7 +27,10 @@ pub use compiled_training::{
     CompiledTrainingRuntime, CompiledTrainingStep, CompiledTrainingStepResult, CpuCompiledAdamW,
     CpuCompiledMomentumSgd, MetalCompiledAdamW, MetalCompiledAdamWCommitResult,
     MetalCompiledAdamWFlushResult, MetalCompiledAdamWPlan, MetalCompiledAdamWStepResult,
-    MetalCompiledEvaluationResult, TrainingParameterInit,
+    MetalCompiledEvaluationResult, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWFlushResult,
+    NativeCpuCompiledAdamWPreparationReport, NativeCpuCompiledAdamWStepResult,
+    NativeCpuCompiledEvaluationResult, NativeCpuProgramPreparationReport, NativeCpuRunReport,
+    TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,
@@ -43,7 +46,7 @@ pub use inference::{
 pub(crate) use inference::{
     CapturedHostGather, CapturedHostIndexedMovement, CapturedHostIndexedMovementKind,
 };
-pub use target::{CpuSessionTarget, MetalSessionTarget, SessionTarget};
+pub use target::{CpuSessionTarget, MetalSessionTarget, NativeCpuSessionTarget, SessionTarget};
 pub use train::{
     CpuBinaryModuleTrainer, CpuModeModuleTrainer, CpuModuleTrainer, ModuleBinaryCrossEntropy,
     ModuleCrossEntropy, ModuleStepResult,

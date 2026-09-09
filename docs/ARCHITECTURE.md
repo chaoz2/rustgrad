@@ -944,6 +944,17 @@ parameter values, build one private Graph with one batched reverse traversal,
 and capture the pure loss/output/update prefix together with ordered parameter
 and optimizer-state stores. AdamW keeps first and second moments plus its U64
 step counter inside that same captured recurrent frontier.
+`NativeCpuSessionTarget` is a separate strict-native AdamW preparation target,
+not a mode on the interpreter session. It precompiles the main replay and every
+attached partial-flush/evaluation pure program through the existing
+`CapturedReplayExecutor` before returning mutable state, then reuses the same
+mixed staging and single `EffectRuntime` commit with interpreter fallback
+disabled. Its typed preparation/run reports expose only CPU facts: native item
+and cache counts, static execution summaries, recurrent logical bytes, stable
+capture/native identities, and call-local wall times excluded from identity.
+Unsupported preparation and failed execution or commit publish neither state
+nor progress; checkpoint bytes and capture identity are shared with the
+interpreter and strict-Metal targets.
 Compiled Transformer residual dropout is an explicit workload extension rather
 than optimizer state. `TrainingDropoutProvider` supplies the block's two
 source-ordered residual sites, while `CompiledDropoutConfig` adds one immutable
@@ -1029,8 +1040,9 @@ strict-Metal acceptance, maintained example, and protected evidence workload.
 `CompiledAdamWPlan` is the resource-free public compiler result: it owns the
 authenticated mixed capture, admitted recurrent frontier, optimizer policy,
 and optional restored checkpoint state before a runtime is chosen. It prepares
-independent CPU replay or a strict resource-free Metal plan directly; Metal no
-longer requires constructing a CPU training session first. `CpuCompiledAdamW`
+independent interpreter CPU replay, strict-native CPU replay, or a strict
+resource-free Metal plan directly; Metal no longer requires constructing a CPU
+training session first. `CpuCompiledAdamW`
 keeps its original constructors as compatibility delegates through this plan.
 `CompiledTrainingRuntime` and `CompiledTrainingStep` are the shared public
 execution contract implemented by CPU momentum-SGD, CPU AdamW, and Metal AdamW:
