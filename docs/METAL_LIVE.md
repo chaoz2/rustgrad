@@ -19,10 +19,9 @@ Provision these external resources before dispatching
    must be online, able to discover a process-visible Metal device, and able to
    fetch the pinned actions, Rust toolchain, and crate dependencies used by the
    workflow.
-2. Configure the existing `live-metal` GitHub environment (ID `21345725438`).
-   Restrict its deployment branches to the reviewed release branch and
-   configure required reviewers. Do not allow unreviewed branches to use the
-   environment.
+2. Preserve the existing `live-metal` GitHub environment (ID `21345725438`):
+   it requires reviewer `chaoz2` with `prevent_self_review=false` and permits
+   deployments from protected branches only. Do not weaken either control.
 3. Only when dispatching with `run_gguf=true`, configure these environment
    variables:
 
@@ -54,11 +53,12 @@ The repository never downloads or uploads the GGUF. Do not place credentials,
 private model locations, or model bytes in commits or workflow inputs.
 
 The current external audit found zero compatible runners. The `live-metal`
-environment exists as ID `21345725438`, but its `protection_rules` are empty and
-its `deployment_branch_policy` is unset, so it is currently unprotected and
-unrestricted. Its environment-variable inventory is empty. Missing GGUF
-variables block only the opt-in GGUF job and do not block the default
-Linear/Transformer/ResNet job. These are external provisioning conditions, not
+environment exists as ID `21345725438` with required reviewer `chaoz2`,
+`prevent_self_review=false`, and protected-branches-only deployment. Runner
+provisioning is therefore the sole remaining blocker for the default
+Linear/Transformer/ResNet job. The environment-variable inventory is empty;
+those variables and runner-local model assets are required only for the opt-in
+GGUF job. These are authoritative external controls and provisioning facts, not
 evidence produced by the repository.
 
 ## Remote preflight
