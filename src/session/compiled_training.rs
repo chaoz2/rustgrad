@@ -1776,16 +1776,23 @@ pub struct CpuCompiledAdamW {
 /// uploads the plan's parameter, moment, and optimizer-step frontier into the
 /// existing epoch-swapped Metal runtime.
 pub struct MetalCompiledAdamWPlan {
-    inner: MetalStatefulInferencePlan,
-    inputs: BTreeMap<String, (Shape, DType)>,
-    output_names: Vec<String>,
-    state_input_keys: BTreeMap<String, RecurrentStateKey>,
-    program_identity: u64,
+    inner: MetalCompiledTrainingPlan,
     progress: AdamWProgress,
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
     dropout: Option<CompiledDropoutState>,
+}
+
+/// Optimizer-neutral strict-Metal rendering of one compiled training program.
+/// Optimizer facades retain only their policy and progress around this shared
+/// recurrent execution core.
+struct MetalCompiledTrainingPlan {
+    inner: MetalStatefulInferencePlan,
+    inputs: BTreeMap<String, (Shape, DType)>,
+    output_names: Vec<String>,
+    state_input_keys: BTreeMap<String, RecurrentStateKey>,
+    program_identity: u64,
     evaluation: Option<(MetalFixedStateReadPlan, Vec<String>, u64)>,
 }
 
@@ -1795,18 +1802,29 @@ pub struct MetalCompiledAdamWPlan {
 /// boundary on every step; requested outputs cross only when the caller uses
 /// the observed [`MetalCompiledAdamW::step`] path.
 pub struct MetalCompiledAdamW {
-    session: MetalDeviceSession,
-    inputs: BTreeMap<String, (Shape, DType)>,
-    output_names: Vec<String>,
-    state_input_keys: BTreeMap<String, RecurrentStateKey>,
-    program_identity: u64,
+    inner: MetalCompiledTrainingProgram,
     progress: AdamWProgress,
     gradient_accumulation_steps: u64,
     max_gradient_norm: Option<f32>,
     loss_scale: f32,
     dropout: Option<CompiledDropoutState>,
+}
+
+/// Optimizer-neutral owner of one prepared strict-Metal training program.
+struct MetalCompiledTrainingProgram {
+    session: MetalDeviceSession,
+    inputs: BTreeMap<String, (Shape, DType)>,
+    output_names: Vec<String>,
+    state_input_keys: BTreeMap<String, RecurrentStateKey>,
+    program_identity: u64,
     scoreboard: Option<MetalScoreboardObserver>,
     evaluation: Option<(MetalFixedStateReadSession, Vec<String>, u64)>,
+}
+
+struct MetalCompiledTrainingRun {
+    loss: TensorData,
+    outputs: BTreeMap<String, TensorData>,
+    report: MetalDeviceRunReport,
 }
 
 /// One committed Metal AdamW step plus its exact device execution report.
@@ -2359,6 +2377,67 @@ impl CompiledTrainingPlan {
             .clone()
             .with_initial_state(initial_state)
             .map_err(captured_inference_error)
+    }
+
+    fn metal_plan(
+        &self,
+        renderer: MetalRenderer,
+        host_token_inputs: &BTreeMap<String, Shape>,
+        evaluation: Option<CompiledEvaluationPlan>,
+    ) -> Result<MetalCompiledTrainingPlan> {
+        let recurrent = self.recurrent_capture()?;
+        let recurrent = recurrent
+            .with_authenticated_host_indexed_movements(host_token_inputs)
+            .map_err(captured_inference_error)?;
+        let inner = MetalStatefulInferencePlan::new(recurrent.clone(), renderer.clone()).map_err(
+            |error| {
+                let detail = if matches!(&error, MetalError::Unsupported(_)) {
+                    recurrent
+                        .capture()
+                        .items
+                        .iter()
+                        .find_map(|item| {
+                            renderer.render(&item.kernel).err().map(|item_error| {
+                                format!(
+                                    " at schedule item {} (node {}, {:?}): {item_error}",
+                                    item.id,
+                                    item.node.index(),
+                                    item.kernel.operation()
+                                )
+                            })
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                training(format!("compiled Metal runtime: {error:?}{detail}"))
+            },
+        )?;
+        let evaluation = evaluation
+            .map(|evaluation| {
+                let parameter_names = evaluation
+                    .parameter_inputs
+                    .values()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                MetalFixedStateReadPlan::new(
+                    evaluation.inference,
+                    renderer,
+                    &inner,
+                    &parameter_names,
+                )
+                .map(|plan| (plan, evaluation.output_names, evaluation.capture_identity))
+                .map_err(metal_training_error)
+            })
+            .transpose()?;
+        Ok(MetalCompiledTrainingPlan {
+            inner,
+            inputs: self.inputs.clone(),
+            output_names: self.output_names.clone(),
+            state_input_keys: self.state_input_keys.clone(),
+            program_identity: self.capture_identity()?,
+            evaluation,
+        })
     }
 
     fn restore_frontier(
@@ -3369,65 +3448,16 @@ impl CompiledAdamWPlan {
     /// Renders the compiled program for strict Metal admission without
     /// creating device resources.
     pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
-        let recurrent = self.inner.recurrent_capture()?;
-        let recurrent = recurrent
-            .with_authenticated_host_indexed_movements(&self.host_token_inputs)
-            .map_err(captured_inference_error)?;
-        let inner = MetalStatefulInferencePlan::new(recurrent.clone(), renderer.clone()).map_err(
-            |error| {
-                let detail = if matches!(&error, MetalError::Unsupported(_)) {
-                    recurrent
-                        .capture()
-                        .items
-                        .iter()
-                        .find_map(|item| {
-                            renderer.render(&item.kernel).err().map(|item_error| {
-                                format!(
-                                    " at schedule item {} (node {}, {:?}): {item_error}",
-                                    item.id,
-                                    item.node.index(),
-                                    item.kernel.operation()
-                                )
-                            })
-                        })
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                training(format!("compiled Metal runtime: {error:?}{detail}"))
-            },
-        )?;
-        let evaluation = self
-            .evaluation
-            .clone()
-            .map(|evaluation| {
-                let parameter_names = evaluation
-                    .parameter_inputs
-                    .values()
-                    .cloned()
-                    .collect::<BTreeSet<_>>();
-                MetalFixedStateReadPlan::new(
-                    evaluation.inference,
-                    renderer,
-                    &inner,
-                    &parameter_names,
-                )
-                .map(|plan| (plan, evaluation.output_names, evaluation.capture_identity))
-                .map_err(metal_training_error)
-            })
-            .transpose()?;
+        let inner =
+            self.inner
+                .metal_plan(renderer, &self.host_token_inputs, self.evaluation.clone())?;
         Ok(MetalCompiledAdamWPlan {
             inner,
-            inputs: self.inner.inputs.clone(),
-            output_names: self.inner.output_names.clone(),
-            state_input_keys: self.inner.state_input_keys.clone(),
-            program_identity: self.program_identity,
             progress: self.progress,
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             max_gradient_norm: self.max_gradient_norm,
             loss_scale: self.loss_scale,
             dropout: self.dropout,
-            evaluation,
         })
     }
 
@@ -4306,11 +4336,11 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for MetalSessionTarget
 
 impl MetalCompiledAdamWPlan {
     pub fn deployment_identity(&self) -> u64 {
-        self.inner.deployment_identity()
+        self.inner.inner.deployment_identity()
     }
 
     pub fn capture_identity(&self) -> u64 {
-        self.program_identity
+        self.inner.program_identity
     }
 
     pub fn step_count(&self) -> u64 {
@@ -4338,11 +4368,11 @@ impl MetalCompiledAdamWPlan {
     }
 
     pub fn summary(&self) -> &MetalDeviceSessionSummary {
-        self.inner.summary()
+        self.inner.inner.summary()
     }
 
     pub fn rendered_items(&self) -> impl ExactSizeIterator<Item = &RenderedMetal> {
-        self.inner.rendered_items()
+        self.inner.inner.rendered_items()
     }
 
     /// Creates all native resources and uploads the captured recurrent
@@ -4358,7 +4388,7 @@ impl MetalCompiledAdamWPlan {
         device: MetalDevice,
         context: MetalScoreboardContext,
     ) -> Result<MetalCompiledAdamW> {
-        let recorder = MetalSessionScoreboard::new_epoch_state(context, &self.inner);
+        let recorder = MetalSessionScoreboard::new_epoch_state(context, &self.inner.inner);
         self.prepare_inner(device, Some(recorder))
     }
 
@@ -4367,6 +4397,24 @@ impl MetalCompiledAdamWPlan {
         device: MetalDevice,
         recorder: Option<MetalSessionScoreboard>,
     ) -> Result<MetalCompiledAdamW> {
+        let inner = self.inner.prepare(device, recorder)?;
+        Ok(MetalCompiledAdamW {
+            inner,
+            progress: self.progress,
+            gradient_accumulation_steps: self.gradient_accumulation_steps,
+            max_gradient_norm: self.max_gradient_norm,
+            loss_scale: self.loss_scale,
+            dropout: self.dropout,
+        })
+    }
+}
+
+impl MetalCompiledTrainingPlan {
+    fn prepare(
+        self,
+        device: MetalDevice,
+        recorder: Option<MetalSessionScoreboard>,
+    ) -> Result<MetalCompiledTrainingProgram> {
         let session = self
             .inner
             .prepare(device.clone())
@@ -4385,38 +4433,27 @@ impl MetalCompiledAdamWPlan {
                     .map_err(|error| training(format!("compiled Metal scoreboard: {error}")))
             })
             .transpose()?;
-        Ok(MetalCompiledAdamW {
+        Ok(MetalCompiledTrainingProgram {
             session,
             inputs: self.inputs,
             output_names: self.output_names,
             state_input_keys: self.state_input_keys,
             program_identity: self.program_identity,
-            progress: self.progress,
-            gradient_accumulation_steps: self.gradient_accumulation_steps,
-            max_gradient_norm: self.max_gradient_norm,
-            loss_scale: self.loss_scale,
-            dropout: self.dropout,
             scoreboard,
             evaluation,
         })
     }
 }
 
-impl MetalCompiledAdamW {
-    fn prepare_step(
+impl MetalCompiledTrainingProgram {
+    fn prepare_inputs(
         &self,
         mut inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
-    ) -> Result<(AdamWProgress, BTreeMap<String, TensorData>)> {
+    ) -> Result<BTreeMap<String, TensorData>> {
         validate_step_inputs(&self.inputs, &inputs, &learning_rate)?;
-        let next = self
-            .progress
-            .advance_replay(self.gradient_accumulation_steps)?;
-        if let Some(dropout) = self.dropout {
-            expected_dropout_counter(dropout, next.replay_step)?;
-        }
         inputs.insert(LEARNING_RATE_INPUT.into(), learning_rate);
-        Ok((next, inputs))
+        Ok(inputs)
     }
 
     fn observe_committed_step(&mut self, run: &MetalDeviceRun) {
@@ -4425,13 +4462,8 @@ impl MetalCompiledAdamW {
         }
     }
 
-    pub fn step(
-        &mut self,
-        inputs: BTreeMap<String, TensorData>,
-        learning_rate: TensorData,
-    ) -> Result<MetalCompiledAdamWStepResult> {
-        let (next, provided) = self.prepare_step(inputs, learning_rate)?;
-        let run = self.session.run(&provided).map_err(metal_training_error)?;
+    fn run(&mut self, provided: &BTreeMap<String, TensorData>) -> Result<MetalCompiledTrainingRun> {
+        let run = self.session.run(provided).map_err(metal_training_error)?;
         self.observe_committed_step(&run);
         let (outputs, report) = run.into_parts();
         debug_assert_eq!(outputs.len(), 1 + self.output_names.len());
@@ -4440,33 +4472,20 @@ impl MetalCompiledAdamW {
             .next()
             .expect("compiled Metal output cardinality was authenticated before preparation");
         let outputs = self.output_names.iter().cloned().zip(outputs).collect();
-        self.progress = next;
-        let inner = adamw_step_result(
-            CompiledTrainingStepResult {
-                loss,
-                outputs,
-                step: self.progress.replay_step,
-                capture_identity: self.program_identity,
-            },
-            self.progress,
-        );
-        Ok(MetalCompiledAdamWStepResult { inner, report })
+        Ok(MetalCompiledTrainingRun {
+            loss,
+            outputs,
+            report,
+        })
     }
 
-    /// Executes and commits the identical captured training program while
-    /// leaving its loss and named outputs on the device. Batch inputs and the
-    /// learning rate are still staged, the complete inactive state bank is
-    /// produced, and successful replay/optimizer progress advances normally.
-    /// Use [`Self::step`] whenever the caller needs to observe loss or outputs.
-    pub fn step_without_host_outputs(
+    fn run_without_host_outputs(
         &mut self,
-        inputs: BTreeMap<String, TensorData>,
-        learning_rate: TensorData,
-    ) -> Result<MetalCompiledAdamWCommitResult> {
-        let (next, provided) = self.prepare_step(inputs, learning_rate)?;
+        provided: &BTreeMap<String, TensorData>,
+    ) -> Result<MetalDeviceRunReport> {
         let run = self
             .session
-            .run_epoch_without_host_outputs(&provided)
+            .run_epoch_without_host_outputs(provided)
             .map_err(metal_training_error)?;
         debug_assert!(run.outputs().is_empty());
         debug_assert_eq!(run.report().output_count, 0);
@@ -4474,15 +4493,10 @@ impl MetalCompiledAdamW {
         debug_assert_eq!(run.report().retained_d2h_bytes, 0);
         self.observe_committed_step(&run);
         let (_, report) = run.into_parts();
-        self.progress = next;
-        Ok(MetalCompiledAdamWCommitResult {
-            progress: self.progress,
-            capture_identity: self.program_identity,
-            report,
-        })
+        Ok(report)
     }
 
-    pub fn evaluate(
+    fn evaluate(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<MetalCompiledEvaluationResult> {
@@ -4499,78 +4513,12 @@ impl MetalCompiledAdamW {
         Ok(MetalCompiledEvaluationResult { inner, report })
     }
 
-    pub fn evaluation_capture_identity(&self) -> Option<u64> {
+    fn evaluation_capture_identity(&self) -> Option<u64> {
         self.evaluation
             .as_ref()
             .map(|(_, _, capture_identity)| *capture_identity)
     }
 
-    /// Returns preparation evidence for both stateless evaluators sharing the
-    /// training session's physical parameter banks. Imported trainable state
-    /// contributes zero resident or initial-state uploads.
-    pub fn evaluation_preparation_reports(
-        &self,
-    ) -> Option<[&crate::runtime::metal::MetalDevicePreparationReport; 2]> {
-        self.evaluation
-            .as_ref()
-            .map(|(evaluation, _, _)| evaluation.preparation_reports())
-    }
-
-    pub fn evaluation_summaries(&self) -> Option<[&MetalDeviceSessionSummary; 2]> {
-        self.evaluation
-            .as_ref()
-            .map(|(evaluation, _, _)| evaluation.summaries())
-    }
-
-    pub fn step_count(&self) -> u64 {
-        self.progress.replay_step
-    }
-
-    pub fn gradient_accumulation_steps(&self) -> u64 {
-        self.gradient_accumulation_steps
-    }
-
-    pub fn max_gradient_norm(&self) -> Option<f32> {
-        self.max_gradient_norm
-    }
-
-    pub fn loss_scale(&self) -> f32 {
-        self.loss_scale
-    }
-
-    pub fn capture_identity(&self) -> u64 {
-        self.program_identity
-    }
-
-    pub fn metal_session(&self) -> &MetalDeviceSession {
-        &self.session
-    }
-
-    /// Returns the opt-in successful-step recorder, when preparation enabled it.
-    pub fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
-        self.scoreboard
-            .as_ref()
-            .map(MetalScoreboardObserver::recorder)
-    }
-
-    /// Returns a deterministic snapshot of all successfully observed steps.
-    pub fn execution_scoreboard_report(
-        &self,
-    ) -> std::result::Result<Option<MetalSessionScoreboardReport>, MetalScoreboardError> {
-        self.execution_scoreboard()
-            .map(MetalSessionScoreboard::report)
-            .transpose()
-    }
-
-    /// Returns the first fail-soft measurement error, if recording froze.
-    pub fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
-        self.scoreboard
-            .as_ref()
-            .and_then(MetalScoreboardObserver::first_error)
-    }
-
-    /// Downloads every currently committed recurrent value once and returns
-    /// it under the optimizer's semantic state keys.
     fn state_snapshots(&self) -> Result<BTreeMap<RecurrentStateKey, TensorData>> {
         let snapshots = self
             .session
@@ -4594,7 +4542,7 @@ impl MetalCompiledAdamW {
             .collect()
     }
 
-    pub fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         let state_inputs = self
             .session
             .state_inputs()
@@ -4647,6 +4595,156 @@ impl MetalCompiledAdamW {
             })
             .collect()
     }
+}
+
+impl MetalCompiledAdamW {
+    fn prepare_step(
+        &self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<(AdamWProgress, BTreeMap<String, TensorData>)> {
+        let inputs = self.inner.prepare_inputs(inputs, learning_rate)?;
+        let next = self
+            .progress
+            .advance_replay(self.gradient_accumulation_steps)?;
+        if let Some(dropout) = self.dropout {
+            expected_dropout_counter(dropout, next.replay_step)?;
+        }
+        Ok((next, inputs))
+    }
+
+    pub fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<MetalCompiledAdamWStepResult> {
+        let (next, provided) = self.prepare_step(inputs, learning_rate)?;
+        let MetalCompiledTrainingRun {
+            loss,
+            outputs,
+            report,
+        } = self.inner.run(&provided)?;
+        self.progress = next;
+        let inner = adamw_step_result(
+            CompiledTrainingStepResult {
+                loss,
+                outputs,
+                step: self.progress.replay_step,
+                capture_identity: self.inner.program_identity,
+            },
+            self.progress,
+        );
+        Ok(MetalCompiledAdamWStepResult { inner, report })
+    }
+
+    /// Executes and commits the identical captured training program while
+    /// leaving its loss and named outputs on the device. Batch inputs and the
+    /// learning rate are still staged, the complete inactive state bank is
+    /// produced, and successful replay/optimizer progress advances normally.
+    /// Use [`Self::step`] whenever the caller needs to observe loss or outputs.
+    pub fn step_without_host_outputs(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<MetalCompiledAdamWCommitResult> {
+        let (next, provided) = self.prepare_step(inputs, learning_rate)?;
+        let report = self.inner.run_without_host_outputs(&provided)?;
+        self.progress = next;
+        Ok(MetalCompiledAdamWCommitResult {
+            progress: self.progress,
+            capture_identity: self.inner.program_identity,
+            report,
+        })
+    }
+
+    pub fn evaluate(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<MetalCompiledEvaluationResult> {
+        self.inner.evaluate(inputs)
+    }
+
+    pub fn evaluation_capture_identity(&self) -> Option<u64> {
+        self.inner.evaluation_capture_identity()
+    }
+
+    /// Returns preparation evidence for both stateless evaluators sharing the
+    /// training session's physical parameter banks. Imported trainable state
+    /// contributes zero resident or initial-state uploads.
+    pub fn evaluation_preparation_reports(
+        &self,
+    ) -> Option<[&crate::runtime::metal::MetalDevicePreparationReport; 2]> {
+        self.inner
+            .evaluation
+            .as_ref()
+            .map(|(evaluation, _, _)| evaluation.preparation_reports())
+    }
+
+    pub fn evaluation_summaries(&self) -> Option<[&MetalDeviceSessionSummary; 2]> {
+        self.inner
+            .evaluation
+            .as_ref()
+            .map(|(evaluation, _, _)| evaluation.summaries())
+    }
+
+    pub fn step_count(&self) -> u64 {
+        self.progress.replay_step
+    }
+
+    pub fn gradient_accumulation_steps(&self) -> u64 {
+        self.gradient_accumulation_steps
+    }
+
+    pub fn max_gradient_norm(&self) -> Option<f32> {
+        self.max_gradient_norm
+    }
+
+    pub fn loss_scale(&self) -> f32 {
+        self.loss_scale
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.inner.program_identity
+    }
+
+    pub fn metal_session(&self) -> &MetalDeviceSession {
+        &self.inner.session
+    }
+
+    /// Returns the opt-in successful-step recorder, when preparation enabled it.
+    pub fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
+        self.inner
+            .scoreboard
+            .as_ref()
+            .map(MetalScoreboardObserver::recorder)
+    }
+
+    /// Returns a deterministic snapshot of all successfully observed steps.
+    pub fn execution_scoreboard_report(
+        &self,
+    ) -> std::result::Result<Option<MetalSessionScoreboardReport>, MetalScoreboardError> {
+        self.execution_scoreboard()
+            .map(MetalSessionScoreboard::report)
+            .transpose()
+    }
+
+    /// Returns the first fail-soft measurement error, if recording froze.
+    pub fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
+        self.inner
+            .scoreboard
+            .as_ref()
+            .and_then(MetalScoreboardObserver::first_error)
+    }
+
+    /// Downloads every currently committed recurrent value once and returns
+    /// it under the optimizer's semantic state keys.
+    fn state_snapshots(&self) -> Result<BTreeMap<RecurrentStateKey, TensorData>> {
+        self.inner.state_snapshots()
+    }
+
+    pub fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.inner.parameter_snapshots()
+    }
 
     pub fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         metal_adamw_state_snapshots(self.state_snapshots()?, AdamWParameterState::FirstMoment)
@@ -4693,13 +4791,14 @@ impl MetalCompiledAdamW {
             return Ok(result);
         }
         let state_inputs = self
+            .inner
             .session
             .state_inputs()
             .iter()
             .map(|input| (input.name.as_str(), &input.desc))
             .collect::<BTreeMap<_, _>>();
         let mut replacements = BTreeMap::new();
-        for (input, key) in &self.state_input_keys {
+        for (input, key) in &self.inner.state_input_keys {
             if key.is_accumulation_reset_state() {
                 let desc = state_inputs
                     .get(input.as_str())
@@ -4711,6 +4810,7 @@ impl MetalCompiledAdamW {
             }
         }
         let expected = self
+            .inner
             .state_input_keys
             .values()
             .filter(|key| key.is_accumulation_reset_state())
@@ -4722,7 +4822,8 @@ impl MetalCompiledAdamW {
         {
             return Err(training("compiled Metal reset state inventory mismatch"));
         }
-        self.session
+        self.inner
+            .session
             .replace_fixed_state(replacements)
             .map_err(metal_training_error)?;
         self.progress = next;
@@ -4780,7 +4881,7 @@ impl MetalCompiledAdamW {
             metal_adamw_state_snapshots(states, AdamWParameterState::GradientAccumulator)?;
         CompiledAdamWCheckpoint::from_bytes(encode_adamw_checkpoint(
             AdamWCheckpointProgress {
-                capture_identity: self.program_identity,
+                capture_identity: self.inner.program_identity,
                 replay_step: self.progress.replay_step,
                 optimizer_step: self.progress.optimizer_step,
                 accumulation_steps: self.gradient_accumulation_steps,
@@ -6097,6 +6198,46 @@ mod tests {
                 .unwrap()
                 .capture_identity,
             adamw.capture_identity()
+        );
+    }
+
+    #[test]
+    fn optimizer_neutral_plan_renders_momentum_through_shared_metal_core() {
+        let plan = CompiledTrainingPlan::compile(
+            MomentumProgram {
+                config: CompiledMomentumSgdConfig::new(0.9).unwrap(),
+            },
+            [TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap()],
+            |graph, _, parameters| Ok((graph.square(parameters["weight"])?, BTreeMap::new())),
+        )
+        .unwrap();
+        let capture_identity = plan.capture_identity().unwrap();
+        let metal = plan
+            .metal_plan(
+                MetalRenderer::new(
+                    8,
+                    crate::runtime::metal::MetalCapabilities {
+                        max_buffer_length: 1 << 30,
+                        unified_memory: true,
+                        family: "Apple9".into(),
+                    },
+                )
+                .unwrap(),
+                &BTreeMap::new(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(metal.program_identity, capture_identity);
+        assert_eq!(metal.inner.summary().fallback_count, 0);
+        assert!(metal.inner.rendered_items().next().is_some());
+        assert_eq!(
+            metal
+                .state_input_keys
+                .values()
+                .filter_map(RecurrentStateKey::momentum_parameter_name)
+                .collect::<Vec<_>>(),
+            ["weight"]
         );
     }
 
