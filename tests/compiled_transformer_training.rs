@@ -176,12 +176,16 @@ fn optimizer_config(max_gradient_norm: Option<f32>) -> CompiledAdamWConfig {
     }
 }
 
-fn masked_config() -> CompiledAdamWConfig {
-    optimizer_config(Some(MAX_GRADIENT_NORM))
+fn masked_config_with_max_gradient_norm(max_gradient_norm: Option<f32>) -> CompiledAdamWConfig {
+    optimizer_config(max_gradient_norm)
         .with_input_batch::<MaskedTransformerBatch>()
         .unwrap()
         .with_token_weighted_gradient_accumulation(LOSS_MASK)
         .unwrap()
+}
+
+fn masked_config() -> CompiledAdamWConfig {
+    masked_config_with_max_gradient_norm(Some(MAX_GRADIENT_NORM))
 }
 
 fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
@@ -230,17 +234,26 @@ fn build_buffered(
     inputs: &BTreeMap<String, NodeId>,
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let (logits, outputs) =
+        forward_with_dropout_observations(&model.transformer, graph, inputs["tokens"], dropout)?;
+    let loss = masked_sparse_causal_loss(graph, logits, inputs["targets"], inputs[LOSS_MASK])?;
+    Ok((loss, outputs))
+}
+
+fn forward_with_dropout_observations(
+    model: &TinyCausalTransformer,
+    graph: &mut Graph,
+    tokens: NodeId,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
     let mut observed = ObservedResidualDropout {
         inner: dropout,
         sites: Vec::new(),
     };
-    let logits = model
-        .transformer
-        .forward(graph, inputs["tokens"], &mut observed)?;
+    let logits = model.forward(graph, tokens, &mut observed)?;
     assert_eq!(observed.sites.len(), 2);
-    let loss = masked_sparse_causal_loss(graph, logits, inputs["targets"], inputs[LOSS_MASK])?;
     Ok((
-        loss,
+        logits,
         BTreeMap::from([
             ("dropout_0_input".into(), observed.sites[0].0),
             ("dropout_0_output".into(), observed.sites[0].1),
@@ -256,22 +269,22 @@ fn build_with_dropout_observations(
     inputs: &BTreeMap<String, NodeId>,
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
-    let mut observed = ObservedResidualDropout {
-        inner: dropout,
-        sites: Vec::new(),
-    };
-    let logits = model.forward(graph, inputs["tokens"], &mut observed)?;
-    assert_eq!(observed.sites.len(), 2);
+    let (logits, outputs) =
+        forward_with_dropout_observations(model, graph, inputs["tokens"], dropout)?;
     let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
-    Ok((
-        loss,
-        BTreeMap::from([
-            ("dropout_0_input".into(), observed.sites[0].0),
-            ("dropout_0_output".into(), observed.sites[0].1),
-            ("dropout_1_input".into(), observed.sites[1].0),
-            ("dropout_1_output".into(), observed.sites[1].1),
-        ]),
-    ))
+    Ok((loss, outputs))
+}
+
+fn build_masked_with_dropout_observations(
+    model: &TinyCausalTransformer,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let (logits, outputs) =
+        forward_with_dropout_observations(model, graph, inputs["tokens"], dropout)?;
+    let loss = masked_sparse_causal_loss(graph, logits, inputs["targets"], inputs[LOSS_MASK])?;
+    Ok((loss, outputs))
 }
 
 fn build_evaluation(
@@ -1454,7 +1467,7 @@ struct TransformerGradientProbe {
     boundary: &'static str,
 }
 
-fn numerical_transformer_gradient_lanes(
+fn numerical_masked_transformer_gradient_lanes(
     model: &TinyCausalTransformer,
     inputs: BTreeMap<String, TensorData>,
     masks: [TensorData; 2],
@@ -1465,10 +1478,11 @@ fn numerical_transformer_gradient_lanes(
     let mut graph = Graph::new();
     let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
     let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
     let mut dropout = FixedResidualDropout::from_masks(masks);
     let logits = model.forward(&mut graph, tokens, &mut dropout).unwrap();
     assert_eq!(dropout.next, 2);
-    let loss = sparse_causal_loss(&mut graph, logits, targets).unwrap();
+    let loss = masked_sparse_causal_loss(&mut graph, logits, targets, loss_mask).unwrap();
     let relu_input = unique_relu_input(&graph, loss);
 
     let trainable = model.trainable_parameters().unwrap();
@@ -2304,17 +2318,20 @@ fn compiled_transformer_active_global_clip_changes_the_first_window_update() {
 }
 
 #[test]
-fn compiled_transformer_second_window_gradient_inputs_match_numerical_oracle() {
+fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() {
     const NUMERICAL_ABSOLUTE_TOLERANCE: f64 = 6e-3;
     const NUMERICAL_RELATIVE_TOLERANCE: f64 = 3e-3;
     const ADAM_INPUT_TOLERANCE: f64 = 1e-5;
     const FIRST_MOMENT_TOLERANCE: f64 = 7e-4;
     const SECOND_MOMENT_TOLERANCE: f64 = 7e-6;
+    const PARAMETER_TOLERANCE: f64 = 2e-5;
+    const TOKEN_COUNTS: [f32; 3] = [5.0, 3.0, 3.0];
+    const TOKEN_COUNT_TOTAL: f32 = 11.0;
     const PROBES: [TransformerGradientProbe; 10] = [
         TransformerGradientProbe {
             parameter: "tokens.weight",
             coordinate: 4,
-            boundary: "embedding lookup, tied output transpose, gather, and mean",
+            boundary: "embedding lookup, tied output transpose, gather, and masked normalization",
         },
         TransformerGradientProbe {
             parameter: "block.query.0",
@@ -2364,22 +2381,27 @@ fn compiled_transformer_second_window_gradient_inputs_match_numerical_oracle() {
     ];
 
     // Clipping is disabled only for this focused proof so the completed
-    // window's first moment exposes the exact averaged gradient presented to
+    // window's moments expose the exact token-weighted gradient presented to
     // AdamW. The separate clipping tests cover the intervening global policy.
-    let optimizer = config_with_max_gradient_norm(None);
+    let optimizer = masked_config_with_max_gradient_norm(None);
     let model = TinyCausalTransformer::new(7).unwrap();
     let tied_identity = model.tokens.weight.id();
     let plan = CompiledAdamWPlan::compile_module_with_dropout(
         optimizer.clone(),
         dropout_config(),
         &model,
-        build_with_dropout_observations,
+        build_masked_with_dropout_observations,
     )
     .unwrap();
     let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
 
     for replay in 1..=ACCUMULATION_STEPS {
-        let step = runtime.step(batch(replay), learning_rate()).unwrap();
+        let step = runtime
+            .step(
+                masked_batch(replay).into_compiled_inputs().unwrap(),
+                learning_rate(),
+            )
+            .unwrap();
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
     }
     assert_eq!(runtime.step_count(), ACCUMULATION_STEPS);
@@ -2394,16 +2416,20 @@ fn compiled_transformer_second_window_gradient_inputs_match_numerical_oracle() {
     let frontier_first_moments = runtime.first_moment_snapshots().unwrap();
     let frontier_second_moments = runtime.second_moment_snapshots().unwrap();
     let frontier_checkpoint = runtime.checkpoint().unwrap();
+    assert_eq!(
+        frontier_checkpoint.info().accumulated_token_count(),
+        Some(0)
+    );
     let oracle_model = TinyCausalTransformer::new(7).unwrap();
     oracle_model
         .load_trainable_parameters_exact(&frontier_parameters)
         .unwrap();
 
     // A checkpoint-identical sibling advances the same replay/dropout cursor,
-    // snapshots each raw gradient in the existing accumulator seam, and then
-    // discards it before the next replay. This captures all three microbatch
-    // gradients without reaching clipping or AdamW and without changing the
-    // sequential runtime whose completed-window recurrence is checked below.
+    // snapshots each token-weighted contribution in the existing accumulator
+    // seam, and then discards it before the next replay. This captures all
+    // three microbatches without reaching clipping or AdamW and without
+    // changing the sequential runtime checked below.
     let gradient_probe_model = TinyCausalTransformer::new(7).unwrap();
     let mut gradient_probe_runtime =
         CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
@@ -2411,28 +2437,50 @@ fn compiled_transformer_second_window_gradient_inputs_match_numerical_oracle() {
             dropout_config(),
             &gradient_probe_model,
             &frontier_checkpoint,
-            build_with_dropout_observations,
+            build_masked_with_dropout_observations,
         )
         .unwrap()
         .prepare_cpu()
         .unwrap();
     let mut masks = Vec::with_capacity(ACCUMULATION_STEPS as usize);
     let mut raw_gradients = Vec::with_capacity(ACCUMULATION_STEPS as usize);
+    let mut token_counts = Vec::with_capacity(ACCUMULATION_STEPS as usize);
     for replay in ACCUMULATION_STEPS + 1..=2 * ACCUMULATION_STEPS {
+        let inputs = masked_batch(replay).into_compiled_inputs().unwrap();
+        let token_count = inputs[LOSS_MASK].to_vec_f64().into_iter().sum::<f64>() as u64;
         let step = gradient_probe_runtime
-            .step(batch(replay), learning_rate())
+            .step(inputs, learning_rate())
             .unwrap();
         assert!(!step.did_update());
         masks.push(observed_dropout_masks(step.outputs()));
+        token_counts.push(token_count as f32);
         assert_eq!(gradient_probe_runtime.accumulation_index().unwrap(), 1);
+        assert_eq!(
+            gradient_probe_runtime
+                .checkpoint()
+                .unwrap()
+                .info()
+                .accumulated_token_count(),
+            Some(token_count)
+        );
         raw_gradients.push(
             gradient_probe_runtime
                 .gradient_accumulator_snapshots()
                 .unwrap(),
         );
         assert!(gradient_probe_runtime.zero_grad().unwrap().did_discard());
+        assert_eq!(
+            gradient_probe_runtime
+                .checkpoint()
+                .unwrap()
+                .info()
+                .accumulated_token_count(),
+            Some(0)
+        );
     }
     assert_eq!(raw_gradients.len(), ACCUMULATION_STEPS as usize);
+    assert_eq!(token_counts.as_slice(), TOKEN_COUNTS.as_slice());
+    assert_eq!(token_counts.iter().sum::<f32>(), TOKEN_COUNT_TOTAL);
     assert_eq!(gradient_probe_runtime.optimizer_step().unwrap(), 1);
     assert_eq!(gradient_probe_runtime.accumulation_index().unwrap(), 0);
     assert_eq!(
@@ -2441,9 +2489,27 @@ fn compiled_transformer_second_window_gradient_inputs_match_numerical_oracle() {
     );
 
     for (index, replay) in (ACCUMULATION_STEPS + 1..=2 * ACCUMULATION_STEPS).enumerate() {
-        let step = runtime.step(batch(replay), learning_rate()).unwrap();
+        let step = runtime
+            .step(
+                masked_batch(replay).into_compiled_inputs().unwrap(),
+                learning_rate(),
+            )
+            .unwrap();
         assert_eq!(observed_dropout_masks(step.outputs()), masks[index]);
         assert_eq!(step.did_update(), replay == 2 * ACCUMULATION_STEPS);
+        let expected_token_count = if step.did_update() {
+            0
+        } else {
+            token_counts[..=index].iter().sum::<f32>() as u64
+        };
+        assert_eq!(
+            runtime
+                .checkpoint()
+                .unwrap()
+                .info()
+                .accumulated_token_count(),
+            Some(expected_token_count)
+        );
     }
     assert_eq!(runtime.optimizer_step().unwrap(), 2);
     assert_eq!(runtime.accumulation_index().unwrap(), 0);
@@ -2453,9 +2519,11 @@ fn compiled_transformer_second_window_gradient_inputs_match_numerical_oracle() {
         .into_iter()
         .enumerate()
         .map(|(index, masks)| {
-            numerical_transformer_gradient_lanes(
+            numerical_masked_transformer_gradient_lanes(
                 &oracle_model,
-                batch(ACCUMULATION_STEPS + 1 + index as u64),
+                masked_batch(ACCUMULATION_STEPS + 1 + index as u64)
+                    .into_compiled_inputs()
+                    .unwrap(),
                 masks,
                 &PROBES,
             )
@@ -2468,51 +2536,69 @@ fn compiled_transformer_second_window_gradient_inputs_match_numerical_oracle() {
             .all(|gradient| gradient.len() == PROBES.len())
     );
 
+    let next_parameters = runtime.parameter_snapshots().unwrap();
     let next_first_moments = runtime.first_moment_snapshots().unwrap();
     let next_second_moments = runtime.second_moment_snapshots().unwrap();
     let beta1 = optimizer.beta1();
     let beta2 = optimizer.beta2();
+    let first_correction = 1.0 - beta1.powf(2.0);
+    let second_correction = 1.0 - beta2.powf(2.0);
+    let learning_rate = learning_rate().scalar_at(0).as_f64() as f32;
+    let decay_factor = 1.0 - learning_rate * optimizer.weight_decay();
+    let weight_decay_exclusions = optimizer
+        .weight_decay_exclusions()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
     for (probe_index, probe) in PROBES.iter().enumerate() {
         let numerical_lanes = [
             numerical[0][probe_index] as f32,
             numerical[1][probe_index] as f32,
             numerical[2][probe_index] as f32,
         ];
-        let actual_lanes: [f32; 3] = std::array::from_fn(|replay_index| {
+        let numerical_contributions: [f32; 3] =
+            std::array::from_fn(|index| numerical_lanes[index] * token_counts[index]);
+        let actual_contributions: [f32; 3] = std::array::from_fn(|replay_index| {
             raw_gradients[replay_index][probe.parameter]
                 .scalar_at(probe.coordinate)
                 .as_f64() as f32
         });
-        for (replay_index, (actual, expected)) in
-            actual_lanes.into_iter().zip(numerical_lanes).enumerate()
+        for (replay_index, (actual, expected)) in actual_contributions
+            .into_iter()
+            .zip(numerical_contributions)
+            .enumerate()
         {
             let error = (f64::from(actual) - f64::from(expected)).abs();
-            let tolerance = NUMERICAL_ABSOLUTE_TOLERANCE
+            let tolerance = NUMERICAL_ABSOLUTE_TOLERANCE * f64::from(token_counts[replay_index])
                 + NUMERICAL_RELATIVE_TOLERANCE * f64::from(actual.abs().max(expected.abs()));
             assert!(
                 error <= tolerance,
-                "{} raw gradient {}[{}] at second-window replay {} mismatch: actual={actual}, numerical={expected}, error={error}, tolerance={tolerance}",
+                "{} token-weighted accumulator contribution {}[{}] at second-window replay {} mismatch: actual={actual}, token_count={}, normalized_numerical_gradient={}, expected_contribution={expected}, error={error}, tolerance={tolerance}",
                 probe.boundary,
                 probe.parameter,
                 probe.coordinate,
-                replay_index + 1
+                replay_index + 1,
+                token_counts[replay_index],
+                numerical_lanes[replay_index]
             );
         }
 
-        let numerical_average = ((numerical_lanes[0] + numerical_lanes[1]) + numerical_lanes[2])
-            / ACCUMULATION_STEPS as f32;
-        let average =
-            ((actual_lanes[0] + actual_lanes[1]) + actual_lanes[2]) / ACCUMULATION_STEPS as f32;
+        let numerical_average = ((numerical_contributions[0] + numerical_contributions[1])
+            + numerical_contributions[2])
+            / TOKEN_COUNT_TOTAL;
+        let average = ((actual_contributions[0] + actual_contributions[1])
+            + actual_contributions[2])
+            / TOKEN_COUNT_TOTAL;
         let average_error = (f64::from(average) - f64::from(numerical_average)).abs();
         let average_tolerance = NUMERICAL_ABSOLUTE_TOLERANCE
             + NUMERICAL_RELATIVE_TOLERANCE * f64::from(average.abs().max(numerical_average.abs()));
         assert!(
             average_error <= average_tolerance,
-            "{} averaged raw gradient {}[{}] mismatch: captured={average}, numerical={numerical_average}, error={average_error}, tolerance={average_tolerance}",
+            "{} token-weighted gradient {}[{}] mismatch: captured={average}, numerical={numerical_average}, error={average_error}, tolerance={average_tolerance}",
             probe.boundary,
             probe.parameter,
             probe.coordinate
         );
+
         let previous_first = frontier_first_moments[probe.parameter]
             .scalar_at(probe.coordinate)
             .as_f64() as f32;
@@ -2547,6 +2633,29 @@ fn compiled_transformer_second_window_gradient_inputs_match_numerical_oracle() {
             (f64::from(actual_second) - f64::from(expected_second)).abs()
                 <= SECOND_MOMENT_TOLERANCE,
             "{} second moment {}[{}] mismatch: actual={actual_second}, numerical={expected_second}",
+            probe.boundary,
+            probe.parameter,
+            probe.coordinate
+        );
+
+        let corrected_first = expected_first / first_correction;
+        let corrected_second = expected_second / second_correction;
+        let normalized = corrected_first / (corrected_second.sqrt() + optimizer.eps());
+        let previous_parameter = frontier_parameters[probe.parameter]
+            .scalar_at(probe.coordinate)
+            .as_f64() as f32;
+        let expected_parameter = if weight_decay_exclusions.contains(probe.parameter) {
+            previous_parameter - learning_rate * normalized
+        } else {
+            previous_parameter * decay_factor - learning_rate * normalized
+        };
+        let actual_parameter = next_parameters[probe.parameter]
+            .scalar_at(probe.coordinate)
+            .as_f64() as f32;
+        assert!(
+            (f64::from(actual_parameter) - f64::from(expected_parameter)).abs()
+                <= PARAMETER_TOLERANCE,
+            "{} parameter transition {}[{}] mismatch: actual={actual_parameter}, weighted_oracle={expected_parameter}",
             probe.boundary,
             probe.parameter,
             probe.coordinate
