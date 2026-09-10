@@ -84,6 +84,9 @@ jobs:
       - name: Compiled Transformer masked-batch resume smoke
         if: matrix.os == 'ubuntu-latest'
         run: cargo run --quiet --example compiled_transformer_train_resume -- cpu-reuse
+      - name: Compiled Transformer complete-module file resume smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo run --quiet --example compiled_transformer_train_resume -- cpu-file-resume
       - run: cargo test --doc
 
   address-sanitizer:
