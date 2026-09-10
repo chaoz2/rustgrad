@@ -937,6 +937,7 @@ impl CapturedReplayExecutor {
     ) -> Result<ReplayValues, ReplayError> {
         plan.validate_replay(capture, provided)?;
         plan.workspace.begin(provided)?;
+        let mut borrowed = super::native_replay_workspace::NativeReplayBorrowedState::new();
         for index in 0..capture.items.len() {
             let item = &capture.items[index];
             plan.workspace.execute_item(
@@ -945,25 +946,34 @@ impl CapturedReplayExecutor {
                 self.jit(plan.vectorized),
                 &capture.quantized_constants,
                 &plan.items[index],
+                &mut borrowed,
             )?;
         }
-        plan.workspace.materialize(capture)
+        plan.workspace.materialize(capture, &borrowed, None)
     }
 
-    pub(super) fn execute_planned_native_items_resolved(
+    pub(super) fn execute_planned_native_items_resolved<'a>(
         &self,
         capture: &CapturedSchedule,
         plan: &mut PlannedNativeItems,
+        borrowed: &mut super::native_replay_workspace::NativeReplayBorrowedState<'a>,
+        selected: Option<&BTreeSet<u64>>,
+        setup: impl FnOnce(
+            &mut NativeReplayWorkspace,
+            &mut super::native_replay_workspace::NativeReplayBorrowedState<'a>,
+        ) -> Result<(), ReplayError>,
         mut import: impl FnMut(
             &crate::ReplayInput,
             &mut NativeReplayWorkspace,
+            &mut super::native_replay_workspace::NativeReplayBorrowedState<'a>,
         ) -> Result<(), ReplayError>,
     ) -> Result<ReplayValues, ReplayError> {
         plan.validate_replay_structure(capture)?;
         validate_quantized_index_inputs(capture)?;
         plan.workspace.begin_resolved();
+        setup(&mut plan.workspace, borrowed)?;
         for input in &capture.inputs {
-            import(input, &mut plan.workspace)?;
+            import(input, &mut plan.workspace, borrowed)?;
         }
         plan.workspace.finish_inputs()?;
         for index in 0..capture.items.len() {
@@ -974,9 +984,10 @@ impl CapturedReplayExecutor {
                 self.jit(plan.vectorized),
                 &capture.quantized_constants,
                 &plan.items[index],
+                borrowed,
             )?;
         }
-        plan.workspace.materialize(capture)
+        plan.workspace.materialize(capture, borrowed, selected)
     }
 }
 

@@ -227,6 +227,143 @@ impl HostSlotPool {
         }
         Ok(())
     }
+
+    pub(crate) fn transact_inactive_banks<T, E>(
+        &self,
+        requests: &[HostBufferBankRequest],
+        stage: impl FnOnce(&mut [HostBufferBank<'_>]) -> Result<T, E>,
+    ) -> Result<T, HostBufferBankTransactionError<E>> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| HostBufferBankTransactionError::Host(HostBufferError::OwnerMismatch))?;
+        let mut requested = BTreeMap::new();
+        for (ordinal, request) in requests.iter().enumerate() {
+            if !Arc::ptr_eq(&self.inner, &request.inner)
+                || requested.insert(request.slot, ordinal).is_some()
+            {
+                return Err(HostBufferBankTransactionError::Host(
+                    HostBufferError::OwnerMismatch,
+                ));
+            }
+            let slot = live_slot(&mut state, request.slot, request.generation)
+                .map_err(HostBufferBankTransactionError::Host)?;
+            if slot.views != 0 || slot.mutable_window {
+                return Err(HostBufferBankTransactionError::Host(
+                    HostBufferError::OutstandingBorrow { slot: request.slot },
+                ));
+            }
+            if slot.descriptor.as_ref() != Some(&request.descriptor) {
+                return Err(HostBufferBankTransactionError::Host(
+                    HostBufferError::IncompatibleDescriptor,
+                ));
+            }
+            let inactive = 1 - slot.active;
+            if slot.values[inactive]
+                .as_ref()
+                .is_none_or(|value| !tensor_matches_descriptor(value, &request.descriptor))
+            {
+                slot.values[inactive] = Some(
+                    TensorData::zeros_with_dtype(
+                        request.descriptor.shape.clone(),
+                        request.descriptor.dtype,
+                    )
+                    .map_err(|_| {
+                        HostBufferBankTransactionError::Host(
+                            HostBufferError::IncompatibleDescriptor,
+                        )
+                    })?,
+                );
+            }
+        }
+
+        let mut banks = Vec::with_capacity(requests.len());
+        for (slot_id, slot) in &mut state.slots {
+            let Some(ordinal) = requested.get(slot_id).copied() else {
+                continue;
+            };
+            let (active, inactive) = if slot.active == 0 {
+                let (active, inactive) = slot.values.split_at_mut(1);
+                (active[0].as_ref(), inactive[0].as_mut())
+            } else {
+                let (inactive, active) = slot.values.split_at_mut(1);
+                (active[0].as_ref(), inactive[0].as_mut())
+            };
+            banks.push(HostBufferBank {
+                ordinal,
+                buffer_id: requests[ordinal].descriptor.buffer_id,
+                active: active.ok_or_else(|| {
+                    HostBufferBankTransactionError::Host(HostBufferError::MissingValue(
+                        requests[ordinal].descriptor.buffer_id,
+                    ))
+                })?,
+                inactive: inactive.expect("inactive persistent bank was initialized"),
+            });
+        }
+        if banks.len() != requests.len() {
+            return Err(HostBufferBankTransactionError::Host(
+                HostBufferError::OwnerMismatch,
+            ));
+        }
+        banks.sort_by_key(|bank| bank.ordinal);
+        let value = stage(&mut banks).map_err(HostBufferBankTransactionError::Stage)?;
+        if banks.iter().any(|bank| {
+            !tensor_matches_descriptor(bank.inactive(), &requests[bank.ordinal].descriptor)
+        }) {
+            return Err(HostBufferBankTransactionError::Host(
+                HostBufferError::IncompatibleDescriptor,
+            ));
+        }
+        drop(banks);
+        for request in requests {
+            let slot = state
+                .slots
+                .get_mut(&request.slot)
+                .expect("validated inactive persistent bank remains live");
+            slot.active = 1 - slot.active;
+        }
+        Ok(value)
+    }
+}
+
+fn tensor_matches_descriptor(value: &TensorData, descriptor: &HostBufferDesc) -> bool {
+    value.shape() == &descriptor.shape
+        && value.dtype() == descriptor.dtype
+        && value.len().checked_mul(value.dtype().itemsize()) == Some(descriptor.bytes)
+}
+
+#[derive(Debug)]
+pub(crate) enum HostBufferBankTransactionError<E> {
+    Host(HostBufferError),
+    Stage(E),
+}
+
+pub(crate) struct HostBufferBankRequest {
+    inner: Arc<Mutex<PoolState>>,
+    slot: u64,
+    generation: u64,
+    descriptor: HostBufferDesc,
+}
+
+pub(crate) struct HostBufferBank<'a> {
+    ordinal: usize,
+    buffer_id: u64,
+    active: &'a TensorData,
+    inactive: &'a mut TensorData,
+}
+
+impl HostBufferBank<'_> {
+    pub(crate) fn buffer_id(&self) -> u64 {
+        self.buffer_id
+    }
+
+    pub(crate) fn tensors(&mut self) -> (&TensorData, &mut TensorData) {
+        (self.active, &mut *self.inactive)
+    }
+
+    pub(crate) fn inactive(&self) -> &TensorData {
+        &*self.inactive
+    }
 }
 
 /// An owned, descriptor-checked value for one pool transaction. This remains
@@ -269,23 +406,6 @@ impl HostBufferLease {
         Ok(())
     }
 
-    pub(crate) fn with_tensor<R>(
-        &self,
-        inspect: impl FnOnce(&TensorData) -> R,
-    ) -> Result<R, HostBufferError> {
-        checked_range(&self.descriptor, 0, self.descriptor.bytes)?;
-        let mut state = self
-            .inner
-            .lock()
-            .map_err(|_| HostBufferError::OwnerMismatch)?;
-        let slot = live_slot(&mut state, self.slot, self.generation)?;
-        let active = slot.active;
-        let value = slot.values[active]
-            .as_ref()
-            .ok_or(HostBufferError::MissingValue(self.descriptor.buffer_id))?;
-        Ok(inspect(value))
-    }
-
     pub(crate) fn staged_write(
         &self,
         value: TensorData,
@@ -300,6 +420,15 @@ impl HostBufferLease {
             descriptor: self.descriptor.clone(),
             value,
         })
+    }
+
+    pub(crate) fn bank_request(&self) -> HostBufferBankRequest {
+        HostBufferBankRequest {
+            inner: self.inner.clone(),
+            slot: self.slot,
+            generation: self.generation,
+            descriptor: self.descriptor.clone(),
+        }
     }
 
     pub(crate) fn view(&self) -> Result<HostBufferView, HostBufferError> {
@@ -630,6 +759,58 @@ mod tests {
         let stats = pool.stats().unwrap();
         assert_eq!(stats.physical_slots, 2);
         assert_eq!(stats.leased_slots, 2);
+    }
+
+    #[test]
+    fn inactive_bank_transaction_hides_failure_and_flips_once() {
+        let pool = HostSlotPool::new();
+        let lease = pool.lease(Some(7), desc(7, [2])).unwrap();
+        lease
+            .write(TensorData::new([2], vec![1.0, 2.0]).unwrap())
+            .unwrap();
+        let requests = [lease.bank_request()];
+        let failed = pool.transact_inactive_banks(&requests, |banks| {
+            let (active, inactive) = banks[0].tensors();
+            assert_eq!(active.to_vec_f64(), vec![1.0, 2.0]);
+            *inactive = TensorData::new([2], vec![9.0, 8.0]).unwrap();
+            Err::<(), _>("reject")
+        });
+        assert!(matches!(
+            failed,
+            Err(HostBufferBankTransactionError::Stage("reject"))
+        ));
+        assert_eq!(
+            lease.view().unwrap().tensor().unwrap().to_vec_f64(),
+            vec![1.0, 2.0]
+        );
+
+        let malformed = pool.transact_inactive_banks(&requests, |banks| {
+            let (_, inactive) = banks[0].tensors();
+            *inactive = TensorData::new([1], vec![9.0]).unwrap();
+            Ok::<_, ()>(())
+        });
+        assert!(matches!(
+            malformed,
+            Err(HostBufferBankTransactionError::Host(
+                HostBufferError::IncompatibleDescriptor
+            ))
+        ));
+        assert_eq!(
+            lease.view().unwrap().tensor().unwrap().to_vec_f64(),
+            vec![1.0, 2.0]
+        );
+
+        pool.transact_inactive_banks(&requests, |banks| {
+            let (active, inactive) = banks[0].tensors();
+            assert_eq!(active.to_vec_f64(), vec![1.0, 2.0]);
+            *inactive = TensorData::new([2], vec![5.0, 6.0]).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(
+            lease.view().unwrap().tensor().unwrap().to_vec_f64(),
+            vec![5.0, 6.0]
+        );
     }
 
     #[test]

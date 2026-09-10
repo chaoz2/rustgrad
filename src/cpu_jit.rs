@@ -123,6 +123,68 @@ pub struct JitBuffer {
     pub mutable: bool,
     bytes: Vec<u8>,
 }
+
+/// One call-scoped dense binding for retained native replay. Persistent state
+/// may borrow typed tensor storage directly; the compiled kernel never retains
+/// the pointer after [`JitKernel::call_indexed_detached_borrowed`] returns.
+pub(crate) enum BorrowedJitBuffer<'a> {
+    Read(&'a crate::TensorData),
+    Write(&'a mut crate::TensorData),
+}
+
+impl BorrowedJitBuffer<'_> {
+    pub(crate) fn tensor(&self) -> &crate::TensorData {
+        match self {
+            Self::Read(value) => value,
+            Self::Write(value) => value,
+        }
+    }
+
+    fn validate(&self, want: &BufferAbi) -> Result<(), JitError> {
+        let value = self.tensor();
+        if value.dtype() != want.dtype
+            || value.len() != want.elements
+            || (want.mutable && !matches!(self, Self::Write(_)))
+            || value.native_dense_ptr().is_none()
+        {
+            return Err(JitError::InvalidBuffer(format!(
+                "borrowed buffer {} descriptor mismatch",
+                want.id
+            )));
+        }
+        Ok(())
+    }
+
+    fn pointer(&mut self) -> Result<*mut c_void, JitError> {
+        match self {
+            Self::Read(value) => value
+                .native_dense_ptr()
+                .map(|pointer| pointer.cast_mut().cast())
+                .ok_or_else(|| {
+                    JitError::InvalidBuffer("borrowed dense input is unsupported".into())
+                }),
+            Self::Write(value) => value
+                .native_dense_mut_ptr()
+                .map(|pointer| pointer.cast())
+                .ok_or_else(|| {
+                    JitError::InvalidBuffer("borrowed dense output is unsupported".into())
+                }),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) -> Result<(), JitError> {
+        match self {
+            Self::Read(_) => Err(JitError::InvalidBuffer(
+                "borrowed native output is read-only".into(),
+            )),
+            Self::Write(value) => {
+                value.clear_native_dense();
+                Ok(())
+            }
+        }
+    }
+}
+
 impl JitBuffer {
     pub fn from_tensor(data: &crate::TensorData, mutable: bool) -> Self {
         let mut out = Self::zeroed(data.dtype(), data.len(), mutable);
@@ -227,6 +289,62 @@ impl JitBuffer {
                     JitError::InvalidBuffer("JIT affine target is out of bounds".into())
                 })?;
             target_bytes.copy_from_slice(source_bytes);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn copy_affine_from_tensor(
+        &mut self,
+        source: &crate::TensorData,
+        view: &crate::AffineView,
+    ) -> Result<(), JitError> {
+        view.validate_read()
+            .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+        let source_elements = view
+            .source_shape
+            .numel()
+            .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+        let logical_elements = view
+            .logical_shape
+            .numel()
+            .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+        if source.dtype() != self.dtype
+            || source.len() != source_elements
+            || self.elements != logical_elements
+        {
+            return Err(JitError::InvalidBuffer(
+                "JIT affine tensor descriptor mismatch".into(),
+            ));
+        }
+        for logical in 0..logical_elements {
+            let source_index = usize::try_from(
+                view.element_offset(logical)
+                    .map_err(|error| JitError::InvalidBuffer(error.to_string()))?,
+            )
+            .map_err(|_| JitError::InvalidBuffer("JIT affine tensor offset is negative".into()))?;
+            let target_start = logical
+                .checked_mul(self.dtype.itemsize())
+                .ok_or_else(|| JitError::InvalidBuffer("JIT affine byte overflow".into()))?;
+            let target = &mut self.bytes[target_start..target_start + self.dtype.itemsize()];
+            match (source.storage(), self.dtype) {
+                (crate::Storage::F32(values), DType::F32) => {
+                    let value = values.get(source_index).ok_or_else(|| {
+                        JitError::InvalidBuffer("JIT affine tensor offset is out of bounds".into())
+                    })?;
+                    target.copy_from_slice(&value.to_ne_bytes());
+                }
+                (crate::Storage::U64(values), DType::U64) => {
+                    let value = values.get(source_index).ok_or_else(|| {
+                        JitError::InvalidBuffer("JIT affine tensor offset is out of bounds".into())
+                    })?;
+                    target.copy_from_slice(&value.to_ne_bytes());
+                }
+                _ => {
+                    return Err(JitError::InvalidBuffer(
+                        "borrowed affine recurrent dtype is unsupported".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -723,6 +841,75 @@ impl JitKernel {
         for entry in &self.abi.pointer_order {
             let pointer = match entry {
                 KernelPointerAbi::Dense(index) => arena[slots[*index]].bytes.as_mut_ptr().cast(),
+                KernelPointerAbi::Quantized(index) => {
+                    quantized[*index].bytes().as_ptr().cast_mut().cast()
+                }
+            };
+            ptrs.push(pointer);
+        }
+        self.invoke(&mut ptrs, &[])
+    }
+
+    /// Invokes one prepared kernel while selected workspace slots borrow
+    /// persistent tensor storage for this call only. Input bindings are
+    /// read-only and outputs target an inactive persistent bank, so a failed
+    /// native invocation cannot mutate the active recurrent frontier.
+    pub(crate) fn call_indexed_detached_borrowed(
+        &self,
+        arena: &mut [JitBuffer],
+        slots: &[usize],
+        borrowed: &mut BTreeMap<usize, BorrowedJitBuffer<'_>>,
+        quantized: &[&crate::QuantizedTensorData],
+    ) -> Result<(), JitError> {
+        if slots.len() != self.abi.buffers.len()
+            || quantized.len() != self.abi.quantized_buffers.len()
+            || self.abi.symbol_count != 0
+        {
+            return Err(JitError::InvalidBuffer(
+                "borrowed replay-workspace ABI count mismatch".into(),
+            ));
+        }
+        for (index, (slot, want)) in slots.iter().copied().zip(&self.abi.buffers).enumerate() {
+            if slots[..index].contains(&slot) {
+                return Err(JitError::InvalidBuffer(
+                    "borrowed replay-workspace slot aliases within one kernel".into(),
+                ));
+            }
+            if let Some(binding) = borrowed.get(&slot) {
+                binding.validate(want)?;
+            } else {
+                let buffer = arena.get(slot).ok_or_else(|| {
+                    JitError::InvalidBuffer("borrowed replay-workspace slot is absent".into())
+                })?;
+                if buffer.dtype != want.dtype || buffer.elements != want.elements {
+                    return Err(JitError::InvalidBuffer(format!(
+                        "borrowed replay-workspace buffer {} descriptor mismatch",
+                        want.id
+                    )));
+                }
+            }
+        }
+        for (value, want) in quantized.iter().zip(&self.abi.quantized_buffers) {
+            value
+                .validate()
+                .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+            if value.descriptor() != &want.desc {
+                return Err(JitError::InvalidBuffer(format!(
+                    "quantized buffer {} descriptor mismatch",
+                    want.id
+                )));
+            }
+        }
+        let mut ptrs = Vec::with_capacity(self.abi.pointer_order.len());
+        for entry in &self.abi.pointer_order {
+            let pointer = match entry {
+                KernelPointerAbi::Dense(index) => {
+                    let slot = slots[*index];
+                    match borrowed.get_mut(&slot) {
+                        Some(binding) => binding.pointer()?,
+                        None => arena[slot].bytes.as_mut_ptr().cast(),
+                    }
+                }
                 KernelPointerAbi::Quantized(index) => {
                     quantized[*index].bytes().as_ptr().cast_mut().cast()
                 }

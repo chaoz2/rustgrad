@@ -5287,7 +5287,12 @@ impl CpuCompiledTrainingProgram {
                 native,
                 injected_failure,
                 |outputs, successors| {
-                    validate_staged_transition(outputs, successors, non_finite_policy, true)?;
+                    validate_staged_transition(
+                        outputs,
+                        successors.iter().copied(),
+                        non_finite_policy,
+                        true,
+                    )?;
                     validate_staged_clip_report(
                         outputs,
                         clip_report_start,
@@ -5729,7 +5734,12 @@ impl CpuCompiledTrainingProgram {
                 native,
                 injected_failure,
                 |outputs, successors| {
-                    validate_staged_transition(outputs, successors, non_finite_policy, false)?;
+                    validate_staged_transition(
+                        outputs,
+                        successors.iter().copied(),
+                        non_finite_policy,
+                        false,
+                    )?;
                     validate_staged_clip_report(outputs, 0, clip_report, non_finite_policy)?;
                     validate_staged_window_loss_report(
                         outputs,
@@ -10133,9 +10143,9 @@ fn validate_learning_rate_for_policy(
     Ok(())
 }
 
-fn validate_staged_transition(
+fn validate_staged_transition<'a>(
     outputs: &[TensorData],
-    successors: &[TensorData],
+    successors: impl IntoIterator<Item = &'a TensorData>,
     policy: CpuNonFinitePolicy,
     require_loss: bool,
 ) -> std::result::Result<(), String> {
@@ -11795,7 +11805,7 @@ mod tests {
         assert_eq!(native_checkpoint.info(), interpreted_checkpoint.info());
     }
 
-    fn native_recurrent_test_counts(native: &NativeCpuCompiledAdamW<'_>) -> (usize, usize, usize) {
+    fn native_recurrent_test_counts(native: &NativeCpuCompiledAdamW<'_>) -> (usize, usize) {
         native.inner.inner.runtime.recurrent_test_counts()
     }
 
@@ -11811,6 +11821,8 @@ mod tests {
         assert!(workspace.allocation_count > 0);
         assert_eq!(workspace.input_import_count, 0);
         assert_eq!(workspace.intermediate_materialization_count, 0);
+        assert_eq!(workspace.borrowed_recurrent_input_bytes, 0);
+        assert_eq!(workspace.borrowed_recurrent_output_bytes, 0);
         let preparation = native.preparation_report();
         assert_eq!(
             preparation.main().capture_identity(),
@@ -11827,6 +11839,7 @@ mod tests {
         assert!(preparation.evaluation().is_none());
         assert!(preparation.recurrent_state_count() > 0);
         assert!(preparation.recurrent_state_bytes() > 0);
+        let recurrent_state_bytes = preparation.recurrent_state_bytes();
         let prepared_native_identity = preparation.main().native_identity();
 
         let cached = target.prepare(&plan).unwrap();
@@ -11843,8 +11856,7 @@ mod tests {
         let actual = native.step(batch(), lr()).unwrap();
         let after_replay = native_recurrent_test_counts(&native);
         assert_eq!(after_replay.0, before_replay.0);
-        assert!(after_replay.1 > before_replay.1);
-        assert_eq!(after_replay.2, before_replay.2 + 1);
+        assert_eq!(after_replay.1, before_replay.1 + 1);
         assert_cross_engine_tensor_close("first loss", actual.loss(), expected.loss());
         assert_cross_engine_tensor_maps_close(
             "first outputs",
@@ -11864,14 +11876,21 @@ mod tests {
         assert_eq!(first_workspace.allocation_count, workspace.allocation_count);
         assert!(first_workspace.input_import_count > 0);
         assert_eq!(first_workspace.intermediate_materialization_count, 0);
+        assert_eq!(
+            first_workspace.borrowed_recurrent_input_bytes,
+            recurrent_state_bytes
+        );
+        assert_eq!(
+            first_workspace.borrowed_recurrent_output_bytes,
+            recurrent_state_bytes
+        );
 
         let before_failure = native.checkpoint().unwrap();
         let before_failure_counts = native_recurrent_test_counts(&native);
         assert!(native.step_inner(batch(), lr(), Some(0)).is_err());
         let after_failure_counts = native_recurrent_test_counts(&native);
         assert_eq!(after_failure_counts.0, before_failure_counts.0);
-        assert!(after_failure_counts.1 > before_failure_counts.1);
-        assert_eq!(after_failure_counts.2, before_failure_counts.2);
+        assert_eq!(after_failure_counts.1, before_failure_counts.1);
         assert_eq!(native.checkpoint().unwrap(), before_failure);
         let failed_workspace = native.main_replay.workspace_stats();
         assert_eq!(
@@ -11879,12 +11898,20 @@ mod tests {
             workspace.allocation_count
         );
         assert_eq!(failed_workspace.intermediate_materialization_count, 0);
+        assert_eq!(
+            failed_workspace.borrowed_recurrent_input_bytes,
+            first_workspace.borrowed_recurrent_input_bytes + recurrent_state_bytes
+        );
+        assert_eq!(
+            failed_workspace.borrowed_recurrent_output_bytes,
+            first_workspace.borrowed_recurrent_output_bytes + recurrent_state_bytes
+        );
         let expected = interpreted.step(batch(), lr()).unwrap();
         let before_retry = native_recurrent_test_counts(&native);
         let actual = native.step(batch(), lr()).unwrap();
         let after_retry = native_recurrent_test_counts(&native);
         assert_eq!(after_retry.0, before_retry.0);
-        assert_eq!(after_retry.2, before_retry.2 + 1);
+        assert_eq!(after_retry.1, before_retry.1 + 1);
         assert_cross_engine_tensor_close("retry loss", actual.loss(), expected.loss());
         assert_cross_engine_tensor_maps_close(
             "retry outputs",
@@ -11903,6 +11930,14 @@ mod tests {
         );
         assert!(retried_workspace.input_import_count > failed_workspace.input_import_count);
         assert_eq!(retried_workspace.intermediate_materialization_count, 0);
+        assert_eq!(
+            retried_workspace.borrowed_recurrent_input_bytes,
+            failed_workspace.borrowed_recurrent_input_bytes + recurrent_state_bytes
+        );
+        assert_eq!(
+            retried_workspace.borrowed_recurrent_output_bytes,
+            failed_workspace.borrowed_recurrent_output_bytes + recurrent_state_bytes
+        );
     }
 
     #[test]
@@ -11954,8 +11989,7 @@ mod tests {
         assert!(native.zero_grad_with_injected_failure(0).is_err());
         let after_failed_reset_counts = native_recurrent_test_counts(&native);
         assert_eq!(after_failed_reset_counts.0, before_failed_reset_counts.0);
-        assert!(after_failed_reset_counts.1 > before_failed_reset_counts.1);
-        assert_eq!(after_failed_reset_counts.2, before_failed_reset_counts.2);
+        assert_eq!(after_failed_reset_counts.1, before_failed_reset_counts.1);
         assert_eq!(native.checkpoint().unwrap(), before_failed_reset);
         assert_eq!(native.successful_zero_grads, 0);
         let before_reset = native_recurrent_test_counts(&native);
@@ -11965,7 +11999,7 @@ mod tests {
         );
         let after_reset = native_recurrent_test_counts(&native);
         assert_eq!(after_reset.0, before_reset.0);
-        assert_eq!(after_reset.2, before_reset.2 + 1);
+        assert_eq!(after_reset.1, before_reset.1 + 1);
         assert_eq!(native.successful_zero_grads, 1);
         assert_native_adamw_state_close(&native, &interpreted);
         let used_reset_workspace = native.zero_grad_replay.as_ref().unwrap().workspace_stats();
@@ -11973,7 +12007,12 @@ mod tests {
             used_reset_workspace.allocation_count,
             reset_workspace.allocation_count
         );
-        assert!(used_reset_workspace.input_import_count > 0);
+        assert_eq!(used_reset_workspace.input_import_count, 0);
+        assert!(used_reset_workspace.borrowed_recurrent_input_bytes > 0);
+        assert_eq!(
+            used_reset_workspace.borrowed_recurrent_input_bytes,
+            used_reset_workspace.borrowed_recurrent_output_bytes
+        );
         assert_eq!(used_reset_workspace.intermediate_materialization_count, 0);
 
         let before_empty_reset = native.checkpoint().unwrap();
@@ -12010,15 +12049,14 @@ mod tests {
         );
         let after_failed_flush_counts = native_recurrent_test_counts(&native);
         assert_eq!(after_failed_flush_counts.0, before_failed_flush_counts.0);
-        assert!(after_failed_flush_counts.1 > before_failed_flush_counts.1);
-        assert_eq!(after_failed_flush_counts.2, before_failed_flush_counts.2);
+        assert_eq!(after_failed_flush_counts.1, before_failed_flush_counts.1);
         assert_eq!(native.checkpoint().unwrap(), before_failed_flush);
         assert_eq!(native.successful_flushes, 0);
         let before_flush = native_recurrent_test_counts(&native);
         let actual = native.flush_partial_window(lr()).unwrap();
         let after_flush = native_recurrent_test_counts(&native);
         assert_eq!(after_flush.0, before_flush.0);
-        assert_eq!(after_flush.2, before_flush.2 + 1);
+        assert_eq!(after_flush.1, before_flush.1 + 1);
         let expected = interpreted.flush_partial_window(lr()).unwrap();
         assert_eq!(
             actual.flushed_microbatches(),
@@ -12060,6 +12098,11 @@ mod tests {
             flush_workspace.allocation_count
         );
         assert!(used_flush_workspace.input_import_count > 0);
+        assert!(used_flush_workspace.borrowed_recurrent_input_bytes > 0);
+        assert_eq!(
+            used_flush_workspace.borrowed_recurrent_input_bytes,
+            used_flush_workspace.borrowed_recurrent_output_bytes
+        );
         assert_eq!(used_flush_workspace.intermediate_materialization_count, 0);
     }
 

@@ -2,7 +2,8 @@
 use super::{BufferState, EffectBatch, EffectBatchStep, EffectError, EffectPlan};
 use crate::TensorData;
 use crate::host_buffer::{
-    HostBufferDesc, HostBufferError, HostBufferLease, HostPoolStats, HostSlotPool,
+    HostBufferBank, HostBufferBankTransactionError, HostBufferDesc, HostBufferError,
+    HostBufferLease, HostPoolStats, HostSlotPool,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -69,28 +70,7 @@ pub struct EffectRuntime {
     #[cfg(test)]
     snapshot_count: std::cell::Cell<usize>,
     #[cfg(test)]
-    recurrent_inspection_count: std::cell::Cell<usize>,
-    #[cfg(test)]
     recurrent_commit_count: usize,
-}
-
-pub(crate) struct RecurrentStateReader<'a> {
-    runtime: &'a EffectRuntime,
-}
-
-impl RecurrentStateReader<'_> {
-    pub(crate) fn inspect<R>(
-        &self,
-        state: &BufferState,
-        inspect: impl FnOnce(&TensorData) -> R,
-    ) -> Result<R, RuntimeError> {
-        self.runtime.inspect(state, inspect)
-    }
-}
-
-pub(crate) struct RecurrentStateSuccessors<T> {
-    pub(crate) value: T,
-    pub(crate) successors: Vec<(BufferState, TensorData)>,
 }
 
 #[derive(Debug)]
@@ -118,8 +98,6 @@ impl EffectRuntime {
             slots: BTreeMap::new(),
             #[cfg(test)]
             snapshot_count: std::cell::Cell::new(0),
-            #[cfg(test)]
-            recurrent_inspection_count: std::cell::Cell::new(0),
             #[cfg(test)]
             recurrent_commit_count: 0,
         }
@@ -260,43 +238,23 @@ impl EffectRuntime {
         })
     }
 
-    fn inspect<R>(
-        &self,
-        state: &BufferState,
-        inspect: impl FnOnce(&TensorData) -> R,
-    ) -> Result<R, RuntimeError> {
-        #[cfg(test)]
-        self.recurrent_inspection_count
-            .set(self.recurrent_inspection_count.get() + 1);
-        let slot = self
-            .slots
-            .get(&state.buffer)
-            .ok_or(RuntimeError::MissingBuffer(state.buffer))?;
-        if slot.state != *state {
-            return Err(RuntimeError::StaleState {
-                buffer: state.buffer,
-                version: state.version,
-            });
-        }
-        slot.lease.with_tensor(inspect).map_err(RuntimeError::Host)
-    }
-
-    /// Runs one detached recurrent transition against borrowed active values,
-    /// then publishes an exact full-replacement frontier in one pool commit.
-    /// Neither the reader nor an incomplete successor set can escape this
-    /// runtime borrow, and every error leaves the active banks unchanged.
-    pub(crate) fn transact_recurrent_replacements<T, E>(
+    /// Runs one native recurrent transition with direct, call-scoped borrows
+    /// of each active tensor and its inactive successor bank. The pool lock and
+    /// every borrow remain live until staging and validation finish; only then
+    /// are all banks flipped together.
+    pub(crate) fn transact_recurrent_native_banks<T, E>(
         &mut self,
         current: &[BufferState],
         next: &[BufferState],
-        stage: impl FnOnce(&RecurrentStateReader<'_>) -> Result<RecurrentStateSuccessors<T>, E>,
+        stage: impl FnOnce(&mut [HostBufferBank<'_>]) -> Result<T, E>,
     ) -> Result<T, RecurrentTransactionError<E>> {
         if current.is_empty() || current.len() != next.len() {
             return Err(RecurrentTransactionError::Contract(
                 "recurrent replacement frontier cardinality mismatch",
             ));
         }
-        let mut expected = BTreeMap::new();
+        let mut requests = Vec::with_capacity(current.len());
+        let mut seen = BTreeSet::new();
         for (current, next) in current.iter().zip(next) {
             super::validate_buffer_state(current)
                 .map_err(RuntimeError::Effect)
@@ -309,7 +267,7 @@ impl EffectRuntime {
                 || current.dtype != next.dtype
                 || current.bytes != next.bytes
                 || current.version.checked_add(1) != Some(next.version)
-                || expected.insert(next.buffer, next.clone()).is_some()
+                || !seen.insert(current.buffer)
             {
                 return Err(RecurrentTransactionError::Contract(
                     "recurrent replacement state mismatch",
@@ -328,71 +286,21 @@ impl EffectRuntime {
                     },
                 ));
             }
+            requests.push(slot.lease.bank_request());
         }
 
-        let staged = stage(&RecurrentStateReader { runtime: self })
-            .map_err(RecurrentTransactionError::Stage)?;
-        if staged.successors.len() != expected.len() {
-            return Err(RecurrentTransactionError::Contract(
-                "recurrent replacement successor cardinality mismatch",
-            ));
-        }
-        let mut successors = BTreeMap::new();
-        for (state, value) in staged.successors {
-            let Some(want) = expected.get(&state.buffer) else {
-                return Err(RecurrentTransactionError::Contract(
-                    "recurrent replacement successor is unexpected",
-                ));
-            };
-            let bytes = value
-                .len()
-                .checked_mul(value.dtype().itemsize())
-                .ok_or(RuntimeError::Host(HostBufferError::Overflow))
-                .map_err(RecurrentTransactionError::Runtime)?;
-            if &state != want
-                || value.shape() != &want.shape
-                || value.dtype() != want.dtype
-                || bytes != want.bytes
-                || successors.insert(state.buffer, (state, value)).is_some()
-            {
-                return Err(RecurrentTransactionError::Contract(
-                    "recurrent replacement successor mismatch",
-                ));
+        let staged = self.pool.transact_inactive_banks(&requests, stage);
+        let value = match staged {
+            Ok(value) => value,
+            Err(HostBufferBankTransactionError::Host(error)) => {
+                return Err(RecurrentTransactionError::Runtime(RuntimeError::Host(
+                    error,
+                )));
             }
-        }
-
-        // Recheck the active frontier after staging. Safe code cannot mutate it
-        // through the read-only transaction view, but this also authenticates
-        // the final commit against the exact runtime owner and versions.
-        let mut writes = Vec::with_capacity(successors.len());
-        for current in current {
-            let slot = self
-                .slots
-                .get(&current.buffer)
-                .ok_or(RuntimeError::MissingBuffer(current.buffer))
-                .map_err(RecurrentTransactionError::Runtime)?;
-            if slot.state != *current {
-                return Err(RecurrentTransactionError::Runtime(
-                    RuntimeError::StaleState {
-                        buffer: current.buffer,
-                        version: current.version,
-                    },
-                ));
+            Err(HostBufferBankTransactionError::Stage(error)) => {
+                return Err(RecurrentTransactionError::Stage(error));
             }
-            let (_, value) = successors
-                .remove(&current.buffer)
-                .expect("validated successor set covers the frontier");
-            writes.push(
-                slot.lease
-                    .staged_write(value)
-                    .map_err(RuntimeError::Host)
-                    .map_err(RecurrentTransactionError::Runtime)?,
-            );
-        }
-        self.pool
-            .commit(writes)
-            .map_err(RuntimeError::Host)
-            .map_err(RecurrentTransactionError::Runtime)?;
+        };
         for state in next {
             self.slots
                 .get_mut(&state.buffer)
@@ -403,16 +311,12 @@ impl EffectRuntime {
         {
             self.recurrent_commit_count += 1;
         }
-        Ok(staged.value)
+        Ok(value)
     }
 
     #[cfg(test)]
-    pub(crate) fn recurrent_test_counts(&self) -> (usize, usize, usize) {
-        (
-            self.snapshot_count.get(),
-            self.recurrent_inspection_count.get(),
-            self.recurrent_commit_count,
-        )
+    pub(crate) fn recurrent_test_counts(&self) -> (usize, usize) {
+        (self.snapshot_count.get(), self.recurrent_commit_count)
     }
 
     pub fn slot_identity(
@@ -1036,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_replacements_flip_exact_banks_and_reject_atomically() {
+    fn recurrent_native_banks_validate_full_frontier_and_reject_atomically() {
         let mut runtime = EffectRuntime::new();
         let left = runtime
             .register(41, data([2], Storage::F32(vec![1.0, 2.0])))
@@ -1063,31 +967,44 @@ mod tests {
         skipped[0].version += 1;
         let staged = std::cell::Cell::new(false);
         assert!(matches!(
-            runtime.transact_recurrent_replacements(&current, &skipped, |_reader| {
+            runtime.transact_recurrent_native_banks(&current, &skipped, |_banks| {
                 staged.set(true);
-                Ok::<_, ()>(RecurrentStateSuccessors {
-                    value: (),
-                    successors: Vec::new(),
-                })
+                Ok::<_, ()>(())
             }),
             Err(RecurrentTransactionError::Contract(
                 "recurrent replacement state mismatch"
             ))
         ));
         assert!(!staged.get());
+        assert!(matches!(
+            runtime.transact_recurrent_native_banks(&current, &next[..1], |_banks| {
+                staged.set(true);
+                Ok::<_, ()>(())
+            }),
+            Err(RecurrentTransactionError::Contract(
+                "recurrent replacement frontier cardinality mismatch"
+            ))
+        ));
+        assert!(!staged.get());
         let observed = runtime
-            .transact_recurrent_replacements(&current, &next, |reader| {
-                assert_eq!(
-                    reader.inspect(&left, |value| value.clone()).unwrap(),
-                    data([2], Storage::F32(vec![1.0, 2.0]))
-                );
-                Ok::<_, ()>(RecurrentStateSuccessors {
-                    value: 7,
-                    successors: vec![
-                        (next[0].clone(), data([2], Storage::F32(vec![4.0, 5.0]))),
-                        (next[1].clone(), data([], Storage::U64(vec![8]))),
-                    ],
-                })
+            .transact_recurrent_native_banks(&current, &next, |banks| {
+                assert_eq!(banks.len(), 2);
+                for bank in banks {
+                    let buffer = bank.buffer_id();
+                    let (active, inactive) = bank.tensors();
+                    match buffer {
+                        41 => {
+                            assert_eq!(active, &data([2], Storage::F32(vec![1.0, 2.0])));
+                            *inactive = data([2], Storage::F32(vec![4.0, 5.0]));
+                        }
+                        42 => {
+                            assert_eq!(active, &data([], Storage::U64(vec![3])));
+                            *inactive = data([], Storage::U64(vec![8]));
+                        }
+                        _ => panic!("unexpected recurrent bank {buffer}"),
+                    }
+                }
+                Ok::<_, ()>(7)
             })
             .unwrap();
         assert_eq!(observed, 7);
@@ -1113,8 +1030,10 @@ mod tests {
             runtime.snapshot(&next[1]).unwrap(),
         ];
         assert!(matches!(
-            runtime.transact_recurrent_replacements(&next, &second, |_reader| {
-                Err::<RecurrentStateSuccessors<()>, _>("rejected")
+            runtime.transact_recurrent_native_banks(&next, &second, |banks| {
+                let (_, inactive) = banks[0].tensors();
+                *inactive = data([2], Storage::F32(vec![90.0, 100.0]));
+                Err::<(), _>("rejected")
             }),
             Err(RecurrentTransactionError::Stage("rejected"))
         ));
@@ -1126,34 +1045,84 @@ mod tests {
             runtime.snapshot(&next[1]).unwrap().tensor(),
             before[1].tensor()
         );
-        assert!(matches!(
-            runtime.transact_recurrent_replacements(&next, &second, |_reader| {
-                Ok::<_, ()>(RecurrentStateSuccessors {
-                    value: (),
-                    successors: vec![(second[0].clone(), data([2], Storage::F32(vec![9.0, 10.0])))],
-                })
-            }),
-            Err(RecurrentTransactionError::Contract(
-                "recurrent replacement successor cardinality mismatch"
-            ))
-        ));
-        assert_eq!(
-            runtime.snapshot(&next[0]).unwrap().tensor(),
-            before[0].tensor()
-        );
         runtime
-            .transact_recurrent_replacements(&next, &second, |_reader| {
-                Ok::<_, ()>(RecurrentStateSuccessors {
-                    value: (),
-                    successors: vec![
-                        (second[0].clone(), data([2], Storage::F32(vec![9.0, 10.0]))),
-                        (second[1].clone(), data([], Storage::U64(vec![11]))),
-                    ],
-                })
+            .transact_recurrent_native_banks(&next, &second, |banks| {
+                assert_eq!(banks.len(), 2);
+                for bank in banks {
+                    let buffer = bank.buffer_id();
+                    let (_, inactive) = bank.tensors();
+                    match buffer {
+                        41 => *inactive = data([2], Storage::F32(vec![9.0, 10.0])),
+                        42 => *inactive = data([], Storage::U64(vec![11])),
+                        _ => panic!("unexpected recurrent bank {buffer}"),
+                    }
+                }
+                Ok::<_, ()>(())
             })
             .unwrap();
         assert_eq!(runtime.stats().unwrap(), stats);
         assert_eq!(runtime.slot_identity(&second[0]).unwrap(), identities[0]);
+        assert_eq!(
+            runtime.snapshot(&second[0]).unwrap().tensor(),
+            &data([2], Storage::F32(vec![9.0, 10.0]))
+        );
+        assert_eq!(
+            runtime.snapshot(&second[1]).unwrap().tensor(),
+            &data([], Storage::U64(vec![11]))
+        );
+    }
+
+    #[test]
+    fn recurrent_native_bank_rejects_malformed_success_before_version_publication() {
+        let mut runtime = EffectRuntime::new();
+        let current = runtime
+            .register(41, data([2], Storage::F32(vec![1.0, 2.0])))
+            .unwrap();
+        let mut next = current.clone();
+        next.version += 1;
+        let before = runtime.recurrent_test_counts();
+
+        assert!(matches!(
+            runtime.transact_recurrent_native_banks(
+                std::slice::from_ref(&current),
+                std::slice::from_ref(&next),
+                |banks| {
+                    let (_, inactive) = banks[0].tensors();
+                    *inactive = data([1], Storage::F32(vec![9.0]));
+                    Ok::<_, ()>(())
+                }
+            ),
+            Err(RecurrentTransactionError::Runtime(RuntimeError::Host(
+                HostBufferError::IncompatibleDescriptor
+            )))
+        ));
+        assert_eq!(runtime.recurrent_test_counts(), before);
+        assert_eq!(
+            runtime.snapshot(&current).unwrap().tensor(),
+            &data([2], Storage::F32(vec![1.0, 2.0]))
+        );
+        assert!(matches!(
+            runtime.snapshot(&next),
+            Err(RuntimeError::StaleState { .. })
+        ));
+
+        runtime
+            .transact_recurrent_native_banks(
+                std::slice::from_ref(&current),
+                std::slice::from_ref(&next),
+                |banks| {
+                    let (active, inactive) = banks[0].tensors();
+                    assert_eq!(active, &data([2], Storage::F32(vec![1.0, 2.0])));
+                    assert_eq!(inactive.shape(), &Shape::from([2]));
+                    *inactive = data([2], Storage::F32(vec![5.0, 6.0]));
+                    Ok::<_, ()>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.snapshot(&next).unwrap().tensor(),
+            &data([2], Storage::F32(vec![5.0, 6.0]))
+        );
     }
 
     #[test]

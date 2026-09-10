@@ -150,6 +150,30 @@ impl TensorData {
         &self.storage
     }
 
+    pub(crate) fn native_dense_ptr(&self) -> Option<*const u8> {
+        match &self.storage {
+            Storage::F32(values) => Some(values.as_ptr().cast()),
+            Storage::U64(values) => Some(values.as_ptr().cast()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn native_dense_mut_ptr(&mut self) -> Option<*mut u8> {
+        match &mut self.storage {
+            Storage::F32(values) => Some(values.as_mut_ptr().cast()),
+            Storage::U64(values) => Some(values.as_mut_ptr().cast()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn clear_native_dense(&mut self) {
+        match &mut self.storage {
+            Storage::F32(values) => values.fill(0.0),
+            Storage::U64(values) => values.fill(0),
+            _ => unreachable!("compiled recurrent native storage was validated"),
+        }
+    }
+
     /// Returns a borrowed, read-only TensorIO-compatible stream for this
     /// realized rank-one U8 value.
     pub fn byte_reader(&self) -> Result<TensorDataReader<'_>> {
