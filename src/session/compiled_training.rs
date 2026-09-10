@@ -5,6 +5,7 @@ mod state_schema;
 use self::state_schema::{
     AdamWGlobalState, AdamWParameterState, INTERNAL_PREFIX, RecurrentStateKey, StateSpec,
 };
+use super::native_training_scoreboard::CompiledAdamWInspection;
 use super::target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,
     NativeCpuSessionTarget, SessionTarget,
@@ -5375,6 +5376,41 @@ impl CompiledAdamWPlan {
         }
     }
 
+    /// Returns immutable logical work and recurrent-state facts without
+    /// preparing a runtime or exposing the raw mixed capture.
+    pub fn inspection(&self) -> Result<CompiledAdamWInspection> {
+        let recurrent_state = checked_recurrent_state_extent(
+            self.inner
+                .state_values
+                .values()
+                .map(checked_bytes)
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        let main = (
+            self.capture_identity(),
+            self.inner.recurrent_capture.execution_plan().clone(),
+        );
+        let partial_flush = self.partial_flush.as_ref().map(|transition| {
+            (
+                transition.capture_identity(),
+                transition.recurrent_capture.execution_plan().clone(),
+            )
+        });
+        let evaluation = self.evaluation.as_ref().map(|evaluation| {
+            (
+                evaluation.capture_identity,
+                evaluation.inference.execution_plan().clone(),
+            )
+        });
+        Ok(CompiledAdamWInspection::new(
+            self.step_count(),
+            main,
+            partial_flush,
+            evaluation,
+            recurrent_state,
+        ))
+    }
+
     /// Returns the explicit compiled dropout policy, when present.
     pub fn dropout_config(&self) -> Option<CompiledDropoutConfig> {
         self.dropout.map(|dropout| dropout.config)
@@ -5589,6 +5625,12 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
 
     pub fn capture_identity(&self) -> u64 {
         self.plan.capture_identity()
+    }
+
+    /// Returns the owned plan's immutable logical work and recurrent-state
+    /// inspection without exposing its sealed module.
+    pub fn inspection(&self) -> Result<CompiledAdamWInspection> {
+        self.plan.inspection()
     }
 
     pub fn step_count(&self) -> u64 {
@@ -6240,14 +6282,14 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     .prepare_native(inner.parameter_snapshots()?, executor, vectorized)
             })
             .transpose()?;
-        let recurrent_state_count = inner.inner.cursor.frontier().len();
-        let recurrent_state_bytes = inner
-            .inner
-            .cursor
-            .frontier()
-            .iter()
-            .try_fold(0usize, |total, state| total.checked_add(state.bytes))
-            .ok_or_else(|| training("compiled native CPU state bytes overflow"))?;
+        let (recurrent_state_count, recurrent_state_bytes) = checked_recurrent_state_extent(
+            inner
+                .inner
+                .cursor
+                .frontier()
+                .iter()
+                .map(|state| state.bytes),
+        )?;
         Ok(Self {
             inner,
             executor,
@@ -8343,6 +8385,23 @@ fn checked_bytes(value: &TensorData) -> Result<usize> {
         .len()
         .checked_mul(value.dtype().itemsize())
         .ok_or_else(|| training("compiled tensor byte extent overflow"))
+}
+
+fn checked_recurrent_state_extent(
+    bytes: impl IntoIterator<Item = usize>,
+) -> Result<(usize, usize)> {
+    bytes
+        .into_iter()
+        .try_fold((0usize, 0usize), |(count, total), bytes| {
+            Ok((
+                count
+                    .checked_add(1)
+                    .ok_or_else(|| training("compiled recurrent state count overflows"))?,
+                total
+                    .checked_add(bytes)
+                    .ok_or_else(|| training("compiled recurrent state bytes overflow"))?,
+            ))
+        })
 }
 
 fn checked_descriptor(shape: &Shape, dtype: DType) -> Result<usize> {

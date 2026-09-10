@@ -10,6 +10,13 @@
 //! cargo run --example compiled_transformer_train_resume -- cpu-reuse
 //! ```
 //!
+//! Emit a bounded strict-native CPU training scoreboard from that same
+//! compile-once path:
+//!
+//! ```text
+//! cargo run --release --example compiled_transformer_train_resume -- native-cpu-scoreboard
+//! ```
+//!
 //! Run on the graph-free CPU replay target:
 //!
 //! ```text
@@ -37,10 +44,11 @@ use rustgrad::{
     CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
     CompiledModuleAdamWPlan, CompiledModuleAdamWSession, CompiledMultiStepLr,
     CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuNonFinitePolicy,
-    CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NativeCpuSessionTarget, NodeId,
-    Parameter, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
+    CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NativeCpuSessionTarget,
+    NativeTrainingScoreboard, NodeId, Parameter, Result, Scalar, Shape, TensorData,
+    TrainingDropoutProvider, TransformerBlock,
 };
-use std::{cell::Cell, collections::BTreeMap, env, error::Error};
+use std::{cell::Cell, collections::BTreeMap, env, error::Error, time::Instant};
 
 const VOCAB: usize = 3;
 const EMBEDDING: usize = 2;
@@ -774,8 +782,82 @@ fn run_cpu_reuse() -> Result<()> {
     Ok(())
 }
 
+fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
+    const SAMPLES: u64 = 6;
+
+    let source = BufferedTinyCausalTransformer::new(7)?;
+    let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1])?;
+    let builds = Cell::new(0);
+    let compile_started = Instant::now();
+    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+        reuse_config(schedule)?,
+        dropout_config(),
+        &source,
+        |model, graph, inputs, dropout| {
+            builds.set(builds.get() + 1);
+            build_buffered(model, graph, inputs, dropout)
+        },
+    )?;
+    let compile_wall_time = compile_started.elapsed();
+    assert_eq!(builds.get(), 1, "the training graph must compile once");
+    let inspection = plan.inspection()?;
+
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor)
+        .vectorized(true)
+        .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let prepare_started = Instant::now();
+    let mut session = plan.prepare(&target)?;
+    let prepare_wall_time = prepare_started.elapsed();
+    let mut scoreboard = NativeTrainingScoreboard::new(
+        inspection.clone(),
+        session.preparation_report(),
+        compile_wall_time,
+        prepare_wall_time,
+    )?;
+    for replay in 1..=SAMPLES {
+        let step = session.step_batch_scheduled(batch(replay)?)?;
+        scoreboard.record(step.report())?;
+    }
+
+    let checkpoint_started = Instant::now();
+    let checkpoint = session.checkpoint()?;
+    let checkpoint_wall_time = checkpoint_started.elapsed();
+    scoreboard.observe_checkpoint(&checkpoint, checkpoint_wall_time)?;
+    let report = scoreboard.report()?;
+
+    let restored = plan.restore_checkpoint(&checkpoint)?;
+    let restored_inspection = restored.inspection()?;
+    assert_eq!(restored_inspection.main(), inspection.main());
+    assert_eq!(
+        restored_inspection.partial_flush(),
+        inspection.partial_flush()
+    );
+    assert_eq!(
+        restored_inspection.recurrent_state_count(),
+        inspection.recurrent_state_count()
+    );
+    assert_eq!(
+        restored_inspection.recurrent_state_bytes(),
+        inspection.recurrent_state_bytes()
+    );
+    assert_eq!(builds.get(), 1, "checkpoint restore must not rebuild");
+    let restored_session = restored.prepare(&target)?;
+    assert_eq!(
+        restored_session
+            .preparation_report()
+            .main()
+            .cache_miss_count(),
+        0
+    );
+
+    print!("{}", String::from_utf8(report.to_json_bytes()?)?);
+    Ok(())
+}
+
 fn main() -> std::result::Result<(), Box<dyn Error>> {
     match env::args().nth(1).as_deref().unwrap_or("cpu") {
+        "native-cpu-scoreboard" => run_native_cpu_scoreboard()?,
         "cpu-reuse" => run_cpu_reuse()?,
         "cpu" => {
             let target = CpuSessionTarget::new();
@@ -804,7 +886,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         }
         other => {
             return Err(format!(
-                "unknown target {other:?}; expected `cpu-reuse`, `cpu`, `native-cpu`, or `metal`"
+                "unknown target {other:?}; expected `native-cpu-scoreboard`, `cpu-reuse`, `cpu`, `native-cpu`, or `metal`"
             )
             .into());
         }
