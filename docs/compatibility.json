@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:4426a1b24c5c5dec",
+  "source_fingerprint": "fnv1a64:9286a6c1c5563d43",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -423,7 +423,16 @@
       "subject": "Captured MultiStep learning rate for compiled AdamW",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Opt-in immutable `CompiledMultiStepLr` derives each candidate update rate inside the graph from the existing recurrent completed-update Step. Interpreter/native CPU expose explicit no-LR scheduled step and partial-flush entrypoints through `CompiledScheduledAdamWRuntime`; wrong-mode calls reject atomically, capture identity authenticates checkpoint restoration policy, and strict Metal rejects scheduled planning before rendering or resources. It adds no recurrent state or checkpoint fields, while the default external-LR capture and APIs remain unchanged."
+        "Acceptance requirement": "Opt-in immutable `CompiledMultiStepLr` derives each candidate update rate inside the graph from the existing recurrent completed-update Step. Construction rehearses `base * gamma^k` at F32 width and rejects any non-finite milestone rate. Interpreter/native CPU expose explicit no-LR scheduled step and partial-flush entrypoints through `CompiledScheduledAdamWRuntime`; wrong-mode calls reject atomically, capture identity authenticates checkpoint restoration policy, and strict Metal rejects scheduled planning before rendering or resources. It adds no recurrent state or checkpoint fields, while the default external-LR capture and APIs remain unchanged."
+      }
+    },
+    {
+      "section": "Runtime, codegen and JIT",
+      "subject_header": "Capability",
+      "subject": "CPU non-finite admission for compiled AdamW",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`CpuNonFinitePolicy::RejectTransition` is selected on `CpuSessionTarget` through the source-compatible `ConfiguredCpuSessionTarget`, or directly on `NativeCpuSessionTarget`. Interpreter and strict-native CPU stage the exact authenticated replay, require a finite rank-zero F32 loss and every fully applied final F32 recurrent successor, then perform the existing single atomic commit; non-finite external learning rates reject before staging. Rejection preserves parameters, moments, partial accumulators, optimizer/replay progress, dropout position, cursor versions, and native successful-invocation counts, so corrected retry is exact. Named outputs, non-F32 counters, signed zero, subnormals, and empty F32 tensors are not rejected. The default remains IEEE propagation, and the target-owned policy changes no plan, capture, checkpoint identity, or wire format. Metal is unchanged."
       }
     },
     {

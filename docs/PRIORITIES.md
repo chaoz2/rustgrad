@@ -74,7 +74,15 @@ native-JIT `NativeCpuSessionTarget`, or an explicitly selected strict
 `MetalSessionTarget`; the optimizer-neutral loop is shared without a backend
 enum. Native CPU preparation compiles the main, partial-flush, and evaluation
 programs before mutable replay and exposes typed cache/work/state evidence;
-unsupported items fail closed without interpreter fallback. Seven CPU replays
+unsupported items fail closed without interpreter fallback. The maintained
+proof uses the historical propagation target, while an opt-in CPU-only
+`CpuNonFinitePolicy::RejectTransition` stages the same authenticated program and
+admits only a finite scalar loss plus fully applied final F32 recurrent
+successors before its one effect commit. Non-finite external rates reject before
+staging, deterministic captured MultiStep rate overflow rejects at construction,
+and failed admission preserves the exact retryable checkpoint/dropout/progress
+frontier without changing capture or wire identity. Named outputs and Metal are
+unchanged. Seven CPU replays
 use deterministic distinct `[2,3]` microbatches under a
 three-replay accumulation window and active finite global clipping. After two
 replays, a nonempty `zero_grad` cancellation preserves replay/dropout progress

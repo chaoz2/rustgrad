@@ -47,7 +47,10 @@ pub use inference::{
 pub(crate) use inference::{
     CapturedHostGather, CapturedHostIndexedMovement, CapturedHostIndexedMovementKind,
 };
-pub use target::{CpuSessionTarget, MetalSessionTarget, NativeCpuSessionTarget, SessionTarget};
+pub use target::{
+    ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,
+    NativeCpuSessionTarget, SessionTarget,
+};
 pub use train::{
     CpuBinaryModuleTrainer, CpuModeModuleTrainer, CpuModuleTrainer, ModuleBinaryCrossEntropy,
     ModuleCrossEntropy, ModuleStepResult,

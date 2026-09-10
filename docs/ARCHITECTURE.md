@@ -955,6 +955,20 @@ capture/native identities, and call-local wall times excluded from identity.
 Unsupported preparation and failed execution or commit publish neither state
 nor progress; checkpoint bytes and capture identity are shared with the
 interpreter and strict-Metal targets.
+CPU targets may opt into `CpuNonFinitePolicy::RejectTransition`. The historical
+unit `CpuSessionTarget` remains the propagation default and returns a separate
+`ConfiguredCpuSessionTarget` when that policy is selected; strict-native CPU
+retains it directly on `NativeCpuSessionTarget`. Mixed replay exposes a narrow
+crate-private checked-replay seam that lends detached requested outputs and
+fully applied next-frontier candidates to a validator while keeping staging and
+commit bound to the same runtime borrow. CPU compiled AdamW checks only its
+rank-zero F32 loss and final F32 recurrent successors before the existing
+single commit. A rejection executes no effect batch and
+therefore advances no runtime state, cursor, optimizer/replay/dropout progress,
+or native success count. External non-finite rates reject before staging, and
+`CompiledMultiStepLr` construction rehearses all finite F32 milestone rates.
+This target-owned admission policy changes no graph, capture identity,
+checkpoint identity, or wire bytes; named outputs and Metal remain unchanged.
 Compiled Transformer residual dropout is an explicit workload extension rather
 than optimizer state. `TrainingDropoutProvider` supplies the block's two
 source-ordered residual sites, while `CompiledDropoutConfig` adds one immutable
@@ -971,7 +985,8 @@ By default every step accepts exact declared inputs plus one rank-zero F32
 learning rate, preserving the historical capture byte-for-byte. AdamW may
 instead opt into immutable `CompiledMultiStepLr` policy: the graph derives the
 candidate update rate from its existing recurrent completed-update Step, with
-each strictly increasing positive milestone scaling the following update.
+each strictly increasing positive milestone scaling the following update; the
+complete F32 rate sequence is validated finite before capture.
 Interpreter/native CPU expose the `CompiledScheduledAdamWRuntime` capability
 and explicit `step_scheduled`/`flush_partial_window_scheduled` entrypoints with
 no learning-rate argument; wrong-mode calls reject before state or progress can

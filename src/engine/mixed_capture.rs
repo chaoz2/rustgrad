@@ -115,6 +115,27 @@ struct StagedMixedReplay {
     outputs: Vec<crate::TensorData>,
 }
 
+/// Execution context for a strict-native replay of a captured pure prefix.
+/// Keeping the executor and vectorization policy together prevents replay
+/// entry points from growing parallel backend-configuration arguments.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeReplayContext<'a> {
+    executor: &'a super::captured_replay::CapturedReplayExecutor,
+    vectorized: bool,
+}
+
+impl<'a> NativeReplayContext<'a> {
+    pub(crate) const fn new(
+        executor: &'a super::captured_replay::CapturedReplayExecutor,
+        vectorized: bool,
+    ) -> Self {
+        Self {
+            executor,
+            vectorized,
+        }
+    }
+}
+
 /// Stable logical identity of a strict-native mixed replay. The native JIT
 /// retains ownership of compiled-item reuse; this trace binds that reuse to
 /// the decoded RGSM schema without creating a second cache.
@@ -454,35 +475,32 @@ impl CapturedMixedSchedule {
         provided: &BTreeMap<String, crate::TensorData>,
         injected_failure: Option<u64>,
     ) -> Result<MixedReplayResult, ReplayError> {
-        validate(self, true)?;
-        validate_recurrent_cursor(self, cursor)?;
+        self.replay_recurrent_checked(runtime, cursor, provided, injected_failure, |_, _| Ok(()))
+    }
 
-        let starts = recurrent_rebase_starts(self, cursor)?;
-        let mut candidates = BTreeMap::new();
-        for state in &cursor.frontier {
-            let value = runtime
-                .snapshot(state)
-                .map_err(|error| ReplayError::Execute(format!("recurrent preflight: {error:?}")))?
-                .tensor()
-                .clone();
-            candidates.insert(state.clone(), value);
-        }
-
-        let staged = self.stage(&mut candidates, starts, provided, None, true)?;
-        let batch = crate::EffectBatch::new(vec![staged.entry])
-            .map_err(|error| ReplayError::Execute(format!("recurrent stage: {error:?}")))?;
-        let next_frontier = recurrent_advanced_frontier(&cursor.frontier, &batch)?;
-        let injected_failure =
-            injected_failure.map(|step| crate::EffectBatchStep { entry: 0, step });
-        let committed = runtime
-            .execute_batch(&batch, injected_failure)
-            .map_err(|error| ReplayError::Execute(format!("recurrent commit: {error:?}")))?;
-        cursor.frontier = next_frontier;
-        Ok(MixedReplayResult {
-            outputs: staged.outputs,
-            committed,
-            native_trace: None,
-        })
+    /// Replays one interpreter transition while admitting its detached outputs
+    /// and fully applied final successor candidates immediately before commit.
+    /// Staging and commit remain bound to this exact runtime borrow, so a
+    /// validator cannot move an authenticated transition between runtimes.
+    pub(crate) fn replay_recurrent_checked<F>(
+        &self,
+        runtime: &mut crate::EffectRuntime,
+        cursor: &mut MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        injected_failure: Option<u64>,
+        validate_transition: F,
+    ) -> Result<MixedReplayResult, ReplayError>
+    where
+        F: FnOnce(&[crate::TensorData], &[crate::TensorData]) -> Result<(), String>,
+    {
+        self.replay_recurrent_checked_impl(
+            runtime,
+            cursor,
+            provided,
+            None,
+            injected_failure,
+            validate_transition,
+        )
     }
 
     /// Compiles the exact recurrent pure prefix without executing it or
@@ -518,21 +536,46 @@ impl CapturedMixedSchedule {
         })
     }
 
-    /// Strict-native counterpart to [`Self::replay_recurrent`]. All pure
-    /// items are planned before any is executed, and persistent publication
-    /// remains the same single atomic effect batch and cursor transition.
-    pub(crate) fn replay_recurrent_native(
+    /// Strict-native counterpart to [`Self::replay_recurrent_checked`].
+    pub(crate) fn replay_recurrent_native_checked<F>(
         &self,
         runtime: &mut crate::EffectRuntime,
         cursor: &mut MixedReplayCursor,
         provided: &BTreeMap<String, crate::TensorData>,
-        executor: &super::captured_replay::CapturedReplayExecutor,
-        vectorized: bool,
+        native: NativeReplayContext<'_>,
         injected_failure: Option<u64>,
-    ) -> Result<MixedReplayResult, ReplayError> {
+        validate_transition: F,
+    ) -> Result<MixedReplayResult, ReplayError>
+    where
+        F: FnOnce(&[crate::TensorData], &[crate::TensorData]) -> Result<(), String>,
+    {
+        self.replay_recurrent_checked_impl(
+            runtime,
+            cursor,
+            provided,
+            Some(native),
+            injected_failure,
+            validate_transition,
+        )
+    }
+
+    fn replay_recurrent_checked_impl<F>(
+        &self,
+        runtime: &mut crate::EffectRuntime,
+        cursor: &mut MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        native: Option<NativeReplayContext<'_>>,
+        injected_failure: Option<u64>,
+        validate_transition: F,
+    ) -> Result<MixedReplayResult, ReplayError>
+    where
+        F: FnOnce(&[crate::TensorData], &[crate::TensorData]) -> Result<(), String>,
+    {
         validate(self, true)?;
         validate_recurrent_cursor(self, cursor)?;
-        let native_trace = self.native_replay_trace(vectorized)?;
+        let native_trace = native
+            .map(|native| self.native_replay_trace(native.vectorized))
+            .transpose()?;
 
         let starts = recurrent_rebase_starts(self, cursor)?;
         let mut candidates = BTreeMap::new();
@@ -545,16 +588,20 @@ impl CapturedMixedSchedule {
             candidates.insert(state.clone(), value);
         }
 
-        let staged = self.stage(
-            &mut candidates,
-            starts,
-            provided,
-            Some((executor, vectorized)),
-            true,
-        )?;
+        let staged = self.stage(&mut candidates, starts, provided, native, true)?;
         let batch = crate::EffectBatch::new(vec![staged.entry])
             .map_err(|error| ReplayError::Execute(format!("recurrent stage: {error:?}")))?;
         let next_frontier = recurrent_advanced_frontier(&cursor.frontier, &batch)?;
+        let successors = next_frontier
+            .iter()
+            .map(|state| {
+                candidates
+                    .get(state)
+                    .cloned()
+                    .ok_or_else(|| ReplayError::Missing("staged recurrent successor".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_transition(&staged.outputs, &successors).map_err(ReplayError::Execute)?;
         let injected_failure =
             injected_failure.map(|step| crate::EffectBatchStep { entry: 0, step });
         let committed = runtime
@@ -564,7 +611,7 @@ impl CapturedMixedSchedule {
         Ok(MixedReplayResult {
             outputs: staged.outputs,
             committed,
-            native_trace: Some(native_trace),
+            native_trace,
         })
     }
 
@@ -585,7 +632,7 @@ impl CapturedMixedSchedule {
         candidates: &mut BTreeMap<BufferState, crate::TensorData>,
         starts: BTreeMap<u64, BufferState>,
         provided: &BTreeMap<String, crate::TensorData>,
-        native: Option<(&super::captured_replay::CapturedReplayExecutor, bool)>,
+        native: Option<NativeReplayContext<'_>>,
         preserve_requested: bool,
     ) -> Result<StagedMixedReplay, ReplayError> {
         validate(self, true)?;
@@ -664,9 +711,12 @@ impl CapturedMixedSchedule {
             |reason| ReplayError::Descriptor(reason.into()),
         )?;
         let values = match native {
-            Some((executor, vectorized)) => {
-                super::captured_replay::replay_native_items(&pure, &inputs, executor, vectorized)?
-            }
+            Some(native) => super::captured_replay::replay_native_items(
+                &pure,
+                &inputs,
+                native.executor,
+                native.vectorized,
+            )?,
             None => super::captured_replay::replay_interpreter_items(&pure, &inputs)?,
         };
         let outputs = if preserve_requested {
@@ -1880,6 +1930,27 @@ mod recurrent_tests {
         let (capture, mut runtime) = fixture(320);
         let initial = capture.initial_recurrent_cursor().unwrap();
         let initial_values = frontier_values(&runtime, &initial);
+
+        let mut rejected = initial.clone();
+        let error = capture
+            .replay_recurrent_checked(
+                &mut runtime,
+                &mut rejected,
+                &delta(1.0),
+                None,
+                |outputs, successors| {
+                    assert_eq!(outputs[0].storage(), &Storage::F32(vec![1.0, 1.0]));
+                    assert_eq!(successors[0].storage(), &Storage::F32(vec![1.0, 1.0]));
+                    Err("fixture admission rejection".into())
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ReplayError::Execute(message) if message == "fixture admission rejection"
+        ));
+        assert_eq!(rejected, initial);
+        assert_eq!(frontier_values(&runtime, &initial), initial_values);
 
         let mut shadowed = initial.clone();
         let mut inputs = delta(1.0);
