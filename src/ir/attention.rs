@@ -980,6 +980,44 @@ impl Graph {
         Ok(output)
     }
 
+    /// Crate-private attention lowering whose probability dropout is supplied
+    /// by a larger stateful graph capture. The callback is invoked exactly once
+    /// after softmax and before the value matmul.
+    pub(crate) fn scaled_dot_product_attention_with_dropout<F>(
+        &mut self,
+        query: NodeId,
+        key: NodeId,
+        value: NodeId,
+        attn_mask: Option<NodeId>,
+        options: AttentionOptions,
+        dropout: F,
+    ) -> Result<NodeId>
+    where
+        F: FnOnce(&mut Graph, NodeId, f64) -> Result<NodeId>,
+    {
+        if !options.dropout_p.is_finite() || !(0.0..=1.0).contains(&options.dropout_p) {
+            return Err(Error::InvalidAttention {
+                reason: "dropout_p must be in [0, 1]",
+            });
+        }
+        let request = AttentionRequest {
+            query,
+            key,
+            value,
+            attn_mask,
+            scale: options.scale,
+            is_causal: options.is_causal,
+            enable_gqa: options.enable_gqa,
+        };
+        let plan = attention_plan(self, request)?;
+        let mut staged = self.clone();
+        let output = staged.lower_attention_with(request, &plan, |graph, probabilities| {
+            dropout(graph, probabilities, options.dropout_p)
+        })?;
+        *self = staged;
+        Ok(output)
+    }
+
     /// Checked-in tinygrad's source-facing scaled dot-product attention.
     ///
     /// Dropout reads [`TrainingContext`] and defaults to evaluation identity.
@@ -1106,6 +1144,25 @@ impl Graph {
         plan: &AttentionPlan,
         dropout: AttentionDropout,
     ) -> Result<NodeId> {
+        self.lower_attention_with(request, plan, |graph, probabilities| match dropout {
+            AttentionDropout::Explicit { training, seed } => {
+                graph.dropout(probabilities, dropout_p, training, seed)
+            }
+            AttentionDropout::Ambient(stream) => {
+                graph.lower_ambient_dropout(probabilities, dropout_p, stream)
+            }
+        })
+    }
+
+    fn lower_attention_with<F>(
+        &mut self,
+        request: AttentionRequest,
+        plan: &AttentionPlan,
+        dropout: F,
+    ) -> Result<NodeId>
+    where
+        F: FnOnce(&mut Graph, NodeId) -> Result<NodeId>,
+    {
         let AttentionRequest {
             query,
             mut key,
@@ -1140,14 +1197,7 @@ impl Graph {
         }
         let scores = self.cast(scores, plan.query_dtype)?;
         let probabilities = self.softmax(scores, -1, None)?;
-        let probabilities = match dropout {
-            AttentionDropout::Explicit { training, seed } => {
-                self.dropout(probabilities, dropout_p, training, seed)?
-            }
-            AttentionDropout::Ambient(stream) => {
-                self.lower_ambient_dropout(probabilities, dropout_p, stream)?
-            }
-        };
+        let probabilities = dropout(self, probabilities)?;
         let output = self.matmul(probabilities, value)?;
         debug_assert_eq!(
             self.shape(output).expect("attention preflighted"),

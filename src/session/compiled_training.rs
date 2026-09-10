@@ -7132,6 +7132,11 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         self.inner.non_finite_policy
     }
 
+    /// Explicit diagnostic snapshot of the recurrent dropout counter.
+    pub fn dropout_block_counter(&self) -> Result<Option<u64>> {
+        self.inner.dropout_block_counter()
+    }
+
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
         self.inner.checkpoint()
     }

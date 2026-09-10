@@ -20,13 +20,24 @@ enum ResidualDropout {
 /// Supplies explicit training-time dropout while a static Transformer graph is
 /// being constructed.
 ///
-/// Providers own any replay state and reservation order. The block invokes the
-/// provider exactly twice on successful block lowering, for its attention and
-/// feed-forward residual branches respectively; attention-weight dropout is
-/// intentionally outside this interface. An earlier lowering error may stop
-/// before the second call.
+/// Providers own any replay state and reservation order. By default the block
+/// invokes [`Self::dropout`] exactly twice on successful lowering, for its
+/// attention and feed-forward residual branches respectively. An opt-in
+/// attention-probability dropout invokes [`Self::attention_dropout`] first;
+/// its default implementation preserves compatibility with existing providers
+/// by delegating to [`Self::dropout`]. An earlier lowering error may stop before
+/// later calls.
 pub trait TrainingDropoutProvider {
     fn dropout(&mut self, graph: &mut Graph, input: NodeId, probability: f64) -> Result<NodeId>;
+
+    fn attention_dropout(
+        &mut self,
+        graph: &mut Graph,
+        probabilities: NodeId,
+        probability: f64,
+    ) -> Result<NodeId> {
+        self.dropout(graph, probabilities, probability)
+    }
 }
 
 /// The checked source stores each Transformer projection as a `(weight, bias)`
@@ -102,6 +113,7 @@ pub struct TransformerBlock<A = ReLU> {
     feed_forward_dim: usize,
     prenorm: bool,
     is_causal: bool,
+    attention_dropout: f64,
     dropout: f64,
     dropout_seeds: [u64; 2],
 }
@@ -171,6 +183,7 @@ impl<A: ModuleForward> TransformerBlock<A> {
             feed_forward_dim,
             prenorm,
             is_causal: false,
+            attention_dropout: 0.0,
             dropout,
             dropout_seeds: [seed.wrapping_add(6), seed.wrapping_add(7)],
         })
@@ -205,6 +218,19 @@ impl<A: ModuleForward> TransformerBlock<A> {
 
     pub const fn is_causal(&self) -> bool {
         self.is_causal
+    }
+
+    /// Selects dropout on the softmax attention probabilities for the explicit
+    /// provider-based training path. Zero preserves the historical two-site
+    /// residual-dropout graph exactly.
+    pub fn with_attention_dropout(mut self, probability: f64) -> Result<Self> {
+        validate_dropout_probability(probability)?;
+        self.attention_dropout = probability;
+        Ok(self)
+    }
+
+    pub const fn attention_dropout(&self) -> f64 {
+        self.attention_dropout
     }
 
     pub const fn dropout(&self) -> f64 {
@@ -258,6 +284,44 @@ impl<A: ModuleForward> TransformerBlock<A> {
         // view of the attention result when `time > 1`. Materialize that
         // source reshape boundary once so the following source-Linear Dot
         // reads ordinary contiguous `[batch, time, embedding]` storage.
+        let attended = graph.contiguous(attended)?;
+        let attended = graph.reshape(attended, [batch, time, self.embedding_dim])?;
+        self.out.forward(graph, attended)
+    }
+
+    fn attention_with_provider<P: TrainingDropoutProvider + ?Sized>(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        batch: usize,
+        time: usize,
+        provider: &mut P,
+    ) -> Result<NodeId> {
+        let heads = |graph: &mut Graph, projection: &TransformerProjection| -> Result<NodeId> {
+            let projected = projection.forward(graph, input)?;
+            let projected =
+                graph.reshape(projected, [batch, time, self.num_heads, self.head_size])?;
+            graph.permute(projected, vec![0, 2, 1, 3])
+        };
+        let query = heads(graph, &self.query)?;
+        let key = heads(graph, &self.key)?;
+        let value = heads(graph, &self.value)?;
+        let attended = graph.scaled_dot_product_attention_with_dropout(
+            query,
+            key,
+            value,
+            None,
+            AttentionOptions {
+                is_causal: self.is_causal,
+                dropout_p: self.attention_dropout,
+                training: true,
+                ..AttentionOptions::default()
+            },
+            |graph, probabilities, probability| {
+                provider.attention_dropout(graph, probabilities, probability)
+            },
+        )?;
+        let attended = graph.permute(attended, vec![0, 2, 1, 3])?;
         let attended = graph.contiguous(attended)?;
         let attended = graph.reshape(attended, [batch, time, self.embedding_dim])?;
         self.out.forward(graph, attended)
@@ -332,6 +396,28 @@ impl<A: ModuleForward> TransformerBlock<A> {
         input: NodeId,
         provider: &mut P,
     ) -> Result<NodeId> {
+        if self.attention_dropout > 0.0 {
+            let (batch, time) = self.geometry(graph, input)?;
+            if self.prenorm {
+                let normalized = self.ln1.forward(graph, input)?;
+                let attended =
+                    self.attention_with_provider(graph, normalized, batch, time, provider)?;
+                let attended = provider.dropout(graph, attended, self.dropout)?;
+                let residual = graph.add(input, attended)?;
+                let normalized = self.ln2.forward(graph, residual)?;
+                let feed_forward = self.feed_forward(graph, normalized)?;
+                let feed_forward = provider.dropout(graph, feed_forward, self.dropout)?;
+                return graph.add(residual, feed_forward);
+            }
+            let attended = self.attention_with_provider(graph, input, batch, time, provider)?;
+            let attended = provider.dropout(graph, attended, self.dropout)?;
+            let residual = graph.add(input, attended)?;
+            let residual = self.ln1.forward(graph, residual)?;
+            let feed_forward = self.feed_forward(graph, residual)?;
+            let feed_forward = provider.dropout(graph, feed_forward, self.dropout)?;
+            let output = graph.add(residual, feed_forward)?;
+            return self.ln2.forward(graph, output);
+        }
         self.lower_with_dropout(graph, input, &mut |graph, input, _branch| {
             provider.dropout(graph, input, self.dropout)
         })
@@ -503,7 +589,22 @@ mod tests {
         assert_eq!(block.feed_forward_dim(), 8);
         assert!(!block.prenorm());
         assert!(!block.is_causal());
+        assert_eq!(block.attention_dropout(), 0.0);
         assert_eq!(block.dropout(), 0.1);
+        assert!(matches!(
+            TransformerBlock::new_static(4, 2, 8, false, 0.1, 1)
+                .unwrap()
+                .with_attention_dropout(f64::NAN),
+            Err(Error::UnsupportedDropout { .. })
+        ));
+        assert_eq!(
+            TransformerBlock::new_static(4, 2, 8, false, 0.1, 1)
+                .unwrap()
+                .with_attention_dropout(0.25)
+                .unwrap()
+                .attention_dropout(),
+            0.25
+        );
         let state = block.state_dict().unwrap();
         assert_eq!(state.tensors()["ff1.0"].shape(), &Shape::new([4, 8]));
         assert_eq!(state.tensors()["ff2.0"].shape(), &Shape::new([8, 4]));
