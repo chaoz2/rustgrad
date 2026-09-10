@@ -9,11 +9,12 @@ use rustgrad::runtime::metal::{
 use rustgrad::{
     Backend, CapturedReplayExecutor, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig,
     CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
-    CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
-    CompiledModuleAdamWPlan, CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep,
-    CpuBackend, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions,
-    MetalCompiledAdamWPlan, Module, NativeCpuSessionTarget, NativeTrainingReport,
+    CompiledAdamWStep, CompiledAdamWStepResult, CompiledCheckpointRuntime, CompiledDropoutConfig,
+    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
+    CompiledInputSpec, CompiledModuleAdamWPlan, CompiledMultiStepLr, CompiledTrainingRuntime,
+    CompiledTrainingStep, CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget,
+    DType, Error, Graph, LossOptions, MetalCompiledAdamWPlan, Module, NativeCpuCompiledAdamW,
+    NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget, NativeTrainingReport,
     NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
     TrainingDropoutProvider, TransformerBlock, cross_entropy, load_safetensors, save_safetensors,
 };
@@ -34,6 +35,8 @@ const LOSS_MASK: &str = "loss_mask";
 const MULTI_HEAD_VOCAB: usize = 5;
 const MULTI_HEAD_EMBEDDING: usize = 4;
 const MULTI_HEAD_FEED_FORWARD: usize = 8;
+const TWO_BLOCK_ACCUMULATION_STEPS: u64 = 2;
+const TWO_BLOCK_MAX_GRADIENT_NORM: f32 = 1e-4;
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -217,6 +220,111 @@ impl Module for MultiHeadCausalTransformer {
     }
 }
 
+struct TwoBlockPositionalGpt {
+    tokens: Embedding,
+    positions: Embedding,
+    first: TransformerBlock,
+    second: TransformerBlock,
+    norm: LayerNorm,
+}
+
+impl TwoBlockPositionalGpt {
+    fn new(seed: u64) -> Result<Self> {
+        let model = Self {
+            tokens: Embedding::new_static(MULTI_HEAD_VOCAB, MULTI_HEAD_EMBEDDING, None, seed)?,
+            positions: Embedding::new_static(
+                TIME,
+                MULTI_HEAD_EMBEDDING,
+                None,
+                seed.wrapping_add(1),
+            )?,
+            first: TransformerBlock::new_static(
+                MULTI_HEAD_EMBEDDING,
+                2,
+                MULTI_HEAD_FEED_FORWARD,
+                true,
+                0.25,
+                seed.wrapping_add(2),
+            )?
+            .with_causal_attention(true),
+            second: TransformerBlock::new_static(
+                MULTI_HEAD_EMBEDDING,
+                2,
+                MULTI_HEAD_FEED_FORWARD,
+                true,
+                0.25,
+                seed.wrapping_add(3),
+            )?
+            .with_causal_attention(true),
+            norm: LayerNorm::new_static([MULTI_HEAD_EMBEDDING], 1e-5, true)?,
+        };
+        let feed_forward_bias = TensorData::new(
+            [MULTI_HEAD_FEED_FORWARD],
+            vec![2.0, -2.0, 2.25, -2.25, 2.5, -2.5, 2.75, -2.75],
+        )?;
+        for path in ["first.ff1.1", "second.ff1.1"] {
+            let mut parameter = None;
+            model.visit("", &mut |name, candidate, _| {
+                if name == path {
+                    parameter = Some(candidate.clone());
+                }
+            });
+            parameter
+                .unwrap_or_else(|| panic!("two-block GPT must expose {path}"))
+                .replace(feed_forward_bias.clone())?;
+        }
+        Ok(model)
+    }
+
+    fn forward(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<NodeId> {
+        let token_hidden = self.tokens.forward(graph, tokens)?;
+        let positions = graph.constant(TensorData::from_scalars(
+            [BATCH, TIME],
+            DType::I32,
+            [0, 1, 2, 0, 1, 2].into_iter().map(Scalar::I),
+        )?);
+        let position_hidden = self.positions.forward(graph, positions)?;
+        let hidden = graph.add(token_hidden, position_hidden)?;
+        let hidden = self
+            .first
+            .forward_training_with_dropout(graph, hidden, dropout)?;
+        let hidden = self
+            .second
+            .forward_training_with_dropout(graph, hidden, dropout)?;
+        let hidden = self.norm.forward(graph, hidden)?;
+        let tied_weight = self.tokens.weight.bind(graph)?;
+        let tied_weight = graph.permute(tied_weight, [1, 0])?;
+        graph.matmul(hidden, tied_weight)
+    }
+}
+
+impl Module for TwoBlockPositionalGpt {
+    fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        let child = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+        self.tokens.visit(&child("tokens"), visitor);
+        self.positions.visit(&child("positions"), visitor);
+        self.first.visit(&child("first"), visitor);
+        self.second.visit(&child("second"), visitor);
+        self.norm.visit(&child("norm"), visitor);
+        visitor(
+            child("lm_head.weight"),
+            &self.tokens.weight,
+            StateKind::Parameter,
+        );
+    }
+}
+
 struct BufferedTinyCausalTransformer {
     transformer: TinyCausalTransformer,
     running_marker: Parameter,
@@ -300,6 +408,19 @@ fn multi_head_config() -> CompiledAdamWConfig {
         .unwrap()
 }
 
+fn two_block_config() -> CompiledAdamWConfig {
+    CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_gradient_accumulation(TWO_BLOCK_ACCUMULATION_STEPS)
+        .unwrap()
+        .with_max_gradient_norm(TWO_BLOCK_MAX_GRADIENT_NORM)
+        .unwrap()
+        .with_host_token_input("tokens", [BATCH, TIME])
+        .unwrap()
+        .with_host_token_input("targets", [BATCH, TIME])
+        .unwrap()
+}
+
 fn sparse_causal_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
     let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
     let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
@@ -361,6 +482,18 @@ fn build_multi_head(
     let mut dropout = FixedResidualDropout::multi_head();
     let logits = model.forward(graph, inputs["tokens"], &mut dropout)?;
     assert_eq!(dropout.next, 2);
+    let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
+    Ok((loss, BTreeMap::from([("logits".into(), logits)])))
+}
+
+fn build_two_block(
+    model: &TwoBlockPositionalGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let mut dropout = FixedResidualDropout::two_block();
+    let logits = model.forward(graph, inputs["tokens"], &mut dropout)?;
+    assert_eq!(dropout.next, 4);
     let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
     Ok((loss, BTreeMap::from([("logits".into(), logits)])))
 }
@@ -795,7 +928,7 @@ fn sparse_causal_loss_matches_dense_reference_and_analytic_gradient() {
 }
 
 struct FixedResidualDropout {
-    masks: [TensorData; 2],
+    masks: Vec<TensorData>,
     next: usize,
 }
 
@@ -819,8 +952,11 @@ impl FixedResidualDropout {
         ])
     }
 
-    fn from_masks(masks: [TensorData; 2]) -> Self {
-        Self { masks, next: 0 }
+    fn from_masks<const N: usize>(masks: [TensorData; N]) -> Self {
+        Self {
+            masks: masks.into(),
+            next: 0,
+        }
     }
 
     fn multi_head() -> Self {
@@ -842,6 +978,18 @@ impl FixedResidualDropout {
                 true, true, false, true, true, false, true, true, false, true, true,
             ]),
         ])
+    }
+
+    fn two_block() -> Self {
+        Self::from_masks::<4>(std::array::from_fn(|site| {
+            TensorData::from_scalars(
+                [BATCH, TIME, MULTI_HEAD_EMBEDDING],
+                DType::Bool,
+                (0..BATCH * TIME * MULTI_HEAD_EMBEDDING)
+                    .map(|coordinate| Scalar::Bool((coordinate + site * 5) % 4 != 0)),
+            )
+            .unwrap()
+        }))
     }
 }
 
@@ -865,7 +1013,7 @@ impl TrainingDropoutProvider for FixedResidualDropout {
         let mask = self
             .masks
             .get(self.next)
-            .expect("the maintained block has exactly two residual-dropout sites")
+            .expect("the fixed residual-dropout fixture is exhausted")
             .clone();
         assert_eq!(graph.shape(input)?, mask.shape());
         self.next += 1;
@@ -1291,8 +1439,8 @@ fn relu_region_unchanged(base: &TensorData, perturbed: &TensorData) -> bool {
         })
 }
 
-fn unique_relu_input(graph: &Graph, loss: NodeId) -> NodeId {
-    let relu_inputs = graph
+fn relu_inputs(graph: &Graph, loss: NodeId) -> Vec<NodeId> {
+    graph
         .trace(loss)
         .unwrap()
         .steps
@@ -1328,7 +1476,11 @@ fn unique_relu_input(graph: &Graph, loss: NodeId) -> NodeId {
                 _ => None,
             }
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn unique_relu_input(graph: &Graph, loss: NodeId) -> NodeId {
+    let relu_inputs = relu_inputs(graph, loss);
     assert_eq!(relu_inputs.len(), 1);
     relu_inputs[0]
 }
@@ -1664,6 +1816,11 @@ struct NumericalMultiHeadTransformerEvaluation {
     gradients: Vec<f64>,
 }
 
+struct NumericalTwoBlockGptEvaluation {
+    loss: f64,
+    gradients: Vec<f64>,
+}
+
 fn numerical_multi_head_transformer_gradient_lanes(
     model: &MultiHeadCausalTransformer,
     inputs: BTreeMap<String, TensorData>,
@@ -1768,6 +1925,122 @@ fn numerical_multi_head_transformer_gradient_lanes(
         })
         .collect();
     NumericalMultiHeadTransformerEvaluation {
+        loss: base.outputs[0].scalar_at(0).as_f64(),
+        gradients,
+    }
+}
+
+fn numerical_two_block_gpt_gradient_lanes(
+    model: &TwoBlockPositionalGpt,
+    inputs: BTreeMap<String, TensorData>,
+    probes: &[TransformerGradientProbe],
+) -> NumericalTwoBlockGptEvaluation {
+    const EPSILONS: [f64; 4] = [1e-2, 5e-3, 2.5e-3, 1e-3];
+    const RELU_MARGIN: f64 = 0.25;
+
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let mut dropout = FixedResidualDropout::two_block();
+    let logits = model.forward(&mut graph, tokens, &mut dropout).unwrap();
+    assert_eq!(dropout.next, 4);
+    let loss = multi_head_sparse_causal_loss(&mut graph, logits, targets).unwrap();
+    let relu_inputs = relu_inputs(&graph, loss);
+    assert_eq!(relu_inputs.len(), 2);
+
+    let parameter_inputs = model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| {
+            let node = parameter.node(&graph).unwrap();
+            let Op::Input { name: input_name } = graph.op(node).unwrap() else {
+                panic!("bound trainable parameter {name} must be a graph input");
+            };
+            (name, input_name.clone())
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert!(
+        probes
+            .iter()
+            .all(|probe| parameter_inputs.contains_key(probe.parameter))
+    );
+
+    let mut bindings = model.input_bindings(&graph).unwrap();
+    bindings.extend(inputs);
+    let mut outputs = Vec::with_capacity(1 + relu_inputs.len());
+    outputs.push(loss);
+    outputs.extend(relu_inputs);
+    let base = CpuBackend
+        .execute_many(&graph, &outputs, &bindings)
+        .unwrap();
+    assert!(
+        base.outputs[1..].iter().all(|relu| {
+            relu.to_vec_f64()
+                .into_iter()
+                .all(|value| value.abs() >= RELU_MARGIN)
+        }),
+        "the two-block finite-difference fixture must stay away from ReLU kinks"
+    );
+
+    let gradients = probes
+        .iter()
+        .map(|probe| {
+            let input_name = &parameter_inputs[probe.parameter];
+            let parameter = &bindings[input_name];
+            assert!(probe.coordinate < parameter.len());
+            let context = format!(
+                "{} through {}[{}]",
+                probe.boundary, probe.parameter, probe.coordinate
+            );
+            EPSILONS
+                .into_iter()
+                .find_map(|epsilon| {
+                    let plus = CpuBackend
+                        .execute_many(
+                            &graph,
+                            &outputs,
+                            &perturbed_parameter_bindings(
+                                &bindings,
+                                input_name,
+                                parameter,
+                                probe.coordinate,
+                                epsilon,
+                            ),
+                        )
+                        .unwrap();
+                    let minus = CpuBackend
+                        .execute_many(
+                            &graph,
+                            &outputs,
+                            &perturbed_parameter_bindings(
+                                &bindings,
+                                input_name,
+                                parameter,
+                                probe.coordinate,
+                                -epsilon,
+                            ),
+                        )
+                        .unwrap();
+                    let preserved = |perturbed: &[TensorData]| {
+                        base.outputs[1..]
+                            .iter()
+                            .zip(&perturbed[1..])
+                            .all(|(base, perturbed)| relu_region_unchanged(base, perturbed))
+                    };
+                    if !preserved(&plus.outputs) || !preserved(&minus.outputs) {
+                        return None;
+                    }
+                    Some(
+                        (plus.outputs[0].scalar_at(0).as_f64()
+                            - minus.outputs[0].scalar_at(0).as_f64())
+                            / (2.0 * epsilon),
+                    )
+                })
+                .unwrap_or_else(|| panic!("no bounded central difference preserved {context}"))
+        })
+        .collect();
+    NumericalTwoBlockGptEvaluation {
         loss: base.outputs[0].scalar_at(0).as_f64(),
         gradients,
     }
@@ -2887,6 +3160,284 @@ fn compiled_multi_head_transformer_gradients_match_forward_only_oracle_and_nativ
     assert_eq!(model.tokens.weight.id(), tied_identity);
     assert!(interpreted_gradients.contains_key("tokens.weight"));
     assert!(!interpreted_gradients.contains_key("lm_head.weight"));
+}
+
+fn assert_two_block_tensor_maps_close(
+    label: &str,
+    interpreted: &BTreeMap<String, TensorData>,
+    native: &BTreeMap<String, TensorData>,
+) {
+    const ABSOLUTE_TOLERANCE: f64 = 2e-5;
+    const RELATIVE_TOLERANCE: f64 = 2e-4;
+    assert_eq!(
+        interpreted.keys().collect::<Vec<_>>(),
+        native.keys().collect::<Vec<_>>()
+    );
+    for (name, expected) in interpreted {
+        let actual = &native[name];
+        assert_eq!(actual.shape(), expected.shape(), "{label} {name} shape");
+        assert_eq!(actual.dtype(), expected.dtype(), "{label} {name} dtype");
+        for coordinate in 0..expected.len() {
+            let expected = expected.scalar_at(coordinate).as_f64();
+            let actual = actual.scalar_at(coordinate).as_f64();
+            let error = (actual - expected).abs();
+            let tolerance =
+                ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * actual.abs().max(expected.abs());
+            assert!(
+                actual.is_finite() && expected.is_finite() && error <= tolerance,
+                "{label} {name}[{coordinate}] mismatch: actual={actual}, expected={expected}, error={error}, tolerance={tolerance}"
+            );
+        }
+    }
+}
+
+fn assert_two_block_step_close(
+    replay: u64,
+    interpreted: &CompiledAdamWStepResult,
+    native: &NativeCpuCompiledAdamWStepResult,
+) {
+    assert_eq!(native.report().fallback_count(), 0);
+    assert_eq!(native.step(), replay);
+    assert_eq!(native.step(), interpreted.step());
+    assert_eq!(native.did_update(), interpreted.did_update());
+    assert_eq!(native.optimizer_step(), interpreted.optimizer_step());
+    assert_eq!(
+        native.accumulation_index(),
+        interpreted.accumulation_index()
+    );
+    let actual = native.loss().scalar_at(0).as_f64();
+    let expected = interpreted.loss().scalar_at(0).as_f64();
+    let error = (actual - expected).abs();
+    let tolerance = 2e-5 + 2e-4 * actual.abs().max(expected.abs());
+    assert!(actual.is_finite() && expected.is_finite() && error <= tolerance);
+    assert_two_block_tensor_maps_close("step outputs", interpreted.outputs(), native.outputs());
+}
+
+fn assert_two_block_frontier_close(
+    interpreted: &CpuCompiledAdamW,
+    native: &NativeCpuCompiledAdamW<'_>,
+) {
+    assert_eq!(
+        interpreted.optimizer_step().unwrap(),
+        native.optimizer_step().unwrap()
+    );
+    assert_eq!(
+        interpreted.accumulation_index().unwrap(),
+        native.accumulation_index().unwrap()
+    );
+    for (label, interpreted, native) in [
+        (
+            "parameters",
+            interpreted.parameter_snapshots().unwrap(),
+            native.parameter_snapshots().unwrap(),
+        ),
+        (
+            "first moments",
+            interpreted.first_moment_snapshots().unwrap(),
+            native.first_moment_snapshots().unwrap(),
+        ),
+        (
+            "second moments",
+            interpreted.second_moment_snapshots().unwrap(),
+            native.second_moment_snapshots().unwrap(),
+        ),
+        (
+            "gradient accumulators",
+            interpreted.gradient_accumulator_snapshots().unwrap(),
+            native.gradient_accumulator_snapshots().unwrap(),
+        ),
+    ] {
+        assert_two_block_tensor_maps_close(label, &interpreted, &native);
+    }
+}
+
+#[test]
+fn compiled_two_block_positional_gpt_trains_resumes_and_matches_native_and_numerical() {
+    const NUMERICAL_ABSOLUTE_TOLERANCE: f64 = 6e-3;
+    const NUMERICAL_RELATIVE_TOLERANCE: f64 = 3e-3;
+    const PROBES: [TransformerGradientProbe; 7] = [
+        TransformerGradientProbe {
+            parameter: "tokens.weight",
+            coordinate: 7,
+            boundary: "token embedding and tied language-model head",
+        },
+        TransformerGradientProbe {
+            parameter: "positions.weight",
+            coordinate: 6,
+            boundary: "learned positional embedding",
+        },
+        TransformerGradientProbe {
+            parameter: "first.query.0",
+            coordinate: 0,
+            boundary: "first-block multi-head causal attention",
+        },
+        TransformerGradientProbe {
+            parameter: "first.out.0",
+            coordinate: 9,
+            boundary: "first-block post-head output projection",
+        },
+        TransformerGradientProbe {
+            parameter: "second.key.0",
+            coordinate: 11,
+            boundary: "second-block multi-head causal attention",
+        },
+        TransformerGradientProbe {
+            parameter: "second.ff1.0",
+            coordinate: 20,
+            boundary: "second-block feed-forward expansion and ReLU",
+        },
+        TransformerGradientProbe {
+            parameter: "norm.bias",
+            coordinate: 2,
+            boundary: "final LayerNorm and sparse causal loss",
+        },
+    ];
+
+    let model = TwoBlockPositionalGpt::new(0x5678).unwrap();
+    assert!(model.first.is_causal());
+    assert!(model.second.is_causal());
+    let mut identities = BTreeMap::new();
+    model.visit("", &mut |name, parameter, _| {
+        identities.insert(name, parameter.id());
+    });
+    assert_eq!(identities["tokens.weight"], identities["lm_head.weight"]);
+    assert_ne!(identities["tokens.weight"], identities["positions.weight"]);
+
+    let compile_count = Cell::new(0);
+    let plan =
+        CompiledAdamWPlan::compile_module(two_block_config(), &model, |model, graph, inputs| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block(model, graph, inputs)
+        })
+        .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(
+        plan.gradient_accumulation_steps(),
+        TWO_BLOCK_ACCUMULATION_STEPS
+    );
+    assert_eq!(plan.max_gradient_norm(), Some(TWO_BLOCK_MAX_GRADIENT_NORM));
+
+    let executor = CapturedReplayExecutor::default();
+    let native_target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let mut native = plan.prepare(&native_target).unwrap();
+    let preparation = native.preparation_report();
+    assert!(preparation.main().native_item_count() > 0);
+    assert_eq!(preparation.main().fallback_count(), 0);
+    assert_eq!(preparation.partial_flush().unwrap().fallback_count(), 0);
+    assert_eq!(preparation.zero_grad().unwrap().fallback_count(), 0);
+    let mut interpreted = plan.prepare(&CpuSessionTarget).unwrap();
+    assert_eq!(compile_count.get(), 1);
+
+    let input = multi_head_batch();
+    let learning_rate = || TensorData::scalar(1e-3);
+    let assert_close = |label: &str, actual: f64, expected: f64| {
+        let error = (actual - expected).abs();
+        let tolerance = 2e-5 + 2e-4 * actual.abs().max(expected.abs());
+        assert!(
+            actual.is_finite() && expected.is_finite() && error <= tolerance,
+            "{label} mismatch: actual={actual}, expected={expected}, error={error}, tolerance={tolerance}"
+        );
+    };
+    let mut first_loss = None;
+    let mut third_loss = None;
+
+    for replay in 1..=3 {
+        let interpreted_step = interpreted.step(input.clone(), learning_rate()).unwrap();
+        let native_step = native.step(input.clone(), learning_rate()).unwrap();
+        assert_eq!(
+            interpreted_step.did_update(),
+            replay % TWO_BLOCK_ACCUMULATION_STEPS == 0
+        );
+        assert_two_block_step_close(replay, &interpreted_step, &native_step);
+        assert_two_block_frontier_close(&interpreted, &native);
+
+        if replay == 1 {
+            first_loss = Some(interpreted_step.loss().scalar_at(0).as_f64());
+            let captured = interpreted.gradient_accumulator_snapshots().unwrap();
+            assert!(captured.contains_key("tokens.weight"));
+            assert!(captured.contains_key("positions.weight"));
+            assert!(!captured.contains_key("lm_head.weight"));
+            let gradient_norm = captured
+                .values()
+                .flat_map(TensorData::to_vec_f64)
+                .map(|gradient| gradient * gradient)
+                .sum::<f64>()
+                .sqrt();
+            assert!(gradient_norm.is_finite());
+            assert!(
+                gradient_norm > f64::from(TWO_BLOCK_MAX_GRADIENT_NORM),
+                "the repeated complete window must activate clipping: norm={gradient_norm}"
+            );
+
+            let numerical = numerical_two_block_gpt_gradient_lanes(&model, input.clone(), &PROBES);
+            assert_close(
+                "forward-only initial loss",
+                interpreted_step.loss().scalar_at(0).as_f64(),
+                numerical.loss,
+            );
+            for (probe, numerical) in PROBES.iter().zip(numerical.gradients) {
+                let captured = captured[probe.parameter]
+                    .scalar_at(probe.coordinate)
+                    .as_f64();
+                assert!(captured.is_finite() && numerical.is_finite());
+                assert!(
+                    captured != 0.0 && numerical != 0.0,
+                    "{} must carry a finite nonzero gradient: captured={captured}, numerical={numerical}",
+                    probe.boundary
+                );
+                let error = (captured - numerical).abs();
+                let tolerance = NUMERICAL_ABSOLUTE_TOLERANCE
+                    + NUMERICAL_RELATIVE_TOLERANCE * captured.abs().max(numerical.abs());
+                assert!(
+                    error <= tolerance,
+                    "{} {}[{}] mismatch: captured={captured}, numerical={numerical}, error={error}, tolerance={tolerance}",
+                    probe.boundary,
+                    probe.parameter,
+                    probe.coordinate
+                );
+            }
+        } else if replay == 2 {
+            assert_eq!(
+                interpreted_step.loss().scalar_at(0).as_f64(),
+                first_loss.unwrap(),
+                "the repeated accumulation batch is evaluated before its first update commits"
+            );
+        } else {
+            third_loss = Some(interpreted_step.loss().scalar_at(0).as_f64());
+        }
+    }
+
+    assert!(
+        third_loss.unwrap() < first_loss.unwrap(),
+        "one clipped AdamW update must decrease the fixed two-block GPT objective"
+    );
+    assert_eq!(interpreted.optimizer_step().unwrap(), 1);
+    assert_eq!(interpreted.accumulation_index().unwrap(), 1);
+    let checkpoint = interpreted.checkpoint().unwrap();
+    assert_eq!(checkpoint.info().replay_step(), 3);
+    assert_eq!(checkpoint.info().optimizer_step(), 1);
+    assert_eq!(checkpoint.info().accumulation_index(), 1);
+
+    let restored_plan = plan.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(restored_plan.capture_identity(), plan.capture_identity());
+    assert_eq!(compile_count.get(), 1);
+    let mut resumed = restored_plan.prepare(&CpuSessionTarget).unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+    let uninterrupted_step = interpreted.step(input.clone(), learning_rate()).unwrap();
+    let resumed_step = resumed.step(input.clone(), learning_rate()).unwrap();
+    assert_eq!(resumed_step.loss(), uninterrupted_step.loss());
+    assert_eq!(resumed_step.outputs(), uninterrupted_step.outputs());
+    assert_eq!(resumed_step.optimizer_step(), 2);
+    assert!(resumed_step.did_update());
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        interpreted.checkpoint().unwrap()
+    );
+
+    let native_step = native.step(input, learning_rate()).unwrap();
+    assert_two_block_step_close(4, &uninterrupted_step, &native_step);
+    assert_two_block_frontier_close(&interpreted, &native);
+    assert_eq!(compile_count.get(), 1);
 }
 
 #[test]
