@@ -94,6 +94,9 @@ const RESUMED_STEPS: usize = 3;
 const POLICY_FROZEN: &str = "block.ff1.0";
 const FILE_RESUME_POLICY_FROZEN: &str = "positions.weight";
 const LOSS_MASK: &str = "loss_mask";
+const ATTENTION_KEEP_MASK: &str = "attention_keep_mask";
+// Per-sample key validity broadcasts across heads and query positions.
+const ATTENTION_KEEP_MASK_SHAPE: [usize; 4] = [BATCH, 1, 1, TIME];
 
 struct TinyCausalTransformer {
     tokens: Embedding,
@@ -231,6 +234,7 @@ impl FileResumeTransformer {
         &self,
         graph: &mut Graph,
         tokens: NodeId,
+        attention_keep_mask: NodeId,
         dropout: &mut dyn TrainingDropoutProvider,
     ) -> Result<NodeId> {
         let token_hidden = self.tokens.forward(graph, tokens)?;
@@ -243,14 +247,29 @@ impl FileResumeTransformer {
         let hidden = graph.add(token_hidden, position_hidden)?;
         let hidden = self
             .first
-            .forward_training_with_dropout(graph, hidden, dropout)?;
+            .forward_training_with_dropout_and_attention_mask(
+                graph,
+                hidden,
+                attention_keep_mask,
+                dropout,
+            )?;
         let hidden = self
             .second
-            .forward_training_with_dropout(graph, hidden, dropout)?;
+            .forward_training_with_dropout_and_attention_mask(
+                graph,
+                hidden,
+                attention_keep_mask,
+                dropout,
+            )?;
         self.project_logits(graph, hidden)
     }
 
-    fn forward_eval(&self, graph: &mut Graph, tokens: NodeId) -> Result<NodeId> {
+    fn forward_eval(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        attention_keep_mask: NodeId,
+    ) -> Result<NodeId> {
         let token_hidden = self.tokens.forward(graph, tokens)?;
         let positions = graph.constant(TensorData::from_scalars(
             [BATCH, TIME],
@@ -259,8 +278,14 @@ impl FileResumeTransformer {
         )?);
         let position_hidden = self.positions.forward(graph, positions)?;
         let hidden = graph.add(token_hidden, position_hidden)?;
-        let hidden = self.first.forward_mode(graph, hidden, Mode::Eval)?.output;
-        let hidden = self.second.forward_mode(graph, hidden, Mode::Eval)?.output;
+        let hidden = self
+            .first
+            .forward_mode_with_attention_mask(graph, hidden, attention_keep_mask, Mode::Eval)?
+            .output;
+        let hidden = self
+            .second
+            .forward_mode_with_attention_mask(graph, hidden, attention_keep_mask, Mode::Eval)?
+            .output;
         self.project_logits(graph, hidden)
     }
 
@@ -331,7 +356,7 @@ fn file_resume_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConf
         .with_loss_scale(128.0)?
         .with_gradient_accumulation(ACCUMULATION_STEPS)?
         .with_max_gradient_norm(MAX_GRADIENT_NORM)?
-        .with_input_batch::<MaskedTransformerBatch>()?
+        .with_input_batch::<FileResumeBatch>()?
         .with_token_weighted_gradient_accumulation(LOSS_MASK)?
         .with_frozen_parameters([FILE_RESUME_POLICY_FROZEN])?
         .with_captured_multi_step_lr(schedule)
@@ -401,7 +426,12 @@ fn build_file_resume(
     inputs: &BTreeMap<String, NodeId>,
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<CompiledAdamWGraph> {
-    let logits = model.forward(graph, inputs[MaskedTransformerBatch::TOKENS], dropout)?;
+    let logits = model.forward(
+        graph,
+        inputs[MaskedTransformerBatch::TOKENS],
+        inputs[ATTENTION_KEEP_MASK],
+        dropout,
+    )?;
     let losses = sparse_causal_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
     Ok(CompiledAdamWGraph::token_mean(
         losses,
@@ -435,6 +465,81 @@ struct MaskedTransformerBatch {
     tokens: TensorData,
     targets: TensorData,
     loss_mask: TensorData,
+}
+
+struct FileResumeBatch {
+    masked: MaskedTransformerBatch,
+    attention_keep_mask: TensorData,
+}
+
+impl FileResumeBatch {
+    const SCHEMA: [CompiledInputSpec; 4] = [
+        CompiledInputSpec::new(ATTENTION_KEEP_MASK, &ATTENTION_KEEP_MASK_SHAPE, DType::Bool),
+        CompiledInputSpec::new(LOSS_MASK, &[BATCH, TIME], DType::F32),
+        CompiledInputSpec::host_token(MaskedTransformerBatch::TARGETS, &[BATCH, TIME]),
+        CompiledInputSpec::host_token(MaskedTransformerBatch::TOKENS, &[BATCH, TIME]),
+    ];
+
+    fn from_masked(masked: MaskedTransformerBatch) -> Result<Self> {
+        assert_eq!(masked.loss_mask.shape(), &Shape::new([BATCH, TIME]));
+        assert_eq!(masked.loss_mask.dtype(), DType::F32);
+        let validity = masked.loss_mask.to_vec_f64();
+        assert!(
+            validity
+                .iter()
+                .all(|value| value.is_finite() && (*value == 0.0 || *value == 1.0))
+        );
+        let attention_keep_mask = TensorData::from_scalars(
+            ATTENTION_KEEP_MASK_SHAPE,
+            DType::Bool,
+            validity.iter().map(|value| Scalar::Bool(*value == 1.0)),
+        )?;
+        let batch = Self {
+            masked,
+            attention_keep_mask,
+        };
+        batch.assert_attention_keep_mask();
+        Ok(batch)
+    }
+
+    fn assert_attention_keep_mask(&self) {
+        assert_eq!(
+            self.attention_keep_mask.shape(),
+            &Shape::new(ATTENTION_KEEP_MASK_SHAPE)
+        );
+        assert_eq!(self.attention_keep_mask.dtype(), DType::Bool);
+        assert_eq!(
+            self.attention_keep_mask.to_vec_f64(),
+            self.masked.loss_mask.to_vec_f64()
+        );
+    }
+
+    fn has_fully_masked_sample(&self) -> bool {
+        self.attention_keep_mask
+            .to_vec_f64()
+            .chunks_exact(TIME)
+            .any(|row| row.iter().all(|value| *value == 0.0))
+    }
+
+    fn loss_mask(&self) -> &TensorData {
+        &self.masked.loss_mask
+    }
+}
+
+impl CompiledInputBatch for FileResumeBatch {
+    fn schema() -> &'static [CompiledInputSpec] {
+        &Self::SCHEMA
+    }
+
+    fn into_compiled_inputs(self) -> Result<BTreeMap<String, TensorData>> {
+        let mut inputs = self.masked.into_compiled_inputs()?;
+        assert!(
+            inputs
+                .insert(ATTENTION_KEEP_MASK.into(), self.attention_keep_mask)
+                .is_none()
+        );
+        Ok(inputs)
+    }
 }
 
 impl MaskedTransformerBatch {
@@ -543,6 +648,10 @@ fn masked_batch(replay: u64) -> Result<MaskedTransformerBatch> {
     )
 }
 
+fn file_resume_batch(replay: u64) -> Result<FileResumeBatch> {
+    FileResumeBatch::from_masked(masked_batch(replay)?)
+}
+
 fn loss_mask_weight(mask: &TensorData) -> u64 {
     mask.to_vec_f64().into_iter().sum::<f64>() as u64
 }
@@ -605,14 +714,16 @@ fn evaluate_mean_file_resume_loss(model: &FileResumeTransformer) -> Result<f64> 
     let tokens = graph.input_dtype(MaskedTransformerBatch::TOKENS, [BATCH, TIME], DType::I32);
     let targets = graph.input_dtype(MaskedTransformerBatch::TARGETS, [BATCH, TIME], DType::I32);
     let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
-    let logits = model.forward_eval(&mut graph, tokens)?;
+    let attention_keep_mask =
+        graph.input_dtype(ATTENTION_KEEP_MASK, ATTENTION_KEEP_MASK_SHAPE, DType::Bool);
+    let logits = model.forward_eval(&mut graph, tokens, attention_keep_mask)?;
     let loss = masked_sparse_causal_loss(&mut graph, logits, targets, loss_mask)?;
     let parameter_bindings = model.input_bindings(&graph)?;
     let mut weighted_loss_sum = 0.0;
     let mut loss_weight_sum = 0;
     for replay in 1..=ACCUMULATION_STEPS {
-        let batch = masked_batch(replay)?;
-        let loss_weight = loss_mask_weight(&batch.loss_mask);
+        let batch = file_resume_batch(replay)?;
+        let loss_weight = loss_mask_weight(batch.loss_mask());
         let mut bindings = parameter_bindings.clone();
         bindings.extend(batch.into_compiled_inputs()?);
         let normalized_loss = CpuBackend
@@ -1142,6 +1253,10 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
     let schedule = CompiledMultiStepLr::new(1e-3, 0.5, [1])?;
     let config = file_resume_config(schedule.clone())?;
     assert!(config.clip_report_enabled());
+    assert!(
+        file_resume_batch(3)?.has_fully_masked_sample(),
+        "the zero-length row must exercise fully masked attention"
+    );
     let source = FileResumeTransformer::new(0x5678)?;
     let source_initial = source.state_dict()?;
     let initial_loss = evaluate_mean_file_resume_loss(&source)?;
@@ -1160,8 +1275,8 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         .prepare(&target)
         .map_err(|error| error.into_parts().1)?;
     for replay in 1..=4 {
-        let batch = masked_batch(replay)?;
-        let loss_weight = loss_mask_weight(&batch.loss_mask);
+        let batch = file_resume_batch(replay)?;
+        let loss_weight = loss_mask_weight(batch.loss_mask());
         let step = uninterrupted.step_batch_scheduled(batch)?;
         assert_eq!(step.loss_weight(), loss_weight);
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
@@ -1267,8 +1382,8 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         Some(saved_dropout_cursor)
     );
     for replay in 5..=LAST_REPLAY {
-        let expected = uninterrupted.step_batch_scheduled(masked_batch(replay)?)?;
-        let actual = resumed.step_batch_scheduled(masked_batch(replay)?)?;
+        let expected = uninterrupted.step_batch_scheduled(file_resume_batch(replay)?)?;
+        let actual = resumed.step_batch_scheduled(file_resume_batch(replay)?)?;
         assert_eq!(actual.loss(), expected.loss());
         assert_eq!(actual.outputs(), expected.outputs());
         assert_eq!(
