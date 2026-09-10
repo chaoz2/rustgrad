@@ -13,11 +13,13 @@ use rustgrad::{
     CompiledEvaluation, CompiledEvaluationRuntime, CompiledModuleAdamWPlan, CompiledMultiStepLr,
     CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuNonFinitePolicy,
     CpuSessionTarget, DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module,
-    NativeCpuSessionTarget, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
-    TrainingDropoutProvider, TransformerBlock, cross_entropy, load_safetensors, save_safetensors,
+    NativeCpuSessionTarget, NativeTrainingReport, NativeTrainingScoreboard, NodeId, Op, Parameter,
+    Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
+    cross_entropy, load_safetensors, save_safetensors,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::{env, fs::OpenOptions, io::Write, path::PathBuf};
 
@@ -1863,6 +1865,9 @@ fn compiled_transformer_native_cpu_target_is_strict_precompiled_and_resumes_exac
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
     let evaluation = run_exact_resume(1e-5, |plan| {
+        let inspection = plan.inspection()?;
+        assert!(inspection.partial_flush().is_some());
+        assert!(inspection.evaluation().is_some());
         let session = plan
             .prepare(&target)
             .map_err(|error| error.into_parts().1)?;
@@ -1876,6 +1881,120 @@ fn compiled_transformer_native_cpu_target_is_strict_precompiled_and_resumes_exac
     assert!(
         evaluation.final_mean_sparse_loss < evaluation.initial_mean_sparse_loss,
         "strict-native compiled causal Transformer eval loss did not decrease: {evaluation:?}"
+    );
+}
+
+#[test]
+fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let plan =
+        CompiledAdamWPlan::compile_module_with_dropout(config(), dropout_config(), &model, build)
+            .unwrap();
+    let inspection = plan.inspection().unwrap();
+    assert!(inspection.main().1.schedule_item_count > 0);
+    assert!(inspection.main().1.peak_logical_bytes > 0);
+    assert!(inspection.partial_flush().is_some());
+    assert!(inspection.evaluation().is_none());
+    assert!(inspection.recurrent_state_count() > 0);
+    assert!(inspection.recurrent_state_bytes() > 0);
+
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let mut session = plan.prepare(&target).unwrap();
+    let mut scoreboard = NativeTrainingScoreboard::new(
+        inspection.clone(),
+        session.preparation_report(),
+        Duration::ZERO,
+        Duration::ZERO,
+    )
+    .unwrap();
+
+    let mut malformed = batch(1);
+    malformed.remove("targets");
+    assert!(session.step(malformed, learning_rate()).is_err());
+    for replay in 1..=3 {
+        let step = session.step(batch(replay), learning_rate()).unwrap();
+        scoreboard.record(step.report()).unwrap();
+    }
+    let checkpoint = session.checkpoint().unwrap();
+    let checkpoint_bytes = checkpoint.as_bytes().len();
+    scoreboard
+        .observe_checkpoint(&checkpoint, Duration::ZERO)
+        .unwrap();
+    let report = scoreboard.report().unwrap();
+    let bytes = report.to_json_bytes().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report.successful_replay_count(), 3);
+    assert_eq!(report.steady_replay_wall_time().sample_count, 2);
+    assert_eq!(report.main().capture_identity(), inspection.main().0);
+    assert_eq!(
+        report.main().execution_plan_identity(),
+        inspection.main().1.identity
+    );
+    assert_eq!(
+        report.main().logical_schedule_item_count() as usize,
+        inspection.main().1.schedule_item_count,
+    );
+    assert_eq!(
+        report.main().peak_logical_temporary_bytes() as usize,
+        inspection.main().1.peak_logical_bytes,
+    );
+    assert_eq!(
+        report.schedule_cache_keys().len(),
+        report.main().native_item_count() as usize
+    );
+    assert_eq!(
+        report.partial_flush().unwrap().capture_identity(),
+        inspection.partial_flush().unwrap().0
+    );
+    assert_eq!(report.fallback_count(), 0);
+    assert_eq!(
+        report.recurrent_state_count() as usize,
+        inspection.recurrent_state_count()
+    );
+    assert_eq!(
+        report.recurrent_state_bytes() as usize,
+        inspection.recurrent_state_bytes()
+    );
+    assert_eq!(
+        report.checkpoint_byte_count().unwrap() as usize,
+        checkpoint_bytes
+    );
+    assert!(
+        report
+            .steady_microbatches_per_second()
+            .is_none_or(|rate| rate.is_finite() && rate > 0.0)
+    );
+    assert!(json["kernel_launch_count"].is_null());
+    assert!(json["host_to_device"].is_null());
+    assert!(json["device_to_host"].is_null());
+    assert!(json["measured_peak_host_memory_bytes"].is_null());
+    assert_eq!(
+        NativeTrainingReport::from_json_bytes(&bytes).unwrap(),
+        report
+    );
+
+    let restored = plan.restore_checkpoint(&checkpoint).unwrap();
+    let restored_inspection = restored.inspection().unwrap();
+    assert_eq!(restored_inspection.initial_replay_step(), 3);
+    assert_eq!(restored_inspection.main(), inspection.main());
+    assert_eq!(
+        restored_inspection.partial_flush(),
+        inspection.partial_flush()
+    );
+    assert_eq!(
+        restored_inspection.recurrent_state_count(),
+        inspection.recurrent_state_count()
+    );
+    assert_eq!(
+        restored_inspection.recurrent_state_bytes(),
+        inspection.recurrent_state_bytes()
+    );
+    let cached = restored.prepare(&target).unwrap();
+    assert_eq!(cached.preparation_report().main().cache_miss_count(), 0);
+    assert_eq!(
+        cached.preparation_report().main().cache_hit_count(),
+        cached.preparation_report().main().native_item_count()
     );
 }
 

@@ -74,7 +74,13 @@ native-JIT `NativeCpuSessionTarget`, or an explicitly selected strict
 `MetalSessionTarget`; the optimizer-neutral loop is shared without a backend
 enum. Native CPU preparation compiles the main, partial-flush, and evaluation
 programs before mutable replay and exposes typed cache/work/state evidence;
-unsupported items fail closed without interpreter fallback. The shared
+unsupported items fail closed without interpreter fallback. Its opt-in bounded
+training scoreboard authenticates immutable plan inspection against preparation
+and committed replay reports, separates first from steady samples, and
+serializes caller-observed compile/prepare/checkpoint time plus logical
+work/cache/state facts. Unsupported kernel-launch, transfer, and physical-memory
+measurements are explicitly absent, and no protected test asserts a latency or
+throughput threshold. The shared
 CPU/Metal proof and public example use the historical propagation target and
 external learning rate, while a dedicated CPU Transformer restore proof uses
 one borrowed compiled plan and captured MultiStep learning rate. It prepares

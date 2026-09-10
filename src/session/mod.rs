@@ -8,6 +8,7 @@ mod classification;
 mod compiled_training;
 mod cpu;
 mod inference;
+mod native_training_scoreboard;
 mod target;
 mod train;
 
@@ -46,6 +47,10 @@ pub use inference::{
 };
 pub(crate) use inference::{
     CapturedHostGather, CapturedHostIndexedMovement, CapturedHostIndexedMovementKind,
+};
+pub use native_training_scoreboard::{
+    CompiledAdamWInspection, NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeTrainingProgramReport,
+    NativeTrainingReport, NativeTrainingScoreboard,
 };
 pub use target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,

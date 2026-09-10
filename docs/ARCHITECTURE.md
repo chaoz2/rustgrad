@@ -955,6 +955,18 @@ capture/native identities, and call-local wall times excluded from identity.
 Unsupported preparation and failed execution or commit publish neither state
 nor progress; checkpoint bytes and capture identity are shared with the
 interpreter and strict-Metal targets.
+`CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
+the main and optional flush/evaluation programs plus checked logical recurrent
+state bytes without preparing a target or exposing a capture. The separate
+`NativeTrainingScoreboard` validates those facts against strict-native
+preparation and committed main-replay reports, then aggregates caller-observed
+compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
+sample set into versioned JSON. It reports deterministic
+schedule/native-item/cache inventories and logical temporary/state peaks; CPU
+kernel launches, host/device transfers,
+and measured physical peak host memory remain unavailable (`null`). Durations
+do not change any plan, capture, checkpoint, or native identity, and the report
+makes no threshold or speedup claim.
 CPU targets may opt into `CpuNonFinitePolicy::RejectTransition`. The historical
 unit `CpuSessionTarget` remains the propagation default and returns a separate
 `ConfiguredCpuSessionTarget` when that policy is selected; strict-native CPU
