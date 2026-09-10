@@ -1069,7 +1069,10 @@ targets, and at least one valid target before runtime mutation; the graph uses
 shares the same fixed program as full rows. An opt-in CPU accumulation policy
 re-sums the F32 mask in that graph, multiplies each normalized gradient by its
 batch count, retains one U64 total, and divides only at full-window commit or
-explicit partial flush before existing clipping and AdamW. The count resets
+explicit partial flush before existing clipping and AdamW. Each successful CPU
+step also reports that same validated U64 count as its loss aggregation weight;
+ordinary scalar-loss and Metal results report one. This is transient result
+metadata, not recurrent or checkpoint state. The count resets
 with accumulators on commit and `zero_grad`; checkpoint v6 carries it until
 captured reset history selects v7. A nonempty CPU `zero_grad` replays a separately
 authenticated, compile-once recurrent transition containing only gradient

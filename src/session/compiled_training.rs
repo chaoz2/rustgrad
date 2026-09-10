@@ -1524,12 +1524,15 @@ impl CompiledTrainingStep for CompiledTrainingStepResult {
 ///
 /// `step` counts microbatch replays. `optimizer_step` advances only when the
 /// configured accumulation window commits, and `accumulation_index` reports
-/// the number of retained microbatches toward the next update.
+/// the number of retained microbatches toward the next update. `loss_weight`
+/// is one for ordinary scalar-loss programs and the exact valid-token count for
+/// compiler-owned token-mean programs.
 #[derive(Clone, Debug)]
 pub struct CompiledAdamWStepResult {
     inner: CompiledTrainingStepResult,
     optimizer_step: u64,
     accumulation_index: u64,
+    loss_weight: u64,
 }
 
 impl CompiledAdamWStepResult {
@@ -1557,6 +1560,14 @@ impl CompiledAdamWStepResult {
         self.accumulation_index
     }
 
+    /// Exact weight of this step's normalized loss in an aggregate mean.
+    ///
+    /// Ordinary scalar-loss programs use one. Compiler-owned token-mean
+    /// programs use the validated number of non-padding tokens in this replay.
+    pub fn loss_weight(&self) -> u64 {
+        self.loss_weight
+    }
+
     pub fn did_update(&self) -> bool {
         self.accumulation_index == 0
     }
@@ -1574,6 +1585,15 @@ pub trait CompiledAdamWStep: CompiledTrainingStep {
     fn optimizer_step(&self) -> u64;
 
     fn accumulation_index(&self) -> u64;
+
+    /// Exact weight of this step's loss in the optimizer's aggregate mean.
+    ///
+    /// The default preserves ordinary scalar-loss and existing external
+    /// implementations. Token-mean CPU results override it with the validated
+    /// number of non-padding tokens in the replay.
+    fn loss_weight(&self) -> u64 {
+        1
+    }
 
     fn did_update(&self) -> bool {
         self.accumulation_index() == 0
@@ -1606,6 +1626,10 @@ impl CompiledAdamWStep for CompiledAdamWStepResult {
     fn accumulation_index(&self) -> u64 {
         CompiledAdamWStepResult::accumulation_index(self)
     }
+
+    fn loss_weight(&self) -> u64 {
+        CompiledAdamWStepResult::loss_weight(self)
+    }
 }
 
 /// One committed strict-native CPU AdamW step and its replay evidence.
@@ -1637,6 +1661,10 @@ impl NativeCpuCompiledAdamWStepResult {
 
     pub fn accumulation_index(&self) -> u64 {
         self.inner.accumulation_index()
+    }
+
+    pub fn loss_weight(&self) -> u64 {
+        self.inner.loss_weight()
     }
 
     pub fn did_update(&self) -> bool {
@@ -1677,6 +1705,10 @@ impl CompiledAdamWStep for NativeCpuCompiledAdamWStepResult {
 
     fn accumulation_index(&self) -> u64 {
         self.inner.accumulation_index()
+    }
+
+    fn loss_weight(&self) -> u64 {
+        self.inner.loss_weight()
     }
 }
 
@@ -2805,6 +2837,10 @@ impl MetalCompiledAdamWStepResult {
         self.inner.accumulation_index()
     }
 
+    pub fn loss_weight(&self) -> u64 {
+        self.inner.loss_weight()
+    }
+
     pub fn did_update(&self) -> bool {
         self.inner.did_update()
     }
@@ -2843,6 +2879,10 @@ impl CompiledAdamWStep for MetalCompiledAdamWStepResult {
 
     fn accumulation_index(&self) -> u64 {
         MetalCompiledAdamWStepResult::accumulation_index(self)
+    }
+
+    fn loss_weight(&self) -> u64 {
+        MetalCompiledAdamWStepResult::loss_weight(self)
     }
 }
 
@@ -6205,7 +6245,8 @@ impl CpuCompiledAdamW {
         injected_failure: Option<u64>,
     ) -> Result<CompiledAdamWStepResult> {
         validate_training_inputs(&self.inner.inputs, &inputs)?;
-        validate_token_weight_mask(&inputs, self.token_weight_mask_input.as_deref())?;
+        let loss_weight =
+            validate_token_weight_mask(&inputs, self.token_weight_mask_input.as_deref())?;
         let next = self
             .progress
             .advance_replay(self.gradient_accumulation_steps)?;
@@ -6220,7 +6261,7 @@ impl CpuCompiledAdamW {
         )?;
         result.step = next.replay_step;
         self.progress = next;
-        Ok(adamw_step_result(result, next))
+        Ok(adamw_step_result(result, next, loss_weight))
     }
 
     pub fn step_batch_scheduled<B>(&mut self, batch: B) -> Result<CompiledAdamWStepResult>
@@ -6664,7 +6705,8 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         injected_failure: Option<u64>,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
         validate_training_inputs(&self.inner.inner.inputs, &inputs)?;
-        validate_token_weight_mask(&inputs, self.inner.token_weight_mask_input.as_deref())?;
+        let loss_weight =
+            validate_token_weight_mask(&inputs, self.inner.token_weight_mask_input.as_deref())?;
         let next = self
             .inner
             .progress
@@ -6689,7 +6731,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         self.inner.progress = next;
         self.successful_steps = successful_invocation;
         Ok(NativeCpuCompiledAdamWStepResult {
-            inner: adamw_step_result(result, next),
+            inner: adamw_step_result(result, next, loss_weight),
             report,
         })
     }
@@ -7273,11 +7315,13 @@ where
 fn adamw_step_result(
     inner: CompiledTrainingStepResult,
     progress: AdamWProgress,
+    loss_weight: u64,
 ) -> CompiledAdamWStepResult {
     CompiledAdamWStepResult {
         inner,
         optimizer_step: progress.optimizer_step,
         accumulation_index: progress.accumulation_index,
+        loss_weight,
     }
 }
 
@@ -7755,6 +7799,7 @@ impl MetalCompiledAdamW {
                 capture_identity: self.inner.program_identity,
             },
             self.progress,
+            1,
         );
         Ok(MetalCompiledAdamWStepResult { inner, report })
     }
@@ -8627,9 +8672,9 @@ fn lower_token_mean_loss(
 fn validate_token_weight_mask(
     inputs: &BTreeMap<String, TensorData>,
     mask_input: Option<&str>,
-) -> Result<()> {
+) -> Result<u64> {
     let Some(mask_input) = mask_input else {
-        return Ok(());
+        return Ok(1);
     };
     let mask = inputs
         .get(mask_input)
@@ -8651,7 +8696,7 @@ fn validate_token_weight_mask(
             "compiled AdamW token-weight mask must contain at least one valid token",
         ));
     }
-    Ok(())
+    Ok(valid_tokens)
 }
 
 fn validate_retained_token_count(
@@ -9947,6 +9992,8 @@ mod tests {
         assert_eq!(actual.step(), expected.step());
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
         assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+        assert_eq!(expected.loss_weight(), 1);
+        assert_eq!(actual.loss_weight(), 1);
         assert_eq!(actual.report().successful_invocation(), 1);
         assert!(actual.report().first_successful_invocation());
         assert_eq!(actual.report().native_identity(), prepared_native_identity);
@@ -9963,6 +10010,8 @@ mod tests {
             actual.outputs(),
             expected.outputs(),
         );
+        assert_eq!(expected.loss_weight(), 1);
+        assert_eq!(actual.loss_weight(), 1);
         assert_eq!(actual.report().successful_invocation(), 2);
         assert_native_adamw_state_close(&native, &interpreted);
     }
@@ -11154,6 +11203,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first.loss().scalar_at(0).as_f64(), 2.0);
+        assert_eq!(first.loss_weight(), 2);
     }
 
     fn token_weighted_batch(features: [f32; 3], mask: [f32; 3]) -> BTreeMap<String, TensorData> {
@@ -11209,13 +11259,13 @@ mod tests {
         }
 
         let first_batch = token_weighted_batch([1.0, 100.0, 1.0], [1.0, -0.0, 1.0]);
-        assert!(
-            !interpreted
-                .step(first_batch.clone(), TensorData::scalar(0.1))
-                .unwrap()
-                .did_update()
-        );
+        let interpreted_first = interpreted
+            .step(first_batch.clone(), TensorData::scalar(0.1))
+            .unwrap();
+        assert!(!interpreted_first.did_update());
+        assert_eq!(interpreted_first.loss_weight(), 2);
         let native_first = native.step(first_batch, TensorData::scalar(0.1)).unwrap();
+        assert_eq!(native_first.loss_weight(), interpreted_first.loss_weight());
         assert_eq!(native_first.report().successful_invocation(), 1);
         assert_eq!(native_first.report().fallback_count(), 0);
         let checkpoint = interpreted.checkpoint().unwrap();
@@ -11251,18 +11301,22 @@ mod tests {
         let native_restored_plan = plan.restore_checkpoint(&native_checkpoint).unwrap();
         let mut native_restored = target.prepare(&native_restored_plan).unwrap();
         let second_batch = token_weighted_batch([3.0, 100.0, 100.0], [1.0, 0.0, 0.0]);
-        interpreted
+        let interpreted_second = interpreted
             .step(second_batch.clone(), TensorData::scalar(0.1))
             .unwrap();
-        restored
+        let restored_second = restored
             .step(second_batch.clone(), TensorData::scalar(0.1))
             .unwrap();
         let native_second = native
             .step(second_batch.clone(), TensorData::scalar(0.1))
             .unwrap();
-        native_restored
+        let native_restored_second = native_restored
             .step(second_batch, TensorData::scalar(0.1))
             .unwrap();
+        assert_eq!(interpreted_second.loss_weight(), 1);
+        assert_eq!(restored_second.loss_weight(), 1);
+        assert_eq!(native_second.loss_weight(), 1);
+        assert_eq!(native_restored_second.loss_weight(), 1);
         assert_eq!(native_second.report().fallback_count(), 0);
         assert_eq!(
             restored.checkpoint().unwrap(),
