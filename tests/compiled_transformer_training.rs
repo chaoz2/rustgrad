@@ -4479,7 +4479,7 @@ fn compiled_two_block_positional_gpt_trains_resumes_and_matches_native_and_numer
 }
 
 #[test]
-fn compiled_two_block_attention_masks_are_ordered_atomic_and_resume_exactly() {
+fn compiled_two_block_attention_mask_lifecycle_is_ordered_atomic_and_flush_resumes_exactly() {
     const ATTENTION_DROPOUT: f64 = 0.25;
     const BLOCKS_PER_REPLAY: u64 = 84;
 
@@ -4489,7 +4489,7 @@ fn compiled_two_block_attention_masks_are_ordered_atomic_and_resume_exactly() {
     assert_eq!(model.second.attention_dropout(), ATTENTION_DROPOUT);
     let compile_count = Cell::new(0);
     let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
-        two_block_attention_mask_config(),
+        two_block_attention_mask_config().with_clip_report(),
         dropout_config(),
         &model,
         |model, graph, inputs, dropout| {
@@ -4679,6 +4679,211 @@ fn compiled_two_block_attention_masks_are_ordered_atomic_and_resume_exactly() {
     assert_eq!(
         checkpoint.info().dropout_block_counter(),
         Some(4 * BLOCKS_PER_REPLAY)
+    );
+
+    let flush_capture_identity = plan.flush_capture_identity().unwrap();
+    let flush_plan = plan.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(flush_plan.capture_identity(), plan.capture_identity());
+    assert_eq!(
+        flush_plan.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
+    let mut flush_interpreted = flush_plan.prepare(&cpu_target).unwrap();
+    let mut flush_native = flush_plan.prepare(&native_target).unwrap();
+    assert_eq!(
+        flush_interpreted.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
+    assert_eq!(
+        flush_native.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
+    assert_eq!(flush_interpreted.checkpoint().unwrap(), checkpoint);
+    assert_eq!(flush_native.checkpoint().unwrap(), checkpoint);
+    assert!(
+        flush_interpreted
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .any(|value| value != 0.0)
+    );
+
+    let interpreted_flush = flush_interpreted
+        .flush_partial_window(learning_rate())
+        .unwrap();
+    let native_flush = flush_native.flush_partial_window(learning_rate()).unwrap();
+    assert_eq!(interpreted_flush.flushed_microbatches(), 1);
+    assert_eq!(native_flush.flushed_microbatches(), 1);
+    assert!(interpreted_flush.did_update());
+    assert!(native_flush.did_update());
+    assert_eq!(interpreted_flush.optimizer_step(), 2);
+    assert_eq!(native_flush.optimizer_step(), 2);
+    let interpreted_clip = interpreted_flush.clip_report().unwrap();
+    let native_clip = native_flush.clip_report().unwrap();
+    assert!(interpreted_clip.is_finite());
+    assert!(native_clip.is_finite());
+    assert_eq!(native_clip.did_clip(), interpreted_clip.did_clip());
+    for (field, expected, actual) in [
+        (
+            "pre-clip global norm",
+            f64::from(interpreted_clip.pre_clip_global_norm()),
+            f64::from(native_clip.pre_clip_global_norm()),
+        ),
+        (
+            "applied clip scale",
+            f64::from(interpreted_clip.applied_scale()),
+            f64::from(native_clip.applied_scale()),
+        ),
+    ] {
+        let error = (actual - expected).abs();
+        let tolerance = 2e-5 + 2e-4 * actual.abs().max(expected.abs());
+        assert!(
+            error <= tolerance,
+            "partial-flush {field} mismatch: actual={actual}, expected={expected}, error={error}, tolerance={tolerance}"
+        );
+    }
+    let native_flush_report = native_flush.report().unwrap();
+    assert_eq!(native_flush_report.fallback_count(), 0);
+    assert_eq!(native_flush_report.successful_invocation(), 1);
+    assert_eq!(flush_interpreted.step_count(), 4);
+    assert_eq!(flush_native.step_count(), 4);
+    assert_eq!(flush_interpreted.optimizer_step().unwrap(), 2);
+    assert_eq!(flush_native.optimizer_step().unwrap(), 2);
+    assert_eq!(flush_interpreted.accumulation_index().unwrap(), 0);
+    assert_eq!(flush_native.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        flush_interpreted.dropout_block_counter().unwrap(),
+        Some(4 * BLOCKS_PER_REPLAY)
+    );
+    assert_eq!(
+        flush_native.dropout_block_counter().unwrap(),
+        Some(4 * BLOCKS_PER_REPLAY)
+    );
+    assert_two_block_token_count(&flush_interpreted, &flush_native, 0);
+    for (label, accumulators) in [
+        (
+            "interpreted",
+            flush_interpreted.gradient_accumulator_snapshots().unwrap(),
+        ),
+        (
+            "native",
+            flush_native.gradient_accumulator_snapshots().unwrap(),
+        ),
+    ] {
+        assert!(
+            accumulators
+                .values()
+                .flat_map(TensorData::to_vec_f64)
+                .all(|value| value == 0.0),
+            "{label} partial flush must clear every gradient accumulator"
+        );
+    }
+    assert_two_block_frontier_close(&flush_interpreted, &flush_native);
+
+    let flushed_checkpoint = flush_interpreted.checkpoint().unwrap();
+    let flushed_info = *flushed_checkpoint.info();
+    assert_eq!(flushed_info.replay_step(), 4);
+    assert_eq!(flushed_info.optimizer_step(), 2);
+    assert_eq!(flushed_info.accumulation_index(), 0);
+    assert_eq!(flushed_info.accumulated_token_count(), Some(0));
+    assert_eq!(flushed_info.discarded_microbatches(), 1);
+    assert_eq!(flushed_info.flushed_window_count(), 1);
+    assert_eq!(flushed_info.flushed_microbatch_count(), 1);
+    assert_eq!(
+        flushed_info.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
+    assert_eq!(
+        flushed_info.dropout_block_counter(),
+        Some(4 * BLOCKS_PER_REPLAY)
+    );
+    assert_eq!(flush_native.checkpoint().unwrap().info(), &flushed_info);
+
+    let flush_resumed_plan = plan.restore_checkpoint(&flushed_checkpoint).unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(
+        flush_resumed_plan.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
+    let mut flush_resumed = flush_resumed_plan.prepare(&cpu_target).unwrap();
+    assert_eq!(flush_resumed.checkpoint().unwrap(), flushed_checkpoint);
+    let flush_uninterrupted_step = flush_interpreted
+        .step(attention_masked_dropout_batch(5, 1.0), learning_rate())
+        .unwrap();
+    let flush_resumed_step = flush_resumed
+        .step(attention_masked_dropout_batch(5, 1.0), learning_rate())
+        .unwrap();
+    assert_eq!(flush_resumed_step.loss(), flush_uninterrupted_step.loss());
+    assert_eq!(
+        flush_resumed_step.outputs(),
+        flush_uninterrupted_step.outputs()
+    );
+    assert_eq!(
+        flush_resumed_step.loss_weight(),
+        attention_masked_loss_weight(5)
+    );
+    assert_eq!(flush_resumed_step.optimizer_step(), 2);
+    assert_eq!(flush_resumed_step.accumulation_index(), 1);
+    assert!(!flush_resumed_step.did_update());
+    assert!(flush_resumed_step.clip_report().is_none());
+    assert_eq!(
+        flush_resumed_step.capture_identity(),
+        plan.capture_identity()
+    );
+    assert_two_block_frontier_exact(&flush_resumed, &flush_interpreted);
+    let flush_continuation_checkpoint = flush_interpreted.checkpoint().unwrap();
+    assert_eq!(
+        flush_resumed.checkpoint().unwrap(),
+        flush_continuation_checkpoint
+    );
+    let flush_continuation_info = *flush_continuation_checkpoint.info();
+    assert_eq!(flush_continuation_info.replay_step(), 5);
+    assert_eq!(flush_continuation_info.optimizer_step(), 2);
+    assert_eq!(flush_continuation_info.accumulation_index(), 1);
+    assert_eq!(
+        flush_continuation_info.accumulated_token_count(),
+        Some(attention_masked_loss_weight(5))
+    );
+    assert_eq!(flush_continuation_info.flushed_window_count(), 1);
+    assert_eq!(flush_continuation_info.flushed_microbatch_count(), 1);
+    assert_eq!(
+        flush_continuation_info.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
+    assert_eq!(
+        flush_continuation_info.dropout_block_counter(),
+        Some(5 * BLOCKS_PER_REPLAY)
+    );
+
+    let flush_native_step = flush_native
+        .step(attention_masked_dropout_batch(5, 1.0), learning_rate())
+        .unwrap();
+    assert_two_block_step_close(5, &flush_uninterrupted_step, &flush_native_step);
+    assert_eq!(flush_native_step.report().fallback_count(), 0);
+    assert!(flush_native_step.clip_report().is_none());
+    assert_eq!(
+        flush_native_step.capture_identity(),
+        plan.capture_identity()
+    );
+    assert_two_block_frontier_close(&flush_interpreted, &flush_native);
+    assert_two_block_token_count(
+        &flush_interpreted,
+        &flush_native,
+        attention_masked_loss_weight(5),
+    );
+    assert_eq!(
+        flush_native.checkpoint().unwrap().info(),
+        &flush_continuation_info
+    );
+    assert_eq!(
+        flush_native.dropout_block_counter().unwrap(),
+        Some(5 * BLOCKS_PER_REPLAY)
+    );
+    assert_eq!(
+        flush_interpreted.dropout_block_counter().unwrap(),
+        Some(5 * BLOCKS_PER_REPLAY)
     );
 
     let restored_plan = plan.restore_checkpoint(&checkpoint).unwrap();
