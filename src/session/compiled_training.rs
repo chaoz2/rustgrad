@@ -10006,6 +10006,10 @@ mod tests {
         assert_eq!(native_checkpoint.info(), interpreted_checkpoint.info());
     }
 
+    fn native_recurrent_test_counts(native: &NativeCpuCompiledAdamW<'_>) -> (usize, usize, usize) {
+        native.inner.inner.runtime.recurrent_test_counts()
+    }
+
     #[test]
     fn native_cpu_adamw_prepares_strictly_reuses_cache_and_commits_atomically() {
         let plan = CompiledAdamWPlan::compile(adamw_config(), initial_parameters(), build_tinybob)
@@ -10046,7 +10050,12 @@ mod tests {
 
         let mut interpreted = plan.prepare_cpu().unwrap();
         let expected = interpreted.step(batch(), lr()).unwrap();
+        let before_replay = native_recurrent_test_counts(&native);
         let actual = native.step(batch(), lr()).unwrap();
+        let after_replay = native_recurrent_test_counts(&native);
+        assert_eq!(after_replay.0, before_replay.0);
+        assert!(after_replay.1 > before_replay.1);
+        assert_eq!(after_replay.2, before_replay.2 + 1);
         assert_cross_engine_tensor_close("first loss", actual.loss(), expected.loss());
         assert_cross_engine_tensor_maps_close(
             "first outputs",
@@ -10068,7 +10077,12 @@ mod tests {
         assert_eq!(first_workspace.intermediate_materialization_count, 0);
 
         let before_failure = native.checkpoint().unwrap();
+        let before_failure_counts = native_recurrent_test_counts(&native);
         assert!(native.step_inner(batch(), lr(), Some(0)).is_err());
+        let after_failure_counts = native_recurrent_test_counts(&native);
+        assert_eq!(after_failure_counts.0, before_failure_counts.0);
+        assert!(after_failure_counts.1 > before_failure_counts.1);
+        assert_eq!(after_failure_counts.2, before_failure_counts.2);
         assert_eq!(native.checkpoint().unwrap(), before_failure);
         let failed_workspace = native.main_replay.workspace_stats();
         assert_eq!(
@@ -10077,7 +10091,11 @@ mod tests {
         );
         assert_eq!(failed_workspace.intermediate_materialization_count, 0);
         let expected = interpreted.step(batch(), lr()).unwrap();
+        let before_retry = native_recurrent_test_counts(&native);
         let actual = native.step(batch(), lr()).unwrap();
+        let after_retry = native_recurrent_test_counts(&native);
+        assert_eq!(after_retry.0, before_retry.0);
+        assert_eq!(after_retry.2, before_retry.2 + 1);
         assert_cross_engine_tensor_close("retry loss", actual.loss(), expected.loss());
         assert_cross_engine_tensor_maps_close(
             "retry outputs",
@@ -10142,14 +10160,23 @@ mod tests {
             expected.outputs(),
         );
         let before_failed_reset = native.checkpoint().unwrap();
+        let before_failed_reset_counts = native_recurrent_test_counts(&native);
         assert_eq!(native.successful_zero_grads, 0);
         assert!(native.zero_grad_with_injected_failure(0).is_err());
+        let after_failed_reset_counts = native_recurrent_test_counts(&native);
+        assert_eq!(after_failed_reset_counts.0, before_failed_reset_counts.0);
+        assert!(after_failed_reset_counts.1 > before_failed_reset_counts.1);
+        assert_eq!(after_failed_reset_counts.2, before_failed_reset_counts.2);
         assert_eq!(native.checkpoint().unwrap(), before_failed_reset);
         assert_eq!(native.successful_zero_grads, 0);
+        let before_reset = native_recurrent_test_counts(&native);
         assert_eq!(
             native.zero_grad().unwrap(),
             interpreted.zero_grad().unwrap()
         );
+        let after_reset = native_recurrent_test_counts(&native);
+        assert_eq!(after_reset.0, before_reset.0);
+        assert_eq!(after_reset.2, before_reset.2 + 1);
         assert_eq!(native.successful_zero_grads, 1);
         assert_native_adamw_state_close(&native, &interpreted);
         let used_reset_workspace = native.zero_grad_replay.as_ref().unwrap().workspace_stats();
@@ -10161,9 +10188,14 @@ mod tests {
         assert_eq!(used_reset_workspace.intermediate_materialization_count, 0);
 
         let before_empty_reset = native.checkpoint().unwrap();
+        let before_empty_reset_counts = native_recurrent_test_counts(&native);
         let before_empty_reset_workspace =
             native.zero_grad_replay.as_ref().unwrap().workspace_stats();
         assert!(!native.zero_grad().unwrap().did_discard());
+        assert_eq!(
+            native_recurrent_test_counts(&native),
+            before_empty_reset_counts
+        );
         assert_eq!(native.successful_zero_grads, 1);
         assert_eq!(native.checkpoint().unwrap(), before_empty_reset);
         assert_eq!(
@@ -10180,15 +10212,24 @@ mod tests {
             expected.outputs(),
         );
         let before_failed_flush = native.checkpoint().unwrap();
+        let before_failed_flush_counts = native_recurrent_test_counts(&native);
         assert_eq!(native.successful_flushes, 0);
         assert!(
             native
                 .flush_partial_window_with_injected_failure(lr(), 0)
                 .is_err()
         );
+        let after_failed_flush_counts = native_recurrent_test_counts(&native);
+        assert_eq!(after_failed_flush_counts.0, before_failed_flush_counts.0);
+        assert!(after_failed_flush_counts.1 > before_failed_flush_counts.1);
+        assert_eq!(after_failed_flush_counts.2, before_failed_flush_counts.2);
         assert_eq!(native.checkpoint().unwrap(), before_failed_flush);
         assert_eq!(native.successful_flushes, 0);
+        let before_flush = native_recurrent_test_counts(&native);
         let actual = native.flush_partial_window(lr()).unwrap();
+        let after_flush = native_recurrent_test_counts(&native);
+        assert_eq!(after_flush.0, before_flush.0);
+        assert_eq!(after_flush.2, before_flush.2 + 1);
         let expected = interpreted.flush_partial_window(lr()).unwrap();
         assert_eq!(
             actual.flushed_microbatches(),
@@ -10203,9 +10244,14 @@ mod tests {
             .as_ref()
             .unwrap()
             .workspace_stats();
+        let before_empty_flush_counts = native_recurrent_test_counts(&native);
         let empty = native.flush_partial_window(lr()).unwrap();
         assert!(!empty.did_update());
         assert!(empty.report().is_none());
+        assert_eq!(
+            native_recurrent_test_counts(&native),
+            before_empty_flush_counts
+        );
         assert_eq!(executor.native_item_plan_count(), 3);
         assert_eq!(
             native

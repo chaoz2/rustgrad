@@ -54,6 +54,19 @@ impl ReplayValues {
     pub(crate) fn insert_tensor(&mut self, id: u64, value: TensorData) {
         self.0.insert(id, ReplayValue::Materialized(value));
     }
+    pub(super) fn take_tensor(
+        &mut self,
+        id: u64,
+        context: &str,
+    ) -> Result<TensorData, ReplayError> {
+        match self.0.remove(&id) {
+            Some(ReplayValue::Materialized(value)) => Ok(value),
+            Some(ReplayValue::PrunedZeroDomain { .. }) => Err(ReplayError::Corrupt(format!(
+                "{context}: pruned value {id} read"
+            ))),
+            None => Err(ReplayError::Missing(id.to_string())),
+        }
+    }
     fn insert_pruned(&mut self, id: u64, descriptor: crate::BufferDesc, producer_item: u64) {
         self.0.insert(
             id,
@@ -827,11 +840,7 @@ impl PlannedNativeItems {
         self.workspace.stats()
     }
 
-    fn validate_replay(
-        &self,
-        capture: &CapturedSchedule,
-        provided: &BTreeMap<String, TensorData>,
-    ) -> Result<(), ReplayError> {
+    fn validate_replay_structure(&self, capture: &CapturedSchedule) -> Result<(), ReplayError> {
         reject_multi_output_items(capture)?;
         if capture.identity != self.capture_identity {
             return Err(ReplayError::Corrupt(
@@ -858,11 +867,19 @@ impl PlannedNativeItems {
                 "prepared native schedule cache keys mismatch".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn validate_replay(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+    ) -> Result<(), ReplayError> {
+        self.validate_replay_structure(capture)?;
         // Authoritative values and witness bindings are not retained by the
         // plan. Revalidate the current invocation before importing it into
         // invalidatable scratch, including quantized row-gather index bounds.
-        validate_inputs(capture, provided)?;
-        Ok(())
+        validate_inputs(capture, provided)
     }
 }
 
@@ -920,6 +937,35 @@ impl CapturedReplayExecutor {
     ) -> Result<ReplayValues, ReplayError> {
         plan.validate_replay(capture, provided)?;
         plan.workspace.begin(provided)?;
+        for index in 0..capture.items.len() {
+            let item = &capture.items[index];
+            plan.workspace.execute_item(
+                index,
+                item,
+                self.jit(plan.vectorized),
+                &capture.quantized_constants,
+                &plan.items[index],
+            )?;
+        }
+        plan.workspace.materialize(capture)
+    }
+
+    pub(super) fn execute_planned_native_items_resolved(
+        &self,
+        capture: &CapturedSchedule,
+        plan: &mut PlannedNativeItems,
+        mut import: impl FnMut(
+            &crate::ReplayInput,
+            &mut NativeReplayWorkspace,
+        ) -> Result<(), ReplayError>,
+    ) -> Result<ReplayValues, ReplayError> {
+        plan.validate_replay_structure(capture)?;
+        validate_quantized_index_inputs(capture)?;
+        plan.workspace.begin_resolved();
+        for input in &capture.inputs {
+            import(input, &mut plan.workspace)?;
+        }
+        plan.workspace.finish_inputs()?;
         for index in 0..capture.items.len() {
             let item = &capture.items[index];
             plan.workspace.execute_item(
@@ -1132,9 +1178,7 @@ pub(crate) fn validate_inputs(
         let value = provided
             .get(&input.name)
             .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
-        if value.shape() != &input.desc.shape || value.dtype() != input.desc.dtype {
-            return Err(ReplayError::Descriptor(input.name.clone()));
-        }
+        validate_input_descriptor(input, value)?;
     }
     for item in &capture.items {
         let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
@@ -1154,6 +1198,56 @@ pub(crate) fn validate_inputs(
             .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
         plan.preflight_indices(indices)
             .map_err(|error| ReplayError::Execute(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn validate_quantized_index_inputs(capture: &CapturedSchedule) -> Result<(), ReplayError> {
+    for item in &capture.items {
+        let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+            item.kernel.operation()
+        else {
+            continue;
+        };
+        if !capture
+            .inputs
+            .iter()
+            .any(|input| input.node == plan.indices)
+        {
+            return Err(ReplayError::Corrupt(
+                "quantized gather indices are not an input".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_input_value(
+    capture: &CapturedSchedule,
+    input: &crate::ReplayInput,
+    value: &TensorData,
+) -> Result<(), ReplayError> {
+    validate_input_descriptor(input, value)?;
+    for item in &capture.items {
+        let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+            item.kernel.operation()
+        else {
+            continue;
+        };
+        if plan.indices == input.node {
+            plan.preflight_indices(value)
+                .map_err(|error| ReplayError::Execute(error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_input_descriptor(
+    input: &crate::ReplayInput,
+    value: &TensorData,
+) -> Result<(), ReplayError> {
+    if value.shape() != &input.desc.shape || value.dtype() != input.desc.dtype {
+        return Err(ReplayError::Descriptor(input.name.clone()));
     }
     Ok(())
 }

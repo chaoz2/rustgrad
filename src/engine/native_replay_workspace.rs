@@ -323,22 +323,49 @@ impl NativeReplayWorkspace {
         &mut self,
         provided: &BTreeMap<String, TensorData>,
     ) -> Result<(), ReplayError> {
+        self.begin_resolved();
+        for (name, value) in provided {
+            self.import_input(name, value)?;
+        }
+        self.finish_inputs()
+    }
+
+    pub(super) fn begin_resolved(&mut self) {
         self.valid.fill(false);
         for slot in &self.immutable {
             self.valid[*slot] = true;
         }
-        for (name, slot) in &self.inputs {
-            let value = provided
-                .get(name)
-                .ok_or_else(|| ReplayError::Missing(name.clone()))?;
-            self.buffers[*slot]
-                .copy_from_tensor(value)
-                .map_err(|error| ReplayError::Backend(error.to_string()))?;
-            self.valid[*slot] = true;
-            #[cfg(test)]
-            {
-                self.input_import_count += 1;
-            }
+    }
+
+    pub(super) fn import_input(
+        &mut self,
+        name: &str,
+        value: &TensorData,
+    ) -> Result<(), ReplayError> {
+        let slot = self
+            .inputs
+            .iter()
+            .find_map(|(input, slot)| (input == name).then_some(*slot))
+            .ok_or_else(|| ReplayError::Extra(name.to_owned()))?;
+        if self.valid[slot] {
+            return Err(ReplayError::Corrupt(format!(
+                "native workspace input {name:?} was imported twice"
+            )));
+        }
+        self.buffers[slot]
+            .copy_from_tensor(value)
+            .map_err(|error| ReplayError::Backend(error.to_string()))?;
+        self.valid[slot] = true;
+        #[cfg(test)]
+        {
+            self.input_import_count += 1;
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_inputs(&self) -> Result<(), ReplayError> {
+        if let Some((name, _)) = self.inputs.iter().find(|(_, slot)| !self.valid[*slot]) {
+            return Err(ReplayError::Missing(name.clone()));
         }
         Ok(())
     }

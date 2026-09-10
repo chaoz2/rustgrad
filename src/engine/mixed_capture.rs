@@ -160,6 +160,22 @@ pub(crate) struct NativeMixedPreparationTrace {
 pub(crate) struct PreparedRecurrentNativeReplay {
     trace: NativeMixedPreparationTrace,
     plan: super::captured_replay::PlannedNativeItems,
+    pure: CapturedSchedule,
+    replacements: PreparedRecurrentReplacementPlan,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedRecurrentReplacement {
+    step: u64,
+    producer: u64,
+    buffer: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedRecurrentReplacementPlan {
+    external_inputs: BTreeSet<String>,
+    state_inputs: BTreeMap<String, u64>,
+    replacements: Vec<PreparedRecurrentReplacement>,
 }
 
 impl PreparedRecurrentNativeReplay {
@@ -194,6 +210,146 @@ impl PreparedRecurrentNativeReplay {
             ));
         }
         Ok(replay)
+    }
+}
+
+impl PreparedRecurrentReplacementPlan {
+    fn from_capture(capture: &CapturedMixedSchedule) -> Result<Self, ReplayError> {
+        let frontier = recurrent_initial_frontier(capture)?;
+        let frontier_by_buffer = frontier
+            .iter()
+            .map(|state| (state.buffer, state))
+            .collect::<BTreeMap<_, _>>();
+        let mut state_inputs = BTreeMap::new();
+        for binding in &capture.state_bindings {
+            if binding.view.is_some() {
+                return Err(ReplayError::Unsupported(
+                    "prepared recurrent native replacement does not support state input views"
+                        .into(),
+                ));
+            }
+            let input = capture
+                .schedule
+                .inputs
+                .iter()
+                .find(|input| input.node == binding.input_node)
+                .ok_or_else(|| ReplayError::Corrupt("state input ABI is absent".into()))?;
+            if !frontier_by_buffer.contains_key(&binding.state.buffer) {
+                return Err(ReplayError::Corrupt(
+                    "state input is absent from recurrent frontier".into(),
+                ));
+            }
+            match state_inputs.insert(input.name.clone(), binding.state.buffer) {
+                Some(buffer) if buffer != binding.state.buffer => {
+                    return Err(ReplayError::Corrupt(
+                        "persistent state input has conflicting bindings".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let external_inputs = capture
+            .schedule
+            .inputs
+            .iter()
+            .filter(|input| !state_inputs.contains_key(&input.name))
+            .map(|input| input.name.clone())
+            .collect::<BTreeSet<_>>();
+
+        let schedule = Schedule {
+            items: capture.schedule.items.clone(),
+            requested_materializations: requested_materializations(&capture.schedule),
+            requested_passthroughs: capture.schedule.requested_passthroughs.clone(),
+            value_bindings: capture.value_bindings.clone(),
+            state_bindings: capture.state_bindings.clone(),
+        };
+        let plan = effect_plan(&schedule)?;
+        let mut producers = BTreeMap::new();
+        for binding in &capture.value_bindings {
+            let payload = effect_payload(&capture.schedule.items[binding.effect_item as usize])?;
+            if producers
+                .insert(payload.step, binding.producer_output.id)
+                .is_some()
+            {
+                return Err(ReplayError::Corrupt(
+                    "recurrent effect has multiple pure successors".into(),
+                ));
+            }
+        }
+        let mut replacements = Vec::with_capacity(plan.steps.len());
+        let mut replaced = BTreeSet::new();
+        for step in &plan.steps {
+            let producer = producers.get(&step.id).copied().ok_or_else(|| {
+                ReplayError::Unsupported(
+                    "prepared recurrent native effect is not pure-sourced".into(),
+                )
+            })?;
+            let initial = frontier_by_buffer.get(&step.write.buffer).ok_or_else(|| {
+                ReplayError::Unsupported(
+                    "prepared recurrent native effect targets no frontier state".into(),
+                )
+            })?;
+            let Some(read) = step.reads.first() else {
+                return Err(ReplayError::Corrupt(
+                    "recurrent effect has no predecessor state".into(),
+                ));
+            };
+            if step.target_view.is_some()
+                || step.index_plan.is_some()
+                || read != *initial
+                || step.write.buffer != initial.buffer
+                || initial.version.checked_add(1) != Some(step.write.version)
+                || step.write.shape != initial.shape
+                || step.write.dtype != initial.dtype
+                || step.write.bytes != initial.bytes
+                || !replaced.insert(step.write.buffer)
+            {
+                return Err(ReplayError::Unsupported(
+                    "prepared recurrent native effect is not one full frontier replacement".into(),
+                ));
+            }
+            replacements.push(PreparedRecurrentReplacement {
+                step: step.id,
+                producer,
+                buffer: step.write.buffer,
+            });
+        }
+        replacements.sort_by_key(|replacement| replacement.buffer);
+        if replacements.len() != frontier.len()
+            || replacements
+                .iter()
+                .map(|replacement| replacement.buffer)
+                .ne(frontier.iter().map(|state| state.buffer))
+        {
+            return Err(ReplayError::Unsupported(
+                "prepared recurrent native replacement frontier is incomplete".into(),
+            ));
+        }
+        Ok(Self {
+            external_inputs,
+            state_inputs,
+            replacements,
+        })
+    }
+
+    fn validate_external_inputs(
+        &self,
+        provided: &BTreeMap<String, crate::TensorData>,
+    ) -> Result<(), ReplayError> {
+        if let Some(name) = provided
+            .keys()
+            .find(|name| !self.external_inputs.contains(*name))
+        {
+            return Err(ReplayError::Extra(name.clone()));
+        }
+        if let Some(name) = self
+            .external_inputs
+            .iter()
+            .find(|name| !provided.contains_key(*name))
+        {
+            return Err(ReplayError::Missing(name.clone()));
+        }
+        Ok(())
     }
 }
 
@@ -563,6 +719,7 @@ impl CapturedMixedSchedule {
         validate(self, true)?;
         validate_recurrent_cursor(self, cursor)?;
         let starts = recurrent_rebase_starts(self, cursor)?;
+        let replacements = PreparedRecurrentReplacementPlan::from_capture(self)?;
         let mut candidates = BTreeMap::new();
         for state in &cursor.frontier {
             let value = runtime
@@ -574,6 +731,24 @@ impl CapturedMixedSchedule {
         }
         let planned = BoundMixedCapture::bind(self, &candidates, starts, provided)?
             .plan_native(executor, vectorized)?;
+        let mut pure = self.schedule.clone();
+        let split = pure
+            .items
+            .iter()
+            .position(crate::ScheduleItem::is_effect)
+            .ok_or_else(|| ReplayError::Unsupported("mixed capture has no effects".into()))?;
+        pure.items.truncate(split);
+        pure.requested = self
+            .value_bindings
+            .iter()
+            .map(|binding| binding.producer_output.id)
+            .collect();
+        for requested in &self.schedule.requested {
+            if !pure.requested.contains(requested) {
+                pure.requested.push(*requested);
+            }
+        }
+        pure.identity = 0;
         let trace = NativeMixedPreparationTrace {
             replay: self.native_replay_trace(vectorized)?,
             item_count: planned.item_count(),
@@ -583,6 +758,8 @@ impl CapturedMixedSchedule {
         Ok(PreparedRecurrentNativeReplay {
             trace,
             plan: planned.plan,
+            pure,
+            replacements,
         })
     }
 
@@ -599,14 +776,120 @@ impl CapturedMixedSchedule {
     where
         F: FnOnce(&[crate::TensorData], &[crate::TensorData]) -> Result<(), String>,
     {
-        self.replay_recurrent_checked_impl(
-            runtime,
-            cursor,
-            provided,
-            Some(native),
-            injected_failure,
-            validate_transition,
-        )
+        validate(self, true)?;
+        validate_recurrent_cursor(self, cursor)?;
+        let native_trace = native.prepared.validate_capture(self)?;
+        let current = cursor.frontier.clone();
+        let next = current
+            .iter()
+            .cloned()
+            .map(|mut state| {
+                state.version = state
+                    .version
+                    .checked_add(1)
+                    .ok_or_else(|| ReplayError::Corrupt("recurrent version overflow".into()))?;
+                Ok(state)
+            })
+            .collect::<Result<Vec<_>, ReplayError>>()?;
+        let capture = &native.prepared.pure;
+        let replacements = &native.prepared.replacements;
+        replacements.validate_external_inputs(provided)?;
+        let staged = runtime.transact_recurrent_replacements(&current, &next, |reader| {
+            let mut values = native.executor.execute_planned_native_items_resolved(
+                capture,
+                &mut native.prepared.plan,
+                |input, workspace| {
+                    if let Some(buffer) = replacements.state_inputs.get(&input.name) {
+                        let state = current
+                            .iter()
+                            .find(|state| state.buffer == *buffer)
+                            .ok_or_else(|| {
+                                ReplayError::Missing(format!("recurrent input state {buffer}"))
+                            })?;
+                        reader
+                            .inspect(state, |value| {
+                                super::captured_replay::validate_input_value(
+                                    capture, input, value,
+                                )?;
+                                workspace.import_input(&input.name, value)
+                            })
+                            .map_err(|error| {
+                                ReplayError::Execute(format!(
+                                    "recurrent input preflight: {error:?}"
+                                ))
+                            })??;
+                    } else {
+                        let value = provided
+                            .get(&input.name)
+                            .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
+                        super::captured_replay::validate_input_value(capture, input, value)?;
+                        workspace.import_input(&input.name, value)?;
+                    }
+                    Ok(())
+                },
+            )?;
+            let outputs = self
+                .schedule
+                .requested
+                .iter()
+                .map(|id| {
+                    if replacements
+                        .replacements
+                        .iter()
+                        .any(|replacement| replacement.producer == *id)
+                    {
+                        // One value cannot be moved into persistent ownership
+                        // and returned publicly. Preserve the public result;
+                        // the unique successor is drained below.
+                        values.tensor(*id, "requested mixed output").cloned()
+                    } else {
+                        values.take_tensor(*id, "requested mixed output")
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut successor_values = Vec::with_capacity(replacements.replacements.len());
+            for replacement in &replacements.replacements {
+                successor_values
+                    .push(values.take_tensor(replacement.producer, "recurrent successor")?);
+            }
+            validate_transition(&outputs, &successor_values).map_err(ReplayError::Execute)?;
+            if let Some(step) = injected_failure
+                && replacements
+                    .replacements
+                    .iter()
+                    .any(|replacement| replacement.step == step)
+            {
+                return Err(ReplayError::Execute(format!(
+                    "recurrent commit: {:?}",
+                    crate::RuntimeError::InjectedFailure(step)
+                )));
+            }
+            let successors = next.iter().cloned().zip(successor_values).collect();
+            Ok(crate::effects::runtime::RecurrentStateSuccessors {
+                value: outputs,
+                successors,
+            })
+        });
+        let outputs = match staged {
+            Ok(outputs) => outputs,
+            Err(crate::effects::runtime::RecurrentTransactionError::Stage(error)) => {
+                return Err(error);
+            }
+            Err(crate::effects::runtime::RecurrentTransactionError::Runtime(error)) => {
+                return Err(ReplayError::Execute(format!(
+                    "recurrent transaction: {error:?}"
+                )));
+            }
+            Err(crate::effects::runtime::RecurrentTransactionError::Contract(reason)) => {
+                return Err(ReplayError::Corrupt(reason.into()));
+            }
+        };
+        cursor.frontier = next.clone();
+        Ok(MixedReplayResult {
+            outputs,
+            committed: next,
+            native_trace: Some(native_trace),
+        })
     }
 
     fn replay_recurrent_checked_impl<F>(
@@ -1633,9 +1916,9 @@ fn recurrent_advanced_frontier(
 mod recurrent_tests {
     use super::*;
     use crate::{
-        BinaryOp, DType, EffectGraph, EffectRuntime, Graph, ScheduleStateBinding,
-        ScheduleValueBinding, Shape, Storage, TensorData, bind_schedule_states,
-        combine_mixed_schedules, schedule, schedule_effects,
+        BinaryOp, CapturedReplayExecutor, DType, EffectGraph, EffectRuntime, Graph,
+        ScheduleStateBinding, ScheduleValueBinding, Shape, Storage, TensorData,
+        bind_schedule_states, combine_mixed_schedules, schedule, schedule_effects,
     };
 
     #[test]
@@ -2046,6 +2329,104 @@ mod recurrent_tests {
                 .is_err()
         );
         assert_eq!(absent, initial);
+    }
+
+    #[test]
+    fn prepared_native_recurrent_replacement_borrows_and_commits_once() {
+        let (capture, mut runtime) = fixture(321);
+        let executor = CapturedReplayExecutor::default();
+        let mut cursor = capture.initial_recurrent_cursor().unwrap();
+        let inputs = delta(1.0);
+        let mut prepared = capture
+            .prepare_recurrent_native(&runtime, &cursor, &inputs, &executor, false)
+            .unwrap();
+        let mut viewed = capture.clone();
+        viewed.state_bindings[0].view = Some(crate::AffineView::identity(Shape::from([2])));
+        assert!(matches!(
+            PreparedRecurrentReplacementPlan::from_capture(&viewed),
+            Err(ReplayError::Unsupported(message))
+                if message == "prepared recurrent native replacement does not support state input views"
+        ));
+        let mut incomplete = capture.clone();
+        incomplete.value_bindings.clear();
+        assert!(matches!(
+            PreparedRecurrentReplacementPlan::from_capture(&incomplete),
+            Err(ReplayError::Unsupported(message))
+                if message == "prepared recurrent native effect is not pure-sourced"
+        ));
+        let before = runtime.recurrent_test_counts();
+        let replay = capture
+            .replay_recurrent_native_checked(
+                &mut runtime,
+                &mut cursor,
+                &inputs,
+                NativeReplayContext::new(&executor, &mut prepared),
+                None,
+                |outputs, successors| {
+                    assert_eq!(outputs[0].storage(), &Storage::F32(vec![1.0, 1.0]));
+                    assert_eq!(successors[0], outputs[0]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let after = runtime.recurrent_test_counts();
+        assert_eq!(after.0, before.0, "native replay must not snapshot state");
+        assert_eq!(after.1, before.1 + 1);
+        assert_eq!(after.2, before.2 + 1);
+        assert_eq!(replay.committed, cursor.frontier());
+
+        let checkpoint = frontier_values(&runtime, &cursor);
+        let failed_cursor = cursor.clone();
+        let before_failure = runtime.recurrent_test_counts();
+        assert!(
+            capture
+                .replay_recurrent_native_checked(
+                    &mut runtime,
+                    &mut cursor,
+                    &inputs,
+                    NativeReplayContext::new(&executor, &mut prepared),
+                    None,
+                    |_outputs, _successors| Err("reject staged replacement".into()),
+                )
+                .is_err()
+        );
+        let after_failure = runtime.recurrent_test_counts();
+        assert_eq!(cursor, failed_cursor);
+        assert_eq!(after_failure.0, before_failure.0);
+        assert_eq!(after_failure.2, before_failure.2);
+        assert_eq!(frontier_values(&runtime, &cursor), checkpoint);
+
+        let before_injected = runtime.recurrent_test_counts();
+        capture
+            .replay_recurrent_native_checked(
+                &mut runtime,
+                &mut cursor,
+                &inputs,
+                NativeReplayContext::new(&executor, &mut prepared),
+                Some(0),
+                |_, _| Ok(()),
+            )
+            .unwrap_err();
+        let after_injected = runtime.recurrent_test_counts();
+        assert_eq!(cursor, failed_cursor);
+        assert_eq!(after_injected.0, before_injected.0);
+        assert_eq!(after_injected.2, before_injected.2);
+        assert_eq!(frontier_values(&runtime, &cursor), checkpoint);
+        let retried = capture
+            .replay_recurrent_native_checked(
+                &mut runtime,
+                &mut cursor,
+                &inputs,
+                NativeReplayContext::new(&executor, &mut prepared),
+                None,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(retried.outputs[0].storage(), &Storage::F32(vec![2.0, 2.0]));
+        assert_eq!(
+            frontier_values(&runtime, &cursor)[0].storage(),
+            &Storage::F32(vec![2.0, 2.0])
+        );
     }
 }
 
