@@ -7,17 +7,18 @@ use rustgrad::runtime::metal::{
     MetalDeviceRunReport, MetalDiscovery, MetalRuntime, MetalScoreboardContext,
 };
 use rustgrad::{
-    Backend, CapturedReplayExecutor, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig,
-    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWPlan,
-    CompiledAdamWRuntime, CompiledAdamWStep, CompiledAdamWStepResult, CompiledCheckpointRuntime,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
-    CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan, CompiledMultiStepLr,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
-    CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions, MetalCompiledAdamWPlan,
-    Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget,
-    NativeTrainingReport, NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result,
-    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
-    load_safetensors, save_safetensors,
+    Backend, CapturedReplayExecutor, CapturedReplayOptions, CapturedSchedule, CompareOp,
+    CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWFlush, CompiledAdamWFlushRuntime,
+    CompiledAdamWGraph, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
+    CompiledAdamWStepResult, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
+    CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
+    CompiledModuleAdamWPlan, CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep,
+    CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph,
+    LossOptions, MetalCompiledAdamWPlan, Module, NativeCpuCompiledAdamW,
+    NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget, NativeTrainingReport,
+    NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
+    TrainingDropoutProvider, TransformerBlock, cross_entropy, load_safetensors, save_safetensors,
+    schedule_many,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1208,10 +1209,39 @@ struct AdamWOracleUpdate {
     included_decay_counterfactuals: usize,
 }
 
+struct AdamWMomentReconstruction {
+    first_moments: BTreeMap<String, TensorData>,
+    second_moments: BTreeMap<String, TensorData>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipScaleUpdateClassification {
+    ReportOnly,
+    HostOnly,
+    Both,
+    Neither,
+}
+
 fn average_gradient_window(
     gradients: &[BTreeMap<String, TensorData>],
 ) -> BTreeMap<String, Vec<f32>> {
     normalize_gradient_window(gradients, ACCUMULATION_STEPS as f32)
+}
+
+fn graph_f32_add(lhs: f32, rhs: f32) -> f32 {
+    (f64::from(lhs) + f64::from(rhs)) as f32
+}
+
+fn graph_f32_div(lhs: f32, rhs: f32) -> f32 {
+    (f64::from(lhs) / f64::from(rhs)) as f32
+}
+
+fn graph_f32_mul(lhs: f32, rhs: f32) -> f32 {
+    (f64::from(lhs) * f64::from(rhs)) as f32
+}
+
+fn graph_f32_sqrt(value: f32) -> f32 {
+    f64::from(value).sqrt() as f32
 }
 
 fn normalize_gradient_window(
@@ -1238,9 +1268,11 @@ fn normalize_gradient_window(
                     let first = contributions[0][name].scalar_at(coordinate).as_f64() as f32;
                     let second = contributions[1][name].scalar_at(coordinate).as_f64() as f32;
                     let third = contributions[2][name].scalar_at(coordinate).as_f64() as f32;
-                    // Match the recurrent F32 addition order before applying
-                    // the complete window's normalization divisor.
-                    ((first + second) + third) / divisor
+                    // GraphBinary evaluates F32 operands in F64 and narrows
+                    // each stored result back to F32. Match the recurrent
+                    // addition order and the final captured division exactly.
+                    let total = graph_f32_add(graph_f32_add(first, second), third);
+                    graph_f32_div(total, divisor)
                 })
                 .collect();
             (name.clone(), averaged)
@@ -1250,19 +1282,31 @@ fn normalize_gradient_window(
 
 fn clip_gradient_window(
     averaged: &BTreeMap<String, Vec<f32>>,
+    descriptors: &BTreeMap<String, TensorData>,
     max_norm: f32,
 ) -> (BTreeMap<String, Vec<f32>>, f32) {
-    let mut squared_norm = 0.0f32;
-    // Production first reduces each canonical parameter in lane order, then
-    // adds those subtotals in canonical parameter order.
-    for gradient in averaged.values() {
-        let parameter_squared_norm = gradient
-            .iter()
-            .fold(0.0f32, |subtotal, gradient| subtotal + gradient * gradient);
-        squared_norm += parameter_squared_norm;
-    }
-    let gradient_norm = squared_norm.sqrt();
-    let scale = max_norm / gradient_norm.max(max_norm);
+    assert_eq!(
+        averaged.keys().collect::<Vec<_>>(),
+        descriptors.keys().collect::<Vec<_>>()
+    );
+    // Production squares each lane at F32, performs Graph::sum_all as
+    // reverse-axis F32 reductions, stacks the canonical parameter subtotals,
+    // and commits one final F32 vector reduction before widened sqrt.
+    let squared_norm = averaged
+        .iter()
+        .map(|(name, gradient)| {
+            let descriptor = &descriptors[name];
+            assert_eq!(descriptor.dtype(), DType::F32);
+            assert_eq!(descriptor.len(), gradient.len());
+            let squared = gradient
+                .iter()
+                .map(|gradient| graph_f32_mul(*gradient, *gradient))
+                .collect::<Vec<_>>();
+            sum_all_f32(squared, descriptor.shape())
+        })
+        .fold(0.0f32, graph_f32_add);
+    let gradient_norm = graph_f32_sqrt(squared_norm);
+    let scale = graph_f32_div(max_norm, gradient_norm.max(max_norm));
     let clipped = averaged
         .iter()
         .map(|(name, gradient)| {
@@ -1275,6 +1319,219 @@ fn clip_gradient_window(
     (clipped, gradient_norm)
 }
 
+fn literal_compiled_clip_norm(
+    averaged: &BTreeMap<String, Vec<f32>>,
+    descriptors: &BTreeMap<String, TensorData>,
+) -> (f32, f32) {
+    assert!(!averaged.is_empty());
+    assert_eq!(
+        averaged.keys().collect::<Vec<_>>(),
+        descriptors.keys().collect::<Vec<_>>()
+    );
+    let mut graph = Graph::new();
+    let mut gradients = BTreeMap::new();
+    for (name, gradient) in averaged {
+        let descriptor = &descriptors[name];
+        assert_eq!(descriptor.dtype(), DType::F32);
+        assert_eq!(descriptor.len(), gradient.len());
+        gradients.insert(
+            name.clone(),
+            graph.constant(tensor_from_f32_lanes(descriptor, gradient.iter().copied())),
+        );
+    }
+    let (norm, _) = literal_compiled_clip_norm_node(&mut graph, &gradients);
+    evaluate_literal_compiled_clip_norm(&graph, norm)
+}
+
+struct LiteralAccumulatedClip {
+    averaged: BTreeMap<String, Vec<f32>>,
+    direct_norm: f32,
+    captured_norm: f32,
+}
+
+fn literal_accumulated_compiled_clip_norm(
+    contributions: &[BTreeMap<String, TensorData>],
+    descriptors: &BTreeMap<String, TensorData>,
+    divisor: f32,
+) -> LiteralAccumulatedClip {
+    assert_eq!(contributions.len(), ACCUMULATION_STEPS as usize);
+    assert_eq!(contributions.len(), 3);
+    for contribution in contributions {
+        assert_eq!(
+            contribution.keys().collect::<Vec<_>>(),
+            descriptors.keys().collect::<Vec<_>>()
+        );
+    }
+    let mut graph = Graph::new();
+    let divisor = graph.constant(TensorData::scalar(divisor));
+    let mut gradients = BTreeMap::new();
+    for (name, descriptor) in descriptors {
+        assert_eq!(descriptor.dtype(), DType::F32);
+        let first = &contributions[0][name];
+        let second = &contributions[1][name];
+        let third = &contributions[2][name];
+        for contribution in [first, second, third] {
+            assert_eq!(contribution.shape(), descriptor.shape());
+            assert_eq!(contribution.dtype(), DType::F32);
+        }
+        let first = graph.constant(first.clone());
+        let second = graph.constant(second.clone());
+        let third = graph.constant(third.clone());
+        let accumulated = graph.add(first, second).unwrap();
+        let accumulated = graph.add(accumulated, third).unwrap();
+        gradients.insert(name.clone(), graph.div(accumulated, divisor).unwrap());
+    }
+    let (norm, materialized_gradients) = literal_compiled_clip_norm_node(&mut graph, &gradients);
+    let (direct_norm, captured_norm) = evaluate_literal_compiled_clip_norm(&graph, norm);
+    let names = materialized_gradients.keys().cloned().collect::<Vec<_>>();
+    let outputs = materialized_gradients.values().copied().collect::<Vec<_>>();
+    // The reconstructed views all resolve to the shared Concat owner. Reading
+    // them therefore observes the same explicit F32 boundary consumed by the
+    // production norm and AdamW update, without inventing an earlier one at Div.
+    let averaged = CpuBackend
+        .execute_many(&graph, &outputs, &HashMap::new())
+        .unwrap()
+        .outputs
+        .into_iter()
+        .map(|tensor| tensor.values().to_vec())
+        .collect::<Vec<_>>();
+    LiteralAccumulatedClip {
+        averaged: names.into_iter().zip(averaged).collect(),
+        direct_norm,
+        captured_norm,
+    }
+}
+
+fn literal_compiled_clip_norm_node(
+    graph: &mut Graph,
+    gradients: &BTreeMap<String, NodeId>,
+) -> (NodeId, BTreeMap<String, NodeId>) {
+    assert!(!gradients.is_empty());
+    let mut flattened = Vec::with_capacity(gradients.len().max(2));
+    let mut ranges = Vec::with_capacity(gradients.len());
+    let mut offset = 0usize;
+    for (name, gradient) in gradients {
+        assert_eq!(graph.dtype(*gradient).unwrap(), DType::F32);
+        let shape = graph.shape(*gradient).unwrap().clone();
+        let elements = shape.numel().unwrap();
+        let end = offset.checked_add(elements).unwrap();
+        flattened.push(graph.reshape(*gradient, [elements]).unwrap());
+        ranges.push((name.clone(), shape, offset, end));
+        offset = end;
+    }
+    if flattened.len() == 1 {
+        flattened.push(graph.constant(TensorData::new([0], Vec::<f32>::new()).unwrap()));
+    }
+    let vector = graph.concat(flattened, 0).unwrap();
+    let gradients = ranges
+        .into_iter()
+        .map(|(name, shape, start, end)| {
+            let slice = graph.shrink(vector, vec![(start, end)]).unwrap();
+            let gradient = graph.reshape(slice, shape).unwrap();
+            (name, gradient)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut squared_norms = gradients
+        .values()
+        .map(|gradient| {
+            let squared = graph.mul(*gradient, *gradient).unwrap();
+            graph.sum_all(squared).unwrap()
+        })
+        .collect::<Vec<_>>();
+    if squared_norms.len() == 1 {
+        squared_norms.push(graph.constant(TensorData::scalar(0.0)));
+    }
+    let squared_norms = graph.stack_default(squared_norms).unwrap();
+    let total = graph.sum_all(squared_norms).unwrap();
+    (graph.sqrt(total).unwrap(), gradients)
+}
+
+fn evaluate_literal_compiled_clip_norm(graph: &Graph, norm: NodeId) -> (f32, f32) {
+    let direct = CpuBackend
+        .execute(graph, norm, &HashMap::new())
+        .unwrap()
+        .scalar_at(0)
+        .as_f64() as f32;
+    let scheduled = schedule_many(graph, &[norm]).unwrap();
+    let captured = CapturedSchedule::capture(graph, &scheduled, &[norm]).unwrap();
+    let replayed = CapturedReplayExecutor::default()
+        .replay(
+            &captured,
+            &BTreeMap::new(),
+            CapturedReplayOptions::default(),
+        )
+        .unwrap()
+        .outputs
+        .into_iter()
+        .next()
+        .unwrap()
+        .scalar_at(0)
+        .as_f64() as f32;
+    (direct, replayed)
+}
+
+fn sum_all_f32(mut values: Vec<f32>, shape: &Shape) -> f32 {
+    assert_eq!(values.len(), shape.numel().unwrap());
+    let mut dims = shape.dims().to_vec();
+    for axis in (0..dims.len()).rev() {
+        let extent = dims[axis];
+        if extent == 1 {
+            dims.remove(axis);
+            continue;
+        }
+        let outer = dims[..axis].iter().product::<usize>();
+        let inner = dims[axis + 1..].iter().product::<usize>();
+        let mut reduced = vec![0.0f32; outer * inner];
+        for outer_index in 0..outer {
+            for axis_index in 0..extent {
+                for inner_index in 0..inner {
+                    let source = (outer_index * extent + axis_index) * inner + inner_index;
+                    let destination = outer_index * inner + inner_index;
+                    reduced[destination] = graph_f32_add(reduced[destination], values[source]);
+                }
+            }
+        }
+        values = reduced;
+        dims.remove(axis);
+    }
+    assert_eq!(values.len(), 1);
+    values[0]
+}
+
+fn assert_accumulated_gradient_recurrence(
+    actual: &BTreeMap<String, TensorData>,
+    contributions: &[BTreeMap<String, TensorData>],
+) {
+    assert!(!contributions.is_empty());
+    assert_eq!(
+        actual.keys().collect::<Vec<_>>(),
+        contributions[0].keys().collect::<Vec<_>>()
+    );
+    for (name, tensor) in actual {
+        assert_eq!(tensor.dtype(), DType::F32);
+        for contribution in contributions {
+            assert_eq!(contribution[name].shape(), tensor.shape());
+            assert_eq!(contribution[name].dtype(), DType::F32);
+        }
+        for coordinate in 0..tensor.len() {
+            let expected = contributions
+                .iter()
+                .fold(0.0f32, |accumulator, contribution| {
+                    graph_f32_add(
+                        accumulator,
+                        contribution[name].scalar_at(coordinate).as_f64() as f32,
+                    )
+                });
+            let actual = tensor.scalar_at(coordinate).as_f64() as f32;
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "accumulated gradient {name}[{coordinate}] differs from the exact isolated-contribution recurrence"
+            );
+        }
+    }
+}
+
 fn tensor_from_f32_lanes(
     template: &TensorData,
     lanes: impl IntoIterator<Item = f32>,
@@ -1285,6 +1542,164 @@ fn tensor_from_f32_lanes(
         lanes.into_iter().map(|value| Scalar::F(f64::from(value))),
     )
     .unwrap()
+}
+
+fn reconstruct_adamw_moments(
+    previous_first_moments: &BTreeMap<String, TensorData>,
+    previous_second_moments: &BTreeMap<String, TensorData>,
+    averaged_gradients: &BTreeMap<String, Vec<f32>>,
+    scale: f32,
+    optimizer: &CompiledAdamWConfig,
+) -> AdamWMomentReconstruction {
+    assert_eq!(
+        previous_first_moments.keys().collect::<Vec<_>>(),
+        averaged_gradients.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        previous_second_moments.keys().collect::<Vec<_>>(),
+        averaged_gradients.keys().collect::<Vec<_>>()
+    );
+    let beta1 = optimizer.beta1();
+    let beta2 = optimizer.beta2();
+    let one_minus_beta1 = 1.0 - beta1;
+    let one_minus_beta2 = 1.0 - beta2;
+    let mut first_moments = BTreeMap::new();
+    let mut second_moments = BTreeMap::new();
+    for (name, averaged) in averaged_gradients {
+        let previous_first = &previous_first_moments[name];
+        let previous_second = &previous_second_moments[name];
+        assert_eq!(previous_first.dtype(), DType::F32);
+        assert_eq!(previous_second.dtype(), DType::F32);
+        assert_eq!(previous_first.shape(), previous_second.shape());
+        assert_eq!(previous_first.len(), averaged.len());
+        let mut next_first = Vec::with_capacity(averaged.len());
+        let mut next_second = Vec::with_capacity(averaged.len());
+        for (coordinate, averaged) in averaged.iter().copied().enumerate() {
+            let gradient = graph_f32_mul(averaged, scale);
+            let retained_first =
+                graph_f32_mul(beta1, previous_first.scalar_at(coordinate).as_f64() as f32);
+            let fresh_first = graph_f32_mul(one_minus_beta1, gradient);
+            next_first.push(graph_f32_add(retained_first, fresh_first));
+            let retained_second =
+                graph_f32_mul(beta2, previous_second.scalar_at(coordinate).as_f64() as f32);
+            let gradient_squared = graph_f32_mul(gradient, gradient);
+            let fresh_second = graph_f32_mul(one_minus_beta2, gradient_squared);
+            next_second.push(graph_f32_add(retained_second, fresh_second));
+        }
+        first_moments.insert(
+            name.clone(),
+            tensor_from_f32_lanes(previous_first, next_first),
+        );
+        second_moments.insert(
+            name.clone(),
+            tensor_from_f32_lanes(previous_second, next_second),
+        );
+    }
+    AdamWMomentReconstruction {
+        first_moments,
+        second_moments,
+    }
+}
+
+fn reconstruct_adamw_parameters_from_moments(
+    previous_parameters: &BTreeMap<String, TensorData>,
+    next_first_moments: &BTreeMap<String, TensorData>,
+    next_second_moments: &BTreeMap<String, TensorData>,
+    optimizer: &CompiledAdamWConfig,
+    optimizer_step: u64,
+    learning_rate: f32,
+) -> BTreeMap<String, TensorData> {
+    assert_eq!(
+        previous_parameters.keys().collect::<Vec<_>>(),
+        next_first_moments.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        previous_parameters.keys().collect::<Vec<_>>(),
+        next_second_moments.keys().collect::<Vec<_>>()
+    );
+    let mut graph = Graph::new();
+    let one = graph.constant(TensorData::scalar(1.0));
+    let beta1 = graph.constant(TensorData::scalar(optimizer.beta1()));
+    let beta2 = graph.constant(TensorData::scalar(optimizer.beta2()));
+    let eps = graph.constant(TensorData::scalar(optimizer.eps()));
+    let weight_decay = graph.constant(TensorData::scalar(optimizer.weight_decay()));
+    let learning_rate = graph.constant(TensorData::scalar(learning_rate));
+    let optimizer_step = graph
+        .full_with_dtype(Shape::from([]), Scalar::U(optimizer_step), DType::U64)
+        .unwrap();
+    let optimizer_step = graph.cast(optimizer_step, DType::F32).unwrap();
+    let beta1_power = graph.pow(beta1, optimizer_step).unwrap();
+    let beta2_power = graph.pow(beta2, optimizer_step).unwrap();
+    let first_correction = graph.sub(one, beta1_power).unwrap();
+    let second_correction = graph.sub(one, beta2_power).unwrap();
+    let decay = graph.mul(learning_rate, weight_decay).unwrap();
+    let decay_factor = graph.sub(one, decay).unwrap();
+    let exclusions = optimizer.weight_decay_exclusions().collect::<BTreeSet<_>>();
+    let mut names = Vec::with_capacity(previous_parameters.len());
+    let mut outputs = Vec::with_capacity(previous_parameters.len());
+    for (name, previous_parameter) in previous_parameters {
+        let next_first = &next_first_moments[name];
+        let next_second = &next_second_moments[name];
+        assert_eq!(previous_parameter.dtype(), DType::F32);
+        assert_eq!(next_first.shape(), previous_parameter.shape());
+        assert_eq!(next_second.shape(), previous_parameter.shape());
+        let previous_parameter = graph.constant(previous_parameter.clone());
+        let next_first = graph.constant(next_first.clone());
+        let next_second = graph.constant(next_second.clone());
+        let corrected_first = graph.div(next_first, first_correction).unwrap();
+        let corrected_second = graph.div(next_second, second_correction).unwrap();
+        let root = graph.sqrt(corrected_second).unwrap();
+        let denominator = graph.add(root, eps).unwrap();
+        let normalized = graph.div(corrected_first, denominator).unwrap();
+        let decayed = if exclusions.contains(name.as_str()) {
+            previous_parameter
+        } else {
+            graph.mul(previous_parameter, decay_factor).unwrap()
+        };
+        let scaled = graph.mul(learning_rate, normalized).unwrap();
+        names.push(name.clone());
+        outputs.push(graph.sub(decayed, scaled).unwrap());
+    }
+    let scheduled = schedule_many(&graph, &outputs).unwrap();
+    let captured = CapturedSchedule::capture(&graph, &scheduled, &outputs).unwrap();
+    let realized = CapturedReplayExecutor::default()
+        .replay(
+            &captured,
+            &BTreeMap::new(),
+            CapturedReplayOptions::default(),
+        )
+        .unwrap();
+    names.into_iter().zip(realized.outputs).collect()
+}
+
+fn f32_tensor_map_first_bit_mismatch(
+    actual: &BTreeMap<String, TensorData>,
+    expected: &BTreeMap<String, TensorData>,
+) -> Option<String> {
+    if actual.keys().collect::<Vec<_>>() != expected.keys().collect::<Vec<_>>() {
+        return Some("tensor names differ".to_owned());
+    }
+    for (name, actual) in actual {
+        let expected = &expected[name];
+        if actual.shape() != expected.shape()
+            || actual.dtype() != DType::F32
+            || expected.dtype() != DType::F32
+        {
+            return Some(format!("{name} descriptor differs"));
+        }
+        for (coordinate, (actual, expected)) in
+            actual.values().iter().zip(expected.values()).enumerate()
+        {
+            if actual.to_bits() != expected.to_bits() {
+                return Some(format!(
+                    "{name}[{coordinate}] differs: actual={actual} ({:#010x}), expected={expected} ({:#010x})",
+                    actual.to_bits(),
+                    expected.to_bits()
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn apply_adamw_oracle_recurrence(
@@ -3922,7 +4337,7 @@ fn compiled_transformer_token_weighted_clipped_second_window_matches_numerical_o
         },
     ];
 
-    let optimizer = masked_config();
+    let optimizer = masked_config().with_clip_report();
     let model = TinyCausalTransformer::new(7).unwrap();
     let tied_identity = model.tokens.weight.id();
     let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
@@ -3942,6 +4357,7 @@ fn compiled_transformer_token_weighted_clipped_second_window_matches_numerical_o
             .unwrap();
         assert_eq!(step.loss_weight(), loss_weight);
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
+        assert_eq!(step.clip_report().is_some(), step.did_update());
     }
     assert_eq!(runtime.step_count(), ACCUMULATION_STEPS);
     assert_eq!(runtime.optimizer_step().unwrap(), 1);
@@ -3954,94 +4370,65 @@ fn compiled_transformer_token_weighted_clipped_second_window_matches_numerical_o
     let frontier_parameters = runtime.parameter_snapshots().unwrap();
     let frontier_first_moments = runtime.first_moment_snapshots().unwrap();
     let frontier_second_moments = runtime.second_moment_snapshots().unwrap();
-    let frontier_checkpoint = runtime.checkpoint().unwrap();
-    assert_eq!(
-        frontier_checkpoint.info().accumulated_token_count(),
-        Some(0)
-    );
     let oracle_model = TinyCausalTransformer::new(7).unwrap();
     oracle_model
         .load_trainable_parameters_exact(&frontier_parameters)
         .unwrap();
 
-    // A checkpoint-identical sibling advances the same replay/dropout cursor,
-    // snapshots each token-weighted contribution in the existing accumulator
-    // seam, and then discards it before the next replay. This captures all
-    // three microbatches without reaching clipping or AdamW and without
-    // changing the sequential runtime checked below.
-    let gradient_probe_model = TinyCausalTransformer::new(7).unwrap();
-    let mut gradient_probe_runtime =
-        CompiledAdamWPlan::compile_token_mean_module_with_dropout_from_checkpoint(
-            optimizer.clone(),
-            dropout_config(),
-            &gradient_probe_model,
-            &frontier_checkpoint,
-            build_masked_with_dropout_observations,
-        )
-        .unwrap()
-        .prepare_cpu()
-        .unwrap();
     let mut masks = Vec::with_capacity(ACCUMULATION_STEPS as usize);
     let mut raw_gradients = Vec::with_capacity(ACCUMULATION_STEPS as usize);
     let mut token_counts = Vec::with_capacity(ACCUMULATION_STEPS as usize);
-    for replay in ACCUMULATION_STEPS + 1..=2 * ACCUMULATION_STEPS {
-        let inputs = masked_batch(replay).into_compiled_inputs().unwrap();
-        let token_count = inputs[LOSS_MASK].to_vec_f64().into_iter().sum::<f64>() as u64;
-        let step = gradient_probe_runtime
-            .step(inputs, learning_rate())
-            .unwrap();
-        assert_eq!(step.loss_weight(), token_count);
-        assert!(!step.did_update());
-        masks.push(observed_dropout_masks(step.outputs()));
-        token_counts.push(token_count as f32);
-        assert_eq!(gradient_probe_runtime.accumulation_index().unwrap(), 1);
-        assert_eq!(
-            gradient_probe_runtime
-                .checkpoint()
-                .unwrap()
-                .info()
-                .accumulated_token_count(),
-            Some(token_count)
-        );
-        raw_gradients.push(
-            gradient_probe_runtime
-                .gradient_accumulator_snapshots()
-                .unwrap(),
-        );
-        assert!(gradient_probe_runtime.zero_grad().unwrap().did_discard());
-        assert_eq!(
-            gradient_probe_runtime
-                .checkpoint()
-                .unwrap()
-                .info()
-                .accumulated_token_count(),
-            Some(0)
-        );
-    }
-    assert_eq!(raw_gradients.len(), ACCUMULATION_STEPS as usize);
-    assert_eq!(token_counts.as_slice(), TOKEN_COUNTS.as_slice());
-    assert_eq!(token_counts.iter().sum::<f32>(), TOKEN_COUNT_TOTAL);
-    assert_eq!(gradient_probe_runtime.optimizer_step().unwrap(), 1);
-    assert_eq!(gradient_probe_runtime.accumulation_index().unwrap(), 0);
-    assert_eq!(
-        gradient_probe_runtime.dropout_block_counter().unwrap(),
-        Some(72)
-    );
-
     let mut observed_losses = Vec::with_capacity(ACCUMULATION_STEPS as usize);
     let mut observed_loss_weights = Vec::with_capacity(ACCUMULATION_STEPS as usize);
+    let mut observed_clip_report = None;
     for (index, replay) in (ACCUMULATION_STEPS + 1..=2 * ACCUMULATION_STEPS).enumerate() {
-        let step = runtime
-            .step(
-                masked_batch(replay).into_compiled_inputs().unwrap(),
-                learning_rate(),
-            )
+        let inputs = masked_batch(replay).into_compiled_inputs().unwrap();
+        let token_count = inputs[LOSS_MASK].to_vec_f64().into_iter().sum::<f64>() as u64;
+        // Probe this exact incoming frontier. Clearing only the sibling's
+        // retained prefix isolates the current contribution while preserving
+        // parameters, optimizer state, and the authenticated dropout cursor.
+        let checkpoint = runtime.checkpoint().unwrap();
+        let retained_prefix = checkpoint.info().accumulation_index();
+        let mut isolated = plan
+            .restore_checkpoint(&checkpoint)
+            .unwrap()
+            .prepare(&CpuSessionTarget)
             .unwrap();
-        assert_eq!(observed_dropout_masks(step.outputs()), masks[index]);
-        assert_eq!(step.loss_weight(), token_counts[index] as u64);
+        if retained_prefix != 0 {
+            let discarded = isolated.zero_grad().unwrap();
+            assert!(discarded.did_discard());
+            assert_eq!(discarded.discarded_microbatches(), retained_prefix);
+        }
+        let isolated_step = isolated.step(inputs.clone(), learning_rate()).unwrap();
+        assert!(!isolated_step.did_update());
+        assert!(isolated_step.clip_report().is_none());
+        assert_eq!(isolated_step.loss_weight(), token_count);
+        let isolated_contribution = isolated.gradient_accumulator_snapshots().unwrap();
+
+        let step = runtime.step(inputs, learning_rate()).unwrap();
+        assert_eq!(step.loss(), isolated_step.loss());
+        assert_eq!(step.outputs(), isolated_step.outputs());
+        let masks_for_replay = observed_dropout_masks(step.outputs());
+        assert_eq!(
+            masks_for_replay,
+            observed_dropout_masks(isolated_step.outputs())
+        );
+        masks.push(masks_for_replay);
+        token_counts.push(token_count as f32);
+        raw_gradients.push(isolated_contribution);
+        assert_eq!(step.loss_weight(), token_count);
         observed_losses.push(step.loss().scalar_at(0).as_f64());
         observed_loss_weights.push(step.loss_weight());
         assert_eq!(step.did_update(), replay == 2 * ACCUMULATION_STEPS);
+        if step.did_update() {
+            observed_clip_report = step.clip_report().copied();
+        } else {
+            assert!(step.clip_report().is_none());
+            assert_accumulated_gradient_recurrence(
+                &runtime.gradient_accumulator_snapshots().unwrap(),
+                &raw_gradients,
+            );
+        }
         let expected_token_count = if step.did_update() {
             0
         } else {
@@ -4056,6 +4443,9 @@ fn compiled_transformer_token_weighted_clipped_second_window_matches_numerical_o
             Some(expected_token_count)
         );
     }
+    assert_eq!(raw_gradients.len(), ACCUMULATION_STEPS as usize);
+    assert_eq!(token_counts.as_slice(), TOKEN_COUNTS.as_slice());
+    assert_eq!(token_counts.iter().sum::<f32>(), TOKEN_COUNT_TOTAL);
     assert_eq!(runtime.optimizer_step().unwrap(), 2);
     assert_eq!(runtime.accumulation_index().unwrap(), 0);
     assert_eq!(runtime.dropout_block_counter().unwrap(), Some(72));
@@ -4126,14 +4516,120 @@ fn compiled_transformer_token_weighted_clipped_second_window_matches_numerical_o
         "the global norm oracle must cover every canonical trainable parameter"
     );
     let max_norm = optimizer.max_gradient_norm().unwrap();
-    let (clipped_average, gradient_norm) = clip_gradient_window(&token_weighted_average, max_norm);
+    let (clipped_average, gradient_norm) =
+        clip_gradient_window(&token_weighted_average, &frontier_parameters, max_norm);
+    let (direct_graph_norm, captured_graph_norm) =
+        literal_compiled_clip_norm(&token_weighted_average, &frontier_parameters);
+    let accumulated_clip = literal_accumulated_compiled_clip_norm(
+        &raw_gradients,
+        &frontier_parameters,
+        TOKEN_COUNT_TOTAL,
+    );
+    let direct_accumulated_graph_norm = accumulated_clip.direct_norm;
+    let captured_accumulated_graph_norm = accumulated_clip.captured_norm;
     assert!(gradient_norm.is_finite());
     assert!(
         gradient_norm > max_norm,
         "the token-weighted second window must activate global clipping: norm={gradient_norm}, max_norm={max_norm}"
     );
-    let clip_scale = max_norm / gradient_norm.max(max_norm);
+    let clip_scale = graph_f32_div(max_norm, gradient_norm.max(max_norm));
     assert!(clip_scale.is_finite() && clip_scale > 0.0 && clip_scale < 1.0);
+    let observed_clip_report = observed_clip_report.unwrap();
+    assert_eq!(
+        observed_clip_report.applied_scale(),
+        graph_f32_div(
+            max_norm,
+            observed_clip_report.pre_clip_global_norm().max(max_norm)
+        ),
+        "clip report scale must be self-consistent with its observed norm"
+    );
+    assert_eq!(
+        direct_graph_norm,
+        captured_graph_norm,
+        "direct CPU and captured-interpreter evaluations of the rounded-average norm graph differ: host_recurrence={gradient_norm}, observed_report={}, direct_accumulated={direct_accumulated_graph_norm}, captured_accumulated={captured_accumulated_graph_norm}",
+        observed_clip_report.pre_clip_global_norm(),
+    );
+    assert_eq!(
+        direct_accumulated_graph_norm,
+        captured_accumulated_graph_norm,
+        "direct CPU and captured-interpreter evaluations of the Add/Add/Div norm graph differ: host_recurrence={gradient_norm}, observed_report={}, direct_rounded={direct_graph_norm}, captured_rounded={captured_graph_norm}",
+        observed_clip_report.pre_clip_global_norm(),
+    );
+    assert_eq!(
+        direct_graph_norm,
+        gradient_norm,
+        "rounded-average norm graph differs from the host recurrence: observed_report={}, captured_rounded={captured_graph_norm}, direct_accumulated={direct_accumulated_graph_norm}, captured_accumulated={captured_accumulated_graph_norm}",
+        observed_clip_report.pre_clip_global_norm()
+    );
+    assert_eq!(
+        direct_accumulated_graph_norm,
+        observed_clip_report.pre_clip_global_norm(),
+        "completed live clip report must match the literal Add/Add/Div production topology"
+    );
+    let norm_ulp_distance = observed_clip_report
+        .pre_clip_global_norm()
+        .to_bits()
+        .abs_diff(gradient_norm.to_bits());
+    assert_eq!(
+        norm_ulp_distance,
+        1,
+        "this fixture must retain the one-ULP distinction between the production Add/Add/Div topology and an artificial pre-rounded average: observed_report={}, host_recurrence={gradient_norm}, direct_rounded={direct_graph_norm}, captured_rounded={captured_graph_norm}, direct_accumulated={direct_accumulated_graph_norm}, captured_accumulated={captured_accumulated_graph_norm}",
+        observed_clip_report.pre_clip_global_norm()
+    );
+    assert_eq!(observed_clip_report.did_clip(), Some(true));
+    // A report-only match authenticates the report scale, a host-only match
+    // would expose a stale report, neither points upstream of clipping, and
+    // both means the two adjacent scales are update-equivalent after F32
+    // rounding. Every lane of both moment families participates.
+    let report_moments = reconstruct_adamw_moments(
+        &frontier_first_moments,
+        &frontier_second_moments,
+        &accumulated_clip.averaged,
+        observed_clip_report.applied_scale(),
+        &optimizer,
+    );
+    let host_moments = reconstruct_adamw_moments(
+        &frontier_first_moments,
+        &frontier_second_moments,
+        &accumulated_clip.averaged,
+        clip_scale,
+        &optimizer,
+    );
+    let report_first_mismatch =
+        f32_tensor_map_first_bit_mismatch(&next_first_moments, &report_moments.first_moments);
+    let report_second_mismatch =
+        f32_tensor_map_first_bit_mismatch(&next_second_moments, &report_moments.second_moments);
+    let host_first_mismatch =
+        f32_tensor_map_first_bit_mismatch(&next_first_moments, &host_moments.first_moments);
+    let host_second_mismatch =
+        f32_tensor_map_first_bit_mismatch(&next_second_moments, &host_moments.second_moments);
+    let report_matches = report_first_mismatch.is_none() && report_second_mismatch.is_none();
+    let host_matches = host_first_mismatch.is_none() && host_second_mismatch.is_none();
+    let update_classification = match (report_matches, host_matches) {
+        (true, false) => ClipScaleUpdateClassification::ReportOnly,
+        (false, true) => ClipScaleUpdateClassification::HostOnly,
+        (true, true) => ClipScaleUpdateClassification::Both,
+        (false, false) => ClipScaleUpdateClassification::Neither,
+    };
+    assert!(
+        report_matches,
+        "completed update is inconsistent with the authenticated clip report: classification={update_classification:?}, report_first_mismatch={report_first_mismatch:?}, report_second_mismatch={report_second_mismatch:?}, host_first_mismatch={host_first_mismatch:?}, host_second_mismatch={host_second_mismatch:?}, report_scale={}, host_scale={clip_scale}",
+        observed_clip_report.applied_scale()
+    );
+    let reconstructed_parameters = reconstruct_adamw_parameters_from_moments(
+        &frontier_parameters,
+        &next_first_moments,
+        &next_second_moments,
+        &optimizer,
+        2,
+        learning_rate,
+    );
+    let parameter_mismatch =
+        f32_tensor_map_first_bit_mismatch(&next_parameters, &reconstructed_parameters);
+    assert!(
+        parameter_mismatch.is_none(),
+        "observed AdamW moments do not reproduce the complete parameter transition bitwise: classification={update_classification:?}, mismatch={parameter_mismatch:?}"
+    );
     for (probe_index, probe) in PROBES.iter().enumerate() {
         let numerical_lanes = [
             numerical[0].gradients[probe_index] as f32,
@@ -4175,12 +4671,16 @@ fn compiled_transformer_token_weighted_clipped_second_window_matches_numerical_o
             );
         }
 
-        let numerical_average = ((numerical_contributions[0] + numerical_contributions[1])
-            + numerical_contributions[2])
-            / TOKEN_COUNT_TOTAL;
-        let average = ((actual_contributions[0] + actual_contributions[1])
-            + actual_contributions[2])
-            / TOKEN_COUNT_TOTAL;
+        let numerical_total = graph_f32_add(
+            graph_f32_add(numerical_contributions[0], numerical_contributions[1]),
+            numerical_contributions[2],
+        );
+        let numerical_average = graph_f32_div(numerical_total, TOKEN_COUNT_TOTAL);
+        let actual_total = graph_f32_add(
+            graph_f32_add(actual_contributions[0], actual_contributions[1]),
+            actual_contributions[2],
+        );
+        let average = graph_f32_div(actual_total, TOKEN_COUNT_TOTAL);
         assert!(
             average.is_finite() && numerical_average.is_finite(),
             "{} token-weighted gradient {}[{}] must be finite: captured={average}, numerical={numerical_average}",
@@ -4358,7 +4858,8 @@ fn compiled_transformer_recurrent_adamw_updates_match_analytic_reference() {
             })
             .collect::<Vec<_>>();
         let averaged = average_gradient_window(&gradients);
-        let (clipped, gradient_norm) = clip_gradient_window(&averaged, max_norm);
+        let (clipped, gradient_norm) =
+            clip_gradient_window(&averaged, &previous.parameters, max_norm);
         assert!(gradient_norm.is_finite());
         if window == 1 {
             assert!(

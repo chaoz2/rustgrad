@@ -924,6 +924,7 @@ pub struct CompiledAdamWConfig {
     gradient_accumulation_steps: u64,
     token_weight_mask_input: Option<String>,
     max_gradient_norm: Option<f32>,
+    clip_report: bool,
     loss_scale: f32,
     frozen_parameters: BTreeSet<String>,
     weight_decay_exclusions: BTreeSet<String>,
@@ -953,6 +954,7 @@ impl CompiledAdamWConfig {
             gradient_accumulation_steps: 1,
             token_weight_mask_input: None,
             max_gradient_norm: None,
+            clip_report: false,
             loss_scale: 1.0,
             frozen_parameters: BTreeSet::new(),
             weight_decay_exclusions: BTreeSet::new(),
@@ -1013,6 +1015,9 @@ impl CompiledAdamWConfig {
     /// norm inside the compiled graph. With gradient accumulation, clipping is
     /// applied once to the averaged window immediately before AdamW updates;
     /// individual microbatch gradients are never clipped independently.
+    /// The squared total is committed at F32 width before its square root so
+    /// interpreter and strict-native CPU overflow semantics are identical; that
+    /// storage boundary is part of the captured program identity.
     pub fn with_max_gradient_norm(mut self, max_norm: f32) -> Result<Self> {
         if !max_norm.is_finite() || max_norm <= 0.0 {
             return Err(training(
@@ -1021,6 +1026,17 @@ impl CompiledAdamWConfig {
         }
         self.max_gradient_norm = Some(max_norm);
         Ok(self)
+    }
+
+    /// Requests CPU step and partial-flush results to report the complete
+    /// pre-clip global gradient norm and the exact scale applied before AdamW.
+    /// Accumulation-only steps and empty flushes report no completed window.
+    /// Under [`CpuNonFinitePolicy::RejectTransition`], only reports belonging
+    /// to a committing full window or explicit partial flush participate in
+    /// admission. The default remains disabled and adds no graph outputs.
+    pub fn with_clip_report(mut self) -> Self {
+        self.clip_report = true;
+        self
     }
 
     /// Scales the differentiation root by a fixed finite factor, then
@@ -1187,6 +1203,10 @@ impl CompiledAdamWConfig {
         self.max_gradient_norm
     }
 
+    pub fn clip_report_enabled(&self) -> bool {
+        self.clip_report
+    }
+
     pub fn loss_scale(&self) -> f32 {
         self.loss_scale
     }
@@ -1219,6 +1239,7 @@ pub struct CompiledTrainingStepResult {
     outputs: BTreeMap<String, TensorData>,
     step: u64,
     capture_identity: u64,
+    clip_report: Option<CompiledAdamWClipReport>,
 }
 
 /// Detached outputs from one read-only evaluation of the live compiled
@@ -1702,6 +1723,47 @@ pub struct CompiledAdamWStepResult {
     loss_weight: u64,
 }
 
+/// Completed-window evidence for compiled global gradient clipping.
+///
+/// Both values are exact F32 results from the captured graph. The scale is
+/// one when clipping is disabled or the pre-clip norm is at or below the
+/// configured limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledAdamWClipReport {
+    pre_clip_global_norm_bits: u32,
+    applied_scale_bits: u32,
+}
+
+impl CompiledAdamWClipReport {
+    fn new(pre_clip_global_norm: f32, applied_scale: f32) -> Self {
+        Self {
+            pre_clip_global_norm_bits: pre_clip_global_norm.to_bits(),
+            applied_scale_bits: applied_scale.to_bits(),
+        }
+    }
+
+    pub fn pre_clip_global_norm(&self) -> f32 {
+        f32::from_bits(self.pre_clip_global_norm_bits)
+    }
+
+    pub fn applied_scale(&self) -> f32 {
+        f32::from_bits(self.applied_scale_bits)
+    }
+
+    /// Whether both captured values are finite.
+    pub fn is_finite(&self) -> bool {
+        self.pre_clip_global_norm().is_finite() && self.applied_scale().is_finite()
+    }
+
+    /// Whether clipping reduced this completed window's gradient.
+    ///
+    /// A non-finite report has no meaningful clipping outcome and returns
+    /// `None` while preserving its exact captured F32 bits for diagnosis.
+    pub fn did_clip(&self) -> Option<bool> {
+        self.is_finite().then(|| self.applied_scale() < 1.0)
+    }
+}
+
 impl CompiledAdamWStepResult {
     pub fn loss(&self) -> &TensorData {
         self.inner.loss()
@@ -1735,6 +1797,11 @@ impl CompiledAdamWStepResult {
         self.loss_weight
     }
 
+    /// Completed-window clipping evidence when reporting was requested.
+    pub fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
+        self.inner.clip_report.as_ref()
+    }
+
     pub fn did_update(&self) -> bool {
         self.accumulation_index == 0
     }
@@ -1760,6 +1827,12 @@ pub trait CompiledAdamWStep: CompiledTrainingStep {
     /// number of non-padding tokens in the replay.
     fn loss_weight(&self) -> u64 {
         1
+    }
+
+    /// Completed-window clipping evidence. Existing implementations and
+    /// programs compiled without the opt-in report return `None`.
+    fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
+        None
     }
 
     fn did_update(&self) -> bool {
@@ -1797,6 +1870,10 @@ impl CompiledAdamWStep for CompiledAdamWStepResult {
     fn loss_weight(&self) -> u64 {
         CompiledAdamWStepResult::loss_weight(self)
     }
+
+    fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
+        CompiledAdamWStepResult::clip_report(self)
+    }
 }
 
 /// One committed strict-native CPU AdamW step and its replay evidence.
@@ -1832,6 +1909,10 @@ impl NativeCpuCompiledAdamWStepResult {
 
     pub fn loss_weight(&self) -> u64 {
         self.inner.loss_weight()
+    }
+
+    pub fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
+        self.inner.clip_report()
     }
 
     pub fn did_update(&self) -> bool {
@@ -1877,6 +1958,10 @@ impl CompiledAdamWStep for NativeCpuCompiledAdamWStepResult {
     fn loss_weight(&self) -> u64 {
         self.inner.loss_weight()
     }
+
+    fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
+        self.inner.clip_report()
+    }
 }
 
 /// Outcome of explicitly discarding a compiled AdamW partial gradient window.
@@ -1902,6 +1987,7 @@ impl CompiledAdamWZeroGradResult {
 pub struct CompiledAdamWFlushResult {
     flushed_microbatches: u64,
     optimizer_step: u64,
+    clip_report: Option<CompiledAdamWClipReport>,
 }
 
 impl CompiledAdamWFlushResult {
@@ -1919,6 +2005,11 @@ impl CompiledAdamWFlushResult {
     pub fn optimizer_step(&self) -> u64 {
         self.optimizer_step
     }
+
+    /// Clipping evidence for a committed nonempty partial window.
+    pub fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
+        self.clip_report.as_ref()
+    }
 }
 
 /// Optimizer progress produced by one optional partial-window flush.
@@ -1928,6 +2019,10 @@ pub trait CompiledAdamWFlush {
     fn did_update(&self) -> bool;
 
     fn optimizer_step(&self) -> u64;
+
+    fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
+        None
+    }
 }
 
 impl CompiledAdamWFlush for CompiledAdamWFlushResult {
@@ -1941,6 +2036,10 @@ impl CompiledAdamWFlush for CompiledAdamWFlushResult {
 
     fn optimizer_step(&self) -> u64 {
         CompiledAdamWFlushResult::optimizer_step(self)
+    }
+
+    fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
+        CompiledAdamWFlushResult::clip_report(self)
     }
 }
 
@@ -1964,6 +2063,10 @@ impl NativeCpuCompiledAdamWFlushResult {
         self.inner.optimizer_step()
     }
 
+    pub fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
+        self.inner.clip_report()
+    }
+
     pub fn report(&self) -> Option<&NativeCpuRunReport> {
         self.report.as_ref()
     }
@@ -1980,6 +2083,10 @@ impl CompiledAdamWFlush for NativeCpuCompiledAdamWFlushResult {
 
     fn optimizer_step(&self) -> u64 {
         self.inner.optimizer_step()
+    }
+
+    fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
+        self.inner.clip_report()
     }
 }
 
@@ -2076,6 +2183,7 @@ impl AdamWProgress {
                 CompiledAdamWFlushResult {
                     flushed_microbatches: 0,
                     optimizer_step: self.optimizer_step,
+                    clip_report: None,
                 },
             ));
         }
@@ -2102,6 +2210,7 @@ impl AdamWProgress {
             CompiledAdamWFlushResult {
                 flushed_microbatches,
                 optimizer_step: next.optimizer_step,
+                clip_report: None,
             },
         ))
     }
@@ -2127,7 +2236,23 @@ trait CompiledOptimizerProgram {
         parameters: &BTreeMap<String, NodeId>,
         gradients: &BTreeMap<String, NodeId>,
         states: &BTreeMap<RecurrentStateKey, NodeId>,
-    ) -> Result<BTreeMap<RecurrentStateKey, NodeId>>;
+    ) -> Result<CompiledOptimizerLowering>;
+}
+
+#[derive(Clone, Copy)]
+struct CompiledAdamWClipNodes {
+    pre_clip_global_norm: NodeId,
+    applied_scale: NodeId,
+}
+
+struct CompiledOptimizerLowering {
+    updates: BTreeMap<RecurrentStateKey, NodeId>,
+    clip_report: Option<CompiledAdamWClipNodes>,
+}
+
+struct ClippedGradients {
+    gradients: BTreeMap<String, NodeId>,
+    report: Option<CompiledAdamWClipNodes>,
 }
 
 struct MomentumProgram {
@@ -2164,7 +2289,7 @@ impl CompiledOptimizerProgram for MomentumProgram {
         parameters: &BTreeMap<String, NodeId>,
         gradients: &BTreeMap<String, NodeId>,
         states: &BTreeMap<RecurrentStateKey, NodeId>,
-    ) -> Result<BTreeMap<RecurrentStateKey, NodeId>> {
+    ) -> Result<CompiledOptimizerLowering> {
         let momentum = scalar_f32(graph, self.config.momentum)?;
         let mut updates = BTreeMap::new();
         for (name, parameter) in parameters {
@@ -2179,7 +2304,10 @@ impl CompiledOptimizerProgram for MomentumProgram {
             updates.insert(momentum_key, next_momentum);
             updates.insert(RecurrentStateKey::parameter(name), next_parameter);
         }
-        Ok(updates)
+        Ok(CompiledOptimizerLowering {
+            updates,
+            clip_report: None,
+        })
     }
 }
 
@@ -2258,18 +2386,22 @@ impl CompiledOptimizerProgram for AdamWProgram {
         parameters: &BTreeMap<String, NodeId>,
         gradients: &BTreeMap<String, NodeId>,
         states: &BTreeMap<RecurrentStateKey, NodeId>,
-    ) -> Result<BTreeMap<RecurrentStateKey, NodeId>> {
+    ) -> Result<CompiledOptimizerLowering> {
         let learning_rate = lower_adamw_learning_rate(&self.config, graph, learning_rate, states)?;
         if self.config.gradient_accumulation_steps == 1 {
-            let gradients = clip_gradients_by_global_norm(&self.config, graph, gradients)?;
-            return lower_adamw_update_candidates(
+            let clipped = clip_gradients_by_global_norm(&self.config, graph, gradients)?;
+            let updates = lower_adamw_update_candidates(
                 &self.config,
                 graph,
                 learning_rate,
                 parameters,
-                &gradients,
+                &clipped.gradients,
                 states,
-            );
+            )?;
+            return Ok(CompiledOptimizerLowering {
+                updates,
+                clip_report: clipped.report,
+            });
         }
 
         let one_u64 = graph.full_with_dtype(Shape::from([]), Scalar::U(1), DType::U64)?;
@@ -2310,27 +2442,26 @@ impl CompiledOptimizerProgram for AdamWProgram {
         let mut averaged_gradients = BTreeMap::new();
         let mut accumulated_gradients = BTreeMap::new();
         for (name, gradient) in gradients {
-            let key =
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
             let gradient = match &weighted_count {
                 Some((batch_count, ..)) => graph.mul(*gradient, *batch_count)?,
                 None => *gradient,
             };
+            let key =
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
             let accumulated = graph.add(states[&key], gradient)?;
             let averaged = graph.div(accumulated, divisor)?;
             accumulated_gradients.insert(name.clone(), accumulated);
             averaged_gradients.insert(name.clone(), averaged);
         }
 
-        let averaged_gradients =
-            clip_gradients_by_global_norm(&self.config, graph, &averaged_gradients)?;
+        let clipped = clip_gradients_by_global_norm(&self.config, graph, &averaged_gradients)?;
 
         let candidates = lower_adamw_update_candidates(
             &self.config,
             graph,
             learning_rate,
             parameters,
-            &averaged_gradients,
+            &clipped.gradients,
             states,
         )?;
         let mut updates = BTreeMap::new();
@@ -2368,7 +2499,10 @@ impl CompiledOptimizerProgram for AdamWProgram {
             updates.insert(second_key, next_second);
             updates.insert(RecurrentStateKey::parameter(name), next_parameter);
         }
-        Ok(updates)
+        Ok(CompiledOptimizerLowering {
+            updates,
+            clip_report: clipped.report,
+        })
     }
 }
 
@@ -2405,33 +2539,98 @@ fn clip_gradients_by_global_norm(
     config: &CompiledAdamWConfig,
     graph: &mut Graph,
     gradients: &BTreeMap<String, NodeId>,
-) -> Result<BTreeMap<String, NodeId>> {
-    let Some(max_norm) = config.max_gradient_norm else {
-        return Ok(gradients.clone());
-    };
+) -> Result<ClippedGradients> {
+    if config.max_gradient_norm.is_none() && !config.clip_report {
+        return Ok(ClippedGradients {
+            gradients: gradients.clone(),
+            report: None,
+        });
+    }
+
+    let gradients = materialize_gradient_vector(graph, gradients)?;
 
     let mut squared_norms = Vec::with_capacity(gradients.len());
     for gradient in gradients.values() {
         let squared = graph.mul(*gradient, *gradient)?;
         squared_norms.push(graph.sum_all(squared)?);
     }
-    let mut squared_norms = squared_norms.into_iter();
-    let mut total = squared_norms
-        .next()
-        .ok_or_else(|| training("compiled AdamW has no gradients to clip"))?;
-    for squared_norm in squared_norms {
-        total = graph.add(total, squared_norm)?;
+    if squared_norms.len() == 1 {
+        // Graph reductions intentionally elide extent-one axes. A trailing
+        // positive zero keeps the single-parameter case on the same explicit
+        // F32 reduction boundary without changing this nonnegative sum.
+        squared_norms.push(scalar_f32(graph, 0.0)?);
     }
+    // Stack the stable per-parameter F32 subtotals and reduce them through one
+    // typed kernel. Its output storage is the exact commitment before `sqrt`:
+    // native replay cannot widen a left-deep scalar addition chain, and no
+    // scalar Contiguous fusion rehearsal can absorb the gradient graph.
+    let squared_norms = graph.stack_default(squared_norms)?;
+    let total = graph.sum_all(squared_norms)?;
     let norm = graph.sqrt(total)?;
-    let max_norm = scalar_f32(graph, max_norm)?;
-    // max(norm, limit) makes the scale exactly one below the limit, while a
-    // NaN norm remains the ordered lhs and therefore propagates through every
-    // gradient instead of being silently treated as finite.
-    let denominator = graph.maximum(norm, max_norm)?;
-    let scale = graph.div(max_norm, denominator)?;
-    gradients
-        .iter()
-        .map(|(name, gradient)| Ok((name.clone(), graph.mul(*gradient, scale)?)))
+    let scale = match config.max_gradient_norm {
+        Some(max_norm) => {
+            let max_norm = scalar_f32(graph, max_norm)?;
+            // max(norm, limit) makes the scale exactly one below the limit,
+            // while a NaN norm remains the ordered lhs and therefore
+            // propagates instead of being silently treated as finite.
+            let denominator = graph.maximum(norm, max_norm)?;
+            graph.div(max_norm, denominator)?
+        }
+        None => scalar_f32(graph, 1.0)?,
+    };
+    let gradients = if config.max_gradient_norm.is_some() {
+        gradients
+            .iter()
+            .map(|(name, gradient)| Ok((name.clone(), graph.mul(*gradient, scale)?)))
+            .collect::<Result<_>>()?
+    } else {
+        gradients.clone()
+    };
+    Ok(ClippedGradients {
+        gradients,
+        report: config.clip_report.then_some(CompiledAdamWClipNodes {
+            pre_clip_global_norm: norm,
+            applied_scale: scale,
+        }),
+    })
+}
+
+fn materialize_gradient_vector(
+    graph: &mut Graph,
+    gradients: &BTreeMap<String, NodeId>,
+) -> Result<BTreeMap<String, NodeId>> {
+    if gradients.is_empty() {
+        return Err(training("compiled AdamW has no gradients to materialize"));
+    }
+    let mut flattened = Vec::with_capacity(gradients.len().max(2));
+    let mut ranges = Vec::with_capacity(gradients.len());
+    let mut offset = 0usize;
+    for (name, gradient) in gradients {
+        let shape = graph.shape(*gradient)?.clone();
+        if graph.dtype(*gradient)? != DType::F32 {
+            return Err(training("compiled AdamW gradient must be F32"));
+        }
+        let elements = shape.numel()?;
+        let end = offset
+            .checked_add(elements)
+            .ok_or_else(|| training("compiled AdamW gradient vector overflow"))?;
+        flattened.push(graph.reshape(*gradient, [elements])?);
+        ranges.push((name.clone(), shape, offset, end));
+        offset = end;
+    }
+    if flattened.len() == 1 {
+        // Concat requires two inputs. One empty F32 leaf forces the same real
+        // materialization owner for a single parameter without adding a lane.
+        flattened.push(graph.constant(TensorData::new([0], Vec::<f32>::new())?));
+    }
+    let vector = graph.concat(flattened, 0)?;
+    ranges
+        .into_iter()
+        .map(|(name, shape, start, end)| {
+            let slice = graph.shrink(vector, vec![(start, end)])?;
+            let gradient = graph.reshape(slice, shape)?;
+            Ok((name, gradient))
+        })
         .collect()
 }
 
@@ -2527,6 +2726,7 @@ pub struct CompiledAdamWPlan {
     gradient_accumulation_steps: u64,
     token_weight_mask_input: Option<String>,
     max_gradient_norm: Option<f32>,
+    clip_report: bool,
     loss_scale: f32,
     progress: AdamWProgress,
     dropout: Option<CompiledDropoutState>,
@@ -2878,6 +3078,7 @@ pub struct CpuCompiledAdamW {
     gradient_accumulation_steps: u64,
     token_weight_mask_input: Option<String>,
     max_gradient_norm: Option<f32>,
+    clip_report: bool,
     loss_scale: f32,
     progress: AdamWProgress,
     dropout: Option<CompiledDropoutState>,
@@ -3282,6 +3483,7 @@ struct CompiledTrainingPlan {
     recurrent_capture: CapturedStatefulInference,
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
+    clip_report: bool,
     parameter_buffers: BTreeMap<String, u64>,
     optimizer_buffers: BTreeMap<RecurrentStateKey, u64>,
     workload_buffers: BTreeMap<RecurrentStateKey, u64>,
@@ -3300,6 +3502,7 @@ struct CompiledAdamWAuxiliaryPlan {
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
     capture_identity: u64,
+    clip_report: bool,
 }
 
 #[derive(Clone)]
@@ -3324,6 +3527,7 @@ struct CpuCompiledTrainingProgram {
     cursor: MixedReplayCursor,
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
+    clip_report: bool,
     parameter_buffers: BTreeMap<String, u64>,
     optimizer_buffers: BTreeMap<RecurrentStateKey, u64>,
     workload_buffers: BTreeMap<RecurrentStateKey, u64>,
@@ -3558,7 +3762,10 @@ impl CompiledTrainingPlan {
             .cloned()
             .zip(gradients)
             .collect::<BTreeMap<_, _>>();
-        let mut updates = optimizer.lower_updates(
+        let CompiledOptimizerLowering {
+            mut updates,
+            clip_report,
+        } = optimizer.lower_updates(
             &mut graph,
             learning_rate,
             &inputs,
@@ -3577,8 +3784,12 @@ impl CompiledTrainingPlan {
         {
             return Err(training("compiled optimizer successor set mismatch"));
         }
+        let clip_requested = clip_report
+            .into_iter()
+            .flat_map(|report| [report.pre_clip_global_norm, report.applied_scale]);
         let public_requested = std::iter::once(loss)
             .chain(outputs.values().copied())
+            .chain(clip_requested)
             .collect::<Vec<_>>();
         let public_requested = materialize_compiled_public_aliases(&mut graph, &public_requested)?;
         let state_links = specs
@@ -3597,7 +3808,8 @@ impl CompiledTrainingPlan {
         )
         .map_err(captured_inference_error)?;
 
-        let mut requested = Vec::with_capacity(1 + outputs.len() + updates.len());
+        let public_output_count = public_requested.len();
+        let mut requested = Vec::with_capacity(public_output_count + updates.len());
         requested.extend(public_requested);
         for spec in &specs {
             requested.push(updates[&spec.key]);
@@ -3613,9 +3825,9 @@ impl CompiledTrainingPlan {
             )));
         }
         let mut captured =
-            CapturedSchedule::capture(&graph, &pure, &requested[..1 + outputs.len()])
+            CapturedSchedule::capture(&graph, &pure, &requested[..public_output_count])
                 .map_err(replay_error)?;
-        if captured.requested.len() != 1 + outputs.len() {
+        if captured.requested.len() != public_output_count {
             return Err(training("compiled capture output count mismatch"));
         }
 
@@ -3665,6 +3877,7 @@ impl CompiledTrainingPlan {
             recurrent_capture,
             inputs: optimizer.inputs().clone(),
             output_names,
+            clip_report: clip_report.is_some(),
             parameter_buffers,
             optimizer_buffers,
             workload_buffers,
@@ -3878,6 +4091,7 @@ impl CompiledTrainingPlan {
             cursor,
             inputs: self.inputs.clone(),
             output_names: self.output_names.clone(),
+            clip_report: self.clip_report,
             parameter_buffers: self.parameter_buffers.clone(),
             optimizer_buffers: self.optimizer_buffers.clone(),
             workload_buffers: self.workload_buffers.clone(),
@@ -3984,7 +4198,7 @@ impl CompiledAdamWAuxiliaryPlan {
                 .ok_or_else(|| training("compiled partial flush accumulator is absent"))?;
             gradients.insert(name.clone(), graph.div(accumulator, divisor)?);
         }
-        let gradients = clip_gradients_by_global_norm(config, &mut graph, &gradients)?;
+        let clipped = clip_gradients_by_global_norm(config, &mut graph, &gradients)?;
         let learning_rate =
             lower_adamw_learning_rate(config, &mut graph, learning_rate, &state_nodes)?;
         let mut updates = lower_adamw_update_candidates(
@@ -3992,7 +4206,7 @@ impl CompiledAdamWAuxiliaryPlan {
             &mut graph,
             learning_rate,
             &parameters,
-            &gradients,
+            &clipped.gradients,
             &state_nodes,
         )?;
         // Token-weighted flush divides by the retained count instead of the
@@ -4044,14 +4258,23 @@ impl CompiledAdamWAuxiliaryPlan {
             .iter()
             .map(|(input, _, value, _, _)| (input.clone(), value.clone()))
             .collect();
-        let recurrent_capture =
-            CapturedStatefulInference::from_graph(&graph, &[], &state_links, initial_state)
-                .map_err(captured_inference_error)?;
-
-        let requested = specs
-            .iter()
-            .map(|(_, key, ..)| updates[key])
+        let clip_requested = clipped
+            .report
+            .into_iter()
+            .flat_map(|report| [report.pre_clip_global_norm, report.applied_scale])
             .collect::<Vec<_>>();
+        let clip_requested = materialize_compiled_public_aliases(&mut graph, &clip_requested)?;
+        let recurrent_capture = CapturedStatefulInference::from_graph(
+            &graph,
+            &clip_requested,
+            &state_links,
+            initial_state,
+        )
+        .map_err(captured_inference_error)?;
+
+        let clip_output_count = clip_requested.len();
+        let mut requested = clip_requested;
+        requested.extend(specs.iter().map(|(_, key, ..)| updates[key]));
         for node in &requested {
             checked_descriptor(graph.shape(*node)?, graph.dtype(*node)?)?;
         }
@@ -4062,7 +4285,9 @@ impl CompiledAdamWAuxiliaryPlan {
                 item.node.index()
             )));
         }
-        let mut captured = CapturedSchedule::capture(&graph, &pure, &[]).map_err(replay_error)?;
+        let mut captured =
+            CapturedSchedule::capture(&graph, &pure, &requested[..clip_output_count])
+                .map_err(replay_error)?;
         let state_bindings = collect_state_bindings(&pure, &state_by_input)?;
         let pure = bind_schedule_states(pure, state_bindings).map_err(schedule_error)?;
         let mut effects = EffectGraph::default();
@@ -4115,6 +4340,7 @@ impl CompiledAdamWAuxiliaryPlan {
                 .map(|(input, key, ..)| (input, key))
                 .collect(),
             capture_identity,
+            clip_report: clipped.report.is_some(),
         })
     }
 
@@ -4270,6 +4496,7 @@ impl CompiledAdamWAuxiliaryPlan {
                 .map(|(input, key, ..)| (input, key))
                 .collect(),
             capture_identity,
+            clip_report: false,
         })
     }
 
@@ -4569,6 +4796,25 @@ fn evaluation_result(
     })
 }
 
+fn take_compiled_clip_report(
+    values: &mut impl Iterator<Item = TensorData>,
+    enabled: bool,
+) -> Option<CompiledAdamWClipReport> {
+    enabled.then(|| {
+        let norm = values
+            .next()
+            .expect("compiled clip-report norm cardinality was authenticated");
+        let scale = values
+            .next()
+            .expect("compiled clip-report scale cardinality was authenticated");
+        debug_assert_eq!(norm.shape(), &Shape::from([]));
+        debug_assert_eq!(norm.dtype(), DType::F32);
+        debug_assert_eq!(scale.shape(), &Shape::from([]));
+        debug_assert_eq!(scale.dtype(), DType::F32);
+        CompiledAdamWClipReport::new(norm.values()[0], scale.values()[0])
+    })
+}
+
 impl CpuCompiledTrainingProgram {
     fn prepare_native(
         &self,
@@ -4622,6 +4868,7 @@ impl CpuCompiledTrainingProgram {
             inputs,
             Some(learning_rate),
             CpuNonFinitePolicy::Propagate,
+            true,
             injected_failure,
         )
     }
@@ -4631,6 +4878,7 @@ impl CpuCompiledTrainingProgram {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: Option<TensorData>,
         non_finite_policy: CpuNonFinitePolicy,
+        validate_clip_report: bool,
         injected_failure: Option<u64>,
     ) -> Result<CompiledTrainingStepResult> {
         validate_training_inputs(&self.inputs, &inputs)?;
@@ -4645,6 +4893,8 @@ impl CpuCompiledTrainingProgram {
         if let Some(learning_rate) = learning_rate {
             provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
         }
+        let clip_report = self.clip_report;
+        let clip_report_start = 1 + self.output_names.len();
         let replay = self
             .capture
             .replay_recurrent_checked(
@@ -4653,27 +4903,39 @@ impl CpuCompiledTrainingProgram {
                 &provided,
                 injected_failure,
                 |outputs, successors| {
-                    validate_staged_transition(outputs, successors, non_finite_policy, true)
+                    validate_staged_transition(outputs, successors, non_finite_policy, true)?;
+                    validate_staged_clip_report(
+                        outputs,
+                        clip_report_start,
+                        clip_report && validate_clip_report,
+                        non_finite_policy,
+                    )
                 },
             )
             .map_err(replay_error)?;
-        debug_assert_eq!(replay.outputs.len(), 1 + self.output_names.len());
+        debug_assert_eq!(
+            replay.outputs.len(),
+            1 + self.output_names.len() + usize::from(self.clip_report) * 2
+        );
         let mut outputs = replay.outputs.into_iter();
         let loss = outputs
             .next()
             .expect("compiled output cardinality was validated before publication");
-        let outputs = self
+        let named_outputs = self
             .output_names
             .iter()
             .cloned()
-            .zip(outputs)
+            .zip(outputs.by_ref())
             .collect::<BTreeMap<_, _>>();
+        let clip_report = take_compiled_clip_report(&mut outputs, self.clip_report);
+        debug_assert!(outputs.next().is_none());
         self.step = next_step;
         Ok(CompiledTrainingStepResult {
             loss,
-            outputs,
+            outputs: named_outputs,
             step: self.step,
             capture_identity: self.cursor.capture_identity(),
+            clip_report,
         })
     }
 
@@ -4682,6 +4944,7 @@ impl CpuCompiledTrainingProgram {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: Option<TensorData>,
         non_finite_policy: CpuNonFinitePolicy,
+        validate_clip_report: bool,
         native: NativeReplayContext<'_>,
         injected_failure: Option<u64>,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
@@ -4698,6 +4961,8 @@ impl CpuCompiledTrainingProgram {
             provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
         }
         let started = Instant::now();
+        let clip_report = self.clip_report;
+        let clip_report_start = 1 + self.output_names.len();
         let replay = self
             .capture
             .replay_recurrent_native_checked(
@@ -4707,7 +4972,13 @@ impl CpuCompiledTrainingProgram {
                 native,
                 injected_failure,
                 |outputs, successors| {
-                    validate_staged_transition(outputs, successors, non_finite_policy, true)
+                    validate_staged_transition(outputs, successors, non_finite_policy, true)?;
+                    validate_staged_clip_report(
+                        outputs,
+                        clip_report_start,
+                        clip_report && validate_clip_report,
+                        non_finite_policy,
+                    )
                 },
             )
             .map_err(replay_error)?;
@@ -4721,19 +4992,30 @@ impl CpuCompiledTrainingProgram {
             next_step,
             started.elapsed(),
         );
-        debug_assert_eq!(replay.outputs.len(), 1 + self.output_names.len());
+        debug_assert_eq!(
+            replay.outputs.len(),
+            1 + self.output_names.len() + usize::from(self.clip_report) * 2
+        );
         let mut outputs = replay.outputs.into_iter();
         let loss = outputs
             .next()
             .expect("compiled output cardinality was validated before publication");
-        let outputs = self.output_names.iter().cloned().zip(outputs).collect();
+        let named_outputs = self
+            .output_names
+            .iter()
+            .cloned()
+            .zip(outputs.by_ref())
+            .collect();
+        let clip_report = take_compiled_clip_report(&mut outputs, self.clip_report);
+        debug_assert!(outputs.next().is_none());
         self.step = next_step;
         Ok((
             CompiledTrainingStepResult {
                 loss,
-                outputs,
+                outputs: named_outputs,
                 step: self.step,
                 capture_identity: self.cursor.capture_identity(),
+                clip_report,
             },
             report,
         ))
@@ -4771,6 +5053,7 @@ impl CpuCompiledTrainingProgram {
             recurrent_capture: self.recurrent_capture.clone(),
             inputs: self.inputs.clone(),
             output_names: self.output_names.clone(),
+            clip_report: self.clip_report,
             parameter_buffers: self.parameter_buffers.clone(),
             optimizer_buffers: self.optimizer_buffers.clone(),
             workload_buffers: self.workload_buffers.clone(),
@@ -5014,8 +5297,9 @@ impl CpuCompiledTrainingProgram {
         learning_rate: Option<TensorData>,
         non_finite_policy: CpuNonFinitePolicy,
         injected_failure: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<Option<CompiledAdamWClipReport>> {
         let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
+        let clip_report = transition.clip_report;
         let replay = transition
             .capture
             .replay_recurrent_checked(
@@ -5024,11 +5308,18 @@ impl CpuCompiledTrainingProgram {
                 &prepared.provided,
                 injected_failure,
                 |outputs, successors| {
-                    validate_staged_transition(outputs, successors, non_finite_policy, false)
+                    validate_staged_transition(outputs, successors, non_finite_policy, false)?;
+                    validate_staged_clip_report(outputs, 0, clip_report, non_finite_policy)
                 },
             )
             .map_err(replay_error)?;
-        debug_assert!(replay.outputs.is_empty());
+        debug_assert_eq!(
+            replay.outputs.len(),
+            usize::from(transition.clip_report) * 2
+        );
+        let mut outputs = replay.outputs.into_iter();
+        let clip_report = take_compiled_clip_report(&mut outputs, transition.clip_report);
+        debug_assert!(outputs.next().is_none());
         #[cfg(debug_assertions)]
         {
             let mut committed = replay.committed.clone();
@@ -5036,7 +5327,7 @@ impl CpuCompiledTrainingProgram {
             debug_assert_eq!(committed, prepared.cursor.frontier());
         }
         self.cursor = prepared.next_main_cursor;
-        Ok(())
+        Ok(clip_report)
     }
 
     fn prepare_native_auxiliary_transition(
@@ -5083,9 +5374,10 @@ impl CpuCompiledTrainingProgram {
         native: NativeReplayContext<'_>,
         successful_invocation: u64,
         injected_failure: Option<u64>,
-    ) -> Result<NativeCpuRunReport> {
+    ) -> Result<(Option<CompiledAdamWClipReport>, NativeCpuRunReport)> {
         let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
         let started = Instant::now();
+        let clip_report = transition.clip_report;
         let replay = transition
             .capture
             .replay_recurrent_native_checked(
@@ -5095,11 +5387,18 @@ impl CpuCompiledTrainingProgram {
                 native,
                 injected_failure,
                 |outputs, successors| {
-                    validate_staged_transition(outputs, successors, non_finite_policy, false)
+                    validate_staged_transition(outputs, successors, non_finite_policy, false)?;
+                    validate_staged_clip_report(outputs, 0, clip_report, non_finite_policy)
                 },
             )
             .map_err(replay_error)?;
-        debug_assert!(replay.outputs.is_empty());
+        debug_assert_eq!(
+            replay.outputs.len(),
+            usize::from(transition.clip_report) * 2
+        );
+        let mut outputs = replay.outputs.into_iter();
+        let clip_report = take_compiled_clip_report(&mut outputs, transition.clip_report);
+        debug_assert!(outputs.next().is_none());
         let native = replay
             .native_trace
             .as_ref()
@@ -5117,7 +5416,7 @@ impl CpuCompiledTrainingProgram {
             debug_assert_eq!(committed, prepared.cursor.frontier());
         }
         self.cursor = prepared.next_main_cursor;
-        Ok(report)
+        Ok((clip_report, report))
     }
 
     fn snapshots(&self, buffers: &BTreeMap<String, u64>) -> Result<BTreeMap<String, TensorData>> {
@@ -5296,6 +5595,7 @@ impl CompiledAdamWPlan {
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let token_weight_mask_input = config.token_weight_mask_input.clone();
         let max_gradient_norm = config.max_gradient_norm;
+        let clip_report = config.clip_report;
         let loss_scale = config.loss_scale;
         let host_token_inputs = config.host_token_inputs.clone();
         let frozen_parameters = config.frozen_parameters.clone();
@@ -5322,6 +5622,7 @@ impl CompiledAdamWPlan {
             gradient_accumulation_steps,
             token_weight_mask_input,
             max_gradient_norm,
+            clip_report,
             loss_scale,
             progress: AdamWProgress::INITIAL,
             dropout: None,
@@ -5546,6 +5847,7 @@ impl CompiledAdamWPlan {
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let token_weight_mask_input = config.token_weight_mask_input.clone();
         let max_gradient_norm = config.max_gradient_norm;
+        let clip_report = config.clip_report;
         let loss_scale = config.loss_scale;
         let host_token_inputs = config.host_token_inputs.clone();
         let frozen_parameters = config.frozen_parameters.clone();
@@ -5592,6 +5894,7 @@ impl CompiledAdamWPlan {
             gradient_accumulation_steps,
             token_weight_mask_input,
             max_gradient_norm,
+            clip_report,
             loss_scale,
             progress: AdamWProgress::INITIAL,
             dropout: Some(dropout),
@@ -5892,6 +6195,7 @@ impl CompiledAdamWPlan {
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             token_weight_mask_input: self.token_weight_mask_input.clone(),
             max_gradient_norm: self.max_gradient_norm,
+            clip_report: self.clip_report,
             loss_scale: self.loss_scale,
             progress: self.progress,
             dropout: self.dropout,
@@ -5937,6 +6241,11 @@ impl CompiledAdamWPlan {
     /// Renders the compiled program for strict Metal admission without
     /// creating device resources.
     pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
+        if self.clip_report {
+            return Err(training(
+                "compiled AdamW clip reporting is currently CPU-only",
+            ));
+        }
         if self.token_weight_mask_input.is_some() {
             return Err(training(
                 "compiled AdamW token-weighted accumulation is currently CPU-only",
@@ -5998,6 +6307,10 @@ impl CompiledAdamWPlan {
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
         self.max_gradient_norm
+    }
+
+    pub fn clip_report_enabled(&self) -> bool {
+        self.clip_report
     }
 
     pub fn loss_scale(&self) -> f32 {
@@ -6773,6 +7086,7 @@ impl CpuCompiledAdamW {
             inputs,
             learning_rate,
             self.non_finite_policy,
+            next.accumulation_index == 0,
             injected_failure,
         )?;
         result.step = next.replay_step;
@@ -6820,6 +7134,10 @@ impl CpuCompiledAdamW {
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
         self.max_gradient_norm
+    }
+
+    pub fn clip_report_enabled(&self) -> bool {
+        self.clip_report
     }
 
     pub fn loss_scale(&self) -> f32 {
@@ -6904,12 +7222,13 @@ impl CpuCompiledAdamW {
             .zero_grad
             .as_ref()
             .ok_or_else(|| training("compiled AdamW zero-grad capture is absent"))?;
-        self.inner.replay_auxiliary_transition(
+        let clip_report = self.inner.replay_auxiliary_transition(
             transition,
             None,
             CpuNonFinitePolicy::Propagate,
             injected_failure,
         )?;
+        debug_assert!(clip_report.is_none());
         self.progress = next;
         Ok(result)
     }
@@ -6946,7 +7265,7 @@ impl CpuCompiledAdamW {
         if let Some(learning_rate) = &learning_rate {
             validate_learning_rate(learning_rate)?;
         }
-        let (next, result) = self
+        let (next, mut result) = self
             .progress
             .flush_partial(self.gradient_accumulation_steps)?;
         if !result.did_update() {
@@ -6959,7 +7278,7 @@ impl CpuCompiledAdamW {
             .partial_flush
             .as_ref()
             .ok_or_else(|| training("compiled AdamW partial flush capture is absent"))?;
-        self.inner.replay_auxiliary_transition(
+        result.clip_report = self.inner.replay_auxiliary_transition(
             transition,
             learning_rate,
             self.non_finite_policy,
@@ -7020,6 +7339,7 @@ impl CpuCompiledAdamW {
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             token_weight_mask_input: self.token_weight_mask_input.clone(),
             max_gradient_norm: self.max_gradient_norm,
+            clip_report: self.clip_report,
             loss_scale: self.loss_scale,
             progress: self.progress,
             dropout: self.dropout,
@@ -7252,6 +7572,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             inputs,
             learning_rate,
             self.inner.non_finite_policy,
+            next.accumulation_index == 0,
             NativeReplayContext::new(self.executor, &mut self.main_replay),
             injected_failure,
         )?;
@@ -7331,7 +7652,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         if let Some(learning_rate) = &learning_rate {
             validate_learning_rate(learning_rate)?;
         }
-        let (next, result) = self
+        let (next, mut result) = self
             .inner
             .progress
             .flush_partial(self.inner.gradient_accumulation_steps)?;
@@ -7357,7 +7678,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .partial_flush_replay
             .as_mut()
             .ok_or_else(|| training("compiled native CPU partial flush preparation is absent"))?;
-        let report = self.inner.inner.replay_auxiliary_transition_native(
+        let (clip_report, report) = self.inner.inner.replay_auxiliary_transition_native(
             transition,
             learning_rate,
             self.inner.non_finite_policy,
@@ -7365,6 +7686,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             successful_invocation,
             injected_failure,
         )?;
+        result.clip_report = clip_report;
         self.inner.progress = next;
         self.successful_flushes = successful_invocation;
         Ok(NativeCpuCompiledAdamWFlushResult {
@@ -7453,7 +7775,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .zero_grad_replay
             .as_mut()
             .ok_or_else(|| training("compiled native CPU zero-grad preparation is absent"))?;
-        self.inner.inner.replay_auxiliary_transition_native(
+        let (clip_report, _) = self.inner.inner.replay_auxiliary_transition_native(
             transition,
             None,
             CpuNonFinitePolicy::Propagate,
@@ -7461,6 +7783,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             successful_invocation,
             injected_failure,
         )?;
+        debug_assert!(clip_report.is_none());
         self.inner.progress = next;
         self.successful_zero_grads = successful_invocation;
         Ok(result)
@@ -7859,10 +8182,13 @@ where
 }
 
 fn adamw_step_result(
-    inner: CompiledTrainingStepResult,
+    mut inner: CompiledTrainingStepResult,
     progress: AdamWProgress,
     loss_weight: u64,
 ) -> CompiledAdamWStepResult {
+    if progress.accumulation_index != 0 {
+        inner.clip_report = None;
+    }
     CompiledAdamWStepResult {
         inner,
         optimizer_step: progress.optimizer_step,
@@ -8343,6 +8669,7 @@ impl MetalCompiledAdamW {
                 outputs,
                 step: self.progress.replay_step,
                 capture_identity: self.inner.program_identity,
+                clip_report: None,
             },
             self.progress,
             1,
@@ -9335,6 +9662,30 @@ fn validate_staged_transition(
     Ok(())
 }
 
+fn validate_staged_clip_report(
+    outputs: &[TensorData],
+    start: usize,
+    enabled: bool,
+    policy: CpuNonFinitePolicy,
+) -> std::result::Result<(), String> {
+    if !enabled || policy == CpuNonFinitePolicy::Propagate {
+        return Ok(());
+    }
+    let report = outputs
+        .get(start..start + 2)
+        .ok_or_else(|| "compiled CPU clip-report output inventory differs".to_owned())?;
+    if report
+        .iter()
+        .any(|value| value.shape() != &Shape::from([]) || value.dtype() != DType::F32)
+    {
+        return Err("compiled CPU clip report must contain rank-zero F32 values".to_owned());
+    }
+    if has_non_finite_f32(report.iter()) {
+        return Err("compiled CPU transition has a non-finite clip report".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_finite_tensors<'a>(
     tensors: impl IntoIterator<Item = &'a TensorData>,
     role: &str,
@@ -10134,6 +10485,9 @@ mod tests {
             .unwrap()
             .with_gradient_accumulation(2)
             .unwrap()
+            .with_max_gradient_norm(1.0)
+            .unwrap()
+            .with_clip_report()
             .with_input("x", [], DType::F32)
             .unwrap();
         let parameter = TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap();
@@ -10158,6 +10512,85 @@ mod tests {
         let finite = TensorData::new([2], vec![-0.0, f32::from_bits(1)]).unwrap();
         assert!(validate_finite_tensors([&empty, &finite], "fixture").is_ok());
         assert!(validate_finite_tensors([&TensorData::scalar(f32::INFINITY)], "fixture",).is_err());
+    }
+
+    #[test]
+    fn clip_report_extraction_preserves_exact_non_finite_f32_bits() {
+        let norm_bits = 0x7f80_0123;
+        let scale_bits = 0x7fc0_4567;
+        let mut values = [
+            TensorData::scalar(f32::from_bits(norm_bits)),
+            TensorData::scalar(f32::from_bits(scale_bits)),
+        ]
+        .into_iter();
+        let report = take_compiled_clip_report(&mut values, true).unwrap();
+        assert_eq!(report.pre_clip_global_norm().to_bits(), norm_bits);
+        assert_eq!(report.applied_scale().to_bits(), scale_bits);
+        assert!(!report.is_finite());
+        assert_eq!(report.did_clip(), None);
+        assert!(values.next().is_none());
+    }
+
+    #[test]
+    fn global_norm_commits_through_stacked_typed_f32_sum() {
+        let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_clip_report();
+        let mut graph = Graph::new();
+        let left = graph.input_dtype("left", [2], DType::F32);
+        let clipped = clip_gradients_by_global_norm(
+            &config,
+            &mut graph,
+            &BTreeMap::from([("left".into(), left)]),
+        )
+        .unwrap();
+        let committed_gradient = clipped.gradients["left"];
+        let gradient_owner = crate::rangeify::computed_view(&graph, committed_gradient)
+            .unwrap()
+            .source;
+        assert!(matches!(
+            graph.op(gradient_owner).unwrap(),
+            Op::Concat { axis: 0, .. }
+        ));
+        let norm = clipped.report.unwrap().pre_clip_global_norm;
+        let Op::Unary {
+            op: crate::UnaryOp::Sqrt,
+            input: committed,
+        } = graph.op(norm).unwrap()
+        else {
+            panic!("global norm must end in sqrt");
+        };
+        let Op::Reduce {
+            input: stacked,
+            kind: crate::ReduceKind::Sum,
+            accumulator: DType::F32,
+            ..
+        } = graph.op(*committed).unwrap()
+        else {
+            panic!("global norm must consume a typed F32 sum");
+        };
+        assert_eq!(graph.dtype(*committed).unwrap(), DType::F32);
+        assert!(matches!(
+            graph.op(*stacked).unwrap(),
+            Op::Concat { axis: 0, .. }
+        ));
+        let Op::Concat { inputs, .. } = graph.op(*stacked).unwrap() else {
+            unreachable!();
+        };
+        let parameter_sum = crate::rangeify::computed_view(&graph, inputs[0])
+            .unwrap()
+            .source;
+        let Op::Reduce { input: squared, .. } = graph.op(parameter_sum).unwrap() else {
+            panic!("stacked norm input must be one parameter reduction");
+        };
+        assert!(matches!(
+            graph.op(*squared).unwrap(),
+            Op::Binary {
+                op: crate::BinaryOp::Mul,
+                lhs,
+                rhs,
+            } if lhs == &committed_gradient && rhs == &committed_gradient
+        ));
     }
 
     #[test]
@@ -10281,6 +10714,174 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_clip_report_rejects_atomically_and_retries_on_both_cpu_paths() {
+        let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+            .unwrap()
+            .with_max_gradient_norm(1.0)
+            .unwrap()
+            .with_clip_report()
+            .with_input("x", [], DType::F32)
+            .unwrap();
+        let plan = CompiledAdamWPlan::compile(
+            config,
+            [TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap()],
+            |graph, inputs, parameters| {
+                Ok((
+                    graph.mul(parameters["weight"], inputs["x"])?,
+                    BTreeMap::new(),
+                ))
+            },
+        )
+        .unwrap();
+        let mut interpreted = plan.prepare(&rejecting_cpu_target()).unwrap();
+        let before = interpreted.checkpoint().unwrap();
+        let error = interpreted
+            .step(scalar_batch(f32::MAX), TensorData::scalar(0.01))
+            .expect_err("non-finite interpreted clip report must reject");
+        assert!(error.to_string().contains("non-finite clip report"));
+        assert_eq!(interpreted.checkpoint().unwrap(), before);
+        assert_eq!(interpreted.step_count(), 0);
+
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor)
+            .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+        let mut native = target.prepare(&plan).unwrap();
+        let error = match native.step(scalar_batch(f32::MAX), TensorData::scalar(0.01)) {
+            Ok(_) => panic!("non-finite native clip report must reject"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("non-finite clip report"));
+        assert_eq!(native.checkpoint().unwrap(), before);
+        assert_eq!(native.successful_steps, 0);
+
+        let interpreted_step = interpreted
+            .step(scalar_batch(3.0), TensorData::scalar(0.01))
+            .unwrap();
+        let native_step = native
+            .step(scalar_batch(3.0), TensorData::scalar(0.01))
+            .unwrap();
+        let report = interpreted_step.clip_report().unwrap();
+        assert_eq!(report.pre_clip_global_norm(), 3.0);
+        assert_eq!(report.applied_scale(), 1.0 / 3.0);
+        assert!(report.is_finite());
+        assert_eq!(report.did_clip(), Some(true));
+        assert_eq!(native_step.clip_report(), Some(report));
+        assert_eq!(native.successful_steps, 1);
+        assert_eq!(
+            native.checkpoint().unwrap(),
+            interpreted.checkpoint().unwrap()
+        );
+    }
+
+    #[test]
+    fn unreported_global_norm_overflow_matches_both_cpu_paths() {
+        let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+            .unwrap()
+            .with_max_gradient_norm(1.0)
+            .unwrap()
+            .with_input("x", [], DType::F32)
+            .unwrap();
+        let plan = CompiledAdamWPlan::compile(
+            config,
+            [TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap()],
+            |graph, inputs, parameters| {
+                Ok((
+                    graph.mul(parameters["weight"], inputs["x"])?,
+                    BTreeMap::new(),
+                ))
+            },
+        )
+        .unwrap();
+        let mut interpreted = plan.prepare(&rejecting_cpu_target()).unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor)
+            .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+        let mut native = target.prepare(&plan).unwrap();
+
+        // MAX is finite: its F32 squared norm overflows, scale becomes zero,
+        // and the finite gradient clips to zero. Both final frontiers are valid.
+        let interpreted_step = interpreted
+            .step(scalar_batch(f32::MAX), TensorData::scalar(0.01))
+            .unwrap();
+        let native_step = native
+            .step(scalar_batch(f32::MAX), TensorData::scalar(0.01))
+            .unwrap();
+        assert!(interpreted_step.clip_report().is_none());
+        assert!(native_step.clip_report().is_none());
+        assert_eq!(interpreted_step.optimizer_step(), 1);
+        assert_eq!(native_step.optimizer_step(), 1);
+        assert_eq!(native.successful_steps, 1);
+        assert_eq!(
+            native.checkpoint().unwrap(),
+            interpreted.checkpoint().unwrap()
+        );
+    }
+
+    #[test]
+    fn accumulation_only_clip_report_overflow_is_discarded_before_safe_commit() {
+        let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+            .unwrap()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_max_gradient_norm(1.0)
+            .unwrap()
+            .with_clip_report()
+            .with_input("x", [], DType::F32)
+            .unwrap();
+        let plan = CompiledAdamWPlan::compile(
+            config,
+            [TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap()],
+            |graph, inputs, parameters| {
+                Ok((
+                    graph.mul(parameters["weight"], inputs["x"])?,
+                    BTreeMap::new(),
+                ))
+            },
+        )
+        .unwrap();
+        let mut interpreted = plan.prepare(&rejecting_cpu_target()).unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor)
+            .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+        let mut native = target.prepare(&plan).unwrap();
+
+        let interpreted_first = interpreted
+            .step(scalar_batch(f32::MAX), TensorData::scalar(0.01))
+            .unwrap();
+        let native_first = native
+            .step(scalar_batch(f32::MAX), TensorData::scalar(0.01))
+            .unwrap();
+        assert!(interpreted_first.clip_report().is_none());
+        assert!(native_first.clip_report().is_none());
+        assert_eq!(interpreted_first.accumulation_index(), 1);
+        assert_eq!(native_first.accumulation_index(), 1);
+        assert_eq!(
+            native.checkpoint().unwrap(),
+            interpreted.checkpoint().unwrap()
+        );
+
+        let interpreted_commit = interpreted
+            .step(scalar_batch(-f32::MAX), TensorData::scalar(0.01))
+            .unwrap();
+        let native_commit = native
+            .step(scalar_batch(-f32::MAX), TensorData::scalar(0.01))
+            .unwrap();
+        let report = interpreted_commit.clip_report().unwrap();
+        assert_eq!(report.pre_clip_global_norm(), 0.0);
+        assert_eq!(report.applied_scale(), 1.0);
+        assert!(report.is_finite());
+        assert_eq!(report.did_clip(), Some(false));
+        assert_eq!(native_commit.clip_report(), Some(report));
+        assert_eq!(interpreted_commit.optimizer_step(), 1);
+        assert_eq!(native_commit.optimizer_step(), 1);
+        assert_eq!(native.successful_steps, 2);
+        assert_eq!(
+            native.checkpoint().unwrap(),
+            interpreted.checkpoint().unwrap()
+        );
+    }
+
+    #[test]
     fn cpu_non_finite_rejection_preserves_partial_dropout_window_and_flush() {
         let config = module_config().with_gradient_accumulation(2).unwrap();
         let dropout = CompiledDropoutConfig::new(CompiledDropoutKey([41, 43]));
@@ -10372,6 +10973,8 @@ mod tests {
             .flush_partial_window(TensorData::scalar(0.01))
             .unwrap();
         assert_eq!(actual, expected);
+        assert_eq!(actual.clip_report(), expected.clip_report());
+        assert!(actual.clip_report().is_some());
         assert_eq!(
             guarded.checkpoint().unwrap(),
             reference.checkpoint().unwrap()
@@ -10409,6 +11012,8 @@ mod tests {
             expected.flushed_microbatches()
         );
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.clip_report(), expected.clip_report());
+        assert!(actual.clip_report().is_some());
         assert_eq!(actual.report().unwrap().successful_invocation(), 1);
         assert_eq!(native.successful_flushes, 1);
         assert_eq!(
@@ -11418,6 +12023,7 @@ mod tests {
             .with_max_gradient_norm(1.0)
             .unwrap();
         assert_eq!(config.max_gradient_norm(), Some(1.0));
+        assert!(!config.clip_report_enabled());
         let parameters = || {
             ["a", "b"]
                 .map(|name| TrainingParameterInit::new(name, TensorData::scalar(0.0)).unwrap())
@@ -11428,20 +12034,87 @@ mod tests {
             build_two_parameter_linear_loss,
         )
         .unwrap();
-        let mut clipped =
-            CpuCompiledAdamW::compile(config, parameters(), build_two_parameter_linear_loss)
-                .unwrap();
+        let mut clipped = CpuCompiledAdamW::compile(
+            config.clone(),
+            parameters(),
+            build_two_parameter_linear_loss,
+        )
+        .unwrap();
         assert_eq!(clipped.max_gradient_norm(), Some(1.0));
         assert_ne!(clipped.capture_identity(), unclipped.capture_identity());
 
-        clipped
+        let unreported = clipped
             .step(BTreeMap::new(), TensorData::scalar(0.1))
             .unwrap();
+        assert!(unreported.clip_report().is_none());
         let moments = clipped.first_moment_snapshots().unwrap();
         let a = moments["a"].scalar_at(0).as_f64();
         let b = moments["b"].scalar_at(0).as_f64();
         assert!((a - 0.6).abs() < 1e-6, "clipped a gradient was {a}");
         assert!((b - 0.8).abs() < 1e-6, "clipped b gradient was {b}");
+
+        let reported_plan = CompiledAdamWPlan::compile(
+            config.with_clip_report(),
+            parameters(),
+            build_two_parameter_linear_loss,
+        )
+        .unwrap();
+        assert!(reported_plan.clip_report_enabled());
+        assert_ne!(reported_plan.capture_identity(), clipped.capture_identity());
+        let renderer = MetalRenderer::new(
+            8,
+            crate::runtime::metal::MetalCapabilities {
+                max_buffer_length: 1 << 30,
+                unified_memory: true,
+                family: "Apple9".into(),
+            },
+        )
+        .unwrap();
+        let error = match reported_plan.metal_plan(renderer) {
+            Ok(_) => panic!("clip-report plan rendered for Metal"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("clip reporting is currently CPU-only")
+        );
+
+        let mut interpreted = reported_plan.prepare_cpu().unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let mut native = reported_plan
+            .prepare_native_cpu(&NativeCpuSessionTarget::new(&executor))
+            .unwrap();
+        let interpreted_step = interpreted
+            .step(BTreeMap::new(), TensorData::scalar(0.1))
+            .unwrap();
+        let native_step = native
+            .step(BTreeMap::new(), TensorData::scalar(0.1))
+            .unwrap();
+        let interpreted_report = interpreted_step.clip_report().unwrap();
+        let native_report = native_step.clip_report().unwrap();
+        assert_eq!(interpreted_report.pre_clip_global_norm(), 5.0);
+        assert_eq!(interpreted_report.applied_scale(), 0.2);
+        assert_eq!(interpreted_report.did_clip(), Some(true));
+        assert_eq!(native_report, interpreted_report);
+        let reported_checkpoint = interpreted.checkpoint().unwrap();
+        assert_eq!(native.checkpoint().unwrap(), reported_checkpoint);
+        let legacy_checkpoint = clipped.checkpoint().unwrap();
+        assert!(
+            reported_plan
+                .restore_checkpoint(&legacy_checkpoint)
+                .is_err()
+        );
+        let (legacy_tensors, mut legacy_metadata) =
+            load_safetensors(legacy_checkpoint.as_bytes()).unwrap();
+        let (reported_tensors, mut reported_metadata) =
+            load_safetensors(reported_checkpoint.as_bytes()).unwrap();
+        assert_eq!(reported_tensors, legacy_tensors);
+        assert_ne!(
+            reported_metadata.remove("capture_identity"),
+            legacy_metadata.remove("capture_identity")
+        );
+        assert_eq!(reported_metadata, legacy_metadata);
     }
 
     #[test]
@@ -12518,6 +13191,114 @@ mod tests {
                 .scalar_at(0)
                 .as_f64(),
             0.0
+        );
+    }
+
+    #[test]
+    fn adamw_clip_report_marks_only_full_or_flushed_windows_on_both_cpu_paths() {
+        let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+            .unwrap()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_max_gradient_norm(1.0)
+            .unwrap()
+            .with_clip_report()
+            .with_input("scale", [], DType::F32)
+            .unwrap();
+        let compile = || {
+            CompiledAdamWPlan::compile(
+                config.clone(),
+                [TrainingParameterInit::new("weight", TensorData::scalar(0.0)).unwrap()],
+                |graph, inputs, parameters| {
+                    Ok((
+                        graph.mul(parameters["weight"], inputs["scale"])?,
+                        BTreeMap::new(),
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let input = |scale| BTreeMap::from([("scale".into(), TensorData::scalar(scale))]);
+        let plan = compile();
+        let mut interpreted = plan.prepare_cpu().unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let mut native = plan
+            .prepare_native_cpu(&NativeCpuSessionTarget::new(&executor))
+            .unwrap();
+
+        assert!(
+            interpreted
+                .step(input(3.0), TensorData::scalar(0.1))
+                .unwrap()
+                .clip_report()
+                .is_none()
+        );
+        assert!(
+            native
+                .step(input(3.0), TensorData::scalar(0.1))
+                .unwrap()
+                .clip_report()
+                .is_none()
+        );
+        let interpreted_step = interpreted
+            .step(input(5.0), TensorData::scalar(0.1))
+            .unwrap();
+        let native_step = native.step(input(5.0), TensorData::scalar(0.1)).unwrap();
+        let expected = interpreted_step.clip_report().unwrap();
+        assert_eq!(expected.pre_clip_global_norm(), 4.0);
+        assert_eq!(expected.applied_scale(), 0.25);
+        assert_eq!(native_step.clip_report(), Some(expected));
+        assert_eq!(
+            native.checkpoint().unwrap(),
+            interpreted.checkpoint().unwrap()
+        );
+
+        let mut interpreted_flush = compile().prepare_cpu().unwrap();
+        let flush_plan = compile();
+        let mut native_flush = flush_plan
+            .prepare_native_cpu(&NativeCpuSessionTarget::new(&executor))
+            .unwrap();
+        assert!(
+            interpreted_flush
+                .step(input(4.0), TensorData::scalar(0.1))
+                .unwrap()
+                .clip_report()
+                .is_none()
+        );
+        assert!(
+            native_flush
+                .step(input(4.0), TensorData::scalar(0.1))
+                .unwrap()
+                .clip_report()
+                .is_none()
+        );
+        let interpreted_flush_result = interpreted_flush
+            .flush_partial_window(TensorData::scalar(0.1))
+            .unwrap();
+        let native_flush_result = native_flush
+            .flush_partial_window(TensorData::scalar(0.1))
+            .unwrap();
+        let expected = interpreted_flush_result.clip_report().unwrap();
+        assert_eq!(expected.pre_clip_global_norm(), 4.0);
+        assert_eq!(expected.applied_scale(), 0.25);
+        assert_eq!(native_flush_result.clip_report(), Some(expected));
+        assert!(
+            interpreted_flush
+                .flush_partial_window(TensorData::scalar(0.1))
+                .unwrap()
+                .clip_report()
+                .is_none()
+        );
+        assert!(
+            native_flush
+                .flush_partial_window(TensorData::scalar(0.1))
+                .unwrap()
+                .clip_report()
+                .is_none()
+        );
+        assert_eq!(
+            native_flush.checkpoint().unwrap(),
+            interpreted_flush.checkpoint().unwrap()
         );
     }
 

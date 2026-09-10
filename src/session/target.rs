@@ -27,7 +27,10 @@ pub enum CpuNonFinitePolicy {
     /// Preserve historical IEEE propagation behavior.
     #[default]
     Propagate,
-    /// Reject a non-finite loss or F32 recurrent successor before state commit.
+    /// Reject a non-finite loss or F32 recurrent successor before state
+    /// commit. Opt-in AdamW clip reports are also checked when a full window
+    /// or explicit partial flush commits; report-only values from an
+    /// accumulation replay are discarded and do not affect admission.
     RejectTransition,
 }
 
