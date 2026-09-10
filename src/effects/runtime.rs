@@ -66,6 +66,38 @@ impl From<HostPoolStats> for PersistentRuntimeStats {
 pub struct EffectRuntime {
     pool: HostSlotPool,
     slots: BTreeMap<u64, PersistentStateSlot>,
+    #[cfg(test)]
+    snapshot_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    recurrent_inspection_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    recurrent_commit_count: usize,
+}
+
+pub(crate) struct RecurrentStateReader<'a> {
+    runtime: &'a EffectRuntime,
+}
+
+impl RecurrentStateReader<'_> {
+    pub(crate) fn inspect<R>(
+        &self,
+        state: &BufferState,
+        inspect: impl FnOnce(&TensorData) -> R,
+    ) -> Result<R, RuntimeError> {
+        self.runtime.inspect(state, inspect)
+    }
+}
+
+pub(crate) struct RecurrentStateSuccessors<T> {
+    pub(crate) value: T,
+    pub(crate) successors: Vec<(BufferState, TensorData)>,
+}
+
+#[derive(Debug)]
+pub(crate) enum RecurrentTransactionError<E> {
+    Runtime(RuntimeError),
+    Stage(E),
+    Contract(&'static str),
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +116,12 @@ impl EffectRuntime {
         Self {
             pool: HostSlotPool::new(),
             slots: BTreeMap::new(),
+            #[cfg(test)]
+            snapshot_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            recurrent_inspection_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            recurrent_commit_count: 0,
         }
     }
     pub fn register(
@@ -203,6 +241,8 @@ impl EffectRuntime {
         Ok(states)
     }
     pub fn snapshot(&self, state: &BufferState) -> Result<PersistentSnapshot, RuntimeError> {
+        #[cfg(test)]
+        self.snapshot_count.set(self.snapshot_count.get() + 1);
         let slot = self
             .slots
             .get(&state.buffer)
@@ -218,6 +258,161 @@ impl EffectRuntime {
             state: state.clone(),
             value: view.tensor()?,
         })
+    }
+
+    fn inspect<R>(
+        &self,
+        state: &BufferState,
+        inspect: impl FnOnce(&TensorData) -> R,
+    ) -> Result<R, RuntimeError> {
+        #[cfg(test)]
+        self.recurrent_inspection_count
+            .set(self.recurrent_inspection_count.get() + 1);
+        let slot = self
+            .slots
+            .get(&state.buffer)
+            .ok_or(RuntimeError::MissingBuffer(state.buffer))?;
+        if slot.state != *state {
+            return Err(RuntimeError::StaleState {
+                buffer: state.buffer,
+                version: state.version,
+            });
+        }
+        slot.lease.with_tensor(inspect).map_err(RuntimeError::Host)
+    }
+
+    /// Runs one detached recurrent transition against borrowed active values,
+    /// then publishes an exact full-replacement frontier in one pool commit.
+    /// Neither the reader nor an incomplete successor set can escape this
+    /// runtime borrow, and every error leaves the active banks unchanged.
+    pub(crate) fn transact_recurrent_replacements<T, E>(
+        &mut self,
+        current: &[BufferState],
+        next: &[BufferState],
+        stage: impl FnOnce(&RecurrentStateReader<'_>) -> Result<RecurrentStateSuccessors<T>, E>,
+    ) -> Result<T, RecurrentTransactionError<E>> {
+        if current.is_empty() || current.len() != next.len() {
+            return Err(RecurrentTransactionError::Contract(
+                "recurrent replacement frontier cardinality mismatch",
+            ));
+        }
+        let mut expected = BTreeMap::new();
+        for (current, next) in current.iter().zip(next) {
+            super::validate_buffer_state(current)
+                .map_err(RuntimeError::Effect)
+                .map_err(RecurrentTransactionError::Runtime)?;
+            super::validate_buffer_state(next)
+                .map_err(RuntimeError::Effect)
+                .map_err(RecurrentTransactionError::Runtime)?;
+            if current.buffer != next.buffer
+                || current.shape != next.shape
+                || current.dtype != next.dtype
+                || current.bytes != next.bytes
+                || current.version.checked_add(1) != Some(next.version)
+                || expected.insert(next.buffer, next.clone()).is_some()
+            {
+                return Err(RecurrentTransactionError::Contract(
+                    "recurrent replacement state mismatch",
+                ));
+            }
+            let slot = self
+                .slots
+                .get(&current.buffer)
+                .ok_or(RuntimeError::MissingBuffer(current.buffer))
+                .map_err(RecurrentTransactionError::Runtime)?;
+            if slot.state != *current {
+                return Err(RecurrentTransactionError::Runtime(
+                    RuntimeError::StaleState {
+                        buffer: current.buffer,
+                        version: current.version,
+                    },
+                ));
+            }
+        }
+
+        let staged = stage(&RecurrentStateReader { runtime: self })
+            .map_err(RecurrentTransactionError::Stage)?;
+        if staged.successors.len() != expected.len() {
+            return Err(RecurrentTransactionError::Contract(
+                "recurrent replacement successor cardinality mismatch",
+            ));
+        }
+        let mut successors = BTreeMap::new();
+        for (state, value) in staged.successors {
+            let Some(want) = expected.get(&state.buffer) else {
+                return Err(RecurrentTransactionError::Contract(
+                    "recurrent replacement successor is unexpected",
+                ));
+            };
+            let bytes = value
+                .len()
+                .checked_mul(value.dtype().itemsize())
+                .ok_or(RuntimeError::Host(HostBufferError::Overflow))
+                .map_err(RecurrentTransactionError::Runtime)?;
+            if &state != want
+                || value.shape() != &want.shape
+                || value.dtype() != want.dtype
+                || bytes != want.bytes
+                || successors.insert(state.buffer, (state, value)).is_some()
+            {
+                return Err(RecurrentTransactionError::Contract(
+                    "recurrent replacement successor mismatch",
+                ));
+            }
+        }
+
+        // Recheck the active frontier after staging. Safe code cannot mutate it
+        // through the read-only transaction view, but this also authenticates
+        // the final commit against the exact runtime owner and versions.
+        let mut writes = Vec::with_capacity(successors.len());
+        for current in current {
+            let slot = self
+                .slots
+                .get(&current.buffer)
+                .ok_or(RuntimeError::MissingBuffer(current.buffer))
+                .map_err(RecurrentTransactionError::Runtime)?;
+            if slot.state != *current {
+                return Err(RecurrentTransactionError::Runtime(
+                    RuntimeError::StaleState {
+                        buffer: current.buffer,
+                        version: current.version,
+                    },
+                ));
+            }
+            let (_, value) = successors
+                .remove(&current.buffer)
+                .expect("validated successor set covers the frontier");
+            writes.push(
+                slot.lease
+                    .staged_write(value)
+                    .map_err(RuntimeError::Host)
+                    .map_err(RecurrentTransactionError::Runtime)?,
+            );
+        }
+        self.pool
+            .commit(writes)
+            .map_err(RuntimeError::Host)
+            .map_err(RecurrentTransactionError::Runtime)?;
+        for state in next {
+            self.slots
+                .get_mut(&state.buffer)
+                .expect("validated recurrent slot remains registered")
+                .state = state.clone();
+        }
+        #[cfg(test)]
+        {
+            self.recurrent_commit_count += 1;
+        }
+        Ok(staged.value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recurrent_test_counts(&self) -> (usize, usize, usize) {
+        (
+            self.snapshot_count.get(),
+            self.recurrent_inspection_count.get(),
+            self.recurrent_commit_count,
+        )
     }
 
     pub fn slot_identity(
@@ -838,6 +1033,127 @@ mod tests {
             runtime.snapshot(next.state()).unwrap().tensor().storage(),
             &Storage::I32(vec![7, 7])
         );
+    }
+
+    #[test]
+    fn recurrent_replacements_flip_exact_banks_and_reject_atomically() {
+        let mut runtime = EffectRuntime::new();
+        let left = runtime
+            .register(41, data([2], Storage::F32(vec![1.0, 2.0])))
+            .unwrap();
+        let right = runtime
+            .register(42, data([], Storage::U64(vec![3])))
+            .unwrap();
+        let retained = runtime.snapshot(&left).unwrap();
+        let identities = [
+            runtime.slot_identity(&left).unwrap(),
+            runtime.slot_identity(&right).unwrap(),
+        ];
+        let stats = runtime.stats().unwrap();
+        let current = vec![left.clone(), right.clone()];
+        let next = current
+            .iter()
+            .cloned()
+            .map(|mut state| {
+                state.version += 1;
+                state
+            })
+            .collect::<Vec<_>>();
+        let mut skipped = next.clone();
+        skipped[0].version += 1;
+        let staged = std::cell::Cell::new(false);
+        assert!(matches!(
+            runtime.transact_recurrent_replacements(&current, &skipped, |_reader| {
+                staged.set(true);
+                Ok::<_, ()>(RecurrentStateSuccessors {
+                    value: (),
+                    successors: Vec::new(),
+                })
+            }),
+            Err(RecurrentTransactionError::Contract(
+                "recurrent replacement state mismatch"
+            ))
+        ));
+        assert!(!staged.get());
+        let observed = runtime
+            .transact_recurrent_replacements(&current, &next, |reader| {
+                assert_eq!(
+                    reader.inspect(&left, |value| value.clone()).unwrap(),
+                    data([2], Storage::F32(vec![1.0, 2.0]))
+                );
+                Ok::<_, ()>(RecurrentStateSuccessors {
+                    value: 7,
+                    successors: vec![
+                        (next[0].clone(), data([2], Storage::F32(vec![4.0, 5.0]))),
+                        (next[1].clone(), data([], Storage::U64(vec![8]))),
+                    ],
+                })
+            })
+            .unwrap();
+        assert_eq!(observed, 7);
+        assert_eq!(retained.tensor(), &data([2], Storage::F32(vec![1.0, 2.0])));
+        assert_eq!(
+            runtime.snapshot(&next[0]).unwrap().tensor(),
+            &data([2], Storage::F32(vec![4.0, 5.0]))
+        );
+        assert_eq!(runtime.slot_identity(&next[0]).unwrap(), identities[0]);
+        assert_eq!(runtime.slot_identity(&next[1]).unwrap(), identities[1]);
+        assert_eq!(runtime.stats().unwrap(), stats);
+
+        let second = next
+            .iter()
+            .cloned()
+            .map(|mut state| {
+                state.version += 1;
+                state
+            })
+            .collect::<Vec<_>>();
+        let before = [
+            runtime.snapshot(&next[0]).unwrap(),
+            runtime.snapshot(&next[1]).unwrap(),
+        ];
+        assert!(matches!(
+            runtime.transact_recurrent_replacements(&next, &second, |_reader| {
+                Err::<RecurrentStateSuccessors<()>, _>("rejected")
+            }),
+            Err(RecurrentTransactionError::Stage("rejected"))
+        ));
+        assert_eq!(
+            runtime.snapshot(&next[0]).unwrap().tensor(),
+            before[0].tensor()
+        );
+        assert_eq!(
+            runtime.snapshot(&next[1]).unwrap().tensor(),
+            before[1].tensor()
+        );
+        assert!(matches!(
+            runtime.transact_recurrent_replacements(&next, &second, |_reader| {
+                Ok::<_, ()>(RecurrentStateSuccessors {
+                    value: (),
+                    successors: vec![(second[0].clone(), data([2], Storage::F32(vec![9.0, 10.0])))],
+                })
+            }),
+            Err(RecurrentTransactionError::Contract(
+                "recurrent replacement successor cardinality mismatch"
+            ))
+        ));
+        assert_eq!(
+            runtime.snapshot(&next[0]).unwrap().tensor(),
+            before[0].tensor()
+        );
+        runtime
+            .transact_recurrent_replacements(&next, &second, |_reader| {
+                Ok::<_, ()>(RecurrentStateSuccessors {
+                    value: (),
+                    successors: vec![
+                        (second[0].clone(), data([2], Storage::F32(vec![9.0, 10.0]))),
+                        (second[1].clone(), data([], Storage::U64(vec![11]))),
+                    ],
+                })
+            })
+            .unwrap();
+        assert_eq!(runtime.stats().unwrap(), stats);
+        assert_eq!(runtime.slot_identity(&second[0]).unwrap(), identities[0]);
     }
 
     #[test]

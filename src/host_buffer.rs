@@ -59,7 +59,8 @@ struct Slot {
     generation: u64,
     capacity: usize,
     descriptor: Option<HostBufferDesc>,
-    value: Option<TensorData>,
+    values: [Option<TensorData>; 2],
+    active: usize,
     leased: bool,
     views: usize,
     mutable_window: bool,
@@ -95,7 +96,8 @@ impl HostSlotPool {
             generation: 0,
             capacity: descriptor.bytes,
             descriptor: None,
-            value: None,
+            values: [None, None],
+            active: 0,
             leased: false,
             views: 0,
             mutable_window: false,
@@ -134,7 +136,8 @@ impl HostSlotPool {
             .checked_add(1)
             .ok_or(HostBufferError::Overflow)?;
         entry.descriptor = Some(descriptor.clone());
-        entry.value = None;
+        entry.values = [None, None];
+        entry.active = 0;
         entry.leased = true;
         Ok(HostBufferLease {
             inner: self.inner.clone(),
@@ -203,13 +206,24 @@ impl HostSlotPool {
             }
         }
         // No fallible checks remain after this point. Values are already owned
-        // by the transaction, and each slot has an exclusive live lease.
+        // by the transaction, and each slot has an exclusive live lease. Stage
+        // every successor into the inactive bank before making any visible.
+        let mut flips = Vec::with_capacity(writes.len());
         for write in writes {
             let slot = state
                 .slots
                 .get_mut(&write.slot)
                 .expect("prevalidated live host slot");
-            slot.value = Some(write.value);
+            let inactive = 1 - slot.active;
+            slot.values[inactive] = Some(write.value);
+            flips.push(write.slot);
+        }
+        for slot in flips {
+            let slot = state
+                .slots
+                .get_mut(&slot)
+                .expect("staged host slot remains live");
+            slot.active = 1 - slot.active;
         }
         Ok(())
     }
@@ -250,8 +264,26 @@ impl HostBufferLease {
         if value.shape() != &self.descriptor.shape || value.dtype() != self.descriptor.dtype {
             return Err(HostBufferError::IncompatibleDescriptor);
         }
-        slot.value = Some(value);
+        let active = slot.active;
+        slot.values[active] = Some(value);
         Ok(())
+    }
+
+    pub(crate) fn with_tensor<R>(
+        &self,
+        inspect: impl FnOnce(&TensorData) -> R,
+    ) -> Result<R, HostBufferError> {
+        checked_range(&self.descriptor, 0, self.descriptor.bytes)?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| HostBufferError::OwnerMismatch)?;
+        let slot = live_slot(&mut state, self.slot, self.generation)?;
+        let active = slot.active;
+        let value = slot.values[active]
+            .as_ref()
+            .ok_or(HostBufferError::MissingValue(self.descriptor.buffer_id))?;
+        Ok(inspect(value))
     }
 
     pub(crate) fn staged_write(
@@ -327,7 +359,7 @@ impl HostBufferLease {
             return Err(HostBufferError::OutstandingBorrow { slot: self.slot });
         }
         slot.leased = false;
-        slot.value = None;
+        slot.values = [None, None];
         self.released = true;
         Ok(())
     }
@@ -408,7 +440,8 @@ impl HostBufferView {
             .lock()
             .map_err(|_| HostBufferError::OwnerMismatch)?;
         let slot = live_slot(&mut state, self.slot, self.generation)?;
-        slot.value
+        let active = slot.active;
+        slot.values[active]
             .clone()
             .ok_or(HostBufferError::MissingValue(self.descriptor.buffer_id))
     }
