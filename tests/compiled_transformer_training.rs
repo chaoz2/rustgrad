@@ -7,7 +7,7 @@ use rustgrad::runtime::metal::{
     MetalDeviceRunReport, MetalDiscovery, MetalRuntime, MetalScoreboardContext,
 };
 use rustgrad::{
-    Backend, CapturedReplayExecutor, CapturedReplayOptions, CapturedSchedule, CompareOp,
+    Backend, BinaryOp, CapturedReplayExecutor, CapturedReplayOptions, CapturedSchedule, CompareOp,
     CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWFlush, CompiledAdamWFlushRuntime,
     CompiledAdamWGraph, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
     CompiledAdamWStepResult, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
@@ -17,8 +17,8 @@ use rustgrad::{
     LossOptions, MetalCompiledAdamWPlan, Module, NativeCpuCompiledAdamW,
     NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget, NativeTrainingReport,
     NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
-    TrainingDropoutProvider, TransformerBlock, cross_entropy, load_safetensors, save_safetensors,
-    schedule_many,
+    TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy, load_safetensors,
+    save_safetensors, schedule_many,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -521,18 +521,88 @@ enum TwoBlockDropoutSite {
 
 struct ObservedTwoBlockDropout<'a> {
     inner: &'a mut dyn TrainingDropoutProvider,
-    sites: Vec<(TwoBlockDropoutSite, Shape, DType, f64)>,
+    sites: Vec<ObservedTwoBlockDropoutSite>,
+}
+
+struct ObservedTwoBlockDropoutSite {
+    kind: TwoBlockDropoutSite,
+    input: NodeId,
+    mask: NodeId,
+    output: NodeId,
+    shape: Shape,
+    dtype: DType,
+    probability: f64,
+}
+
+fn observed_compiled_dropout_mask(
+    graph: &Graph,
+    input: NodeId,
+    output: NodeId,
+    probability: f64,
+) -> Result<NodeId> {
+    let invalid = || Error::SessionTraining {
+        reason: "observed compiled dropout does not match its authenticated lowering".into(),
+    };
+    let Op::Binary {
+        op: BinaryOp::Mul,
+        lhs: masked,
+        rhs: reciprocal,
+    } = graph.op(output)?
+    else {
+        return Err(invalid());
+    };
+    let Op::Unary {
+        op: UnaryOp::Reciprocal,
+        input: denominator,
+    } = graph.op(*reciprocal)?
+    else {
+        return Err(invalid());
+    };
+    let Op::Select {
+        condition: mask,
+        on_true,
+        on_false,
+    } = graph.op(*masked)?
+    else {
+        return Err(invalid());
+    };
+    let (Op::Constant(zero), Op::Constant(denominator)) =
+        (graph.op(*on_false)?, graph.op(*denominator)?)
+    else {
+        return Err(invalid());
+    };
+    if *on_true != input
+        || graph.dtype(output)? != DType::F32
+        || graph.shape(output)? != graph.shape(input)?
+        || graph.dtype(*mask)? != DType::Bool
+        || graph.shape(*mask)? != graph.shape(input)?
+        || zero.shape().rank() != 0
+        || zero.dtype() != DType::F32
+        || zero.scalar_at(0).as_f64().to_bits() != 0.0f64.to_bits()
+        || denominator.shape().rank() != 0
+        || denominator.dtype() != DType::F32
+        || denominator.scalar_at(0).as_f64().to_bits()
+            != f64::from((1.0 - probability) as f32).to_bits()
+    {
+        return Err(invalid());
+    }
+    Ok(*mask)
 }
 
 impl TrainingDropoutProvider for ObservedTwoBlockDropout<'_> {
     fn dropout(&mut self, graph: &mut Graph, input: NodeId, probability: f64) -> Result<NodeId> {
-        self.sites.push((
-            TwoBlockDropoutSite::Residual,
-            graph.shape(input)?.clone(),
-            graph.dtype(input)?,
+        let output = self.inner.dropout(graph, input, probability)?;
+        let mask = observed_compiled_dropout_mask(graph, input, output, probability)?;
+        self.sites.push(ObservedTwoBlockDropoutSite {
+            kind: TwoBlockDropoutSite::Residual,
+            input,
+            mask,
+            output,
+            shape: graph.shape(input)?.clone(),
+            dtype: graph.dtype(input)?,
             probability,
-        ));
-        self.inner.dropout(graph, input, probability)
+        });
+        Ok(output)
     }
 
     fn attention_dropout(
@@ -541,14 +611,20 @@ impl TrainingDropoutProvider for ObservedTwoBlockDropout<'_> {
         probabilities: NodeId,
         probability: f64,
     ) -> Result<NodeId> {
-        self.sites.push((
-            TwoBlockDropoutSite::AttentionProbabilities,
-            graph.shape(probabilities)?.clone(),
-            graph.dtype(probabilities)?,
+        let output = self
+            .inner
+            .attention_dropout(graph, probabilities, probability)?;
+        let mask = observed_compiled_dropout_mask(graph, probabilities, output, probability)?;
+        self.sites.push(ObservedTwoBlockDropoutSite {
+            kind: TwoBlockDropoutSite::AttentionProbabilities,
+            input: probabilities,
+            mask,
+            output,
+            shape: graph.shape(probabilities)?.clone(),
+            dtype: graph.dtype(probabilities)?,
             probability,
-        ));
-        self.inner
-            .attention_dropout(graph, probabilities, probability)
+        });
+        Ok(output)
     }
 }
 
@@ -572,20 +648,38 @@ fn build_two_block_with_attention_dropout(
         TwoBlockDropoutSite::Residual,
     ];
     assert_eq!(observed.sites.len(), expected.len());
-    for ((site, shape, dtype, probability), expected) in observed.sites.iter().zip(expected) {
-        assert_eq!(*site, expected);
-        assert_eq!(*dtype, DType::F32);
-        assert_eq!(probability.to_bits(), 0.25f64.to_bits());
-        let expected_shape = match site {
+    for (site, expected) in observed.sites.iter().zip(expected) {
+        assert_eq!(site.kind, expected);
+        assert_eq!(site.dtype, DType::F32);
+        assert_eq!(site.probability.to_bits(), 0.25f64.to_bits());
+        let expected_shape = match site.kind {
             TwoBlockDropoutSite::AttentionProbabilities => Shape::new([BATCH, 2, TIME, TIME]),
             TwoBlockDropoutSite::Residual => Shape::new([BATCH, TIME, MULTI_HEAD_EMBEDDING]),
         };
-        assert_eq!(*shape, expected_shape);
+        assert_eq!(site.shape, expected_shape);
     }
     let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
     let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
     let loss = graph.add(loss, guard)?;
-    Ok((loss, BTreeMap::from([("logits".into(), logits)])))
+    let mut outputs = BTreeMap::from([("logits".into(), logits)]);
+    for (index, site) in observed.sites.into_iter().enumerate() {
+        assert!(
+            outputs
+                .insert(format!("dropout_{index}_input"), site.input)
+                .is_none()
+        );
+        assert!(
+            outputs
+                .insert(format!("dropout_{index}_mask"), site.mask)
+                .is_none()
+        );
+        assert!(
+            outputs
+                .insert(format!("dropout_{index}_output"), site.output)
+                .is_none()
+        );
+    }
+    Ok((loss, outputs))
 }
 
 fn build_buffered(
@@ -1164,6 +1258,74 @@ fn observed_dropout_masks(outputs: &BTreeMap<String, TensorData>) -> [TensorData
             }),
         )
         .unwrap()
+    })
+}
+
+fn observed_two_block_dropout_masks(outputs: &BTreeMap<String, TensorData>) -> [TensorData; 6] {
+    assert_eq!(
+        outputs.len(),
+        19,
+        "six observed input/mask/output triples plus logits are required"
+    );
+    let expected_sites = [
+        TwoBlockDropoutSite::AttentionProbabilities,
+        TwoBlockDropoutSite::Residual,
+        TwoBlockDropoutSite::Residual,
+        TwoBlockDropoutSite::AttentionProbabilities,
+        TwoBlockDropoutSite::Residual,
+        TwoBlockDropoutSite::Residual,
+    ];
+    std::array::from_fn(|site| {
+        let input = &outputs[&format!("dropout_{site}_input")];
+        let mask = &outputs[&format!("dropout_{site}_mask")];
+        let output = &outputs[&format!("dropout_{site}_output")];
+        let expected_shape = match expected_sites[site] {
+            TwoBlockDropoutSite::AttentionProbabilities => Shape::new([BATCH, 2, TIME, TIME]),
+            TwoBlockDropoutSite::Residual => Shape::new([BATCH, TIME, MULTI_HEAD_EMBEDDING]),
+        };
+        assert_eq!(input.shape(), &expected_shape);
+        assert_eq!(mask.shape(), &expected_shape);
+        assert_eq!(output.shape(), &expected_shape);
+        assert_eq!(input.dtype(), DType::F32);
+        assert_eq!(mask.dtype(), DType::Bool);
+        assert_eq!(output.dtype(), DType::F32);
+        let mut kept_valid_probabilities = 0;
+        let mut dropped_valid_probabilities = 0;
+        for coordinate in 0..input.len() {
+            let input = input.scalar_at(coordinate).as_f64();
+            let kept = mask.scalar_at(coordinate).as_bool();
+            let output = output.scalar_at(coordinate).as_f64();
+            assert!(input.is_finite() && output.is_finite());
+            if expected_sites[site] == TwoBlockDropoutSite::AttentionProbabilities {
+                assert!(input >= 0.0, "attention probabilities must be nonnegative");
+            }
+            if kept {
+                assert!(
+                    (output * 0.75 - input).abs() <= 1e-6,
+                    "dropout site {site} lane {coordinate} has an invalid kept value"
+                );
+            } else {
+                assert_eq!(
+                    output.to_bits(),
+                    0.0f64.to_bits(),
+                    "dropout site {site} lane {coordinate} has an invalid dropped value"
+                );
+            }
+            if input > 0.0 && expected_sites[site] == TwoBlockDropoutSite::AttentionProbabilities {
+                if kept {
+                    kept_valid_probabilities += 1;
+                } else {
+                    dropped_valid_probabilities += 1;
+                }
+            }
+        }
+        if expected_sites[site] == TwoBlockDropoutSite::AttentionProbabilities {
+            assert!(
+                kept_valid_probabilities > 0 && dropped_valid_probabilities > 0,
+                "attention dropout site {site} must exercise kept and dropped valid probabilities"
+            );
+        }
+        mask.clone()
     })
 }
 
@@ -2452,9 +2614,6 @@ fn numerical_two_block_gpt_gradient_lanes(
     inputs: BTreeMap<String, TensorData>,
     probes: &[TransformerGradientProbe],
 ) -> NumericalTwoBlockGptEvaluation {
-    const EPSILONS: [f64; 4] = [1e-2, 5e-3, 2.5e-3, 1e-3];
-    const RELU_MARGIN: f64 = 0.25;
-
     let mut graph = Graph::new();
     let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
     let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
@@ -2462,6 +2621,38 @@ fn numerical_two_block_gpt_gradient_lanes(
     let logits = model.forward(&mut graph, tokens, &mut dropout).unwrap();
     assert_eq!(dropout.next, 4);
     let loss = multi_head_sparse_causal_loss(&mut graph, logits, targets).unwrap();
+    numerical_two_block_gradient_lanes_from_forward(model, graph, loss, inputs, probes)
+}
+
+fn numerical_two_block_attention_dropout_gradient_lanes(
+    model: &TwoBlockPositionalGpt,
+    inputs: BTreeMap<String, TensorData>,
+    masks: [TensorData; 6],
+    probes: &[TransformerGradientProbe],
+) -> NumericalTwoBlockGptEvaluation {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let guard = graph.input_dtype(ATTENTION_DROPOUT_TRANSITION_GUARD, [], DType::F32);
+    let mut dropout = FixedResidualDropout::from_masks(masks);
+    let logits = model.forward(&mut graph, tokens, &mut dropout).unwrap();
+    assert_eq!(dropout.next, 6);
+    let loss = multi_head_sparse_causal_loss(&mut graph, logits, targets).unwrap();
+    let guard = graph.reciprocal(guard).unwrap();
+    let loss = graph.add(loss, guard).unwrap();
+    numerical_two_block_gradient_lanes_from_forward(model, graph, loss, inputs, probes)
+}
+
+fn numerical_two_block_gradient_lanes_from_forward(
+    model: &TwoBlockPositionalGpt,
+    graph: Graph,
+    loss: NodeId,
+    inputs: BTreeMap<String, TensorData>,
+    probes: &[TransformerGradientProbe],
+) -> NumericalTwoBlockGptEvaluation {
+    const EPSILONS: [f64; 4] = [1e-2, 5e-3, 2.5e-3, 1e-3];
+    const RELU_MARGIN: f64 = 0.25;
+
     let relu_inputs = relu_inputs(&graph, loss);
     assert_eq!(relu_inputs.len(), 2);
 
@@ -4102,6 +4293,114 @@ fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() 
         Some(5 * BLOCKS_PER_REPLAY)
     );
     assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_attention_dropout_gradients_match_fixed_mask_central_differences() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+    const ABSOLUTE_TOLERANCE: f64 = 6e-3;
+    const RELATIVE_TOLERANCE: f64 = 3e-3;
+    const PROBES: [TransformerGradientProbe; 8] = [
+        TransformerGradientProbe {
+            parameter: "tokens.weight",
+            coordinate: 7,
+            boundary: "token embedding and tied language-model head",
+        },
+        TransformerGradientProbe {
+            parameter: "first.query.0",
+            coordinate: 0,
+            boundary: "first-block query projection before attention-probability dropout",
+        },
+        TransformerGradientProbe {
+            parameter: "first.value.0",
+            coordinate: 12,
+            boundary: "first-block value projection after attention-probability dropout",
+        },
+        TransformerGradientProbe {
+            parameter: "first.out.0",
+            coordinate: 9,
+            boundary: "first-block post-head output projection",
+        },
+        TransformerGradientProbe {
+            parameter: "second.key.0",
+            coordinate: 11,
+            boundary: "second-block key projection before attention-probability dropout",
+        },
+        TransformerGradientProbe {
+            parameter: "second.out.0",
+            coordinate: 9,
+            boundary: "second-block post-head output projection",
+        },
+        TransformerGradientProbe {
+            parameter: "second.ff1.0",
+            coordinate: 20,
+            boundary: "second-block feed-forward expansion and ReLU",
+        },
+        TransformerGradientProbe {
+            parameter: "norm.bias",
+            coordinate: 2,
+            boundary: "final LayerNorm and sparse causal loss",
+        },
+    ];
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let mut identities = BTreeMap::new();
+    model.visit("", &mut |name, parameter, _| {
+        identities.insert(name, parameter.id());
+    });
+    assert_eq!(identities["tokens.weight"], identities["lm_head.weight"]);
+    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+        two_block_attention_dropout_config(),
+        dropout_config(),
+        &model,
+        build_two_block_with_attention_dropout,
+    )
+    .unwrap();
+    let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
+    let inputs = attention_dropout_batch(1.0);
+    let step = runtime
+        .step(inputs.clone(), TensorData::scalar(1e-3))
+        .unwrap();
+    assert!(!step.did_update());
+    assert_eq!(runtime.accumulation_index().unwrap(), 1);
+    let captured = runtime.gradient_accumulator_snapshots().unwrap();
+    assert!(captured.contains_key("tokens.weight"));
+    assert!(!captured.contains_key("lm_head.weight"));
+    let masks = observed_two_block_dropout_masks(step.outputs());
+    let numerical =
+        numerical_two_block_attention_dropout_gradient_lanes(&model, inputs, masks, &PROBES);
+    let captured_loss = step.loss().scalar_at(0).as_f64();
+    assert!(
+        (captured_loss - numerical.loss).abs() <= 2e-5,
+        "fixed-mask forward loss differs: captured={captured_loss}, numerical={}",
+        numerical.loss
+    );
+    for (probe, numerical) in PROBES.iter().zip(numerical.gradients) {
+        let captured = captured[probe.parameter]
+            .scalar_at(probe.coordinate)
+            .as_f64();
+        assert!(
+            captured.is_finite() && numerical.is_finite(),
+            "{} must remain finite: captured={captured}, numerical={numerical}",
+            probe.boundary
+        );
+        assert!(
+            captured != 0.0 && numerical != 0.0,
+            "{} must carry a nonzero gradient: captured={captured}, numerical={numerical}",
+            probe.boundary
+        );
+        let error = (captured - numerical).abs();
+        let tolerance =
+            ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * captured.abs().max(numerical.abs());
+        assert!(
+            error <= tolerance,
+            "{} {}[{}] mismatch: captured={captured}, numerical={numerical}, error={error}, tolerance={tolerance}",
+            probe.boundary,
+            probe.parameter,
+            probe.coordinate
+        );
+    }
 }
 
 #[test]
