@@ -95,16 +95,16 @@ rebuilds the same topology and authenticates it against the checkpoint. Within
 one process, a caller can instead reuse a borrowed `CompiledAdamWPlan` and call
 `restore_checkpoint` without rebuilding its graph, gradients, schedules, or
 captures. The example's `cpu-reuse` mode demonstrates that path with a captured
-learning-rate policy and guarded CPU transitions. Its `native-cpu-scoreboard`
-mode emits bounded versioned JSON for caller-timed compile, prepare, and
-checkpoint phases plus runtime-timed first/steady replay, together with
-authenticated logical work, cache, and recurrent-state facts. CPU kernel-launch,
-transfer, and physical peak-memory fields remain `null` because this path does
-not measure
-them. This is workload evidence, not a speedup or performance threshold. Its
-Metal form selects the first visible device explicitly, verifies strict
-zero-fallback admission before
-allocation, and keeps the checkpoint bytes portable through the same
+learning-rate policy, guarded CPU transitions, and fixed-capacity right-padded
+batches whose F32 mask excludes padding from causal loss. Its
+`native-cpu-scoreboard` mode emits bounded versioned JSON for caller-timed
+compile, prepare, and checkpoint phases plus runtime-timed first/steady replay,
+together with authenticated logical work, cache, and recurrent-state facts. CPU
+kernel-launch, transfer, and physical peak-memory fields remain `null` because
+this path does not measure them. This is workload evidence, not a speedup or
+performance threshold. Its Metal form selects the first visible device
+explicitly, verifies strict zero-fallback admission before allocation, and
+keeps the checkpoint bytes portable through the same
 authenticated recompile boundary as CPU.
 
 ## Run ResNet on a persistent Metal session

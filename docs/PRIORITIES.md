@@ -112,6 +112,15 @@ capture-owned policy-frozen constant, while preserving its tied identity,
 policy-frozen state, inherent frozen state, and buffer. Portable resume into a
 fresh owned module continues to recompile and authenticate the topology because
 executable captures are intentionally absent from checkpoint bytes.
+That CPU-only borrowed-plan workload now binds an exact `[B,T]` F32 loss mask
+beside fixed-capacity I32 tokens and legal dummy targets. Batch conversion
+rejects non-finite or non-binary masks, non-right padding, out-of-vocabulary
+tokens or dummy targets, and an all-padding batch before recurrent mutation.
+The capture computes `sum(mask * sparse_nll) / sum(mask)` across distinct valid
+lengths, including one padded final partial row. Accumulation deliberately
+averages these already-normalized microbatch gradients equally; a recurrent
+valid-token denominator and token-weighted window semantics remain out of
+scope. The shared external-rate CPU/native/Metal workload is unchanged.
 Evaluation is stateless with respect to replay, optimizer, dropout,
 accumulation, checkpoint, and scoreboard state, including after a `zero_grad`
 bank flip. Compiled
