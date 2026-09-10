@@ -1413,10 +1413,6 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
     }
     assert_eq!(resumed.optimizer_step()?, 3);
     assert_eq!(resumed.accumulation_index()?, 0);
-    assert_eq!(
-        resumed.module_checkpoint()?,
-        uninterrupted.module_checkpoint()?
-    );
     for (_, parameter, _, before) in &destination_states {
         let after = parameter.snapshot()?;
         assert_eq!(after.data, before.data);
@@ -1425,10 +1421,13 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         assert_eq!(after.trainable, before.trainable);
     }
 
-    let uninterrupted_model = uninterrupted
-        .finish()
+    let (uninterrupted_model, uninterrupted_checkpoint) = uninterrupted
+        .finish_with_module_checkpoint()
         .map_err(|error| error.into_parts().1)?;
-    let resumed_model = resumed.finish().map_err(|error| error.into_parts().1)?;
+    let (resumed_model, resumed_checkpoint) = resumed
+        .finish_with_module_checkpoint()
+        .map_err(|error| error.into_parts().1)?;
+    assert_eq!(resumed_checkpoint, uninterrupted_checkpoint);
     assert_eq!(
         resumed_model.state_dict()?,
         uninterrupted_model.state_dict()?
