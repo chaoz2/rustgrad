@@ -855,12 +855,14 @@ impl CompiledAdamWConfig {
     /// Configures an existing fixed F32 binary mask for compiler-owned token
     /// mean loss and valid-token-weighted gradient accumulation.
     ///
-    /// This CPU-first opt-in requires accumulation and compilation through
-    /// [`CompiledAdamWPlan::compile_token_mean_module_with_dropout`]. That
-    /// surface derives the scalar loss from per-token losses, then weights each
-    /// normalized microbatch gradient by its valid count and divides by the
-    /// whole window count immediately before clipping and AdamW. It adds one
-    /// recurrent U64 count; mask padding layout remains a batch-level policy.
+    /// This CPU-first opt-in requires accumulation and an explicit token-mean
+    /// objective through [`CompiledAdamWPlan::compile_module_graph`] or its
+    /// dropout variant. The compatibility token-mean constructor follows the
+    /// same lowering. Compilation derives the scalar loss from per-token
+    /// losses, then weights each normalized microbatch gradient by its valid
+    /// count and divides by the whole window count immediately before clipping
+    /// and AdamW. It adds one recurrent U64 count; mask padding layout remains
+    /// a batch-level policy.
     pub fn with_token_weighted_gradient_accumulation(
         mut self,
         mask_input_name: impl Into<String>,
@@ -2405,6 +2407,72 @@ pub struct CompiledAdamWPlan {
     frozen_parameters: BTreeSet<String>,
     evaluation: Option<CompiledEvaluationPlan>,
     learning_rate: CompiledLearningRatePolicy,
+}
+
+/// Explicit differentiation objective returned by a module training builder.
+///
+/// [`Scalar`](Self::Scalar) is the already-normalized scalar loss used by the
+/// ordinary compiled AdamW policy. [`TokenMean`](Self::TokenMean) is a
+/// fixed-shape F32 tensor of per-token losses; compilation combines it with
+/// the token mask configured on [`CompiledAdamWConfig`] and owns the resulting
+/// masked mean as both the public loss and differentiation root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompiledAdamWObjective {
+    Scalar(NodeId),
+    TokenMean(NodeId),
+}
+
+impl CompiledAdamWObjective {
+    pub const fn scalar(loss: NodeId) -> Self {
+        Self::Scalar(loss)
+    }
+
+    pub const fn token_mean(losses: NodeId) -> Self {
+        Self::TokenMean(losses)
+    }
+
+    pub const fn node(self) -> NodeId {
+        match self {
+            Self::Scalar(node) | Self::TokenMean(node) => node,
+        }
+    }
+}
+
+/// Compact result of building one compiled AdamW module graph.
+///
+/// The objective makes scalar-loss versus compiler-owned token-mean policy
+/// explicit at the builder boundary. Named outputs retain their existing
+/// replay behavior and capture identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledAdamWGraph {
+    objective: CompiledAdamWObjective,
+    outputs: BTreeMap<String, NodeId>,
+}
+
+impl CompiledAdamWGraph {
+    pub fn new(objective: CompiledAdamWObjective, outputs: BTreeMap<String, NodeId>) -> Self {
+        Self { objective, outputs }
+    }
+
+    pub fn scalar(loss: NodeId, outputs: BTreeMap<String, NodeId>) -> Self {
+        Self::new(CompiledAdamWObjective::Scalar(loss), outputs)
+    }
+
+    pub fn token_mean(losses: NodeId, outputs: BTreeMap<String, NodeId>) -> Self {
+        Self::new(CompiledAdamWObjective::TokenMean(losses), outputs)
+    }
+
+    pub const fn objective(&self) -> CompiledAdamWObjective {
+        self.objective
+    }
+
+    pub fn outputs(&self) -> &BTreeMap<String, NodeId> {
+        &self.outputs
+    }
+
+    pub fn into_parts(self) -> (CompiledAdamWObjective, BTreeMap<String, NodeId>) {
+        (self.objective, self.outputs)
+    }
 }
 
 /// Resource-free AdamW plan paired with the exact module value used to build it.
@@ -5074,6 +5142,21 @@ impl CompiledAdamWPlan {
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
         reject_token_weighted_scalar_loss(&config)?;
+        Self::compile_parameters_with_lowered_loss(config, parameters, build)
+    }
+
+    fn compile_parameters_with_lowered_loss<F>(
+        config: CompiledAdamWConfig,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        build: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
         let parameters = parameters.into_iter().collect::<Vec<_>>();
         validate_weight_decay_exclusion_names(
             &config,
@@ -5145,6 +5228,53 @@ impl CompiledAdamWPlan {
         Ok(plan)
     }
 
+    /// Compiles a module through one explicit scalar-or-token-mean objective
+    /// facade without preparing a runtime.
+    ///
+    /// The objective must agree with the configuration: ordinary configs
+    /// accept [`CompiledAdamWObjective::Scalar`], while token-weighted configs
+    /// accept [`CompiledAdamWObjective::TokenMean`]. The selected objective is
+    /// lowered through the same capture path as the compatibility constructors.
+    pub fn compile_module_graph<M, F>(
+        config: CompiledAdamWConfig,
+        module: &M,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(&M, &mut Graph, &BTreeMap<String, NodeId>) -> Result<CompiledAdamWGraph>,
+    {
+        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
+        parameter_plan.validate_weight_decay_exclusions(&config)?;
+        let parameters = parameter_plan.initial_parameters()?;
+        let objective_config = config.clone();
+        let mut frozen_parameter_nodes = BTreeSet::new();
+        let mut plan = Self::compile_parameters_with_lowered_loss(
+            config,
+            parameters,
+            |graph, inputs, parameters| {
+                parameter_plan.lower_with_frozen_parameter_nodes(
+                    graph,
+                    parameters,
+                    &mut frozen_parameter_nodes,
+                    |graph| {
+                        let built = build(module, graph, inputs)?;
+                        let (objective, outputs) = built.into_parts();
+                        let loss = lower_compiled_adamw_objective(
+                            &objective_config,
+                            graph,
+                            inputs,
+                            objective,
+                        )?;
+                        Ok((loss, outputs))
+                    },
+                )
+            },
+        )?;
+        plan.inner.frozen_parameter_nodes = frozen_parameter_nodes;
+        Ok(plan)
+    }
+
     /// Compiles module-bound AdamW with one device-resident Threefry block
     /// counter shared by the module's explicit residual-dropout calls.
     pub fn compile_module_with_dropout<M, F>(
@@ -5172,6 +5302,42 @@ impl CompiledAdamWPlan {
             parameter_plan,
             parameters,
             build,
+        )
+    }
+
+    /// Compiles a module with recurrent dropout through the unified explicit
+    /// scalar-or-token-mean objective facade.
+    pub fn compile_module_graph_with_dropout<M, F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: &M,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
+        let parameters = parameter_plan.initial_parameters()?;
+        let objective_config = config.clone();
+        Self::compile_module_with_dropout_parameters(
+            config,
+            dropout,
+            module,
+            parameter_plan,
+            parameters,
+            |module, graph, inputs, dropout| {
+                let built = build(module, graph, inputs, dropout)?;
+                let (objective, outputs) = built.into_parts();
+                let loss =
+                    lower_compiled_adamw_objective(&objective_config, graph, inputs, objective)?;
+                Ok((loss, outputs))
+            },
         )
     }
 
@@ -5828,6 +5994,44 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         let frozen_parameters = config.frozen_parameters.clone();
         Self::build_owned(module, &frozen_parameters, |module| {
             CompiledAdamWPlan::compile_module_with_dropout(config, dropout, module, build)
+        })
+    }
+
+    /// Compiles and owns a module through the unified explicit objective
+    /// facade.
+    pub fn compile_graph<F>(
+        config: CompiledAdamWConfig,
+        module: M,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(&M, &mut Graph, &BTreeMap<String, NodeId>) -> Result<CompiledAdamWGraph>,
+    {
+        let frozen_parameters = config.frozen_parameters.clone();
+        Self::build_owned(module, &frozen_parameters, |module| {
+            CompiledAdamWPlan::compile_module_graph(config, module, build)
+        })
+    }
+
+    /// Compiles and owns a recurrent-dropout module through the unified
+    /// explicit objective facade.
+    pub fn compile_graph_with_dropout<F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: M,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        let frozen_parameters = config.frozen_parameters.clone();
+        Self::build_owned(module, &frozen_parameters, |module| {
+            CompiledAdamWPlan::compile_module_graph_with_dropout(config, dropout, module, build)
         })
     }
 
@@ -8689,6 +8893,27 @@ fn reject_token_weighted_scalar_loss(config: &CompiledAdamWConfig) -> Result<()>
     Ok(())
 }
 
+fn lower_compiled_adamw_objective(
+    config: &CompiledAdamWConfig,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    objective: CompiledAdamWObjective,
+) -> Result<NodeId> {
+    match objective {
+        CompiledAdamWObjective::Scalar(loss) => {
+            reject_token_weighted_scalar_loss(config)?;
+            Ok(loss)
+        }
+        CompiledAdamWObjective::TokenMean(losses) => {
+            let (mask_input, mask_shape) = token_mean_loss_descriptor(config)?;
+            let mask = inputs.get(&mask_input).copied().ok_or_else(|| {
+                training("compiled AdamW token-weight mask input is absent during compilation")
+            })?;
+            lower_token_mean_loss(graph, losses, mask, &mask_shape)
+        }
+    }
+}
+
 fn token_mean_loss_descriptor(config: &CompiledAdamWConfig) -> Result<(String, Shape)> {
     let mask_input = config.token_weight_mask_input.as_ref().ok_or_else(|| {
         training("compiled AdamW token-mean-loss compilation requires token weighting")
@@ -11318,6 +11543,16 @@ mod tests {
         ))
     }
 
+    fn build_token_graph(
+        module: &TokenMeanModule,
+        graph: &mut Graph,
+        inputs: &BTreeMap<String, NodeId>,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<CompiledAdamWGraph> {
+        let (losses, outputs) = build_token_losses(module, graph, inputs, dropout)?;
+        Ok(CompiledAdamWGraph::token_mean(losses, outputs))
+    }
+
     fn compile_token_weighted_plan(steps: u64) -> CompiledAdamWPlan {
         CompiledAdamWPlan::compile_token_mean_module_with_dropout(
             token_weighted_config(steps),
@@ -11326,6 +11561,298 @@ mod tests {
             build_token_losses,
         )
         .unwrap()
+    }
+
+    fn compile_direct_token_mean_without_dropout(
+        config: CompiledAdamWConfig,
+        module: &TokenMeanModule,
+    ) -> CompiledAdamWPlan {
+        let (mask_input, mask_shape) = token_mean_loss_descriptor(&config).unwrap();
+        let parameter =
+            TrainingParameterInit::new("weight", module.weight.value().unwrap()).unwrap();
+        CompiledAdamWPlan::compile_parameters_with_lowered_loss(
+            config,
+            [parameter],
+            |graph, inputs, parameters| {
+                let losses = graph.mul(parameters["weight"], inputs["features"])?;
+                let loss =
+                    lower_token_mean_loss(graph, losses, inputs[mask_input.as_str()], &mask_shape)?;
+                Ok((loss, BTreeMap::new()))
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unified_scalar_objective_matches_legacy_capture_replay_and_checkpoint() {
+        let module = TiedFrozenModule::new([0.1, -0.2]);
+        let legacy =
+            CompiledAdamWPlan::compile_module(module_config(), &module, build_tied_frozen).unwrap();
+        let unified = CompiledAdamWPlan::compile_module_graph(
+            module_config(),
+            &module,
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                let built = CompiledAdamWGraph::scalar(loss, outputs);
+                assert_eq!(built.objective().node(), loss);
+                assert_eq!(built.outputs().len(), 1);
+                assert!(built.outputs().contains_key("output"));
+                Ok(built)
+            },
+        )
+        .unwrap();
+        assert_eq!(unified.capture_identity(), legacy.capture_identity());
+        assert_eq!(unified.inspection().unwrap(), legacy.inspection().unwrap());
+
+        let inputs =
+            || BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 2.0]).unwrap())]);
+        let mut legacy_runtime = legacy.prepare_cpu().unwrap();
+        let mut unified_runtime = unified.prepare_cpu().unwrap();
+        let legacy_step = legacy_runtime
+            .step(inputs(), TensorData::scalar(0.01))
+            .unwrap();
+        let unified_step = unified_runtime
+            .step(inputs(), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(unified_step.loss(), legacy_step.loss());
+        assert_eq!(unified_step.outputs(), legacy_step.outputs());
+        assert_eq!(unified_step.optimizer_step(), legacy_step.optimizer_step());
+        assert_eq!(unified_step.loss_weight(), 1);
+        let checkpoint = unified_runtime.checkpoint().unwrap();
+        assert_eq!(checkpoint, legacy_runtime.checkpoint().unwrap());
+        assert_eq!(
+            unified
+                .restore_checkpoint(&checkpoint)
+                .unwrap()
+                .prepare_cpu()
+                .unwrap()
+                .checkpoint()
+                .unwrap(),
+            checkpoint
+        );
+
+        let owned = CompiledModuleAdamWPlan::compile_graph(
+            module_config(),
+            TiedFrozenModule::new([0.1, -0.2]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::new(
+                    CompiledAdamWObjective::scalar(loss),
+                    outputs,
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(owned.capture_identity(), legacy.capture_identity());
+        assert_eq!(owned.inspection().unwrap(), legacy.inspection().unwrap());
+
+        let dropout = CompiledDropoutConfig::new(CompiledDropoutKey([61, 67]));
+        let legacy_dropout = CompiledAdamWPlan::compile_module_with_dropout(
+            module_config(),
+            dropout,
+            &module,
+            build_tied_dropout,
+        )
+        .unwrap();
+        let unified_dropout = CompiledAdamWPlan::compile_module_graph_with_dropout(
+            module_config(),
+            dropout,
+            &module,
+            |module, graph, inputs, dropout| {
+                let (loss, outputs) = build_tied_dropout(module, graph, inputs, dropout)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            unified_dropout.capture_identity(),
+            legacy_dropout.capture_identity()
+        );
+        assert_eq!(
+            unified_dropout.inspection().unwrap(),
+            legacy_dropout.inspection().unwrap()
+        );
+    }
+
+    #[test]
+    fn unified_token_mean_objective_matches_legacy_and_rejects_policy_mismatch_atomically() {
+        let module = TokenMeanModule::new();
+        let direct = compile_direct_token_mean_without_dropout(token_weighted_config(2), &module);
+        let unified_without_dropout = CompiledAdamWPlan::compile_module_graph(
+            token_weighted_config(2),
+            &module,
+            |module, graph, inputs| {
+                let weight = module.weight.bind(graph)?;
+                let losses = graph.mul(weight, inputs["features"])?;
+                Ok(CompiledAdamWGraph::token_mean(losses, BTreeMap::new()))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            unified_without_dropout.capture_identity(),
+            direct.capture_identity()
+        );
+        assert_eq!(
+            unified_without_dropout.inspection().unwrap(),
+            direct.inspection().unwrap()
+        );
+        let first_batch = || token_weighted_batch([1.0, 100.0, 1.0], [1.0, 0.0, 1.0]);
+        let mut direct_runtime = direct.prepare_cpu().unwrap();
+        let mut unified_without_dropout_runtime = unified_without_dropout.prepare_cpu().unwrap();
+        let direct_step = direct_runtime
+            .step(first_batch(), TensorData::scalar(0.1))
+            .unwrap();
+        let unified_without_dropout_step = unified_without_dropout_runtime
+            .step(first_batch(), TensorData::scalar(0.1))
+            .unwrap();
+        assert_eq!(unified_without_dropout_step.loss(), direct_step.loss());
+        assert_eq!(
+            unified_without_dropout_step.outputs(),
+            direct_step.outputs()
+        );
+        assert_eq!(unified_without_dropout_step.loss_weight(), 2);
+        let without_dropout_checkpoint = unified_without_dropout_runtime.checkpoint().unwrap();
+        assert_eq!(
+            without_dropout_checkpoint,
+            direct_runtime.checkpoint().unwrap()
+        );
+        assert_eq!(
+            unified_without_dropout
+                .restore_checkpoint(&without_dropout_checkpoint)
+                .unwrap()
+                .prepare_cpu()
+                .unwrap()
+                .checkpoint()
+                .unwrap(),
+            without_dropout_checkpoint
+        );
+
+        let legacy = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+            token_weighted_config(2),
+            token_mean_dropout(),
+            &module,
+            build_token_losses,
+        )
+        .unwrap();
+        let unified = CompiledAdamWPlan::compile_module_graph_with_dropout(
+            token_weighted_config(2),
+            token_mean_dropout(),
+            &module,
+            build_token_graph,
+        )
+        .unwrap();
+        assert_eq!(unified.capture_identity(), legacy.capture_identity());
+        assert_eq!(unified.inspection().unwrap(), legacy.inspection().unwrap());
+
+        let mut legacy_runtime = legacy.prepare_cpu().unwrap();
+        let mut unified_runtime = unified.prepare_cpu().unwrap();
+        let legacy_step = legacy_runtime
+            .step(first_batch(), TensorData::scalar(0.1))
+            .unwrap();
+        let unified_step = unified_runtime
+            .step(first_batch(), TensorData::scalar(0.1))
+            .unwrap();
+        assert_eq!(unified_step.loss(), legacy_step.loss());
+        assert_eq!(unified_step.outputs(), legacy_step.outputs());
+        assert_eq!(unified_step.loss_weight(), 2);
+        let checkpoint = unified_runtime.checkpoint().unwrap();
+        assert_eq!(checkpoint, legacy_runtime.checkpoint().unwrap());
+        assert_eq!(
+            unified
+                .restore_checkpoint(&checkpoint)
+                .unwrap()
+                .prepare_cpu()
+                .unwrap()
+                .checkpoint()
+                .unwrap(),
+            checkpoint
+        );
+
+        let owned = CompiledModuleAdamWPlan::compile_graph_with_dropout(
+            token_weighted_config(2),
+            token_mean_dropout(),
+            TokenMeanModule::new(),
+            build_token_graph,
+        )
+        .unwrap();
+        assert_eq!(owned.capture_identity(), legacy.capture_identity());
+        assert_eq!(owned.inspection().unwrap(), legacy.inspection().unwrap());
+
+        let scalar_before = module.weight.snapshot().unwrap();
+        let scalar_mismatch = CompiledAdamWPlan::compile_module_graph(
+            token_weighted_config(2),
+            &module,
+            |module, graph, inputs| {
+                let weight = module.weight.bind(graph)?;
+                let losses = graph.mul(weight, inputs["features"])?;
+                Ok(CompiledAdamWGraph::scalar(
+                    graph.sum_all(losses)?,
+                    BTreeMap::new(),
+                ))
+            },
+        );
+        let scalar_error = match scalar_mismatch {
+            Ok(_) => panic!("scalar objective compiled with token weighting"),
+            Err(error) => error,
+        };
+        assert!(
+            scalar_error
+                .to_string()
+                .contains("requires the token-mean-loss compile surface")
+        );
+        assert_parameter_snapshot_eq(&module.weight.snapshot().unwrap(), &scalar_before);
+
+        let ordinary_config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+            .unwrap()
+            .with_input("features", [3], DType::F32)
+            .unwrap();
+        let token_before = module.weight.snapshot().unwrap();
+        let token_mismatch = CompiledAdamWPlan::compile_module_graph(
+            ordinary_config.clone(),
+            &module,
+            |module, graph, inputs| {
+                let weight = module.weight.bind(graph)?;
+                Ok(CompiledAdamWGraph::token_mean(
+                    graph.mul(weight, inputs["features"])?,
+                    BTreeMap::new(),
+                ))
+            },
+        );
+        let token_error = match token_mismatch {
+            Ok(_) => panic!("token-mean objective compiled without token weighting"),
+            Err(error) => error,
+        };
+        assert!(
+            token_error
+                .to_string()
+                .contains("token-mean-loss compilation requires token weighting")
+        );
+        assert_parameter_snapshot_eq(&module.weight.snapshot().unwrap(), &token_before);
+
+        let owned_module = TokenMeanModule::new();
+        let owned_before = owned_module.weight.snapshot().unwrap();
+        let owned_error = match CompiledModuleAdamWPlan::compile_graph(
+            ordinary_config,
+            owned_module,
+            |module, graph, inputs| {
+                let weight = module.weight.bind(graph)?;
+                Ok(CompiledAdamWGraph::token_mean(
+                    graph.mul(weight, inputs["features"])?,
+                    BTreeMap::new(),
+                ))
+            },
+        ) {
+            Ok(_) => panic!("token-mean objective compiled without its mask policy"),
+            Err(error) => error,
+        };
+        assert!(
+            owned_error
+                .source_error()
+                .to_string()
+                .contains("token-mean-loss compilation requires token weighting")
+        );
+        let returned = owned_error.into_module();
+        assert_parameter_snapshot_eq(&returned.weight.snapshot().unwrap(), &owned_before);
     }
 
     #[test]

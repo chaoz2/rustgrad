@@ -18,10 +18,11 @@ pub use classification::{
 };
 pub use compiled_training::{
     CompiledAdamWCheckpoint, CompiledAdamWCheckpointInfo, CompiledAdamWConfig, CompiledAdamWFlush,
-    CompiledAdamWFlushResult, CompiledAdamWFlushRuntime, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWZeroGradResult,
-    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
-    CompiledEvaluationResult, CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
+    CompiledAdamWFlushResult, CompiledAdamWFlushRuntime, CompiledAdamWGraph,
+    CompiledAdamWObjective, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
+    CompiledAdamWStepResult, CompiledAdamWZeroGradResult, CompiledCheckpointRuntime,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationResult,
+    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
     CompiledModuleAdamWCompileError, CompiledModuleAdamWEvaluationError,
     CompiledModuleAdamWFinishError, CompiledModuleAdamWPlan, CompiledModuleAdamWPrepareError,
     CompiledModuleAdamWRestoreError, CompiledModuleAdamWSession, CompiledMomentumSgdConfig,

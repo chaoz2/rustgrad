@@ -42,10 +42,10 @@ use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
     Backend, CapturedReplayExecutor, CompiledAdamWCheckpoint, CompiledAdamWConfig,
-    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
-    CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
-    CompiledModuleAdamWPlan, CompiledModuleAdamWSession, CompiledMultiStepLr,
+    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWPlan,
+    CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig,
+    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
+    CompiledInputSpec, CompiledModuleAdamWPlan, CompiledModuleAdamWSession, CompiledMultiStepLr,
     CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuNonFinitePolicy,
     CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NativeCpuSessionTarget,
     NativeTrainingScoreboard, NodeId, Parameter, Result, Scalar, Shape, TensorData,
@@ -687,13 +687,14 @@ fn run_cpu_reuse() -> Result<()> {
         .value()?;
     let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1])?;
     let builds = Cell::new(0);
-    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+    let plan = CompiledAdamWPlan::compile_module_graph_with_dropout(
         reuse_config(schedule.clone())?,
         dropout_config(),
         &source,
         |model, graph, inputs, dropout| {
             builds.set(builds.get() + 1);
-            build_buffered(model, graph, inputs, dropout)
+            let (losses, outputs) = build_buffered(model, graph, inputs, dropout)?;
+            Ok(CompiledAdamWGraph::token_mean(losses, outputs))
         },
     )?;
     assert_eq!(builds.get(), 1, "the training graph must compile once");

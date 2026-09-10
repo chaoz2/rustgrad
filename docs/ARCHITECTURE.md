@@ -1121,6 +1121,13 @@ independent interpreter CPU replay, strict-native CPU replay, or a strict
 resource-free Metal plan directly; Metal no longer requires constructing a CPU
 training session first. `CpuCompiledAdamW`
 keeps its original constructors as compatibility delegates through this plan.
+Module builders may return `CompiledAdamWGraph`, whose explicit
+`CompiledAdamWObjective` selects an already-normalized scalar or a
+compiler-owned masked token mean alongside the same named outputs. Borrowed and
+owned module compilation expose the same facade with or without recurrent
+dropout; objective/configuration mismatches reject without publishing a plan,
+while the legacy scalar and token-mean constructors preserve their established
+captures and behavior.
 `CompiledTrainingRuntime` and `CompiledTrainingStep` are the shared public
 execution contract implemented by CPU momentum-SGD, CPU AdamW, and Metal AdamW:
 one generic loop observes loss, named outputs, capture identity, replay progress,
