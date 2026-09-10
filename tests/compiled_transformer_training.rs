@@ -10,15 +10,15 @@ use rustgrad::{
     Backend, BinaryOp, CapturedReplayExecutor, CapturedReplayOptions, CapturedSchedule, CompareOp,
     CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWFlush, CompiledAdamWFlushRuntime,
     CompiledAdamWGraph, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
-    CompiledAdamWStepResult, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
-    CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
-    CompiledModuleAdamWPlan, CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep,
-    CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph,
-    LossOptions, MetalCompiledAdamWPlan, Module, NativeCpuCompiledAdamW,
-    NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget, NativeTrainingReport,
-    NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
-    TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy, load_safetensors,
-    save_safetensors, schedule_many,
+    CompiledAdamWStepResult, CompiledAdamWWindowLossReport, CompiledCheckpointRuntime,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
+    CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan, CompiledMultiStepLr,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
+    CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions, MetalCompiledAdamWPlan,
+    Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget,
+    NativeTrainingReport, NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result,
+    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy,
+    load_safetensors, save_safetensors, schedule_many,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1174,6 +1174,44 @@ fn masked_batch(replay: u64) -> MaskedTransformerBatch {
 
 fn loss_mask_weight(mask: &TensorData) -> u64 {
     mask.to_vec_f64().into_iter().sum::<f64>() as u64
+}
+
+fn expected_window_loss(samples: &[(f32, u64)]) -> (f32, u64) {
+    let mut numerator = 0.0_f32;
+    let mut weight = 0_u64;
+    for (loss, sample_weight) in samples {
+        numerator += *loss * *sample_weight as f32;
+        weight += *sample_weight;
+    }
+    (numerator / weight as f32, weight)
+}
+
+fn assert_window_loss_report(
+    context: &str,
+    report: &CompiledAdamWWindowLossReport,
+    samples: &[(f32, u64)],
+) {
+    let (mean_loss, loss_weight) = expected_window_loss(samples);
+    assert_eq!(report.loss_weight(), loss_weight, "{context} loss weight");
+    assert_eq!(
+        report.microbatch_count(),
+        samples.len() as u64,
+        "{context} microbatch count"
+    );
+    assert!(report.is_finite(), "{context} report must be finite");
+    let actual = report.mean_loss();
+    let error = (actual - mean_loss).abs();
+    // The independent host fold uses Rust F32 arithmetic, while GraphBinary
+    // evaluates each operation in F64 and commits each result to F32. Bound
+    // that legal rounding difference without weakening exact report metadata
+    // or uninterrupted/resumed result equality.
+    let tolerance = 8.0 * f32::EPSILON * actual.abs().max(mean_loss.abs()).max(1.0);
+    assert!(
+        error <= tolerance,
+        "{context} mean loss mismatch: actual={actual} expected={mean_loss} error={error} tolerance={tolerance} actual_bits={} expected_bits={}",
+        actual.to_bits(),
+        mean_loss.to_bits()
+    );
 }
 
 fn invalid_masked_batches() -> Vec<MaskedTransformerBatch> {
@@ -6055,7 +6093,8 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
     let policy = masked_config()
         .with_frozen_parameters([POLICY_FROZEN])
         .unwrap()
-        .with_captured_multi_step_lr(schedule.clone());
+        .with_captured_multi_step_lr(schedule.clone())
+        .with_window_loss_report();
     let masks = (1..=3)
         .map(|replay| masked_batch(replay).loss_mask)
         .collect::<Vec<_>>();
@@ -6085,6 +6124,7 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
     assert_eq!(builds.get(), 1);
     assert_eq!(plan.step_count(), 0);
     assert_eq!(plan.captured_multi_step_lr(), Some(&schedule));
+    assert!(plan.window_loss_report_enabled());
     assert_eq!(
         plan.token_weighted_gradient_accumulation_mask(),
         Some(LOSS_MASK)
@@ -6118,6 +6158,7 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
             .step_batch_scheduled(masked_batch(replay))
             .unwrap();
         assert!(!step.did_update());
+        assert!(step.window_loss_report().is_none());
     }
     assert_eq!(
         uninterrupted.zero_grad().unwrap().discarded_microbatches(),
@@ -6134,10 +6175,32 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         checkpoint_dropout_block_counter(&uninterrupted.checkpoint().unwrap()),
         24
     );
-    for replay in 3..=6 {
+    assert_eq!(
         uninterrupted
+            .checkpoint()
+            .unwrap()
+            .info()
+            .accumulated_loss_numerator()
+            .unwrap()
+            .to_bits(),
+        0.0_f32.to_bits()
+    );
+    let mut pending_window = Vec::new();
+    for replay in 3..=6 {
+        let step = uninterrupted
             .step_batch_scheduled(masked_batch(replay))
             .unwrap();
+        pending_window.push((step.loss().scalar_at(0).as_f64() as f32, step.loss_weight()));
+        if step.did_update() {
+            assert_window_loss_report(
+                "uninterrupted full window",
+                step.window_loss_report().unwrap(),
+                &pending_window,
+            );
+            pending_window.clear();
+        } else {
+            assert!(step.window_loss_report().is_none());
+        }
     }
 
     let checkpoint = uninterrupted.checkpoint().unwrap();
@@ -6168,6 +6231,16 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
     assert_eq!(checkpoint.info().optimizer_step(), 1);
     assert_eq!(checkpoint.info().accumulation_index(), 1);
     assert_eq!(checkpoint.info().accumulated_token_count(), Some(3));
+    assert!(checkpoint.info().window_loss_report_enabled());
+    let expected_numerator = pending_window[0].0 * pending_window[0].1 as f32;
+    assert_eq!(
+        checkpoint
+            .info()
+            .accumulated_loss_numerator()
+            .unwrap()
+            .to_bits(),
+        expected_numerator.to_bits()
+    );
     assert_eq!(checkpoint.info().discarded_microbatches(), 2);
     assert_eq!(checkpoint.info().dropout_block_counter(), Some(72));
 
@@ -6252,6 +6325,7 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
     );
     assert_eq!(resumed.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
     assert_eq!(resumed.captured_multi_step_lr(), Some(&schedule));
+    assert!(resumed.window_loss_report_enabled());
     assert_eq!(
         resumed.non_finite_policy(),
         CpuNonFinitePolicy::RejectTransition
@@ -6300,12 +6374,19 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         running_marker_before.version
     );
 
+    let executor = CapturedReplayExecutor::default();
+    let native_target = NativeCpuSessionTarget::new(&executor)
+        .vectorized(true)
+        .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut native = resumed_plan.prepare(&native_target).unwrap();
+    assert_eq!(native.checkpoint().unwrap(), checkpoint);
     for replay in 7..=9 {
         let loss_weight = loss_mask_weight(&masked_batch(replay).loss_mask);
         let expected = uninterrupted
             .step_batch_scheduled(masked_batch(replay))
             .unwrap();
         let actual = resumed.step_batch_scheduled(masked_batch(replay)).unwrap();
+        let native_step = native.step_batch_scheduled(masked_batch(replay)).unwrap();
         assert_eq!(actual.loss(), expected.loss());
         assert_eq!(actual.loss_weight(), expected.loss_weight());
         assert_eq!(actual.loss_weight(), loss_weight);
@@ -6315,6 +6396,29 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         assert_eq!(actual.accumulation_index(), expected.accumulation_index());
         assert_eq!(actual.did_update(), expected.did_update());
         assert_eq!(actual.did_update(), replay == 8);
+        pending_window.push((
+            actual.loss().scalar_at(0).as_f64() as f32,
+            actual.loss_weight(),
+        ));
+        if actual.did_update() {
+            let expected_report = expected.window_loss_report().unwrap();
+            let actual_report = actual.window_loss_report().unwrap();
+            assert_eq!(actual_report, expected_report);
+            assert_window_loss_report("resumed full window", actual_report, &pending_window);
+            let native_report = native_step.window_loss_report().unwrap();
+            assert_eq!(native_report.loss_weight(), actual_report.loss_weight());
+            assert_eq!(
+                native_report.microbatch_count(),
+                actual_report.microbatch_count()
+            );
+            let error = (native_report.mean_loss() - actual_report.mean_loss()).abs();
+            assert!(error <= 1e-5, "native window loss differs by {error}");
+            pending_window.clear();
+        } else {
+            assert!(expected.window_loss_report().is_none());
+            assert!(actual.window_loss_report().is_none());
+            assert!(native_step.window_loss_report().is_none());
+        }
         assert_eq!(actual.capture_identity(), capture_identity);
         assert_eq!(
             checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
@@ -6351,6 +6455,7 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
 
     let expected_flush = uninterrupted.flush_partial_window_scheduled().unwrap();
     let actual_flush = resumed.flush_partial_window_scheduled().unwrap();
+    let native_flush = native.flush_partial_window_scheduled().unwrap();
     assert_eq!(actual_flush.flushed_microbatches(), 1);
     assert_eq!(
         actual_flush.flushed_microbatches(),
@@ -6361,6 +6466,25 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         expected_flush.optimizer_step()
     );
     assert_eq!(actual_flush.did_update(), expected_flush.did_update());
+    assert_eq!(
+        actual_flush.window_loss_report(),
+        expected_flush.window_loss_report()
+    );
+    assert_window_loss_report(
+        "resumed partial flush",
+        actual_flush.window_loss_report().unwrap(),
+        &pending_window,
+    );
+    let native_report = native_flush.window_loss_report().unwrap();
+    assert_eq!(
+        native_report.loss_weight(),
+        actual_flush.window_loss_report().unwrap().loss_weight()
+    );
+    assert_eq!(native_report.microbatch_count(), 1);
+    assert!(
+        (native_report.mean_loss() - actual_flush.window_loss_report().unwrap().mean_loss()).abs()
+            <= 1e-5
+    );
     assert_eq!(resumed.optimizer_step().unwrap(), 3);
     assert_eq!(resumed.accumulation_index().unwrap(), 0);
     assert_eq!(resumed.step_count(), 9);

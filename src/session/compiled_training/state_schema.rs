@@ -26,6 +26,7 @@ pub(super) enum AdamWGlobalState {
     Step,
     AccumulationIndex,
     AccumulatedTokenCount,
+    AccumulatedLossNumerator,
 }
 
 impl AdamWGlobalState {
@@ -34,6 +35,7 @@ impl AdamWGlobalState {
             Self::Step => "step",
             Self::AccumulationIndex => "accumulation_index",
             Self::AccumulatedTokenCount => "accumulated_token_count",
+            Self::AccumulatedLossNumerator => "accumulated_loss_numerator",
         }
     }
 }
@@ -158,6 +160,7 @@ impl RecurrentStateKey {
             &self.semantic,
             RecurrentStateSemantic::AdamWGlobal(AdamWGlobalState::AccumulationIndex)
                 | RecurrentStateSemantic::AdamWGlobal(AdamWGlobalState::AccumulatedTokenCount)
+                | RecurrentStateSemantic::AdamWGlobal(AdamWGlobalState::AccumulatedLossNumerator,)
                 | RecurrentStateSemantic::AdamWParameter {
                     state: AdamWParameterState::GradientAccumulator,
                     ..
@@ -228,10 +231,14 @@ impl StateSpec {
     }
 
     pub(super) fn adamw_global(state: AdamWGlobalState) -> Result<Self> {
+        let dtype = match state {
+            AdamWGlobalState::AccumulatedLossNumerator => DType::F32,
+            _ => DType::U64,
+        };
         Ok(Self {
             key: RecurrentStateKey::adamw_global(state),
             input_name: format!("{INTERNAL_PREFIX}adamw_{}", state.canonical_suffix()),
-            value: TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)])?,
+            value: TensorData::zeros_with_dtype(Shape::from([]), dtype)?,
             requires_grad: false,
         })
     }
@@ -266,6 +273,7 @@ mod tests {
             RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
             RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
             RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedTokenCount),
+            RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedLossNumerator),
             RecurrentStateKey::dropout_counter(),
         ];
         for parameter in parameter_names {
@@ -338,6 +346,11 @@ mod tests {
         );
         assert_eq!(
             keys[3].canonical_name(),
+            "global:accumulated_loss_numerator",
+            "global spelling changed"
+        );
+        assert_eq!(
+            keys[4].canonical_name(),
             "workload:dropout_block_counter",
             "workload spelling changed"
         );
@@ -384,6 +397,7 @@ mod tests {
             StateSpec::adamw_global(AdamWGlobalState::Step).unwrap(),
             StateSpec::adamw_global(AdamWGlobalState::AccumulationIndex).unwrap(),
             StateSpec::adamw_global(AdamWGlobalState::AccumulatedTokenCount).unwrap(),
+            StateSpec::adamw_global(AdamWGlobalState::AccumulatedLossNumerator).unwrap(),
             StateSpec::dropout_counter().unwrap(),
         ];
         assert!(cases[0].requires_grad);
@@ -391,9 +405,13 @@ mod tests {
         assert!(cases[..5].iter().all(|spec| {
             spec.value.shape() == &Shape::from([2, 3]) && spec.value.dtype() == DType::F32
         }));
-        assert!(cases[5..].iter().all(|spec| {
+        assert!(cases[5..8].iter().all(|spec| {
             spec.value.shape() == &Shape::from([]) && spec.value.dtype() == DType::U64
         }));
+        assert_eq!(cases[8].value.dtype(), DType::F32);
+        assert_eq!(cases[8].value.shape(), &Shape::from([]));
+        assert_eq!(cases[9].value.dtype(), DType::U64);
+        assert_eq!(cases[9].value.shape(), &Shape::from([]));
         assert_eq!(
             cases.each_ref().map(|spec| spec.key.canonical_name()),
             [
@@ -405,6 +423,7 @@ mod tests {
                 "global:step",
                 "global:accumulation_index",
                 "global:accumulated_token_count",
+                "global:accumulated_loss_numerator",
                 "workload:dropout_block_counter",
             ]
         );
@@ -419,6 +438,7 @@ mod tests {
                 "__rustgrad_compiled_training_adamw_step",
                 "__rustgrad_compiled_training_adamw_accumulation_index",
                 "__rustgrad_compiled_training_adamw_accumulated_token_count",
+                "__rustgrad_compiled_training_adamw_accumulated_loss_numerator",
                 "__rustgrad_compiled_training_dropout_block_counter",
             ]
         );
