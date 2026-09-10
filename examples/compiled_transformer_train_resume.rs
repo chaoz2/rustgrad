@@ -3,9 +3,8 @@
 //!
 //! Same-process callers may instead retain one `CompiledAdamWPlan` and call
 //! `restore_checkpoint` without rebuilding its graph or captures. That CPU
-//! path uses fixed-capacity right-padded batches and averages each masked
-//! microbatch equally across an accumulation window; it does not retain a
-//! token-count denominator as recurrent state.
+//! path uses fixed-capacity right-padded batches and weights each normalized
+//! microbatch gradient by its valid-token count across an accumulation window.
 //!
 //! Run that compile-once, same-process CPU path:
 //!
@@ -192,6 +191,7 @@ fn optimizer_config() -> Result<CompiledAdamWConfig> {
 fn reuse_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
     Ok(optimizer_config()?
         .with_input_batch::<MaskedTransformerBatch>()?
+        .with_token_weighted_gradient_accumulation(LOSS_MASK)?
         .with_frozen_parameters([POLICY_FROZEN])?
         .with_captured_multi_step_lr(schedule))
 }
@@ -694,6 +694,10 @@ fn run_cpu_reuse() -> Result<()> {
     )?;
     assert_eq!(builds.get(), 1, "the training graph must compile once");
     let capture_identity = plan.capture_identity();
+    assert_eq!(
+        plan.token_weighted_gradient_accumulation_mask(),
+        Some(LOSS_MASK)
+    );
     let target =
         CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
     let mut uninterrupted = plan.prepare(&target)?;
@@ -718,6 +722,7 @@ fn run_cpu_reuse() -> Result<()> {
     assert_eq!(checkpoint.info().replay_step(), 4);
     assert_eq!(checkpoint.info().optimizer_step(), 1);
     assert_eq!(checkpoint.info().accumulation_index(), 1);
+    assert_eq!(checkpoint.info().accumulated_token_count(), Some(5));
     assert_eq!(uninterrupted.dropout_block_counter()?, Some(48));
 
     let restored_plan = plan.restore_checkpoint(&checkpoint)?;
