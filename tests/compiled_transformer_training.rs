@@ -2890,6 +2890,34 @@ fn numerical_two_block_attention_dropout_gradient_lanes(
     numerical_two_block_gradient_lanes_from_forward(model, graph, loss, inputs, probes)
 }
 
+fn numerical_two_block_attention_mask_gradient_lanes(
+    model: &TwoBlockPositionalGpt,
+    inputs: BTreeMap<String, TensorData>,
+    masks: [TensorData; 6],
+    probes: &[TransformerGradientProbe],
+) -> NumericalTwoBlockGptEvaluation {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let attention_mask =
+        graph.input_dtype(ATTENTION_KEEP_MASK, ATTENTION_KEEP_MASK_SHAPE, DType::Bool);
+    let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
+    let guard = graph.input_dtype(ATTENTION_DROPOUT_TRANSITION_GUARD, [], DType::F32);
+    let mut dropout = FixedResidualDropout::from_masks(masks);
+    let logits = model
+        .forward_with_attention_mask(&mut graph, tokens, attention_mask, &mut dropout)
+        .unwrap();
+    assert_eq!(dropout.next, 6);
+    let losses = multi_head_sparse_causal_losses(&mut graph, logits, targets).unwrap();
+    let guard = graph.reciprocal(guard).unwrap();
+    let losses = graph.add(losses, guard).unwrap();
+    let weighted = graph.mul(losses, loss_mask).unwrap();
+    let numerator = graph.sum_all(weighted).unwrap();
+    let denominator = graph.sum_all(loss_mask).unwrap();
+    let loss = graph.div(numerator, denominator).unwrap();
+    numerical_two_block_gradient_lanes_from_forward(model, graph, loss, inputs, probes)
+}
+
 fn numerical_two_block_gradient_lanes_from_forward(
     model: &TwoBlockPositionalGpt,
     graph: Graph,
@@ -4707,6 +4735,128 @@ fn compiled_two_block_attention_masks_are_ordered_atomic_and_resume_exactly() {
         native.dropout_block_counter().unwrap(),
         Some(5 * BLOCKS_PER_REPLAY)
     );
+    assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_attention_mask_gradients_match_fixed_dropout_central_differences() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+    const ABSOLUTE_TOLERANCE: f64 = 6e-3;
+    const RELATIVE_TOLERANCE: f64 = 3e-3;
+    const PROBES: [TransformerGradientProbe; 9] = [
+        TransformerGradientProbe {
+            parameter: "tokens.weight",
+            coordinate: 7,
+            boundary: "token embedding and tied language-model head",
+        },
+        TransformerGradientProbe {
+            parameter: "positions.weight",
+            coordinate: 6,
+            boundary: "learned positional embedding",
+        },
+        TransformerGradientProbe {
+            parameter: "first.query.0",
+            coordinate: 0,
+            boundary: "first-block masked query projection before attention dropout",
+        },
+        TransformerGradientProbe {
+            parameter: "first.value.0",
+            coordinate: 12,
+            boundary: "first-block masked value projection through attention dropout",
+        },
+        TransformerGradientProbe {
+            parameter: "first.out.0",
+            coordinate: 9,
+            boundary: "first-block masked attention output projection",
+        },
+        TransformerGradientProbe {
+            parameter: "second.key.0",
+            coordinate: 11,
+            boundary: "second-block packed-segment key projection",
+        },
+        TransformerGradientProbe {
+            parameter: "second.out.0",
+            coordinate: 9,
+            boundary: "second-block masked attention output projection",
+        },
+        TransformerGradientProbe {
+            parameter: "second.ff1.0",
+            coordinate: 20,
+            boundary: "second-block feed-forward expansion and ReLU",
+        },
+        TransformerGradientProbe {
+            parameter: "norm.bias",
+            coordinate: 2,
+            boundary: "final LayerNorm and token-mean sparse loss",
+        },
+    ];
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let mut identities = BTreeMap::new();
+    model.visit("", &mut |name, parameter, _| {
+        identities.insert(name, parameter.id());
+    });
+    assert_eq!(identities["tokens.weight"], identities["lm_head.weight"]);
+    let compile_count = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+        two_block_attention_mask_config(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_with_attention_mask(model, graph, inputs, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
+    let inputs = attention_masked_dropout_batch(1, 1.0);
+    let step = runtime
+        .step(inputs.clone(), TensorData::scalar(1e-3))
+        .unwrap();
+    assert!(!step.did_update());
+    assert_eq!(runtime.accumulation_index().unwrap(), 1);
+    let token_count = attention_masked_loss_weight(1);
+    assert_eq!(step.loss_weight(), token_count);
+    let captured = runtime.gradient_accumulator_snapshots().unwrap();
+    assert!(captured.contains_key("tokens.weight"));
+    assert!(!captured.contains_key("lm_head.weight"));
+    let masks = observed_two_block_dropout_masks(step.outputs());
+    let numerical =
+        numerical_two_block_attention_mask_gradient_lanes(&model, inputs, masks, &PROBES);
+    let captured_loss = step.loss().scalar_at(0).as_f64();
+    assert!(
+        (captured_loss - numerical.loss).abs() <= 2e-5,
+        "fixed-mask token-mean loss differs: captured={captured_loss}, numerical={}",
+        numerical.loss
+    );
+    for (probe, numerical) in PROBES.iter().zip(numerical.gradients) {
+        let captured = captured[probe.parameter]
+            .scalar_at(probe.coordinate)
+            .as_f64();
+        let expected = numerical * token_count as f64;
+        assert!(
+            captured.is_finite() && numerical.is_finite() && expected.is_finite(),
+            "{} must remain finite: captured={captured}, numerical={numerical}, weighted={expected}",
+            probe.boundary
+        );
+        assert!(
+            captured != 0.0 && numerical != 0.0 && expected != 0.0,
+            "{} must carry a nonzero gradient: captured={captured}, numerical={numerical}, weighted={expected}",
+            probe.boundary
+        );
+        let error = (captured - expected).abs();
+        let tolerance = ABSOLUTE_TOLERANCE * token_count as f64
+            + RELATIVE_TOLERANCE * captured.abs().max(expected.abs());
+        assert!(
+            error <= tolerance,
+            "{} {}[{}] token-weighted mismatch: captured={captured}, numerical={numerical}, token_count={token_count}, weighted={expected}, error={error}, tolerance={tolerance}",
+            probe.boundary,
+            probe.parameter,
+            probe.coordinate
+        );
+    }
     assert_eq!(compile_count.get(), 1);
 }
 
