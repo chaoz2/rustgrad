@@ -4,6 +4,12 @@
 //! Same-process callers may instead retain one `CompiledAdamWPlan` and call
 //! `restore_checkpoint` without rebuilding its graph or captures.
 //!
+//! Run that compile-once, same-process CPU path:
+//!
+//! ```text
+//! cargo run --example compiled_transformer_train_resume -- cpu-reuse
+//! ```
+//!
 //! Run on the graph-free CPU replay target:
 //!
 //! ```text
@@ -26,14 +32,15 @@ use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
     Backend, CapturedReplayExecutor, CompiledAdamWCheckpoint, CompiledAdamWConfig,
-    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWRuntime, CompiledAdamWStep,
-    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
-    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan,
-    CompiledModuleAdamWSession, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
+    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWPlan, CompiledAdamWRuntime,
+    CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
+    CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
+    CompiledModuleAdamWPlan, CompiledModuleAdamWSession, CompiledMultiStepLr,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuNonFinitePolicy,
     CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NativeCpuSessionTarget, NodeId,
     Parameter, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
 };
-use std::{collections::BTreeMap, env, error::Error};
+use std::{cell::Cell, collections::BTreeMap, env, error::Error};
 
 const VOCAB: usize = 3;
 const EMBEDDING: usize = 2;
@@ -58,6 +65,7 @@ const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
 ];
 const INITIAL_STEPS: usize = 4;
 const RESUMED_STEPS: usize = 3;
+const POLICY_FROZEN: &str = "block.ff1.0";
 
 struct TinyCausalTransformer {
     tokens: Embedding,
@@ -131,6 +139,32 @@ impl Module for TinyCausalTransformer {
     }
 }
 
+struct BufferedTinyCausalTransformer {
+    transformer: TinyCausalTransformer,
+    running_marker: Parameter,
+}
+
+impl BufferedTinyCausalTransformer {
+    fn new(seed: u64) -> Result<Self> {
+        Ok(Self {
+            transformer: TinyCausalTransformer::new(seed)?,
+            running_marker: Parameter::new(TensorData::scalar(3.0), false),
+        })
+    }
+}
+
+impl Module for BufferedTinyCausalTransformer {
+    fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        self.transformer.visit(prefix, visitor);
+        let name = if prefix.is_empty() {
+            "running_marker".to_owned()
+        } else {
+            format!("{prefix}.running_marker")
+        };
+        visitor(name, &self.running_marker, StateKind::Buffer);
+    }
+}
+
 fn config() -> Result<CompiledAdamWConfig> {
     CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)?
         .with_weight_decay_exclusions(WEIGHT_DECAY_EXCLUSIONS)?
@@ -138,6 +172,12 @@ fn config() -> Result<CompiledAdamWConfig> {
         .with_gradient_accumulation(ACCUMULATION_STEPS)?
         .with_max_gradient_norm(MAX_GRADIENT_NORM)?
         .with_input_batch::<TransformerBatch>()
+}
+
+fn reuse_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
+    Ok(config()?
+        .with_frozen_parameters([POLICY_FROZEN])?
+        .with_captured_multi_step_lr(schedule))
 }
 
 fn dropout_config() -> CompiledDropoutConfig {
@@ -163,6 +203,19 @@ fn build(
     let logits = model.forward(graph, inputs[TransformerBatch::TOKENS], dropout)?;
     let loss = sparse_causal_loss(graph, logits, inputs[TransformerBatch::TARGETS])?;
     Ok((loss, BTreeMap::new()))
+}
+
+fn build_buffered(
+    model: &BufferedTinyCausalTransformer,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let logits = model
+        .transformer
+        .forward(graph, inputs[TransformerBatch::TOKENS], dropout)?;
+    let loss = sparse_causal_loss(graph, logits, inputs[TransformerBatch::TARGETS])?;
+    Ok((loss, BTreeMap::from([("logits".into(), logits)])))
 }
 
 fn build_evaluation(
@@ -483,8 +536,247 @@ where
     Ok(())
 }
 
+fn run_cpu_reuse() -> Result<()> {
+    let source = BufferedTinyCausalTransformer::new(7)?;
+    let initial_mean_sparse_loss = evaluate_mean_sparse_loss(&source.transformer)?;
+    let source_policy_frozen = source
+        .trainable_parameters()?
+        .into_iter()
+        .find_map(|(name, parameter)| (name == POLICY_FROZEN).then_some(parameter))
+        .expect("the maintained Transformer exposes the policy-frozen parameter")
+        .value()?;
+    let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1])?;
+    let builds = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+        reuse_config(schedule.clone())?,
+        dropout_config(),
+        &source,
+        |model, graph, inputs, dropout| {
+            builds.set(builds.get() + 1);
+            build_buffered(model, graph, inputs, dropout)
+        },
+    )?;
+    assert_eq!(builds.get(), 1, "the training graph must compile once");
+    let capture_identity = plan.capture_identity();
+    let target =
+        CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut uninterrupted = plan.prepare(&target)?;
+    assert_eq!(
+        uninterrupted.non_finite_policy(),
+        CpuNonFinitePolicy::RejectTransition
+    );
+    assert_eq!(uninterrupted.captured_multi_step_lr(), Some(&schedule));
+    assert!(
+        !uninterrupted
+            .parameter_snapshots()?
+            .contains_key(POLICY_FROZEN)
+    );
+
+    for replay in 1..=4 {
+        let step = uninterrupted.step_batch_scheduled(batch(replay)?)?;
+        assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
+    }
+    assert_eq!(uninterrupted.optimizer_step()?, 1);
+    assert_eq!(uninterrupted.accumulation_index()?, 1);
+    let checkpoint = uninterrupted.checkpoint()?;
+    assert_eq!(checkpoint.info().replay_step(), 4);
+    assert_eq!(checkpoint.info().optimizer_step(), 1);
+    assert_eq!(checkpoint.info().accumulation_index(), 1);
+    assert_eq!(uninterrupted.dropout_block_counter()?, Some(48));
+
+    let restored_plan = plan.restore_checkpoint(&checkpoint)?;
+    assert_eq!(
+        builds.get(),
+        1,
+        "checkpoint restore must not rebuild the graph"
+    );
+    assert_eq!(
+        plan.step_count(),
+        0,
+        "the borrowed source plan stays reusable"
+    );
+    assert_eq!(restored_plan.capture_identity(), capture_identity);
+    assert_eq!(restored_plan.captured_multi_step_lr(), Some(&schedule));
+    assert_eq!(restored_plan.step_count(), 4);
+    let mut resumed = restored_plan.prepare(&target)?;
+    assert_eq!(resumed.captured_multi_step_lr(), Some(&schedule));
+    assert_eq!(
+        resumed.non_finite_policy(),
+        CpuNonFinitePolicy::RejectTransition
+    );
+    assert_eq!(resumed.checkpoint()?, checkpoint);
+
+    let before_wrong_entrypoint = resumed.checkpoint()?;
+    assert!(resumed.step_batch(batch(5)?, 0.05).is_err());
+    assert_eq!(resumed.checkpoint()?, before_wrong_entrypoint);
+    for replay in 5..=6 {
+        let expected = uninterrupted.step_batch_scheduled(batch(replay)?)?;
+        let actual = resumed.step_batch_scheduled(batch(replay)?)?;
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(
+            actual
+                .output("logits")
+                .expect("the reuse capture exposes logits")
+                .shape(),
+            &Shape::new([BATCH, TIME, VOCAB])
+        );
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(actual.step(), expected.step());
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+        assert_eq!(actual.did_update(), expected.did_update());
+        assert_eq!(
+            resumed.parameter_snapshots()?,
+            uninterrupted.parameter_snapshots()?
+        );
+        assert_eq!(
+            resumed.first_moment_snapshots()?,
+            uninterrupted.first_moment_snapshots()?
+        );
+        assert_eq!(
+            resumed.second_moment_snapshots()?,
+            uninterrupted.second_moment_snapshots()?
+        );
+        assert_eq!(
+            resumed.gradient_accumulator_snapshots()?,
+            uninterrupted.gradient_accumulator_snapshots()?
+        );
+        assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
+    }
+    assert_eq!(resumed.optimizer_step()?, 2);
+    assert_eq!(resumed.accumulation_index()?, 0);
+    assert_eq!(resumed.dropout_block_counter()?, Some(72));
+
+    let final_parameters = resumed.parameter_snapshots()?;
+    let destination = BufferedTinyCausalTransformer::new(0xdecafbad)?;
+    let tied_before = destination.transformer.tokens.weight.snapshot()?;
+    let tied_identity = tied_before.identity;
+    assert_ne!(
+        destination.transformer.tokens.weight.value()?,
+        final_parameters["tokens.weight"]
+    );
+    let policy_frozen = destination
+        .trainable_parameters()?
+        .into_iter()
+        .find_map(|(name, parameter)| (name == POLICY_FROZEN).then_some(parameter))
+        .expect("the destination exposes the policy-frozen parameter");
+    assert_ne!(policy_frozen.value()?, source_policy_frozen);
+    policy_frozen.replace(source_policy_frozen)?;
+    let policy_frozen_before = policy_frozen.snapshot()?;
+    let inherent_frozen_before = destination.transformer.frozen_scale.snapshot()?;
+    destination
+        .running_marker
+        .replace(TensorData::scalar(29.0))?;
+    let running_marker_before = destination.running_marker.snapshot()?;
+    let effective_trainables_before = destination
+        .trainable_parameters()?
+        .into_iter()
+        .filter(|(name, _)| name != POLICY_FROZEN)
+        .map(|(name, parameter)| Ok((name, parameter.snapshot()?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let final_checkpoint = resumed.checkpoint()?;
+    assert!(resumed.publish_parameters(&destination)?.is_clean());
+    assert_eq!(resumed.checkpoint()?, final_checkpoint);
+
+    let mut tied_alias = None;
+    destination.visit("", &mut |name, parameter, _| {
+        if name == "lm_head.weight" {
+            tied_alias = Some(parameter.clone());
+        }
+    });
+    let tied_alias = tied_alias.expect("the destination exposes the tied output alias");
+    assert_eq!(tied_alias.id(), tied_identity);
+    assert_eq!(destination.transformer.tokens.weight.id(), tied_identity);
+    assert!(
+        !destination
+            .state_dict()?
+            .tensors()
+            .contains_key("lm_head.weight")
+    );
+    for (name, parameter) in destination.trainable_parameters()? {
+        if name != POLICY_FROZEN {
+            let before = &effective_trainables_before[&name];
+            let after = parameter.snapshot()?;
+            assert_eq!(after.data, final_parameters[&name]);
+            assert_eq!(after.identity, before.identity);
+            assert_eq!(after.trainable, before.trainable);
+            assert_eq!(
+                after.version,
+                before
+                    .version
+                    .checked_add(1)
+                    .expect("successful publication cannot overflow a version")
+            );
+        }
+    }
+    let tied_after = destination.transformer.tokens.weight.snapshot()?;
+    assert_eq!(tied_after.data, final_parameters["tokens.weight"]);
+    assert_eq!(tied_after.identity, tied_before.identity);
+    assert_eq!(tied_after.trainable, tied_before.trainable);
+    assert_eq!(
+        tied_after.version,
+        tied_before
+            .version
+            .checked_add(1)
+            .expect("successful publication cannot overflow the tied weight version")
+    );
+    let tied_alias_after = tied_alias.snapshot()?;
+    assert_eq!(tied_alias_after.data, tied_after.data);
+    assert_eq!(tied_alias_after.identity, tied_after.identity);
+    assert_eq!(tied_alias_after.version, tied_after.version);
+    assert_eq!(tied_alias_after.trainable, tied_after.trainable);
+    let policy_frozen_after = policy_frozen.snapshot()?;
+    assert_eq!(policy_frozen_after.data, policy_frozen_before.data);
+    assert_eq!(policy_frozen_after.version, policy_frozen_before.version);
+    assert_eq!(policy_frozen_after.identity, policy_frozen_before.identity);
+    assert_eq!(
+        policy_frozen_after.trainable,
+        policy_frozen_before.trainable
+    );
+    let inherent_frozen_after = destination.transformer.frozen_scale.snapshot()?;
+    assert_eq!(inherent_frozen_after.data, inherent_frozen_before.data);
+    assert_eq!(
+        inherent_frozen_after.version,
+        inherent_frozen_before.version
+    );
+    assert_eq!(
+        inherent_frozen_after.identity,
+        inherent_frozen_before.identity
+    );
+    assert_eq!(
+        inherent_frozen_after.trainable,
+        inherent_frozen_before.trainable
+    );
+    let running_marker_after = destination.running_marker.snapshot()?;
+    assert_eq!(running_marker_after.data, running_marker_before.data);
+    assert_eq!(running_marker_after.version, running_marker_before.version);
+    assert_eq!(
+        running_marker_after.identity,
+        running_marker_before.identity
+    );
+    assert_eq!(
+        running_marker_after.trainable,
+        running_marker_before.trainable
+    );
+
+    let final_mean_sparse_loss = evaluate_mean_sparse_loss(&destination.transformer)?;
+    assert!(
+        final_mean_sparse_loss < initial_mean_sparse_loss,
+        "compile-once causal Transformer loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
+    );
+    println!(
+        "CPU reuse: capture={capture_identity:016x}, builds={}, checkpoint=(replay=4, optimizer=1, accumulation=1), optimizer_steps={}, eval_mean_sparse_loss={:.6} -> {:.6}, exact_resume=true, published=true",
+        builds.get(),
+        resumed.optimizer_step()?,
+        initial_mean_sparse_loss,
+        final_mean_sparse_loss
+    );
+    Ok(())
+}
+
 fn main() -> std::result::Result<(), Box<dyn Error>> {
     match env::args().nth(1).as_deref().unwrap_or("cpu") {
+        "cpu-reuse" => run_cpu_reuse()?,
         "cpu" => {
             let target = CpuSessionTarget::new();
             run_exact_resume("CPU", |plan| {
@@ -512,7 +804,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         }
         other => {
             return Err(format!(
-                "unknown target {other:?}; expected `cpu`, `native-cpu`, or `metal`"
+                "unknown target {other:?}; expected `cpu-reuse`, `cpu`, `native-cpu`, or `metal`"
             )
             .into());
         }

@@ -94,8 +94,9 @@ or strict Metal only at target preparation. Its portable resume deliberately
 rebuilds the same topology and authenticates it against the checkpoint. Within
 one process, a caller can instead reuse a borrowed `CompiledAdamWPlan` and call
 `restore_checkpoint` without rebuilding its graph, gradients, schedules, or
-captures. The example's Metal form selects the first
-visible device explicitly, verifies strict zero-fallback admission before
+captures. The example's `cpu-reuse` mode demonstrates that path with a captured
+learning-rate policy and guarded CPU transitions. Its Metal form selects the
+first visible device explicitly, verifies strict zero-fallback admission before
 allocation, and keeps the checkpoint bytes portable through the same
 authenticated recompile boundary as CPU.
 
