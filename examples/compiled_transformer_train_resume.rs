@@ -388,6 +388,10 @@ fn masked_batch(replay: u64) -> Result<MaskedTransformerBatch> {
     )
 }
 
+fn loss_mask_weight(mask: &TensorData) -> u64 {
+    mask.to_vec_f64().into_iter().sum::<f64>() as u64
+}
+
 fn evaluate(model: &TinyCausalTransformer) -> Result<TensorData> {
     let mut graph = Graph::new();
     let tokens = graph.input_dtype(TransformerBatch::TOKENS, [BATCH, TIME], DType::I32);
@@ -424,16 +428,21 @@ fn evaluate_mean_masked_sparse_loss(model: &TinyCausalTransformer) -> Result<f64
     let logits = model.forward_eval(&mut graph, tokens)?;
     let loss = masked_sparse_causal_loss(&mut graph, logits, targets, loss_mask)?;
     let parameter_bindings = model.input_bindings(&graph)?;
-    let mut total = 0.0;
+    let mut weighted_loss_sum = 0.0;
+    let mut loss_weight_sum = 0;
     for replay in 1..=ACCUMULATION_STEPS {
+        let batch = masked_batch(replay)?;
+        let loss_weight = loss_mask_weight(&batch.loss_mask);
         let mut bindings = parameter_bindings.clone();
-        bindings.extend(masked_batch(replay)?.into_compiled_inputs()?);
-        total += CpuBackend
+        bindings.extend(batch.into_compiled_inputs()?);
+        let normalized_loss = CpuBackend
             .execute(&graph, loss, &bindings)?
             .scalar_at(0)
             .as_f64();
+        weighted_loss_sum += normalized_loss * loss_weight as f64;
+        loss_weight_sum += loss_weight;
     }
-    Ok(total / ACCUMULATION_STEPS as f64)
+    Ok(weighted_loss_sum / loss_weight_sum as f64)
 }
 
 fn run_exact_resume<R, P>(target_name: &str, mut prepare: P) -> Result<()>
@@ -708,7 +717,10 @@ fn run_cpu_reuse() -> Result<()> {
     );
 
     for replay in 1..=4 {
-        let step = uninterrupted.step_batch_scheduled(masked_batch(replay)?)?;
+        let batch = masked_batch(replay)?;
+        let loss_weight = loss_mask_weight(&batch.loss_mask);
+        let step = uninterrupted.step_batch_scheduled(batch)?;
+        assert_eq!(step.loss_weight(), loss_weight);
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
     }
     assert_eq!(uninterrupted.optimizer_step()?, 1);
@@ -746,9 +758,12 @@ fn run_cpu_reuse() -> Result<()> {
     assert!(resumed.step_batch(masked_batch(5)?, 0.05).is_err());
     assert_eq!(resumed.checkpoint()?, before_wrong_entrypoint);
     for replay in 5..=6 {
+        let loss_weight = loss_mask_weight(&masked_batch(replay)?.loss_mask);
         let expected = uninterrupted.step_batch_scheduled(masked_batch(replay)?)?;
         let actual = resumed.step_batch_scheduled(masked_batch(replay)?)?;
         assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.loss_weight(), expected.loss_weight());
+        assert_eq!(actual.loss_weight(), loss_weight);
         assert_eq!(
             actual
                 .output("logits")

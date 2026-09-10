@@ -124,9 +124,10 @@ constructors. Across distinct valid lengths, including one padded final partial
 row, the CPU-only policy re-sums that mask inside the captured graph, retains a
 checked exact U64 valid-token count, and weights each normalized microbatch
 gradient before the whole-window divide, clipping, and AdamW update. Interpreter
-and strict-native CPU replay reject malformed masks before staging and retain
-zero fallback; Metal fails closed while the default scalar-loss CPU/native/Metal
-workload is unchanged.
+and strict-native CPU results expose that same exact valid-token count as the
+normalized loss aggregation weight. They reject malformed masks before staging
+and retain zero fallback; Metal fails closed while the default scalar-loss
+CPU/native/Metal workload reports weight one and remains otherwise unchanged.
 Evaluation is stateless with respect to replay, optimizer, dropout,
 accumulation, checkpoint, and scoreboard state, including after a `zero_grad`
 bank flip. Compiled

@@ -448,6 +448,10 @@ fn masked_batch(replay: u64) -> MaskedTransformerBatch {
     )
 }
 
+fn loss_mask_weight(mask: &TensorData) -> u64 {
+    mask.to_vec_f64().into_iter().sum::<f64>() as u64
+}
+
 fn invalid_masked_batches() -> Vec<MaskedTransformerBatch> {
     let (tokens, targets) = batch_values(1);
     let mut batches = vec![
@@ -1466,12 +1470,17 @@ struct TransformerGradientProbe {
     boundary: &'static str,
 }
 
+struct NumericalMaskedTransformerEvaluation {
+    loss: f64,
+    gradients: Vec<f64>,
+}
+
 fn numerical_masked_transformer_gradient_lanes(
     model: &TinyCausalTransformer,
     inputs: BTreeMap<String, TensorData>,
     masks: [TensorData; 2],
     probes: &[TransformerGradientProbe],
-) -> Vec<f64> {
+) -> NumericalMaskedTransformerEvaluation {
     const EPSILONS: [f64; 4] = [1e-3, 5e-4, 2.5e-4, 1.25e-4];
 
     let mut graph = Graph::new();
@@ -1503,8 +1512,12 @@ fn numerical_masked_transformer_gradient_lanes(
 
     let mut bindings = model.input_bindings(&graph).unwrap();
     bindings.extend(inputs);
-    let base_relu = CpuBackend.execute(&graph, relu_input, &bindings).unwrap();
-    probes
+    let base = CpuBackend
+        .execute_many(&graph, &[loss, relu_input], &bindings)
+        .unwrap();
+    let independent_loss = base.outputs[0].scalar_at(0).as_f64();
+    let base_relu = &base.outputs[1];
+    let gradients = probes
         .iter()
         .map(|probe| {
             let input_name = &parameter_inputs[probe.parameter];
@@ -1545,18 +1558,18 @@ fn numerical_masked_transformer_gradient_lanes(
                     let minus = CpuBackend
                         .execute_many(&graph, &outputs, &minus_bindings)
                         .unwrap();
-                    if !relu_region_unchanged(&base_relu, &plus.outputs[1])
-                        || !relu_region_unchanged(&base_relu, &minus.outputs[1])
+                    if !relu_region_unchanged(base_relu, &plus.outputs[1])
+                        || !relu_region_unchanged(base_relu, &minus.outputs[1])
                     {
                         return None;
                     }
                     assert_relu_region_unchanged(
-                        &base_relu,
+                        base_relu,
                         &plus.outputs[1],
                         &format!("{context} +"),
                     );
                     assert_relu_region_unchanged(
-                        &base_relu,
+                        base_relu,
                         &minus.outputs[1],
                         &format!("{context} -"),
                     );
@@ -1568,7 +1581,11 @@ fn numerical_masked_transformer_gradient_lanes(
                 })
                 .unwrap_or_else(|| panic!("no bounded central difference preserved {context}"))
         })
-        .collect()
+        .collect();
+    NumericalMaskedTransformerEvaluation {
+        loss: independent_loss,
+        gradients,
+    }
 }
 
 fn evaluate(model: &TinyCausalTransformer) -> TensorData {
@@ -1609,18 +1626,23 @@ fn evaluate_mean_masked_sparse_loss(model: &TinyCausalTransformer) -> f64 {
     let logits = model.forward_eval(&mut graph, tokens).unwrap();
     let loss = masked_sparse_causal_loss(&mut graph, logits, targets, loss_mask).unwrap();
     let parameter_bindings = model.input_bindings(&graph).unwrap();
-    let total = (1..=ACCUMULATION_STEPS)
+    let (weighted_loss_sum, loss_weight_sum) = (1..=ACCUMULATION_STEPS)
         .map(|replay| {
+            let batch = masked_batch(replay);
+            let loss_weight = loss_mask_weight(&batch.loss_mask);
             let mut bindings = parameter_bindings.clone();
-            bindings.extend(masked_batch(replay).into_compiled_inputs().unwrap());
-            CpuBackend
+            bindings.extend(batch.into_compiled_inputs().unwrap());
+            let loss = CpuBackend
                 .execute(&graph, loss, &bindings)
                 .unwrap()
                 .scalar_at(0)
-                .as_f64()
+                .as_f64();
+            (loss * loss_weight as f64, loss_weight)
         })
-        .sum::<f64>();
-    total / ACCUMULATION_STEPS as f64
+        .fold((0.0, 0), |(loss_sum, weight_sum), (loss, weight)| {
+            (loss_sum + loss, weight_sum + weight)
+        });
+    weighted_loss_sum / loss_weight_sum as f64
 }
 
 #[derive(Debug)]
@@ -2406,12 +2428,12 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
     let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
 
     for replay in 1..=ACCUMULATION_STEPS {
+        let batch = masked_batch(replay);
+        let loss_weight = loss_mask_weight(&batch.loss_mask);
         let step = runtime
-            .step(
-                masked_batch(replay).into_compiled_inputs().unwrap(),
-                learning_rate(),
-            )
+            .step(batch.into_compiled_inputs().unwrap(), learning_rate())
             .unwrap();
+        assert_eq!(step.loss_weight(), loss_weight);
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
     }
     assert_eq!(runtime.step_count(), ACCUMULATION_STEPS);
@@ -2461,6 +2483,7 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
         let step = gradient_probe_runtime
             .step(inputs, learning_rate())
             .unwrap();
+        assert_eq!(step.loss_weight(), token_count);
         assert!(!step.did_update());
         masks.push(observed_dropout_masks(step.outputs()));
         token_counts.push(token_count as f32);
@@ -2498,6 +2521,8 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
         Some(72)
     );
 
+    let mut observed_losses = Vec::with_capacity(ACCUMULATION_STEPS as usize);
+    let mut observed_loss_weights = Vec::with_capacity(ACCUMULATION_STEPS as usize);
     for (index, replay) in (ACCUMULATION_STEPS + 1..=2 * ACCUMULATION_STEPS).enumerate() {
         let step = runtime
             .step(
@@ -2506,6 +2531,9 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
             )
             .unwrap();
         assert_eq!(observed_dropout_masks(step.outputs()), masks[index]);
+        assert_eq!(step.loss_weight(), token_counts[index] as u64);
+        observed_losses.push(step.loss().scalar_at(0).as_f64());
+        observed_loss_weights.push(step.loss_weight());
         assert_eq!(step.did_update(), replay == 2 * ACCUMULATION_STEPS);
         let expected_token_count = if step.did_update() {
             0
@@ -2543,8 +2571,31 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
     assert!(
         numerical
             .iter()
-            .all(|gradient| gradient.len() == PROBES.len())
+            .all(|evaluation| evaluation.gradients.len() == PROBES.len())
     );
+    assert_eq!(
+        observed_loss_weights,
+        TOKEN_COUNTS.map(|count| count as u64)
+    );
+    for (observed, independent) in observed_losses
+        .iter()
+        .zip(numerical.iter().map(|evaluation| evaluation.loss))
+    {
+        assert!((observed - independent).abs() <= 1e-6);
+    }
+    let reported_weighted_loss = observed_losses
+        .iter()
+        .zip(&observed_loss_weights)
+        .map(|(loss, weight)| loss * *weight as f64)
+        .sum::<f64>()
+        / observed_loss_weights.iter().sum::<u64>() as f64;
+    let independent_weighted_loss = numerical
+        .iter()
+        .zip(TOKEN_COUNTS)
+        .map(|(evaluation, weight)| evaluation.loss * f64::from(weight))
+        .sum::<f64>()
+        / f64::from(TOKEN_COUNT_TOTAL);
+    assert!((reported_weighted_loss - independent_weighted_loss).abs() <= 1e-6);
 
     let next_parameters = runtime.parameter_snapshots().unwrap();
     let next_first_moments = runtime.first_moment_snapshots().unwrap();
@@ -2561,9 +2612,9 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
         .collect::<BTreeSet<_>>();
     for (probe_index, probe) in PROBES.iter().enumerate() {
         let numerical_lanes = [
-            numerical[0][probe_index] as f32,
-            numerical[1][probe_index] as f32,
-            numerical[2][probe_index] as f32,
+            numerical[0].gradients[probe_index] as f32,
+            numerical[1].gradients[probe_index] as f32,
+            numerical[2].gradients[probe_index] as f32,
         ];
         let numerical_contributions: [f32; 3] =
             std::array::from_fn(|index| numerical_lanes[index] * token_counts[index]);
@@ -3127,11 +3178,14 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
     );
 
     for replay in 7..=9 {
+        let loss_weight = loss_mask_weight(&masked_batch(replay).loss_mask);
         let expected = uninterrupted
             .step_batch_scheduled(masked_batch(replay))
             .unwrap();
         let actual = resumed.step_batch_scheduled(masked_batch(replay)).unwrap();
         assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.loss_weight(), expected.loss_weight());
+        assert_eq!(actual.loss_weight(), loss_weight);
         assert_eq!(actual.outputs(), expected.outputs());
         assert_eq!(actual.step(), expected.step());
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
