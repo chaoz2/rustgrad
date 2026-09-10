@@ -6,6 +6,7 @@ mod mixed;
 pub mod mixed_batch;
 pub mod mixed_capture;
 pub mod mixed_rebinding;
+mod native_replay_workspace;
 mod persistent_inputs;
 mod replay_liveness;
 pub(crate) mod symbolic;

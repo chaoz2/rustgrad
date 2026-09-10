@@ -126,9 +126,20 @@ pub struct JitBuffer {
 impl JitBuffer {
     pub fn from_tensor(data: &crate::TensorData, mutable: bool) -> Self {
         let mut out = Self::zeroed(data.dtype(), data.len(), mutable);
+        out.copy_from_tensor(data)
+            .expect("new JIT buffer exactly matches its tensor");
+        out
+    }
+
+    pub(crate) fn copy_from_tensor(&mut self, data: &crate::TensorData) -> Result<(), JitError> {
+        if self.dtype != data.dtype() || self.elements != data.len() {
+            return Err(JitError::InvalidBuffer(
+                "JIT buffer tensor descriptor mismatch".into(),
+            ));
+        }
         macro_rules! copy {
             ($values:expr) => {
-                for (dst, value) in out
+                for (dst, value) in self
                     .bytes
                     .chunks_exact_mut(data.dtype().itemsize())
                     .zip($values)
@@ -139,17 +150,17 @@ impl JitBuffer {
         }
         match data.storage() {
             crate::Storage::Bool(values) => {
-                for (dst, value) in out.bytes.iter_mut().zip(values) {
+                for (dst, value) in self.bytes.iter_mut().zip(values) {
                     *dst = u8::from(*value);
                 }
             }
             crate::Storage::I8(values) => {
-                for (dst, value) in out.bytes.iter_mut().zip(values) {
+                for (dst, value) in self.bytes.iter_mut().zip(values) {
                     *dst = *value as u8;
                 }
             }
-            crate::Storage::U8(values) => out.bytes.copy_from_slice(values),
-            crate::Storage::Float8(values) => out.bytes.copy_from_slice(values.as_raw()),
+            crate::Storage::U8(values) => self.bytes.copy_from_slice(values),
+            crate::Storage::Float8(values) => self.bytes.copy_from_slice(values.as_raw()),
             crate::Storage::I16(values) => copy!(values),
             crate::Storage::U16(values)
             | crate::Storage::F16(values)
@@ -161,7 +172,81 @@ impl JitBuffer {
             crate::Storage::F32(values) => copy!(values),
             crate::Storage::F64(values) => copy!(values),
         }
-        out
+        Ok(())
+    }
+
+    pub(crate) fn copy_affine_from(
+        &mut self,
+        source: &Self,
+        view: &crate::AffineView,
+    ) -> Result<(), JitError> {
+        view.validate_read()
+            .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+        let source_elements = view
+            .source_shape
+            .numel()
+            .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+        let logical_elements = view
+            .logical_shape
+            .numel()
+            .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+        if source.dtype != self.dtype
+            || source.elements != source_elements
+            || self.elements != logical_elements
+        {
+            return Err(JitError::InvalidBuffer(
+                "JIT affine source descriptor mismatch".into(),
+            ));
+        }
+        let width = self.dtype.itemsize();
+        for logical in 0..logical_elements {
+            let physical = usize::try_from(
+                view.element_offset(logical)
+                    .map_err(|error| JitError::InvalidBuffer(error.to_string()))?,
+            )
+            .map_err(|_| JitError::InvalidBuffer("negative JIT affine offset".into()))?;
+            let source_start = physical
+                .checked_mul(width)
+                .ok_or_else(|| JitError::InvalidBuffer("JIT affine byte overflow".into()))?;
+            let target_start = logical
+                .checked_mul(width)
+                .ok_or_else(|| JitError::InvalidBuffer("JIT affine byte overflow".into()))?;
+            let source_end = source_start
+                .checked_add(width)
+                .ok_or_else(|| JitError::InvalidBuffer("JIT affine byte overflow".into()))?;
+            let target_end = target_start
+                .checked_add(width)
+                .ok_or_else(|| JitError::InvalidBuffer("JIT affine byte overflow".into()))?;
+            let source_bytes = source.bytes.get(source_start..source_end).ok_or_else(|| {
+                JitError::InvalidBuffer("JIT affine source is out of bounds".into())
+            })?;
+            let target_bytes = self
+                .bytes
+                .get_mut(target_start..target_end)
+                .ok_or_else(|| {
+                    JitError::InvalidBuffer("JIT affine target is out of bounds".into())
+                })?;
+            target_bytes.copy_from_slice(source_bytes);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn copy_from_buffer(&mut self, source: &Self) -> Result<(), JitError> {
+        if source.dtype != self.dtype || source.elements != self.elements {
+            return Err(JitError::InvalidBuffer(
+                "JIT buffer copy descriptor mismatch".into(),
+            ));
+        }
+        self.bytes.copy_from_slice(&source.bytes);
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.bytes.fill(0);
+    }
+
+    pub(crate) fn to_tensor(&self, shape: crate::Shape) -> crate::Result<crate::TensorData> {
+        self.clone().into_tensor(shape)
     }
     pub fn into_tensor(self, shape: crate::Shape) -> crate::Result<crate::TensorData> {
         if let Some(format) = self.dtype.float8_format() {
@@ -587,6 +672,64 @@ impl JitKernel {
             })
             .collect::<Vec<_>>();
         self.invoke_transactional(buffers, &mut ptrs, symbols)
+    }
+
+    /// Invokes one prepared kernel against private replay-workspace slots.
+    /// The slots are never externally observable and the caller invalidates
+    /// every produced value on failure, so no per-call output backup is
+    /// necessary. Raw pointers exist only for the duration of `invoke`.
+    pub(crate) fn call_indexed_detached(
+        &self,
+        arena: &mut [JitBuffer],
+        slots: &[usize],
+        quantized: &[&crate::QuantizedTensorData],
+    ) -> Result<(), JitError> {
+        if slots.len() != self.abi.buffers.len()
+            || quantized.len() != self.abi.quantized_buffers.len()
+            || self.abi.symbol_count != 0
+        {
+            return Err(JitError::InvalidBuffer(
+                "detached replay-workspace ABI count mismatch".into(),
+            ));
+        }
+        for (index, (slot, want)) in slots.iter().copied().zip(&self.abi.buffers).enumerate() {
+            if slots[..index].contains(&slot) {
+                return Err(JitError::InvalidBuffer(
+                    "detached replay-workspace slot aliases within one kernel".into(),
+                ));
+            }
+            let buffer = arena.get(slot).ok_or_else(|| {
+                JitError::InvalidBuffer("detached replay-workspace slot is absent".into())
+            })?;
+            if buffer.dtype != want.dtype || buffer.elements != want.elements {
+                return Err(JitError::InvalidBuffer(format!(
+                    "detached replay-workspace buffer {} descriptor mismatch",
+                    want.id
+                )));
+            }
+        }
+        for (value, want) in quantized.iter().zip(&self.abi.quantized_buffers) {
+            value
+                .validate()
+                .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+            if value.descriptor() != &want.desc {
+                return Err(JitError::InvalidBuffer(format!(
+                    "quantized buffer {} descriptor mismatch",
+                    want.id
+                )));
+            }
+        }
+        let mut ptrs = Vec::with_capacity(self.abi.pointer_order.len());
+        for entry in &self.abi.pointer_order {
+            let pointer = match entry {
+                KernelPointerAbi::Dense(index) => arena[slots[*index]].bytes.as_mut_ptr().cast(),
+                KernelPointerAbi::Quantized(index) => {
+                    quantized[*index].bytes().as_ptr().cast_mut().cast()
+                }
+            };
+            ptrs.push(pointer);
+        }
+        self.invoke(&mut ptrs, &[])
     }
 
     /// Native kernels may detect a domain failure after earlier loop iterations
