@@ -40,6 +40,8 @@ const MULTI_HEAD_FEED_FORWARD: usize = 8;
 const TWO_BLOCK_ACCUMULATION_STEPS: u64 = 2;
 const TWO_BLOCK_MAX_GRADIENT_NORM: f32 = 1e-4;
 const ATTENTION_DROPOUT_TRANSITION_GUARD: &str = "attention_dropout_transition_guard";
+const ATTENTION_KEEP_MASK: &str = "attention_keep_mask";
+const ATTENTION_KEEP_MASK_SHAPE: [usize; 4] = [BATCH, 1, TIME, TIME];
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -291,6 +293,26 @@ impl TwoBlockPositionalGpt {
         tokens: NodeId,
         dropout: &mut dyn TrainingDropoutProvider,
     ) -> Result<NodeId> {
+        self.forward_with_optional_attention_mask(graph, tokens, None, dropout)
+    }
+
+    fn forward_with_attention_mask(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        attention_mask: NodeId,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<NodeId> {
+        self.forward_with_optional_attention_mask(graph, tokens, Some(attention_mask), dropout)
+    }
+
+    fn forward_with_optional_attention_mask(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        attention_mask: Option<NodeId>,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<NodeId> {
         let token_hidden = self.tokens.forward(graph, tokens)?;
         let positions = graph.constant(TensorData::from_scalars(
             [BATCH, TIME],
@@ -299,12 +321,22 @@ impl TwoBlockPositionalGpt {
         )?);
         let position_hidden = self.positions.forward(graph, positions)?;
         let hidden = graph.add(token_hidden, position_hidden)?;
-        let hidden = self
-            .first
-            .forward_training_with_dropout(graph, hidden, dropout)?;
-        let hidden = self
-            .second
-            .forward_training_with_dropout(graph, hidden, dropout)?;
+        let hidden = match attention_mask {
+            Some(mask) => self
+                .first
+                .forward_training_with_dropout_and_attention_mask(graph, hidden, mask, dropout)?,
+            None => self
+                .first
+                .forward_training_with_dropout(graph, hidden, dropout)?,
+        };
+        let hidden = match attention_mask {
+            Some(mask) => self
+                .second
+                .forward_training_with_dropout_and_attention_mask(graph, hidden, mask, dropout)?,
+            None => self
+                .second
+                .forward_training_with_dropout(graph, hidden, dropout)?,
+        };
         let hidden = self.norm.forward(graph, hidden)?;
         let tied_weight = self.tokens.weight.bind(graph)?;
         let tied_weight = graph.permute(tied_weight, [1, 0])?;
@@ -436,6 +468,16 @@ fn two_block_attention_dropout_config() -> CompiledAdamWConfig {
         .unwrap()
 }
 
+fn two_block_attention_mask_config() -> CompiledAdamWConfig {
+    two_block_attention_dropout_config()
+        .with_input(ATTENTION_KEEP_MASK, ATTENTION_KEEP_MASK_SHAPE, DType::Bool)
+        .unwrap()
+        .with_input(LOSS_MASK, [BATCH, TIME], DType::F32)
+        .unwrap()
+        .with_token_weighted_gradient_accumulation(LOSS_MASK)
+        .unwrap()
+}
+
 fn sparse_causal_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
     let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
     let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
@@ -456,13 +498,22 @@ fn multi_head_sparse_causal_loss(
     logits: NodeId,
     targets: NodeId,
 ) -> Result<NodeId> {
+    let losses = multi_head_sparse_causal_losses(graph, logits, targets)?;
+    graph.mean_default(losses)
+}
+
+fn multi_head_sparse_causal_losses(
+    graph: &mut Graph,
+    logits: NodeId,
+    targets: NodeId,
+) -> Result<NodeId> {
     let logits = graph.reshape(logits, [TOKEN_COUNT, MULTI_HEAD_VOCAB])?;
     let log_probabilities = graph.log_softmax(logits, 1, None)?;
     let target_indices = graph.reshape(targets, [TOKEN_COUNT, 1])?;
     let selected = graph.gather(log_probabilities, target_indices, 1)?;
     let selected = graph.reshape(selected, [TOKEN_COUNT])?;
     let losses = graph.neg(selected)?;
-    graph.mean_default(losses)
+    graph.reshape(losses, [BATCH, TIME])
 }
 
 fn masked_sparse_causal_loss(
@@ -634,11 +685,48 @@ fn build_two_block_with_attention_dropout(
     inputs: &BTreeMap<String, NodeId>,
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let (logits, outputs) =
+        forward_two_block_with_attention_dropout(model, graph, inputs, None, dropout)?;
+    let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
+    let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
+    Ok((graph.add(loss, guard)?, outputs))
+}
+
+fn build_two_block_with_attention_mask(
+    model: &TwoBlockPositionalGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let (logits, outputs) = forward_two_block_with_attention_dropout(
+        model,
+        graph,
+        inputs,
+        Some(inputs[ATTENTION_KEEP_MASK]),
+        dropout,
+    )?;
+    let losses = multi_head_sparse_causal_losses(graph, logits, inputs["targets"])?;
+    let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
+    Ok((graph.add(losses, guard)?, outputs))
+}
+
+fn forward_two_block_with_attention_dropout(
+    model: &TwoBlockPositionalGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    attention_mask: Option<NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
     let mut observed = ObservedTwoBlockDropout {
         inner: dropout,
         sites: Vec::new(),
     };
-    let logits = model.forward(graph, inputs["tokens"], &mut observed)?;
+    let logits = match attention_mask {
+        Some(mask) => {
+            model.forward_with_attention_mask(graph, inputs["tokens"], mask, &mut observed)?
+        }
+        None => model.forward(graph, inputs["tokens"], &mut observed)?,
+    };
     let expected = [
         TwoBlockDropoutSite::AttentionProbabilities,
         TwoBlockDropoutSite::Residual,
@@ -658,9 +746,6 @@ fn build_two_block_with_attention_dropout(
         };
         assert_eq!(site.shape, expected_shape);
     }
-    let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
-    let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
-    let loss = graph.add(loss, guard)?;
     let mut outputs = BTreeMap::from([("logits".into(), logits)]);
     for (index, site) in observed.sites.into_iter().enumerate() {
         assert!(
@@ -679,7 +764,7 @@ fn build_two_block_with_attention_dropout(
                 .is_none()
         );
     }
-    Ok((loss, outputs))
+    Ok((logits, outputs))
 }
 
 fn build_buffered(
@@ -801,6 +886,168 @@ fn attention_dropout_batch(guard: f32) -> BTreeMap<String, TensorData> {
             .is_none()
     );
     batch
+}
+
+fn attention_keep_mask(replay: u64) -> TensorData {
+    let values = if replay % 2 == 1 {
+        // One right-padded query row, followed by a packed sample whose
+        // second segment cannot attend back into its first token.
+        [
+            true, true, true, true, true, true, false, false, false, true, false, false, false,
+            true, true, false, true, true,
+        ]
+    } else {
+        // An unpadded sample beside a sample with two padded query rows.
+        [
+            true, true, true, true, true, true, true, true, true, true, false, false, false, false,
+            false, false, false, false,
+        ]
+    };
+    TensorData::from_scalars(
+        ATTENTION_KEEP_MASK_SHAPE,
+        DType::Bool,
+        values.into_iter().map(Scalar::Bool),
+    )
+    .unwrap()
+}
+
+fn attention_masked_dropout_batch(replay: u64, guard: f32) -> BTreeMap<String, TensorData> {
+    let mut batch = attention_dropout_batch(guard);
+    assert!(
+        batch
+            .insert(ATTENTION_KEEP_MASK.into(), attention_keep_mask(replay))
+            .is_none()
+    );
+    assert!(
+        batch
+            .insert(LOSS_MASK.into(), attention_loss_mask(replay))
+            .is_none()
+    );
+    batch
+}
+
+fn attention_masked_padded_counterfactual_batch() -> BTreeMap<String, TensorData> {
+    let mut batch = attention_masked_dropout_batch(1, 1.0);
+    assert!(
+        batch
+            .insert("tokens".into(), token_tensor([0, 1, 4, 3, 4, 1]))
+            .is_some()
+    );
+    assert!(
+        batch
+            .insert("targets".into(), token_tensor([1, 3, 0, 2, 0, 4]))
+            .is_some()
+    );
+    batch
+}
+
+fn attention_loss_mask(replay: u64) -> TensorData {
+    let values = if replay % 2 == 1 {
+        // The packed sample remains fully valid; only its connectivity is
+        // segmented by the Bool attention mask.
+        [1.0, 1.0, 0.0, 1.0, 1.0, 1.0]
+    } else {
+        [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+    };
+    TensorData::new([BATCH, TIME], values.to_vec()).unwrap()
+}
+
+fn attention_masked_loss_weight(replay: u64) -> u64 {
+    attention_loss_mask(replay)
+        .to_vec_f64()
+        .into_iter()
+        .sum::<f64>() as u64
+}
+
+fn invalid_attention_masked_dropout_batch() -> BTreeMap<String, TensorData> {
+    let mut batch = attention_masked_dropout_batch(1, 1.0);
+    assert!(
+        batch
+            .insert(
+                ATTENTION_KEEP_MASK.into(),
+                TensorData::from_scalars([], DType::Bool, [Scalar::Bool(true)]).unwrap(),
+            )
+            .is_some()
+    );
+    batch
+}
+
+fn assert_attention_keep_mask_is_observed(
+    outputs: &BTreeMap<String, TensorData>,
+    mask: &TensorData,
+    loss_mask: &TensorData,
+) {
+    assert_eq!(mask.shape(), &Shape::new([BATCH, 1, TIME, TIME]));
+    assert_eq!(mask.dtype(), DType::Bool);
+    assert_eq!(loss_mask.shape(), &Shape::new([BATCH, TIME]));
+    assert_eq!(loss_mask.dtype(), DType::F32);
+    let mask = mask.to_vec_f64();
+    let loss_mask = loss_mask.to_vec_f64();
+    for site in [0, 3] {
+        let probabilities = &outputs[&format!("dropout_{site}_input")];
+        assert_eq!(probabilities.shape(), &Shape::new([BATCH, 2, TIME, TIME]));
+        assert_eq!(probabilities.dtype(), DType::F32);
+        let mut fully_masked_rows = 0;
+        for batch in 0..BATCH {
+            for head in 0..2 {
+                for query in 0..TIME {
+                    let row_is_valid = (0..TIME).any(|key| {
+                        let mask_index = (batch * TIME + query) * TIME + key;
+                        mask[mask_index] != 0.0 && key <= query
+                    });
+                    assert_eq!(row_is_valid, loss_mask[batch * TIME + query] != 0.0);
+                    let mut sum = 0.0;
+                    for key in 0..TIME {
+                        let mask_index = (batch * TIME + query) * TIME + key;
+                        let probability_index = ((batch * 2 + head) * TIME + query) * TIME + key;
+                        let probability = probabilities.scalar_at(probability_index).as_f64();
+                        assert!(probability.is_finite());
+                        sum += probability;
+                        if mask[mask_index] == 0.0 || key > query {
+                            assert_eq!(probability.to_bits(), 0.0f64.to_bits());
+                        }
+                    }
+                    if row_is_valid {
+                        assert!((sum - 1.0).abs() <= 2e-5);
+                    } else {
+                        fully_masked_rows += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            fully_masked_rows > 0,
+            "dropout site {site} must observe a fully masked query row"
+        );
+    }
+}
+
+fn assert_only_padded_logits_change(
+    actual: &TensorData,
+    counterfactual: &TensorData,
+    loss_mask: &TensorData,
+) {
+    assert_eq!(actual.shape(), &Shape::new([BATCH, TIME, MULTI_HEAD_VOCAB]));
+    assert_eq!(actual.dtype(), DType::F32);
+    assert_eq!(counterfactual.shape(), actual.shape());
+    assert_eq!(counterfactual.dtype(), DType::F32);
+    assert_eq!(loss_mask.shape(), &Shape::new([BATCH, TIME]));
+    assert_eq!(loss_mask.dtype(), DType::F32);
+    let loss_mask = loss_mask.to_vec_f64();
+    let mut padded_logit_changed = false;
+    for (token, mask) in loss_mask.iter().enumerate() {
+        for vocabulary in 0..MULTI_HEAD_VOCAB {
+            let coordinate = token * MULTI_HEAD_VOCAB + vocabulary;
+            let actual = actual.scalar_at(coordinate).as_f64() as f32;
+            let counterfactual = counterfactual.scalar_at(coordinate).as_f64() as f32;
+            if *mask == 0.0 {
+                padded_logit_changed |= actual.to_bits() != counterfactual.to_bits();
+            } else {
+                assert_eq!(actual.to_bits(), counterfactual.to_bits());
+            }
+        }
+    }
+    assert!(padded_logit_changed);
 }
 
 struct MaskedTransformerBatch {
@@ -3959,6 +4206,61 @@ fn assert_two_block_frontier_close(
     }
 }
 
+fn assert_two_block_token_count(
+    interpreted: &CpuCompiledAdamW,
+    native: &NativeCpuCompiledAdamW<'_>,
+    expected: u64,
+) {
+    assert_eq!(
+        interpreted
+            .checkpoint()
+            .unwrap()
+            .info()
+            .accumulated_token_count(),
+        Some(expected)
+    );
+    assert_eq!(
+        native
+            .checkpoint()
+            .unwrap()
+            .info()
+            .accumulated_token_count(),
+        Some(expected)
+    );
+}
+
+fn assert_two_block_frontier_exact(left: &CpuCompiledAdamW, right: &CpuCompiledAdamW) {
+    assert_eq!(left.step_count(), right.step_count());
+    assert_eq!(
+        left.optimizer_step().unwrap(),
+        right.optimizer_step().unwrap()
+    );
+    assert_eq!(
+        left.accumulation_index().unwrap(),
+        right.accumulation_index().unwrap()
+    );
+    assert_eq!(
+        left.dropout_block_counter().unwrap(),
+        right.dropout_block_counter().unwrap()
+    );
+    assert_eq!(
+        left.parameter_snapshots().unwrap(),
+        right.parameter_snapshots().unwrap()
+    );
+    assert_eq!(
+        left.first_moment_snapshots().unwrap(),
+        right.first_moment_snapshots().unwrap()
+    );
+    assert_eq!(
+        left.second_moment_snapshots().unwrap(),
+        right.second_moment_snapshots().unwrap()
+    );
+    assert_eq!(
+        left.gradient_accumulator_snapshots().unwrap(),
+        right.gradient_accumulator_snapshots().unwrap()
+    );
+}
+
 #[test]
 fn compiled_two_block_positional_gpt_trains_resumes_and_matches_native_and_numerical() {
     const NUMERICAL_ABSOLUTE_TOLERANCE: f64 = 6e-3;
@@ -4149,7 +4451,7 @@ fn compiled_two_block_positional_gpt_trains_resumes_and_matches_native_and_numer
 }
 
 #[test]
-fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() {
+fn compiled_two_block_attention_masks_are_ordered_atomic_and_resume_exactly() {
     const ATTENTION_DROPOUT: f64 = 0.25;
     const BLOCKS_PER_REPLAY: u64 = 84;
 
@@ -4158,13 +4460,13 @@ fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() 
     assert_eq!(model.first.attention_dropout(), ATTENTION_DROPOUT);
     assert_eq!(model.second.attention_dropout(), ATTENTION_DROPOUT);
     let compile_count = Cell::new(0);
-    let plan = CompiledAdamWPlan::compile_module_with_dropout(
-        two_block_attention_dropout_config(),
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+        two_block_attention_mask_config(),
         dropout_config(),
         &model,
         |model, graph, inputs, dropout| {
             compile_count.set(compile_count.get() + 1);
-            build_two_block_with_attention_dropout(model, graph, inputs, dropout)
+            build_two_block_with_attention_mask(model, graph, inputs, dropout)
         },
     )
     .unwrap();
@@ -4180,19 +4482,51 @@ fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() 
     let mut interpreted = plan.prepare(&cpu_target).unwrap();
     let mut native = plan.prepare(&native_target).unwrap();
     let mut retry_reference = plan.prepare(&cpu_target).unwrap();
+    assert_eq!(
+        plan.token_weighted_gradient_accumulation_mask(),
+        Some(LOSS_MASK)
+    );
     let preparation = native.preparation_report();
     assert!(preparation.main().native_item_count() > 0);
     assert_eq!(preparation.main().fallback_count(), 0);
     assert_eq!(preparation.partial_flush().unwrap().fallback_count(), 0);
     assert_eq!(preparation.zero_grad().unwrap().fallback_count(), 0);
     assert_eq!(compile_count.get(), 1);
-    let input = attention_dropout_batch;
     let learning_rate = || TensorData::scalar(1e-3);
 
     let interpreted_before_failure = interpreted.checkpoint().unwrap();
     let native_before_failure = native.checkpoint().unwrap();
-    assert!(interpreted.step(input(0.0), learning_rate()).is_err());
-    assert!(native.step(input(0.0), learning_rate()).is_err());
+    assert!(
+        interpreted
+            .step(invalid_attention_masked_dropout_batch(), learning_rate())
+            .is_err()
+    );
+    assert!(
+        native
+            .step(invalid_attention_masked_dropout_batch(), learning_rate())
+            .is_err()
+    );
+    assert_eq!(
+        interpreted.checkpoint().unwrap(),
+        interpreted_before_failure
+    );
+    assert_eq!(native.checkpoint().unwrap(), native_before_failure);
+    assert_eq!(interpreted.step_count(), 0);
+    assert_eq!(native.step_count(), 0);
+    assert_eq!(interpreted.dropout_block_counter().unwrap(), Some(0));
+    assert_eq!(native.dropout_block_counter().unwrap(), Some(0));
+    assert_two_block_token_count(&interpreted, &native, 0);
+
+    assert!(
+        interpreted
+            .step(attention_masked_dropout_batch(1, 0.0), learning_rate())
+            .is_err()
+    );
+    assert!(
+        native
+            .step(attention_masked_dropout_batch(1, 0.0), learning_rate())
+            .is_err()
+    );
     assert_eq!(
         interpreted.checkpoint().unwrap(),
         interpreted_before_failure
@@ -4203,12 +4537,37 @@ fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() 
     assert_eq!(interpreted.dropout_block_counter().unwrap(), Some(0));
     assert_eq!(native.dropout_block_counter().unwrap(), Some(0));
 
-    let interpreted_step = interpreted.step(input(1.0), learning_rate()).unwrap();
-    let reference_step = retry_reference.step(input(1.0), learning_rate()).unwrap();
-    let native_step = native.step(input(1.0), learning_rate()).unwrap();
+    let interpreted_step = interpreted
+        .step(attention_masked_dropout_batch(1, 1.0), learning_rate())
+        .unwrap();
+    let reference_step = retry_reference
+        .step(
+            attention_masked_padded_counterfactual_batch(),
+            learning_rate(),
+        )
+        .unwrap();
+    let native_step = native
+        .step(attention_masked_dropout_batch(1, 1.0), learning_rate())
+        .unwrap();
     assert_two_block_step_close(1, &interpreted_step, &native_step);
+    assert_eq!(
+        interpreted_step.loss_weight(),
+        attention_masked_loss_weight(1)
+    );
+    assert_eq!(native_step.loss_weight(), attention_masked_loss_weight(1));
+    assert_eq!(native_step.report().successful_invocation(), 1);
+    assert_attention_keep_mask_is_observed(
+        interpreted_step.outputs(),
+        &attention_keep_mask(1),
+        &attention_loss_mask(1),
+    );
     assert_eq!(interpreted_step.loss(), reference_step.loss());
-    assert_eq!(interpreted_step.outputs(), reference_step.outputs());
+    assert_only_padded_logits_change(
+        &interpreted_step.outputs()["logits"],
+        &reference_step.outputs()["logits"],
+        &attention_loss_mask(1),
+    );
+    assert_two_block_frontier_exact(&interpreted, &retry_reference);
     assert_eq!(
         interpreted.checkpoint().unwrap(),
         retry_reference.checkpoint().unwrap()
@@ -4222,6 +4581,7 @@ fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() 
         native.dropout_block_counter().unwrap(),
         Some(BLOCKS_PER_REPLAY)
     );
+    assert_two_block_token_count(&interpreted, &native, attention_masked_loss_weight(1));
 
     assert_eq!(interpreted.zero_grad().unwrap().discarded_microbatches(), 1);
     assert_eq!(native.zero_grad().unwrap().discarded_microbatches(), 1);
@@ -4237,12 +4597,30 @@ fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() 
         native.dropout_block_counter().unwrap(),
         Some(BLOCKS_PER_REPLAY)
     );
+    assert_two_block_token_count(&interpreted, &native, 0);
     assert_two_block_frontier_close(&interpreted, &native);
 
     for replay in 2..=4 {
-        let interpreted_step = interpreted.step(input(1.0), learning_rate()).unwrap();
-        let native_step = native.step(input(1.0), learning_rate()).unwrap();
+        let interpreted_step = interpreted
+            .step(attention_masked_dropout_batch(replay, 1.0), learning_rate())
+            .unwrap();
+        let native_step = native
+            .step(attention_masked_dropout_batch(replay, 1.0), learning_rate())
+            .unwrap();
         assert_two_block_step_close(replay, &interpreted_step, &native_step);
+        assert_eq!(
+            interpreted_step.loss_weight(),
+            attention_masked_loss_weight(replay)
+        );
+        assert_eq!(
+            native_step.loss_weight(),
+            attention_masked_loss_weight(replay)
+        );
+        assert_attention_keep_mask_is_observed(
+            interpreted_step.outputs(),
+            &attention_keep_mask(replay),
+            &attention_loss_mask(replay),
+        );
         assert_two_block_frontier_close(&interpreted, &native);
         assert_eq!(
             interpreted.dropout_block_counter().unwrap(),
@@ -4252,6 +4630,12 @@ fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() 
             native.dropout_block_counter().unwrap(),
             Some(replay * BLOCKS_PER_REPLAY)
         );
+        let expected_token_count = match replay {
+            2 | 4 => attention_masked_loss_weight(replay),
+            3 => 0,
+            _ => unreachable!(),
+        };
+        assert_two_block_token_count(&interpreted, &native, expected_token_count);
     }
     assert_eq!(interpreted.optimizer_step().unwrap(), 1);
     assert_eq!(interpreted.accumulation_index().unwrap(), 1);
@@ -4259,6 +4643,10 @@ fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() 
     assert_eq!(checkpoint.info().replay_step(), 4);
     assert_eq!(checkpoint.info().optimizer_step(), 1);
     assert_eq!(checkpoint.info().accumulation_index(), 1);
+    assert_eq!(
+        checkpoint.info().accumulated_token_count(),
+        Some(attention_masked_loss_weight(4))
+    );
     assert_eq!(checkpoint.info().discarded_microbatches(), 1);
     assert_eq!(
         checkpoint.info().dropout_block_counter(),
@@ -4270,24 +4658,51 @@ fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() 
     assert_eq!(restored_plan.capture_identity(), plan.capture_identity());
     let mut resumed = restored_plan.prepare(&cpu_target).unwrap();
     assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
-    let uninterrupted_step = interpreted.step(input(1.0), learning_rate()).unwrap();
-    let resumed_step = resumed.step(input(1.0), learning_rate()).unwrap();
+    let uninterrupted_step = interpreted
+        .step(attention_masked_dropout_batch(5, 1.0), learning_rate())
+        .unwrap();
+    let resumed_step = resumed
+        .step(attention_masked_dropout_batch(5, 1.0), learning_rate())
+        .unwrap();
+    assert_eq!(
+        uninterrupted_step.loss_weight(),
+        attention_masked_loss_weight(5)
+    );
+    assert_eq!(resumed_step.loss_weight(), attention_masked_loss_weight(5));
     assert_eq!(resumed_step.loss(), uninterrupted_step.loss());
     assert_eq!(resumed_step.outputs(), uninterrupted_step.outputs());
+    assert_attention_keep_mask_is_observed(
+        resumed_step.outputs(),
+        &attention_keep_mask(5),
+        &attention_loss_mask(5),
+    );
     assert_eq!(
         resumed.checkpoint().unwrap(),
         interpreted.checkpoint().unwrap()
     );
+    assert_two_block_frontier_exact(&resumed, &interpreted);
     assert_eq!(resumed.optimizer_step().unwrap(), 2);
     assert_eq!(resumed.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        resumed
+            .checkpoint()
+            .unwrap()
+            .info()
+            .accumulated_token_count(),
+        Some(0)
+    );
     assert_eq!(
         resumed.dropout_block_counter().unwrap(),
         Some(5 * BLOCKS_PER_REPLAY)
     );
 
-    let native_step = native.step(input(1.0), learning_rate()).unwrap();
+    let native_step = native
+        .step(attention_masked_dropout_batch(5, 1.0), learning_rate())
+        .unwrap();
+    assert_eq!(native_step.loss_weight(), attention_masked_loss_weight(5));
     assert_two_block_step_close(5, &uninterrupted_step, &native_step);
     assert_two_block_frontier_close(&interpreted, &native);
+    assert_two_block_token_count(&interpreted, &native, 0);
     assert_eq!(
         native.dropout_block_counter().unwrap(),
         Some(5 * BLOCKS_PER_REPLAY)
