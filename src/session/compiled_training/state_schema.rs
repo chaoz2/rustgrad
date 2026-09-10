@@ -25,6 +25,7 @@ impl AdamWParameterState {
 pub(super) enum AdamWGlobalState {
     Step,
     AccumulationIndex,
+    AccumulatedTokenCount,
 }
 
 impl AdamWGlobalState {
@@ -32,6 +33,7 @@ impl AdamWGlobalState {
         match self {
             Self::Step => "step",
             Self::AccumulationIndex => "accumulation_index",
+            Self::AccumulatedTokenCount => "accumulated_token_count",
         }
     }
 }
@@ -155,6 +157,7 @@ impl RecurrentStateKey {
         matches!(
             &self.semantic,
             RecurrentStateSemantic::AdamWGlobal(AdamWGlobalState::AccumulationIndex)
+                | RecurrentStateSemantic::AdamWGlobal(AdamWGlobalState::AccumulatedTokenCount)
                 | RecurrentStateSemantic::AdamWParameter {
                     state: AdamWParameterState::GradientAccumulator,
                     ..
@@ -262,6 +265,7 @@ mod tests {
         let mut keys = vec![
             RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
             RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
+            RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedTokenCount),
             RecurrentStateKey::dropout_counter(),
         ];
         for parameter in parameter_names {
@@ -329,6 +333,11 @@ mod tests {
         );
         assert_eq!(
             keys[2].canonical_name(),
+            "global:accumulated_token_count",
+            "global spelling changed"
+        );
+        assert_eq!(
+            keys[3].canonical_name(),
             "workload:dropout_block_counter",
             "workload spelling changed"
         );
@@ -374,6 +383,7 @@ mod tests {
             .unwrap(),
             StateSpec::adamw_global(AdamWGlobalState::Step).unwrap(),
             StateSpec::adamw_global(AdamWGlobalState::AccumulationIndex).unwrap(),
+            StateSpec::adamw_global(AdamWGlobalState::AccumulatedTokenCount).unwrap(),
             StateSpec::dropout_counter().unwrap(),
         ];
         assert!(cases[0].requires_grad);
@@ -394,6 +404,7 @@ mod tests {
                 "slot:weight:gradient_accumulator",
                 "global:step",
                 "global:accumulation_index",
+                "global:accumulated_token_count",
                 "workload:dropout_block_counter",
             ]
         );
@@ -407,6 +418,7 @@ mod tests {
                 "__rustgrad_compiled_training_gradient_accumulator_7",
                 "__rustgrad_compiled_training_adamw_step",
                 "__rustgrad_compiled_training_adamw_accumulation_index",
+                "__rustgrad_compiled_training_adamw_accumulated_token_count",
                 "__rustgrad_compiled_training_dropout_block_counter",
             ]
         );

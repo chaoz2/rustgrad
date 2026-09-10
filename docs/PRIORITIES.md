@@ -117,10 +117,13 @@ beside fixed-capacity I32 tokens and legal dummy targets. Batch conversion
 rejects non-finite or non-binary masks, non-right padding, out-of-vocabulary
 tokens or dummy targets, and an all-padding batch before recurrent mutation.
 The capture computes `sum(mask * sparse_nll) / sum(mask)` across distinct valid
-lengths, including one padded final partial row. Accumulation deliberately
-averages these already-normalized microbatch gradients equally; a recurrent
-valid-token denominator and token-weighted window semantics remain out of
-scope. The shared external-rate CPU/native/Metal workload is unchanged.
+lengths, including one padded final partial row. Its CPU-only opt-in accumulation
+policy re-sums that mask inside the captured graph, retains a checked exact U64
+valid-token count, and weights each normalized microbatch gradient before the
+whole-window divide, clipping, and AdamW update. Interpreter and strict-native
+CPU replay reject malformed masks before staging and retain zero fallback;
+Metal fails closed while the shared external-rate CPU/native/Metal workload is
+unchanged.
 Evaluation is stateless with respect to replay, optimizer, dropout,
 accumulation, checkpoint, and scoreboard state, including after a `zero_grad`
 bank flip. Compiled

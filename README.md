@@ -96,7 +96,8 @@ one process, a caller can instead reuse a borrowed `CompiledAdamWPlan` and call
 `restore_checkpoint` without rebuilding its graph, gradients, schedules, or
 captures. The example's `cpu-reuse` mode demonstrates that path with a captured
 learning-rate policy, guarded CPU transitions, and fixed-capacity right-padded
-batches whose F32 mask excludes padding from causal loss. Its
+batches whose F32 mask excludes padding from causal loss and opt-in
+token-weighted accumulation keeps unequal valid lengths unbiased. Its
 `native-cpu-scoreboard` mode emits bounded versioned JSON for caller-timed
 compile, prepare, and checkpoint phases plus runtime-timed first/steady replay,
 together with authenticated logical work, cache, and recurrent-state facts. CPU

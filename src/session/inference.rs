@@ -1905,7 +1905,7 @@ fn captured_owned_input(
         .cloned()
         .ok_or_else(|| {
             CapturedInferenceError::Binding(format!(
-                "{label} input is absent from captured ownership"
+                "{label} input {name:?} is absent from captured ownership"
             ))
         })
 }

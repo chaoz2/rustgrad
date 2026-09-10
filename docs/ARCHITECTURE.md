@@ -1065,11 +1065,15 @@ binding a new F32 `[B,T]` loss mask on every replay. Its typed batch boundary
 admits only finite binary right-padding masks, legal I32 tokens and dummy
 targets, and at least one valid target before runtime mutation; the graph uses
 `sum(mask * sparse_nll) / sum(mask)`. A padded final partial row therefore
-shares the same program and recurrent frontier as full rows. Accumulation
-continues to average already-normalized microbatch gradients equally rather
-than retaining a token-count denominator. This adds no dynamic shape, recurrent
-state, checkpoint field, Metal policy, or change to the shared external-rate
-capture.
+shares the same fixed program as full rows. An opt-in CPU accumulation policy
+re-sums the F32 mask in that graph, multiplies each normalized gradient by its
+batch count, retains one U64 total, and divides only at full-window commit or
+explicit partial flush before existing clipping and AdamW. The count resets
+with accumulators on commit and `zero_grad`, and checkpoint v6 carries it for
+exact builder-free restore; v1--v5/default captures and bytes remain unchanged.
+Interpreter and strict-native inputs are preflighted as finite, binary, and
+nonempty without moving the batch-owned right-padding rule into the runtime.
+Metal rejects this CPU-first policy before resource planning.
 `CompiledAdamWConfig::with_frozen_parameters` projects a deterministic set of
 exact canonical module names out of that optimizer frontier at compile time.
 Resolution happens by `ParameterId`, so a canonical tied weight and every alias
