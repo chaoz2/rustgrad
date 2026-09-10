@@ -2375,6 +2375,63 @@ fn zero_compiled_adamw<R: CompiledAdamWRuntime>(runtime: &mut R) -> (bool, u64) 
     (result.did_discard(), result.discarded_microbatches())
 }
 
+fn assert_captured_cpu_reset_matches_metal_host_reset<C, M>(
+    program: &CompiledAdamWPlan,
+    cpu: &C,
+    metal: &M,
+) where
+    C: CompiledAdamWRuntime,
+    M: CompiledAdamWRuntime,
+{
+    let cpu_checkpoint = cpu.checkpoint().unwrap();
+    let metal_checkpoint = metal.checkpoint().unwrap();
+    let (cpu_state, cpu_metadata) = crate::load_safetensors(cpu_checkpoint.as_bytes()).unwrap();
+    let (metal_state, metal_metadata) =
+        crate::load_safetensors(metal_checkpoint.as_bytes()).unwrap();
+    assert_eq!(cpu_state, metal_state);
+
+    let portable_progress = |checkpoint: &crate::CompiledAdamWCheckpoint| {
+        let info = checkpoint.info();
+        (
+            info.capture_identity(),
+            info.replay_step(),
+            info.optimizer_step(),
+            info.gradient_accumulation_steps(),
+            info.accumulation_index(),
+            info.discarded_microbatches(),
+            info.flushed_window_count(),
+            info.flushed_microbatch_count(),
+            info.flush_capture_identity(),
+            info.dropout_block_counter(),
+            info.accumulated_token_count(),
+        )
+    };
+    assert_eq!(
+        portable_progress(&cpu_checkpoint),
+        portable_progress(&metal_checkpoint)
+    );
+
+    assert_eq!(cpu_metadata["format"], "rustgrad-compiled-adamw-v7");
+    assert_eq!(cpu_checkpoint.info().reset_transition_count(), 1);
+    assert_eq!(
+        cpu_checkpoint.info().reset_capture_identity(),
+        cpu.zero_grad_capture_identity()
+    );
+    assert!(cpu.zero_grad_capture_identity().is_some());
+    assert_eq!(metal_metadata["format"], "rustgrad-compiled-adamw-v3");
+    assert_eq!(metal_checkpoint.info().reset_transition_count(), 0);
+    assert_eq!(metal_checkpoint.info().reset_capture_identity(), None);
+    assert_eq!(metal.zero_grad_capture_identity(), None);
+    assert_ne!(cpu_checkpoint, metal_checkpoint);
+
+    let restored = program
+        .restore_checkpoint(&metal_checkpoint)
+        .unwrap()
+        .prepare_cpu()
+        .unwrap();
+    assert_eq!(restored.checkpoint().unwrap(), metal_checkpoint);
+}
+
 #[test]
 fn compiled_adamw_runtime_contract_drives_cpu_and_metal_without_parallel_loops() {
     let program = compiled_scalar_adamw_plan();
@@ -3252,7 +3309,7 @@ fn compiled_adamw_zero_grad_is_atomic_device_state_and_preserves_run_numbering()
     let scoreboard = metal.execution_scoreboard_report().unwrap().unwrap();
     assert_eq!(scoreboard.deployment_identity, deployment_identity);
     assert_eq!(scoreboard.successful_run_count, 1);
-    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+    assert_captured_cpu_reset_matches_metal_host_reset(&program, &cpu, &metal);
     let active = metal.metal_session().state_epoch();
     mock.clear_calls();
     assert!(!metal.zero_grad().unwrap().did_discard());
@@ -3278,7 +3335,7 @@ fn compiled_adamw_zero_grad_is_atomic_device_state_and_preserves_run_numbering()
             .successful_run_count,
         3
     );
-    assert_eq!(metal.checkpoint().unwrap(), cpu.checkpoint().unwrap());
+    assert_captured_cpu_reset_matches_metal_host_reset(&program, &cpu, &metal);
 
     let mut failing = compiled_scalar_adamw_plan_with_accumulation(2)
         .metal_plan(MetalRenderer::new(8, capabilities()).unwrap())

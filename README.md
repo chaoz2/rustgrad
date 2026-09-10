@@ -100,11 +100,13 @@ batches whose F32 mask lets the compiler derive the scalar token-mean loss and
 keeps unequal valid lengths unbiased across opt-in accumulation. Its
 `native-cpu-scoreboard` mode emits bounded versioned JSON for caller-timed
 compile, prepare, and checkpoint phases plus runtime-timed first/steady replay,
-together with authenticated logical work, cache, and recurrent-state facts. CPU
-kernel-launch, transfer, and physical peak-memory fields remain `null` because
-this path does not measure them. This is workload evidence, not a speedup or
-performance threshold. Its Metal form selects the first visible device
-explicitly, verifies strict zero-fallback admission before allocation, and
+together with authenticated main, partial-flush, captured-zero-grad, evaluation,
+cache, and recurrent-state facts. Nonempty CPU `zero_grad` uses an authenticated
+compile-once state-only replay, while an empty window remains an exact no-op.
+CPU kernel-launch, transfer, and physical peak-memory fields remain `null`
+because this path does not measure them. This is workload evidence, not a
+speedup or performance threshold. Its Metal form selects the first visible
+device explicitly, verifies strict zero-fallback admission before allocation, and
 keeps the checkpoint bytes portable through the same
 authenticated recompile boundary as CPU.
 

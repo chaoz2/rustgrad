@@ -1732,11 +1732,16 @@ where
     let saved = uninterrupted.checkpoint().unwrap();
     let checkpoint = CompiledAdamWCheckpoint::from_bytes(saved.into_bytes()).unwrap();
     let (_, checkpoint_metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
-    assert_eq!(checkpoint_metadata["format"], "rustgrad-compiled-adamw-v4");
+    assert_eq!(checkpoint_metadata["format"], "rustgrad-compiled-adamw-v7");
     let checkpoint_info = *checkpoint.info();
     assert_eq!(checkpoint_info.capture_identity(), capture_identity);
     assert_eq!(checkpoint_info.replay_step(), 4);
     assert_eq!(checkpoint_info.optimizer_step(), 0);
+    assert_eq!(checkpoint_info.reset_transition_count(), 1);
+    assert_eq!(
+        checkpoint_info.reset_capture_identity(),
+        uninterrupted.zero_grad_capture_identity()
+    );
     assert_eq!(checkpoint_info.gradient_accumulation_steps(), 3);
     assert_eq!(checkpoint_info.accumulation_index(), 2);
     assert_eq!(checkpoint_info.discarded_microbatches(), 2);
@@ -2130,6 +2135,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     assert!(inspection.main().1.schedule_item_count > 0);
     assert!(inspection.main().1.peak_logical_bytes > 0);
     assert!(inspection.partial_flush().is_some());
+    assert!(inspection.zero_grad().is_some());
     assert!(inspection.evaluation().is_none());
     assert!(inspection.recurrent_state_count() > 0);
     assert!(inspection.recurrent_state_bytes() > 0);
@@ -2183,6 +2189,10 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         report.partial_flush().unwrap().capture_identity(),
         inspection.partial_flush().unwrap().0
     );
+    assert_eq!(
+        report.zero_grad().unwrap().capture_identity(),
+        inspection.zero_grad().unwrap().0
+    );
     assert_eq!(report.fallback_count(), 0);
     assert_eq!(
         report.recurrent_state_count() as usize,
@@ -2218,6 +2228,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         restored_inspection.partial_flush(),
         inspection.partial_flush()
     );
+    assert_eq!(restored_inspection.zero_grad(), inspection.zero_grad());
     assert_eq!(
         restored_inspection.recurrent_state_count(),
         inspection.recurrent_state_count()

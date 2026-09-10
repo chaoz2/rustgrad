@@ -14,6 +14,7 @@ pub(super) const ADAMW_CHECKPOINT_FORMAT_V3: &str = "rustgrad-compiled-adamw-v3"
 pub(super) const ADAMW_CHECKPOINT_FORMAT_V4: &str = "rustgrad-compiled-adamw-v4";
 pub(super) const ADAMW_CHECKPOINT_FORMAT_V5: &str = "rustgrad-compiled-adamw-v5";
 pub(super) const ADAMW_CHECKPOINT_FORMAT_V6: &str = "rustgrad-compiled-adamw-v6";
+pub(super) const ADAMW_CHECKPOINT_FORMAT_V7: &str = "rustgrad-compiled-adamw-v7";
 
 /// Deterministic, portable state for one exact compiled AdamW program.
 ///
@@ -27,8 +28,9 @@ pub(super) const ADAMW_CHECKPOINT_FORMAT_V6: &str = "rustgrad-compiled-adamw-v6"
 /// Dropout-bearing v4 adds its recurrent U64 block counter. A v5 checkpoint
 /// records progress consumed by explicit CPU partial-window flushes and
 /// whether that same counter is present. Opt-in token-weighted accumulation
-/// uses v6 for its recurrent valid-token count; legacy v1--v5 bytes remain
-/// accepted unchanged.
+/// uses v6 for its recurrent valid-token count. A v7 checkpoint records
+/// captured zero-grad transition history and its auxiliary capture identity;
+/// legacy v1--v6 bytes remain accepted unchanged.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledAdamWCheckpoint {
     bytes: Vec<u8>,
@@ -61,7 +63,7 @@ impl CompiledAdamWCheckpoint {
 
 /// Validated, read-only progress carried by a compiled AdamW checkpoint.
 ///
-/// Legacy v1--v5 checkpoints expose zero or `None` for progress fields that
+/// Legacy checkpoints expose zero or `None` for progress fields that
 /// predate their wire formats. These values are suitable for selecting the next
 /// workload batch or learning-rate schedule before recompiling the saved
 /// program; executable capture and tensor payloads remain private checkpoint
@@ -79,6 +81,8 @@ pub struct CompiledAdamWCheckpointInfo {
     flush_capture_identity: Option<u64>,
     dropout_block_counter: Option<u64>,
     accumulated_token_count: Option<u64>,
+    reset_transition_count: u64,
+    reset_capture_identity: Option<u64>,
 }
 
 impl CompiledAdamWCheckpointInfo {
@@ -95,6 +99,8 @@ impl CompiledAdamWCheckpointInfo {
             flush_capture_identity: decoded.flush_capture_identity,
             dropout_block_counter: decoded.dropout_block_counter,
             accumulated_token_count: decoded.accumulated_token_count,
+            reset_transition_count: decoded.reset_transition_count,
+            reset_capture_identity: decoded.reset_capture_identity,
         }
     }
 
@@ -152,6 +158,16 @@ impl CompiledAdamWCheckpointInfo {
     pub fn accumulated_token_count(&self) -> Option<u64> {
         self.accumulated_token_count
     }
+
+    /// Number of nonempty windows discarded by the captured reset transition.
+    pub fn reset_transition_count(&self) -> u64 {
+        self.reset_transition_count
+    }
+
+    /// Authenticated state-only reset capture identity when v7 history exists.
+    pub fn reset_capture_identity(&self) -> Option<u64> {
+        self.reset_capture_identity
+    }
 }
 
 pub(super) struct DecodedAdamWCheckpoint {
@@ -166,6 +182,8 @@ pub(super) struct DecodedAdamWCheckpoint {
     pub(super) flush_capture_identity: Option<u64>,
     pub(super) dropout_block_counter: Option<u64>,
     pub(super) accumulated_token_count: Option<u64>,
+    pub(super) reset_transition_count: u64,
+    pub(super) reset_capture_identity: Option<u64>,
     pub(super) parameters: BTreeMap<String, TensorData>,
     pub(super) first_moments: BTreeMap<String, TensorData>,
     pub(super) second_moments: BTreeMap<String, TensorData>,
@@ -185,6 +203,8 @@ pub(super) struct AdamWCheckpointProgress {
     pub(super) flush_capture_identity: Option<u64>,
     pub(super) dropout_block_counter: Option<u64>,
     pub(super) accumulated_token_count: Option<u64>,
+    pub(super) reset_transition_count: u64,
+    pub(super) reset_capture_identity: Option<u64>,
 }
 
 pub(super) struct AdamWCheckpointTensors {
@@ -210,6 +230,8 @@ pub(super) fn encode_adamw_checkpoint(
         flush_capture_identity,
         dropout_block_counter,
         accumulated_token_count,
+        reset_transition_count,
+        reset_capture_identity,
     } = progress;
     let AdamWCheckpointTensors {
         parameters,
@@ -226,6 +248,7 @@ pub(super) fn encode_adamw_checkpoint(
             discarded_microbatches,
             flushed_window_count,
             flushed_microbatch_count,
+            reset_transition_count,
         },
         accumulation_steps,
     )?;
@@ -253,6 +276,17 @@ pub(super) fn encode_adamw_checkpoint(
                 "compiled AdamW token-weighted checkpoint flush identity is absent",
             ));
         }
+    }
+    if reset_transition_count != 0 {
+        if reset_capture_identity.is_none() || reset_transition_count > discarded_microbatches {
+            return Err(training(
+                "compiled AdamW checkpoint reset progress is invalid",
+            ));
+        }
+    } else if reset_capture_identity.is_some() {
+        return Err(training(
+            "compiled AdamW checkpoint has unexpected reset identity",
+        ));
     }
     let names = parameters.keys().cloned().collect::<Vec<_>>();
     let mut tensors = StateDict::default();
@@ -287,7 +321,66 @@ pub(super) fn encode_adamw_checkpoint(
     }
     let parameter_names = serde_json::to_string(&names)
         .map_err(|error| training(format!("checkpoint names: {error}")))?;
-    let metadata = if accumulated_token_count.is_some() {
+    let metadata = if reset_transition_count != 0 {
+        let flush_identity_present = accumulated_token_count.is_some() || flushed_window_count != 0;
+        let authenticated_flush_identity = if flush_identity_present {
+            Some(flush_capture_identity.ok_or_else(|| {
+                training("compiled AdamW reset checkpoint flush identity is absent")
+            })?)
+        } else {
+            None
+        };
+        Metadata::from([
+            ("format".into(), ADAMW_CHECKPOINT_FORMAT_V7.into()),
+            ("capture_identity".into(), capture_identity.to_string()),
+            (
+                "flush_capture_identity".into(),
+                authenticated_flush_identity.unwrap_or(0).to_string(),
+            ),
+            (
+                "flush_capture_identity_present".into(),
+                flush_identity_present.to_string(),
+            ),
+            (
+                "reset_capture_identity".into(),
+                reset_capture_identity
+                    .expect("reset checkpoint identity was validated")
+                    .to_string(),
+            ),
+            ("replay_step".into(), replay_step.to_string()),
+            ("optimizer_step".into(), optimizer_step.to_string()),
+            (
+                "gradient_accumulation_steps".into(),
+                accumulation_steps.to_string(),
+            ),
+            ("accumulation_index".into(), accumulation_index.to_string()),
+            (
+                "discarded_microbatch_count".into(),
+                discarded_microbatches.to_string(),
+            ),
+            (
+                "flushed_window_count".into(),
+                flushed_window_count.to_string(),
+            ),
+            (
+                "flushed_microbatch_count".into(),
+                flushed_microbatch_count.to_string(),
+            ),
+            (
+                "reset_transition_count".into(),
+                reset_transition_count.to_string(),
+            ),
+            (
+                "dropout_state_present".into(),
+                dropout_block_counter.is_some().to_string(),
+            ),
+            (
+                "token_weighted_accumulation_present".into(),
+                accumulated_token_count.is_some().to_string(),
+            ),
+            ("parameter_names".into(), parameter_names),
+        ])
+    } else if accumulated_token_count.is_some() {
         Metadata::from([
             ("format".into(), ADAMW_CHECKPOINT_FORMAT_V6.into()),
             ("capture_identity".into(), capture_identity.to_string()),
@@ -482,6 +575,24 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
             "dropout_state_present",
             "parameter_names",
         ]),
+        ADAMW_CHECKPOINT_FORMAT_V7 => BTreeSet::from([
+            "format",
+            "capture_identity",
+            "flush_capture_identity",
+            "flush_capture_identity_present",
+            "reset_capture_identity",
+            "replay_step",
+            "optimizer_step",
+            "gradient_accumulation_steps",
+            "accumulation_index",
+            "discarded_microbatch_count",
+            "flushed_window_count",
+            "flushed_microbatch_count",
+            "reset_transition_count",
+            "dropout_state_present",
+            "token_weighted_accumulation_present",
+            "parameter_names",
+        ]),
         _ => return Err(training("compiled AdamW checkpoint format mismatch")),
     };
     if metadata.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_metadata {
@@ -499,11 +610,13 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
         flushed_window_count,
         flushed_microbatch_count,
         flush_capture_identity,
+        reset_transition_count,
+        reset_capture_identity,
     ) = if format == ADAMW_CHECKPOINT_FORMAT_V1 {
         let step = metadata["step"]
             .parse::<u64>()
             .map_err(|_| training("compiled AdamW checkpoint step is invalid"))?;
-        (step, step, 1, 0, 0, 0, 0, None)
+        (step, step, 1, 0, 0, 0, 0, None, 0, None)
     } else {
         (
             parse_checkpoint_u64(&metadata, "replay_step")?,
@@ -516,6 +629,7 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
                     | ADAMW_CHECKPOINT_FORMAT_V4
                     | ADAMW_CHECKPOINT_FORMAT_V5
                     | ADAMW_CHECKPOINT_FORMAT_V6
+                    | ADAMW_CHECKPOINT_FORMAT_V7
             ) {
                 parse_checkpoint_u64(&metadata, "discarded_microbatch_count")?
             } else {
@@ -523,7 +637,9 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
             },
             if matches!(
                 format.as_str(),
-                ADAMW_CHECKPOINT_FORMAT_V5 | ADAMW_CHECKPOINT_FORMAT_V6
+                ADAMW_CHECKPOINT_FORMAT_V5
+                    | ADAMW_CHECKPOINT_FORMAT_V6
+                    | ADAMW_CHECKPOINT_FORMAT_V7
             ) {
                 parse_checkpoint_u64(&metadata, "flushed_window_count")?
             } else {
@@ -531,7 +647,9 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
             },
             if matches!(
                 format.as_str(),
-                ADAMW_CHECKPOINT_FORMAT_V5 | ADAMW_CHECKPOINT_FORMAT_V6
+                ADAMW_CHECKPOINT_FORMAT_V5
+                    | ADAMW_CHECKPOINT_FORMAT_V6
+                    | ADAMW_CHECKPOINT_FORMAT_V7
             ) {
                 parse_checkpoint_u64(&metadata, "flushed_microbatch_count")?
             } else {
@@ -542,6 +660,33 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
                 ADAMW_CHECKPOINT_FORMAT_V5 | ADAMW_CHECKPOINT_FORMAT_V6
             ) {
                 Some(parse_checkpoint_u64(&metadata, "flush_capture_identity")?)
+            } else if format == ADAMW_CHECKPOINT_FORMAT_V7 {
+                let present = match metadata["flush_capture_identity_present"].as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(training(
+                            "compiled AdamW checkpoint flush-identity flag is invalid",
+                        ));
+                    }
+                };
+                let identity = parse_checkpoint_u64(&metadata, "flush_capture_identity")?;
+                if !present && identity != 0 {
+                    return Err(training(
+                        "compiled AdamW checkpoint has unexpected flush identity",
+                    ));
+                }
+                present.then_some(identity)
+            } else {
+                None
+            },
+            if format == ADAMW_CHECKPOINT_FORMAT_V7 {
+                parse_checkpoint_u64(&metadata, "reset_transition_count")?
+            } else {
+                0
+            },
+            if format == ADAMW_CHECKPOINT_FORMAT_V7 {
+                Some(parse_checkpoint_u64(&metadata, "reset_capture_identity")?)
             } else {
                 None
             },
@@ -557,6 +702,13 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
             "compiled AdamW v5 checkpoint flushed progress is invalid",
         ));
     }
+    if format == ADAMW_CHECKPOINT_FORMAT_V7
+        && (reset_transition_count == 0 || reset_transition_count > discarded_microbatches)
+    {
+        return Err(training(
+            "compiled AdamW v7 checkpoint reset progress is invalid",
+        ));
+    }
     validate_adamw_progress(
         AdamWProgress {
             replay_step,
@@ -565,6 +717,7 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
             discarded_microbatches,
             flushed_window_count,
             flushed_microbatch_count,
+            reset_transition_count,
         },
         accumulation_steps,
     )?;
@@ -584,7 +737,7 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
     let mut tensors = state;
     let has_dropout = if matches!(
         format.as_str(),
-        ADAMW_CHECKPOINT_FORMAT_V5 | ADAMW_CHECKPOINT_FORMAT_V6
+        ADAMW_CHECKPOINT_FORMAT_V5 | ADAMW_CHECKPOINT_FORMAT_V6 | ADAMW_CHECKPOINT_FORMAT_V7
     ) {
         match metadata["dropout_state_present"].as_str() {
             "true" => true,
@@ -611,7 +764,20 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
     } else {
         None
     };
-    let accumulated_token_count = if format == ADAMW_CHECKPOINT_FORMAT_V6 {
+    let has_accumulated_token_count = if format == ADAMW_CHECKPOINT_FORMAT_V7 {
+        match metadata["token_weighted_accumulation_present"].as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(training(
+                    "compiled AdamW checkpoint token-weighted flag is invalid",
+                ));
+            }
+        }
+    } else {
+        format == ADAMW_CHECKPOINT_FORMAT_V6
+    };
+    let accumulated_token_count = if has_accumulated_token_count {
         let count = tensors
             .remove("accumulated_token_count")
             .ok_or_else(|| training("compiled AdamW accumulated token count is absent"))?;
@@ -634,6 +800,14 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
     } else {
         None
     };
+    if format == ADAMW_CHECKPOINT_FORMAT_V7
+        && (flush_capture_identity.is_some()
+            != (accumulated_token_count.is_some() || flushed_window_count != 0))
+    {
+        return Err(training(
+            "compiled AdamW checkpoint flush identity presence is invalid",
+        ));
+    }
     let mut parameters = BTreeMap::new();
     let mut first_moments = BTreeMap::new();
     let mut second_moments = BTreeMap::new();
@@ -685,6 +859,8 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
         flush_capture_identity,
         dropout_block_counter,
         accumulated_token_count,
+        reset_transition_count,
+        reset_capture_identity,
         parameters,
         first_moments,
         second_moments,

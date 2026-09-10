@@ -946,7 +946,7 @@ and optimizer-state stores. AdamW keeps first and second moments plus its U64
 step counter inside that same captured recurrent frontier.
 `NativeCpuSessionTarget` is a separate strict-native AdamW preparation target,
 not a mode on the interpreter session. It precompiles the main replay and every
-attached partial-flush/evaluation pure program through the existing
+attached partial-flush/zero-grad/evaluation pure program through the existing
 `CapturedReplayExecutor` before returning mutable state, then reuses the same
 mixed staging and single `EffectRuntime` commit with interpreter fallback
 disabled. Its typed preparation/run reports expose only CPU facts: native item
@@ -956,9 +956,9 @@ Unsupported preparation and failed execution or commit publish neither state
 nor progress; checkpoint bytes and capture identity are shared with the
 interpreter and strict-Metal targets.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
-the main and optional flush/evaluation programs plus checked logical recurrent
-state bytes without preparing a target or exposing a capture. The separate
-`NativeTrainingScoreboard` validates those facts against strict-native
+the main and optional flush/zero-grad/evaluation programs plus checked logical
+recurrent state bytes without preparing a target or exposing a capture. The
+separate `NativeTrainingScoreboard` v2 validates those facts against strict-native
 preparation and committed main-replay reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
 sample set into versioned JSON. It reports deterministic
@@ -966,7 +966,8 @@ schedule/native-item/cache inventories and logical temporary/state peaks; CPU
 kernel launches, host/device transfers,
 and measured physical peak host memory remain unavailable (`null`). Durations
 do not change any plan, capture, checkpoint, or native identity, and the report
-makes no threshold or speedup claim.
+makes no threshold or speedup claim. Legacy v1 reports without zero-grad
+inventory remain readable.
 CPU targets may opt into `CpuNonFinitePolicy::RejectTransition`. The historical
 unit `CpuSessionTarget` remains the propagation default and returns a separate
 `ConfiguredCpuSessionTarget` when that policy is selected; strict-native CPU
@@ -1069,8 +1070,15 @@ shares the same fixed program as full rows. An opt-in CPU accumulation policy
 re-sums the F32 mask in that graph, multiplies each normalized gradient by its
 batch count, retains one U64 total, and divides only at full-window commit or
 explicit partial flush before existing clipping and AdamW. The count resets
-with accumulators on commit and `zero_grad`, and checkpoint v6 carries it for
-exact builder-free restore; v1--v5/default captures and bytes remain unchanged.
+with accumulators on commit and `zero_grad`; checkpoint v6 carries it until
+captured reset history selects v7. A nonempty CPU `zero_grad` replays a separately
+authenticated, compile-once recurrent transition containing only gradient
+accumulators, the accumulation index, and the optional token count. Each
+successor selects a typed zero through a state-dependent false predicate, so
+NaN/Inf accumulators clear without `x - x`; empty windows remain exact no-ops.
+Checkpoint v7 authenticates successful reset history and its capture identity,
+allowing restore to reconstruct split state versions exactly while v1--v6
+decoding and historical bytes remain unchanged.
 Interpreter and strict-native inputs are preflighted as finite, binary, and
 nonempty without moving the batch-owned right-padding rule into the runtime.
 Metal rejects this CPU-first policy before resource planning.
