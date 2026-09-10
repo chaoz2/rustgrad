@@ -17,6 +17,18 @@ enum ResidualDropout {
     Ambient([RandomStream; 2]),
 }
 
+struct AttentionKeepMaskPlan {
+    batch: usize,
+    time: usize,
+    score_shape: Shape,
+}
+
+#[derive(Clone, Copy)]
+struct LoweredAttentionKeepMask {
+    safe_mask: NodeId,
+    row_valid: NodeId,
+}
+
 /// Supplies explicit training-time dropout while a static Transformer graph is
 /// being constructed.
 ///
@@ -37,6 +49,14 @@ pub trait TrainingDropoutProvider {
         probability: f64,
     ) -> Result<NodeId> {
         self.dropout(graph, probabilities, probability)
+    }
+}
+
+struct IdentityTrainingDropout;
+
+impl TrainingDropoutProvider for IdentityTrainingDropout {
+    fn dropout(&mut self, _graph: &mut Graph, input: NodeId, _probability: f64) -> Result<NodeId> {
+        Ok(input)
     }
 }
 
@@ -253,6 +273,133 @@ impl<A: ModuleForward> TransformerBlock<A> {
         Ok((shape.dims()[0], shape.dims()[1]))
     }
 
+    fn attention_keep_mask_plan(
+        &self,
+        graph: &Graph,
+        input: NodeId,
+        attention_mask: NodeId,
+    ) -> Result<AttentionKeepMaskPlan> {
+        let (batch, time) = self.geometry(graph, input)?;
+        let extent = |shape: &Shape, dtype: DType| {
+            shape
+                .numel()?
+                .checked_mul(dtype.itemsize())
+                .ok_or_else(|| Error::ShapeOverflow(shape.clone()))
+        };
+        let input_shape = graph.shape(input)?;
+        extent(input_shape, graph.dtype(input)?)?;
+        let mask_shape = graph.shape(attention_mask)?;
+        if graph.dtype(attention_mask)? != DType::Bool {
+            return Err(Error::InvalidAttention {
+                reason: "TransformerBlock attention keep mask must have Bool dtype",
+            });
+        }
+        extent(mask_shape, DType::Bool)?;
+        let score_shape = Shape::new([batch, self.num_heads, time, time]);
+        extent(&score_shape, DType::Bool)?;
+        if mask_shape.broadcast_with(&score_shape).as_ref() != Ok(&score_shape) {
+            return Err(Error::InvalidAttention {
+                reason: "TransformerBlock attention keep mask must broadcast to attention scores",
+            });
+        }
+        let row_shape = Shape::new([batch, self.num_heads, time, 1]);
+        extent(&row_shape, DType::Bool)?;
+        let key_zero_shape = Shape::new([1, 1, 1, time]);
+        extent(&key_zero_shape, DType::Bool)?;
+        if self.is_causal {
+            extent(&Shape::new([time, time]), DType::Bool)?;
+        }
+        Ok(AttentionKeepMaskPlan {
+            batch,
+            time,
+            score_shape,
+        })
+    }
+
+    fn lower_attention_keep_mask(
+        &self,
+        graph: &mut Graph,
+        attention_mask: NodeId,
+        plan: &AttentionKeepMaskPlan,
+    ) -> Result<LoweredAttentionKeepMask> {
+        let mut effective = if graph.shape(attention_mask)? == &plan.score_shape {
+            attention_mask
+        } else {
+            graph.expand(attention_mask, plan.score_shape.clone())?
+        };
+        if self.is_causal {
+            let causal = graph.full_with_dtype([], crate::Scalar::Bool(true), DType::Bool)?;
+            let causal = graph.expand(causal, [plan.time, plan.time])?;
+            let causal = graph.tril_static(causal, 0)?;
+            effective = graph.logical_and(effective, causal)?;
+        }
+        let row_valid = graph.any(effective, Some(vec![-1]), true)?;
+        let key_zero = if plan.time == 0 {
+            graph.zeros_with_dtype([1, 1, 1, 0], DType::Bool)?
+        } else {
+            let first =
+                graph.full_with_dtype([1, 1, 1, 1], crate::Scalar::Bool(true), DType::Bool)?;
+            graph.pad(
+                first,
+                vec![(0, 0), (0, 0), (0, 0), (0, plan.time - 1)],
+                crate::Scalar::Bool(false),
+            )?
+        };
+        let invalid_row = graph.logical_not(row_valid)?;
+        let temporary_key = graph.logical_and(invalid_row, key_zero)?;
+        let safe_mask = graph.logical_or(effective, temporary_key)?;
+        Ok(LoweredAttentionKeepMask {
+            safe_mask,
+            row_valid,
+        })
+    }
+
+    fn attention_heads(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        batch: usize,
+        time: usize,
+    ) -> Result<(NodeId, NodeId, NodeId)> {
+        let heads = |graph: &mut Graph, projection: &TransformerProjection| -> Result<NodeId> {
+            let projected = projection.forward(graph, input)?;
+            let projected =
+                graph.reshape(projected, [batch, time, self.num_heads, self.head_size])?;
+            graph.permute(projected, vec![0, 2, 1, 3])
+        };
+        let query = heads(graph, &self.query)?;
+        let key = heads(graph, &self.key)?;
+        let value = heads(graph, &self.value)?;
+        Ok((query, key, value))
+    }
+
+    fn finish_attention(
+        &self,
+        graph: &mut Graph,
+        attended: NodeId,
+        batch: usize,
+        time: usize,
+    ) -> Result<NodeId> {
+        let attended = graph.permute(attended, vec![0, 2, 1, 3])?;
+        // Flattening heads after the time/head transpose is not one affine
+        // view of the attention result when `time > 1`. Materialize that
+        // source reshape boundary once so the following source-Linear Dot
+        // reads ordinary contiguous `[batch, time, embedding]` storage.
+        let attended = graph.contiguous(attended)?;
+        let attended = graph.reshape(attended, [batch, time, self.embedding_dim])?;
+        self.out.forward(graph, attended)
+    }
+
+    fn zero_invalid_attention_rows(
+        graph: &mut Graph,
+        probabilities: NodeId,
+        row_valid: NodeId,
+    ) -> Result<NodeId> {
+        let dtype = graph.dtype(probabilities)?;
+        let zero = graph.zeros_with_dtype(Shape::new([]), dtype)?;
+        graph.select(row_valid, probabilities, zero)
+    }
+
     fn attention(
         &self,
         graph: &mut Graph,
@@ -327,6 +474,57 @@ impl<A: ModuleForward> TransformerBlock<A> {
         self.out.forward(graph, attended)
     }
 
+    fn attention_with_keep_mask(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: NodeId,
+        plan: &AttentionKeepMaskPlan,
+    ) -> Result<NodeId> {
+        let (query, key, value) = self.attention_heads(graph, input, plan.batch, plan.time)?;
+        let lowered = self.lower_attention_keep_mask(graph, attention_mask, plan)?;
+        let attended = graph.scaled_dot_product_attention_with_dropout(
+            query,
+            key,
+            value,
+            Some(lowered.safe_mask),
+            AttentionOptions::default(),
+            |graph, probabilities, _| {
+                Self::zero_invalid_attention_rows(graph, probabilities, lowered.row_valid)
+            },
+        )?;
+        self.finish_attention(graph, attended, plan.batch, plan.time)
+    }
+
+    fn attention_with_provider_and_keep_mask<P: TrainingDropoutProvider + ?Sized>(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: NodeId,
+        plan: &AttentionKeepMaskPlan,
+        provider: &mut P,
+    ) -> Result<NodeId> {
+        let (query, key, value) = self.attention_heads(graph, input, plan.batch, plan.time)?;
+        let lowered = self.lower_attention_keep_mask(graph, attention_mask, plan)?;
+        let attended = graph.scaled_dot_product_attention_with_dropout(
+            query,
+            key,
+            value,
+            Some(lowered.safe_mask),
+            AttentionOptions {
+                dropout_p: self.attention_dropout,
+                training: true,
+                ..AttentionOptions::default()
+            },
+            |graph, probabilities, probability| {
+                let probabilities =
+                    Self::zero_invalid_attention_rows(graph, probabilities, lowered.row_valid)?;
+                provider.attention_dropout(graph, probabilities, probability)
+            },
+        )?;
+        self.finish_attention(graph, attended, plan.batch, plan.time)
+    }
+
     fn feed_forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
         let hidden = self.ff1.forward(graph, input)?;
         let hidden = self.activation.forward(graph, hidden)?;
@@ -379,10 +577,106 @@ impl<A: ModuleForward> TransformerBlock<A> {
         }
     }
 
+    fn lower_with_attention_mask_and_dropout(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: NodeId,
+        plan: &AttentionKeepMaskPlan,
+        dropout: &mut dyn FnMut(&mut Graph, NodeId, usize) -> Result<NodeId>,
+    ) -> Result<NodeId> {
+        if self.prenorm {
+            let normalized = self.ln1.forward(graph, input)?;
+            let attended =
+                self.attention_with_keep_mask(graph, normalized, attention_mask, plan)?;
+            let attended = dropout(graph, attended, 0)?;
+            let residual = graph.add(input, attended)?;
+            let normalized = self.ln2.forward(graph, residual)?;
+            let feed_forward = self.feed_forward(graph, normalized)?;
+            let feed_forward = dropout(graph, feed_forward, 1)?;
+            graph.add(residual, feed_forward)
+        } else {
+            let attended = self.attention_with_keep_mask(graph, input, attention_mask, plan)?;
+            let attended = dropout(graph, attended, 0)?;
+            let residual = graph.add(input, attended)?;
+            let residual = self.ln1.forward(graph, residual)?;
+            let feed_forward = self.feed_forward(graph, residual)?;
+            let feed_forward = dropout(graph, feed_forward, 1)?;
+            let output = graph.add(residual, feed_forward)?;
+            self.ln2.forward(graph, output)
+        }
+    }
+
     fn lower(&self, graph: &mut Graph, input: NodeId, mode: ResidualDropout) -> Result<NodeId> {
         self.lower_with_dropout(graph, input, &mut |graph, input, branch| {
             self.apply_dropout(graph, input, branch, mode)
         })
+    }
+
+    fn lower_with_attention_mask(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: NodeId,
+        plan: &AttentionKeepMaskPlan,
+        mode: ResidualDropout,
+    ) -> Result<NodeId> {
+        self.lower_with_attention_mask_and_dropout(
+            graph,
+            input,
+            attention_mask,
+            plan,
+            &mut |graph, input, branch| self.apply_dropout(graph, input, branch, mode),
+        )
+    }
+
+    fn lower_with_provider_and_attention_mask<P: TrainingDropoutProvider + ?Sized>(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: NodeId,
+        plan: &AttentionKeepMaskPlan,
+        provider: &mut P,
+    ) -> Result<NodeId> {
+        if self.attention_dropout > 0.0 {
+            if self.prenorm {
+                let normalized = self.ln1.forward(graph, input)?;
+                let attended = self.attention_with_provider_and_keep_mask(
+                    graph,
+                    normalized,
+                    attention_mask,
+                    plan,
+                    provider,
+                )?;
+                let attended = provider.dropout(graph, attended, self.dropout)?;
+                let residual = graph.add(input, attended)?;
+                let normalized = self.ln2.forward(graph, residual)?;
+                let feed_forward = self.feed_forward(graph, normalized)?;
+                let feed_forward = provider.dropout(graph, feed_forward, self.dropout)?;
+                return graph.add(residual, feed_forward);
+            }
+            let attended = self.attention_with_provider_and_keep_mask(
+                graph,
+                input,
+                attention_mask,
+                plan,
+                provider,
+            )?;
+            let attended = provider.dropout(graph, attended, self.dropout)?;
+            let residual = graph.add(input, attended)?;
+            let residual = self.ln1.forward(graph, residual)?;
+            let feed_forward = self.feed_forward(graph, residual)?;
+            let feed_forward = provider.dropout(graph, feed_forward, self.dropout)?;
+            let output = graph.add(residual, feed_forward)?;
+            return self.ln2.forward(graph, output);
+        }
+        self.lower_with_attention_mask_and_dropout(
+            graph,
+            input,
+            attention_mask,
+            plan,
+            &mut |graph, input, _branch| provider.dropout(graph, input, self.dropout),
+        )
     }
 
     /// Lowers the block's two residual-dropout sites through an explicit
@@ -420,6 +714,109 @@ impl<A: ModuleForward> TransformerBlock<A> {
         }
         self.lower_with_dropout(graph, input, &mut |graph, input, _branch| {
             provider.dropout(graph, input, self.dropout)
+        })
+    }
+
+    /// Lowers provider-backed training with a caller-supplied Bool attention
+    /// keep mask broadcastable to `[batch, heads, time, time]`.
+    ///
+    /// `true` permits an attention edge. A causal block intersects the caller
+    /// mask with its lower triangle. A fully masked query row contributes exact
+    /// zero attention probabilities through the value and softmax-gradient
+    /// paths rather than propagating a non-finite softmax. Mask and built-in
+    /// descriptor failures occur before graph publication or user-provider
+    /// calls; errors produced by the user provider retain the existing
+    /// provider-backed prefix semantics.
+    pub fn forward_training_with_dropout_and_attention_mask<P: TrainingDropoutProvider + ?Sized>(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: NodeId,
+        provider: &mut P,
+    ) -> Result<NodeId> {
+        let plan = self.attention_keep_mask_plan(graph, input, attention_mask)?;
+        let mut candidate = graph.clone();
+        let mut rehearsal_provider = IdentityTrainingDropout;
+        self.lower_with_provider_and_attention_mask(
+            &mut candidate,
+            input,
+            attention_mask,
+            &plan,
+            &mut rehearsal_provider,
+        )?;
+        self.lower_with_provider_and_attention_mask(graph, input, attention_mask, &plan, provider)
+    }
+
+    /// Composes the block under an explicit deterministic mode and a
+    /// caller-supplied Bool attention keep mask.
+    pub fn forward_mode_with_attention_mask<'a>(
+        &'a self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: NodeId,
+        mode: Mode,
+    ) -> Result<ModeForwardOutput<'a>> {
+        let plan = self.attention_keep_mask_plan(graph, input, attention_mask)?;
+        let dropout = match mode {
+            Mode::Eval => ResidualDropout::Eval,
+            Mode::Training => ResidualDropout::Seeded(self.dropout_seeds),
+        };
+        let mut candidate = graph.clone();
+        let output =
+            self.lower_with_attention_mask(&mut candidate, input, attention_mask, &plan, dropout)?;
+        *graph = candidate;
+        Ok(ModeForwardOutput {
+            output,
+            pending: PendingModeEffects::empty(),
+        })
+    }
+
+    /// Composes the block under the scoped ambient mode and a caller-supplied
+    /// Bool attention keep mask.
+    pub fn forward_ambient_with_attention_mask<'a>(
+        &'a self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: NodeId,
+    ) -> Result<ModeForwardOutput<'a>> {
+        let plan = self.attention_keep_mask_plan(graph, input, attention_mask)?;
+        validate_dropout_probability(self.dropout)?;
+        let training = TrainingContext::is_training();
+        let output = if training && self.dropout > 0.0 && self.dropout < 1.0 {
+            let shape = graph.shape(input)?.clone();
+            graph.with_implicit_uniform_streams(
+                vec![(shape.clone(), DType::F32), (shape, DType::F32)],
+                0,
+                |candidate, streams| {
+                    self.lower_with_attention_mask(
+                        candidate,
+                        input,
+                        attention_mask,
+                        &plan,
+                        ResidualDropout::Ambient([streams[0], streams[1]]),
+                    )
+                },
+            )?
+        } else {
+            let dropout = if training {
+                ResidualDropout::Seeded(self.dropout_seeds)
+            } else {
+                ResidualDropout::Eval
+            };
+            let mut candidate = graph.clone();
+            let output = self.lower_with_attention_mask(
+                &mut candidate,
+                input,
+                attention_mask,
+                &plan,
+                dropout,
+            )?;
+            *graph = candidate;
+            output
+        };
+        Ok(ModeForwardOutput {
+            output,
+            pending: PendingModeEffects::empty(),
         })
     }
 }
@@ -513,7 +910,7 @@ mod tests {
         ActivationFn, Backend, CapturedReplayExecutor, CapturedReplayOptions, CpuBackend, Error,
         ModuleStateDict, Op, TensorData, nn::CastPolicy,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn data(shape: impl Into<Shape>, values: &[f32]) -> TensorData {
         TensorData::new(shape, values.to_vec()).unwrap()
@@ -872,6 +1269,275 @@ mod tests {
             .forward_mode(&mut explicit_training, training_input, Mode::Training)
             .unwrap();
         assert_eq!(random_streams(&explicit_training).len(), 2);
+    }
+
+    #[test]
+    fn attention_keep_mask_broadcasts_intersects_causal_and_stabilizes_empty_rows() {
+        let block = TransformerBlock::new_static(4, 2, 8, true, 0.0, 31)
+            .unwrap()
+            .with_causal_attention(true);
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3, 4]);
+        let mask = graph.input_dtype("mask", [1, 1, 3, 3], DType::Bool);
+        let plan = block.attention_keep_mask_plan(&graph, input, mask).unwrap();
+        assert_eq!(plan.score_shape, Shape::new([2, 2, 3, 3]));
+        let lowered = block
+            .lower_attention_keep_mask(&mut graph, mask, &plan)
+            .unwrap();
+        let bindings = HashMap::from([(
+            "mask".into(),
+            TensorData::from_scalars(
+                [1, 1, 3, 3],
+                DType::Bool,
+                [true, true, false, true, true, false, false, false, false]
+                    .into_iter()
+                    .map(crate::Scalar::Bool),
+            )
+            .unwrap(),
+        )]);
+        let realized = CpuBackend
+            .execute_many(&graph, &[lowered.safe_mask, lowered.row_valid], &bindings)
+            .unwrap();
+        assert_eq!(realized.outputs[0].shape(), &Shape::new([2, 2, 3, 3]));
+        assert_eq!(realized.outputs[1].shape(), &Shape::new([2, 2, 3, 1]));
+        let safe = realized.outputs[0]
+            .to_vec_f64()
+            .into_iter()
+            .map(|value| value != 0.0)
+            .collect::<Vec<_>>();
+        let expected_safe = [true, false, false, true, true, false, true, false, false];
+        assert_eq!(
+            safe.chunks_exact(expected_safe.len()).collect::<Vec<_>>(),
+            vec![expected_safe.as_slice(); 4]
+        );
+        assert_eq!(
+            realized.outputs[1]
+                .to_vec_f64()
+                .into_iter()
+                .map(|value| value != 0.0)
+                .collect::<Vec<_>>(),
+            [true, true, false].repeat(4)
+        );
+    }
+
+    #[test]
+    fn fully_masked_attention_rows_have_exact_zero_values_and_qkv_gradients() {
+        let block = TransformerBlock::new_static(4, 2, 8, true, 0.0, 37)
+            .unwrap()
+            .with_causal_attention(true);
+        let mut graph = Graph::new();
+        let input = graph.input("input", [1, 3, 4]);
+        let mask = graph.input_dtype("mask", [1, 1, 3, 3], DType::Bool);
+        let query_weight = block.query.weight.bind(&mut graph).unwrap();
+        let key_weight = block.key.weight.bind(&mut graph).unwrap();
+        let value_weight = block.value.weight.bind(&mut graph).unwrap();
+        let plan = block.attention_keep_mask_plan(&graph, input, mask).unwrap();
+        let output = block
+            .attention_with_keep_mask(&mut graph, input, mask, &plan)
+            .unwrap();
+        let loss = graph.sum_all(output).unwrap();
+        let gradients = graph
+            .gradient_default(loss, &[input, query_weight, key_weight, value_weight])
+            .unwrap();
+        let mut bindings = block.input_bindings(&graph).unwrap();
+        bindings.insert(
+            "input".into(),
+            data(
+                [1, 3, 4],
+                &[
+                    1.0, -2.0, 3.0, 0.5, -1.0, 4.0, 2.0, -3.0, 0.5, 1.5, -2.5, 3.5,
+                ],
+            ),
+        );
+        bindings.insert(
+            "mask".into(),
+            TensorData::from_scalars(
+                [1, 1, 3, 3],
+                DType::Bool,
+                std::iter::repeat_n(crate::Scalar::Bool(false), 9),
+            )
+            .unwrap(),
+        );
+        let mut targets = vec![output];
+        targets.extend(gradients);
+        let realized = CpuBackend
+            .execute_many(&graph, &targets, &bindings)
+            .unwrap();
+        for tensor in realized.outputs {
+            assert!(
+                tensor
+                    .to_vec_f64()
+                    .into_iter()
+                    .all(|value| value.is_finite() && value == 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn masked_transformer_entrypoints_preflight_atomically_and_preserve_public_modes() {
+        #[derive(Default)]
+        struct CountingDropout {
+            shapes: Vec<Shape>,
+        }
+
+        impl TrainingDropoutProvider for CountingDropout {
+            fn dropout(
+                &mut self,
+                graph: &mut Graph,
+                input: NodeId,
+                _probability: f64,
+            ) -> Result<NodeId> {
+                self.shapes.push(graph.shape(input)?.clone());
+                Ok(input)
+            }
+        }
+
+        let block = TransformerBlock::new_static(4, 2, 8, true, 0.25, 41)
+            .unwrap()
+            .with_causal_attention(true)
+            .with_attention_dropout(0.25)
+            .unwrap();
+        let mut invalid = Graph::new();
+        let input = invalid.input("input", [1, 3, 4]);
+        let float_mask = invalid.input("float_mask", [1, 1, 3, 3]);
+        let mut provider = CountingDropout::default();
+        let before = invalid.node_count();
+        assert_eq!(
+            block.forward_training_with_dropout_and_attention_mask(
+                &mut invalid,
+                input,
+                float_mask,
+                &mut provider,
+            ),
+            Err(Error::InvalidAttention {
+                reason: "TransformerBlock attention keep mask must have Bool dtype"
+            })
+        );
+        assert_eq!(invalid.node_count(), before);
+        assert!(provider.shapes.is_empty());
+
+        let wrong_shape = invalid.input_dtype("wrong_shape", [2, 2], DType::Bool);
+        let before = invalid.node_count();
+        assert_eq!(
+            block.forward_training_with_dropout_and_attention_mask(
+                &mut invalid,
+                input,
+                wrong_shape,
+                &mut provider,
+            ),
+            Err(Error::InvalidAttention {
+                reason: "TransformerBlock attention keep mask must broadcast to attention scores"
+            })
+        );
+        assert_eq!(invalid.node_count(), before);
+        assert!(provider.shapes.is_empty());
+
+        let overflow_block = TransformerBlock::new_static(4, 2, 8, true, 0.25, 43)
+            .unwrap()
+            .with_attention_dropout(0.25)
+            .unwrap();
+        let mut overflow = Graph::new();
+        // The Bool score extent fits in usize, while the same F32 attention
+        // score descriptor overflows its required byte count.
+        let time = 1usize << (usize::BITS / 2 - 1);
+        let input = overflow.input("input", [1, time, 4]);
+        let mask = overflow.input_dtype("mask", [], DType::Bool);
+        let before = overflow.node_count();
+        let mut provider = CountingDropout::default();
+        assert!(matches!(
+            overflow_block.forward_training_with_dropout_and_attention_mask(
+                &mut overflow,
+                input,
+                mask,
+                &mut provider,
+            ),
+            Err(Error::ShapeOverflow(shape)) if shape == Shape::new([1, 2, time, time])
+        ));
+        assert_eq!(overflow.node_count(), before);
+        assert!(provider.shapes.is_empty());
+
+        let input_value = data(
+            [1, 3, 4],
+            &[
+                1.0, -2.0, 3.0, 0.5, -1.0, 4.0, 2.0, -3.0, 0.5, 1.5, -2.5, 3.5,
+            ],
+        );
+        let mask_value = TensorData::from_scalars(
+            [1, 1, 3, 3],
+            DType::Bool,
+            std::iter::repeat_n(crate::Scalar::Bool(true), 9),
+        )
+        .unwrap();
+        let lower = |ambient: bool| {
+            let mut graph = Graph::new();
+            let input = graph.input("input", [1, 3, 4]);
+            let mask = graph.input_dtype("mask", [1, 1, 3, 3], DType::Bool);
+            let output = if ambient {
+                block
+                    .forward_ambient_with_attention_mask(&mut graph, input, mask)
+                    .unwrap()
+                    .output
+            } else {
+                block
+                    .forward_mode_with_attention_mask(&mut graph, input, mask, Mode::Eval)
+                    .unwrap()
+                    .output
+            };
+            let mut bindings = block.input_bindings(&graph).unwrap();
+            bindings.insert("input".into(), input_value.clone());
+            bindings.insert("mask".into(), mask_value.clone());
+            let expected = CpuBackend.execute(&graph, output, &bindings).unwrap();
+            let schedule = crate::schedule(&graph, output).unwrap();
+            assert_replayable_schedule(&graph, &schedule);
+            let capture = crate::CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+            let replay = CapturedReplayExecutor::default()
+                .replay(
+                    &capture,
+                    &bindings.into_iter().collect::<BTreeMap<_, _>>(),
+                    CapturedReplayOptions::default(),
+                )
+                .unwrap();
+            assert_eq!(replay.outputs, vec![expected.clone()]);
+            expected
+        };
+        let masked_eval = lower(false);
+        assert_eq!(masked_eval, lower(true));
+
+        let mut legacy_graph = Graph::new();
+        let legacy_input = legacy_graph.input("input", [1, 3, 4]);
+        let legacy_output = block
+            .forward_mode(&mut legacy_graph, legacy_input, Mode::Eval)
+            .unwrap()
+            .output;
+        let mut legacy_bindings = block.input_bindings(&legacy_graph).unwrap();
+        legacy_bindings.insert("input".into(), input_value);
+        assert_eq!(
+            masked_eval,
+            CpuBackend
+                .execute(&legacy_graph, legacy_output, &legacy_bindings)
+                .unwrap()
+        );
+
+        let mut graph = Graph::new();
+        let input = graph.input("input", [1, 3, 4]);
+        let mask = graph.input_dtype("mask", [1, 1, 3, 3], DType::Bool);
+        let mut provider = CountingDropout::default();
+        block
+            .forward_training_with_dropout_and_attention_mask(
+                &mut graph,
+                input,
+                mask,
+                &mut provider,
+            )
+            .unwrap();
+        assert_eq!(
+            provider.shapes,
+            vec![
+                Shape::new([1, 2, 3, 3]),
+                Shape::new([1, 3, 4]),
+                Shape::new([1, 3, 4]),
+            ]
+        );
     }
 
     #[test]
