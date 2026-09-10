@@ -3,8 +3,9 @@
 //!
 //! Same-process callers may instead retain one `CompiledAdamWPlan` and call
 //! `restore_checkpoint` without rebuilding its graph or captures. That CPU
-//! path uses fixed-capacity right-padded batches and weights each normalized
-//! microbatch gradient by its valid-token count across an accumulation window.
+//! path uses fixed-capacity right-padded batches; compilation derives the
+//! masked token-mean loss and weights its gradient by each valid-token count
+//! across an accumulation window.
 //!
 //! Run that compile-once, same-process CPU path:
 //!
@@ -200,13 +201,18 @@ fn dropout_config() -> CompiledDropoutConfig {
     CompiledDropoutConfig::new(CompiledDropoutKey([0x1234_5678, 0x9abc_def0]))
 }
 
-fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
+fn sparse_causal_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
     let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
     let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
     let target_indices = graph.reshape(targets, [TOKEN_COUNT, 1])?;
     let selected = graph.gather(log_probabilities, target_indices, 1)?;
     let selected = graph.reshape(selected, [TOKEN_COUNT])?;
     let losses = graph.neg(selected)?;
+    graph.reshape(losses, [BATCH, TIME])
+}
+
+fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
+    let losses = sparse_causal_losses(graph, logits, targets)?;
     graph.mean_default(losses)
 }
 
@@ -216,13 +222,7 @@ fn masked_sparse_causal_loss(
     targets: NodeId,
     loss_mask: NodeId,
 ) -> Result<NodeId> {
-    let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
-    let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
-    let target_indices = graph.reshape(targets, [TOKEN_COUNT, 1])?;
-    let selected = graph.gather(log_probabilities, target_indices, 1)?;
-    let selected = graph.reshape(selected, [TOKEN_COUNT])?;
-    let losses = graph.neg(selected)?;
-    let loss_mask = graph.reshape(loss_mask, [TOKEN_COUNT])?;
+    let losses = sparse_causal_losses(graph, logits, targets)?;
     let weighted = graph.mul(losses, loss_mask)?;
     let numerator = graph.sum_default(weighted)?;
     let denominator = graph.sum_default(loss_mask)?;
@@ -250,13 +250,8 @@ fn build_buffered(
         model
             .transformer
             .forward(graph, inputs[MaskedTransformerBatch::TOKENS], dropout)?;
-    let loss = masked_sparse_causal_loss(
-        graph,
-        logits,
-        inputs[MaskedTransformerBatch::TARGETS],
-        inputs[LOSS_MASK],
-    )?;
-    Ok((loss, BTreeMap::from([("logits".into(), logits)])))
+    let losses = sparse_causal_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
+    Ok((losses, BTreeMap::from([("logits".into(), logits)])))
 }
 
 fn build_evaluation(
@@ -683,7 +678,7 @@ fn run_cpu_reuse() -> Result<()> {
         .value()?;
     let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1])?;
     let builds = Cell::new(0);
-    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
         reuse_config(schedule.clone())?,
         dropout_config(),
         &source,
@@ -922,7 +917,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1])?;
     let builds = Cell::new(0);
     let compile_started = Instant::now();
-    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
         reuse_config(schedule)?,
         dropout_config(),
         &source,

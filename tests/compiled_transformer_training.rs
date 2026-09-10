@@ -188,13 +188,18 @@ fn masked_config() -> CompiledAdamWConfig {
     masked_config_with_max_gradient_norm(Some(MAX_GRADIENT_NORM))
 }
 
-fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
+fn sparse_causal_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
     let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
     let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
     let target_indices = graph.reshape(targets, [TOKEN_COUNT, 1])?;
     let selected = graph.gather(log_probabilities, target_indices, 1)?;
     let selected = graph.reshape(selected, [TOKEN_COUNT])?;
     let losses = graph.neg(selected)?;
+    graph.reshape(losses, [BATCH, TIME])
+}
+
+fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
+    let losses = sparse_causal_losses(graph, logits, targets)?;
     graph.mean_default(losses)
 }
 
@@ -204,13 +209,7 @@ fn masked_sparse_causal_loss(
     targets: NodeId,
     loss_mask: NodeId,
 ) -> Result<NodeId> {
-    let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
-    let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
-    let target_indices = graph.reshape(targets, [TOKEN_COUNT, 1])?;
-    let selected = graph.gather(log_probabilities, target_indices, 1)?;
-    let selected = graph.reshape(selected, [TOKEN_COUNT])?;
-    let losses = graph.neg(selected)?;
-    let loss_mask = graph.reshape(loss_mask, [TOKEN_COUNT])?;
+    let losses = sparse_causal_losses(graph, logits, targets)?;
     let weighted = graph.mul(losses, loss_mask)?;
     let numerator = graph.sum_default(weighted)?;
     let denominator = graph.sum_default(loss_mask)?;
@@ -236,8 +235,8 @@ fn build_buffered(
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
     let (logits, outputs) =
         forward_with_dropout_observations(&model.transformer, graph, inputs["tokens"], dropout)?;
-    let loss = masked_sparse_causal_loss(graph, logits, inputs["targets"], inputs[LOSS_MASK])?;
-    Ok((loss, outputs))
+    let losses = sparse_causal_losses(graph, logits, inputs["targets"])?;
+    Ok((losses, outputs))
 }
 
 fn forward_with_dropout_observations(
@@ -283,8 +282,8 @@ fn build_masked_with_dropout_observations(
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
     let (logits, outputs) =
         forward_with_dropout_observations(model, graph, inputs["tokens"], dropout)?;
-    let loss = masked_sparse_causal_loss(graph, logits, inputs["targets"], inputs[LOSS_MASK])?;
-    Ok((loss, outputs))
+    let losses = sparse_causal_losses(graph, logits, inputs["targets"])?;
+    Ok((losses, outputs))
 }
 
 fn build_evaluation(
@@ -2386,7 +2385,7 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
     let optimizer = masked_config_with_max_gradient_norm(None);
     let model = TinyCausalTransformer::new(7).unwrap();
     let tied_identity = model.tokens.weight.id();
-    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
         optimizer.clone(),
         dropout_config(),
         &model,
@@ -2432,7 +2431,7 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
     // changing the sequential runtime checked below.
     let gradient_probe_model = TinyCausalTransformer::new(7).unwrap();
     let mut gradient_probe_runtime =
-        CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
+        CompiledAdamWPlan::compile_token_mean_module_with_dropout_from_checkpoint(
             optimizer.clone(),
             dropout_config(),
             &gradient_probe_model,
@@ -2888,7 +2887,7 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         .value()
         .unwrap();
     let builds = Cell::new(0);
-    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
         policy,
         dropout_config(),
         &source,

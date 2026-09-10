@@ -850,12 +850,15 @@ impl CompiledAdamWConfig {
         Ok(self)
     }
 
-    /// Weights each normalized microbatch gradient by the number of valid
-    /// tokens in an existing fixed F32 binary mask, then divides by the whole
-    /// window's valid-token count immediately before clipping and AdamW.
+    /// Configures an existing fixed F32 binary mask for compiler-owned token
+    /// mean loss and valid-token-weighted gradient accumulation.
     ///
-    /// This CPU-first opt-in requires accumulation and adds one recurrent U64
-    /// count. Mask padding layout remains a batch-level policy.
+    /// This CPU-first opt-in requires accumulation and compilation through
+    /// [`CompiledAdamWPlan::compile_token_mean_module_with_dropout`]. That
+    /// surface derives the scalar loss from per-token losses, then weights each
+    /// normalized microbatch gradient by its valid count and divides by the
+    /// whole window count immediately before clipping and AdamW. It adds one
+    /// recurrent U64 count; mask padding layout remains a batch-level policy.
     pub fn with_token_weighted_gradient_accumulation(
         mut self,
         mask_input_name: impl Into<String>,
@@ -4814,6 +4817,7 @@ impl CompiledAdamWPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
+        reject_token_weighted_scalar_loss(&config)?;
         let parameters = parameters.into_iter().collect::<Vec<_>>();
         validate_weight_decay_exclusion_names(
             &config,
@@ -4898,6 +4902,7 @@ impl CompiledAdamWPlan {
             &mut dyn TrainingDropoutProvider,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
+        reject_token_weighted_scalar_loss(&config)?;
         let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
         let parameters = parameter_plan.initial_parameters()?;
         Self::compile_module_with_dropout_parameters(
@@ -4907,6 +4912,46 @@ impl CompiledAdamWPlan {
             parameter_plan,
             parameters,
             build,
+        )
+    }
+
+    /// Compiles module-bound AdamW and derives its scalar differentiation root
+    /// from fixed-shape per-token F32 losses and the configured token mask.
+    ///
+    /// The returned loss node must have exactly the mask input's descriptor.
+    /// Capture owns `sum(mask * losses) / sum(mask)` as both the public loss and
+    /// differentiation root, while the existing replay guard rejects an empty
+    /// or malformed mask before recurrent state can advance.
+    pub fn compile_token_mean_module_with_dropout<M, F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: &M,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let (mask_input, mask_shape) = token_mean_loss_descriptor(&config)?;
+        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
+        let parameters = parameter_plan.initial_parameters()?;
+        Self::compile_module_with_dropout_parameters(
+            config,
+            dropout,
+            module,
+            parameter_plan,
+            parameters,
+            |module, graph, inputs, dropout| {
+                let (losses, outputs) = build(module, graph, inputs, dropout)?;
+                let loss =
+                    lower_token_mean_loss(graph, losses, inputs[mask_input.as_str()], &mask_shape)?;
+                Ok((loss, outputs))
+            },
         )
     }
 
@@ -5212,6 +5257,28 @@ impl CompiledAdamWPlan {
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
         Self::compile_module_with_dropout(config, dropout, module, build)?
+            .restore_checkpoint(checkpoint)
+    }
+
+    /// Compatibility constructor for a compiler-owned token-mean loss that
+    /// restores its portable optimizer and Threefry-counter frontier.
+    pub fn compile_token_mean_module_with_dropout_from_checkpoint<M, F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: &M,
+        checkpoint: &CompiledAdamWCheckpoint,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Self::compile_token_mean_module_with_dropout(config, dropout, module, build)?
             .restore_checkpoint(checkpoint)
     }
 
@@ -8192,6 +8259,53 @@ fn validate_token_weighted_accumulation(
     Ok(())
 }
 
+fn reject_token_weighted_scalar_loss(config: &CompiledAdamWConfig) -> Result<()> {
+    if config.token_weight_mask_input.is_some() {
+        return Err(training(
+            "compiled AdamW token-weighted accumulation requires the token-mean-loss compile surface",
+        ));
+    }
+    Ok(())
+}
+
+fn token_mean_loss_descriptor(config: &CompiledAdamWConfig) -> Result<(String, Shape)> {
+    let mask_input = config.token_weight_mask_input.as_ref().ok_or_else(|| {
+        training("compiled AdamW token-mean-loss compilation requires token weighting")
+    })?;
+    let (shape, dtype) = config
+        .inputs
+        .get(mask_input)
+        .ok_or_else(|| training("compiled AdamW token-weight mask must name an existing input"))?;
+    if *dtype != DType::F32 {
+        return Err(training(
+            "compiled AdamW token-weight mask must be nonempty fixed-shape F32",
+        ));
+    }
+    Ok((mask_input.clone(), shape.clone()))
+}
+
+fn lower_token_mean_loss(
+    graph: &mut Graph,
+    losses: NodeId,
+    mask: NodeId,
+    expected_shape: &Shape,
+) -> Result<NodeId> {
+    if graph.dtype(losses)? != DType::F32 || graph.shape(losses)? != expected_shape {
+        return Err(training(
+            "compiled AdamW per-token losses must exactly match the token-weight mask descriptor",
+        ));
+    }
+    if graph.dtype(mask)? != DType::F32 || graph.shape(mask)? != expected_shape {
+        return Err(training(
+            "compiled AdamW token-weight mask descriptor changed during compilation",
+        ));
+    }
+    let weighted = graph.mul(losses, mask)?;
+    let numerator = graph.sum_all(weighted)?;
+    let denominator = graph.sum_all(mask)?;
+    graph.div(numerator, denominator)
+}
+
 fn validate_token_weight_mask(
     inputs: &BTreeMap<String, TensorData>,
     mask_input: Option<&str>,
@@ -10531,16 +10645,138 @@ mod tests {
             .unwrap()
     }
 
-    fn build_token_weighted_loss(
+    struct TokenMeanModule {
+        weight: Parameter,
+    }
+
+    impl TokenMeanModule {
+        fn new() -> Self {
+            Self {
+                weight: Parameter::new(TensorData::scalar(2.0), true),
+            }
+        }
+    }
+
+    impl Module for TokenMeanModule {
+        fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+            assert!(prefix.is_empty());
+            visitor("weight".into(), &self.weight, StateKind::Parameter);
+        }
+    }
+
+    fn token_mean_dropout() -> CompiledDropoutConfig {
+        CompiledDropoutConfig::new(CompiledDropoutKey([47, 53]))
+    }
+
+    fn build_token_losses(
+        module: &TokenMeanModule,
         graph: &mut Graph,
         inputs: &BTreeMap<String, NodeId>,
-        parameters: &BTreeMap<String, NodeId>,
+        dropout: &mut dyn TrainingDropoutProvider,
     ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
-        let losses = graph.mul(parameters["weight"], inputs["features"])?;
-        let weighted = graph.mul(losses, inputs["mask"])?;
-        let numerator = graph.sum_all(weighted)?;
-        let denominator = graph.sum_all(inputs["mask"])?;
-        Ok((graph.div(numerator, denominator)?, BTreeMap::new()))
+        let observation = dropout.dropout(graph, inputs["features"], 0.5)?;
+        let weight = module.weight.bind(graph)?;
+        let losses = graph.mul(weight, inputs["features"])?;
+        Ok((
+            losses,
+            BTreeMap::from([("dropout_observation".into(), observation)]),
+        ))
+    }
+
+    fn compile_token_weighted_plan(steps: u64) -> CompiledAdamWPlan {
+        CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+            token_weighted_config(steps),
+            token_mean_dropout(),
+            &TokenMeanModule::new(),
+            build_token_losses,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn token_mean_loss_surface_owns_normalization_and_rejects_scalar_seams() {
+        let module = TokenMeanModule::new();
+        let config = token_weighted_config(2);
+        let invoked = Cell::new(false);
+        let raw = CompiledAdamWPlan::compile(
+            config.clone(),
+            [TrainingParameterInit::new("weight", TensorData::scalar(0.0)).unwrap()],
+            |_, _, _| {
+                invoked.set(true);
+                Err(training("scalar builder should not run"))
+            },
+        );
+        assert!(raw.is_err());
+        assert!(!invoked.get());
+
+        let module_scalar =
+            CompiledAdamWPlan::compile_module(config.clone(), &module, |_, _, _| {
+                invoked.set(true);
+                Err(training("scalar builder should not run"))
+            });
+        assert!(module_scalar.is_err());
+        assert!(!invoked.get());
+
+        let dropout_scalar = CompiledAdamWPlan::compile_module_with_dropout(
+            config.clone(),
+            token_mean_dropout(),
+            &module,
+            |_, _, _, _| {
+                invoked.set(true);
+                Err(training("scalar builder should not run"))
+            },
+        );
+        assert!(dropout_scalar.is_err());
+        assert!(!invoked.get());
+
+        let without_policy = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+            CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+                .unwrap()
+                .with_gradient_accumulation(2)
+                .unwrap()
+                .with_input("features", [3], DType::F32)
+                .unwrap()
+                .with_input("mask", [3], DType::F32)
+                .unwrap(),
+            token_mean_dropout(),
+            &module,
+            |_, _, _, _| {
+                invoked.set(true);
+                Err(training("token-loss builder should not run"))
+            },
+        );
+        assert!(without_policy.is_err());
+        assert!(!invoked.get());
+
+        for wrong_dtype in [false, true] {
+            let invalid = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+                config.clone(),
+                token_mean_dropout(),
+                &module,
+                |module, graph, inputs, dropout| {
+                    let _ = dropout.dropout(graph, inputs["features"], 0.5)?;
+                    let weight = module.weight.bind(graph)?;
+                    let losses = graph.mul(weight, inputs["features"])?;
+                    let losses = if wrong_dtype {
+                        graph.cast(losses, DType::I32)?
+                    } else {
+                        graph.sum_all(losses)?
+                    };
+                    Ok((losses, BTreeMap::new()))
+                },
+            );
+            assert!(invalid.is_err());
+        }
+
+        let plan = compile_token_weighted_plan(2);
+        let mut runtime = plan.prepare_cpu().unwrap();
+        let first = runtime
+            .step(
+                token_weighted_batch([1.0, 100.0, 1.0], [1.0, 0.0, 1.0]),
+                TensorData::scalar(0.1),
+            )
+            .unwrap();
+        assert_eq!(first.loss().scalar_at(0).as_f64(), 2.0);
     }
 
     fn token_weighted_batch(features: [f32; 3], mask: [f32; 3]) -> BTreeMap<String, TensorData> {
@@ -10555,12 +10791,7 @@ mod tests {
 
     #[test]
     fn token_weighted_accumulation_is_atomic_native_consistent_and_checkpointed() {
-        let plan = CompiledAdamWPlan::compile(
-            token_weighted_config(2),
-            [TrainingParameterInit::new("weight", TensorData::scalar(0.0)).unwrap()],
-            build_token_weighted_loss,
-        )
-        .unwrap();
+        let plan = compile_token_weighted_plan(2);
         assert_eq!(
             plan.token_weighted_gradient_accumulation_mask(),
             Some("mask")
@@ -10681,23 +10912,12 @@ mod tests {
 
     #[test]
     fn token_weighted_partial_flush_and_zero_grad_reset_the_count() {
-        let parameter = || [TrainingParameterInit::new("weight", TensorData::scalar(0.0)).unwrap()];
-        let flush_plan = CompiledAdamWPlan::compile(
-            token_weighted_config(3),
-            parameter(),
-            build_token_weighted_loss,
-        )
-        .unwrap();
+        let flush_plan = compile_token_weighted_plan(3);
         let mut flushed = flush_plan.prepare_cpu().unwrap();
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor);
         let mut native_flushed = target.prepare(&flush_plan).unwrap();
-        let mut complete = CpuCompiledAdamW::compile(
-            token_weighted_config(2),
-            parameter(),
-            build_token_weighted_loss,
-        )
-        .unwrap();
+        let mut complete = compile_token_weighted_plan(2).prepare_cpu().unwrap();
         let batches = [
             token_weighted_batch([1.0, 1.0, 100.0], [1.0, 1.0, 0.0]),
             token_weighted_batch([3.0, 100.0, 100.0], [1.0, 0.0, 0.0]),
