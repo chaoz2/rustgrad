@@ -719,6 +719,29 @@ mod tests {
     }
 
     #[test]
+    fn positive_derived_rate_round_trips_exactly_and_rejects_tampering() {
+        let mut report = zero_report();
+        let elapsed = BenchmarkDuration::from_duration(Duration::from_nanos(63));
+        report.steady_replay_total_wall_time = elapsed;
+        report.steady_replay_wall_time.min = elapsed;
+        report.steady_replay_wall_time.nearest_rank_p50 = elapsed;
+        report.steady_replay_wall_time.nearest_rank_p95 = elapsed;
+        report.steady_replay_wall_time.max = elapsed;
+        report.steady_microbatches_per_second = rate_from_total(1, elapsed).unwrap();
+
+        let bytes = report.to_json_bytes().unwrap();
+        assert_eq!(
+            NativeTrainingReport::from_json_bytes(&bytes).unwrap(),
+            report
+        );
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["steady_microbatches_per_second"] = serde_json::json!(1.0);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+    }
+
+    #[test]
     fn report_rejects_infeasible_steady_totals() {
         let mut report = zero_report();
         let positive = BenchmarkDuration::from_duration(Duration::from_nanos(10));
