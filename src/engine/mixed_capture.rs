@@ -116,23 +116,20 @@ struct StagedMixedReplay {
 }
 
 /// Execution context for a strict-native replay of a captured pure prefix.
-/// Keeping the executor and vectorization policy together prevents replay
-/// entry points from growing parallel backend-configuration arguments.
+/// The prepared program owns kernels and immutable schema only; replay-local
+/// tensor bytes remain owned by the caller and recurrent runtime.
 #[derive(Clone, Copy)]
 pub(crate) struct NativeReplayContext<'a> {
     executor: &'a super::captured_replay::CapturedReplayExecutor,
-    vectorized: bool,
+    prepared: &'a PreparedRecurrentNativeReplay,
 }
 
 impl<'a> NativeReplayContext<'a> {
     pub(crate) const fn new(
         executor: &'a super::captured_replay::CapturedReplayExecutor,
-        vectorized: bool,
+        prepared: &'a PreparedRecurrentNativeReplay,
     ) -> Self {
-        Self {
-            executor,
-            vectorized,
-        }
+        Self { executor, prepared }
     }
 }
 
@@ -155,6 +152,42 @@ pub(crate) struct NativeMixedPreparationTrace {
     pub(crate) item_count: usize,
     pub(crate) cache_hit_count: usize,
     pub(crate) cache_miss_count: usize,
+}
+
+/// Reusable strict-native ownership for one recurrent mixed capture. It keeps
+/// prepared kernels and authenticated immutable schema, never bindings,
+/// runtime leases, cursor state, or tensor bytes from preparation.
+pub(crate) struct PreparedRecurrentNativeReplay {
+    trace: NativeMixedPreparationTrace,
+    plan: super::captured_replay::PlannedNativeItems,
+}
+
+impl PreparedRecurrentNativeReplay {
+    pub(crate) fn preparation_trace(&self) -> &NativeMixedPreparationTrace {
+        &self.trace
+    }
+
+    fn validate_capture(
+        &self,
+        capture: &CapturedMixedSchedule,
+    ) -> Result<NativeMixedReplayTrace, ReplayError> {
+        let replay = capture.native_replay_trace(self.plan.vectorized())?;
+        if replay != self.trace.replay {
+            return Err(ReplayError::Corrupt(
+                "prepared recurrent native capture identity mismatch".into(),
+            ));
+        }
+        if self.trace.item_count != self.plan.item_count()
+            || self.trace.cache_hit_count != self.plan.cache_hit_count()
+            || self.trace.cache_miss_count != self.plan.cache_miss_count()
+            || self.trace.replay.pure_item_cache_keys.as_slice() != self.plan.schedule_cache_keys()
+        {
+            return Err(ReplayError::Corrupt(
+                "prepared recurrent native plan inventory mismatch".into(),
+            ));
+        }
+        Ok(replay)
+    }
 }
 
 /// Validated, detached input binding for one mixed capture. It has no runtime
@@ -513,7 +546,7 @@ impl CapturedMixedSchedule {
         provided: &BTreeMap<String, crate::TensorData>,
         executor: &super::captured_replay::CapturedReplayExecutor,
         vectorized: bool,
-    ) -> Result<NativeMixedPreparationTrace, ReplayError> {
+    ) -> Result<PreparedRecurrentNativeReplay, ReplayError> {
         validate(self, true)?;
         validate_recurrent_cursor(self, cursor)?;
         let starts = recurrent_rebase_starts(self, cursor)?;
@@ -528,11 +561,15 @@ impl CapturedMixedSchedule {
         }
         let planned = BoundMixedCapture::bind(self, &candidates, starts, provided)?
             .plan_native(executor, vectorized)?;
-        Ok(NativeMixedPreparationTrace {
+        let trace = NativeMixedPreparationTrace {
             replay: self.native_replay_trace(vectorized)?,
             item_count: planned.item_count(),
             cache_hit_count: planned.cache_hit_count(),
             cache_miss_count: planned.cache_miss_count(),
+        };
+        Ok(PreparedRecurrentNativeReplay {
+            trace,
+            plan: planned.plan,
         })
     }
 
@@ -574,7 +611,7 @@ impl CapturedMixedSchedule {
         validate(self, true)?;
         validate_recurrent_cursor(self, cursor)?;
         let native_trace = native
-            .map(|native| self.native_replay_trace(native.vectorized))
+            .map(|native| native.prepared.validate_capture(self))
             .transpose()?;
 
         let starts = recurrent_rebase_starts(self, cursor)?;
@@ -711,11 +748,10 @@ impl CapturedMixedSchedule {
             |reason| ReplayError::Descriptor(reason.into()),
         )?;
         let values = match native {
-            Some(native) => super::captured_replay::replay_native_items(
+            Some(native) => native.executor.execute_planned_native_items(
                 &pure,
                 &inputs,
-                native.executor,
-                native.vectorized,
+                &native.prepared.plan,
             )?,
             None => super::captured_replay::replay_interpreter_items(&pure, &inputs)?,
         };

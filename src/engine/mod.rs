@@ -19,6 +19,7 @@ use crate::{
     Backend, BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc,
     MemoryPlan, NodeId, Op, Schedule, Shape, TensorData,
 };
+pub(crate) use captured_replay::PlannedNativeItems;
 pub use captured_replay::{
     CapturedBackendPolicy, CapturedBatch, CapturedBatchResult, CapturedInvocation,
     CapturedItemTrace, CapturedReplayExecutor, CapturedReplayOptions, CapturedReplayResult,
