@@ -3012,9 +3012,10 @@ impl<M, E: std::error::Error + 'static> std::error::Error
 /// Finalization failure retaining the intact owned module/session pair.
 ///
 /// This covers both parameter-only [`CompiledModuleAdamWSession::finish`] and
-/// checkpointed [`CompiledModuleAdamWSession::finish_with_checkpoint`]
-/// finalization. The retained session remains available for inspection, retry,
-/// or recovery without publication.
+/// checkpointed [`CompiledModuleAdamWSession::finish_with_checkpoint`] and
+/// [`CompiledModuleAdamWSession::finish_with_module_checkpoint`] finalization.
+/// The retained session remains available for inspection, retry, or recovery
+/// without publication.
 pub struct CompiledModuleAdamWFinishError<M, R> {
     session: Box<CompiledModuleAdamWSession<M, R>>,
     source: Error,
@@ -6896,6 +6897,63 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
         let Self { module, .. } = self;
         Ok((module, checkpoint))
     }
+
+    /// Atomically publishes and returns one complete module checkpoint built
+    /// from the exact AdamW snapshot used for publication.
+    ///
+    /// The checkpoint retains canonical module topology, ties, frozen
+    /// parameters, and buffers in addition to the optimizer frontier. The
+    /// runtime is checkpointed exactly once; encoding and publication both use
+    /// that same snapshot. A seal, checkpoint, encoding, decode, or publication
+    /// failure retains the intact session in [`CompiledModuleAdamWFinishError`]
+    /// for inspection or retry.
+    pub fn finish_with_module_checkpoint(
+        self,
+    ) -> std::result::Result<(M, CompiledModuleAdamWCheckpoint), CompiledModuleAdamWFinishError<M, R>>
+    {
+        if let Err(source) = self.seal.validate_unchanged(&self.module) {
+            return Err(CompiledModuleAdamWFinishError {
+                session: Box::new(self),
+                source,
+            });
+        }
+        let optimizer = match self.runtime.checkpoint() {
+            Ok(checkpoint) => checkpoint,
+            Err(source) => {
+                return Err(CompiledModuleAdamWFinishError {
+                    session: Box::new(self),
+                    source,
+                });
+            }
+        };
+        let (states, visits) = self.seal.checkpoint_inventory();
+        let checkpoint = match encode_module_adamw_checkpoint(&optimizer, &states, &visits) {
+            Ok(checkpoint) => checkpoint,
+            Err(source) => {
+                return Err(CompiledModuleAdamWFinishError {
+                    session: Box::new(self),
+                    source,
+                });
+            }
+        };
+        let parameters = match decode_adamw_checkpoint(optimizer.as_bytes()) {
+            Ok(decoded) => decoded.parameters,
+            Err(source) => {
+                return Err(CompiledModuleAdamWFinishError {
+                    session: Box::new(self),
+                    source,
+                });
+            }
+        };
+        if let Err(source) = self.seal.publish(&self.module, &parameters) {
+            return Err(CompiledModuleAdamWFinishError {
+                session: Box::new(self),
+                source,
+            });
+        }
+        let Self { module, .. } = self;
+        Ok((module, checkpoint))
+    }
 }
 
 impl<M> CompiledModuleAdamWSession<M, CpuCompiledAdamW> {
@@ -9738,7 +9796,7 @@ fn training(reason: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, LossOptions, Op, Parameter, cross_entropy};
-    use std::{cell::Cell, collections::HashMap};
+    use std::{cell::Cell, collections::HashMap, rc::Rc};
 
     #[test]
     fn compiled_state_aliases_receive_explicit_capture_owners() {
@@ -9867,6 +9925,91 @@ mod tests {
         weight: Parameter,
         finish_visits: Cell<u64>,
         race_after_second_visit: Cell<bool>,
+    }
+
+    struct CheckpointCountingRuntime {
+        inner: CpuCompiledAdamW,
+        checkpoint_calls: Rc<Cell<u64>>,
+    }
+
+    impl CompiledTrainingRuntime for CheckpointCountingRuntime {
+        type Step = CompiledAdamWStepResult;
+
+        fn step(
+            &mut self,
+            inputs: BTreeMap<String, TensorData>,
+            learning_rate: TensorData,
+        ) -> Result<Self::Step> {
+            self.inner.step(inputs, learning_rate)
+        }
+
+        fn step_count(&self) -> u64 {
+            self.inner.step_count()
+        }
+
+        fn capture_identity(&self) -> u64 {
+            self.inner.capture_identity()
+        }
+
+        fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+            self.inner.parameter_snapshots()
+        }
+
+        fn publish_parameters(&self, module: &dyn Module) -> Result<LoadReport> {
+            CompiledTrainingRuntime::publish_parameters(&self.inner, module)
+        }
+    }
+
+    impl CompiledCheckpointRuntime for CheckpointCountingRuntime {
+        type Checkpoint = CompiledAdamWCheckpoint;
+
+        fn checkpoint(&self) -> Result<Self::Checkpoint> {
+            self.checkpoint_calls
+                .set(self.checkpoint_calls.get().saturating_add(1));
+            self.inner.checkpoint()
+        }
+    }
+
+    impl CompiledAdamWRuntime for CheckpointCountingRuntime {
+        fn gradient_accumulation_steps(&self) -> u64 {
+            self.inner.gradient_accumulation_steps()
+        }
+
+        fn max_gradient_norm(&self) -> Option<f32> {
+            self.inner.max_gradient_norm()
+        }
+
+        fn loss_scale(&self) -> f32 {
+            self.inner.loss_scale()
+        }
+
+        fn optimizer_step(&self) -> Result<u64> {
+            self.inner.optimizer_step()
+        }
+
+        fn accumulation_index(&self) -> Result<u64> {
+            self.inner.accumulation_index()
+        }
+
+        fn zero_grad(&mut self) -> Result<CompiledAdamWZeroGradResult> {
+            self.inner.zero_grad()
+        }
+
+        fn zero_grad_capture_identity(&self) -> Option<u64> {
+            self.inner.zero_grad_capture_identity()
+        }
+
+        fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+            self.inner.first_moment_snapshots()
+        }
+
+        fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+            self.inner.second_moment_snapshots()
+        }
+
+        fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+            self.inner.gradient_accumulator_snapshots()
+        }
     }
 
     impl FinishRaceModule {
@@ -10392,6 +10535,51 @@ mod tests {
         let squared = graph.square(output)?;
         let loss = graph.reduce(squared, crate::ReduceKind::Mean, None, false)?;
         Ok((loss, BTreeMap::from([("output".into(), output)])))
+    }
+
+    fn tied_token_mean_config() -> CompiledAdamWConfig {
+        module_config()
+            .with_input("mask", [2], DType::F32)
+            .unwrap()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_token_weighted_gradient_accumulation("mask")
+            .unwrap()
+            .with_max_gradient_norm(0.25)
+            .unwrap()
+            .with_clip_report()
+    }
+
+    fn tied_token_mean_dropout() -> CompiledDropoutConfig {
+        CompiledDropoutConfig::new(CompiledDropoutKey([71, 73]))
+    }
+
+    fn build_tied_frozen_token_mean(
+        module: &TiedFrozenModule,
+        graph: &mut Graph,
+        inputs: &BTreeMap<String, NodeId>,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<CompiledAdamWGraph> {
+        let shared = module.shared.bind(graph)?;
+        assert_eq!(module.shared.bind(graph)?, shared);
+        let frozen = module.frozen.bind(graph)?;
+        assert!(!graph.requires_grad(frozen)?);
+        let scaled = graph.mul(inputs["x"], shared)?;
+        let tied = graph.add(scaled, shared)?;
+        let output = graph.add(tied, frozen)?;
+        let dropped = dropout.dropout(graph, output, 0.25)?;
+        let losses = graph.square(dropped)?;
+        Ok(CompiledAdamWGraph::token_mean(
+            losses,
+            BTreeMap::from([("output".into(), dropped)]),
+        ))
+    }
+
+    fn tied_token_mean_batch(x: [f32; 2], mask: [f32; 2]) -> BTreeMap<String, TensorData> {
+        BTreeMap::from([
+            ("mask".into(), TensorData::new([2], mask.to_vec()).unwrap()),
+            ("x".into(), TensorData::new([2], x.to_vec()).unwrap()),
+        ])
     }
 
     fn initial_parameters() -> Vec<TrainingParameterInit> {
@@ -14342,6 +14530,177 @@ mod tests {
     }
 
     #[test]
+    fn complete_checkpoint_finish_publishes_one_snapshot_and_resumes_exactly() {
+        let config = tied_token_mean_config();
+        let dropout = tied_token_mean_dropout();
+        let source_module = TiedFrozenModule::new([1.0, -1.0]);
+        let source_shared = source_module.shared.snapshot().unwrap();
+        let source_tied_identity = source_module.shared.id();
+        let source_frozen = source_module.frozen.snapshot().unwrap();
+        let source_buffer = source_module.buffer.snapshot().unwrap();
+        let source_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout(
+            config.clone(),
+            dropout,
+            source_module,
+            build_tied_frozen_token_mean,
+        )
+        .unwrap();
+        let capture_identity = source_plan.capture_identity();
+        let mut source = source_plan.prepare(&CpuSessionTarget::new()).unwrap();
+
+        let first = source
+            .step(
+                tied_token_mean_batch([0.5, -0.25], [1.0, 0.0]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        assert_eq!(first.loss_weight(), 1);
+        assert!(first.clip_report().is_none());
+        let second = source
+            .step(
+                tied_token_mean_batch([-0.75, 0.25], [1.0, 1.0]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        assert_eq!(second.loss_weight(), 2);
+        assert!(second.clip_report().is_some());
+        source
+            .step(
+                tied_token_mean_batch([0.25, 0.75], [0.0, 1.0]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        let partial = source.module_checkpoint().unwrap();
+        assert_eq!(partial.optimizer_checkpoint().info().optimizer_step(), 1);
+        assert_eq!(
+            partial.optimizer_checkpoint().info().accumulation_index(),
+            1
+        );
+        assert_eq!(
+            partial
+                .optimizer_checkpoint()
+                .info()
+                .accumulated_token_count(),
+            Some(1)
+        );
+        assert!(
+            partial
+                .optimizer_checkpoint()
+                .info()
+                .dropout_block_counter()
+                .unwrap()
+                > 0
+        );
+
+        let destination_module = TiedFrozenModule::new([7.0, 8.0]);
+        destination_module
+            .buffer
+            .replace(TensorData::scalar(-4.0))
+            .unwrap();
+        let destination_shared = destination_module.shared.snapshot().unwrap();
+        let destination_frozen = destination_module.frozen.snapshot().unwrap();
+        let destination_buffer = destination_module.buffer.snapshot().unwrap();
+        let destination_tied_identity = destination_module.shared.id();
+        let restored_plan =
+            CompiledModuleAdamWPlan::compile_graph_with_dropout_from_module_checkpoint(
+                config,
+                dropout,
+                destination_module,
+                &partial,
+                build_tied_frozen_token_mean,
+            )
+            .unwrap();
+        assert_eq!(restored_plan.capture_identity(), capture_identity);
+        let mut resumed = restored_plan.prepare(&CpuSessionTarget::new()).unwrap();
+        assert_eq!(resumed.module_checkpoint().unwrap(), partial);
+        assert_parameter_snapshot_eq(
+            &resumed.module.shared.snapshot().unwrap(),
+            &destination_shared,
+        );
+        assert_parameter_snapshot_eq(
+            &resumed.module.frozen.snapshot().unwrap(),
+            &destination_frozen,
+        );
+        assert_parameter_snapshot_eq(
+            &resumed.module.buffer.snapshot().unwrap(),
+            &destination_buffer,
+        );
+
+        for (x, mask) in [([1.0, -0.5], [1.0, 1.0]), ([-0.5, 0.5], [1.0, 0.0])] {
+            let expected = source
+                .step(tied_token_mean_batch(x, mask), TensorData::scalar(0.01))
+                .unwrap();
+            let actual = resumed
+                .step(tied_token_mean_batch(x, mask), TensorData::scalar(0.01))
+                .unwrap();
+            assert_eq!(actual.loss(), expected.loss());
+            assert_eq!(actual.outputs(), expected.outputs());
+            assert_eq!(actual.loss_weight(), expected.loss_weight());
+            assert_eq!(actual.clip_report(), expected.clip_report());
+            assert_eq!(
+                resumed.module_checkpoint().unwrap(),
+                source.module_checkpoint().unwrap()
+            );
+        }
+
+        let expected_optimizer = source.checkpoint().unwrap();
+        let expected_complete = source.module_checkpoint().unwrap();
+        assert_eq!(expected_optimizer.info().accumulation_index(), 1);
+        assert_eq!(expected_optimizer.info().accumulated_token_count(), Some(1));
+        let CompiledModuleAdamWSession {
+            module,
+            runtime,
+            seal,
+        } = source;
+        let checkpoint_calls = Rc::new(Cell::new(0));
+        let source = CompiledModuleAdamWSession {
+            module,
+            runtime: CheckpointCountingRuntime {
+                inner: runtime,
+                checkpoint_calls: Rc::clone(&checkpoint_calls),
+            },
+            seal,
+        };
+        let (source_module, completed) = source.finish_with_module_checkpoint().unwrap();
+        assert_eq!(checkpoint_calls.get(), 1);
+        assert_eq!(completed, expected_complete);
+        assert_eq!(completed.optimizer_checkpoint(), &expected_optimizer);
+        assert_eq!(
+            CompiledModuleAdamWCheckpoint::from_bytes(completed.as_bytes().to_vec()).unwrap(),
+            completed
+        );
+        assert_eq!(
+            source_module.shared.value().unwrap(),
+            decode_adamw_checkpoint(completed.optimizer_checkpoint().as_bytes())
+                .unwrap()
+                .parameters["shared"]
+        );
+        assert_eq!(source_module.shared.id(), source_tied_identity);
+        assert_eq!(
+            source_module.shared.version().unwrap(),
+            source_shared.version + 1
+        );
+        assert_parameter_snapshot_eq(&source_module.frozen.snapshot().unwrap(), &source_frozen);
+        assert_parameter_snapshot_eq(&source_module.buffer.snapshot().unwrap(), &source_buffer);
+        let decoded = decode_module_adamw_checkpoint(completed.as_bytes()).unwrap();
+        assert_eq!(decoded.states.len(), 3);
+        assert_eq!(decoded.visits.len(), 4);
+        assert_eq!(decoded.visits[0].canonical_name, "shared");
+        assert_eq!(decoded.visits[1].canonical_name, "shared");
+
+        let (destination_module, resumed_complete) =
+            resumed.finish_with_module_checkpoint().unwrap();
+        assert_eq!(resumed_complete, completed);
+        assert_eq!(
+            destination_module.state_dict().unwrap(),
+            source_module.state_dict().unwrap()
+        );
+        assert_eq!(destination_module.shared.id(), destination_tied_identity);
+        assert!(!destination_module.frozen.is_trainable());
+        assert!(!destination_module.buffer.is_trainable());
+    }
+
+    #[test]
     fn checkpointed_finish_retains_session_after_late_publication_race() {
         let module = FinishRaceModule::new();
         let weight = module.weight.clone();
@@ -14355,10 +14714,10 @@ mod tests {
                 TensorData::scalar(0.01),
             )
             .unwrap();
-        let checkpoint = session.checkpoint().unwrap();
+        let checkpoint = session.module_checkpoint().unwrap();
         session.module.arm_finish_race();
 
-        let error = session.finish_with_checkpoint().unwrap_err();
+        let error = session.finish_with_module_checkpoint().unwrap_err();
         assert!(matches!(
             error.source_error(),
             Error::ParameterVersionConflict {
@@ -14366,16 +14725,22 @@ mod tests {
                 actual: 1
             }
         ));
-        assert_eq!(error.session().checkpoint().unwrap(), checkpoint);
+        assert_eq!(
+            error.session().checkpoint().unwrap(),
+            checkpoint.optimizer_checkpoint().clone()
+        );
         assert_eq!(error.session().step_count(), 1);
 
         weight.set_version_for_test(initial.version).unwrap();
-        let (module, retried_checkpoint) = error.into_session().finish_with_checkpoint().unwrap();
+        let (module, retried_checkpoint) = error
+            .into_session()
+            .finish_with_module_checkpoint()
+            .unwrap();
         assert_eq!(retried_checkpoint, checkpoint);
         assert_eq!(module.weight.version().unwrap(), initial.version + 1);
         assert_eq!(
             module.weight.value().unwrap(),
-            decode_adamw_checkpoint(checkpoint.as_bytes())
+            decode_adamw_checkpoint(checkpoint.optimizer_checkpoint().as_bytes())
                 .unwrap()
                 .parameters["weight"]
         );

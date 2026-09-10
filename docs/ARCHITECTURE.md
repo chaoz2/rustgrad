@@ -1034,6 +1034,11 @@ snapshot, publishes the parameter values decoded from that exact snapshot, and
 returns the module together with the same resumable parameter, moment,
 accumulator, dropout, and progress frontier. Strict device runtimes therefore
 perform no second parameter-only read during checkpointed finalization.
+`finish_with_module_checkpoint` uses the same single optimizer snapshot to
+encode the complete module envelope before publication, then returns that
+envelope with the published module. Its immutable frozen/buffer values and tied
+topology therefore describe the same sealed lifecycle as the optimizer bytes;
+encoding, decoding, or publication failure retains the session for retry.
 `CompiledModuleAdamWCheckpoint` is the separate complete-module persistence
 envelope. It embeds those existing AdamW checkpoint bytes unchanged and adds a
 canonical, identity-deduplicated inventory of traversal aliases, state kinds,
