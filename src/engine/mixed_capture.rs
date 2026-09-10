@@ -116,18 +116,17 @@ struct StagedMixedReplay {
 }
 
 /// Execution context for a strict-native replay of a captured pure prefix.
-/// The prepared program owns kernels and immutable schema only; replay-local
-/// tensor bytes remain owned by the caller and recurrent runtime.
-#[derive(Clone, Copy)]
+/// The prepared program owns kernels, immutable schema, and invalidatable
+/// scratch; authoritative tensor bytes remain caller/runtime-owned.
 pub(crate) struct NativeReplayContext<'a> {
     executor: &'a super::captured_replay::CapturedReplayExecutor,
-    prepared: &'a PreparedRecurrentNativeReplay,
+    prepared: &'a mut PreparedRecurrentNativeReplay,
 }
 
 impl<'a> NativeReplayContext<'a> {
     pub(crate) const fn new(
         executor: &'a super::captured_replay::CapturedReplayExecutor,
-        prepared: &'a PreparedRecurrentNativeReplay,
+        prepared: &'a mut PreparedRecurrentNativeReplay,
     ) -> Self {
         Self { executor, prepared }
     }
@@ -155,8 +154,9 @@ pub(crate) struct NativeMixedPreparationTrace {
 }
 
 /// Reusable strict-native ownership for one recurrent mixed capture. It keeps
-/// prepared kernels and authenticated immutable schema, never bindings,
-/// runtime leases, cursor state, or tensor bytes from preparation.
+/// prepared kernels, authenticated immutable schema, capture constants, and
+/// zero-initialized scratch, never witness bindings, runtime leases, or cursor
+/// state from preparation.
 pub(crate) struct PreparedRecurrentNativeReplay {
     trace: NativeMixedPreparationTrace,
     plan: super::captured_replay::PlannedNativeItems,
@@ -165,6 +165,13 @@ pub(crate) struct PreparedRecurrentNativeReplay {
 impl PreparedRecurrentNativeReplay {
     pub(crate) fn preparation_trace(&self) -> &NativeMixedPreparationTrace {
         &self.trace
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_stats(
+        &self,
+    ) -> super::native_replay_workspace::NativeReplayWorkspaceStats {
+        self.plan.workspace_stats()
     }
 
     fn validate_capture(
@@ -278,6 +285,11 @@ impl<'a> BoundMixedCapture<'a> {
             .iter()
             .map(|x| x.producer_output.id)
             .collect();
+        for requested in &self.capture.schedule.requested {
+            if !pure.requested.contains(requested) {
+                pure.requested.push(*requested);
+            }
+        }
         pure.identity = 0;
         let plan = executor.plan_native_items(&pure, &self.inputs, vectorized)?;
         Ok(PlannedBoundMixedCapture { bound: self, plan })
@@ -325,8 +337,9 @@ impl<'a> PlannedBoundMixedCapture<'a> {
     pub(crate) fn cache_miss_count(&self) -> usize {
         self.plan.cache_miss_count()
     }
+
     pub(crate) fn execute(
-        &self,
+        &mut self,
         executor: &super::captured_replay::CapturedReplayExecutor,
     ) -> Result<super::captured_replay::ReplayValues, ReplayError> {
         let mut pure = self.bound.capture.schedule.clone();
@@ -337,11 +350,11 @@ impl<'a> PlannedBoundMixedCapture<'a> {
             .ok_or_else(|| ReplayError::Unsupported("mixed capture has no effects".into()))?;
         pure.items.truncate(split);
         pure.identity = 0;
-        executor.execute_planned_native_items(&pure, &self.bound.inputs, &self.plan)
+        executor.execute_planned_native_items(&pure, &self.bound.inputs, &mut self.plan)
     }
 
     pub(crate) fn execute_stage(
-        self,
+        mut self,
         candidates: &mut BTreeMap<BufferState, crate::TensorData>,
         executor: &super::captured_replay::CapturedReplayExecutor,
     ) -> Result<crate::EffectBatchEntry, ReplayError> {
@@ -611,6 +624,7 @@ impl CapturedMixedSchedule {
         validate(self, true)?;
         validate_recurrent_cursor(self, cursor)?;
         let native_trace = native
+            .as_ref()
             .map(|native| native.prepared.validate_capture(self))
             .transpose()?;
 
@@ -751,7 +765,7 @@ impl CapturedMixedSchedule {
             Some(native) => native.executor.execute_planned_native_items(
                 &pure,
                 &inputs,
-                &native.prepared.plan,
+                &mut native.prepared.plan,
             )?,
             None => super::captured_replay::replay_interpreter_items(&pure, &inputs)?,
         };

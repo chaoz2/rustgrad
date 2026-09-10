@@ -70,6 +70,11 @@ pub(crate) struct PreparedScheduleItem {
     pub(crate) vector: VectorPlan,
     schedule_cache_key: u64,
 }
+impl PreparedScheduleItem {
+    pub(crate) fn abi(&self) -> &crate::KernelAbi {
+        self.kernel.abi()
+    }
+}
 impl CpuJitBackend {
     pub fn new(fallback: JitFallback) -> Self {
         Self {
@@ -333,24 +338,45 @@ impl CpuJitBackend {
             .swap_remove(output_index)
             .into_tensor(item.primary_output().shape.clone())
             .map_err(|e| JitBackendError::Binding(e.to_string()))?;
-        Ok((
-            output,
-            JitExecution {
-                cache_key: prepared.native_cache_key.clone(),
-                native: true,
-                vector_main: if prepared.vector.enabled {
-                    output_elements / prepared.vector.lanes * prepared.vector.lanes
-                } else {
-                    0
-                },
-                vector_tail: if prepared.vector.enabled {
-                    output_elements % prepared.vector.lanes
-                } else {
-                    output_elements
-                },
-                vector: prepared.vector.clone(),
-            },
-        ))
+        Ok((output, prepared_execution(prepared, output_elements)))
+    }
+
+    pub(crate) fn execute_prepared_schedule_item_in_workspace(
+        &self,
+        item: &ScheduleItem,
+        buffers: &mut [JitBuffer],
+        slots: &[usize],
+        quantized_values: &BTreeMap<u64, crate::QuantizedTensorData>,
+        prepared: &PreparedScheduleItem,
+    ) -> Result<JitExecution, JitBackendError> {
+        if prepared.schedule_cache_key != item.cache_key
+            || slots.len() != prepared.kernel.abi().buffers.len()
+        {
+            return Err(JitBackendError::Binding(
+                "prepared workspace schedule identity mismatch".into(),
+            ));
+        }
+        let quantized = prepared
+            .kernel
+            .abi()
+            .quantized_buffers
+            .iter()
+            .map(|desc| {
+                quantized_values.get(&desc.id).ok_or_else(|| {
+                    JitBackendError::Binding(format!("missing packed captured buffer {}", desc.id))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        prepared
+            .kernel
+            .call_indexed_detached(buffers, slots, &quantized)
+            .map_err(jit_error)?;
+        let output_elements = item
+            .primary_output()
+            .shape
+            .numel()
+            .map_err(|error| JitBackendError::Binding(error.to_string()))?;
+        Ok(prepared_execution(prepared, output_elements))
     }
     pub fn execute_native(
         &self,
@@ -491,6 +517,25 @@ impl CpuJitBackend {
         }
     }
 }
+
+fn prepared_execution(prepared: &PreparedScheduleItem, output_elements: usize) -> JitExecution {
+    JitExecution {
+        cache_key: prepared.native_cache_key.clone(),
+        native: true,
+        vector_main: if prepared.vector.enabled {
+            output_elements / prepared.vector.lanes * prepared.vector.lanes
+        } else {
+            0
+        },
+        vector_tail: if prepared.vector.enabled {
+            output_elements % prepared.vector.lanes
+        } else {
+            output_elements
+        },
+        vector: prepared.vector.clone(),
+    }
+}
+
 fn jit_error(e: JitError) -> JitBackendError {
     match e {
         JitError::Unsupported(s) | JitError::Symbolic(s) => JitBackendError::Unsupported(s),

@@ -1,5 +1,6 @@
 //! Graph-independent interpreter/native replay and deterministic batching.
 use super::capture::{CapturedSchedule, ReplayError};
+use super::native_replay_workspace::NativeReplayWorkspace;
 use super::replay_liveness::ReplayLivenessPlan;
 use crate::backend::{JitBackendError, PreparedScheduleItem, TensorValueStore};
 use crate::{
@@ -768,8 +769,8 @@ enum PlannedItem {
 }
 
 /// Crate-private preparation ownership for one strict-native invocation.
-/// It deliberately carries only already-validated logical plan data and the
-/// existing prepared kernels; callers cannot observe or reuse backend handles.
+/// It carries already-validated logical plan data, prepared kernels, and
+/// private scratch storage; callers cannot observe or reuse backend handles.
 pub(crate) struct PreparedPrunedNativeReplay {
     plan: Vec<PlannedItem>,
     vectorized: bool,
@@ -787,10 +788,11 @@ impl PreparedPrunedNativeReplay {
     }
 }
 
-/// Fully compiled strict-native pure prefix, kept in the existing executor's
-/// ownership domain until detached execution.
+/// Fully compiled strict-native pure prefix and reusable scratch storage, kept
+/// in the existing executor's ownership domain until detached execution.
 pub(crate) struct PlannedNativeItems {
     items: Vec<PreparedScheduleItem>,
+    workspace: NativeReplayWorkspace,
     vectorized: bool,
     capture_identity: u64,
     input_schema: Vec<crate::ReplayInput>,
@@ -816,6 +818,13 @@ impl PlannedNativeItems {
 
     pub(crate) fn schedule_cache_keys(&self) -> &[u64] {
         &self.schedule_cache_keys
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_stats(
+        &self,
+    ) -> super::native_replay_workspace::NativeReplayWorkspaceStats {
+        self.workspace.stats()
     }
 
     fn validate_replay(
@@ -849,9 +858,9 @@ impl PlannedNativeItems {
                 "prepared native schedule cache keys mismatch".into(),
             ));
         }
-        // Values are intentionally not retained by the plan. Revalidate the
-        // current invocation after authenticating its immutable schema; this
-        // includes data-dependent quantized row-gather index bounds.
+        // Authoritative values and witness bindings are not retained by the
+        // plan. Revalidate the current invocation before importing it into
+        // invalidatable scratch, including quantized row-gather index bounds.
         validate_inputs(capture, provided)?;
         Ok(())
     }
@@ -892,8 +901,10 @@ impl CapturedReplayExecutor {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let workspace = NativeReplayWorkspace::new(capture, &items)?;
         Ok(PlannedNativeItems {
             items,
+            workspace,
             vectorized,
             capture_identity: capture.identity,
             input_schema: capture.inputs.clone(),
@@ -905,24 +916,21 @@ impl CapturedReplayExecutor {
         &self,
         capture: &CapturedSchedule,
         provided: &BTreeMap<String, TensorData>,
-        plan: &PlannedNativeItems,
+        plan: &mut PlannedNativeItems,
     ) -> Result<ReplayValues, ReplayError> {
         plan.validate_replay(capture, provided)?;
-        let mut values = initial_values(capture, provided)?;
-        for (item, prepared) in capture.items.iter().zip(&plan.items) {
-            let (value, _) = self
-                .jit(plan.vectorized)
-                .execute_prepared_schedule_item(
-                    item,
-                    &values,
-                    &capture.quantized_constants,
-                    prepared,
-                )
-                .map_err(backend_error)?;
-            values.insert_tensor(item.primary_output().id, value);
+        plan.workspace.begin(provided)?;
+        for index in 0..capture.items.len() {
+            let item = &capture.items[index];
+            plan.workspace.execute_item(
+                index,
+                item,
+                self.jit(plan.vectorized),
+                &capture.quantized_constants,
+                &plan.items[index],
+            )?;
         }
-        values.project_requested_aliases(&capture.requested_passthroughs)?;
-        Ok(values)
+        plan.workspace.materialize(capture)
     }
 }
 
@@ -1095,8 +1103,8 @@ pub(crate) fn replay_native_items(
     executor: &CapturedReplayExecutor,
     vectorized: bool,
 ) -> Result<ReplayValues, ReplayError> {
-    let plan = executor.plan_native_items(capture, provided, vectorized)?;
-    executor.execute_planned_native_items(capture, provided, &plan)
+    let mut plan = executor.plan_native_items(capture, provided, vectorized)?;
+    executor.execute_planned_native_items(capture, provided, &mut plan)
 }
 
 fn reject_multi_output_items(capture: &CapturedSchedule) -> Result<(), ReplayError> {
@@ -1260,7 +1268,7 @@ fn interpret_item(
         .map_err(|e| ReplayError::Execute(e.to_string()))
 }
 
-fn backend_error(error: JitBackendError) -> ReplayError {
+pub(super) fn backend_error(error: JitBackendError) -> ReplayError {
     match error {
         JitBackendError::Unsupported(reason) => ReplayError::Unsupported(reason),
         other => ReplayError::Backend(other.to_string()),
@@ -1360,17 +1368,29 @@ mod tests {
             .plan_native_items(&capture, &bindings, false)
             .unwrap();
         assert_eq!(executor.native_item_plan_count(), 1);
+        let prepared = plan.workspace_stats();
+        assert!(prepared.allocation_count >= capture.inputs.len() + capture.items.len());
+        assert_eq!(prepared.input_import_count, 0);
+        assert_eq!(prepared.intermediate_materialization_count, 0);
 
         let first = executor
-            .execute_planned_native_items(&capture, &bindings, &plan)
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
             .unwrap();
+        let first_stats = plan.workspace_stats();
+        assert_eq!(first_stats.allocation_count, prepared.allocation_count);
+        assert_eq!(first_stats.input_import_count, capture.inputs.len());
+        assert_eq!(first_stats.intermediate_materialization_count, 0);
         let changed = BTreeMap::from([(
             "input".into(),
             TensorData::new([2], vec![3.0, -4.0]).unwrap(),
         )]);
         let second = executor
-            .execute_planned_native_items(&capture, &changed, &plan)
+            .execute_planned_native_items(&capture, &changed, &mut plan)
             .unwrap();
+        let second_stats = plan.workspace_stats();
+        assert_eq!(second_stats.allocation_count, prepared.allocation_count);
+        assert_eq!(second_stats.input_import_count, capture.inputs.len() * 2);
+        assert_eq!(second_stats.intermediate_materialization_count, 0);
         assert_ne!(
             first.requested(&capture.requested).unwrap(),
             second.requested(&capture.requested).unwrap()
@@ -1380,14 +1400,15 @@ mod tests {
         let malformed =
             BTreeMap::from([("input".into(), TensorData::new([1], vec![1.0]).unwrap())]);
         assert!(matches!(
-            executor.execute_planned_native_items(&capture, &malformed, &plan),
+            executor.execute_planned_native_items(&capture, &malformed, &mut plan),
             Err(ReplayError::Descriptor(_))
         ));
+        assert_eq!(plan.workspace_stats(), second_stats);
         assert_eq!(executor.native_item_plan_count(), 1);
 
         plan.items.pop();
         assert!(matches!(
-            executor.execute_planned_native_items(&capture, &bindings, &plan),
+            executor.execute_planned_native_items(&capture, &bindings, &mut plan),
             Err(ReplayError::Corrupt(message))
                 if message == "prepared native item count mismatch"
         ));

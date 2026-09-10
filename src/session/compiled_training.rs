@@ -4270,14 +4270,14 @@ impl CompiledEvaluationPlan {
         inputs: BTreeMap<String, TensorData>,
         parameters: BTreeMap<String, TensorData>,
         executor: &CapturedReplayExecutor,
-        prepared: &PreparedNativeCpuEvaluation,
+        prepared: &mut PreparedNativeCpuEvaluation,
     ) -> Result<(CompiledEvaluationResult, NativeCpuRunReport)> {
         let inputs = self.bind(inputs, parameters)?;
         let started = Instant::now();
         let capture = self.inference.capture();
         prepared.validate(self.capture_identity, capture)?;
         let values = executor
-            .execute_planned_native_items(capture, &inputs, &prepared.plan)
+            .execute_planned_native_items(capture, &inputs, &mut prepared.plan)
             .map_err(replay_error)?;
         let outputs = values.requested(&capture.requested).map_err(replay_error)?;
         let schedule_cache_keys = prepared.plan.schedule_cache_keys().to_vec();
@@ -6769,7 +6769,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             inputs,
             learning_rate,
             self.inner.non_finite_policy,
-            NativeReplayContext::new(self.executor, &self.main_replay),
+            NativeReplayContext::new(self.executor, &mut self.main_replay),
             injected_failure,
         )?;
         result.step = next.replay_step;
@@ -6814,7 +6814,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .ok_or_else(|| training("compiled evaluation is not attached"))?;
         let prepared = self
             .evaluation_replay
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| training("compiled native CPU evaluation preparation is absent"))?;
         let (inner, mut report) = evaluation.plan.evaluate_native(
             inputs,
@@ -6872,7 +6872,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .ok_or_else(|| training("compiled AdamW partial flush capture is absent"))?;
         let prepared = self
             .partial_flush_replay
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| training("compiled native CPU partial flush preparation is absent"))?;
         let report = self.inner.inner.replay_auxiliary_transition_native(
             transition,
@@ -6963,7 +6963,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .ok_or_else(|| training("compiled AdamW zero-grad capture is absent"))?;
         let prepared = self
             .zero_grad_replay
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| training("compiled native CPU zero-grad preparation is absent"))?;
         self.inner.inner.replay_auxiliary_transition_native(
             transition,
@@ -10014,6 +10014,10 @@ mod tests {
         let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
         let mut native = target.prepare(&plan).unwrap();
         assert_eq!(executor.native_item_plan_count(), 1);
+        let workspace = native.main_replay.workspace_stats();
+        assert!(workspace.allocation_count > 0);
+        assert_eq!(workspace.input_import_count, 0);
+        assert_eq!(workspace.intermediate_materialization_count, 0);
         let preparation = native.preparation_report();
         assert_eq!(
             preparation.main().capture_identity(),
@@ -10058,10 +10062,20 @@ mod tests {
         assert!(actual.report().first_successful_invocation());
         assert_eq!(actual.report().native_identity(), prepared_native_identity);
         assert_native_adamw_state_close(&native, &interpreted);
+        let first_workspace = native.main_replay.workspace_stats();
+        assert_eq!(first_workspace.allocation_count, workspace.allocation_count);
+        assert!(first_workspace.input_import_count > 0);
+        assert_eq!(first_workspace.intermediate_materialization_count, 0);
 
         let before_failure = native.checkpoint().unwrap();
         assert!(native.step_inner(batch(), lr(), Some(0)).is_err());
         assert_eq!(native.checkpoint().unwrap(), before_failure);
+        let failed_workspace = native.main_replay.workspace_stats();
+        assert_eq!(
+            failed_workspace.allocation_count,
+            workspace.allocation_count
+        );
+        assert_eq!(failed_workspace.intermediate_materialization_count, 0);
         let expected = interpreted.step(batch(), lr()).unwrap();
         let actual = native.step(batch(), lr()).unwrap();
         assert_cross_engine_tensor_close("retry loss", actual.loss(), expected.loss());
@@ -10075,6 +10089,13 @@ mod tests {
         assert_eq!(actual.report().successful_invocation(), 2);
         assert_native_adamw_state_close(&native, &interpreted);
         assert_eq!(executor.native_item_plan_count(), 2);
+        let retried_workspace = native.main_replay.workspace_stats();
+        assert_eq!(
+            retried_workspace.allocation_count,
+            workspace.allocation_count
+        );
+        assert!(retried_workspace.input_import_count > failed_workspace.input_import_count);
+        assert_eq!(retried_workspace.intermediate_materialization_count, 0);
     }
 
     #[test]
@@ -10100,6 +10121,14 @@ mod tests {
         let target = NativeCpuSessionTarget::new(&executor);
         let mut native = target.prepare(&plan).unwrap();
         assert_eq!(executor.native_item_plan_count(), 3);
+        let flush_workspace = native
+            .partial_flush_replay
+            .as_ref()
+            .unwrap()
+            .workspace_stats();
+        let reset_workspace = native.zero_grad_replay.as_ref().unwrap().workspace_stats();
+        assert!(flush_workspace.allocation_count > 0);
+        assert!(reset_workspace.allocation_count > 0);
         let mut interpreted = plan.prepare_cpu().unwrap();
         assert!(native.preparation_report().partial_flush().is_some());
         assert!(native.preparation_report().zero_grad().is_some());
@@ -10123,11 +10152,24 @@ mod tests {
         );
         assert_eq!(native.successful_zero_grads, 1);
         assert_native_adamw_state_close(&native, &interpreted);
+        let used_reset_workspace = native.zero_grad_replay.as_ref().unwrap().workspace_stats();
+        assert_eq!(
+            used_reset_workspace.allocation_count,
+            reset_workspace.allocation_count
+        );
+        assert!(used_reset_workspace.input_import_count > 0);
+        assert_eq!(used_reset_workspace.intermediate_materialization_count, 0);
 
         let before_empty_reset = native.checkpoint().unwrap();
+        let before_empty_reset_workspace =
+            native.zero_grad_replay.as_ref().unwrap().workspace_stats();
         assert!(!native.zero_grad().unwrap().did_discard());
         assert_eq!(native.successful_zero_grads, 1);
         assert_eq!(native.checkpoint().unwrap(), before_empty_reset);
+        assert_eq!(
+            native.zero_grad_replay.as_ref().unwrap().workspace_stats(),
+            before_empty_reset_workspace
+        );
 
         let actual = native.step(batch(), lr()).unwrap();
         let expected = interpreted.step(batch(), lr()).unwrap();
@@ -10156,10 +10198,34 @@ mod tests {
         assert_eq!(actual.report().unwrap().successful_invocation(), 1);
         assert_native_adamw_state_close(&native, &interpreted);
 
+        let before_empty_flush_workspace = native
+            .partial_flush_replay
+            .as_ref()
+            .unwrap()
+            .workspace_stats();
         let empty = native.flush_partial_window(lr()).unwrap();
         assert!(!empty.did_update());
         assert!(empty.report().is_none());
         assert_eq!(executor.native_item_plan_count(), 3);
+        assert_eq!(
+            native
+                .partial_flush_replay
+                .as_ref()
+                .unwrap()
+                .workspace_stats(),
+            before_empty_flush_workspace
+        );
+        let used_flush_workspace = native
+            .partial_flush_replay
+            .as_ref()
+            .unwrap()
+            .workspace_stats();
+        assert_eq!(
+            used_flush_workspace.allocation_count,
+            flush_workspace.allocation_count
+        );
+        assert!(used_flush_workspace.input_import_count > 0);
+        assert_eq!(used_flush_workspace.intermediate_materialization_count, 0);
     }
 
     #[test]
@@ -10210,10 +10276,29 @@ mod tests {
         let mut session = target.prepare(plan).unwrap();
         assert_eq!(executor.native_item_plan_count(), 2);
         let checkpoint = session.checkpoint().unwrap();
+        let workspace = session
+            .runtime
+            .evaluation_replay
+            .as_ref()
+            .unwrap()
+            .plan
+            .workspace_stats();
+        assert!(workspace.allocation_count > 0);
+        assert_eq!(workspace.input_import_count, 0);
 
         assert!(session.evaluate(BTreeMap::new()).is_err());
         assert_eq!(session.checkpoint().unwrap(), checkpoint);
         assert_eq!(session.runtime.successful_evaluations, 0);
+        assert_eq!(
+            session
+                .runtime
+                .evaluation_replay
+                .as_ref()
+                .unwrap()
+                .plan
+                .workspace_stats(),
+            workspace
+        );
 
         let evaluation = session
             .evaluate(BTreeMap::from([(
@@ -10225,6 +10310,19 @@ mod tests {
         assert!(evaluation.report().first_successful_invocation());
         assert_eq!(session.checkpoint().unwrap(), checkpoint);
         assert_eq!(executor.native_item_plan_count(), 2);
+        let evaluated_workspace = session
+            .runtime
+            .evaluation_replay
+            .as_ref()
+            .unwrap()
+            .plan
+            .workspace_stats();
+        assert_eq!(
+            evaluated_workspace.allocation_count,
+            workspace.allocation_count
+        );
+        assert!(evaluated_workspace.input_import_count > 0);
+        assert_eq!(evaluated_workspace.intermediate_materialization_count, 0);
     }
 
     #[test]
