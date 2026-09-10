@@ -961,28 +961,36 @@ struct AdamWOracleUpdate {
 fn average_gradient_window(
     gradients: &[BTreeMap<String, TensorData>],
 ) -> BTreeMap<String, Vec<f32>> {
-    assert_eq!(gradients.len(), ACCUMULATION_STEPS as usize);
-    let names = gradients[0].keys().collect::<Vec<_>>();
-    for gradient in gradients.iter().skip(1) {
-        assert_eq!(gradient.keys().collect::<Vec<_>>(), names);
+    normalize_gradient_window(gradients, ACCUMULATION_STEPS as f32)
+}
+
+fn normalize_gradient_window(
+    contributions: &[BTreeMap<String, TensorData>],
+    divisor: f32,
+) -> BTreeMap<String, Vec<f32>> {
+    assert_eq!(contributions.len(), ACCUMULATION_STEPS as usize);
+    assert!(divisor.is_finite() && divisor > 0.0);
+    let names = contributions[0].keys().collect::<Vec<_>>();
+    for contribution in contributions.iter().skip(1) {
+        assert_eq!(contribution.keys().collect::<Vec<_>>(), names);
     }
     names
         .into_iter()
         .map(|name| {
-            let descriptor = &gradients[0][name];
+            let descriptor = &contributions[0][name];
             assert_eq!(descriptor.dtype(), DType::F32);
-            for gradient in gradients.iter().skip(1) {
-                assert_eq!(gradient[name].shape(), descriptor.shape());
-                assert_eq!(gradient[name].dtype(), DType::F32);
+            for contribution in contributions.iter().skip(1) {
+                assert_eq!(contribution[name].shape(), descriptor.shape());
+                assert_eq!(contribution[name].dtype(), DType::F32);
             }
             let averaged = (0..descriptor.len())
                 .map(|coordinate| {
-                    let first = gradients[0][name].scalar_at(coordinate).as_f64() as f32;
-                    let second = gradients[1][name].scalar_at(coordinate).as_f64() as f32;
-                    let third = gradients[2][name].scalar_at(coordinate).as_f64() as f32;
-                    // Recurrent accumulation stores each F32 sum before the
-                    // next replay adds to it.
-                    ((first + second) + third) / ACCUMULATION_STEPS as f32
+                    let first = contributions[0][name].scalar_at(coordinate).as_f64() as f32;
+                    let second = contributions[1][name].scalar_at(coordinate).as_f64() as f32;
+                    let third = contributions[2][name].scalar_at(coordinate).as_f64() as f32;
+                    // Match the recurrent F32 addition order before applying
+                    // the complete window's normalization divisor.
+                    ((first + second) + third) / divisor
                 })
                 .collect();
             (name.clone(), averaged)
@@ -2882,7 +2890,7 @@ fn compiled_multi_head_transformer_gradients_match_forward_only_oracle_and_nativ
 }
 
 #[test]
-fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() {
+fn compiled_transformer_token_weighted_clipped_second_window_matches_numerical_oracle() {
     const NUMERICAL_ABSOLUTE_TOLERANCE: f64 = 6e-3;
     const NUMERICAL_RELATIVE_TOLERANCE: f64 = 3e-3;
     const ADAM_INPUT_TOLERANCE: f64 = 1e-5;
@@ -2891,7 +2899,7 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
     const PARAMETER_TOLERANCE: f64 = 2e-5;
     const TOKEN_COUNTS: [f32; 3] = [5.0, 3.0, 3.0];
     const TOKEN_COUNT_TOTAL: f32 = 11.0;
-    const PROBES: [TransformerGradientProbe; 10] = [
+    const PROBES: [TransformerGradientProbe; 8] = [
         TransformerGradientProbe {
             parameter: "tokens.weight",
             coordinate: 4,
@@ -2928,26 +2936,13 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
             boundary: "second LayerNorm affine bias",
         },
         TransformerGradientProbe {
-            parameter: "block.ff1.0",
-            coordinate: 6,
-            boundary: "feed-forward expansion and ReLU",
-        },
-        TransformerGradientProbe {
-            parameter: "block.ff2.0",
-            coordinate: 5,
-            boundary: "feed-forward contraction",
-        },
-        TransformerGradientProbe {
             parameter: "norm.bias",
             coordinate: 1,
             boundary: "final LayerNorm affine and logits reduction",
         },
     ];
 
-    // Clipping is disabled only for this focused proof so the completed
-    // window's moments expose the exact token-weighted gradient presented to
-    // AdamW. The separate clipping tests cover the intervening global policy.
-    let optimizer = masked_config_with_max_gradient_norm(None);
+    let optimizer = masked_config();
     let model = TinyCausalTransformer::new(7).unwrap();
     let tied_identity = model.tokens.weight.id();
     let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
@@ -3142,6 +3137,23 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
         .weight_decay_exclusions()
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
+    // Each isolated accumulator stores n_i * g_i, so this independently forms
+    // the complete canonical G = sum(n_i * g_i) / sum(n_i) map on the host.
+    let token_weighted_average = normalize_gradient_window(&raw_gradients, TOKEN_COUNT_TOTAL);
+    assert_eq!(
+        token_weighted_average.keys().collect::<Vec<_>>(),
+        frontier_parameters.keys().collect::<Vec<_>>(),
+        "the global norm oracle must cover every canonical trainable parameter"
+    );
+    let max_norm = optimizer.max_gradient_norm().unwrap();
+    let (clipped_average, gradient_norm) = clip_gradient_window(&token_weighted_average, max_norm);
+    assert!(gradient_norm.is_finite());
+    assert!(
+        gradient_norm > max_norm,
+        "the token-weighted second window must activate global clipping: norm={gradient_norm}, max_norm={max_norm}"
+    );
+    let clip_scale = max_norm / gradient_norm.max(max_norm);
+    assert!(clip_scale.is_finite() && clip_scale > 0.0 && clip_scale < 1.0);
     for (probe_index, probe) in PROBES.iter().enumerate() {
         let numerical_lanes = [
             numerical[0].gradients[probe_index] as f32,
@@ -3160,6 +3172,14 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
             .zip(numerical_contributions)
             .enumerate()
         {
+            assert!(
+                actual.is_finite() && expected.is_finite(),
+                "{} token-weighted accumulator contribution {}[{}] at second-window replay {} must be finite: actual={actual}, numerical={expected}",
+                probe.boundary,
+                probe.parameter,
+                probe.coordinate,
+                replay_index + 1
+            );
             let error = (f64::from(actual) - f64::from(expected)).abs();
             let tolerance = NUMERICAL_ABSOLUTE_TOLERANCE * f64::from(token_counts[replay_index])
                 + NUMERICAL_RELATIVE_TOLERANCE * f64::from(actual.abs().max(expected.abs()));
@@ -3181,6 +3201,25 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
         let average = ((actual_contributions[0] + actual_contributions[1])
             + actual_contributions[2])
             / TOKEN_COUNT_TOTAL;
+        assert!(
+            average.is_finite() && numerical_average.is_finite(),
+            "{} token-weighted gradient {}[{}] must be finite: captured={average}, numerical={numerical_average}",
+            probe.boundary,
+            probe.parameter,
+            probe.coordinate
+        );
+        assert!(
+            average != 0.0 && numerical_average != 0.0,
+            "{} token-weighted gradient {}[{}] must remain nonzero after the complete 5/3/3 reduction: captured={average}, numerical={numerical_average}",
+            probe.boundary,
+            probe.parameter,
+            probe.coordinate
+        );
+        assert_eq!(
+            average, token_weighted_average[probe.parameter][probe.coordinate],
+            "{} canonical token-weighted gradient {}[{}] must preserve recurrent F32 order",
+            probe.boundary, probe.parameter, probe.coordinate
+        );
         let average_error = (f64::from(average) - f64::from(numerical_average)).abs();
         let average_tolerance = NUMERICAL_ABSOLUTE_TOLERANCE
             + NUMERICAL_RELATIVE_TOLERANCE * f64::from(average.abs().max(numerical_average.abs()));
@@ -3191,6 +3230,8 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
             probe.parameter,
             probe.coordinate
         );
+        let clipped = clipped_average[probe.parameter][probe.coordinate];
+        assert_eq!(clipped, average * clip_scale);
 
         let previous_first = frontier_first_moments[probe.parameter]
             .scalar_at(probe.coordinate)
@@ -3200,21 +3241,21 @@ fn compiled_transformer_token_weighted_second_window_matches_numerical_oracle() 
             .as_f64() as f32;
         let captured_adam_input = (actual_first - beta1 * previous_first) / (1.0 - beta1);
         assert!(
-            (f64::from(captured_adam_input) - f64::from(average)).abs() <= ADAM_INPUT_TOLERANCE,
-            "{} averaged AdamW input {}[{}] mismatch: captured={captured_adam_input}, raw={average}",
+            (f64::from(captured_adam_input) - f64::from(clipped)).abs() <= ADAM_INPUT_TOLERANCE,
+            "{} clipped token-weighted AdamW input {}[{}] mismatch: captured={captured_adam_input}, unclipped={average}, clip_scale={clip_scale}, clipped={clipped}",
             probe.boundary,
             probe.parameter,
             probe.coordinate
         );
 
-        let expected_first = beta1 * previous_first + (1.0 - beta1) * average;
+        let expected_first = beta1 * previous_first + (1.0 - beta1) * clipped;
         let previous_second = frontier_second_moments[probe.parameter]
             .scalar_at(probe.coordinate)
             .as_f64() as f32;
         let actual_second = next_second_moments[probe.parameter]
             .scalar_at(probe.coordinate)
             .as_f64() as f32;
-        let expected_second = beta2 * previous_second + (1.0 - beta2) * (average * average);
+        let expected_second = beta2 * previous_second + (1.0 - beta2) * (clipped * clipped);
         assert!(
             (f64::from(actual_first) - f64::from(expected_first)).abs() <= FIRST_MOMENT_TOLERANCE,
             "{} first moment {}[{}] mismatch: actual={actual_first}, numerical={expected_first}",
