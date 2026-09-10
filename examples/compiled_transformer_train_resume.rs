@@ -2,7 +2,10 @@
 //! Transformer for portable resume on CPU or strict Metal.
 //!
 //! Same-process callers may instead retain one `CompiledAdamWPlan` and call
-//! `restore_checkpoint` without rebuilding its graph or captures.
+//! `restore_checkpoint` without rebuilding its graph or captures. That CPU
+//! path uses fixed-capacity right-padded batches and averages each masked
+//! microbatch equally across an accumulation window; it does not retain a
+//! token-count denominator as recurrent state.
 //!
 //! Run that compile-once, same-process CPU path:
 //!
@@ -74,6 +77,7 @@ const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
 const INITIAL_STEPS: usize = 4;
 const RESUMED_STEPS: usize = 3;
 const POLICY_FROZEN: &str = "block.ff1.0";
+const LOSS_MASK: &str = "loss_mask";
 
 struct TinyCausalTransformer {
     tokens: Embedding,
@@ -174,16 +178,20 @@ impl Module for BufferedTinyCausalTransformer {
 }
 
 fn config() -> Result<CompiledAdamWConfig> {
+    optimizer_config()?.with_input_batch::<TransformerBatch>()
+}
+
+fn optimizer_config() -> Result<CompiledAdamWConfig> {
     CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)?
         .with_weight_decay_exclusions(WEIGHT_DECAY_EXCLUSIONS)?
         .with_loss_scale(128.0)?
         .with_gradient_accumulation(ACCUMULATION_STEPS)?
-        .with_max_gradient_norm(MAX_GRADIENT_NORM)?
-        .with_input_batch::<TransformerBatch>()
+        .with_max_gradient_norm(MAX_GRADIENT_NORM)
 }
 
 fn reuse_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
-    Ok(config()?
+    Ok(optimizer_config()?
+        .with_input_batch::<MaskedTransformerBatch>()?
         .with_frozen_parameters([POLICY_FROZEN])?
         .with_captured_multi_step_lr(schedule))
 }
@@ -200,6 +208,25 @@ fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Res
     let selected = graph.reshape(selected, [TOKEN_COUNT])?;
     let losses = graph.neg(selected)?;
     graph.mean_default(losses)
+}
+
+fn masked_sparse_causal_loss(
+    graph: &mut Graph,
+    logits: NodeId,
+    targets: NodeId,
+    loss_mask: NodeId,
+) -> Result<NodeId> {
+    let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
+    let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
+    let target_indices = graph.reshape(targets, [TOKEN_COUNT, 1])?;
+    let selected = graph.gather(log_probabilities, target_indices, 1)?;
+    let selected = graph.reshape(selected, [TOKEN_COUNT])?;
+    let losses = graph.neg(selected)?;
+    let loss_mask = graph.reshape(loss_mask, [TOKEN_COUNT])?;
+    let weighted = graph.mul(losses, loss_mask)?;
+    let numerator = graph.sum_default(weighted)?;
+    let denominator = graph.sum_default(loss_mask)?;
+    graph.div(numerator, denominator)
 }
 
 fn build(
@@ -219,10 +246,16 @@ fn build_buffered(
     inputs: &BTreeMap<String, NodeId>,
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
-    let logits = model
-        .transformer
-        .forward(graph, inputs[TransformerBatch::TOKENS], dropout)?;
-    let loss = sparse_causal_loss(graph, logits, inputs[TransformerBatch::TARGETS])?;
+    let logits =
+        model
+            .transformer
+            .forward(graph, inputs[MaskedTransformerBatch::TOKENS], dropout)?;
+    let loss = masked_sparse_causal_loss(
+        graph,
+        logits,
+        inputs[MaskedTransformerBatch::TARGETS],
+        inputs[LOSS_MASK],
+    )?;
     Ok((loss, BTreeMap::from([("logits".into(), logits)])))
 }
 
@@ -248,6 +281,63 @@ struct TransformerBatch {
     targets: TensorData,
 }
 
+struct MaskedTransformerBatch {
+    tokens: TensorData,
+    targets: TensorData,
+    loss_mask: TensorData,
+}
+
+impl MaskedTransformerBatch {
+    const TOKENS: &'static str = "tokens";
+    const TARGETS: &'static str = "targets";
+    const SCHEMA: [CompiledInputSpec; 3] = [
+        CompiledInputSpec::new(LOSS_MASK, &[BATCH, TIME], DType::F32),
+        CompiledInputSpec::host_token(Self::TARGETS, &[BATCH, TIME]),
+        CompiledInputSpec::host_token(Self::TOKENS, &[BATCH, TIME]),
+    ];
+
+    fn right_padded(replay: u64, valid_lengths: [usize; BATCH]) -> Result<Self> {
+        if valid_lengths.iter().any(|valid| *valid > TIME) || valid_lengths.iter().all(|v| *v == 0)
+        {
+            return Err(rustgrad::Error::SessionTraining {
+                reason: "masked causal batch needs bounded right-padded valid lengths".into(),
+            });
+        }
+        let (mut tokens, mut targets) = batch_values(replay);
+        let mut loss_mask = [0.0; TOKEN_COUNT];
+        for (row, valid) in valid_lengths.into_iter().enumerate() {
+            for column in 0..TIME {
+                let index = row * TIME + column;
+                if column < valid {
+                    loss_mask[index] = 1.0;
+                } else {
+                    tokens[index] = 0;
+                    targets[index] = 0;
+                }
+            }
+        }
+        Ok(Self {
+            tokens: token_tensor(tokens)?,
+            targets: token_tensor(targets)?,
+            loss_mask: TensorData::new([BATCH, TIME], loss_mask.to_vec())?,
+        })
+    }
+}
+
+impl CompiledInputBatch for MaskedTransformerBatch {
+    fn schema() -> &'static [CompiledInputSpec] {
+        &Self::SCHEMA
+    }
+
+    fn into_compiled_inputs(self) -> Result<BTreeMap<String, TensorData>> {
+        Ok(BTreeMap::from([
+            (LOSS_MASK.into(), self.loss_mask),
+            (Self::TARGETS.into(), self.targets),
+            (Self::TOKENS.into(), self.tokens),
+        ]))
+    }
+}
+
 impl TransformerBatch {
     const TOKENS: &'static str = "tokens";
     const TARGETS: &'static str = "targets";
@@ -270,24 +360,37 @@ impl CompiledInputBatch for TransformerBatch {
     }
 }
 
-fn batch(replay: u64) -> Result<TransformerBatch> {
-    let tensor = |values: [i32; TOKEN_COUNT]| {
-        TensorData::from_scalars(
-            Shape::new([BATCH, TIME]),
-            DType::I32,
-            values.into_iter().map(|value| Scalar::I(i64::from(value))),
-        )
-    };
-    let (tokens, targets) = match (replay - 1) % ACCUMULATION_STEPS {
+fn batch_values(replay: u64) -> ([i32; TOKEN_COUNT], [i32; TOKEN_COUNT]) {
+    match (replay - 1) % ACCUMULATION_STEPS {
         0 => ([0, 1, 2, 2, 0, 1], [1, 2, 0, 0, 1, 2]),
         1 => ([1, 2, 0, 0, 1, 2], [2, 0, 1, 1, 2, 0]),
         2 => ([2, 0, 1, 1, 2, 0], [0, 1, 2, 2, 0, 1]),
         _ => unreachable!(),
-    };
+    }
+}
+
+fn token_tensor(values: [i32; TOKEN_COUNT]) -> Result<TensorData> {
+    TensorData::from_scalars(
+        Shape::new([BATCH, TIME]),
+        DType::I32,
+        values.into_iter().map(|value| Scalar::I(i64::from(value))),
+    )
+}
+
+fn batch(replay: u64) -> Result<TransformerBatch> {
+    let (tokens, targets) = batch_values(replay);
     Ok(TransformerBatch {
-        tokens: tensor(tokens)?,
-        targets: tensor(targets)?,
+        tokens: token_tensor(tokens)?,
+        targets: token_tensor(targets)?,
     })
+}
+
+fn masked_batch(replay: u64) -> Result<MaskedTransformerBatch> {
+    const VALID_LENGTHS: [[usize; BATCH]; 3] = [[3, 2], [2, 1], [3, 0]];
+    MaskedTransformerBatch::right_padded(
+        replay,
+        VALID_LENGTHS[((replay - 1) % ACCUMULATION_STEPS) as usize],
+    )
 }
 
 fn evaluate(model: &TinyCausalTransformer) -> Result<TensorData> {
@@ -310,6 +413,26 @@ fn evaluate_mean_sparse_loss(model: &TinyCausalTransformer) -> Result<f64> {
     for replay in 1..=ACCUMULATION_STEPS {
         let mut bindings = parameter_bindings.clone();
         bindings.extend(batch(replay)?.into_compiled_inputs()?);
+        total += CpuBackend
+            .execute(&graph, loss, &bindings)?
+            .scalar_at(0)
+            .as_f64();
+    }
+    Ok(total / ACCUMULATION_STEPS as f64)
+}
+
+fn evaluate_mean_masked_sparse_loss(model: &TinyCausalTransformer) -> Result<f64> {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype(MaskedTransformerBatch::TOKENS, [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype(MaskedTransformerBatch::TARGETS, [BATCH, TIME], DType::I32);
+    let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
+    let logits = model.forward_eval(&mut graph, tokens)?;
+    let loss = masked_sparse_causal_loss(&mut graph, logits, targets, loss_mask)?;
+    let parameter_bindings = model.input_bindings(&graph)?;
+    let mut total = 0.0;
+    for replay in 1..=ACCUMULATION_STEPS {
+        let mut bindings = parameter_bindings.clone();
+        bindings.extend(masked_batch(replay)?.into_compiled_inputs()?);
         total += CpuBackend
             .execute(&graph, loss, &bindings)?
             .scalar_at(0)
@@ -546,7 +669,12 @@ where
 
 fn run_cpu_reuse() -> Result<()> {
     let source = BufferedTinyCausalTransformer::new(7)?;
-    let initial_mean_sparse_loss = evaluate_mean_sparse_loss(&source.transformer)?;
+    let initial_mean_sparse_loss = evaluate_mean_masked_sparse_loss(&source.transformer)?;
+    assert_eq!(
+        masked_batch(3)?.loss_mask.to_vec_f64(),
+        vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+        "the third replay is a right-padded final partial row"
+    );
     let source_policy_frozen = source
         .trainable_parameters()?
         .into_iter()
@@ -581,7 +709,7 @@ fn run_cpu_reuse() -> Result<()> {
     );
 
     for replay in 1..=4 {
-        let step = uninterrupted.step_batch_scheduled(batch(replay)?)?;
+        let step = uninterrupted.step_batch_scheduled(masked_batch(replay)?)?;
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
     }
     assert_eq!(uninterrupted.optimizer_step()?, 1);
@@ -615,11 +743,11 @@ fn run_cpu_reuse() -> Result<()> {
     assert_eq!(resumed.checkpoint()?, checkpoint);
 
     let before_wrong_entrypoint = resumed.checkpoint()?;
-    assert!(resumed.step_batch(batch(5)?, 0.05).is_err());
+    assert!(resumed.step_batch(masked_batch(5)?, 0.05).is_err());
     assert_eq!(resumed.checkpoint()?, before_wrong_entrypoint);
     for replay in 5..=6 {
-        let expected = uninterrupted.step_batch_scheduled(batch(replay)?)?;
-        let actual = resumed.step_batch_scheduled(batch(replay)?)?;
+        let expected = uninterrupted.step_batch_scheduled(masked_batch(replay)?)?;
+        let actual = resumed.step_batch_scheduled(masked_batch(replay)?)?;
         assert_eq!(actual.loss(), expected.loss());
         assert_eq!(
             actual
@@ -767,7 +895,7 @@ fn run_cpu_reuse() -> Result<()> {
         running_marker_before.trainable
     );
 
-    let final_mean_sparse_loss = evaluate_mean_sparse_loss(&destination.transformer)?;
+    let final_mean_sparse_loss = evaluate_mean_masked_sparse_loss(&destination.transformer)?;
     assert!(
         final_mean_sparse_loss < initial_mean_sparse_loss,
         "compile-once causal Transformer loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
@@ -816,7 +944,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         prepare_wall_time,
     )?;
     for replay in 1..=SAMPLES {
-        let step = session.step_batch_scheduled(batch(replay)?)?;
+        let step = session.step_batch_scheduled(masked_batch(replay)?)?;
         scoreboard.record(step.report())?;
     }
 

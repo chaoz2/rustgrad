@@ -10,12 +10,12 @@ use rustgrad::{
     Backend, CapturedReplayExecutor, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig,
     CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWPlan, CompiledAdamWRuntime,
     CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
-    CompiledEvaluation, CompiledEvaluationRuntime, CompiledModuleAdamWPlan, CompiledMultiStepLr,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuNonFinitePolicy,
-    CpuSessionTarget, DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module,
-    NativeCpuSessionTarget, NativeTrainingReport, NativeTrainingScoreboard, NodeId, Op, Parameter,
-    Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
-    cross_entropy, load_safetensors, save_safetensors,
+    CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
+    CompiledModuleAdamWPlan, CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep,
+    CpuBackend, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions,
+    MetalCompiledAdamWPlan, Module, NativeCpuSessionTarget, NativeTrainingReport,
+    NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
+    TrainingDropoutProvider, TransformerBlock, cross_entropy, load_safetensors, save_safetensors,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -30,6 +30,7 @@ const TIME: usize = 3;
 const TOKEN_COUNT: usize = BATCH * TIME;
 const ACCUMULATION_STEPS: u64 = 3;
 const MAX_GRADIENT_NORM: f32 = 0.25;
+const LOSS_MASK: &str = "loss_mask";
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -153,6 +154,14 @@ fn frozen_embedding_config() -> CompiledAdamWConfig {
 }
 
 fn config_with_max_gradient_norm(max_gradient_norm: Option<f32>) -> CompiledAdamWConfig {
+    optimizer_config(max_gradient_norm)
+        .with_host_token_input("tokens", [BATCH, TIME])
+        .unwrap()
+        .with_host_token_input("targets", [BATCH, TIME])
+        .unwrap()
+}
+
+fn optimizer_config(max_gradient_norm: Option<f32>) -> CompiledAdamWConfig {
     let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)
         .unwrap()
         .with_weight_decay_exclusions(WEIGHT_DECAY_EXCLUSIONS)
@@ -161,14 +170,15 @@ fn config_with_max_gradient_norm(max_gradient_norm: Option<f32>) -> CompiledAdam
         .unwrap()
         .with_gradient_accumulation(ACCUMULATION_STEPS)
         .unwrap();
-    let config = match max_gradient_norm {
+    match max_gradient_norm {
         Some(max_gradient_norm) => config.with_max_gradient_norm(max_gradient_norm).unwrap(),
         None => config,
-    };
-    config
-        .with_host_token_input("tokens", [BATCH, TIME])
-        .unwrap()
-        .with_host_token_input("targets", [BATCH, TIME])
+    }
+}
+
+fn masked_config() -> CompiledAdamWConfig {
+    optimizer_config(Some(MAX_GRADIENT_NORM))
+        .with_input_batch::<MaskedTransformerBatch>()
         .unwrap()
 }
 
@@ -180,6 +190,25 @@ fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Res
     let selected = graph.reshape(selected, [TOKEN_COUNT])?;
     let losses = graph.neg(selected)?;
     graph.mean_default(losses)
+}
+
+fn masked_sparse_causal_loss(
+    graph: &mut Graph,
+    logits: NodeId,
+    targets: NodeId,
+    loss_mask: NodeId,
+) -> Result<NodeId> {
+    let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
+    let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
+    let target_indices = graph.reshape(targets, [TOKEN_COUNT, 1])?;
+    let selected = graph.gather(log_probabilities, target_indices, 1)?;
+    let selected = graph.reshape(selected, [TOKEN_COUNT])?;
+    let losses = graph.neg(selected)?;
+    let loss_mask = graph.reshape(loss_mask, [TOKEN_COUNT])?;
+    let weighted = graph.mul(losses, loss_mask)?;
+    let numerator = graph.sum_default(weighted)?;
+    let denominator = graph.sum_default(loss_mask)?;
+    graph.div(numerator, denominator)
 }
 
 fn build(
@@ -199,7 +228,24 @@ fn build_buffered(
     inputs: &BTreeMap<String, NodeId>,
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
-    build_with_dropout_observations(&model.transformer, graph, inputs, dropout)
+    let mut observed = ObservedResidualDropout {
+        inner: dropout,
+        sites: Vec::new(),
+    };
+    let logits = model
+        .transformer
+        .forward(graph, inputs["tokens"], &mut observed)?;
+    assert_eq!(observed.sites.len(), 2);
+    let loss = masked_sparse_causal_loss(graph, logits, inputs["targets"], inputs[LOSS_MASK])?;
+    Ok((
+        loss,
+        BTreeMap::from([
+            ("dropout_0_input".into(), observed.sites[0].0),
+            ("dropout_0_output".into(), observed.sites[0].1),
+            ("dropout_1_input".into(), observed.sites[1].0),
+            ("dropout_1_output".into(), observed.sites[1].1),
+        ]),
+    ))
 }
 
 fn build_with_dropout_observations(
@@ -240,25 +286,178 @@ fn dropout_config() -> CompiledDropoutConfig {
     CompiledDropoutConfig::new(CompiledDropoutKey([0x1234_5678, 0x9abc_def0]))
 }
 
-fn batch(replay: u64) -> BTreeMap<String, TensorData> {
-    let tensor = |values: [i32; TOKEN_COUNT]| {
-        TensorData::from_scalars(
-            Shape::new([BATCH, TIME]),
-            DType::I32,
-            values.into_iter().map(|value| Scalar::I(i64::from(value))),
-        )
-        .unwrap()
-    };
-    let (tokens, targets) = match (replay - 1) % ACCUMULATION_STEPS {
+fn batch_values(replay: u64) -> ([i32; TOKEN_COUNT], [i32; TOKEN_COUNT]) {
+    match (replay - 1) % ACCUMULATION_STEPS {
         0 => ([0, 1, 2, 2, 0, 1], [1, 2, 0, 0, 1, 2]),
         1 => ([1, 2, 0, 0, 1, 2], [2, 0, 1, 1, 2, 0]),
         2 => ([2, 0, 1, 1, 2, 0], [0, 1, 2, 2, 0, 1]),
         _ => unreachable!(),
-    };
+    }
+}
+
+fn token_tensor(values: [i32; TOKEN_COUNT]) -> TensorData {
+    TensorData::from_scalars(
+        Shape::new([BATCH, TIME]),
+        DType::I32,
+        values.into_iter().map(|value| Scalar::I(i64::from(value))),
+    )
+    .unwrap()
+}
+
+fn batch(replay: u64) -> BTreeMap<String, TensorData> {
+    let (tokens, targets) = batch_values(replay);
     BTreeMap::from([
-        ("tokens".into(), tensor(tokens)),
-        ("targets".into(), tensor(targets)),
+        ("tokens".into(), token_tensor(tokens)),
+        ("targets".into(), token_tensor(targets)),
     ])
+}
+
+struct MaskedTransformerBatch {
+    tokens: TensorData,
+    targets: TensorData,
+    loss_mask: TensorData,
+}
+
+impl MaskedTransformerBatch {
+    const SCHEMA: [CompiledInputSpec; 3] = [
+        CompiledInputSpec::new(LOSS_MASK, &[BATCH, TIME], DType::F32),
+        CompiledInputSpec::host_token("targets", &[BATCH, TIME]),
+        CompiledInputSpec::host_token("tokens", &[BATCH, TIME]),
+    ];
+
+    fn right_padded(replay: u64, valid_lengths: [usize; BATCH]) -> Self {
+        let (mut tokens, mut targets) = batch_values(replay);
+        let mut loss_mask = [0.0; TOKEN_COUNT];
+        for (row, valid) in valid_lengths.into_iter().enumerate() {
+            for column in 0..TIME {
+                let index = row * TIME + column;
+                if column < valid {
+                    loss_mask[index] = 1.0;
+                } else {
+                    tokens[index] = 0;
+                    targets[index] = 0;
+                }
+            }
+        }
+        Self::from_values(tokens, targets, loss_mask)
+    }
+
+    fn from_values(
+        tokens: [i32; TOKEN_COUNT],
+        targets: [i32; TOKEN_COUNT],
+        loss_mask: [f32; TOKEN_COUNT],
+    ) -> Self {
+        Self {
+            tokens: token_tensor(tokens),
+            targets: token_tensor(targets),
+            loss_mask: TensorData::new([BATCH, TIME], loss_mask.to_vec()).unwrap(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let expected_shape = Shape::new([BATCH, TIME]);
+        if self.tokens.shape() != &expected_shape
+            || self.tokens.dtype() != DType::I32
+            || self.targets.shape() != &expected_shape
+            || self.targets.dtype() != DType::I32
+            || self.loss_mask.shape() != &expected_shape
+            || self.loss_mask.dtype() != DType::F32
+        {
+            return Err(masked_batch_error(
+                "masked causal batch descriptor mismatch",
+            ));
+        }
+        let mut any_valid = false;
+        for row in 0..BATCH {
+            let mut reached_padding = false;
+            for column in 0..TIME {
+                let index = row * TIME + column;
+                let token = self.tokens.scalar_at(index).as_i64();
+                let target = self.targets.scalar_at(index).as_i64();
+                if !(0..VOCAB as i64).contains(&token) || !(0..VOCAB as i64).contains(&target) {
+                    return Err(masked_batch_error(
+                        "masked causal batch tokens and dummy targets must be legal vocabulary indices",
+                    ));
+                }
+                let mask = self.loss_mask.scalar_at(index).as_f64();
+                if !mask.is_finite() || (mask != 0.0 && mask != 1.0) {
+                    return Err(masked_batch_error(
+                        "masked causal batch loss mask must contain finite binary values",
+                    ));
+                }
+                if mask == 0.0 {
+                    reached_padding = true;
+                } else if reached_padding {
+                    return Err(masked_batch_error(
+                        "masked causal batch loss mask must describe right padding",
+                    ));
+                } else {
+                    any_valid = true;
+                }
+            }
+        }
+        if !any_valid {
+            return Err(masked_batch_error(
+                "masked causal batch must contain at least one valid target",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl CompiledInputBatch for MaskedTransformerBatch {
+    fn schema() -> &'static [CompiledInputSpec] {
+        &Self::SCHEMA
+    }
+
+    fn into_compiled_inputs(self) -> Result<BTreeMap<String, TensorData>> {
+        self.validate()?;
+        Ok(BTreeMap::from([
+            (LOSS_MASK.into(), self.loss_mask),
+            ("targets".into(), self.targets),
+            ("tokens".into(), self.tokens),
+        ]))
+    }
+}
+
+fn masked_batch_error(reason: &str) -> Error {
+    Error::SessionTraining {
+        reason: reason.into(),
+    }
+}
+
+fn masked_batch(replay: u64) -> MaskedTransformerBatch {
+    const VALID_LENGTHS: [[usize; BATCH]; 3] = [[3, 2], [2, 1], [3, 0]];
+    MaskedTransformerBatch::right_padded(
+        replay,
+        VALID_LENGTHS[((replay - 1) % ACCUMULATION_STEPS) as usize],
+    )
+}
+
+fn invalid_masked_batches() -> Vec<MaskedTransformerBatch> {
+    let (tokens, targets) = batch_values(1);
+    let mut batches = vec![
+        MaskedTransformerBatch::from_values(tokens, targets, [f32::NAN, 1.0, 0.0, 1.0, 0.0, 0.0]),
+        MaskedTransformerBatch::from_values(tokens, targets, [0.5, 1.0, 0.0, 1.0, 0.0, 0.0]),
+        MaskedTransformerBatch::from_values(tokens, targets, [1.0, 0.0, 1.0, 1.0, 0.0, 0.0]),
+        MaskedTransformerBatch::from_values(
+            tokens,
+            [1, 2, 3, 0, 0, 0],
+            [1.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+        ),
+        MaskedTransformerBatch::from_values(tokens, targets, [0.0; TOKEN_COUNT]),
+    ];
+    batches.push(MaskedTransformerBatch {
+        tokens: token_tensor(tokens),
+        targets: token_tensor(targets),
+        loss_mask: TensorData::scalar(1.0),
+    });
+    batches.push(MaskedTransformerBatch {
+        tokens: token_tensor(tokens),
+        targets: token_tensor(targets),
+        loss_mask: token_tensor([1; TOKEN_COUNT]),
+    });
+    batches
 }
 
 fn learning_rate() -> TensorData {
@@ -1377,6 +1576,28 @@ fn evaluate_mean_sparse_loss(model: &TinyCausalTransformer) -> f64 {
         .map(|replay| {
             let mut bindings = parameter_bindings.clone();
             bindings.extend(batch(replay));
+            CpuBackend
+                .execute(&graph, loss, &bindings)
+                .unwrap()
+                .scalar_at(0)
+                .as_f64()
+        })
+        .sum::<f64>();
+    total / ACCUMULATION_STEPS as f64
+}
+
+fn evaluate_mean_masked_sparse_loss(model: &TinyCausalTransformer) -> f64 {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
+    let logits = model.forward_eval(&mut graph, tokens).unwrap();
+    let loss = masked_sparse_causal_loss(&mut graph, logits, targets, loss_mask).unwrap();
+    let parameter_bindings = model.input_bindings(&graph).unwrap();
+    let total = (1..=ACCUMULATION_STEPS)
+        .map(|replay| {
+            let mut bindings = parameter_bindings.clone();
+            bindings.extend(masked_batch(replay).into_compiled_inputs().unwrap());
             CpuBackend
                 .execute(&graph, loss, &bindings)
                 .unwrap()
@@ -2536,11 +2757,18 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
     const POLICY_FROZEN: &str = "block.ff1.0";
 
     let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1]).unwrap();
-    let policy = config()
+    let policy = masked_config()
         .with_frozen_parameters([POLICY_FROZEN])
         .unwrap()
         .with_captured_multi_step_lr(schedule.clone());
+    let masks = (1..=3)
+        .map(|replay| masked_batch(replay).loss_mask)
+        .collect::<Vec<_>>();
+    assert_ne!(masks[0], masks[1]);
+    assert_ne!(masks[1], masks[2]);
+    assert_eq!(masks[2].to_vec_f64(), vec![1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
     let source = BufferedTinyCausalTransformer::new(7).unwrap();
+    let initial_mean_sparse_loss = evaluate_mean_masked_sparse_loss(&source.transformer);
     let source_policy_frozen = source
         .trainable_parameters()
         .unwrap()
@@ -2570,14 +2798,48 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
     let mut uninterrupted = plan.prepare(&target).unwrap();
     assert_eq!(uninterrupted.captured_multi_step_lr(), Some(&schedule));
     assert_eq!(
+        uninterrupted.gradient_accumulation_steps(),
+        ACCUMULATION_STEPS
+    );
+    assert_eq!(uninterrupted.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
+    assert_eq!(
         uninterrupted.non_finite_policy(),
         CpuNonFinitePolicy::RejectTransition
     );
+    let initial_checkpoint = uninterrupted.checkpoint().unwrap();
+    for invalid in invalid_masked_batches() {
+        assert!(uninterrupted.step_batch_scheduled(invalid).is_err());
+        assert_eq!(uninterrupted.checkpoint().unwrap(), initial_checkpoint);
+    }
     let before_wrong_entrypoint = uninterrupted.checkpoint().unwrap();
-    assert!(uninterrupted.step(batch(1), learning_rate()).is_err());
+    assert!(uninterrupted.step_batch(masked_batch(1), 0.05).is_err());
     assert_eq!(uninterrupted.checkpoint().unwrap(), before_wrong_entrypoint);
-    for replay in 1..=4 {
-        uninterrupted.step_scheduled(batch(replay)).unwrap();
+    let empty_accumulators = uninterrupted.gradient_accumulator_snapshots().unwrap();
+    for replay in 1..=2 {
+        let step = uninterrupted
+            .step_batch_scheduled(masked_batch(replay))
+            .unwrap();
+        assert!(!step.did_update());
+    }
+    assert_eq!(
+        uninterrupted.zero_grad().unwrap().discarded_microbatches(),
+        2
+    );
+    assert_eq!(uninterrupted.step_count(), 2);
+    assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
+    assert_eq!(uninterrupted.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        uninterrupted.gradient_accumulator_snapshots().unwrap(),
+        empty_accumulators
+    );
+    assert_eq!(
+        checkpoint_dropout_block_counter(&uninterrupted.checkpoint().unwrap()),
+        24
+    );
+    for replay in 3..=6 {
+        uninterrupted
+            .step_batch_scheduled(masked_batch(replay))
+            .unwrap();
     }
 
     let checkpoint = uninterrupted.checkpoint().unwrap();
@@ -2604,10 +2866,11 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
             .any(|value| value != 0.0)
     );
     assert_eq!(checkpoint.info().capture_identity(), capture_identity);
-    assert_eq!(checkpoint.info().replay_step(), 4);
+    assert_eq!(checkpoint.info().replay_step(), 6);
     assert_eq!(checkpoint.info().optimizer_step(), 1);
     assert_eq!(checkpoint.info().accumulation_index(), 1);
-    assert_eq!(checkpoint.info().dropout_block_counter(), Some(48));
+    assert_eq!(checkpoint.info().discarded_microbatches(), 2);
+    assert_eq!(checkpoint.info().dropout_block_counter(), Some(72));
 
     let destination = BufferedTinyCausalTransformer::new(0xdecafbad).unwrap();
     let tied = destination.transformer.tokens.weight.clone();
@@ -2677,27 +2940,28 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         resumed_plan.flush_capture_identity(),
         flush_capture_identity
     );
-    assert_eq!(resumed_plan.step_count(), 4);
+    assert_eq!(resumed_plan.step_count(), 6);
     assert_eq!(resumed_plan.captured_multi_step_lr(), Some(&schedule));
     let mut resumed = resumed_plan.prepare(&target).unwrap();
     assert_eq!(resumed.capture_identity(), capture_identity);
-    assert_eq!(resumed.step_count(), 4);
+    assert_eq!(resumed.step_count(), 6);
     assert_eq!(resumed.optimizer_step().unwrap(), 1);
     assert_eq!(resumed.accumulation_index().unwrap(), 1);
+    assert_eq!(resumed.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
     assert_eq!(resumed.captured_multi_step_lr(), Some(&schedule));
     assert_eq!(
         resumed.non_finite_policy(),
         CpuNonFinitePolicy::RejectTransition
     );
     let restored_before_wrong_entrypoint = resumed.checkpoint().unwrap();
-    assert!(resumed.step(batch(5), learning_rate()).is_err());
+    assert!(resumed.step_batch(masked_batch(7), 0.05).is_err());
     assert_eq!(
         resumed.checkpoint().unwrap(),
         restored_before_wrong_entrypoint
     );
     assert_eq!(
         checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
-        48
+        72
     );
     assert_eq!(
         resumed.parameter_snapshots().unwrap(),
@@ -2733,16 +2997,18 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         running_marker_before.version
     );
 
-    for replay in 5..=6 {
-        let expected = uninterrupted.step_scheduled(batch(replay)).unwrap();
-        let actual = resumed.step_scheduled(batch(replay)).unwrap();
+    for replay in 7..=9 {
+        let expected = uninterrupted
+            .step_batch_scheduled(masked_batch(replay))
+            .unwrap();
+        let actual = resumed.step_batch_scheduled(masked_batch(replay)).unwrap();
         assert_eq!(actual.loss(), expected.loss());
         assert_eq!(actual.outputs(), expected.outputs());
         assert_eq!(actual.step(), expected.step());
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
         assert_eq!(actual.accumulation_index(), expected.accumulation_index());
         assert_eq!(actual.did_update(), expected.did_update());
-        assert_eq!(actual.did_update(), replay == 6);
+        assert_eq!(actual.did_update(), replay == 8);
         assert_eq!(actual.capture_identity(), capture_identity);
         assert_eq!(
             checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
@@ -2769,12 +3035,36 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
             uninterrupted.checkpoint().unwrap()
         );
     }
-    assert_eq!(resumed.step_count(), 6);
+    assert_eq!(resumed.step_count(), 9);
     assert_eq!(resumed.optimizer_step().unwrap(), 2);
-    assert_eq!(resumed.accumulation_index().unwrap(), 0);
+    assert_eq!(resumed.accumulation_index().unwrap(), 1);
     assert_eq!(
         checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
-        72
+        108
+    );
+
+    let expected_flush = uninterrupted.flush_partial_window_scheduled().unwrap();
+    let actual_flush = resumed.flush_partial_window_scheduled().unwrap();
+    assert_eq!(actual_flush.flushed_microbatches(), 1);
+    assert_eq!(
+        actual_flush.flushed_microbatches(),
+        expected_flush.flushed_microbatches()
+    );
+    assert_eq!(
+        actual_flush.optimizer_step(),
+        expected_flush.optimizer_step()
+    );
+    assert_eq!(actual_flush.did_update(), expected_flush.did_update());
+    assert_eq!(resumed.optimizer_step().unwrap(), 3);
+    assert_eq!(resumed.accumulation_index().unwrap(), 0);
+    assert_eq!(resumed.step_count(), 9);
+    assert_eq!(
+        checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
+        108
+    );
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
     );
 
     let final_parameters = resumed.parameter_snapshots().unwrap();
@@ -2832,6 +3122,11 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
     assert_eq!(
         running_marker_after.trainable,
         running_marker_before.trainable
+    );
+    let final_mean_sparse_loss = evaluate_mean_masked_sparse_loss(&destination.transformer);
+    assert!(
+        final_mean_sparse_loss < initial_mean_sparse_loss,
+        "masked compile-once causal Transformer loss did not decrease: {initial_mean_sparse_loss} -> {final_mean_sparse_loss}"
     );
 }
 

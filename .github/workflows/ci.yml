@@ -81,6 +81,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+      - name: Compiled Transformer masked-batch resume smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo run --quiet --example compiled_transformer_train_resume -- cpu-reuse
       - run: cargo test --doc
 
   address-sanitizer:

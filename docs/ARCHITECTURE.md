@@ -1060,6 +1060,16 @@ attached-evaluation construction. Independent runtimes may then prepare from
 the original and restored plans, and publication may target a separately
 initialized module after its capture-owned frozen constants are aligned with
 the compiled program, without making that module part of checkpoint restore.
+The dedicated CPU borrowed-plan workload keeps the capture shape fixed while
+binding a new F32 `[B,T]` loss mask on every replay. Its typed batch boundary
+admits only finite binary right-padding masks, legal I32 tokens and dummy
+targets, and at least one valid target before runtime mutation; the graph uses
+`sum(mask * sparse_nll) / sum(mask)`. A padded final partial row therefore
+shares the same program and recurrent frontier as full rows. Accumulation
+continues to average already-normalized microbatch gradients equally rather
+than retaining a token-count denominator. This adds no dynamic shape, recurrent
+state, checkpoint field, Metal policy, or change to the shared external-rate
+capture.
 `CompiledAdamWConfig::with_frozen_parameters` projects a deterministic set of
 exact canonical module names out of that optimizer frontier at compile time.
 Resolution happens by `ParameterId`, so a canonical tied weight and every alias
