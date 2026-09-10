@@ -37,6 +37,7 @@ const MULTI_HEAD_EMBEDDING: usize = 4;
 const MULTI_HEAD_FEED_FORWARD: usize = 8;
 const TWO_BLOCK_ACCUMULATION_STEPS: u64 = 2;
 const TWO_BLOCK_MAX_GRADIENT_NORM: f32 = 1e-4;
+const ATTENTION_DROPOUT_TRANSITION_GUARD: &str = "attention_dropout_transition_guard";
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -230,6 +231,10 @@ struct TwoBlockPositionalGpt {
 
 impl TwoBlockPositionalGpt {
     fn new(seed: u64) -> Result<Self> {
+        Self::new_with_attention_dropout(seed, 0.0)
+    }
+
+    fn new_with_attention_dropout(seed: u64, attention_dropout: f64) -> Result<Self> {
         let model = Self {
             tokens: Embedding::new_static(MULTI_HEAD_VOCAB, MULTI_HEAD_EMBEDDING, None, seed)?,
             positions: Embedding::new_static(
@@ -246,7 +251,8 @@ impl TwoBlockPositionalGpt {
                 0.25,
                 seed.wrapping_add(2),
             )?
-            .with_causal_attention(true),
+            .with_causal_attention(true)
+            .with_attention_dropout(attention_dropout)?,
             second: TransformerBlock::new_static(
                 MULTI_HEAD_EMBEDDING,
                 2,
@@ -255,7 +261,8 @@ impl TwoBlockPositionalGpt {
                 0.25,
                 seed.wrapping_add(3),
             )?
-            .with_causal_attention(true),
+            .with_causal_attention(true)
+            .with_attention_dropout(attention_dropout)?,
             norm: LayerNorm::new_static([MULTI_HEAD_EMBEDDING], 1e-5, true)?,
         };
         let feed_forward_bias = TensorData::new(
@@ -421,6 +428,12 @@ fn two_block_config() -> CompiledAdamWConfig {
         .unwrap()
 }
 
+fn two_block_attention_dropout_config() -> CompiledAdamWConfig {
+    two_block_config()
+        .with_input(ATTENTION_DROPOUT_TRANSITION_GUARD, [], DType::F32)
+        .unwrap()
+}
+
 fn sparse_causal_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
     let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
     let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
@@ -495,6 +508,81 @@ fn build_two_block(
     let logits = model.forward(graph, inputs["tokens"], &mut dropout)?;
     assert_eq!(dropout.next, 4);
     let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
+    Ok((loss, BTreeMap::from([("logits".into(), logits)])))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TwoBlockDropoutSite {
+    AttentionProbabilities,
+    Residual,
+}
+
+struct ObservedTwoBlockDropout<'a> {
+    inner: &'a mut dyn TrainingDropoutProvider,
+    sites: Vec<(TwoBlockDropoutSite, Shape, DType, f64)>,
+}
+
+impl TrainingDropoutProvider for ObservedTwoBlockDropout<'_> {
+    fn dropout(&mut self, graph: &mut Graph, input: NodeId, probability: f64) -> Result<NodeId> {
+        self.sites.push((
+            TwoBlockDropoutSite::Residual,
+            graph.shape(input)?.clone(),
+            graph.dtype(input)?,
+            probability,
+        ));
+        self.inner.dropout(graph, input, probability)
+    }
+
+    fn attention_dropout(
+        &mut self,
+        graph: &mut Graph,
+        probabilities: NodeId,
+        probability: f64,
+    ) -> Result<NodeId> {
+        self.sites.push((
+            TwoBlockDropoutSite::AttentionProbabilities,
+            graph.shape(probabilities)?.clone(),
+            graph.dtype(probabilities)?,
+            probability,
+        ));
+        self.inner
+            .attention_dropout(graph, probabilities, probability)
+    }
+}
+
+fn build_two_block_with_attention_dropout(
+    model: &TwoBlockPositionalGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let mut observed = ObservedTwoBlockDropout {
+        inner: dropout,
+        sites: Vec::new(),
+    };
+    let logits = model.forward(graph, inputs["tokens"], &mut observed)?;
+    let expected = [
+        TwoBlockDropoutSite::AttentionProbabilities,
+        TwoBlockDropoutSite::Residual,
+        TwoBlockDropoutSite::Residual,
+        TwoBlockDropoutSite::AttentionProbabilities,
+        TwoBlockDropoutSite::Residual,
+        TwoBlockDropoutSite::Residual,
+    ];
+    assert_eq!(observed.sites.len(), expected.len());
+    for ((site, shape, dtype, probability), expected) in observed.sites.iter().zip(expected) {
+        assert_eq!(*site, expected);
+        assert_eq!(*dtype, DType::F32);
+        assert_eq!(probability.to_bits(), 0.25f64.to_bits());
+        let expected_shape = match site {
+            TwoBlockDropoutSite::AttentionProbabilities => Shape::new([BATCH, 2, TIME, TIME]),
+            TwoBlockDropoutSite::Residual => Shape::new([BATCH, TIME, MULTI_HEAD_EMBEDDING]),
+        };
+        assert_eq!(*shape, expected_shape);
+    }
+    let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
+    let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
+    let loss = graph.add(loss, guard)?;
     Ok((loss, BTreeMap::from([("logits".into(), logits)])))
 }
 
@@ -604,6 +692,19 @@ fn multi_head_batch() -> BTreeMap<String, TensorData> {
         ("tokens".into(), token_tensor(tokens)),
         ("targets".into(), token_tensor(targets)),
     ])
+}
+
+fn attention_dropout_batch(guard: f32) -> BTreeMap<String, TensorData> {
+    let mut batch = multi_head_batch();
+    assert!(
+        batch
+            .insert(
+                ATTENTION_DROPOUT_TRANSITION_GUARD.into(),
+                TensorData::scalar(guard),
+            )
+            .is_none()
+    );
+    batch
 }
 
 struct MaskedTransformerBatch {
@@ -3437,6 +3538,153 @@ fn compiled_two_block_positional_gpt_trains_resumes_and_matches_native_and_numer
     let native_step = native.step(input, learning_rate()).unwrap();
     assert_two_block_step_close(4, &uninterrupted_step, &native_step);
     assert_two_block_frontier_close(&interpreted, &native);
+    assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+    const BLOCKS_PER_REPLAY: u64 = 84;
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    assert_eq!(model.first.attention_dropout(), ATTENTION_DROPOUT);
+    assert_eq!(model.second.attention_dropout(), ATTENTION_DROPOUT);
+    let compile_count = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+        two_block_attention_dropout_config(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_with_attention_dropout(model, graph, inputs, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(plan.dropout_blocks_per_replay(), Some(BLOCKS_PER_REPLAY));
+
+    let cpu_target =
+        CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let executor = CapturedReplayExecutor::default();
+    let native_target = NativeCpuSessionTarget::new(&executor)
+        .vectorized(true)
+        .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut interpreted = plan.prepare(&cpu_target).unwrap();
+    let mut native = plan.prepare(&native_target).unwrap();
+    let mut retry_reference = plan.prepare(&cpu_target).unwrap();
+    let preparation = native.preparation_report();
+    assert!(preparation.main().native_item_count() > 0);
+    assert_eq!(preparation.main().fallback_count(), 0);
+    assert_eq!(preparation.partial_flush().unwrap().fallback_count(), 0);
+    assert_eq!(preparation.zero_grad().unwrap().fallback_count(), 0);
+    assert_eq!(compile_count.get(), 1);
+    let input = attention_dropout_batch;
+    let learning_rate = || TensorData::scalar(1e-3);
+
+    let interpreted_before_failure = interpreted.checkpoint().unwrap();
+    let native_before_failure = native.checkpoint().unwrap();
+    assert!(interpreted.step(input(0.0), learning_rate()).is_err());
+    assert!(native.step(input(0.0), learning_rate()).is_err());
+    assert_eq!(
+        interpreted.checkpoint().unwrap(),
+        interpreted_before_failure
+    );
+    assert_eq!(native.checkpoint().unwrap(), native_before_failure);
+    assert_eq!(interpreted.step_count(), 0);
+    assert_eq!(native.step_count(), 0);
+    assert_eq!(interpreted.dropout_block_counter().unwrap(), Some(0));
+    assert_eq!(native.dropout_block_counter().unwrap(), Some(0));
+
+    let interpreted_step = interpreted.step(input(1.0), learning_rate()).unwrap();
+    let reference_step = retry_reference.step(input(1.0), learning_rate()).unwrap();
+    let native_step = native.step(input(1.0), learning_rate()).unwrap();
+    assert_two_block_step_close(1, &interpreted_step, &native_step);
+    assert_eq!(interpreted_step.loss(), reference_step.loss());
+    assert_eq!(interpreted_step.outputs(), reference_step.outputs());
+    assert_eq!(
+        interpreted.checkpoint().unwrap(),
+        retry_reference.checkpoint().unwrap()
+    );
+    assert_two_block_frontier_close(&interpreted, &native);
+    assert_eq!(
+        interpreted.dropout_block_counter().unwrap(),
+        Some(BLOCKS_PER_REPLAY)
+    );
+    assert_eq!(
+        native.dropout_block_counter().unwrap(),
+        Some(BLOCKS_PER_REPLAY)
+    );
+
+    assert_eq!(interpreted.zero_grad().unwrap().discarded_microbatches(), 1);
+    assert_eq!(native.zero_grad().unwrap().discarded_microbatches(), 1);
+    assert_eq!(interpreted.step_count(), 1);
+    assert_eq!(native.step_count(), 1);
+    assert_eq!(interpreted.accumulation_index().unwrap(), 0);
+    assert_eq!(native.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        interpreted.dropout_block_counter().unwrap(),
+        Some(BLOCKS_PER_REPLAY)
+    );
+    assert_eq!(
+        native.dropout_block_counter().unwrap(),
+        Some(BLOCKS_PER_REPLAY)
+    );
+    assert_two_block_frontier_close(&interpreted, &native);
+
+    for replay in 2..=4 {
+        let interpreted_step = interpreted.step(input(1.0), learning_rate()).unwrap();
+        let native_step = native.step(input(1.0), learning_rate()).unwrap();
+        assert_two_block_step_close(replay, &interpreted_step, &native_step);
+        assert_two_block_frontier_close(&interpreted, &native);
+        assert_eq!(
+            interpreted.dropout_block_counter().unwrap(),
+            Some(replay * BLOCKS_PER_REPLAY)
+        );
+        assert_eq!(
+            native.dropout_block_counter().unwrap(),
+            Some(replay * BLOCKS_PER_REPLAY)
+        );
+    }
+    assert_eq!(interpreted.optimizer_step().unwrap(), 1);
+    assert_eq!(interpreted.accumulation_index().unwrap(), 1);
+    let checkpoint = interpreted.checkpoint().unwrap();
+    assert_eq!(checkpoint.info().replay_step(), 4);
+    assert_eq!(checkpoint.info().optimizer_step(), 1);
+    assert_eq!(checkpoint.info().accumulation_index(), 1);
+    assert_eq!(checkpoint.info().discarded_microbatches(), 1);
+    assert_eq!(
+        checkpoint.info().dropout_block_counter(),
+        Some(4 * BLOCKS_PER_REPLAY)
+    );
+
+    let restored_plan = plan.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(restored_plan.capture_identity(), plan.capture_identity());
+    let mut resumed = restored_plan.prepare(&cpu_target).unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+    let uninterrupted_step = interpreted.step(input(1.0), learning_rate()).unwrap();
+    let resumed_step = resumed.step(input(1.0), learning_rate()).unwrap();
+    assert_eq!(resumed_step.loss(), uninterrupted_step.loss());
+    assert_eq!(resumed_step.outputs(), uninterrupted_step.outputs());
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        interpreted.checkpoint().unwrap()
+    );
+    assert_eq!(resumed.optimizer_step().unwrap(), 2);
+    assert_eq!(resumed.accumulation_index().unwrap(), 0);
+    assert_eq!(
+        resumed.dropout_block_counter().unwrap(),
+        Some(5 * BLOCKS_PER_REPLAY)
+    );
+
+    let native_step = native.step(input(1.0), learning_rate()).unwrap();
+    assert_two_block_step_close(5, &uninterrupted_step, &native_step);
+    assert_two_block_frontier_close(&interpreted, &native);
+    assert_eq!(
+        native.dropout_block_counter().unwrap(),
+        Some(5 * BLOCKS_PER_REPLAY)
+    );
     assert_eq!(compile_count.get(), 1);
 }
 
