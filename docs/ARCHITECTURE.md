@@ -1039,6 +1039,15 @@ optimizer-owned recurrent inputs, tied handles share that one node/state tuple,
 and frozen parameters or buffers become immutable capture constants.
 `compile_module_from_checkpoint` rebuilds the same module topology and requires
 its frozen values and graph to reproduce the authenticated capture identity.
+That is the portable cross-process path because checkpoints contain recurrent
+values and progress, not executable captures. In the same process,
+`CompiledAdamWPlan::restore_checkpoint` instead clones the already compiled
+resource-free program and rebases only its authenticated recurrent frontier;
+it invokes no module builder, graph/autograd transform, scheduler, capture, or
+attached-evaluation construction. Independent runtimes may then prepare from
+the original and restored plans, and publication may target a separately
+initialized module after its capture-owned frozen constants are aligned with
+the compiled program, without making that module part of checkpoint restore.
 `CompiledAdamWConfig::with_frozen_parameters` projects a deterministic set of
 exact canonical module names out of that optimizer frontier at compile time.
 Resolution happens by `ParameterId`, so a canonical tied weight and every alias

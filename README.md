@@ -87,10 +87,14 @@ For repeated training, the compiled runtime captures
 and optimizer slots in one atomic recurrent frontier. `CompiledTrainingRuntime`
 is the small optimizer-neutral loop contract; checkpointing and AdamW policy are
 separate capabilities, and concrete Metal sessions keep their device reports.
-The maintained tiny causal Transformer example compiles one backend-neutral
-`CompiledAdamWPlan`, runs and resumes it through the same generic loop, and
-selects interpreter CPU, strict-native CPU, or strict Metal only at target
-preparation. Its Metal form selects the first
+The maintained tiny causal Transformer example compiles a backend-neutral
+`CompiledAdamWPlan` for each fresh owned-module lifecycle, runs and resumes
+through the same generic loop, and selects interpreter CPU, strict-native CPU,
+or strict Metal only at target preparation. Its portable resume deliberately
+rebuilds the same topology and authenticates it against the checkpoint. Within
+one process, a caller can instead reuse a borrowed `CompiledAdamWPlan` and call
+`restore_checkpoint` without rebuilding its graph, gradients, schedules, or
+captures. The example's Metal form selects the first
 visible device explicitly, verifies strict zero-fallback admission before
 allocation, and keeps the checkpoint bytes portable through the same
 authenticated recompile boundary as CPU.

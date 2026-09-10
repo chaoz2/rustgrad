@@ -1,4 +1,8 @@
-//! Compile a fixed two-row tiny causal Transformer once, then train and resume on CPU or strict Metal.
+//! Compile, train, checkpoint, and authentically recompile a fresh owned tiny
+//! Transformer for portable resume on CPU or strict Metal.
+//!
+//! Same-process callers may instead retain one `CompiledAdamWPlan` and call
+//! `restore_checkpoint` without rebuilding its graph or captures.
 //!
 //! Run on the graph-free CPU replay target:
 //!

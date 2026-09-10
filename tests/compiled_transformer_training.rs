@@ -10,11 +10,11 @@ use rustgrad::{
     Backend, CapturedReplayExecutor, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig,
     CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWPlan, CompiledAdamWRuntime,
     CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
-    CompiledEvaluation, CompiledEvaluationRuntime, CompiledModuleAdamWPlan,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuSessionTarget, DType, Graph,
-    LossOptions, MetalCompiledAdamWPlan, Module, NativeCpuSessionTarget, NodeId, Op, Parameter,
-    Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
-    cross_entropy, load_safetensors, save_safetensors,
+    CompiledEvaluation, CompiledEvaluationRuntime, CompiledModuleAdamWPlan, CompiledMultiStepLr,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuNonFinitePolicy,
+    CpuSessionTarget, DType, Graph, LossOptions, MetalCompiledAdamWPlan, Module,
+    NativeCpuSessionTarget, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
+    TrainingDropoutProvider, TransformerBlock, cross_entropy, load_safetensors, save_safetensors,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -2416,7 +2416,11 @@ fn owned_compiled_transformer_session_finishes_and_resumes_one_module_lifecycle(
 fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly() {
     const POLICY_FROZEN: &str = "block.ff1.0";
 
-    let policy = config().with_frozen_parameters([POLICY_FROZEN]).unwrap();
+    let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1]).unwrap();
+    let policy = config()
+        .with_frozen_parameters([POLICY_FROZEN])
+        .unwrap()
+        .with_captured_multi_step_lr(schedule.clone());
     let source = BufferedTinyCausalTransformer::new(7).unwrap();
     let source_policy_frozen = source
         .trainable_parameters()
@@ -2426,18 +2430,35 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         .unwrap()
         .value()
         .unwrap();
-    let source_plan = CompiledModuleAdamWPlan::compile_with_dropout(
-        policy.clone(),
+    let builds = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_module_with_dropout(
+        policy,
         dropout_config(),
-        source,
-        build_buffered,
+        &source,
+        |model, graph, inputs, dropout| {
+            builds.set(builds.get() + 1);
+            build_buffered(model, graph, inputs, dropout)
+        },
     )
     .unwrap();
-    let capture_identity = source_plan.capture_identity();
-    let flush_capture_identity = source_plan.flush_capture_identity();
-    let mut uninterrupted = source_plan.prepare(&CpuSessionTarget::new()).unwrap();
+    assert_eq!(builds.get(), 1);
+    assert_eq!(plan.step_count(), 0);
+    assert_eq!(plan.captured_multi_step_lr(), Some(&schedule));
+    let capture_identity = plan.capture_identity();
+    let flush_capture_identity = plan.flush_capture_identity();
+    let target =
+        CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut uninterrupted = plan.prepare(&target).unwrap();
+    assert_eq!(uninterrupted.captured_multi_step_lr(), Some(&schedule));
+    assert_eq!(
+        uninterrupted.non_finite_policy(),
+        CpuNonFinitePolicy::RejectTransition
+    );
+    let before_wrong_entrypoint = uninterrupted.checkpoint().unwrap();
+    assert!(uninterrupted.step(batch(1), learning_rate()).is_err());
+    assert_eq!(uninterrupted.checkpoint().unwrap(), before_wrong_entrypoint);
     for replay in 1..=4 {
-        uninterrupted.step(batch(replay), learning_rate()).unwrap();
+        uninterrupted.step_scheduled(batch(replay)).unwrap();
     }
 
     let checkpoint = uninterrupted.checkpoint().unwrap();
@@ -2483,7 +2504,7 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         .find_map(|(name, parameter)| (name == POLICY_FROZEN).then_some(parameter))
         .unwrap();
     assert_ne!(policy_frozen.value().unwrap(), source_policy_frozen);
-    policy_frozen.replace(source_policy_frozen.clone()).unwrap();
+    policy_frozen.replace(source_policy_frozen).unwrap();
     let policy_frozen_before = policy_frozen.snapshot().unwrap();
     let inherent_frozen = destination.transformer.frozen_scale.clone();
     let inherent_frozen_before = inherent_frozen.snapshot().unwrap();
@@ -2521,25 +2542,40 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         );
     }
 
-    let resumed_plan = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
-        policy,
-        dropout_config(),
-        destination,
-        &checkpoint,
-        build_buffered,
-    )
-    .unwrap();
+    let resumed_plan = plan.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(
+        builds.get(),
+        1,
+        "checkpoint restore must not rebuild the graph"
+    );
+    assert_eq!(
+        plan.step_count(),
+        0,
+        "borrowed source plan must stay unchanged"
+    );
     assert_eq!(resumed_plan.capture_identity(), capture_identity);
     assert_eq!(
         resumed_plan.flush_capture_identity(),
         flush_capture_identity
     );
     assert_eq!(resumed_plan.step_count(), 4);
-    let mut resumed = resumed_plan.prepare(&CpuSessionTarget::new()).unwrap();
+    assert_eq!(resumed_plan.captured_multi_step_lr(), Some(&schedule));
+    let mut resumed = resumed_plan.prepare(&target).unwrap();
     assert_eq!(resumed.capture_identity(), capture_identity);
     assert_eq!(resumed.step_count(), 4);
     assert_eq!(resumed.optimizer_step().unwrap(), 1);
     assert_eq!(resumed.accumulation_index().unwrap(), 1);
+    assert_eq!(resumed.captured_multi_step_lr(), Some(&schedule));
+    assert_eq!(
+        resumed.non_finite_policy(),
+        CpuNonFinitePolicy::RejectTransition
+    );
+    let restored_before_wrong_entrypoint = resumed.checkpoint().unwrap();
+    assert!(resumed.step(batch(5), learning_rate()).is_err());
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        restored_before_wrong_entrypoint
+    );
     assert_eq!(
         checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
         48
@@ -2579,15 +2615,20 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
     );
 
     for replay in 5..=6 {
-        let expected = uninterrupted.step(batch(replay), learning_rate()).unwrap();
-        let actual = resumed.step(batch(replay), learning_rate()).unwrap();
+        let expected = uninterrupted.step_scheduled(batch(replay)).unwrap();
+        let actual = resumed.step_scheduled(batch(replay)).unwrap();
         assert_eq!(actual.loss(), expected.loss());
         assert_eq!(actual.outputs(), expected.outputs());
         assert_eq!(actual.step(), expected.step());
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
         assert_eq!(actual.accumulation_index(), expected.accumulation_index());
         assert_eq!(actual.did_update(), expected.did_update());
+        assert_eq!(actual.did_update(), replay == 6);
         assert_eq!(actual.capture_identity(), capture_identity);
+        assert_eq!(
+            checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap()),
+            checkpoint_dropout_block_counter(&uninterrupted.checkpoint().unwrap())
+        );
         assert_eq!(
             resumed.parameter_snapshots().unwrap(),
             uninterrupted.parameter_snapshots().unwrap()
@@ -2618,8 +2659,10 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
     );
 
     let final_parameters = resumed.parameter_snapshots().unwrap();
-    let _source = uninterrupted.finish().unwrap();
-    let destination = resumed.finish().unwrap();
+    let final_checkpoint = resumed.checkpoint().unwrap();
+    assert_eq!(final_checkpoint, uninterrupted.checkpoint().unwrap());
+    assert!(resumed.publish_parameters(&destination).unwrap().is_clean());
+    assert_eq!(resumed.checkpoint().unwrap(), final_checkpoint);
     assert_eq!(destination.transformer.tokens.weight.id(), tied_identity);
     assert_eq!(destination.transformer.tokens.weight.id(), tied.id());
     let mut tied_alias_identity = None;
@@ -2636,6 +2679,8 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
                 policy_frozen_before.data
             );
             assert_eq!(parameter.version().unwrap(), policy_frozen_before.version);
+            assert_eq!(parameter.id(), policy_frozen_before.identity);
+            assert_eq!(parameter.is_trainable(), policy_frozen_before.trainable);
         } else {
             assert_eq!(parameter.value().unwrap(), final_parameters[&name]);
             assert_eq!(
@@ -2650,9 +2695,25 @@ fn compiled_transformer_checkpoint_replaces_different_destination_state_exactly(
         inherent_frozen_after.version,
         inherent_frozen_before.version
     );
+    assert_eq!(
+        inherent_frozen_after.identity,
+        inherent_frozen_before.identity
+    );
+    assert_eq!(
+        inherent_frozen_after.trainable,
+        inherent_frozen_before.trainable
+    );
     let running_marker_after = running_marker.snapshot().unwrap();
     assert_eq!(running_marker_after.data, running_marker_before.data);
     assert_eq!(running_marker_after.version, running_marker_before.version);
+    assert_eq!(
+        running_marker_after.identity,
+        running_marker_before.identity
+    );
+    assert_eq!(
+        running_marker_after.trainable,
+        running_marker_before.trainable
+    );
 }
 
 #[test]
