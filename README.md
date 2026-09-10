@@ -99,6 +99,11 @@ learning-rate policy, guarded CPU transitions, and fixed-capacity right-padded
 batches whose F32 mask lets the compiler derive the scalar token-mean loss and
 keeps unequal valid lengths unbiased across opt-in accumulation; each step
 reports its exact valid-token aggregation weight. Its
+`cpu-file-resume` mode demonstrates the portable different-initialization path:
+it writes a complete owned-module checkpoint, recompiles the same two-block
+attention-dropout topology from that file, and publishes saved immutable and
+trained values into the untouched destination only after exact CPU continuation.
+Its
 `native-cpu-scoreboard` mode emits bounded versioned JSON for caller-timed
 compile, prepare, and checkpoint phases plus runtime-timed first/steady replay,
 together with authenticated main, partial-flush, captured-zero-grad, evaluation,

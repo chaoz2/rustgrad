@@ -13,6 +13,13 @@
 //! cargo run --example compiled_transformer_train_resume -- cpu-reuse
 //! ```
 //!
+//! Run a complete module checkpoint through a file and recompile a deliberately
+//! different initialization before exact CPU continuation:
+//!
+//! ```text
+//! cargo run --example compiled_transformer_train_resume -- cpu-file-resume
+//! ```
+//!
 //! Emit a bounded strict-native CPU training scoreboard from that same
 //! compile-once path:
 //!
@@ -45,13 +52,21 @@ use rustgrad::{
     CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWPlan,
     CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig,
     CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
-    CompiledInputSpec, CompiledModuleAdamWPlan, CompiledModuleAdamWSession, CompiledMultiStepLr,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuNonFinitePolicy,
-    CpuSessionTarget, DType, Graph, MetalSessionTarget, Module, NativeCpuSessionTarget,
-    NativeTrainingScoreboard, NodeId, Parameter, Result, Scalar, Shape, TensorData,
-    TrainingDropoutProvider, TransformerBlock,
+    CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
+    CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep,
+    CpuBackend, CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, MetalSessionTarget, Module,
+    NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Parameter, Result, Scalar, Shape,
+    TensorData, TrainingDropoutProvider, TransformerBlock,
 };
-use std::{cell::Cell, collections::BTreeMap, env, error::Error, time::Instant};
+use std::{
+    cell::Cell,
+    collections::BTreeMap,
+    env,
+    error::Error,
+    fs,
+    path::PathBuf,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 const VOCAB: usize = 3;
 const EMBEDDING: usize = 2;
@@ -77,6 +92,7 @@ const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
 const INITIAL_STEPS: usize = 4;
 const RESUMED_STEPS: usize = 3;
 const POLICY_FROZEN: &str = "block.ff1.0";
+const FILE_RESUME_POLICY_FROZEN: &str = "positions.weight";
 const LOSS_MASK: &str = "loss_mask";
 
 struct TinyCausalTransformer {
@@ -177,6 +193,119 @@ impl Module for BufferedTinyCausalTransformer {
     }
 }
 
+struct FileResumeTransformer {
+    tokens: Embedding,
+    positions: Embedding,
+    first: TransformerBlock,
+    second: TransformerBlock,
+    norm: LayerNorm,
+    frozen_scale: Parameter,
+    running_marker: Parameter,
+}
+
+impl FileResumeTransformer {
+    fn new(seed: u64) -> Result<Self> {
+        Ok(Self {
+            tokens: Embedding::new_static(VOCAB, EMBEDDING, None, seed)?,
+            positions: Embedding::new_static(TIME, EMBEDDING, None, seed.wrapping_add(1))?,
+            first: TransformerBlock::new_static(EMBEDDING, 1, 4, true, 0.25, seed.wrapping_add(2))?
+                .with_causal_attention(true)
+                .with_attention_dropout(0.25)?,
+            second: TransformerBlock::new_static(
+                EMBEDDING,
+                1,
+                4,
+                true,
+                0.25,
+                seed.wrapping_add(3),
+            )?
+            .with_causal_attention(true)
+            .with_attention_dropout(0.25)?,
+            norm: LayerNorm::new_static([EMBEDDING], 1e-5, true)?,
+            frozen_scale: Parameter::new(TensorData::scalar(1.0), false),
+            running_marker: Parameter::new(TensorData::scalar(3.0), false),
+        })
+    }
+
+    fn forward(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<NodeId> {
+        let token_hidden = self.tokens.forward(graph, tokens)?;
+        let positions = graph.constant(TensorData::from_scalars(
+            [BATCH, TIME],
+            DType::I32,
+            [0, 1, 2, 0, 1, 2].into_iter().map(Scalar::I),
+        )?);
+        let position_hidden = self.positions.forward(graph, positions)?;
+        let hidden = graph.add(token_hidden, position_hidden)?;
+        let hidden = self
+            .first
+            .forward_training_with_dropout(graph, hidden, dropout)?;
+        let hidden = self
+            .second
+            .forward_training_with_dropout(graph, hidden, dropout)?;
+        self.project_logits(graph, hidden)
+    }
+
+    fn forward_eval(&self, graph: &mut Graph, tokens: NodeId) -> Result<NodeId> {
+        let token_hidden = self.tokens.forward(graph, tokens)?;
+        let positions = graph.constant(TensorData::from_scalars(
+            [BATCH, TIME],
+            DType::I32,
+            [0, 1, 2, 0, 1, 2].into_iter().map(Scalar::I),
+        )?);
+        let position_hidden = self.positions.forward(graph, positions)?;
+        let hidden = graph.add(token_hidden, position_hidden)?;
+        let hidden = self.first.forward_mode(graph, hidden, Mode::Eval)?.output;
+        let hidden = self.second.forward_mode(graph, hidden, Mode::Eval)?.output;
+        self.project_logits(graph, hidden)
+    }
+
+    fn project_logits(&self, graph: &mut Graph, hidden: NodeId) -> Result<NodeId> {
+        let hidden = self.norm.forward(graph, hidden)?;
+        let tied_weight = self.tokens.weight.bind(graph)?;
+        let tied_weight = graph.permute(tied_weight, [1, 0])?;
+        let logits = graph.matmul(hidden, tied_weight)?;
+        let frozen_scale = self.frozen_scale.bind(graph)?;
+        graph.mul(logits, frozen_scale)
+    }
+}
+
+impl Module for FileResumeTransformer {
+    fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        let child = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+        self.tokens.visit(&child("tokens"), visitor);
+        self.positions.visit(&child("positions"), visitor);
+        self.first.visit(&child("first"), visitor);
+        self.second.visit(&child("second"), visitor);
+        self.norm.visit(&child("norm"), visitor);
+        visitor(
+            child("frozen_scale"),
+            &self.frozen_scale,
+            StateKind::Parameter,
+        );
+        visitor(
+            child("running_marker"),
+            &self.running_marker,
+            StateKind::Buffer,
+        );
+        visitor(
+            child("lm_head.weight"),
+            &self.tokens.weight,
+            StateKind::Parameter,
+        );
+    }
+}
+
 fn config() -> Result<CompiledAdamWConfig> {
     optimizer_config()?.with_input_batch::<TransformerBatch>()
 }
@@ -195,6 +324,18 @@ fn reuse_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
         .with_token_weighted_gradient_accumulation(LOSS_MASK)?
         .with_frozen_parameters([POLICY_FROZEN])?
         .with_captured_multi_step_lr(schedule))
+}
+
+fn file_resume_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
+    Ok(CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)?
+        .with_loss_scale(128.0)?
+        .with_gradient_accumulation(ACCUMULATION_STEPS)?
+        .with_max_gradient_norm(MAX_GRADIENT_NORM)?
+        .with_input_batch::<MaskedTransformerBatch>()?
+        .with_token_weighted_gradient_accumulation(LOSS_MASK)?
+        .with_frozen_parameters([FILE_RESUME_POLICY_FROZEN])?
+        .with_captured_multi_step_lr(schedule)
+        .with_clip_report())
 }
 
 fn dropout_config() -> CompiledDropoutConfig {
@@ -252,6 +393,20 @@ fn build_buffered(
             .forward(graph, inputs[MaskedTransformerBatch::TOKENS], dropout)?;
     let losses = sparse_causal_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
     Ok((losses, BTreeMap::from([("logits".into(), logits)])))
+}
+
+fn build_file_resume(
+    model: &FileResumeTransformer,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<CompiledAdamWGraph> {
+    let logits = model.forward(graph, inputs[MaskedTransformerBatch::TOKENS], dropout)?;
+    let losses = sparse_causal_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
+    Ok(CompiledAdamWGraph::token_mean(
+        losses,
+        BTreeMap::from([("logits".into(), logits)]),
+    ))
 }
 
 fn build_evaluation(
@@ -443,6 +598,61 @@ fn evaluate_mean_masked_sparse_loss(model: &TinyCausalTransformer) -> Result<f64
         loss_weight_sum += loss_weight;
     }
     Ok(weighted_loss_sum / loss_weight_sum as f64)
+}
+
+fn evaluate_mean_file_resume_loss(model: &FileResumeTransformer) -> Result<f64> {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype(MaskedTransformerBatch::TOKENS, [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype(MaskedTransformerBatch::TARGETS, [BATCH, TIME], DType::I32);
+    let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
+    let logits = model.forward_eval(&mut graph, tokens)?;
+    let loss = masked_sparse_causal_loss(&mut graph, logits, targets, loss_mask)?;
+    let parameter_bindings = model.input_bindings(&graph)?;
+    let mut weighted_loss_sum = 0.0;
+    let mut loss_weight_sum = 0;
+    for replay in 1..=ACCUMULATION_STEPS {
+        let batch = masked_batch(replay)?;
+        let loss_weight = loss_mask_weight(&batch.loss_mask);
+        let mut bindings = parameter_bindings.clone();
+        bindings.extend(batch.into_compiled_inputs()?);
+        let normalized_loss = CpuBackend
+            .execute(&graph, loss, &bindings)?
+            .scalar_at(0)
+            .as_f64();
+        weighted_loss_sum += normalized_loss * loss_weight as f64;
+        loss_weight_sum += loss_weight;
+    }
+    Ok(weighted_loss_sum / loss_weight_sum as f64)
+}
+
+struct TemporaryCheckpointFile {
+    path: PathBuf,
+    staged: PathBuf,
+}
+
+impl TemporaryCheckpointFile {
+    fn new() -> std::result::Result<Self, Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = env::temp_dir().join(format!(
+            "rustgrad-compiled-module-resume-{}-{nonce}.safetensors",
+            std::process::id()
+        ));
+        let staged = path.with_extension("safetensors.tmp");
+        Ok(Self { path, staged })
+    }
+
+    fn write_then_read(&self, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        fs::write(&self.staged, bytes)?;
+        fs::rename(&self.staged, &self.path)?;
+        fs::read(&self.path)
+    }
+}
+
+impl Drop for TemporaryCheckpointFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.staged);
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn run_exact_resume<R, P>(target_name: &str, mut prepare: P) -> Result<()>
@@ -926,6 +1136,259 @@ fn run_cpu_reuse() -> Result<()> {
     Ok(())
 }
 
+fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
+    const LAST_REPLAY: u64 = 9;
+
+    let schedule = CompiledMultiStepLr::new(1e-3, 0.5, [1])?;
+    let config = file_resume_config(schedule.clone())?;
+    assert!(config.clip_report_enabled());
+    let source = FileResumeTransformer::new(0x5678)?;
+    let source_initial = source.state_dict()?;
+    let initial_loss = evaluate_mean_file_resume_loss(&source)?;
+    let source_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout(
+        config.clone(),
+        dropout_config(),
+        source,
+        build_file_resume,
+    )
+    .map_err(|error| error.into_parts().1)?;
+    let capture_identity = source_plan.capture_identity();
+    assert_eq!(source_plan.captured_multi_step_lr(), Some(&schedule));
+    let target =
+        CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut uninterrupted = source_plan
+        .prepare(&target)
+        .map_err(|error| error.into_parts().1)?;
+    for replay in 1..=4 {
+        let batch = masked_batch(replay)?;
+        let loss_weight = loss_mask_weight(&batch.loss_mask);
+        let step = uninterrupted.step_batch_scheduled(batch)?;
+        assert_eq!(step.loss_weight(), loss_weight);
+        assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
+        assert_eq!(step.clip_report().is_some(), step.did_update());
+        if let Some(report) = step.clip_report() {
+            assert!(report.is_finite());
+            assert!(report.did_clip().is_some());
+        }
+    }
+    assert_eq!(uninterrupted.step_count(), 4);
+    assert_eq!(uninterrupted.optimizer_step()?, 1);
+    assert_eq!(uninterrupted.accumulation_index()?, 1);
+    let saved_optimizer_checkpoint = uninterrupted.checkpoint()?;
+    let saved_dropout_cursor = saved_optimizer_checkpoint
+        .info()
+        .dropout_block_counter()
+        .expect("attention and residual dropout are captured");
+    assert!(saved_dropout_cursor > 0);
+
+    let checkpoint = uninterrupted.module_checkpoint()?;
+    assert_eq!(
+        checkpoint.optimizer_checkpoint(),
+        &saved_optimizer_checkpoint
+    );
+    assert_eq!(checkpoint.optimizer_checkpoint().info().replay_step(), 4);
+    assert_eq!(
+        checkpoint
+            .optimizer_checkpoint()
+            .info()
+            .accumulation_index(),
+        1
+    );
+    assert_eq!(
+        checkpoint
+            .optimizer_checkpoint()
+            .info()
+            .accumulated_token_count(),
+        Some(5)
+    );
+    let checkpoint_file = TemporaryCheckpointFile::new()?;
+    let decoded = CompiledModuleAdamWCheckpoint::from_bytes(
+        checkpoint_file.write_then_read(checkpoint.as_bytes())?,
+    )?;
+    assert_eq!(decoded, checkpoint);
+
+    let destination = FileResumeTransformer::new(0x9abc)?;
+    destination.frozen_scale.replace(TensorData::scalar(7.0))?;
+    destination
+        .running_marker
+        .replace(TensorData::scalar(29.0))?;
+    let destination_initial = destination.state_dict()?;
+    assert_ne!(destination_initial.tensors(), source_initial.tensors());
+    assert_ne!(
+        destination.positions.weight.value()?,
+        source_initial.tensors()[FILE_RESUME_POLICY_FROZEN]
+    );
+    let destination_tied_identity = destination.tokens.weight.id();
+    let mut tied_alias = None;
+    let mut destination_states = Vec::new();
+    destination.visit("", &mut |name, parameter, kind| {
+        if name == "lm_head.weight" {
+            tied_alias = Some(parameter.clone());
+        }
+        destination_states.push((
+            name,
+            parameter.clone(),
+            kind,
+            parameter
+                .snapshot()
+                .expect("the destination state remains readable"),
+        ));
+    });
+    let tied_alias = tied_alias.expect("the destination exposes the tied output head");
+    assert_eq!(tied_alias.id(), destination_tied_identity);
+
+    let restored_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout_from_module_checkpoint(
+        config,
+        dropout_config(),
+        destination,
+        &decoded,
+        build_file_resume,
+    )
+    .map_err(|error| error.into_parts().1)?;
+    assert_eq!(restored_plan.capture_identity(), capture_identity);
+    assert_eq!(restored_plan.captured_multi_step_lr(), Some(&schedule));
+    for (_, parameter, _, before) in &destination_states {
+        let after = parameter.snapshot()?;
+        assert_eq!(after.data, before.data);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.trainable, before.trainable);
+    }
+
+    let mut resumed = restored_plan
+        .prepare(&target)
+        .map_err(|error| error.into_parts().1)?;
+    assert_eq!(
+        resumed.checkpoint()?,
+        decoded.optimizer_checkpoint().clone()
+    );
+    assert_eq!(
+        resumed.checkpoint()?.info().dropout_block_counter(),
+        Some(saved_dropout_cursor)
+    );
+    for replay in 5..=LAST_REPLAY {
+        let expected = uninterrupted.step_batch_scheduled(masked_batch(replay)?)?;
+        let actual = resumed.step_batch_scheduled(masked_batch(replay)?)?;
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(
+            actual
+                .output("logits")
+                .expect("the file-resume capture exposes logits")
+                .shape(),
+            &Shape::new([BATCH, TIME, VOCAB])
+        );
+        assert_eq!(actual.step(), expected.step());
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+        assert_eq!(actual.loss_weight(), expected.loss_weight());
+        assert_eq!(actual.did_update(), expected.did_update());
+        assert_eq!(actual.clip_report(), expected.clip_report());
+        assert_eq!(
+            actual.clip_report().is_some(),
+            actual.accumulation_index() == 0
+        );
+        let actual_checkpoint = resumed.checkpoint()?;
+        let expected_checkpoint = uninterrupted.checkpoint()?;
+        assert_eq!(
+            actual_checkpoint.info().dropout_block_counter(),
+            expected_checkpoint.info().dropout_block_counter()
+        );
+        assert_eq!(actual_checkpoint, expected_checkpoint);
+    }
+    assert_eq!(resumed.optimizer_step()?, 3);
+    assert_eq!(resumed.accumulation_index()?, 0);
+    assert_eq!(
+        resumed.module_checkpoint()?,
+        uninterrupted.module_checkpoint()?
+    );
+    for (_, parameter, _, before) in &destination_states {
+        let after = parameter.snapshot()?;
+        assert_eq!(after.data, before.data);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.trainable, before.trainable);
+    }
+
+    let uninterrupted_model = uninterrupted
+        .finish()
+        .map_err(|error| error.into_parts().1)?;
+    let resumed_model = resumed.finish().map_err(|error| error.into_parts().1)?;
+    assert_eq!(
+        resumed_model.state_dict()?,
+        uninterrupted_model.state_dict()?
+    );
+    let mut expected_states = Vec::new();
+    uninterrupted_model.visit("", &mut |name, parameter, kind| {
+        expected_states.push((
+            name,
+            kind,
+            parameter
+                .snapshot()
+                .expect("the finished reference state remains readable"),
+        ));
+    });
+    let mut resumed_states = Vec::new();
+    resumed_model.visit("", &mut |name, parameter, kind| {
+        resumed_states.push((
+            name,
+            kind,
+            parameter
+                .snapshot()
+                .expect("the finished destination state remains readable"),
+        ));
+    });
+    assert_eq!(resumed_states.len(), destination_states.len());
+    assert_eq!(resumed_states.len(), expected_states.len());
+    for (
+        ((name, _, kind, before), (expected_name, expected_kind, expected)),
+        (actual_name, actual_kind, actual),
+    ) in destination_states
+        .iter()
+        .zip(&expected_states)
+        .zip(&resumed_states)
+    {
+        assert_eq!(actual_name, name);
+        assert_eq!(expected_name, name);
+        assert_eq!(actual_kind, kind);
+        assert_eq!(expected_kind, kind);
+        assert_eq!(actual.data, expected.data);
+        assert_eq!(actual.identity, before.identity);
+        assert_eq!(actual.trainable, before.trainable);
+        assert_eq!(
+            actual.version,
+            before
+                .version
+                .checked_add(1)
+                .expect("successful publication cannot overflow a version")
+        );
+    }
+    assert_eq!(resumed_model.tokens.weight.id(), destination_tied_identity);
+    assert_eq!(tied_alias.id(), destination_tied_identity);
+    assert_eq!(tied_alias.value()?, resumed_model.tokens.weight.value()?);
+    assert!(resumed_model.positions.weight.is_trainable());
+    assert!(!resumed_model.frozen_scale.is_trainable());
+    assert!(!resumed_model.running_marker.is_trainable());
+    assert_eq!(
+        resumed_model.frozen_scale.value()?,
+        uninterrupted_model.frozen_scale.value()?
+    );
+    assert_eq!(
+        resumed_model.running_marker.value()?,
+        uninterrupted_model.running_marker.value()?
+    );
+
+    let final_loss = evaluate_mean_file_resume_loss(&resumed_model)?;
+    assert!(
+        final_loss < initial_loss,
+        "file-resumed two-block causal Transformer loss did not decrease: {initial_loss} -> {final_loss}"
+    );
+    println!(
+        "CPU file resume: capture={capture_identity:016x}, checkpoint=(replay=4, optimizer=1, accumulation=1), optimizer_steps=3, eval_mean_sparse_loss={initial_loss:.6} -> {final_loss:.6}, exact_resume=true, different_init=true, published=true"
+    );
+    Ok(())
+}
+
 fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     const SAMPLES: u64 = 6;
 
@@ -1003,6 +1466,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     match env::args().nth(1).as_deref().unwrap_or("cpu") {
         "native-cpu-scoreboard" => run_native_cpu_scoreboard()?,
         "cpu-reuse" => run_cpu_reuse()?,
+        "cpu-file-resume" => run_cpu_file_resume()?,
         "cpu" => {
             let target = CpuSessionTarget::new();
             run_exact_resume("CPU", |plan| {
@@ -1030,7 +1494,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         }
         other => {
             return Err(format!(
-                "unknown target {other:?}; expected `native-cpu-scoreboard`, `cpu-reuse`, `cpu`, `native-cpu`, or `metal`"
+                "unknown target {other:?}; expected `native-cpu-scoreboard`, `cpu-reuse`, `cpu-file-resume`, `cpu`, `native-cpu`, or `metal`"
             )
             .into());
         }
