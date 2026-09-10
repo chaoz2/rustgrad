@@ -74,15 +74,17 @@ native-JIT `NativeCpuSessionTarget`, or an explicitly selected strict
 `MetalSessionTarget`; the optimizer-neutral loop is shared without a backend
 enum. Native CPU preparation compiles the main, partial-flush, and evaluation
 programs before mutable replay and exposes typed cache/work/state evidence;
-unsupported items fail closed without interpreter fallback. The maintained
-proof uses the historical propagation target, while an opt-in CPU-only
-`CpuNonFinitePolicy::RejectTransition` stages the same authenticated program and
-admits only a finite scalar loss plus fully applied final F32 recurrent
-successors before its one effect commit. Non-finite external rates reject before
-staging, deterministic captured MultiStep rate overflow rejects at construction,
-and failed admission preserves the exact retryable checkpoint/dropout/progress
-frontier without changing capture or wire identity. Named outputs and Metal are
-unchanged. Seven CPU replays
+unsupported items fail closed without interpreter fallback. The shared
+CPU/Metal proof and public example use the historical propagation target and
+external learning rate, while a dedicated CPU Transformer restore proof uses
+one borrowed compiled plan and captured MultiStep learning rate. It prepares
+through the opt-in `CpuNonFinitePolicy::RejectTransition`, which stages the same
+authenticated program and admits only a finite scalar loss plus fully applied
+final F32 recurrent successors before its one effect commit. Non-finite external
+rates reject before staging, deterministic captured MultiStep rate overflow
+rejects at construction, and failed admission preserves the exact retryable
+checkpoint/dropout/progress frontier without changing capture or wire identity.
+Named outputs and Metal are unchanged. Seven CPU replays
 use deterministic distinct `[2,3]` microbatches under a
 three-replay accumulation window and active finite global clipping. After two
 replays, a nonempty `zero_grad` cancellation preserves replay/dropout progress
@@ -94,6 +96,16 @@ outputs and complete recurrent parameter/moment/accumulator state match the
 uninterrupted run. In-session evaluation observes that same live parameter
 frontier before publication: CPU binds current runtime snapshots, while strict
 Metal aliases the active epoch parameter bank without parameter transfer.
+The dedicated CPU proof checkpoints after update one with a retained partial
+window, restores by cloning that already compiled plan without another builder
+call, and crosses the first MultiStep boundary while matching loss, outputs,
+parameters, moments, accumulators, dropout, and complete checkpoint bytes after
+every continued replay. It finally publishes into a deliberately different
+effective-trainable initialization after aligning the destination's
+capture-owned policy-frozen constant, while preserving its tied identity,
+policy-frozen state, inherent frozen state, and buffer. Portable resume into a
+fresh owned module continues to recompile and authenticate the topology because
+executable captures are intentionally absent from checkpoint bytes.
 Evaluation is stateless with respect to replay, optimizer, dropout,
 accumulation, checkpoint, and scoreboard state, including after a `zero_grad`
 bank flip. Compiled
