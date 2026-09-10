@@ -15,7 +15,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 1;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 2;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +31,7 @@ pub struct CompiledAdamWInspection {
     initial_replay_step: u64,
     main: ProgramInspection,
     partial_flush: Option<ProgramInspection>,
+    zero_grad: Option<ProgramInspection>,
     evaluation: Option<ProgramInspection>,
     recurrent_state_count: usize,
     recurrent_state_bytes: usize,
@@ -41,6 +42,7 @@ impl CompiledAdamWInspection {
         initial_replay_step: u64,
         main: (u64, ExecutionPlanSummary),
         partial_flush: Option<(u64, ExecutionPlanSummary)>,
+        zero_grad: Option<(u64, ExecutionPlanSummary)>,
         evaluation: Option<(u64, ExecutionPlanSummary)>,
         recurrent_state: (usize, usize),
     ) -> Self {
@@ -52,6 +54,7 @@ impl CompiledAdamWInspection {
             initial_replay_step,
             main: program(main),
             partial_flush: partial_flush.map(program),
+            zero_grad: zero_grad.map(program),
             evaluation: evaluation.map(program),
             recurrent_state_count: recurrent_state.0,
             recurrent_state_bytes: recurrent_state.1,
@@ -74,6 +77,12 @@ impl CompiledAdamWInspection {
 
     pub fn evaluation(&self) -> Option<(u64, &ExecutionPlanSummary)> {
         self.evaluation
+            .as_ref()
+            .map(|program| (program.capture_identity, &program.execution_plan))
+    }
+
+    pub fn zero_grad(&self) -> Option<(u64, &ExecutionPlanSummary)> {
+        self.zero_grad
             .as_ref()
             .map(|program| (program.capture_identity, &program.execution_plan))
     }
@@ -208,6 +217,8 @@ pub struct NativeTrainingReport {
     successful_replay_count: u64,
     main: NativeTrainingProgramReport,
     partial_flush: Option<NativeTrainingProgramReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    zero_grad: Option<NativeTrainingProgramReport>,
     evaluation: Option<NativeTrainingProgramReport>,
     recurrent_logical_state_count: u64,
     recurrent_logical_state_bytes: u64,
@@ -243,6 +254,10 @@ impl NativeTrainingReport {
 
     pub const fn evaluation(&self) -> Option<&NativeTrainingProgramReport> {
         self.evaluation.as_ref()
+    }
+
+    pub const fn zero_grad(&self) -> Option<&NativeTrainingProgramReport> {
+        self.zero_grad.as_ref()
     }
 
     pub const fn successful_replay_count(&self) -> u64 {
@@ -304,8 +319,21 @@ impl NativeTrainingReport {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.format_version != NATIVE_TRAINING_REPORT_FORMAT_VERSION {
+        if self.format_version != 1 && self.format_version != NATIVE_TRAINING_REPORT_FORMAT_VERSION
+        {
             return Err(invalid("unsupported native training report version"));
+        }
+        if self.format_version == 1 && self.zero_grad.is_some() {
+            return Err(invalid(
+                "legacy native training report has zero-grad evidence",
+            ));
+        }
+        if self.format_version == NATIVE_TRAINING_REPORT_FORMAT_VERSION
+            && self.partial_flush.is_some() != self.zero_grad.is_some()
+        {
+            return Err(invalid(
+                "native training auxiliary program inventory differs",
+            ));
         }
         for duration in [
             self.compile_wall_time,
@@ -322,7 +350,12 @@ impl NativeTrainingReport {
                 .map_err(|_| invalid("invalid native training duration"))?;
         }
         self.main.validate()?;
-        for program in self.partial_flush.iter().chain(&self.evaluation) {
+        for program in self
+            .partial_flush
+            .iter()
+            .chain(&self.zero_grad)
+            .chain(&self.evaluation)
+        {
             program.validate()?;
             if program.vectorized != self.main.vectorized {
                 return Err(invalid("native program vectorization policy differs"));
@@ -389,6 +422,7 @@ pub struct NativeTrainingScoreboard {
     inspection: CompiledAdamWInspection,
     main: NativeTrainingProgramReport,
     partial_flush: Option<NativeTrainingProgramReport>,
+    zero_grad: Option<NativeTrainingProgramReport>,
     evaluation: Option<NativeTrainingProgramReport>,
     durations: Vec<Duration>,
     schedule_cache_keys: Option<Vec<u64>>,
@@ -408,6 +442,11 @@ impl NativeTrainingScoreboard {
             inspection.partial_flush.as_ref(),
             preparation.partial_flush(),
         )?;
+        let zero_grad = matching_program(
+            "zero grad",
+            inspection.zero_grad.as_ref(),
+            preparation.zero_grad(),
+        )?;
         let evaluation = matching_program(
             "evaluation",
             inspection.evaluation.as_ref(),
@@ -424,6 +463,7 @@ impl NativeTrainingScoreboard {
             inspection,
             main,
             partial_flush,
+            zero_grad,
             evaluation,
             durations: Vec::new(),
             schedule_cache_keys: None,
@@ -503,6 +543,7 @@ impl NativeTrainingScoreboard {
             successful_replay_count: self.durations.len() as u64,
             main: self.main.clone(),
             partial_flush: self.partial_flush.clone(),
+            zero_grad: self.zero_grad.clone(),
             evaluation: self.evaluation.clone(),
             recurrent_logical_state_count: count(
                 self.inspection.recurrent_state_count,
@@ -648,6 +689,7 @@ mod tests {
                 cache_miss_count: 2,
             },
             partial_flush: None,
+            zero_grad: None,
             evaluation: None,
             recurrent_logical_state_count: 4,
             recurrent_logical_state_bytes: 16,
@@ -694,6 +736,23 @@ mod tests {
             NativeTrainingReport::from_json_bytes(&bytes).unwrap(),
             report
         );
+    }
+
+    #[test]
+    fn legacy_report_without_zero_grad_evidence_still_decodes() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json["format_version"] = serde_json::json!(1);
+        json.as_object_mut().unwrap().remove("zero_grad");
+        let report =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(report.zero_grad().is_none());
+    }
+
+    #[test]
+    fn current_report_rejects_incomplete_auxiliary_inventory() {
+        let mut report = zero_report();
+        report.zero_grad = Some(report.main.clone());
+        assert!(report.validate().is_err());
     }
 
     #[test]

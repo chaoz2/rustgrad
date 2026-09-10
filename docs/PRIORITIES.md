@@ -72,9 +72,9 @@ likelihood, one batched reverse traversal, and captured AdamW. One resource-free
 `CompiledAdamWPlan` prepares through interpreter `CpuSessionTarget`, strict
 native-JIT `NativeCpuSessionTarget`, or an explicitly selected strict
 `MetalSessionTarget`; the optimizer-neutral loop is shared without a backend
-enum. Native CPU preparation compiles the main, partial-flush, and evaluation
-programs before mutable replay and exposes typed cache/work/state evidence;
-unsupported items fail closed without interpreter fallback. Its opt-in bounded
+enum. Native CPU preparation compiles the main, partial-flush, zero-grad, and
+evaluation programs before mutable replay and exposes typed cache/work/state
+evidence; unsupported items fail closed without interpreter fallback. Its opt-in bounded
 training scoreboard authenticates immutable plan inspection against preparation
 and committed replay reports, separates first from steady samples, and
 serializes caller-observed compile/prepare/checkpoint time plus logical
