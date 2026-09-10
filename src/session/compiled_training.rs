@@ -1,6 +1,7 @@
 //! Graph-free CPU replay for static training programs with recurrent state.
 
 mod adamw_checkpoint;
+mod module_adamw_checkpoint;
 mod state_schema;
 
 #[cfg(test)]
@@ -14,6 +15,11 @@ use self::adamw_checkpoint::{
     encode_adamw_checkpoint,
 };
 pub use self::adamw_checkpoint::{CompiledAdamWCheckpoint, CompiledAdamWCheckpointInfo};
+pub use self::module_adamw_checkpoint::CompiledModuleAdamWCheckpoint;
+use self::module_adamw_checkpoint::{
+    DecodedModuleAdamWCheckpoint, ModuleCheckpointState, ModuleCheckpointStateKind,
+    ModuleCheckpointVisit, decode_module_adamw_checkpoint, encode_module_adamw_checkpoint,
+};
 use self::state_schema::{
     AdamWGlobalState, AdamWParameterState, INTERNAL_PREFIX, RecurrentStateKey, StateSpec,
 };
@@ -264,7 +270,9 @@ struct SealedModuleState {
     parameter: Parameter,
     snapshot: ParameterSnapshot,
     kind: StateKind,
+    source_trainable: bool,
     trainable: bool,
+    publication_value: Option<TensorData>,
 }
 
 /// Complete host-module state retained while an owned compiled session runs.
@@ -334,9 +342,11 @@ impl CompiledModuleSeal {
                 SealedModuleState {
                     name,
                     parameter: parameter.clone(),
-                    snapshot,
                     kind,
+                    source_trainable: snapshot.trainable,
+                    snapshot,
                     trainable,
+                    publication_value: None,
                 },
             );
         });
@@ -412,6 +422,96 @@ impl CompiledModuleSeal {
         Ok(())
     }
 
+    fn checkpoint_inventory(&self) -> (Vec<ModuleCheckpointState>, Vec<ModuleCheckpointVisit>) {
+        let mut states = Vec::with_capacity(self.states.len());
+        let mut visits = Vec::with_capacity(self.visits.len());
+        let mut seen = BTreeSet::new();
+        for visit in &self.visits {
+            let state = &self.states[&visit.identity];
+            visits.push(ModuleCheckpointVisit {
+                name: visit.name.clone(),
+                canonical_name: state.name.clone(),
+            });
+            if seen.insert(visit.identity) {
+                states.push(ModuleCheckpointState {
+                    name: state.name.clone(),
+                    kind: match state.kind {
+                        StateKind::Parameter => ModuleCheckpointStateKind::Parameter,
+                        StateKind::Buffer => ModuleCheckpointStateKind::Buffer,
+                    },
+                    source_trainable: state.source_trainable,
+                    policy_frozen: self.frozen_parameters.contains(&state.name),
+                    value: (!state.trainable).then(|| {
+                        state
+                            .publication_value
+                            .clone()
+                            .unwrap_or_else(|| state.snapshot.data.clone())
+                    }),
+                });
+            }
+        }
+        (states, visits)
+    }
+
+    fn apply_module_checkpoint(
+        &mut self,
+        checkpoint: &DecodedModuleAdamWCheckpoint,
+    ) -> Result<BTreeMap<String, TensorData>> {
+        let (current_states, current_visits) = self.checkpoint_inventory();
+        if current_visits != checkpoint.visits || current_states.len() != checkpoint.states.len() {
+            return Err(training("compiled module checkpoint topology mismatch"));
+        }
+        let optimizer_parameters =
+            decode_adamw_checkpoint(checkpoint.optimizer.as_bytes())?.parameters;
+        let mut immutable_values = BTreeMap::new();
+        for (current, saved) in current_states.iter().zip(&checkpoint.states) {
+            if current.name != saved.name
+                || current.kind != saved.kind
+                || current.source_trainable != saved.source_trainable
+                || current.policy_frozen != saved.policy_frozen
+                || current.trainable() != saved.trainable()
+            {
+                return Err(training(
+                    "compiled module checkpoint state topology mismatch",
+                ));
+            }
+            let saved_value = match &saved.value {
+                Some(value) => value,
+                None => &optimizer_parameters[&saved.name],
+            };
+            let state = self
+                .states
+                .values_mut()
+                .find(|state| state.name == saved.name)
+                .ok_or_else(|| training("compiled module checkpoint state is absent"))?;
+            if saved_value.shape() != &state.snapshot.shape
+                || saved_value.dtype() != state.snapshot.dtype
+            {
+                return Err(training(
+                    "compiled module checkpoint state descriptor mismatch",
+                ));
+            }
+            checked_bytes(saved_value)?;
+            if let Some(value) = &saved.value {
+                next_version(state.snapshot.version)?;
+                state.publication_value = Some(value.clone());
+                immutable_values.insert(saved.name.clone(), value.clone());
+            }
+        }
+        Ok(immutable_values)
+    }
+
+    fn parameter_plan(&self, module: &(impl Module + ?Sized)) -> Result<ModuleParameterPlan> {
+        let immutable_values = self
+            .checkpoint_inventory()
+            .0
+            .into_iter()
+            .filter_map(|state| state.value.map(|value| (state.name, value)))
+            .collect::<BTreeMap<_, _>>();
+        ModuleParameterPlan::new(module, &self.frozen_parameters)?
+            .with_immutable_values(&immutable_values)
+    }
+
     fn publish(
         &self,
         module: &(impl Module + ?Sized),
@@ -448,7 +548,10 @@ impl CompiledModuleSeal {
                 loaded_keys.push(state.name.clone());
                 (value.clone(), next_version(state.snapshot.version)?)
             } else {
-                (state.snapshot.data.clone(), state.snapshot.version)
+                match &state.publication_value {
+                    Some(value) => (value.clone(), next_version(state.snapshot.version)?),
+                    None => (state.snapshot.data.clone(), state.snapshot.version),
+                }
             };
             restores.push(ParameterRestore {
                 parameter: state.parameter.clone(),
@@ -570,6 +673,30 @@ impl ModuleParameterPlan {
             }
         }
         Ok(())
+    }
+
+    fn with_immutable_values(mut self, values: &BTreeMap<String, TensorData>) -> Result<Self> {
+        let expected = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.trainable)
+            .map(|entry| entry.name.as_str())
+            .collect::<BTreeSet<_>>();
+        if expected != values.keys().map(String::as_str).collect::<BTreeSet<_>>() {
+            return Err(training(
+                "compiled module checkpoint immutable inventory mismatch",
+            ));
+        }
+        for entry in self.entries.iter_mut().filter(|entry| !entry.trainable) {
+            let value = &values[&entry.name];
+            if value.shape() != entry.value.shape() || value.dtype() != entry.value.dtype() {
+                return Err(training(
+                    "compiled module checkpoint immutable descriptor mismatch",
+                ));
+            }
+            entry.value = value.clone();
+        }
+        Ok(self)
     }
 
     fn initial_parameters(&self) -> Result<Vec<TrainingParameterInit>> {
@@ -4173,7 +4300,12 @@ impl CompiledAdamWAuxiliaryPlan {
 }
 
 impl CompiledEvaluationPlan {
-    fn compile<M, F>(module: &M, training_plan: &CompiledAdamWPlan, build: F) -> Result<Self>
+    fn compile_with_parameter_plan<M, F>(
+        module: &M,
+        training_plan: &CompiledAdamWPlan,
+        parameter_plan: ModuleParameterPlan,
+        build: F,
+    ) -> Result<Self>
     where
         M: Module + ?Sized,
         F: FnOnce(
@@ -4182,7 +4314,6 @@ impl CompiledEvaluationPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let parameter_plan = ModuleParameterPlan::new(module, &training_plan.frozen_parameters)?;
         let mut graph = Graph::new();
         let inputs = training_plan
             .inner
@@ -5245,6 +5376,19 @@ impl CompiledAdamWPlan {
         F: FnOnce(&M, &mut Graph, &BTreeMap<String, NodeId>) -> Result<CompiledAdamWGraph>,
     {
         let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
+        Self::compile_module_graph_parameters(config, module, parameter_plan, build)
+    }
+
+    fn compile_module_graph_parameters<M, F>(
+        config: CompiledAdamWConfig,
+        module: &M,
+        parameter_plan: ModuleParameterPlan,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(&M, &mut Graph, &BTreeMap<String, NodeId>) -> Result<CompiledAdamWGraph>,
+    {
         parameter_plan.validate_weight_decay_exclusions(&config)?;
         let parameters = parameter_plan.initial_parameters()?;
         let objective_config = config.clone();
@@ -5956,6 +6100,32 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         }
     }
 
+    fn build_owned_from_module_checkpoint<F>(
+        config: &CompiledAdamWConfig,
+        module: M,
+        checkpoint: &CompiledModuleAdamWCheckpoint,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(&M, ModuleParameterPlan) -> Result<CompiledAdamWPlan>,
+    {
+        let result: Result<(CompiledAdamWPlan, CompiledModuleSeal)> = (|| {
+            let decoded = decode_module_adamw_checkpoint(checkpoint.as_bytes())?;
+            let mut seal = CompiledModuleSeal::capture(&module, &config.frozen_parameters)?;
+            let immutable_values = seal.apply_module_checkpoint(&decoded)?;
+            let parameter_plan = ModuleParameterPlan::new(&module, &config.frozen_parameters)?
+                .with_immutable_values(&immutable_values)?;
+            let plan = build(&module, parameter_plan)?
+                .restore_checkpoint(checkpoint.optimizer_checkpoint())?;
+            seal.validate_unchanged(&module)?;
+            Ok((plan, seal))
+        })();
+        match result {
+            Ok((plan, seal)) => Ok(Self { module, plan, seal }),
+            Err(source) => Err(CompiledModuleAdamWCompileError { module, source }),
+        }
+    }
+
     /// Compiles AdamW from, and takes ownership of, one exact module value.
     pub fn compile<F>(
         config: CompiledAdamWConfig,
@@ -6033,6 +6203,84 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         Self::build_owned(module, &frozen_parameters, |module| {
             CompiledAdamWPlan::compile_module_graph_with_dropout(config, dropout, module, build)
         })
+    }
+
+    /// Recompiles a unified owned module program from a complete module
+    /// checkpoint without first mutating the destination module.
+    ///
+    /// Saved frozen parameters and buffers are used as capture constants.
+    /// Destination topology, ties, kinds, and source trainability must match;
+    /// optimizer and immutable values are published together only by finish.
+    pub fn compile_graph_from_module_checkpoint<F>(
+        config: CompiledAdamWConfig,
+        module: M,
+        checkpoint: &CompiledModuleAdamWCheckpoint,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(&M, &mut Graph, &BTreeMap<String, NodeId>) -> Result<CompiledAdamWGraph>,
+    {
+        let objective_config = config.clone();
+        Self::build_owned_from_module_checkpoint(
+            &config,
+            module,
+            checkpoint,
+            move |module, parameter_plan| {
+                CompiledAdamWPlan::compile_module_graph_parameters(
+                    objective_config,
+                    module,
+                    parameter_plan,
+                    build,
+                )
+            },
+        )
+    }
+
+    /// Recompiles a recurrent-dropout unified owned module program from a
+    /// complete module checkpoint without mutating the destination module.
+    pub fn compile_graph_with_dropout_from_module_checkpoint<F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: M,
+        checkpoint: &CompiledModuleAdamWCheckpoint,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        let objective_config = config.clone();
+        Self::build_owned_from_module_checkpoint(
+            &config,
+            module,
+            checkpoint,
+            move |module, parameter_plan| {
+                let parameters = parameter_plan.initial_parameters()?;
+                let lower_config = objective_config.clone();
+                CompiledAdamWPlan::compile_module_with_dropout_parameters(
+                    objective_config,
+                    dropout,
+                    module,
+                    parameter_plan,
+                    parameters,
+                    move |module, graph, inputs, dropout| {
+                        let built = build(module, graph, inputs, dropout)?;
+                        let (objective, outputs) = built.into_parts();
+                        let loss = lower_compiled_adamw_objective(
+                            &lower_config,
+                            graph,
+                            inputs,
+                            objective,
+                        )?;
+                        Ok((loss, outputs))
+                    },
+                )
+            },
+        )
     }
 
     /// Compatibility constructor that compiles an owned module program and
@@ -6138,7 +6386,13 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 return Err(training("compiled evaluation is already attached"));
             }
             self.seal.validate_unchanged(&self.module)?;
-            let evaluation = CompiledEvaluationPlan::compile(&self.module, &self.plan, build)?;
+            let parameter_plan = self.seal.parameter_plan(&self.module)?;
+            let evaluation = CompiledEvaluationPlan::compile_with_parameter_plan(
+                &self.module,
+                &self.plan,
+                parameter_plan,
+                build,
+            )?;
             self.seal.validate_unchanged(&self.module)?;
             Ok(evaluation)
         })();
@@ -6270,6 +6524,19 @@ impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleAdamWSession<M, R> {
 }
 
 impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
+    /// Snapshots the exact optimizer frontier together with the owned
+    /// module's canonical immutable state and topology.
+    ///
+    /// This does not publish into or release the sealed host module. The
+    /// embedded optimizer checkpoint retains its existing v1--v7 bytes.
+    pub fn module_checkpoint(&self) -> Result<CompiledModuleAdamWCheckpoint> {
+        self.seal.validate_unchanged(&self.module)?;
+        let optimizer = self.runtime.checkpoint()?;
+        self.seal.validate_unchanged(&self.module)?;
+        let (states, visits) = self.seal.checkpoint_inventory();
+        encode_module_adamw_checkpoint(&optimizer, &states, &visits)
+    }
+
     /// Atomically publishes and returns the exact checkpointed AdamW frontier.
     ///
     /// The module seal is validated before snapshot work. One coherent
@@ -6318,7 +6585,19 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
     }
 }
 
+impl<M> CompiledModuleAdamWSession<M, CpuCompiledAdamW> {
+    /// Explicit diagnostic snapshot of the recurrent dropout counter.
+    pub fn dropout_block_counter(&self) -> Result<Option<u64>> {
+        self.runtime.dropout_block_counter()
+    }
+}
+
 impl<'a, M> CompiledModuleAdamWSession<M, NativeCpuCompiledAdamW<'a>> {
+    /// Explicit diagnostic snapshot of the recurrent dropout counter.
+    pub fn dropout_block_counter(&self) -> Result<Option<u64>> {
+        self.runtime.dropout_block_counter()
+    }
+
     /// Returns strict-native CPU preparation evidence without exposing the
     /// sealed module or mutable runtime internals.
     pub fn native_cpu_preparation_report(&self) -> &NativeCpuCompiledAdamWPreparationReport {
@@ -13080,6 +13359,205 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.into_plan().capture_identity(), capture_identity);
+    }
+
+    #[test]
+    fn complete_module_checkpoint_restores_constants_without_mutating_destination() {
+        let config = module_config().with_gradient_accumulation(2).unwrap();
+        let source = TiedFrozenModule::new([1.0, -1.0]);
+        let source_frozen = source.frozen.clone();
+        let source_buffer = source.buffer.clone();
+        let source_plan = CompiledModuleAdamWPlan::compile_graph(
+            config.clone(),
+            source,
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap();
+        let capture_identity = source_plan.capture_identity();
+        let mut source = source_plan.prepare(&CpuSessionTarget::new()).unwrap();
+        let batch =
+            || BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]);
+        source.step(batch(), TensorData::scalar(0.01)).unwrap();
+        let checkpoint = source.module_checkpoint().unwrap();
+        assert_eq!(
+            checkpoint.optimizer_checkpoint(),
+            &source.checkpoint().unwrap()
+        );
+        assert_eq!(
+            CompiledModuleAdamWCheckpoint::from_bytes(checkpoint.as_bytes().to_vec()).unwrap(),
+            checkpoint
+        );
+        let (envelope_tensors, _) = load_safetensors(checkpoint.as_bytes()).unwrap();
+        assert_eq!(envelope_tensors.len(), 3);
+        assert!(envelope_tensors.contains_key("optimizer_checkpoint"));
+
+        let schema_destination = TiedFrozenModule::new([4.0, 5.0]);
+        let schema_shared_before = schema_destination.shared.snapshot().unwrap();
+        let schema_frozen_before = schema_destination.frozen.snapshot().unwrap();
+        let schema_buffer_before = schema_destination.buffer.snapshot().unwrap();
+        let (schema_tensors, mut schema_metadata) =
+            load_safetensors(checkpoint.as_bytes()).unwrap();
+        schema_metadata.insert("unexpected".into(), "field".into());
+        assert!(
+            CompiledModuleAdamWCheckpoint::from_bytes(
+                save_safetensors(&schema_tensors, &schema_metadata).unwrap()
+            )
+            .is_err()
+        );
+        assert_parameter_snapshot_eq(
+            &schema_destination.shared.snapshot().unwrap(),
+            &schema_shared_before,
+        );
+        assert_parameter_snapshot_eq(
+            &schema_destination.frozen.snapshot().unwrap(),
+            &schema_frozen_before,
+        );
+        assert_parameter_snapshot_eq(
+            &schema_destination.buffer.snapshot().unwrap(),
+            &schema_buffer_before,
+        );
+
+        let topology_destination = TiedFrozenModule::new([5.0, 6.0]);
+        let topology_shared_before = topology_destination.shared.snapshot().unwrap();
+        let topology_frozen_before = topology_destination.frozen.snapshot().unwrap();
+        let topology_buffer_before = topology_destination.buffer.snapshot().unwrap();
+        let (topology_tensors, mut topology_metadata) =
+            load_safetensors(checkpoint.as_bytes()).unwrap();
+        topology_metadata.insert("visit.1.name".into(), "renamed_alias".into());
+        let topology_checkpoint = CompiledModuleAdamWCheckpoint::from_bytes(
+            save_safetensors(&topology_tensors, &topology_metadata).unwrap(),
+        )
+        .unwrap();
+        let topology_error = CompiledModuleAdamWPlan::compile_graph_from_module_checkpoint(
+            config.clone(),
+            topology_destination,
+            &topology_checkpoint,
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .err()
+        .expect("mismatched alias topology must reject");
+        let topology_destination = topology_error.into_module();
+        assert_parameter_snapshot_eq(
+            &topology_destination.shared.snapshot().unwrap(),
+            &topology_shared_before,
+        );
+        assert_parameter_snapshot_eq(
+            &topology_destination.frozen.snapshot().unwrap(),
+            &topology_frozen_before,
+        );
+        assert_parameter_snapshot_eq(
+            &topology_destination.buffer.snapshot().unwrap(),
+            &topology_buffer_before,
+        );
+
+        let destination = TiedFrozenModule::new([7.0, 8.0]);
+        let shared = destination.shared.clone();
+        let frozen = destination.frozen.clone();
+        let buffer = destination.buffer.clone();
+        buffer.replace(TensorData::scalar(-4.0)).unwrap();
+        let shared_before = shared.snapshot().unwrap();
+        let frozen_before = frozen.snapshot().unwrap();
+        let buffer_before = buffer.snapshot().unwrap();
+        let restored_plan = CompiledModuleAdamWPlan::compile_graph_from_module_checkpoint(
+            config.clone(),
+            destination,
+            &checkpoint,
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap();
+        assert_eq!(restored_plan.capture_identity(), capture_identity);
+        assert_parameter_snapshot_eq(&shared.snapshot().unwrap(), &shared_before);
+        assert_parameter_snapshot_eq(&frozen.snapshot().unwrap(), &frozen_before);
+        assert_parameter_snapshot_eq(&buffer.snapshot().unwrap(), &buffer_before);
+
+        let mut resumed = restored_plan.prepare(&CpuSessionTarget::new()).unwrap();
+        assert_eq!(
+            resumed.checkpoint().unwrap(),
+            checkpoint.optimizer_checkpoint().clone()
+        );
+        let uninterrupted_step = source.step(batch(), TensorData::scalar(0.01)).unwrap();
+        let resumed_step = resumed.step(batch(), TensorData::scalar(0.01)).unwrap();
+        assert_eq!(resumed_step.loss(), uninterrupted_step.loss());
+        assert_eq!(resumed_step.outputs(), uninterrupted_step.outputs());
+        assert_eq!(resumed.checkpoint().unwrap(), source.checkpoint().unwrap());
+        let source = source.finish().unwrap();
+        let destination = resumed.finish().unwrap();
+        assert_eq!(
+            destination.state_dict().unwrap(),
+            source.state_dict().unwrap()
+        );
+        assert_eq!(destination.shared.id(), shared.id());
+        assert!(destination.shared.is_trainable());
+        assert!(!destination.frozen.is_trainable());
+        assert!(!destination.buffer.is_trainable());
+        assert_eq!(
+            destination.frozen.value().unwrap(),
+            source_frozen.value().unwrap()
+        );
+        assert_eq!(
+            destination.buffer.value().unwrap(),
+            source_buffer.value().unwrap()
+        );
+        assert_eq!(
+            destination.shared.version().unwrap(),
+            shared_before.version + 1
+        );
+        assert_eq!(
+            destination.frozen.version().unwrap(),
+            frozen_before.version + 1
+        );
+        assert_eq!(
+            destination.buffer.version().unwrap(),
+            buffer_before.version + 1
+        );
+
+        let malformed_destination = TiedFrozenModule::new([9.0, 10.0]);
+        let malformed_shared = malformed_destination.shared.snapshot().unwrap();
+        let malformed_frozen = malformed_destination.frozen.snapshot().unwrap();
+        let malformed_buffer = malformed_destination.buffer.snapshot().unwrap();
+        let (mut tensors, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+        let immutable = tensors
+            .iter_mut()
+            .find(|(name, _)| name.starts_with("immutable."))
+            .unwrap();
+        *immutable.1 = TensorData::scalar(1.0);
+        let malformed = CompiledModuleAdamWCheckpoint::from_bytes(
+            save_safetensors(&tensors, &metadata).unwrap(),
+        )
+        .unwrap();
+        let error = CompiledModuleAdamWPlan::compile_graph_from_module_checkpoint(
+            config,
+            malformed_destination,
+            &malformed,
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .err()
+        .expect("malformed immutable descriptor must reject");
+        let malformed_destination = error.into_module();
+        assert_parameter_snapshot_eq(
+            &malformed_destination.shared.snapshot().unwrap(),
+            &malformed_shared,
+        );
+        assert_parameter_snapshot_eq(
+            &malformed_destination.frozen.snapshot().unwrap(),
+            &malformed_frozen,
+        );
+        assert_parameter_snapshot_eq(
+            &malformed_destination.buffer.snapshot().unwrap(),
+            &malformed_buffer,
+        );
     }
 
     #[test]
