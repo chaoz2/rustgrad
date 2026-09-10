@@ -8,15 +8,16 @@ use rustgrad::runtime::metal::{
 };
 use rustgrad::{
     Backend, CapturedReplayExecutor, CompareOp, CompiledAdamWCheckpoint, CompiledAdamWConfig,
-    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledAdamWStep, CompiledAdamWStepResult, CompiledCheckpointRuntime, CompiledDropoutConfig,
-    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
-    CompiledInputSpec, CompiledModuleAdamWPlan, CompiledMultiStepLr, CompiledTrainingRuntime,
-    CompiledTrainingStep, CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget,
-    DType, Error, Graph, LossOptions, MetalCompiledAdamWPlan, Module, NativeCpuCompiledAdamW,
-    NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget, NativeTrainingReport,
-    NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
-    TrainingDropoutProvider, TransformerBlock, cross_entropy, load_safetensors, save_safetensors,
+    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWPlan,
+    CompiledAdamWRuntime, CompiledAdamWStep, CompiledAdamWStepResult, CompiledCheckpointRuntime,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
+    CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan, CompiledMultiStepLr,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
+    CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions, MetalCompiledAdamWPlan,
+    Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget,
+    NativeTrainingReport, NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result,
+    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, cross_entropy,
+    load_safetensors, save_safetensors,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -3686,6 +3687,186 @@ fn compiled_two_block_attention_dropout_is_ordered_atomic_and_resumes_exactly() 
         Some(5 * BLOCKS_PER_REPLAY)
     );
     assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_module_checkpoint_restores_different_immutable_state() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+    let config = two_block_attention_dropout_config()
+        .with_frozen_parameters(["positions.weight"])
+        .unwrap();
+    let source_model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let source_initial = source_model.state_dict().unwrap();
+    let source_compile_count = Cell::new(0);
+    let source_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout(
+        config.clone(),
+        dropout_config(),
+        source_model,
+        |model, graph, inputs, dropout| {
+            source_compile_count.set(source_compile_count.get() + 1);
+            let (loss, outputs) =
+                build_two_block_with_attention_dropout(model, graph, inputs, dropout)?;
+            Ok(CompiledAdamWGraph::scalar(loss, outputs))
+        },
+    )
+    .unwrap();
+    assert_eq!(source_compile_count.get(), 1);
+    let capture_identity = source_plan.capture_identity();
+    let mut uninterrupted = source_plan
+        .prepare(
+            &CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition),
+        )
+        .unwrap();
+    uninterrupted
+        .step(attention_dropout_batch(1.0), TensorData::scalar(1e-3))
+        .unwrap();
+    assert_eq!(uninterrupted.accumulation_index().unwrap(), 1);
+    let module_checkpoint = uninterrupted.module_checkpoint().unwrap();
+    assert_eq!(
+        module_checkpoint.optimizer_checkpoint(),
+        &uninterrupted.checkpoint().unwrap()
+    );
+
+    let wrong_policy =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x9abc, ATTENTION_DROPOUT).unwrap();
+    let wrong_policy_before = wrong_policy.state_dict().unwrap();
+    let mut wrong_policy_snapshots = Vec::new();
+    wrong_policy.visit("", &mut |name, parameter, kind| {
+        wrong_policy_snapshots.push((name, kind, parameter.snapshot().unwrap()));
+    });
+    let wrong_policy_error =
+        CompiledModuleAdamWPlan::compile_graph_with_dropout_from_module_checkpoint(
+            two_block_attention_dropout_config(),
+            dropout_config(),
+            wrong_policy,
+            &module_checkpoint,
+            |model, graph, inputs, dropout| {
+                let (loss, outputs) =
+                    build_two_block_with_attention_dropout(model, graph, inputs, dropout)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .err()
+        .expect("a different frozen-state policy must reject");
+    let wrong_policy = wrong_policy_error.into_module();
+    assert_eq!(wrong_policy.state_dict().unwrap(), wrong_policy_before);
+    let mut wrong_policy_after = Vec::new();
+    wrong_policy.visit("", &mut |name, parameter, kind| {
+        wrong_policy_after.push((name, kind, parameter.snapshot().unwrap()));
+    });
+    assert_eq!(wrong_policy_after.len(), wrong_policy_snapshots.len());
+    for ((name, kind, before), (after_name, after_kind, after)) in
+        wrong_policy_snapshots.iter().zip(&wrong_policy_after)
+    {
+        assert_eq!(after_name, name);
+        assert_eq!(after_kind, kind);
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.trainable, before.trainable);
+        assert_eq!(after.data, before.data);
+    }
+
+    let destination =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x9abc, ATTENTION_DROPOUT).unwrap();
+    let destination_initial = destination.state_dict().unwrap();
+    assert_ne!(destination_initial.tensors(), source_initial.tensors());
+    let destination_tied_identity = destination.tokens.weight.id();
+    let destination_frozen = destination.positions.weight.clone();
+    let destination_frozen_before = destination_frozen.snapshot().unwrap();
+    let mut destination_states = Vec::new();
+    destination.visit("", &mut |name, parameter, kind| {
+        destination_states.push((name, parameter.clone(), kind, parameter.snapshot().unwrap()));
+    });
+    let restored_compile_count = Cell::new(0);
+    let restored_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout_from_module_checkpoint(
+        config,
+        dropout_config(),
+        destination,
+        &module_checkpoint,
+        |model, graph, inputs, dropout| {
+            restored_compile_count.set(restored_compile_count.get() + 1);
+            let (loss, outputs) =
+                build_two_block_with_attention_dropout(model, graph, inputs, dropout)?;
+            Ok(CompiledAdamWGraph::scalar(loss, outputs))
+        },
+    )
+    .unwrap();
+    assert_eq!(restored_compile_count.get(), 1);
+    assert_eq!(restored_plan.capture_identity(), capture_identity);
+    for (_, parameter, _, before) in &destination_states {
+        let after = parameter.snapshot().unwrap();
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.trainable, before.trainable);
+        assert_eq!(after.data, before.data);
+    }
+
+    let mut resumed = restored_plan
+        .prepare(
+            &CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition),
+        )
+        .unwrap();
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+    assert_eq!(
+        resumed.dropout_block_counter().unwrap(),
+        uninterrupted.dropout_block_counter().unwrap()
+    );
+    let uninterrupted_step = uninterrupted
+        .step(attention_dropout_batch(1.0), TensorData::scalar(1e-3))
+        .unwrap();
+    let resumed_step = resumed
+        .step(attention_dropout_batch(1.0), TensorData::scalar(1e-3))
+        .unwrap();
+    assert_eq!(resumed_step.loss(), uninterrupted_step.loss());
+    assert_eq!(resumed_step.outputs(), uninterrupted_step.outputs());
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+    let uninterrupted_model = uninterrupted.finish().unwrap();
+    let resumed_model = resumed.finish().unwrap();
+    assert_eq!(
+        resumed_model.state_dict().unwrap(),
+        uninterrupted_model.state_dict().unwrap()
+    );
+    let mut restored_states = Vec::new();
+    resumed_model.visit("", &mut |name, parameter, kind| {
+        restored_states.push((name, parameter.clone(), kind, parameter.snapshot().unwrap()));
+    });
+    assert_eq!(restored_states.len(), destination_states.len());
+    for ((name, _, kind, before), (restored_name, _, restored_kind, after)) in
+        destination_states.iter().zip(&restored_states)
+    {
+        assert_eq!(restored_name, name);
+        assert_eq!(restored_kind, kind);
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.trainable, before.trainable);
+    }
+    assert_eq!(resumed_model.tokens.weight.id(), destination_tied_identity);
+    let mut tied_alias_identity = None;
+    resumed_model.visit("", &mut |name, parameter, _| {
+        if name == "lm_head.weight" {
+            tied_alias_identity = Some(parameter.id());
+        }
+    });
+    assert_eq!(tied_alias_identity, Some(destination_tied_identity));
+    assert_eq!(
+        resumed_model.positions.weight.id(),
+        destination_frozen_before.identity
+    );
+    assert!(resumed_model.positions.weight.is_trainable());
+    assert_eq!(
+        resumed_model.positions.weight.version().unwrap(),
+        destination_frozen_before.version + 1
+    );
+    assert_eq!(
+        resumed_model.positions.weight.value().unwrap(),
+        uninterrupted_model.positions.weight.value().unwrap()
+    );
 }
 
 #[test]

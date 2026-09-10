@@ -1034,6 +1034,17 @@ snapshot, publishes the parameter values decoded from that exact snapshot, and
 returns the module together with the same resumable parameter, moment,
 accumulator, dropout, and progress frontier. Strict device runtimes therefore
 perform no second parameter-only read during checkpointed finalization.
+`CompiledModuleAdamWCheckpoint` is the separate complete-module persistence
+envelope. It embeds those existing AdamW checkpoint bytes unchanged and adds a
+canonical, identity-deduplicated inventory of traversal aliases, state kinds,
+source trainability, policy freezing, descriptors, and immutable frozen/buffer
+values. Unified owned recompilation validates that portable topology against a
+fresh module, injects saved immutable values only into capture constants, and
+restores the optimizer frontier without mutating the host destination. Finish
+then publishes restored immutable values and trained parameters together in the
+same all-lock transaction while retaining the destination's identities, ties,
+and trainability. The envelope still contains no executable graph, schedule,
+runtime resource, host identity, or host version.
 Compilation failure returns the exact module, including graph-build,
 checkpoint-admission, seal, and maximum-version preflight failures. Checkpoint
 snapshot, decode, or publication failure returns an error that retains the
