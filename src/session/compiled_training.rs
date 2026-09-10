@@ -22,7 +22,8 @@ use super::target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,
     NativeCpuSessionTarget, SessionTarget,
 };
-use crate::engine::mixed_capture::NativeReplayContext;
+use crate::engine::PlannedNativeItems;
+use crate::engine::mixed_capture::{NativeReplayContext, PreparedRecurrentNativeReplay};
 use crate::nn::{
     Parameter, ParameterRestore, ParameterSnapshot, StateKind, TrainingDropoutProvider,
     next_version, restore_parameters,
@@ -35,12 +36,12 @@ use crate::runtime::metal::{
     MetalSessionScoreboardReport, MetalStatefulInferencePlan, RenderedMetal,
 };
 use crate::{
-    BufferState, CapturedBackendPolicy, CapturedMixedSchedule, CapturedReplayExecutor,
-    CapturedReplayOptions, CapturedSchedule, CapturedStatefulInference, CompareOp, DType,
-    EffectGraph, EffectRuntime, Error, ExecutionPlanSummary, Graph, InferenceStateLink, LoadReport,
-    MixedReplayCursor, Module, NativeMixedReplayTrace, NodeId, ParameterId, ReplayError, Result,
-    Scalar, Schedule, ScheduleStateBinding, ScheduleValueBinding, Shape, TensorData,
-    bind_schedule_states, combine_mixed_schedules, schedule_effects, schedule_many,
+    BufferState, CapturedMixedSchedule, CapturedReplayExecutor, CapturedSchedule,
+    CapturedStatefulInference, CompareOp, DType, EffectGraph, EffectRuntime, Error,
+    ExecutionPlanSummary, Graph, InferenceStateLink, LoadReport, MixedReplayCursor, Module,
+    NativeMixedReplayTrace, NodeId, ParameterId, ReplayError, Result, Scalar, Schedule,
+    ScheduleStateBinding, ScheduleValueBinding, Shape, TensorData, bind_schedule_states,
+    combine_mixed_schedules, schedule_effects, schedule_many,
 };
 #[cfg(test)]
 use crate::{load_safetensors, save_safetensors};
@@ -1190,6 +1191,43 @@ impl NativeCpuCompiledAdamWPreparationReport {
 
     pub const fn recurrent_state_bytes(&self) -> usize {
         self.recurrent_state_bytes
+    }
+}
+
+struct PreparedNativeCpuProgram {
+    report: NativeCpuProgramPreparationReport,
+    replay: PreparedRecurrentNativeReplay,
+}
+
+struct PreparedNativeCpuEvaluation {
+    report: NativeCpuProgramPreparationReport,
+    plan: PlannedNativeItems,
+}
+
+impl PreparedNativeCpuEvaluation {
+    fn validate(&self, capture_identity: u64, capture: &CapturedSchedule) -> Result<()> {
+        let native_identity = native_cpu_identity(
+            capture_identity,
+            self.plan.vectorized(),
+            self.plan.schedule_cache_keys().iter().copied(),
+        );
+        if self.report.capture_identity != capture_identity
+            || self.report.native_identity != native_identity
+            || self.report.native_item_count != self.plan.item_count()
+            || self.report.cache_hit_count != self.plan.cache_hit_count()
+            || self.report.cache_miss_count != self.plan.cache_miss_count()
+            || self.report.vectorized != self.plan.vectorized()
+            || capture.items.iter().map(|item| item.cache_key).ne(self
+                .plan
+                .schedule_cache_keys()
+                .iter()
+                .copied())
+        {
+            return Err(training(
+                "compiled native CPU evaluation preparation identity mismatch",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2662,7 +2700,10 @@ pub struct CpuCompiledAdamW {
 pub struct NativeCpuCompiledAdamW<'a> {
     inner: CpuCompiledAdamW,
     executor: &'a CapturedReplayExecutor,
-    vectorized: bool,
+    main_replay: PreparedRecurrentNativeReplay,
+    partial_flush_replay: Option<PreparedRecurrentNativeReplay>,
+    zero_grad_replay: Option<PreparedRecurrentNativeReplay>,
+    evaluation_replay: Option<PreparedNativeCpuEvaluation>,
     preparation: NativeCpuCompiledAdamWPreparationReport,
     successful_steps: u64,
     successful_flushes: u64,
@@ -4198,7 +4239,7 @@ impl CompiledEvaluationPlan {
         parameters: BTreeMap<String, TensorData>,
         executor: &CapturedReplayExecutor,
         vectorized: bool,
-    ) -> Result<NativeCpuProgramPreparationReport> {
+    ) -> Result<PreparedNativeCpuEvaluation> {
         let started = Instant::now();
         let inputs = self.bind(zero_inputs(&self.inputs)?, parameters)?;
         let capture = self.inference.capture();
@@ -4207,7 +4248,7 @@ impl CompiledEvaluationPlan {
             .map_err(replay_error)?;
         let execution_plan = ExecutionPlanSummary::from_capture(capture, true)
             .map_err(|error| training(format!("compiled native CPU summary: {error}")))?;
-        Ok(NativeCpuProgramPreparationReport {
+        let report = NativeCpuProgramPreparationReport {
             capture_identity: self.capture_identity,
             native_identity: native_cpu_identity(
                 self.capture_identity,
@@ -4220,7 +4261,8 @@ impl CompiledEvaluationPlan {
             cache_miss_count: plan.cache_miss_count(),
             execution_plan,
             wall_time: started.elapsed(),
-        })
+        };
+        Ok(PreparedNativeCpuEvaluation { report, plan })
     }
 
     fn evaluate_native(
@@ -4228,40 +4270,28 @@ impl CompiledEvaluationPlan {
         inputs: BTreeMap<String, TensorData>,
         parameters: BTreeMap<String, TensorData>,
         executor: &CapturedReplayExecutor,
-        vectorized: bool,
+        prepared: &PreparedNativeCpuEvaluation,
     ) -> Result<(CompiledEvaluationResult, NativeCpuRunReport)> {
         let inputs = self.bind(inputs, parameters)?;
         let started = Instant::now();
-        let replay = executor
-            .replay(
-                self.inference.capture(),
-                &inputs,
-                CapturedReplayOptions {
-                    backend: CapturedBackendPolicy::NativeJit { vectorized },
-                },
-            )
+        let capture = self.inference.capture();
+        prepared.validate(self.capture_identity, capture)?;
+        let values = executor
+            .execute_planned_native_items(capture, &inputs, &prepared.plan)
             .map_err(replay_error)?;
-        let schedule_cache_keys = replay
-            .trace
-            .items
-            .iter()
-            .map(|item| item.schedule_cache_key)
-            .collect::<Vec<_>>();
+        let outputs = values.requested(&capture.requested).map_err(replay_error)?;
+        let schedule_cache_keys = prepared.plan.schedule_cache_keys().to_vec();
         let report = NativeCpuRunReport {
             capture_identity: self.capture_identity,
-            native_identity: native_cpu_identity(
-                self.capture_identity,
-                vectorized,
-                schedule_cache_keys.iter().copied(),
-            ),
-            vectorized,
+            native_identity: prepared.report.native_identity,
+            vectorized: prepared.plan.vectorized(),
             successful_invocation: 0,
-            native_item_count: replay.trace.items.len(),
+            native_item_count: prepared.plan.item_count(),
             schedule_cache_keys,
             wall_time: started.elapsed(),
         };
         Ok((
-            evaluation_result(replay.outputs, &self.output_names, self.capture_identity)?,
+            evaluation_result(outputs, &self.output_names, self.capture_identity)?,
             report,
         ))
     }
@@ -4346,7 +4376,7 @@ impl CpuCompiledTrainingProgram {
         executor: &CapturedReplayExecutor,
         vectorized: bool,
         external_learning_rate: bool,
-    ) -> Result<NativeCpuProgramPreparationReport> {
+    ) -> Result<PreparedNativeCpuProgram> {
         let started = Instant::now();
         let mut provided = zero_inputs(&self.inputs)?;
         if external_learning_rate {
@@ -4355,11 +4385,12 @@ impl CpuCompiledTrainingProgram {
                 TensorData::zeros_with_dtype(Shape::from([]), DType::F32)?,
             );
         }
-        let trace = self
+        let replay = self
             .capture
             .prepare_recurrent_native(&self.runtime, &self.cursor, &provided, executor, vectorized)
             .map_err(replay_error)?;
-        Ok(NativeCpuProgramPreparationReport {
+        let trace = replay.preparation_trace();
+        let report = NativeCpuProgramPreparationReport {
             capture_identity: self.capture_identity(),
             native_identity: trace.replay.identity,
             vectorized,
@@ -4368,7 +4399,8 @@ impl CpuCompiledTrainingProgram {
             cache_miss_count: trace.cache_miss_count,
             execution_plan: self.recurrent_capture.execution_plan().clone(),
             wall_time: started.elapsed(),
-        })
+        };
+        Ok(PreparedNativeCpuProgram { report, replay })
     }
 
     /// Executes one graph-free replay and atomically publishes every recurrent
@@ -4451,8 +4483,7 @@ impl CpuCompiledTrainingProgram {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: Option<TensorData>,
         non_finite_policy: CpuNonFinitePolicy,
-        executor: &CapturedReplayExecutor,
-        vectorized: bool,
+        native: NativeReplayContext<'_>,
         injected_failure: Option<u64>,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
         validate_training_inputs(&self.inputs, &inputs)?;
@@ -4474,7 +4505,7 @@ impl CpuCompiledTrainingProgram {
                 &mut self.runtime,
                 &mut self.cursor,
                 &provided,
-                NativeReplayContext::new(executor, vectorized),
+                native,
                 injected_failure,
                 |outputs, successors| {
                     validate_staged_transition(outputs, successors, non_finite_policy, true)
@@ -4815,13 +4846,13 @@ impl CpuCompiledTrainingProgram {
         executor: &CapturedReplayExecutor,
         vectorized: bool,
         external_learning_rate: bool,
-    ) -> Result<NativeCpuProgramPreparationReport> {
+    ) -> Result<PreparedNativeCpuProgram> {
         let started = Instant::now();
         let learning_rate = external_learning_rate
             .then(|| TensorData::zeros_with_dtype(Shape::from([]), DType::F32))
             .transpose()?;
         let prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
-        let trace = transition
+        let replay = transition
             .capture
             .prepare_recurrent_native(
                 &self.runtime,
@@ -4831,7 +4862,8 @@ impl CpuCompiledTrainingProgram {
                 vectorized,
             )
             .map_err(replay_error)?;
-        Ok(NativeCpuProgramPreparationReport {
+        let trace = replay.preparation_trace();
+        let report = NativeCpuProgramPreparationReport {
             capture_identity: transition.capture_identity(),
             native_identity: trace.replay.identity,
             vectorized,
@@ -4840,7 +4872,8 @@ impl CpuCompiledTrainingProgram {
             cache_miss_count: trace.cache_miss_count,
             execution_plan: transition.recurrent_capture.execution_plan().clone(),
             wall_time: started.elapsed(),
-        })
+        };
+        Ok(PreparedNativeCpuProgram { report, replay })
     }
 
     fn replay_auxiliary_transition_native(
@@ -6658,15 +6691,29 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 .iter()
                 .map(|state| state.bytes),
         )?;
+        let PreparedNativeCpuProgram {
+            report: main_report,
+            replay: main_replay,
+        } = main;
+        let (partial_flush_report, partial_flush_replay) = partial_flush
+            .map(|prepared| (prepared.report, prepared.replay))
+            .unzip();
+        let (zero_grad_report, zero_grad_replay) = zero_grad
+            .map(|prepared| (prepared.report, prepared.replay))
+            .unzip();
+        let evaluation_report = evaluation.as_ref().map(|prepared| prepared.report.clone());
         Ok(Self {
             inner,
             executor,
-            vectorized,
+            main_replay,
+            partial_flush_replay,
+            zero_grad_replay,
+            evaluation_replay: evaluation,
             preparation: NativeCpuCompiledAdamWPreparationReport {
-                main,
-                partial_flush,
-                zero_grad,
-                evaluation,
+                main: main_report,
+                partial_flush: partial_flush_report,
+                zero_grad: zero_grad_report,
+                evaluation: evaluation_report,
                 recurrent_state_count,
                 recurrent_state_bytes,
             },
@@ -6722,8 +6769,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             inputs,
             learning_rate,
             self.inner.non_finite_policy,
-            self.executor,
-            self.vectorized,
+            NativeReplayContext::new(self.executor, &self.main_replay),
             injected_failure,
         )?;
         result.step = next.replay_step;
@@ -6766,11 +6812,15 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .evaluation
             .as_ref()
             .ok_or_else(|| training("compiled evaluation is not attached"))?;
+        let prepared = self
+            .evaluation_replay
+            .as_ref()
+            .ok_or_else(|| training("compiled native CPU evaluation preparation is absent"))?;
         let (inner, mut report) = evaluation.plan.evaluate_native(
             inputs,
             self.inner.inner.parameter_snapshots()?,
             self.executor,
-            self.vectorized,
+            prepared,
         )?;
         report.successful_invocation = successful_invocation;
         self.successful_evaluations = successful_invocation;
@@ -6820,11 +6870,15 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .partial_flush
             .as_ref()
             .ok_or_else(|| training("compiled AdamW partial flush capture is absent"))?;
+        let prepared = self
+            .partial_flush_replay
+            .as_ref()
+            .ok_or_else(|| training("compiled native CPU partial flush preparation is absent"))?;
         let report = self.inner.inner.replay_auxiliary_transition_native(
             transition,
             learning_rate,
             self.inner.non_finite_policy,
-            NativeReplayContext::new(self.executor, self.vectorized),
+            NativeReplayContext::new(self.executor, prepared),
             successful_invocation,
             injected_failure,
         )?;
@@ -6907,11 +6961,15 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .zero_grad
             .as_ref()
             .ok_or_else(|| training("compiled AdamW zero-grad capture is absent"))?;
+        let prepared = self
+            .zero_grad_replay
+            .as_ref()
+            .ok_or_else(|| training("compiled native CPU zero-grad preparation is absent"))?;
         self.inner.inner.replay_auxiliary_transition_native(
             transition,
             None,
             CpuNonFinitePolicy::Propagate,
-            NativeReplayContext::new(self.executor, self.vectorized),
+            NativeReplayContext::new(self.executor, prepared),
             successful_invocation,
             injected_failure,
         )?;
@@ -9955,6 +10013,7 @@ mod tests {
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
         let mut native = target.prepare(&plan).unwrap();
+        assert_eq!(executor.native_item_plan_count(), 1);
         let preparation = native.preparation_report();
         assert_eq!(
             preparation.main().capture_identity(),
@@ -9974,6 +10033,7 @@ mod tests {
         let prepared_native_identity = preparation.main().native_identity();
 
         let cached = target.prepare(&plan).unwrap();
+        assert_eq!(executor.native_item_plan_count(), 2);
         assert_eq!(cached.preparation_report().main().cache_miss_count(), 0);
         assert_eq!(
             cached.preparation_report().main().native_identity(),
@@ -10014,6 +10074,7 @@ mod tests {
         assert_eq!(actual.loss_weight(), 1);
         assert_eq!(actual.report().successful_invocation(), 2);
         assert_native_adamw_state_close(&native, &interpreted);
+        assert_eq!(executor.native_item_plan_count(), 2);
     }
 
     #[test]
@@ -10038,6 +10099,7 @@ mod tests {
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor);
         let mut native = target.prepare(&plan).unwrap();
+        assert_eq!(executor.native_item_plan_count(), 3);
         let mut interpreted = plan.prepare_cpu().unwrap();
         assert!(native.preparation_report().partial_flush().is_some());
         assert!(native.preparation_report().zero_grad().is_some());
@@ -10097,6 +10159,7 @@ mod tests {
         let empty = native.flush_partial_window(lr()).unwrap();
         assert!(!empty.did_update());
         assert!(empty.report().is_none());
+        assert_eq!(executor.native_item_plan_count(), 3);
     }
 
     #[test]
@@ -10145,6 +10208,7 @@ mod tests {
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor);
         let mut session = target.prepare(plan).unwrap();
+        assert_eq!(executor.native_item_plan_count(), 2);
         let checkpoint = session.checkpoint().unwrap();
 
         assert!(session.evaluate(BTreeMap::new()).is_err());
@@ -10160,6 +10224,7 @@ mod tests {
         assert_eq!(evaluation.report().successful_invocation(), 1);
         assert!(evaluation.report().first_successful_invocation());
         assert_eq!(session.checkpoint().unwrap(), checkpoint);
+        assert_eq!(executor.native_item_plan_count(), 2);
     }
 
     #[test]

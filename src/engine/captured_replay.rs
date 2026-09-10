@@ -306,6 +306,8 @@ pub struct CapturedReplayExecutor {
     scalar: CpuJitBackend,
     vectorized: CpuJitBackend,
     specializations: Mutex<SpecializationCache>,
+    #[cfg(test)]
+    native_item_plan_count: std::sync::atomic::AtomicUsize,
 }
 impl Default for CapturedReplayExecutor {
     fn default() -> Self {
@@ -313,6 +315,8 @@ impl Default for CapturedReplayExecutor {
             scalar: CpuJitBackend::new(JitFallback::Error),
             vectorized: CpuJitBackend::new(JitFallback::Error).vectorized(true),
             specializations: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            native_item_plan_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -326,6 +330,12 @@ impl CapturedReplayExecutor {
             .lock()
             .expect("specialization cache lock")
             .len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_item_plan_count(&self) -> usize {
+        self.native_item_plan_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Evaluates one complete symbolic environment and returns a concrete,
@@ -782,6 +792,9 @@ impl PreparedPrunedNativeReplay {
 pub(crate) struct PlannedNativeItems {
     items: Vec<PreparedScheduleItem>,
     vectorized: bool,
+    capture_identity: u64,
+    input_schema: Vec<crate::ReplayInput>,
+    schedule_cache_keys: Vec<u64>,
 }
 
 impl PlannedNativeItems {
@@ -796,6 +809,52 @@ impl PlannedNativeItems {
     pub(crate) fn cache_miss_count(&self) -> usize {
         self.items.iter().filter(|item| !item.cache_hit).count()
     }
+
+    pub(crate) fn vectorized(&self) -> bool {
+        self.vectorized
+    }
+
+    pub(crate) fn schedule_cache_keys(&self) -> &[u64] {
+        &self.schedule_cache_keys
+    }
+
+    fn validate_replay(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+    ) -> Result<(), ReplayError> {
+        reject_multi_output_items(capture)?;
+        if capture.identity != self.capture_identity {
+            return Err(ReplayError::Corrupt(
+                "prepared native capture identity mismatch".into(),
+            ));
+        }
+        if capture.inputs != self.input_schema {
+            return Err(ReplayError::Corrupt(
+                "prepared native input schema mismatch".into(),
+            ));
+        }
+        if capture.items.len() != self.items.len() {
+            return Err(ReplayError::Corrupt(
+                "prepared native item count mismatch".into(),
+            ));
+        }
+        if capture
+            .items
+            .iter()
+            .map(|item| item.cache_key)
+            .ne(self.schedule_cache_keys.iter().copied())
+        {
+            return Err(ReplayError::Corrupt(
+                "prepared native schedule cache keys mismatch".into(),
+            ));
+        }
+        // Values are intentionally not retained by the plan. Revalidate the
+        // current invocation after authenticating its immutable schema; this
+        // includes data-dependent quantized row-gather index bounds.
+        validate_inputs(capture, provided)?;
+        Ok(())
+    }
 }
 
 impl CapturedReplayExecutor {
@@ -805,6 +864,9 @@ impl CapturedReplayExecutor {
         provided: &BTreeMap<String, TensorData>,
         vectorized: bool,
     ) -> Result<PlannedNativeItems, ReplayError> {
+        #[cfg(test)]
+        self.native_item_plan_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         reject_multi_output_items(capture)?;
         validate_inputs(capture, provided)?;
         if capture
@@ -830,7 +892,13 @@ impl CapturedReplayExecutor {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(PlannedNativeItems { items, vectorized })
+        Ok(PlannedNativeItems {
+            items,
+            vectorized,
+            capture_identity: capture.identity,
+            input_schema: capture.inputs.clone(),
+            schedule_cache_keys: capture.items.iter().map(|item| item.cache_key).collect(),
+        })
     }
 
     pub(crate) fn execute_planned_native_items(
@@ -839,7 +907,7 @@ impl CapturedReplayExecutor {
         provided: &BTreeMap<String, TensorData>,
         plan: &PlannedNativeItems,
     ) -> Result<ReplayValues, ReplayError> {
-        reject_multi_output_items(capture)?;
+        plan.validate_replay(capture, provided)?;
         let mut values = initial_values(capture, provided)?;
         for (item, prepared) in capture.items.iter().zip(&plan.items) {
             let (value, _) = self
@@ -1275,6 +1343,55 @@ mod tests {
             .unwrap();
         assert_eq!(native.outputs[0].storage(), expected.storage());
         assert_eq!(native.trace.items[0].backend, ItemBackend::NativeJit);
+    }
+
+    #[test]
+    fn planned_native_items_reuse_current_bindings_and_reject_truncated_plans() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2]);
+        let output = graph.relu(input).unwrap();
+        let capture = captured(&graph, &[output]);
+        let bindings = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([2], vec![-1.0, 2.0]).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        assert_eq!(executor.native_item_plan_count(), 1);
+
+        let first = executor
+            .execute_planned_native_items(&capture, &bindings, &plan)
+            .unwrap();
+        let changed = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([2], vec![3.0, -4.0]).unwrap(),
+        )]);
+        let second = executor
+            .execute_planned_native_items(&capture, &changed, &plan)
+            .unwrap();
+        assert_ne!(
+            first.requested(&capture.requested).unwrap(),
+            second.requested(&capture.requested).unwrap()
+        );
+        assert_eq!(executor.native_item_plan_count(), 1);
+
+        let malformed =
+            BTreeMap::from([("input".into(), TensorData::new([1], vec![1.0]).unwrap())]);
+        assert!(matches!(
+            executor.execute_planned_native_items(&capture, &malformed, &plan),
+            Err(ReplayError::Descriptor(_))
+        ));
+        assert_eq!(executor.native_item_plan_count(), 1);
+
+        plan.items.pop();
+        assert!(matches!(
+            executor.execute_planned_native_items(&capture, &bindings, &plan),
+            Err(ReplayError::Corrupt(message))
+                if message == "prepared native item count mismatch"
+        ));
+        assert_eq!(executor.native_item_plan_count(), 1);
     }
 
     fn assert_computed_affine_replay(
