@@ -31,6 +31,9 @@ const TOKEN_COUNT: usize = BATCH * TIME;
 const ACCUMULATION_STEPS: u64 = 3;
 const MAX_GRADIENT_NORM: f32 = 0.25;
 const LOSS_MASK: &str = "loss_mask";
+const MULTI_HEAD_VOCAB: usize = 5;
+const MULTI_HEAD_EMBEDDING: usize = 4;
+const MULTI_HEAD_FEED_FORWARD: usize = 8;
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -118,6 +121,102 @@ impl Module for TinyCausalTransformer {
     }
 }
 
+struct MultiHeadCausalTransformer {
+    tokens: Embedding,
+    block: TransformerBlock,
+    norm: LayerNorm,
+}
+
+impl MultiHeadCausalTransformer {
+    fn new(seed: u64) -> Result<Self> {
+        let model = Self {
+            tokens: Embedding::new_static(MULTI_HEAD_VOCAB, MULTI_HEAD_EMBEDDING, None, seed)?,
+            block: TransformerBlock::new_static(
+                MULTI_HEAD_EMBEDDING,
+                2,
+                MULTI_HEAD_FEED_FORWARD,
+                true,
+                0.25,
+                seed.wrapping_add(1),
+            )?
+            .with_causal_attention(true),
+            norm: LayerNorm::new_static([MULTI_HEAD_EMBEDDING], 1e-5, true)?,
+        };
+
+        let mut ff1_bias = None;
+        model.visit("", &mut |name, parameter, _| {
+            if name == "block.ff1.1" {
+                ff1_bias = Some(parameter.clone());
+            }
+        });
+        ff1_bias
+            .expect("the multi-head Transformer exposes its feed-forward bias")
+            .replace(TensorData::new(
+                [MULTI_HEAD_FEED_FORWARD],
+                vec![2.0, -2.0, 2.25, -2.25, 2.5, -2.5, 2.75, -2.75],
+            )?)?;
+
+        for projection in [
+            "block.query.0",
+            "block.key.0",
+            "block.value.0",
+            "block.out.0",
+        ] {
+            let mut weight = None;
+            model.visit("", &mut |name, parameter, _| {
+                if name == projection {
+                    weight = Some(parameter.value());
+                }
+            });
+            let lanes = weight
+                .expect("the multi-head Transformer exposes every attention projection")?
+                .to_vec_f64();
+            assert!(
+                lanes.iter().all(|lane| lane.is_finite())
+                    && lanes.into_iter().any(|lane| lane != 0.0),
+                "{projection} must be a nonzero deterministic projection"
+            );
+        }
+        Ok(model)
+    }
+
+    fn forward(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<NodeId> {
+        let hidden = self.tokens.forward(graph, tokens)?;
+        let hidden = self
+            .block
+            .forward_training_with_dropout(graph, hidden, dropout)?;
+        let hidden = self.norm.forward(graph, hidden)?;
+        let tied_weight = self.tokens.weight.bind(graph)?;
+        let tied_weight = graph.permute(tied_weight, [1, 0])?;
+        graph.matmul(hidden, tied_weight)
+    }
+}
+
+impl Module for MultiHeadCausalTransformer {
+    fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        let child = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+        self.tokens.visit(&child("tokens"), visitor);
+        self.block.visit(&child("block"), visitor);
+        self.norm.visit(&child("norm"), visitor);
+        visitor(
+            child("lm_head.weight"),
+            &self.tokens.weight,
+            StateKind::Parameter,
+        );
+    }
+}
+
 struct BufferedTinyCausalTransformer {
     transformer: TinyCausalTransformer,
     running_marker: Parameter,
@@ -188,6 +287,19 @@ fn masked_config() -> CompiledAdamWConfig {
     masked_config_with_max_gradient_norm(Some(MAX_GRADIENT_NORM))
 }
 
+fn multi_head_config() -> CompiledAdamWConfig {
+    CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+        .unwrap()
+        .with_gradient_accumulation(2)
+        .unwrap()
+        .with_max_gradient_norm(1e-4)
+        .unwrap()
+        .with_host_token_input("tokens", [BATCH, TIME])
+        .unwrap()
+        .with_host_token_input("targets", [BATCH, TIME])
+        .unwrap()
+}
+
 fn sparse_causal_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
     let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
     let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
@@ -200,6 +312,20 @@ fn sparse_causal_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> R
 
 fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
     let losses = sparse_causal_losses(graph, logits, targets)?;
+    graph.mean_default(losses)
+}
+
+fn multi_head_sparse_causal_loss(
+    graph: &mut Graph,
+    logits: NodeId,
+    targets: NodeId,
+) -> Result<NodeId> {
+    let logits = graph.reshape(logits, [TOKEN_COUNT, MULTI_HEAD_VOCAB])?;
+    let log_probabilities = graph.log_softmax(logits, 1, None)?;
+    let target_indices = graph.reshape(targets, [TOKEN_COUNT, 1])?;
+    let selected = graph.gather(log_probabilities, target_indices, 1)?;
+    let selected = graph.reshape(selected, [TOKEN_COUNT])?;
+    let losses = graph.neg(selected)?;
     graph.mean_default(losses)
 }
 
@@ -225,6 +351,18 @@ fn build(
     let logits = model.forward(graph, inputs["tokens"], dropout)?;
     let loss = sparse_causal_loss(graph, logits, inputs["targets"])?;
     Ok((loss, BTreeMap::new()))
+}
+
+fn build_multi_head(
+    model: &MultiHeadCausalTransformer,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let mut dropout = FixedResidualDropout::multi_head();
+    let logits = model.forward(graph, inputs["tokens"], &mut dropout)?;
+    assert_eq!(dropout.next, 2);
+    let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
+    Ok((loss, BTreeMap::from([("logits".into(), logits)])))
 }
 
 fn build_buffered(
@@ -320,6 +458,15 @@ fn token_tensor(values: [i32; TOKEN_COUNT]) -> TensorData {
 
 fn batch(replay: u64) -> BTreeMap<String, TensorData> {
     let (tokens, targets) = batch_values(replay);
+    BTreeMap::from([
+        ("tokens".into(), token_tensor(tokens)),
+        ("targets".into(), token_tensor(targets)),
+    ])
+}
+
+fn multi_head_batch() -> BTreeMap<String, TensorData> {
+    let tokens = [0, 1, 2, 3, 4, 1];
+    let targets = [1, 3, 4, 2, 0, 4];
     BTreeMap::from([
         ("tokens".into(), token_tensor(tokens)),
         ("targets".into(), token_tensor(targets)),
@@ -675,6 +822,27 @@ impl FixedResidualDropout {
     fn from_masks(masks: [TensorData; 2]) -> Self {
         Self { masks, next: 0 }
     }
+
+    fn multi_head() -> Self {
+        let mask = |values: [bool; BATCH * TIME * MULTI_HEAD_EMBEDDING]| {
+            TensorData::from_scalars(
+                [BATCH, TIME, MULTI_HEAD_EMBEDDING],
+                DType::Bool,
+                values.into_iter().map(Scalar::Bool),
+            )
+            .unwrap()
+        };
+        Self::from_masks([
+            mask([
+                true, false, true, true, false, true, true, false, true, true, false, true, true,
+                false, true, false, false, true, false, true, true, true, true, false,
+            ]),
+            mask([
+                false, true, true, true, true, false, true, false, true, false, true, true, false,
+                true, true, false, true, true, false, true, true, false, true, true,
+            ]),
+        ])
+    }
 }
 
 struct ObservedResidualDropout<'a> {
@@ -694,12 +862,12 @@ impl TrainingDropoutProvider for FixedResidualDropout {
     fn dropout(&mut self, graph: &mut Graph, input: NodeId, probability: f64) -> Result<NodeId> {
         assert_eq!(probability.to_bits(), 0.25f64.to_bits());
         assert_eq!(graph.dtype(input)?, DType::F32);
-        assert_eq!(graph.shape(input)?, &Shape::new([BATCH, TIME, EMBEDDING]));
         let mask = self
             .masks
             .get(self.next)
             .expect("the maintained block has exactly two residual-dropout sites")
             .clone();
+        assert_eq!(graph.shape(input)?, mask.shape());
         self.next += 1;
         let mask = graph.constant(mask);
         let mask = graph.contiguous(mask)?;
@@ -1473,6 +1641,128 @@ struct TransformerGradientProbe {
 struct NumericalMaskedTransformerEvaluation {
     loss: f64,
     gradients: Vec<f64>,
+}
+
+#[derive(Clone, Copy)]
+struct MultiHeadGradientProbe {
+    parameter: &'static str,
+    coordinate: usize,
+    boundary: &'static str,
+    head: Option<usize>,
+}
+
+struct NumericalMultiHeadTransformerEvaluation {
+    loss: f64,
+    gradients: Vec<f64>,
+}
+
+fn numerical_multi_head_transformer_gradient_lanes(
+    model: &MultiHeadCausalTransformer,
+    inputs: BTreeMap<String, TensorData>,
+    probes: &[MultiHeadGradientProbe],
+) -> NumericalMultiHeadTransformerEvaluation {
+    const EPSILONS: [f64; 4] = [1e-2, 5e-3, 2.5e-3, 1e-3];
+    const RELU_MARGIN: f64 = 0.25;
+
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let mut dropout = FixedResidualDropout::multi_head();
+    let logits = model.forward(&mut graph, tokens, &mut dropout).unwrap();
+    assert_eq!(dropout.next, 2);
+    let loss = multi_head_sparse_causal_loss(&mut graph, logits, targets).unwrap();
+    let relu_input = unique_relu_input(&graph, loss);
+
+    let parameter_inputs = model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| {
+            let node = parameter.node(&graph).unwrap();
+            let Op::Input { name: input_name } = graph.op(node).unwrap() else {
+                panic!("bound trainable parameter {name} must be a graph input");
+            };
+            (name, input_name.clone())
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert!(
+        probes
+            .iter()
+            .all(|probe| parameter_inputs.contains_key(probe.parameter))
+    );
+
+    let mut bindings = model.input_bindings(&graph).unwrap();
+    bindings.extend(inputs);
+    let outputs = [loss, relu_input];
+    let base = CpuBackend
+        .execute_many(&graph, &outputs, &bindings)
+        .unwrap();
+    let base_relu = &base.outputs[1];
+    assert!(
+        base_relu
+            .to_vec_f64()
+            .into_iter()
+            .all(|value| value.abs() >= RELU_MARGIN),
+        "the multi-head finite-difference fixture must stay away from ReLU kinks"
+    );
+
+    let gradients = probes
+        .iter()
+        .map(|probe| {
+            let input_name = &parameter_inputs[probe.parameter];
+            let parameter = &bindings[input_name];
+            assert!(probe.coordinate < parameter.len());
+            let context = format!(
+                "{} through {}[{}]",
+                probe.boundary, probe.parameter, probe.coordinate
+            );
+            EPSILONS
+                .into_iter()
+                .find_map(|epsilon| {
+                    let plus = CpuBackend
+                        .execute_many(
+                            &graph,
+                            &outputs,
+                            &perturbed_parameter_bindings(
+                                &bindings,
+                                input_name,
+                                parameter,
+                                probe.coordinate,
+                                epsilon,
+                            ),
+                        )
+                        .unwrap();
+                    let minus = CpuBackend
+                        .execute_many(
+                            &graph,
+                            &outputs,
+                            &perturbed_parameter_bindings(
+                                &bindings,
+                                input_name,
+                                parameter,
+                                probe.coordinate,
+                                -epsilon,
+                            ),
+                        )
+                        .unwrap();
+                    if !relu_region_unchanged(base_relu, &plus.outputs[1])
+                        || !relu_region_unchanged(base_relu, &minus.outputs[1])
+                    {
+                        return None;
+                    }
+                    Some(
+                        (plus.outputs[0].scalar_at(0).as_f64()
+                            - minus.outputs[0].scalar_at(0).as_f64())
+                            / (2.0 * epsilon),
+                    )
+                })
+                .unwrap_or_else(|| panic!("no bounded central difference preserved {context}"))
+        })
+        .collect();
+    NumericalMultiHeadTransformerEvaluation {
+        loss: base.outputs[0].scalar_at(0).as_f64(),
+        gradients,
+    }
 }
 
 fn numerical_masked_transformer_gradient_lanes(
@@ -2347,6 +2637,248 @@ fn compiled_transformer_active_global_clip_changes_the_first_window_update() {
         unclipped.parameter_snapshots().unwrap(),
         "active clipping must change the maintained Transformer's update"
     );
+}
+
+#[test]
+fn compiled_multi_head_transformer_gradients_match_forward_only_oracle_and_native() {
+    const ABSOLUTE_TOLERANCE: f64 = 6e-3;
+    const RELATIVE_TOLERANCE: f64 = 3e-3;
+    const PARITY_ABSOLUTE_TOLERANCE: f64 = 2e-5;
+    const PARITY_RELATIVE_TOLERANCE: f64 = 2e-4;
+    const PROBES: [MultiHeadGradientProbe; 12] = [
+        MultiHeadGradientProbe {
+            parameter: "block.query.0",
+            coordinate: 0,
+            boundary: "query projection head 0",
+            head: Some(0),
+        },
+        MultiHeadGradientProbe {
+            parameter: "block.query.0",
+            coordinate: 6,
+            boundary: "query projection head 1",
+            head: Some(1),
+        },
+        MultiHeadGradientProbe {
+            parameter: "block.key.0",
+            coordinate: 9,
+            boundary: "key projection head 0",
+            head: Some(0),
+        },
+        MultiHeadGradientProbe {
+            parameter: "block.key.0",
+            coordinate: 11,
+            boundary: "key projection head 1",
+            head: Some(1),
+        },
+        MultiHeadGradientProbe {
+            parameter: "block.value.0",
+            coordinate: 12,
+            boundary: "value projection head 0",
+            head: Some(0),
+        },
+        MultiHeadGradientProbe {
+            parameter: "block.value.0",
+            coordinate: 14,
+            boundary: "value projection head 1",
+            head: Some(1),
+        },
+        MultiHeadGradientProbe {
+            parameter: "block.out.0",
+            coordinate: 9,
+            boundary: "post-concatenation attention output projection",
+            head: None,
+        },
+        MultiHeadGradientProbe {
+            parameter: "tokens.weight",
+            coordinate: 7,
+            boundary: "embedding lookup and tied output projection",
+            head: None,
+        },
+        MultiHeadGradientProbe {
+            parameter: "block.ln1.0",
+            coordinate: 3,
+            boundary: "pre-attention LayerNorm affine scale",
+            head: None,
+        },
+        MultiHeadGradientProbe {
+            parameter: "block.ff1.0",
+            coordinate: 20,
+            boundary: "feed-forward expansion and ReLU",
+            head: None,
+        },
+        MultiHeadGradientProbe {
+            parameter: "block.ff2.0",
+            coordinate: 17,
+            boundary: "feed-forward contraction",
+            head: None,
+        },
+        MultiHeadGradientProbe {
+            parameter: "norm.bias",
+            coordinate: 2,
+            boundary: "final LayerNorm and logits reduction",
+            head: None,
+        },
+    ];
+
+    let model = MultiHeadCausalTransformer::new(0x4567).unwrap();
+    let tied_identity = model.tokens.weight.id();
+    let mut visited = BTreeMap::new();
+    model.visit("", &mut |name, parameter, _| {
+        visited.insert(name, parameter.id());
+    });
+    assert_eq!(visited["tokens.weight"], visited["lm_head.weight"]);
+
+    let compile_count = Cell::new(0);
+    let plan =
+        CompiledAdamWPlan::compile_module(multi_head_config(), &model, |model, graph, inputs| {
+            compile_count.set(compile_count.get() + 1);
+            build_multi_head(model, graph, inputs)
+        })
+        .unwrap();
+    assert_eq!(compile_count.get(), 1);
+
+    let executor = CapturedReplayExecutor::default();
+    let mut interpreted = plan.prepare(&CpuSessionTarget).unwrap();
+    let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let mut native = plan.prepare(&target).unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(native.preparation_report().main().fallback_count(), 0);
+    assert!(native.preparation_report().main().native_item_count() > 0);
+    assert_eq!(
+        native
+            .preparation_report()
+            .partial_flush()
+            .unwrap()
+            .fallback_count(),
+        0
+    );
+    assert_eq!(
+        native
+            .preparation_report()
+            .zero_grad()
+            .unwrap()
+            .fallback_count(),
+        0
+    );
+
+    let initial_parameters = interpreted.parameter_snapshots().unwrap();
+    let interpreted_step = interpreted
+        .step(multi_head_batch(), TensorData::scalar(0.01))
+        .unwrap();
+    let native_step = native
+        .step(multi_head_batch(), TensorData::scalar(0.01))
+        .unwrap();
+    assert!(!interpreted_step.did_update());
+    assert!(!native_step.did_update());
+    assert_eq!(interpreted_step.accumulation_index(), 1);
+    assert_eq!(native_step.accumulation_index(), 1);
+    assert_eq!(native_step.report().fallback_count(), 0);
+
+    let assert_close = |context: &str, actual: f64, expected: f64| {
+        let error = (actual - expected).abs();
+        let tolerance = PARITY_ABSOLUTE_TOLERANCE
+            + PARITY_RELATIVE_TOLERANCE * actual.abs().max(expected.abs());
+        assert!(
+            error <= tolerance,
+            "{context} mismatch: actual={actual}, expected={expected}, error={error}, tolerance={tolerance}"
+        );
+    };
+    assert_close(
+        "native scalar loss",
+        native_step.loss().scalar_at(0).as_f64(),
+        interpreted_step.loss().scalar_at(0).as_f64(),
+    );
+    let native_logits = &native_step.outputs()["logits"];
+    let interpreted_logits = &interpreted_step.outputs()["logits"];
+    assert_eq!(native_logits.shape(), interpreted_logits.shape());
+    for coordinate in 0..native_logits.len() {
+        assert_close(
+            &format!("native logits[{coordinate}]"),
+            native_logits.scalar_at(coordinate).as_f64(),
+            interpreted_logits.scalar_at(coordinate).as_f64(),
+        );
+    }
+
+    let interpreted_gradients = interpreted.gradient_accumulator_snapshots().unwrap();
+    let native_gradients = native.gradient_accumulator_snapshots().unwrap();
+    assert_eq!(
+        interpreted_gradients.keys().collect::<Vec<_>>(),
+        native_gradients.keys().collect::<Vec<_>>()
+    );
+    let mut squared_gradient_norm = 0.0;
+    for (name, interpreted_gradient) in &interpreted_gradients {
+        let native_gradient = &native_gradients[name];
+        assert_eq!(native_gradient.shape(), interpreted_gradient.shape());
+        for coordinate in 0..interpreted_gradient.len() {
+            let interpreted_lane = interpreted_gradient.scalar_at(coordinate).as_f64();
+            let native_lane = native_gradient.scalar_at(coordinate).as_f64();
+            assert_close(
+                &format!("native pre-clip gradient {name}[{coordinate}]"),
+                native_lane,
+                interpreted_lane,
+            );
+            squared_gradient_norm += interpreted_lane * interpreted_lane;
+        }
+    }
+    assert!(
+        squared_gradient_norm.sqrt() > 1e-3,
+        "the captured first-microbatch frontier must precede the configured 1e-4 clipping bound"
+    );
+    assert_eq!(
+        interpreted.parameter_snapshots().unwrap(),
+        initial_parameters
+    );
+    assert_eq!(native.parameter_snapshots().unwrap(), initial_parameters);
+    assert!(
+        interpreted
+            .first_moment_snapshots()
+            .unwrap()
+            .values()
+            .all(|value| value.to_vec_f64().into_iter().all(|lane| lane == 0.0))
+    );
+
+    let numerical =
+        numerical_multi_head_transformer_gradient_lanes(&model, multi_head_batch(), &PROBES);
+    assert_close(
+        "forward-only scalar loss",
+        interpreted_step.loss().scalar_at(0).as_f64(),
+        numerical.loss,
+    );
+    let mut head_probe_counts = [0; 2];
+    for (probe, numerical) in PROBES.iter().zip(numerical.gradients) {
+        let captured = interpreted_gradients[probe.parameter]
+            .scalar_at(probe.coordinate)
+            .as_f64();
+        assert!(captured.is_finite() && numerical.is_finite());
+        assert!(
+            captured != 0.0 && numerical != 0.0,
+            "{} must carry a finite nonzero gradient through both proofs: captured={captured}, numerical={numerical}",
+            probe.boundary
+        );
+        if let Some(head) = probe.head {
+            assert_eq!(
+                (probe.coordinate % MULTI_HEAD_EMBEDDING) / 2,
+                head,
+                "{} must address the declared projection head",
+                probe.boundary
+            );
+            head_probe_counts[head] += 1;
+        }
+        let error = (captured - numerical).abs();
+        let tolerance =
+            ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * captured.abs().max(numerical.abs());
+        assert!(
+            error <= tolerance,
+            "{} {}[{}] mismatch: captured={captured}, numerical={numerical}, error={error}, tolerance={tolerance}",
+            probe.boundary,
+            probe.parameter,
+            probe.coordinate
+        );
+    }
+    assert_eq!(head_probe_counts, [3, 3]);
+    assert_eq!(model.tokens.weight.id(), tied_identity);
+    assert!(interpreted_gradients.contains_key("tokens.weight"));
+    assert!(!interpreted_gradients.contains_key("lm_head.weight"));
 }
 
 #[test]
