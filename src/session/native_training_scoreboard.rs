@@ -31,7 +31,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V6: u32 = 6;
 const NATIVE_TRAINING_REPORT_FORMAT_V7: u32 = 7;
 const NATIVE_TRAINING_REPORT_FORMAT_V8: u32 = 8;
 const NATIVE_TRAINING_REPORT_FORMAT_V9: u32 = 9;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 10;
+const NATIVE_TRAINING_REPORT_FORMAT_V10: u32 = 10;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 11;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,6 +128,7 @@ impl NativeTrainingPreparationTiming {
 pub struct CompiledAdamWInspection {
     initial_replay_step: u64,
     main: ProgramInspection,
+    accumulation: Option<ProgramInspection>,
     partial_flush: Option<ProgramInspection>,
     zero_grad: Option<ProgramInspection>,
     evaluation: Option<ProgramInspection>,
@@ -138,6 +140,7 @@ impl CompiledAdamWInspection {
     pub(crate) fn new(
         initial_replay_step: u64,
         main: (u64, ExecutionPlanSummary),
+        accumulation: Option<(u64, ExecutionPlanSummary)>,
         partial_flush: Option<(u64, ExecutionPlanSummary)>,
         zero_grad: Option<(u64, ExecutionPlanSummary)>,
         evaluation: Option<(u64, ExecutionPlanSummary)>,
@@ -150,6 +153,7 @@ impl CompiledAdamWInspection {
         Self {
             initial_replay_step,
             main: program(main),
+            accumulation: accumulation.map(program),
             partial_flush: partial_flush.map(program),
             zero_grad: zero_grad.map(program),
             evaluation: evaluation.map(program),
@@ -164,6 +168,12 @@ impl CompiledAdamWInspection {
 
     pub const fn main(&self) -> (u64, &ExecutionPlanSummary) {
         (self.main.capture_identity, &self.main.execution_plan)
+    }
+
+    pub fn accumulation(&self) -> Option<(u64, &ExecutionPlanSummary)> {
+        self.accumulation
+            .as_ref()
+            .map(|program| (program.capture_identity, &program.execution_plan))
     }
 
     pub fn partial_flush(&self) -> Option<(u64, &ExecutionPlanSummary)> {
@@ -324,6 +334,7 @@ impl NativeTrainingProgramReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
+                | NATIVE_TRAINING_REPORT_FORMAT_V10
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self)?,
@@ -416,7 +427,7 @@ struct CheckpointReport {
 }
 
 /// First-replay and bounded steady-replay wall time for one measured portion
-/// of successful strict-native CPU main replay.
+/// of successful strict-native CPU training-step replay.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeTrainingReplayTiming {
@@ -507,6 +518,8 @@ pub struct NativeTrainingReport {
     initial_replay_step: u64,
     successful_replay_count: u64,
     main: NativeTrainingProgramReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accumulation: Option<NativeTrainingProgramReport>,
     partial_flush: Option<NativeTrainingProgramReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     zero_grad: Option<NativeTrainingProgramReport>,
@@ -518,6 +531,10 @@ pub struct NativeTrainingReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     main_replay_executed_native_item_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    accumulation_replay_traffic: Option<NativeCpuReplayTraffic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accumulation_replay_executed_native_item_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     main_replay_executor_wall_time: Option<NativeTrainingReplayTiming>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     main_replay_recurrent_overhead_wall_time: Option<NativeTrainingReplayTiming>,
@@ -528,6 +545,8 @@ pub struct NativeTrainingReport {
     steady_replay_wall_time: BenchmarkLatencySummary,
     steady_microbatches_per_second: Option<f64>,
     schedule_cache_keys: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    accumulation_schedule_cache_keys: Vec<u64>,
     checkpoint: Option<CheckpointReport>,
     fallback_count: u64,
     kernel_launch_count: Option<u64>,
@@ -569,6 +588,10 @@ impl NativeTrainingReport {
 
     pub const fn main(&self) -> &NativeTrainingProgramReport {
         &self.main
+    }
+
+    pub const fn accumulation(&self) -> Option<&NativeTrainingProgramReport> {
+        self.accumulation.as_ref()
     }
 
     pub const fn partial_flush(&self) -> Option<&NativeTrainingProgramReport> {
@@ -620,18 +643,32 @@ impl NativeTrainingReport {
     }
 
     /// Stable number of prepared CPU JIT items actually invoked by each
-    /// successfully published main replay.
+    /// successfully published optimizer-commit replay.
     pub const fn main_replay_executed_native_item_count(&self) -> Option<u64> {
         self.main_replay_executed_native_item_count
     }
 
-    /// Wall time inside the sealed native executor for committed main replays.
+    pub const fn accumulation_replay_traffic(&self) -> Option<&NativeCpuReplayTraffic> {
+        self.accumulation_replay_traffic.as_ref()
+    }
+
+    pub const fn accumulation_replay_executed_native_item_count(&self) -> Option<u64> {
+        self.accumulation_replay_executed_native_item_count
+    }
+
+    pub fn accumulation_schedule_cache_keys(&self) -> &[u64] {
+        &self.accumulation_schedule_cache_keys
+    }
+
+    /// Wall time inside the sealed native executor for successful training
+    /// steps across their authenticated phase-specific programs.
     pub const fn main_replay_executor_wall_time(&self) -> Option<&NativeTrainingReplayTiming> {
         self.main_replay_executor_wall_time.as_ref()
     }
 
-    /// Checked end-to-end remainder outside the sealed native executor. This
-    /// covers recurrent staging, validation, and atomic commit/publication.
+    /// Checked end-to-end remainder outside the sealed native executor across
+    /// the authenticated phase-specific programs. This covers recurrent
+    /// staging, validation, and atomic commit/publication.
     pub const fn main_replay_recurrent_overhead_wall_time(
         &self,
     ) -> Option<&NativeTrainingReplayTiming> {
@@ -639,7 +676,7 @@ impl NativeTrainingReport {
     }
 
     /// First replay and warm replay timings classified solely by whether the
-    /// successful main replay committed an optimizer update.
+    /// successful training step committed an optimizer update.
     pub const fn step_phases(&self) -> Option<&NativeTrainingStepPhaseReport> {
         self.step_phases.as_ref()
     }
@@ -681,6 +718,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
+                | NATIVE_TRAINING_REPORT_FORMAT_V10
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -712,6 +750,31 @@ impl NativeTrainingReport {
                 .map_err(|_| invalid("invalid native training duration"))?;
         }
         self.main.validate(self.format_version)?;
+        match (
+            self.format_version,
+            &self.accumulation,
+            &self.accumulation_replay_traffic,
+            self.accumulation_replay_executed_native_item_count,
+        ) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V10, None, None, None) => {}
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(program),
+                Some(traffic),
+                Some(executed),
+            ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
+                && traffic.borrowed_recurrent_output_bytes()
+                    == self.recurrent_logical_state_bytes
+                && executed <= program.rendered_entry_count
+                && program.capture_identity != self.main.capture_identity =>
+            {
+                program.validate(self.format_version)?;
+                if program.vectorized != self.main.vectorized {
+                    return Err(invalid("native program vectorization policy differs"));
+                }
+            }
+            _ => return Err(invalid("native accumulation replay inventory differs")),
+        }
         match (self.format_version, &self.main_replay_traffic) {
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2, None) => {}
             (
@@ -722,6 +785,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
+                | NATIVE_TRAINING_REPORT_FORMAT_V10
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -744,7 +808,8 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
-                | NATIVE_TRAINING_REPORT_FORMAT_V9,
+                | NATIVE_TRAINING_REPORT_FORMAT_V9
+                | NATIVE_TRAINING_REPORT_FORMAT_V10,
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
             (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(executed))
@@ -755,8 +820,9 @@ impl NativeTrainingReport {
             _ => return Err(invalid("native training execution count differs")),
         }
         for program in self
-            .partial_flush
+            .accumulation
             .iter()
+            .chain(&self.partial_flush)
             .chain(&self.zero_grad)
             .chain(&self.evaluation)
         {
@@ -779,6 +845,7 @@ impl NativeTrainingReport {
             }
             NATIVE_TRAINING_REPORT_FORMAT_V8
             | NATIVE_TRAINING_REPORT_FORMAT_V9
+            | NATIVE_TRAINING_REPORT_FORMAT_V10
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
@@ -793,6 +860,7 @@ impl NativeTrainingReport {
                     .ok_or_else(|| invalid("native compiler concurrency is absent"))?;
                 let (expected_count, module_job_count, compiler_time_sum, compiler_time_max) =
                     std::iter::once(&self.main)
+                        .chain(self.accumulation.iter())
                         .chain(self.partial_flush.iter())
                         .chain(&self.zero_grad)
                         .chain(&self.evaluation)
@@ -860,6 +928,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
+                | NATIVE_TRAINING_REPORT_FORMAT_V10
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
@@ -869,6 +938,7 @@ impl NativeTrainingReport {
                     (
                         NATIVE_TRAINING_REPORT_FORMAT_V8
                         | NATIVE_TRAINING_REPORT_FORMAT_V9
+                        | NATIVE_TRAINING_REPORT_FORMAT_V10
                         | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                         Some(overlap),
                     ) => overlap
@@ -893,6 +963,7 @@ impl NativeTrainingReport {
                     .as_nanos()
                     .map_err(|_| invalid("invalid native prepare duration"))?;
                 let mut programs = std::iter::once(&self.main)
+                    .chain(self.accumulation.iter())
                     .chain(self.partial_flush.iter())
                     .chain(&self.zero_grad)
                     .chain(&self.evaluation);
@@ -951,6 +1022,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
+                | NATIVE_TRAINING_REPORT_FORMAT_V10
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -978,7 +1050,10 @@ impl NativeTrainingReport {
         }
         match (self.format_version, &self.step_phases) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V9, None) => {}
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(phases)) => phases.validate(
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V10 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(phases),
+            ) => phases.validate(
                 self.successful_replay_count,
                 self.first_replay_wall_time,
                 self.steady_replay_total_wall_time,
@@ -1002,6 +1077,15 @@ impl NativeTrainingReport {
             || self.schedule_cache_keys.len()
                 != usize::try_from(self.main.native_item_count)
                     .map_err(|_| invalid("native item count overflows usize"))?
+            || match &self.accumulation {
+                Some(program) => {
+                    self.accumulation_schedule_cache_keys.len()
+                        != usize::try_from(program.native_item_count).map_err(|_| {
+                            invalid("native accumulation item count overflows usize")
+                        })?
+                }
+                None => !self.accumulation_schedule_cache_keys.is_empty(),
+            }
         {
             return Err(invalid("invalid native training replay inventory"));
         }
@@ -1033,7 +1117,7 @@ impl NativeTrainingReport {
     }
 }
 
-/// Bounded collector for successful strict-native CPU main replays.
+/// Bounded collector for successful strict-native CPU training-step replays.
 pub struct NativeTrainingScoreboard {
     compile_wall_time: Duration,
     prepare_wall_time: Duration,
@@ -1044,6 +1128,7 @@ pub struct NativeTrainingScoreboard {
     prepare_max_parallel_compiler_process_count: u64,
     inspection: CompiledAdamWInspection,
     main: NativeTrainingProgramReport,
+    accumulation: Option<NativeTrainingProgramReport>,
     partial_flush: Option<NativeTrainingProgramReport>,
     zero_grad: Option<NativeTrainingProgramReport>,
     evaluation: Option<NativeTrainingProgramReport>,
@@ -1053,6 +1138,9 @@ pub struct NativeTrainingScoreboard {
     schedule_cache_keys: Option<Vec<u64>>,
     main_replay_traffic: Option<NativeCpuReplayTraffic>,
     main_replay_executed_native_item_count: Option<u64>,
+    accumulation_schedule_cache_keys: Option<Vec<u64>>,
+    accumulation_replay_traffic: Option<NativeCpuReplayTraffic>,
+    accumulation_replay_executed_native_item_count: Option<u64>,
     checkpoint: Option<CheckpointReport>,
 }
 
@@ -1068,6 +1156,11 @@ impl NativeTrainingScoreboard {
         prepare_wall_time: Duration,
     ) -> Result<Self> {
         let main = NativeTrainingProgramReport::new(&inspection.main, preparation.main())?;
+        let accumulation = matching_program(
+            "accumulation",
+            inspection.accumulation.as_ref(),
+            preparation.accumulation(),
+        )?;
         let partial_flush = matching_program(
             "partial flush",
             inspection.partial_flush.as_ref(),
@@ -1089,6 +1182,7 @@ impl NativeTrainingScoreboard {
             return Err(invalid("plan and prepared recurrent state differ"));
         }
         let program_prepare_wall_time = std::iter::once(preparation.main())
+            .chain(preparation.accumulation())
             .chain(preparation.partial_flush())
             .chain(preparation.zero_grad())
             .chain(preparation.evaluation())
@@ -1124,6 +1218,7 @@ impl NativeTrainingScoreboard {
             prepare_max_parallel_compiler_process_count,
             inspection,
             main,
+            accumulation,
             partial_flush,
             zero_grad,
             evaluation,
@@ -1133,6 +1228,9 @@ impl NativeTrainingScoreboard {
             schedule_cache_keys: None,
             main_replay_traffic: None,
             main_replay_executed_native_item_count: None,
+            accumulation_schedule_cache_keys: None,
+            accumulation_replay_traffic: None,
+            accumulation_replay_executed_native_item_count: None,
             checkpoint: None,
         })
     }
@@ -1143,42 +1241,71 @@ impl NativeTrainingScoreboard {
         if self.recording_mode == ReplayRecordingMode::Phased {
             return Err(invalid("cannot mix raw and classified replay samples"));
         }
-        let (timing, executed) = self.validate_replay(report)?;
-        self.commit_replay(report, timing, executed);
+        if self.accumulation.is_some() {
+            return Err(invalid(
+                "phase-specialized replay requires classified step recording",
+            ));
+        }
+        let phase = NativeTrainingStepPhase::OptimizerCommit;
+        let (timing, executed) = self.validate_replay(report, phase)?;
+        self.commit_replay(report, timing, executed, phase);
         self.recording_mode = ReplayRecordingMode::Raw;
         Ok(())
     }
 
-    /// Records and classifies one successful compiled AdamW main replay using
+    /// Records and classifies one successful compiled AdamW training step using
     /// only its authenticated public `did_update` result. Partial flushes are
-    /// deliberately outside this main-step scoreboard.
+    /// deliberately outside this training-step scoreboard.
     pub fn record_step(&mut self, step: &NativeCpuCompiledAdamWStepResult) -> Result<()> {
         if self.recording_mode == ReplayRecordingMode::Raw {
             return Err(invalid("cannot mix raw and classified replay samples"));
         }
-        let (timing, executed) = self.validate_replay(step.report())?;
         let phase = if step.did_update() {
             NativeTrainingStepPhase::OptimizerCommit
         } else {
             NativeTrainingStepPhase::AccumulationOnly
         };
-        self.commit_replay(step.report(), timing, executed);
+        let (timing, executed) = self.validate_replay(step.report(), phase)?;
+        self.commit_replay(step.report(), timing, executed, phase);
         self.replay_step_phases.push(phase);
         self.recording_mode = ReplayRecordingMode::Phased;
         Ok(())
     }
 
-    fn validate_replay(&self, report: &NativeCpuRunReport) -> Result<(ReplayTiming, u64)> {
+    fn validate_replay(
+        &self,
+        report: &NativeCpuRunReport,
+        phase: NativeTrainingStepPhase,
+    ) -> Result<(ReplayTiming, u64)> {
         if self.replay_timings.len() >= MAX_REPLAY_SAMPLES {
             return Err(invalid("native training replay sample limit exceeded"));
         }
         let expected_invocation = self.replay_timings.len() as u64 + 1;
-        if report.capture_identity() != self.main.capture_identity
-            || report.native_identity() != self.main.native_identity
-            || report.is_vectorized() != self.main.vectorized
-            || count(report.native_item_count(), "native item")? != self.main.native_item_count
+        let expected = match phase {
+            NativeTrainingStepPhase::AccumulationOnly => self
+                .accumulation
+                .as_ref()
+                .ok_or_else(|| invalid("accumulation replay program is absent"))?,
+            NativeTrainingStepPhase::OptimizerCommit => &self.main,
+        };
+        let (expected_cache_keys, expected_traffic, expected_executed) = match phase {
+            NativeTrainingStepPhase::AccumulationOnly => (
+                &self.accumulation_schedule_cache_keys,
+                self.accumulation_replay_traffic,
+                self.accumulation_replay_executed_native_item_count,
+            ),
+            NativeTrainingStepPhase::OptimizerCommit => (
+                &self.schedule_cache_keys,
+                self.main_replay_traffic,
+                self.main_replay_executed_native_item_count,
+            ),
+        };
+        if report.capture_identity() != expected.capture_identity
+            || report.native_identity() != expected.native_identity
+            || report.is_vectorized() != expected.vectorized
+            || count(report.native_item_count(), "native item")? != expected.native_item_count
             || report.executed_native_item_count()
-                > usize::try_from(self.main.rendered_entry_count)
+                > usize::try_from(expected.rendered_entry_count)
                     .map_err(|_| invalid("native rendered entry count overflows usize"))?
             || report.fallback_count() != 0
             || report.successful_invocation() != expected_invocation
@@ -1188,7 +1315,7 @@ impl NativeTrainingScoreboard {
                 "native replay report does not match the scoreboard",
             ));
         }
-        if let Some(expected) = &self.schedule_cache_keys
+        if let Some(expected) = expected_cache_keys
             && expected != report.schedule_cache_keys()
         {
             return Err(invalid("native replay cache keys changed"));
@@ -1204,13 +1331,13 @@ impl NativeTrainingScoreboard {
                 "native replay traffic does not match recurrent state",
             ));
         }
-        if let Some(expected) = self.main_replay_traffic
+        if let Some(expected) = expected_traffic
             && expected != *report.traffic()
         {
             return Err(invalid("native replay traffic changed"));
         }
         let executed = count(report.executed_native_item_count(), "executed native item")?;
-        if let Some(expected) = self.main_replay_executed_native_item_count
+        if let Some(expected) = expected_executed
             && expected != executed
         {
             return Err(invalid("native replay execution count changed"));
@@ -1230,15 +1357,33 @@ impl NativeTrainingScoreboard {
         ))
     }
 
-    fn commit_replay(&mut self, report: &NativeCpuRunReport, timing: ReplayTiming, executed: u64) {
-        if self.schedule_cache_keys.is_none() {
-            self.schedule_cache_keys = Some(report.schedule_cache_keys().to_vec());
+    fn commit_replay(
+        &mut self,
+        report: &NativeCpuRunReport,
+        timing: ReplayTiming,
+        executed: u64,
+        phase: NativeTrainingStepPhase,
+    ) {
+        let (cache_keys, traffic, executed_count) = match phase {
+            NativeTrainingStepPhase::AccumulationOnly => (
+                &mut self.accumulation_schedule_cache_keys,
+                &mut self.accumulation_replay_traffic,
+                &mut self.accumulation_replay_executed_native_item_count,
+            ),
+            NativeTrainingStepPhase::OptimizerCommit => (
+                &mut self.schedule_cache_keys,
+                &mut self.main_replay_traffic,
+                &mut self.main_replay_executed_native_item_count,
+            ),
+        };
+        if cache_keys.is_none() {
+            *cache_keys = Some(report.schedule_cache_keys().to_vec());
         }
-        if self.main_replay_traffic.is_none() {
-            self.main_replay_traffic = Some(*report.traffic());
+        if traffic.is_none() {
+            *traffic = Some(*report.traffic());
         }
-        if self.main_replay_executed_native_item_count.is_none() {
-            self.main_replay_executed_native_item_count = Some(executed);
+        if executed_count.is_none() {
+            *executed_count = Some(executed);
         }
         self.replay_timings.push(timing);
     }
@@ -1255,8 +1400,13 @@ impl NativeTrainingScoreboard {
             .initial_replay_step
             .checked_add(replay_count)
             .ok_or_else(|| invalid("checkpoint replay step overflows"))?;
+        let expected_accumulation_identity = self
+            .accumulation
+            .as_ref()
+            .map(|program| program.capture_identity);
         if info.capture_identity() != self.main.capture_identity
             || info.replay_step() != expected_step
+            || info.accumulation_capture_identity() != expected_accumulation_identity
         {
             return Err(invalid("checkpoint does not match recorded replays"));
         }
@@ -1289,7 +1439,11 @@ impl NativeTrainingScoreboard {
         let (format_version, step_phases) = match self.recording_mode {
             ReplayRecordingMode::Raw => (NATIVE_TRAINING_REPORT_FORMAT_V9, None),
             ReplayRecordingMode::Phased => (
-                NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                if self.accumulation.is_some() {
+                    NATIVE_TRAINING_REPORT_FORMAT_VERSION
+                } else {
+                    NATIVE_TRAINING_REPORT_FORMAT_V10
+                },
                 Some(NativeTrainingStepPhaseReport::from_timings(
                     &self.replay_timings,
                     &self.replay_step_phases,
@@ -1319,6 +1473,7 @@ impl NativeTrainingScoreboard {
             initial_replay_step: self.inspection.initial_replay_step,
             successful_replay_count: self.replay_timings.len() as u64,
             main: self.main.clone(),
+            accumulation: self.accumulation.clone(),
             partial_flush: self.partial_flush.clone(),
             zero_grad: self.zero_grad.clone(),
             evaluation: self.evaluation.clone(),
@@ -1332,6 +1487,9 @@ impl NativeTrainingScoreboard {
             )?,
             main_replay_traffic: self.main_replay_traffic,
             main_replay_executed_native_item_count: self.main_replay_executed_native_item_count,
+            accumulation_replay_traffic: self.accumulation_replay_traffic,
+            accumulation_replay_executed_native_item_count: self
+                .accumulation_replay_executed_native_item_count,
             main_replay_executor_wall_time: Some(NativeTrainingReplayTiming::from_durations(
                 first.executor,
                 &executors,
@@ -1345,6 +1503,10 @@ impl NativeTrainingScoreboard {
             steady_replay_wall_time: latency_summary(&totals)?,
             steady_microbatches_per_second,
             schedule_cache_keys: self.schedule_cache_keys.clone().unwrap_or_default(),
+            accumulation_schedule_cache_keys: self
+                .accumulation_schedule_cache_keys
+                .clone()
+                .unwrap_or_default(),
             checkpoint: self.checkpoint.clone(),
             fallback_count: 0,
             kernel_launch_count: None,
@@ -1596,7 +1758,7 @@ mod tests {
 
     fn zero_report() -> NativeTrainingReport {
         NativeTrainingReport {
-            format_version: NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+            format_version: NATIVE_TRAINING_REPORT_FORMAT_V10,
             compile_wall_time: zero_duration(),
             prepare_wall_time: zero_duration(),
             prepare_runtime_overhead_wall_time: Some(zero_duration()),
@@ -1624,6 +1786,7 @@ mod tests {
                 compiler_invocation_count: 1,
                 preparation_timing: Some(zero_preparation_timing()),
             },
+            accumulation: None,
             partial_flush: None,
             zero_grad: None,
             evaluation: None,
@@ -1631,6 +1794,8 @@ mod tests {
             recurrent_logical_state_bytes: 16,
             main_replay_traffic: Some(NativeCpuReplayTraffic::new(2, 12, 16, 16)),
             main_replay_executed_native_item_count: Some(1),
+            accumulation_replay_traffic: None,
+            accumulation_replay_executed_native_item_count: None,
             main_replay_executor_wall_time: Some(zero_replay_timing()),
             main_replay_recurrent_overhead_wall_time: Some(zero_replay_timing()),
             step_phases: Some(NativeTrainingStepPhaseReport {
@@ -1680,6 +1845,7 @@ mod tests {
             steady_replay_total_wall_time: zero_duration(),
             steady_microbatches_per_second: None,
             schedule_cache_keys: vec![17, 19],
+            accumulation_schedule_cache_keys: Vec::new(),
             checkpoint: Some(CheckpointReport {
                 capture_identity: 7,
                 replay_step: 2,
@@ -1694,15 +1860,68 @@ mod tests {
         }
     }
 
+    fn phase_specialized_report() -> NativeTrainingReport {
+        let mut report = zero_report();
+        report.format_version = NATIVE_TRAINING_REPORT_FORMAT_VERSION;
+        let mut accumulation = report.main.clone();
+        accumulation.capture_identity = 8;
+        accumulation.native_identity = 12;
+        accumulation.execution_plan_identity = 14;
+        report.accumulation = Some(accumulation);
+        report.accumulation_replay_traffic = report.main_replay_traffic;
+        report.accumulation_replay_executed_native_item_count =
+            report.main_replay_executed_native_item_count;
+        report.accumulation_schedule_cache_keys = vec![23, 29];
+        report.prepare_compiler_process_count = Some(2);
+        report
+    }
+
+    #[test]
+    fn phase_specialized_report_round_trips_and_authenticates_both_programs() {
+        let report = phase_specialized_report();
+        let bytes = report.to_json_bytes().unwrap();
+        let decoded = NativeTrainingReport::from_json_bytes(&bytes).unwrap();
+        assert_eq!(decoded, report);
+        assert_eq!(
+            decoded.format_version,
+            NATIVE_TRAINING_REPORT_FORMAT_VERSION
+        );
+        assert_eq!(decoded.accumulation().unwrap().capture_identity(), 8);
+        assert_eq!(decoded.accumulation_schedule_cache_keys(), [23, 29]);
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["accumulation_schedule_cache_keys"] = serde_json::json!([23]);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["accumulation_replay_executed_native_item_count"] = serde_json::json!(3);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        let main_identity = json["main"]["capture_identity"].clone();
+        json["accumulation"]["capture_identity"] = main_identity;
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["accumulation_replay_traffic"]["borrowed_recurrent_output_bytes"] =
+            serde_json::json!(15);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+    }
+
     #[test]
     fn zero_durations_and_unavailable_cpu_measurements_round_trip() {
         let report = zero_report();
         let bytes = report.to_json_bytes().unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            json["format_version"],
-            NATIVE_TRAINING_REPORT_FORMAT_VERSION
-        );
+        assert_eq!(json["format_version"], NATIVE_TRAINING_REPORT_FORMAT_V10);
         for field in [
             "kernel_launch_count",
             "host_to_device",
@@ -1924,7 +2143,7 @@ mod tests {
     }
 
     #[test]
-    fn current_report_accepts_grouped_physical_native_inventory() {
+    fn single_program_report_accepts_grouped_physical_native_inventory() {
         let mut report = zero_report();
         report.main.logical_schedule_item_count = 4;
         report.main.native_item_count = 4;
@@ -1933,10 +2152,7 @@ mod tests {
         report.schedule_cache_keys.extend([23, 29]);
         let bytes = report.to_json_bytes().unwrap();
         let decoded = NativeTrainingReport::from_json_bytes(&bytes).unwrap();
-        assert_eq!(
-            decoded.format_version,
-            NATIVE_TRAINING_REPORT_FORMAT_VERSION
-        );
+        assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V10);
         assert_eq!(decoded.main().native_item_count(), 4);
         assert_eq!(decoded.main().rendered_entry_count(), 1);
         assert_eq!(decoded.main_replay_executed_native_item_count(), Some(1));

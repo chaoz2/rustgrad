@@ -7,8 +7,7 @@ mod state_schema;
 #[cfg(test)]
 use self::adamw_checkpoint::{
     ADAMW_CHECKPOINT_FORMAT_V1, ADAMW_CHECKPOINT_FORMAT_V2, ADAMW_CHECKPOINT_FORMAT_V3,
-    ADAMW_CHECKPOINT_FORMAT_V4, ADAMW_CHECKPOINT_FORMAT_V5, ADAMW_CHECKPOINT_FORMAT_V6,
-    ADAMW_CHECKPOINT_FORMAT_V7, ADAMW_CHECKPOINT_FORMAT_V8,
+    ADAMW_CHECKPOINT_FORMAT_V4, ADAMW_CHECKPOINT_FORMAT_V9,
 };
 use self::adamw_checkpoint::{
     AdamWCheckpointProgress, AdamWCheckpointTensors, decode_adamw_checkpoint,
@@ -1523,6 +1522,7 @@ impl NativeCpuProgramPreparationReport {
 #[derive(Clone, Debug)]
 pub struct NativeCpuCompiledAdamWPreparationReport {
     main: NativeCpuProgramPreparationReport,
+    accumulation: Option<NativeCpuProgramPreparationReport>,
     partial_flush: Option<NativeCpuProgramPreparationReport>,
     zero_grad: Option<NativeCpuProgramPreparationReport>,
     evaluation: Option<NativeCpuProgramPreparationReport>,
@@ -1537,6 +1537,11 @@ pub struct NativeCpuCompiledAdamWPreparationReport {
 impl NativeCpuCompiledAdamWPreparationReport {
     pub const fn main(&self) -> &NativeCpuProgramPreparationReport {
         &self.main
+    }
+
+    /// Preparation evidence for the accumulation-only sibling program.
+    pub const fn accumulation(&self) -> Option<&NativeCpuProgramPreparationReport> {
+        self.accumulation.as_ref()
     }
 
     pub const fn partial_flush(&self) -> Option<&NativeCpuProgramPreparationReport> {
@@ -2812,6 +2817,7 @@ struct CompiledAdamWWindowLossNodes {
 
 struct CompiledOptimizerLowering {
     updates: BTreeMap<RecurrentStateKey, NodeId>,
+    accumulation_updates: Option<BTreeMap<RecurrentStateKey, NodeId>>,
     clip_report: Option<CompiledAdamWClipNodes>,
     window_loss_report: Option<CompiledAdamWWindowLossNodes>,
 }
@@ -2875,6 +2881,7 @@ impl CompiledOptimizerProgram for MomentumProgram {
         }
         Ok(CompiledOptimizerLowering {
             updates,
+            accumulation_updates: None,
             clip_report: None,
             window_loss_report: None,
         })
@@ -2997,6 +3004,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
             };
             return Ok(CompiledOptimizerLowering {
                 updates,
+                accumulation_updates: None,
                 clip_report: clipped.report,
                 window_loss_report,
             });
@@ -3079,6 +3087,23 @@ impl CompiledOptimizerProgram for AdamWProgram {
             &clipped.gradients,
             states,
         )?;
+        let mut accumulation_updates = states
+            .iter()
+            .map(|(key, value)| (key.clone(), *value))
+            .collect::<BTreeMap<_, _>>();
+        accumulation_updates.insert(accumulation_index_key.clone(), next_index);
+        if let Some((_, count_key, total_count, _)) = &weighted_count {
+            accumulation_updates.insert(count_key.clone(), *total_count);
+        }
+        if let Some((key, numerator, ..)) = &window_loss {
+            accumulation_updates.insert(key.clone(), *numerator);
+        }
+        for name in parameters.keys() {
+            let accumulator_key =
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
+            accumulation_updates.insert(accumulator_key, accumulated_gradients[name]);
+        }
+
         let mut updates = BTreeMap::new();
         updates.insert(accumulation_index_key, reset_index);
         if let Some((_, count_key, total_count, _)) = weighted_count {
@@ -3120,6 +3145,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
         }
         Ok(CompiledOptimizerLowering {
             updates,
+            accumulation_updates: Some(accumulation_updates),
             clip_report: clipped.report,
             window_loss_report: window_loss.map(|(_, _, mean_loss, loss_weight)| {
                 CompiledAdamWWindowLossNodes {
@@ -3729,6 +3755,7 @@ pub struct NativeCpuCompiledAdamW<'a> {
     inner: CpuCompiledAdamW,
     executor: &'a CapturedReplayExecutor,
     main_replay: PreparedRecurrentNativeReplay,
+    accumulation_replay: Option<PreparedRecurrentNativeReplay>,
     partial_flush_replay: Option<PreparedRecurrentNativeReplay>,
     zero_grad_replay: Option<PreparedRecurrentNativeReplay>,
     evaluation_replay: Option<PreparedNativeCpuEvaluation>,
@@ -3744,6 +3771,7 @@ pub struct NativeCpuCompiledAdamW<'a> {
 /// existing epoch-swapped Metal runtime.
 pub struct MetalCompiledAdamWPlan {
     inner: MetalCompiledTrainingPlan,
+    accumulation_capture_identity: Option<u64>,
     partial_flush: Option<MetalFixedStateTransitionPlan>,
     progress: AdamWProgress,
     flush_capture_identity: Option<u64>,
@@ -3773,6 +3801,7 @@ struct MetalCompiledTrainingPlan {
 /// the observed [`MetalCompiledAdamW::step`] path.
 pub struct MetalCompiledAdamW {
     inner: MetalCompiledTrainingProgram,
+    accumulation_capture_identity: Option<u64>,
     partial_flush: Option<MetalFixedStateTransitionSession>,
     progress: AdamWProgress,
     flush_capture_identity: Option<u64>,
@@ -4132,6 +4161,16 @@ struct CompiledTrainingPlan {
     adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
     frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
+    accumulation: Option<CompiledAdamWAccumulationPlan>,
+}
+
+#[derive(Clone)]
+struct CompiledAdamWAccumulationPlan {
+    capture: CapturedMixedSchedule,
+    recurrent_capture: CapturedStatefulInference,
+    state_buffers: BTreeMap<RecurrentStateKey, u64>,
+    adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
+    capture_identity: u64,
 }
 
 #[derive(Clone)]
@@ -4179,6 +4218,7 @@ struct CpuCompiledTrainingProgram {
     adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
     frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
+    accumulation: Option<CompiledAdamWAccumulationPlan>,
 }
 
 struct CpuAuxiliaryReplay {
@@ -4374,6 +4414,150 @@ fn adamw_native_update_manifests(
     Ok(manifests)
 }
 
+struct CompiledTrainingPhaseCapture {
+    capture: CapturedMixedSchedule,
+    recurrent_capture: CapturedStatefulInference,
+    state_buffers: BTreeMap<RecurrentStateKey, u64>,
+    adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
+}
+
+struct CompiledTrainingPhaseInput<'a> {
+    specs: &'a [StateSpec],
+    state_nodes: &'a BTreeMap<RecurrentStateKey, NodeId>,
+    state_values: &'a [(u64, TensorData)],
+    state_by_input: &'a BTreeMap<NodeId, BufferState>,
+    parameter_names: &'a [String],
+    updates: &'a BTreeMap<RecurrentStateKey, NodeId>,
+    public_requested: &'a [NodeId],
+    external_input_names: &'a [String],
+    materialize_state_passthroughs: bool,
+}
+
+fn capture_training_phase(
+    graph: &mut Graph,
+    input: CompiledTrainingPhaseInput<'_>,
+) -> Result<CompiledTrainingPhaseCapture> {
+    let CompiledTrainingPhaseInput {
+        specs,
+        state_nodes,
+        state_values,
+        state_by_input,
+        parameter_names,
+        updates,
+        public_requested,
+        external_input_names,
+        materialize_state_passthroughs,
+    } = input;
+    if updates.len() != specs.len() || specs.iter().any(|spec| !updates.contains_key(&spec.key)) {
+        return Err(training("compiled optimizer successor set mismatch"));
+    }
+    let ordered_updates = specs
+        .iter()
+        .map(|spec| updates[&spec.key])
+        .collect::<Vec<_>>();
+    let ordered_updates = if materialize_state_passthroughs {
+        materialize_compiled_state_aliases(graph, &ordered_updates)?
+    } else {
+        ordered_updates
+    };
+    let updates = specs
+        .iter()
+        .zip(ordered_updates)
+        .map(|(spec, update)| (spec.key.clone(), update))
+        .collect::<BTreeMap<_, _>>();
+    let state_links = specs
+        .iter()
+        .map(|spec| InferenceStateLink::new(state_nodes[&spec.key], updates[&spec.key]))
+        .collect::<Vec<_>>();
+    let public_requested =
+        materialize_compiled_recurrent_public_aliases(graph, public_requested, &state_links)?;
+    let initial_state = specs
+        .iter()
+        .map(|spec| (spec.input_name.clone(), spec.value.clone()))
+        .collect();
+    let recurrent_capture = CapturedStatefulInference::from_graph(
+        graph,
+        &public_requested,
+        &state_links,
+        initial_state,
+    )
+    .map_err(captured_inference_error)?;
+
+    let public_output_count = public_requested.len();
+    let mut requested = Vec::with_capacity(public_output_count + updates.len());
+    requested.extend(public_requested);
+    for spec in specs {
+        requested.push(updates[&spec.key]);
+    }
+    for node in &requested {
+        checked_descriptor(graph.shape(*node)?, graph.dtype(*node)?)?;
+    }
+    let pure = schedule_many(graph, &requested).map_err(schedule_error)?;
+    if let Some(item) = pure.items.iter().find(|item| item.boundary.is_some()) {
+        return Err(training(format!(
+            "compiled pure prefix has an unsupported boundary at node {}",
+            item.node.index()
+        )));
+    }
+    let state_buffers = specs
+        .iter()
+        .zip(state_values)
+        .map(|(spec, (buffer, _))| (spec.key.clone(), *buffer))
+        .collect::<BTreeMap<_, _>>();
+    let adamw_native_updates =
+        adamw_native_update_manifests(parameter_names.iter().cloned(), &updates, &state_buffers)?;
+    let mut captured = CapturedSchedule::capture(graph, &pure, &requested[..public_output_count])
+        .map_err(replay_error)?;
+    if captured.requested.len() != public_output_count {
+        return Err(training("compiled capture output count mismatch"));
+    }
+
+    let state_bindings = collect_state_bindings(&pure, state_by_input)?;
+    let pure = bind_schedule_states(pure, state_bindings).map_err(schedule_error)?;
+    let mut effects = EffectGraph::default();
+    let mut effect_bindings = Vec::with_capacity(updates.len());
+    for (ordinal, spec) in specs.iter().enumerate() {
+        let next = updates[&spec.key];
+        if next.index() as u64 >= STATE_BUFFER_BASE {
+            return Err(training(
+                "graph node identity overlaps persistent state namespace",
+            ));
+        }
+        let buffer = state_values[ordinal].0;
+        let destination = effects
+            .insert(buffer, spec.value.clone())
+            .map_err(effect_error)?;
+        let source = effects
+            .insert(
+                next.index() as u64,
+                TensorData::zeros_with_dtype(spec.value.shape().clone(), spec.value.dtype())?,
+            )
+            .map_err(effect_error)?;
+        effects
+            .assign(&destination, &source)
+            .map_err(effect_error)?;
+        let effect_index = u64::try_from(ordinal).map_err(|_| training("effect index overflow"))?;
+        effect_bindings.push(value_binding(&pure, next, effect_index)?);
+    }
+    let mixed = combine_mixed_schedules(
+        pure,
+        schedule_effects(&effects).map_err(schedule_error)?,
+        effect_bindings,
+    )
+    .map_err(schedule_error)?;
+    captured.items = mixed.items.clone();
+    let states = effect_states(&effects)?;
+    let capture =
+        CapturedMixedSchedule::from_parts(captured, &mixed, states).map_err(replay_error)?;
+    validate_external_binding_ownership(&capture, external_input_names.iter())?;
+    Ok(CompiledTrainingPhaseCapture {
+        capture,
+        recurrent_capture,
+        state_buffers,
+        adamw_native_updates,
+    })
+}
+
 impl CompiledTrainingPlan {
     /// Compiles one exact static training program.
     ///
@@ -4527,6 +4711,7 @@ impl CompiledTrainingPlan {
             .collect::<BTreeMap<_, _>>();
         let CompiledOptimizerLowering {
             mut updates,
+            mut accumulation_updates,
             clip_report,
             window_loss_report,
         } = optimizer.lower_updates(
@@ -4543,127 +4728,96 @@ impl CompiledTrainingPlan {
         match (specs.get(optimizer_spec_count), workload_successor) {
             (Some(spec), Some(successor)) => {
                 updates.insert(spec.key.clone(), successor);
+                if let Some(accumulation_updates) = &mut accumulation_updates {
+                    accumulation_updates.insert(spec.key.clone(), successor);
+                }
             }
             (None, None) => {}
             _ => return Err(training("compiled workload successor set mismatch")),
         }
-        if updates.len() != specs.len() || specs.iter().any(|spec| !updates.contains_key(&spec.key))
-        {
-            return Err(training("compiled optimizer successor set mismatch"));
-        }
+        let clip_report_enabled = clip_report.is_some();
+        let window_loss_report_enabled = window_loss_report.is_some();
         let clip_requested = clip_report
             .into_iter()
             .flat_map(|report| [report.pre_clip_global_norm, report.applied_scale]);
         let window_loss_requested = window_loss_report
             .into_iter()
             .flat_map(|report| [report.mean_loss, report.loss_weight]);
-        let state_links = specs
-            .iter()
-            .map(|spec| InferenceStateLink::new(state_nodes[&spec.key], updates[&spec.key]))
-            .collect::<Vec<_>>();
-        let public_requested = std::iter::once(loss)
+        let main_public_requested = std::iter::once(loss)
             .chain(outputs.values().copied())
             .chain(clip_requested)
             .chain(window_loss_requested)
             .collect::<Vec<_>>();
-        let public_requested = materialize_compiled_recurrent_public_aliases(
+        let parameter_names = parameter_nodes.keys().cloned().collect::<Vec<_>>();
+        let external_input_names = optimizer.inputs().keys().cloned().collect::<Vec<_>>();
+        let main = capture_training_phase(
             &mut graph,
-            &public_requested,
-            &state_links,
+            CompiledTrainingPhaseInput {
+                specs: &specs,
+                state_nodes: &state_nodes,
+                state_values: &state_values,
+                state_by_input: &state_by_input,
+                parameter_names: &parameter_names,
+                updates: &updates,
+                public_requested: &main_public_requested,
+                external_input_names: &external_input_names,
+                materialize_state_passthroughs: false,
+            },
         )?;
-        let initial_state = specs
-            .iter()
-            .map(|spec| (spec.input_name.clone(), spec.value.clone()))
-            .collect();
-        let recurrent_capture = CapturedStatefulInference::from_graph(
-            &graph,
-            &public_requested,
-            &state_links,
-            initial_state,
-        )
-        .map_err(captured_inference_error)?;
-
-        let public_output_count = public_requested.len();
-        let mut requested = Vec::with_capacity(public_output_count + updates.len());
-        requested.extend(public_requested);
-        for spec in &specs {
-            requested.push(updates[&spec.key]);
-        }
-        for node in &requested {
-            checked_descriptor(graph.shape(*node)?, graph.dtype(*node)?)?;
-        }
-        let pure = schedule_many(&graph, &requested).map_err(schedule_error)?;
-        if let Some(item) = pure.items.iter().find(|item| item.boundary.is_some()) {
-            return Err(training(format!(
-                "compiled pure prefix has an unsupported boundary at node {}",
-                item.node.index()
-            )));
-        }
-        let state_buffers = specs
-            .iter()
-            .zip(&state_values)
-            .map(|(spec, (buffer, _))| (spec.key.clone(), *buffer))
-            .collect::<BTreeMap<_, _>>();
-        let adamw_native_updates = adamw_native_update_manifests(
-            parameter_nodes.keys().cloned(),
-            &updates,
-            &state_buffers,
-        )?;
-        let mut captured =
-            CapturedSchedule::capture(&graph, &pure, &requested[..public_output_count])
-                .map_err(replay_error)?;
-        if captured.requested.len() != public_output_count {
-            return Err(training("compiled capture output count mismatch"));
-        }
-
-        let state_bindings = collect_state_bindings(&pure, &state_by_input)?;
-        let pure = bind_schedule_states(pure, state_bindings).map_err(schedule_error)?;
-        let mut effects = EffectGraph::default();
-        let mut effect_bindings = Vec::with_capacity(updates.len());
-        for (ordinal, spec) in specs.iter().enumerate() {
-            let next = updates[&spec.key];
-            if next.index() as u64 >= STATE_BUFFER_BASE {
+        let accumulation = accumulation_updates
+            .map(|updates| {
+                let public_requested = std::iter::once(loss)
+                    .chain(outputs.values().copied())
+                    .collect::<Vec<_>>();
+                let phase = capture_training_phase(
+                    &mut graph,
+                    CompiledTrainingPhaseInput {
+                        specs: &specs,
+                        state_nodes: &state_nodes,
+                        state_values: &state_values,
+                        state_by_input: &state_by_input,
+                        parameter_names: &parameter_names,
+                        updates: &updates,
+                        public_requested: &public_requested,
+                        external_input_names: &external_input_names,
+                        materialize_state_passthroughs: true,
+                    },
+                )?;
+                let capture_identity = phase
+                    .capture
+                    .initial_recurrent_cursor()
+                    .map_err(replay_error)?
+                    .capture_identity();
+                Ok::<_, Error>(CompiledAdamWAccumulationPlan {
+                    capture: phase.capture,
+                    recurrent_capture: phase.recurrent_capture,
+                    state_buffers: phase.state_buffers,
+                    adamw_native_updates: phase.adamw_native_updates,
+                    capture_identity,
+                })
+            })
+            .transpose()?;
+        if let Some(accumulation) = &accumulation {
+            let main_identity = main
+                .capture
+                .initial_recurrent_cursor()
+                .map_err(replay_error)?
+                .capture_identity();
+            if accumulation.capture_identity == main_identity {
                 return Err(training(
-                    "graph node identity overlaps persistent state namespace",
+                    "compiled accumulation capture identity is not distinct",
                 ));
             }
-            let buffer = state_values[ordinal].0;
-            let destination = effects
-                .insert(buffer, spec.value.clone())
-                .map_err(effect_error)?;
-            let source = effects
-                .insert(
-                    next.index() as u64,
-                    TensorData::zeros_with_dtype(spec.value.shape().clone(), spec.value.dtype())?,
-                )
-                .map_err(effect_error)?;
-            effects
-                .assign(&destination, &source)
-                .map_err(effect_error)?;
-            let effect_index =
-                u64::try_from(ordinal).map_err(|_| training("effect index overflow"))?;
-            effect_bindings.push(value_binding(&pure, next, effect_index)?);
         }
-        let mixed = combine_mixed_schedules(
-            pure,
-            schedule_effects(&effects).map_err(schedule_error)?,
-            effect_bindings,
-        )
-        .map_err(schedule_error)?;
-        captured.items = mixed.items.clone();
-        let states = effect_states(&effects)?;
-        let capture =
-            CapturedMixedSchedule::from_parts(captured, &mixed, states).map_err(replay_error)?;
-        validate_external_binding_ownership(&capture, optimizer.inputs().keys())?;
 
         let output_names = outputs.keys().cloned().collect();
         Ok(Self {
-            capture,
-            recurrent_capture,
+            capture: main.capture,
+            recurrent_capture: main.recurrent_capture,
             inputs: optimizer.inputs().clone(),
             output_names,
-            clip_report: clip_report.is_some(),
-            window_loss_report: window_loss_report.is_some(),
+            clip_report: clip_report_enabled,
+            window_loss_report: window_loss_report_enabled,
             parameter_buffers,
             optimizer_buffers,
             workload_buffers,
@@ -4674,9 +4828,10 @@ impl CompiledTrainingPlan {
                 .map(|spec| (spec.key.clone(), spec.value.clone()))
                 .collect(),
             state_versions: specs.iter().map(|spec| (spec.key.clone(), 0)).collect(),
-            adamw_native_updates,
+            adamw_native_updates: main.adamw_native_updates,
             frozen_parameter_nodes: BTreeSet::new(),
             step: 0,
+            accumulation,
         })
     }
 
@@ -4888,6 +5043,7 @@ impl CompiledTrainingPlan {
             adamw_native_updates: self.adamw_native_updates.clone(),
             frozen_parameter_nodes: self.frozen_parameter_nodes.clone(),
             step: 0,
+            accumulation: self.accumulation.clone(),
         };
         if self.step != 0 || self.state_versions.values().any(|version| *version != 0) {
             program.restore_frontier(self.step, &self.state_values, &self.state_versions)?;
@@ -6140,6 +6296,138 @@ impl CpuCompiledTrainingProgram {
         ))
     }
 
+    fn step_accumulation_inner_with_learning_rate(
+        &mut self,
+        transition: &CompiledAdamWAccumulationPlan,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: Option<TensorData>,
+        non_finite_policy: CpuNonFinitePolicy,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledTrainingStepResult> {
+        validate_training_inputs(&self.inputs, &inputs)?;
+        if let Some(learning_rate) = &learning_rate {
+            validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
+        }
+        let next_step = self
+            .step
+            .checked_add(1)
+            .ok_or_else(|| training("compiled training step overflow"))?;
+        let mut prepared =
+            self.prepare_phase_replay(&transition.capture, &transition.state_buffers, inputs)?;
+        let replay = transition
+            .capture
+            .replay_recurrent_checked(
+                &mut self.runtime,
+                &mut prepared.cursor,
+                &prepared.provided,
+                injected_failure,
+                |outputs, successors| {
+                    validate_staged_transition(outputs, successors, non_finite_policy, true)
+                },
+            )
+            .map_err(replay_error)?;
+        debug_assert_eq!(replay.outputs.len(), 1 + self.output_names.len());
+        let mut outputs = replay.outputs.into_iter();
+        let loss = outputs
+            .next()
+            .expect("compiled accumulation output cardinality was validated");
+        let named_outputs = self
+            .output_names
+            .iter()
+            .cloned()
+            .zip(outputs.by_ref())
+            .collect();
+        debug_assert!(outputs.next().is_none());
+        self.cursor = prepared.next_main_cursor;
+        self.step = next_step;
+        Ok(CompiledTrainingStepResult {
+            loss,
+            outputs: named_outputs,
+            step: self.step,
+            capture_identity: self.capture_identity(),
+            clip_report: None,
+            window_loss: None,
+        })
+    }
+
+    fn step_accumulation_native_inner_with_learning_rate(
+        &mut self,
+        transition: &CompiledAdamWAccumulationPlan,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: Option<TensorData>,
+        non_finite_policy: CpuNonFinitePolicy,
+        native: NativeReplayContext<'_>,
+        injected_failure: Option<u64>,
+    ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
+        validate_training_inputs(&self.inputs, &inputs)?;
+        if let Some(learning_rate) = &learning_rate {
+            validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
+        }
+        let next_step = self
+            .step
+            .checked_add(1)
+            .ok_or_else(|| training("compiled training step overflow"))?;
+        let mut prepared =
+            self.prepare_phase_replay(&transition.capture, &transition.state_buffers, inputs)?;
+        let started = Instant::now();
+        let replay = native
+            .replay_recurrent_checked(
+                &mut self.runtime,
+                &mut prepared.cursor,
+                &prepared.provided,
+                injected_failure,
+                |outputs, successors| {
+                    validate_staged_transition(
+                        outputs,
+                        successors.iter().copied(),
+                        non_finite_policy,
+                        true,
+                    )
+                },
+            )
+            .map_err(replay_error)?;
+        let traffic = replay.traffic;
+        let executor_wall_time = replay.executor_wall_time;
+        let replay = replay.replay;
+        debug_assert_eq!(replay.outputs.len(), 1 + self.output_names.len());
+        let mut outputs = replay.outputs.into_iter();
+        let loss = outputs
+            .next()
+            .expect("compiled accumulation output cardinality was validated");
+        let named_outputs = self
+            .output_names
+            .iter()
+            .cloned()
+            .zip(outputs.by_ref())
+            .collect();
+        debug_assert!(outputs.next().is_none());
+        let native = replay
+            .native_trace
+            .as_ref()
+            .expect("strict-native recurrent replay returns a native trace");
+        let report = native_cpu_run_report(
+            transition.capture_identity,
+            native,
+            traffic,
+            executor_wall_time,
+            0,
+            started.elapsed(),
+        );
+        self.cursor = prepared.next_main_cursor;
+        self.step = next_step;
+        Ok((
+            CompiledTrainingStepResult {
+                loss,
+                outputs: named_outputs,
+                step: self.step,
+                capture_identity: self.capture_identity(),
+                clip_report: None,
+                window_loss: None,
+            },
+            report,
+        ))
+    }
+
     fn step_count(&self) -> u64 {
         self.step
     }
@@ -6190,6 +6478,7 @@ impl CpuCompiledTrainingProgram {
             adamw_native_updates: self.adamw_native_updates.clone(),
             frozen_parameter_nodes: self.frozen_parameter_nodes.clone(),
             step: self.step,
+            accumulation: self.accumulation.clone(),
         })
     }
 
@@ -6367,11 +6656,20 @@ impl CpuCompiledTrainingProgram {
         if let Some(learning_rate) = &learning_rate {
             validate_learning_rate(learning_rate)?;
         }
-        let selected_buffers = transition
-            .state_buffers
-            .values()
-            .copied()
-            .collect::<BTreeSet<_>>();
+        let mut provided = BTreeMap::new();
+        if let Some(learning_rate) = learning_rate {
+            provided.insert(LEARNING_RATE_INPUT.to_owned(), learning_rate);
+        }
+        self.prepare_phase_replay(&transition.capture, &transition.state_buffers, provided)
+    }
+
+    fn prepare_phase_replay(
+        &self,
+        capture: &CapturedMixedSchedule,
+        state_buffers: &BTreeMap<RecurrentStateKey, u64>,
+        provided: BTreeMap<String, TensorData>,
+    ) -> Result<CpuAuxiliaryReplay> {
+        let selected_buffers = state_buffers.values().copied().collect::<BTreeSet<_>>();
         let selected_frontier = self
             .cursor
             .frontier()
@@ -6382,8 +6680,7 @@ impl CpuCompiledTrainingProgram {
         if selected_frontier.len() != selected_buffers.len() {
             return Err(training("compiled auxiliary state frontier is incomplete"));
         }
-        let cursor = MixedReplayCursor::resume(&transition.capture, selected_frontier)
-            .map_err(replay_error)?;
+        let cursor = MixedReplayCursor::resume(capture, selected_frontier).map_err(replay_error)?;
         let next_frontier = self
             .cursor
             .frontier()
@@ -6401,10 +6698,6 @@ impl CpuCompiledTrainingProgram {
         let next_main_cursor =
             MixedReplayCursor::resume(&self.capture, next_frontier).map_err(replay_error)?;
 
-        let mut provided = BTreeMap::new();
-        if let Some(learning_rate) = learning_rate {
-            provided.insert(LEARNING_RATE_INPUT.to_owned(), learning_rate);
-        }
         Ok(CpuAuxiliaryReplay {
             cursor,
             next_main_cursor,
@@ -6488,6 +6781,29 @@ impl CpuCompiledTrainingProgram {
         Ok((preparation, started.elapsed()))
     }
 
+    fn preflight_native_accumulation(
+        &self,
+        transition: &CompiledAdamWAccumulationPlan,
+        vectorized: bool,
+    ) -> Result<(RecurrentNativePreparation, Duration)> {
+        let started = Instant::now();
+        let prepared = self.prepare_phase_replay(
+            &transition.capture,
+            &transition.state_buffers,
+            zero_inputs(&self.inputs)?,
+        )?;
+        let preparation = transition
+            .capture
+            .preflight_recurrent_native(
+                &self.runtime,
+                &prepared.cursor,
+                &prepared.provided,
+                vectorized,
+            )
+            .map_err(replay_error)?;
+        Ok((preparation, started.elapsed()))
+    }
+
     fn finish_native_auxiliary_transition(
         &self,
         transition: &CompiledAdamWAuxiliaryPlan,
@@ -6500,6 +6816,32 @@ impl CpuCompiledTrainingProgram {
         let wall_time = native_preparation_wall_time(trace.module, residual_wall_time)?;
         let report = NativeCpuProgramPreparationReport {
             capture_identity: transition.capture_identity(),
+            native_identity: trace.replay.identity,
+            vectorized: trace.replay.vectorized,
+            native_item_count: trace.item_count,
+            cache_hit_count: trace.cache_hit_count,
+            cache_miss_count: trace.cache_miss_count,
+            work: NativeCpuPreparationWork::from_module(trace.module),
+            phases: NativeCpuPreparationPhases::from_module(trace.module, wall_time)?,
+            execution_plan: transition.recurrent_capture.execution_plan().clone(),
+            wall_time,
+        };
+        report.validate_work()?;
+        Ok(PreparedNativeCpuProgram { report, replay })
+    }
+
+    fn finish_native_accumulation(
+        &self,
+        transition: &CompiledAdamWAccumulationPlan,
+        preparation: RecurrentNativePreparation,
+        plan: PlannedNativeItems,
+        residual_wall_time: Duration,
+    ) -> Result<PreparedNativeCpuProgram> {
+        let replay = preparation.finish(plan).map_err(replay_error)?;
+        let trace = replay.preparation_trace();
+        let wall_time = native_preparation_wall_time(trace.module, residual_wall_time)?;
+        let report = NativeCpuProgramPreparationReport {
+            capture_identity: transition.capture_identity,
             native_identity: trace.replay.identity,
             vectorized: trace.replay.vectorized,
             native_item_count: trace.item_count,
@@ -7084,7 +7426,8 @@ impl CompiledAdamWPlan {
 
     /// Returns an independent plan whose recurrent frontier is restored from
     /// one checkpoint without rebuilding the Graph, derivatives, schedules,
-    /// captures, partial-flush transition, or attached evaluation program.
+    /// captures, accumulation/partial-flush transitions, or attached evaluation
+    /// program.
     ///
     /// The checkpoint must authenticate this exact compiled program and its
     /// accumulation, dropout, frozen-parameter, input, clipping, loss-scaling,
@@ -7123,6 +7466,13 @@ impl CompiledAdamWPlan {
         if self.capture_identity() != decoded.capture_identity {
             return Err(training(
                 "compiled AdamW checkpoint capture identity mismatch",
+            ));
+        }
+        if decoded.accumulation_capture_identity.is_some()
+            && self.accumulation_capture_identity() != decoded.accumulation_capture_identity
+        {
+            return Err(training(
+                "compiled AdamW checkpoint accumulation capture identity mismatch",
             ));
         }
         if decoded.flush_capture_identity.is_some()
@@ -7472,6 +7822,7 @@ impl CompiledAdamWPlan {
             .transpose()?;
         Ok(MetalCompiledAdamWPlan {
             inner,
+            accumulation_capture_identity: self.accumulation_capture_identity(),
             partial_flush,
             progress: self.progress,
             flush_capture_identity: self.flush_capture_identity(),
@@ -7537,6 +7888,12 @@ impl CompiledAdamWPlan {
             self.capture_identity(),
             self.inner.recurrent_capture.execution_plan().clone(),
         );
+        let accumulation = self.inner.accumulation.as_ref().map(|transition| {
+            (
+                transition.capture_identity,
+                transition.recurrent_capture.execution_plan().clone(),
+            )
+        });
         let partial_flush = self.partial_flush.as_ref().map(|transition| {
             (
                 transition.capture_identity(),
@@ -7558,6 +7915,7 @@ impl CompiledAdamWPlan {
         Ok(CompiledAdamWInspection::new(
             self.step_count(),
             main,
+            accumulation,
             partial_flush,
             zero_grad,
             evaluation,
@@ -7573,6 +7931,14 @@ impl CompiledAdamWPlan {
     /// Number of Threefry U64 blocks reserved by each successful replay.
     pub fn dropout_blocks_per_replay(&self) -> Option<u64> {
         self.dropout.map(|dropout| dropout.blocks_per_replay)
+    }
+
+    /// Stable identity of the private accumulation-only sibling capture.
+    pub fn accumulation_capture_identity(&self) -> Option<u64> {
+        self.inner
+            .accumulation
+            .as_ref()
+            .map(|transition| transition.capture_identity)
     }
 
     /// Stable identity of the state-only flush capture, when accumulation is
@@ -8022,6 +8388,12 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         self.plan.capture_identity()
     }
 
+    /// Returns the private accumulation-only sibling capture identity when
+    /// gradient accumulation is enabled for this owned plan.
+    pub fn accumulation_capture_identity(&self) -> Option<u64> {
+        self.plan.accumulation_capture_identity()
+    }
+
     /// Returns the owned plan's immutable logical work and recurrent-state
     /// inspection without exposing its sealed module.
     pub fn inspection(&self) -> Result<CompiledAdamWInspection> {
@@ -8126,10 +8498,11 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
     /// module's canonical immutable state and topology.
     ///
     /// This does not publish into or release the sealed host module. The
-    /// embedded optimizer checkpoint is reused byte-for-byte across v1--v8;
-    /// report-disabled programs retain their existing v1--v7 bytes. The module
-    /// envelope remains v1 when no evaluator is attached and uses v2 only to
-    /// authenticate an attached evaluator's capture identity.
+    /// embedded optimizer checkpoint is reused byte-for-byte across v1--v9.
+    /// Programs without the private accumulation sibling retain their existing
+    /// v1--v8 formats; multi-replay accumulation emits v9. The module envelope
+    /// remains v1 when no evaluator is attached and uses v2 only to authenticate
+    /// an attached evaluator's capture identity.
     pub fn module_checkpoint(&self) -> Result<CompiledModuleAdamWCheckpoint> {
         self.seal.validate_unchanged(&self.module)?;
         let optimizer = self.runtime.checkpoint()?;
@@ -8437,13 +8810,28 @@ impl CpuCompiledAdamW {
         if let Some(dropout) = self.dropout {
             expected_dropout_counter(dropout, next.replay_step)?;
         }
-        let mut result = self.inner.step_inner_with_learning_rate(
-            inputs,
-            learning_rate,
-            self.non_finite_policy,
-            next.accumulation_index == 0,
-            injected_failure,
-        )?;
+        let mut result = if next.accumulation_index == 0 {
+            self.inner.step_inner_with_learning_rate(
+                inputs,
+                learning_rate,
+                self.non_finite_policy,
+                true,
+                injected_failure,
+            )?
+        } else {
+            let transition = self
+                .inner
+                .accumulation
+                .clone()
+                .ok_or_else(|| training("compiled accumulation replay is absent"))?;
+            self.inner.step_accumulation_inner_with_learning_rate(
+                &transition,
+                inputs,
+                learning_rate,
+                self.non_finite_policy,
+                injected_failure,
+            )?
+        };
         result.step = next.replay_step;
         self.progress = next;
         Ok(adamw_step_result(
@@ -8778,6 +9166,11 @@ impl CpuCompiledAdamW {
         let bytes = encode_adamw_checkpoint(
             AdamWCheckpointProgress {
                 capture_identity: self.capture_identity(),
+                accumulation_capture_identity: self
+                    .inner
+                    .accumulation
+                    .as_ref()
+                    .map(|transition| transition.capture_identity),
                 replay_step: self.progress.replay_step,
                 optimizer_step: self.progress.optimizer_step,
                 accumulation_steps: self.gradient_accumulation_steps,
@@ -8834,7 +9227,8 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         let external_learning_rate =
             matches!(&inner.learning_rate, CompiledLearningRatePolicy::External);
         let mut drafts = Vec::with_capacity(
-            1 + usize::from(inner.partial_flush.is_some())
+            1 + usize::from(inner.inner.accumulation.is_some())
+                + usize::from(inner.partial_flush.is_some())
                 + usize::from(inner.zero_grad.is_some())
                 + usize::from(inner.evaluation.is_some()),
         );
@@ -8854,6 +9248,28 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             );
         }
         main_preparation.release_input_witnesses();
+        let accumulation_preparation = match inner.inner.accumulation.as_ref() {
+            Some(transition) => {
+                let (mut preparation, residual) = inner
+                    .inner
+                    .preflight_native_accumulation(transition, vectorized)?;
+                {
+                    let (pure, inputs) = preparation.pure_and_inputs();
+                    drafts.push(
+                        executor
+                            .preflight_native_items_with_adamw_updates(
+                                pure,
+                                inputs,
+                                &transition.adamw_native_updates,
+                            )
+                            .map_err(replay_error)?,
+                    );
+                }
+                preparation.release_input_witnesses();
+                Some((preparation, residual))
+            }
+            None => None,
+        };
         let partial_flush_preparation = match inner.partial_flush.as_ref() {
             Some(transition) => {
                 let (mut preparation, residual) =
@@ -8927,6 +9343,14 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 .next()
                 .expect("native main planning draft is present"),
         ));
+        if let Some((preparation, _)) = &accumulation_preparation {
+            programs.push((
+                preparation.pure(),
+                drafts
+                    .next()
+                    .expect("native accumulation planning draft is present"),
+            ));
+        }
         if let Some((preparation, _)) = &partial_flush_preparation {
             programs.push((
                 preparation.pure(),
@@ -8963,6 +9387,24 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 .ok_or_else(|| training("compiled native CPU main plan is absent"))?,
             main_residual,
         )?;
+        let accumulation = match (inner.inner.accumulation.as_ref(), accumulation_preparation) {
+            (Some(transition), Some((preparation, residual))) => {
+                Some(inner.inner.finish_native_accumulation(
+                    transition,
+                    preparation,
+                    plans.next().ok_or_else(|| {
+                        training("compiled native CPU accumulation plan is absent")
+                    })?,
+                    residual,
+                )?)
+            }
+            (None, None) => None,
+            _ => {
+                return Err(training(
+                    "compiled native CPU accumulation preparation differs",
+                ));
+            }
+        };
         let partial_flush = match (inner.partial_flush.as_ref(), partial_flush_preparation) {
             (Some(transition), Some((preparation, residual))) => {
                 Some(inner.inner.finish_native_auxiliary_transition(
@@ -9031,6 +9473,9 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             report: main_report,
             replay: main_replay,
         } = main;
+        let (accumulation_report, accumulation_replay) = accumulation
+            .map(|prepared| (prepared.report, prepared.replay))
+            .unzip();
         let (partial_flush_report, partial_flush_replay) = partial_flush
             .map(|prepared| (prepared.report, prepared.replay))
             .unzip();
@@ -9042,11 +9487,13 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             inner,
             executor,
             main_replay,
+            accumulation_replay,
             partial_flush_replay,
             zero_grad_replay,
             evaluation_replay: evaluation,
             preparation: NativeCpuCompiledAdamWPreparationReport {
                 main: main_report,
+                accumulation: accumulation_report,
                 partial_flush: partial_flush_report,
                 zero_grad: zero_grad_report,
                 evaluation: evaluation_report,
@@ -9106,14 +9553,37 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .successful_steps
             .checked_add(1)
             .ok_or_else(|| training("compiled native CPU run count overflow"))?;
-        let (mut result, mut report) = self.inner.inner.step_native_inner_with_learning_rate(
-            inputs,
-            learning_rate,
-            self.inner.non_finite_policy,
-            next.accumulation_index == 0,
-            NativeReplayContext::new(self.executor, &mut self.main_replay),
-            injected_failure,
-        )?;
+        let (mut result, mut report) = if next.accumulation_index == 0 {
+            self.inner.inner.step_native_inner_with_learning_rate(
+                inputs,
+                learning_rate,
+                self.inner.non_finite_policy,
+                true,
+                NativeReplayContext::new(self.executor, &mut self.main_replay),
+                injected_failure,
+            )?
+        } else {
+            let transition = self
+                .inner
+                .inner
+                .accumulation
+                .clone()
+                .ok_or_else(|| training("compiled accumulation replay is absent"))?;
+            let replay = self
+                .accumulation_replay
+                .as_mut()
+                .ok_or_else(|| training("compiled native CPU accumulation replay is absent"))?;
+            self.inner
+                .inner
+                .step_accumulation_native_inner_with_learning_rate(
+                    &transition,
+                    inputs,
+                    learning_rate,
+                    self.inner.non_finite_policy,
+                    NativeReplayContext::new(self.executor, replay),
+                    injected_failure,
+                )?
+        };
         result.step = next.replay_step;
         report.successful_invocation = successful_invocation;
         self.inner.progress = next;
@@ -10035,6 +10505,7 @@ impl MetalCompiledAdamWPlan {
             .transpose()?;
         Ok(MetalCompiledAdamW {
             inner,
+            accumulation_capture_identity: self.accumulation_capture_identity,
             partial_flush,
             progress: self.progress,
             flush_capture_identity: self.flush_capture_identity,
@@ -10572,6 +11043,7 @@ impl MetalCompiledAdamW {
         CompiledAdamWCheckpoint::from_bytes(encode_adamw_checkpoint(
             AdamWCheckpointProgress {
                 capture_identity: self.inner.program_identity,
+                accumulation_capture_identity: self.accumulation_capture_identity,
                 replay_step: self.progress.replay_step,
                 optimizer_step: self.progress.optimizer_step,
                 accumulation_steps: self.gradient_accumulation_steps,
@@ -11976,6 +12448,7 @@ mod tests {
             encode_adamw_checkpoint(
                 AdamWCheckpointProgress {
                     capture_identity: decoded.capture_identity,
+                    accumulation_capture_identity: decoded.accumulation_capture_identity,
                     replay_step: decoded.replay_step,
                     optimizer_step: decoded.optimizer_step,
                     accumulation_steps: decoded.accumulation_steps,
@@ -12053,35 +12526,67 @@ mod tests {
                 TensorData::scalar(0.01),
             )
             .unwrap();
-        let v2 = accumulated.checkpoint().unwrap();
+        let current = accumulated.checkpoint().unwrap();
+        let (state, metadata) = load_safetensors(current.as_bytes()).unwrap();
+        let v2 = CompiledAdamWCheckpoint::from_bytes(
+            save_safetensors(
+                &state,
+                &crate::Metadata::from([
+                    ("format".into(), ADAMW_CHECKPOINT_FORMAT_V2.into()),
+                    (
+                        "capture_identity".into(),
+                        metadata["capture_identity"].clone(),
+                    ),
+                    ("replay_step".into(), metadata["replay_step"].clone()),
+                    ("optimizer_step".into(), metadata["optimizer_step"].clone()),
+                    (
+                        "gradient_accumulation_steps".into(),
+                        metadata["gradient_accumulation_steps"].clone(),
+                    ),
+                    (
+                        "accumulation_index".into(),
+                        metadata["accumulation_index"].clone(),
+                    ),
+                    (
+                        "parameter_names".into(),
+                        metadata["parameter_names"].clone(),
+                    ),
+                ]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         accumulated.zero_grad().unwrap();
-        let decoded =
-            decode_adamw_checkpoint(accumulated.checkpoint().unwrap().as_bytes()).unwrap();
+        let current = accumulated.checkpoint().unwrap();
+        let (state, metadata) = load_safetensors(current.as_bytes()).unwrap();
         let v3 = CompiledAdamWCheckpoint::from_bytes(
-            encode_adamw_checkpoint(
-                AdamWCheckpointProgress {
-                    capture_identity: decoded.capture_identity,
-                    replay_step: decoded.replay_step,
-                    optimizer_step: decoded.optimizer_step,
-                    accumulation_steps: decoded.accumulation_steps,
-                    accumulation_index: decoded.accumulation_index,
-                    discarded_microbatches: decoded.discarded_microbatches,
-                    flushed_window_count: decoded.flushed_window_count,
-                    flushed_microbatch_count: decoded.flushed_microbatch_count,
-                    flush_capture_identity: decoded.flush_capture_identity,
-                    dropout_block_counter: decoded.dropout_block_counter,
-                    accumulated_token_count: decoded.accumulated_token_count,
-                    window_loss_report: false,
-                    reset_transition_count: 0,
-                    reset_capture_identity: None,
-                },
-                AdamWCheckpointTensors {
-                    parameters: decoded.parameters,
-                    first_moments: decoded.first_moments,
-                    second_moments: decoded.second_moments,
-                    gradient_accumulators: decoded.gradient_accumulators,
-                    accumulated_loss_numerator: None,
-                },
+            save_safetensors(
+                &state,
+                &crate::Metadata::from([
+                    ("format".into(), ADAMW_CHECKPOINT_FORMAT_V3.into()),
+                    (
+                        "capture_identity".into(),
+                        metadata["capture_identity"].clone(),
+                    ),
+                    ("replay_step".into(), metadata["replay_step"].clone()),
+                    ("optimizer_step".into(), metadata["optimizer_step"].clone()),
+                    (
+                        "gradient_accumulation_steps".into(),
+                        metadata["gradient_accumulation_steps"].clone(),
+                    ),
+                    (
+                        "accumulation_index".into(),
+                        metadata["accumulation_index"].clone(),
+                    ),
+                    (
+                        "discarded_microbatch_count".into(),
+                        metadata["discarded_microbatch_count"].clone(),
+                    ),
+                    (
+                        "parameter_names".into(),
+                        metadata["parameter_names"].clone(),
+                    ),
+                ]),
             )
             .unwrap(),
         )
@@ -12105,6 +12610,16 @@ mod tests {
             assert_eq!(info.flush_capture_identity(), None);
             assert_eq!(info.dropout_block_counter(), None);
             assert_eq!(info.accumulated_token_count(), None);
+            assert_eq!(info.accumulation_capture_identity(), None);
+            let restored = CompiledAdamWPlan::compile_module_from_checkpoint(
+                module_config().with_gradient_accumulation(2).unwrap(),
+                &fresh,
+                &legacy,
+                build_tied_frozen,
+            )
+            .unwrap();
+            assert_eq!(restored.step_count(), 1);
+            assert!(restored.accumulation_capture_identity().is_some());
             assert!(
                 CompiledAdamWPlan::compile_module_with_dropout_from_checkpoint(
                     module_config().with_gradient_accumulation(2).unwrap(),
@@ -13439,6 +13954,14 @@ mod tests {
 
         for index in main_updates[0] {
             let mut native = plan.prepare(&target).unwrap();
+            let mut interpreted = plan.prepare_cpu().unwrap();
+            let expected = interpreted.step(batch(), lr()).unwrap();
+            let actual = native.step(batch(), lr()).unwrap();
+            assert_cross_engine_tensor_close(
+                "AdamW accumulation before grouped update",
+                actual.loss(),
+                expected.loss(),
+            );
             let checkpoint = native.checkpoint().unwrap();
             let cursor = native.inner.inner.cursor.clone();
             let counts = native_recurrent_test_counts(&native);
@@ -13455,7 +13978,6 @@ mod tests {
             assert_eq!(native.inner.inner.cursor, cursor);
             assert_eq!(native_recurrent_test_counts(&native), counts);
             assert_eq!(native.checkpoint().unwrap(), checkpoint);
-            let mut interpreted = plan.prepare_cpu().unwrap();
             let expected = interpreted.step(batch(), lr()).unwrap();
             let actual = native.step(batch(), lr()).unwrap();
             assert_cross_engine_tensor_close(
@@ -13502,8 +14024,15 @@ mod tests {
         let mut native = target.prepare(&plan).unwrap();
         let mut interpreted = plan.prepare_cpu().unwrap();
         let prepared = native.main_replay.workspace_stats();
+        let accumulation_prepared = native
+            .accumulation_replay
+            .as_ref()
+            .unwrap()
+            .workspace_stats();
         assert!(prepared.retained_transpose_matmul_input_count >= 2);
+        assert!(accumulation_prepared.retained_transpose_matmul_input_count >= 2);
         assert_eq!(prepared.affine_matmul_materialization_bytes, 0);
+        assert_eq!(accumulation_prepared.affine_matmul_materialization_bytes, 0);
         assert_eq!(native.preparation_report().main().fallback_count(), 0);
 
         let batch = BTreeMap::from([
@@ -13524,12 +14053,19 @@ mod tests {
         );
         assert_eq!(native.checkpoint().unwrap(), before);
         assert_eq!(
-            native.main_replay.workspace_stats().allocation_count,
-            prepared.allocation_count
+            native
+                .accumulation_replay
+                .as_ref()
+                .unwrap()
+                .workspace_stats()
+                .allocation_count,
+            accumulation_prepared.allocation_count
         );
         assert_eq!(
             native
-                .main_replay
+                .accumulation_replay
+                .as_ref()
+                .unwrap()
                 .workspace_stats()
                 .affine_matmul_materialization_bytes,
             0
@@ -13667,6 +14203,16 @@ mod tests {
             build_tinybob,
         )
         .unwrap();
+        let accumulation_transition = plan.inner.accumulation.as_ref().unwrap();
+        assert!(
+            accumulation_transition
+                .capture
+                .schedule
+                .inputs
+                .iter()
+                .all(|input| input.name != LEARNING_RATE_INPUT),
+            "the accumulation-only graph must not retain external learning-rate work"
+        );
         let reset_transition = plan.zero_grad.as_ref().unwrap();
         assert_eq!(
             reset_transition.state_buffers.len(),
@@ -13679,9 +14225,15 @@ mod tests {
                 .all(RecurrentStateKey::is_accumulation_reset_state)
         );
         let executor = CapturedReplayExecutor::default();
-        let target = NativeCpuSessionTarget::new(&executor);
+        let target = NativeCpuSessionTarget::new(&executor)
+            .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
         let mut native = target.prepare(&plan).unwrap();
-        assert_eq!(executor.native_item_plan_count(), 3);
+        assert_eq!(executor.native_item_plan_count(), 4);
+        let accumulation_workspace = native
+            .accumulation_replay
+            .as_ref()
+            .unwrap()
+            .workspace_stats();
         let flush_workspace = native
             .partial_flush_replay
             .as_ref()
@@ -13689,6 +14241,14 @@ mod tests {
             .workspace_stats();
         let reset_workspace = native.zero_grad_replay.as_ref().unwrap().workspace_stats();
         assert_eq!(native.main_replay.structure_validation_count(), 1);
+        assert_eq!(
+            native
+                .accumulation_replay
+                .as_ref()
+                .unwrap()
+                .structure_validation_count(),
+            1
+        );
         assert_eq!(
             native
                 .partial_flush_replay
@@ -13706,11 +14266,27 @@ mod tests {
             1
         );
         assert!(flush_workspace.allocation_count > 0);
+        assert!(accumulation_workspace.allocation_count > 0);
         assert!(reset_workspace.allocation_count > 0);
-        let mut interpreted = plan.prepare_cpu().unwrap();
+        let mut interpreted = plan
+            .prepare_cpu_with_non_finite_policy(CpuNonFinitePolicy::RejectTransition)
+            .unwrap();
         assert!(native.preparation_report().partial_flush().is_some());
         assert!(native.preparation_report().zero_grad().is_some());
-        assert!(native.preparation_report().compiler_process_count() <= 3);
+        let accumulation_preparation = native.preparation_report().accumulation().unwrap();
+        assert_eq!(
+            accumulation_preparation.capture_identity(),
+            plan.accumulation_capture_identity().unwrap()
+        );
+        assert_ne!(
+            accumulation_preparation.capture_identity(),
+            plan.capture_identity()
+        );
+        assert!(
+            accumulation_preparation.native_item_count()
+                < native.preparation_report().main().native_item_count()
+        );
+        assert!(native.preparation_report().compiler_process_count() <= 4);
         assert!(
             native
                 .preparation_report()
@@ -13719,6 +14295,7 @@ mod tests {
         );
         for program in [
             Some(native.preparation_report().main()),
+            native.preparation_report().accumulation(),
             native.preparation_report().partial_flush(),
             native.preparation_report().zero_grad(),
         ]
@@ -13730,8 +14307,57 @@ mod tests {
             assert!(program.work().compiler_invocation_count() <= 1);
         }
 
+        let initial_checkpoint = native.checkpoint().unwrap();
+        let initial_interpreted_checkpoint = interpreted.checkpoint().unwrap();
+        let invalid_native_learning_rate =
+            match native.step_inner(batch(), TensorData::scalar(f32::NAN), None) {
+                Ok(_) => panic!("non-finite native accumulation learning rate was accepted"),
+                Err(error) => error,
+            };
+        assert!(
+            invalid_native_learning_rate
+                .to_string()
+                .contains("non-finite")
+        );
+        let invalid_interpreted_learning_rate = interpreted
+            .step_inner(batch(), TensorData::scalar(f32::NAN), None)
+            .unwrap_err();
+        assert!(
+            invalid_interpreted_learning_rate
+                .to_string()
+                .contains("non-finite")
+        );
+        assert_eq!(native.checkpoint().unwrap(), initial_checkpoint);
+        assert_eq!(
+            interpreted.checkpoint().unwrap(),
+            initial_interpreted_checkpoint
+        );
+        assert_eq!(native.successful_steps, 0);
+        assert!(native.step_inner(batch(), lr(), Some(0)).is_err());
+        assert_eq!(native.checkpoint().unwrap(), initial_checkpoint);
+        assert_eq!(native.successful_steps, 0);
+
+        let parameter_values = native.parameter_snapshots().unwrap();
+        let first_moments = native.first_moment_snapshots().unwrap();
+        let second_moments = native.second_moment_snapshots().unwrap();
+        let state_versions = native.inner.inner.plan().unwrap().state_versions;
         let actual = native.step(batch(), lr()).unwrap();
         let expected = interpreted.step(batch(), lr()).unwrap();
+        assert!(!actual.did_update());
+        assert_eq!(actual.capture_identity(), plan.capture_identity());
+        assert!(actual.clip_report().is_none());
+        assert_eq!(
+            actual.report().capture_identity(),
+            plan.accumulation_capture_identity().unwrap()
+        );
+        assert_eq!(native.parameter_snapshots().unwrap(), parameter_values);
+        assert_eq!(native.first_moment_snapshots().unwrap(), first_moments);
+        assert_eq!(native.second_moment_snapshots().unwrap(), second_moments);
+        let next_versions = native.inner.inner.plan().unwrap().state_versions;
+        assert_eq!(next_versions.len(), state_versions.len());
+        for (key, version) in state_versions {
+            assert_eq!(next_versions[&key], version + 1, "{key:?}");
+        }
         assert_cross_engine_tensor_close("cancelled-window loss", actual.loss(), expected.loss());
         assert_cross_engine_tensor_maps_close(
             "cancelled-window outputs",
@@ -13870,6 +14496,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .workspace_stats();
+        let before_empty_flush_plan_count = executor.native_item_plan_count();
         let before_empty_flush_counts = native_recurrent_test_counts(&native);
         let empty = native.flush_partial_window(lr()).unwrap();
         assert!(!empty.did_update());
@@ -13878,7 +14505,10 @@ mod tests {
             native_recurrent_test_counts(&native),
             before_empty_flush_counts
         );
-        assert_eq!(executor.native_item_plan_count(), 3);
+        assert_eq!(
+            executor.native_item_plan_count(),
+            before_empty_flush_plan_count
+        );
         assert_eq!(
             native
                 .partial_flush_replay
@@ -13951,6 +14581,15 @@ mod tests {
         assert_eq!(
             native
                 .main_replay
+                .workspace_stats()
+                .borrowed_external_input_bytes,
+            0
+        );
+        assert_eq!(
+            native
+                .accumulation_replay
+                .as_ref()
+                .unwrap()
                 .workspace_stats()
                 .borrowed_external_input_bytes,
             64
@@ -15881,7 +16520,7 @@ mod tests {
         assert_native_adamw_state_close(&native, &interpreted);
         assert_eq!(checkpoint.info().accumulated_token_count(), Some(2));
         let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
-        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V6);
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V9);
         let (mut tensors, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
         tensors.insert(
             "accumulated_token_count".into(),
@@ -16052,7 +16691,7 @@ mod tests {
         );
         assert_native_adamw_state_close(&native_flushed, &flushed);
         let (_, metadata) = load_safetensors(reset_checkpoint.as_bytes()).unwrap();
-        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V7);
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V9);
         assert_eq!(metadata["token_weighted_accumulation_present"], "true");
     }
 
@@ -16271,7 +16910,7 @@ mod tests {
         let checkpoint = interpreted.checkpoint().unwrap();
         assert_eq!(native.checkpoint().unwrap(), checkpoint);
         let (mut checkpoint_tensors, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
-        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V8);
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V9);
         assert_eq!(metadata["window_loss_report_enabled"], "true");
         assert!(
             checkpoint_tensors
@@ -16473,12 +17112,34 @@ mod tests {
             CpuCompiledAdamW::compile(config.clone(), initial_parameters(), build_tinybob).unwrap();
         uninterrupted.step(batch(), lr()).unwrap();
         let checkpoint = uninterrupted.checkpoint().unwrap();
-        let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
-        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V2);
+        let (state, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V9);
         assert_eq!(metadata["replay_step"], "1");
         assert_eq!(metadata["optimizer_step"], "0");
         assert_eq!(metadata["gradient_accumulation_steps"], "3");
         assert_eq!(metadata["accumulation_index"], "1");
+        assert_eq!(
+            checkpoint.info().accumulation_capture_identity(),
+            uninterrupted
+                .inner
+                .accumulation
+                .as_ref()
+                .map(|transition| transition.capture_identity)
+        );
+        let mut malformed_metadata = metadata;
+        let accumulation_identity = checkpoint.info().accumulation_capture_identity().unwrap();
+        malformed_metadata.insert(
+            "accumulation_capture_identity".into(),
+            (accumulation_identity ^ 1).to_string(),
+        );
+        let malformed = CompiledAdamWCheckpoint::from_bytes(
+            save_safetensors(&state, &malformed_metadata).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            CpuCompiledAdamW::compile_from_checkpoint(config.clone(), &malformed, build_tinybob)
+                .is_err()
+        );
 
         let mut resumed =
             CpuCompiledAdamW::compile_from_checkpoint(config, &checkpoint, build_tinybob).unwrap();
@@ -16520,6 +17181,7 @@ mod tests {
         let decoded = decode_adamw_checkpoint(runtime.checkpoint().unwrap().as_bytes()).unwrap();
         let progress = AdamWCheckpointProgress {
             capture_identity: decoded.capture_identity,
+            accumulation_capture_identity: decoded.accumulation_capture_identity,
             replay_step: decoded.replay_step,
             optimizer_step: decoded.optimizer_step,
             accumulation_steps: decoded.accumulation_steps,
@@ -16628,7 +17290,7 @@ mod tests {
 
         let checkpoint = flushed.checkpoint().unwrap();
         let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
-        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V5);
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V9);
         assert_eq!(metadata["replay_step"], "2");
         assert_eq!(metadata["optimizer_step"], "1");
         assert_eq!(metadata["flushed_window_count"], "1");
@@ -16911,7 +17573,7 @@ mod tests {
 
         let checkpoint = cancelled.checkpoint().unwrap();
         let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
-        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V7);
+        assert_eq!(metadata["format"], ADAMW_CHECKPOINT_FORMAT_V9);
         assert_eq!(metadata["replay_step"], "2");
         assert_eq!(metadata["optimizer_step"], "0");
         assert_eq!(metadata["accumulation_index"], "0");
