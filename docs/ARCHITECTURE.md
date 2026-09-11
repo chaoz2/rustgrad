@@ -949,21 +949,26 @@ not a mode on the interpreter session. It precompiles the main replay and every
 attached partial-flush/zero-grad/evaluation pure program through the existing
 `CapturedReplayExecutor` before returning mutable state, then reuses the same
 mixed staging and single `EffectRuntime` commit with interpreter fallback
-disabled. Each prepared recurrent program seals its validated RGSM identity,
+disabled. Each attached schedule renders its ordered native entries once and
+loads them as uniquely named functions in one content-addressed shared module;
+replay keeps item-level execution and error attribution. Each prepared recurrent
+program seals its validated RGSM identity,
 pure cache/layout inventory, replacement map, and initial frontier descriptor
 once. Main, partial-flush, and zero-grad hot replay therefore repeats only
 call-dependent cursor, input, active-bank, quantized-index, successor, and
 transaction admission; generic artifact replay retains full per-call artifact
 validation. Its typed preparation/run reports expose only CPU facts: native item
-and cache counts, static execution summaries, recurrent logical bytes, stable
-capture/native identities, and call-local wall times excluded from identity.
+and cache counts, rendered entries, loaded modules, durable artifact hits/misses,
+actual compiler invocations, static execution summaries, recurrent logical
+bytes, stable capture/native identities, and call-local wall times excluded from
+identity.
 Unsupported preparation and failed execution or commit publish neither state
 nor progress; checkpoint bytes and capture identity are shared with the
 interpreter and strict-Metal targets.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v4 validates those facts against strict-native
+separate `NativeTrainingScoreboard` v5 validates those facts against strict-native
 preparation and committed main-replay reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
 sample set into versioned JSON. It reports deterministic
@@ -977,8 +982,9 @@ expose no report sample. CPU device kernel launches, host/device transfers, and
 measured physical peak host memory remain unavailable (`null`). Durations
 do not change any plan, capture, checkpoint, or native identity, and the report
 makes no threshold or speedup claim. Legacy v1 reports without zero-grad
-inventory, v2 reports without replay traffic, and v3 reports without executed
-native-item counts remain readable.
+inventory, v2 reports without replay traffic, v3 reports without executed
+native-item counts, and v4 reports without shared-module preparation evidence
+remain readable.
 CPU targets may opt into `CpuNonFinitePolicy::RejectTransition`. The historical
 unit `CpuSessionTarget` remains the propagation default and returns a separate
 `ConfiguredCpuSessionTarget` when that policy is selected; strict-native CPU

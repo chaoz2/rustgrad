@@ -17,7 +17,8 @@ use std::time::Duration;
 
 const NATIVE_TRAINING_REPORT_FORMAT_V2: u32 = 2;
 const NATIVE_TRAINING_REPORT_FORMAT_V3: u32 = 3;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 4;
+const NATIVE_TRAINING_REPORT_FORMAT_V4: u32 = 4;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 5;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +114,16 @@ pub struct NativeTrainingProgramReport {
     native_item_count: u64,
     cache_hit_count: u64,
     cache_miss_count: u64,
+    #[serde(default)]
+    rendered_entry_count: u64,
+    #[serde(default)]
+    loaded_module_count: u64,
+    #[serde(default)]
+    durable_artifact_cache_hit_count: u64,
+    #[serde(default)]
+    durable_artifact_cache_miss_count: u64,
+    #[serde(default)]
+    compiler_invocation_count: u64,
 }
 
 impl NativeTrainingProgramReport {
@@ -143,10 +154,27 @@ impl NativeTrainingProgramReport {
             native_item_count: count(preparation.native_item_count(), "native item")?,
             cache_hit_count: count(preparation.cache_hit_count(), "cache hit")?,
             cache_miss_count: count(preparation.cache_miss_count(), "cache miss")?,
+            rendered_entry_count: count(
+                preparation.work().rendered_entry_count(),
+                "rendered entry",
+            )?,
+            loaded_module_count: count(preparation.work().loaded_module_count(), "loaded module")?,
+            durable_artifact_cache_hit_count: count(
+                preparation.work().durable_artifact_cache_hit_count(),
+                "durable artifact cache hit",
+            )?,
+            durable_artifact_cache_miss_count: count(
+                preparation.work().durable_artifact_cache_miss_count(),
+                "durable artifact cache miss",
+            )?,
+            compiler_invocation_count: count(
+                preparation.work().compiler_invocation_count(),
+                "compiler invocation",
+            )?,
         })
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, format_version: u32) -> Result<()> {
         if self
             .cache_hit_count
             .checked_add(self.cache_miss_count)
@@ -154,6 +182,35 @@ impl NativeTrainingProgramReport {
             != self.native_item_count
         {
             return Err(invalid("native program cache inventory differs"));
+        }
+        let preparation = [
+            self.rendered_entry_count,
+            self.loaded_module_count,
+            self.durable_artifact_cache_hit_count,
+            self.durable_artifact_cache_miss_count,
+            self.compiler_invocation_count,
+        ];
+        if format_version < NATIVE_TRAINING_REPORT_FORMAT_VERSION {
+            if preparation.into_iter().any(|value| value != 0) {
+                return Err(invalid(
+                    "legacy native program has module preparation evidence",
+                ));
+            }
+        } else {
+            let durable_access_count = self
+                .durable_artifact_cache_hit_count
+                .checked_add(self.durable_artifact_cache_miss_count)
+                .ok_or_else(|| invalid("durable artifact cache count overflows"))?;
+            let expected_modules = u64::from(self.native_item_count != 0);
+            if self.rendered_entry_count != self.native_item_count
+                || self.loaded_module_count != expected_modules
+                || durable_access_count > self.loaded_module_count
+                || self.compiler_invocation_count != self.durable_artifact_cache_miss_count
+            {
+                return Err(invalid(
+                    "native program module preparation evidence differs",
+                ));
+            }
         }
         Ok(())
     }
@@ -196,6 +253,26 @@ impl NativeTrainingProgramReport {
 
     pub const fn cache_miss_count(&self) -> u64 {
         self.cache_miss_count
+    }
+
+    pub const fn rendered_entry_count(&self) -> u64 {
+        self.rendered_entry_count
+    }
+
+    pub const fn loaded_module_count(&self) -> u64 {
+        self.loaded_module_count
+    }
+
+    pub const fn durable_artifact_cache_hit_count(&self) -> u64 {
+        self.durable_artifact_cache_hit_count
+    }
+
+    pub const fn durable_artifact_cache_miss_count(&self) -> u64 {
+        self.durable_artifact_cache_miss_count
+    }
+
+    pub const fn compiler_invocation_count(&self) -> u64 {
+        self.compiler_invocation_count
     }
 }
 
@@ -339,6 +416,7 @@ impl NativeTrainingReport {
             self.format_version,
             1 | NATIVE_TRAINING_REPORT_FORMAT_V2
                 | NATIVE_TRAINING_REPORT_FORMAT_V3
+                | NATIVE_TRAINING_REPORT_FORMAT_V4
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -369,11 +447,13 @@ impl NativeTrainingReport {
                 .to_duration()
                 .map_err(|_| invalid("invalid native training duration"))?;
         }
-        self.main.validate()?;
+        self.main.validate(self.format_version)?;
         match (self.format_version, &self.main_replay_traffic) {
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2, None) => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V3 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V3
+                | NATIVE_TRAINING_REPORT_FORMAT_V4
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
                 && traffic.borrowed_recurrent_output_bytes()
@@ -388,8 +468,10 @@ impl NativeTrainingReport {
             self.main_replay_executed_native_item_count,
         ) {
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2 | NATIVE_TRAINING_REPORT_FORMAT_V3, None) => {}
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(executed))
-                if executed <= self.main.native_item_count => {}
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V4 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(executed),
+            ) if executed <= self.main.native_item_count => {}
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2 | NATIVE_TRAINING_REPORT_FORMAT_V3, Some(_)) => {
                 return Err(invalid("legacy native training report has execution count"));
             }
@@ -401,7 +483,7 @@ impl NativeTrainingReport {
             .chain(&self.zero_grad)
             .chain(&self.evaluation)
         {
-            program.validate()?;
+            program.validate(self.format_version)?;
             if program.vectorized != self.main.vectorized {
                 return Err(invalid("native program vectorization policy differs"));
             }
@@ -750,6 +832,23 @@ mod tests {
         BenchmarkDuration::from_duration(Duration::ZERO)
     }
 
+    fn remove_module_preparation(json: &mut serde_json::Value) {
+        for program in ["main", "partial_flush", "zero_grad", "evaluation"] {
+            let Some(program) = json[program].as_object_mut() else {
+                continue;
+            };
+            for field in [
+                "rendered_entry_count",
+                "loaded_module_count",
+                "durable_artifact_cache_hit_count",
+                "durable_artifact_cache_miss_count",
+                "compiler_invocation_count",
+            ] {
+                program.remove(field);
+            }
+        }
+    }
+
     fn zero_report() -> NativeTrainingReport {
         NativeTrainingReport {
             format_version: NATIVE_TRAINING_REPORT_FORMAT_VERSION,
@@ -768,6 +867,11 @@ mod tests {
                 native_item_count: 2,
                 cache_hit_count: 0,
                 cache_miss_count: 2,
+                rendered_entry_count: 2,
+                loaded_module_count: 1,
+                durable_artifact_cache_hit_count: 0,
+                durable_artifact_cache_miss_count: 1,
+                compiler_invocation_count: 1,
             },
             partial_flush: None,
             zero_grad: None,
@@ -839,6 +943,7 @@ mod tests {
         json.as_object_mut()
             .unwrap()
             .remove("main_replay_executed_native_item_count");
+        remove_module_preparation(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.zero_grad().is_none());
@@ -852,6 +957,7 @@ mod tests {
         json.as_object_mut()
             .unwrap()
             .remove("main_replay_executed_native_item_count");
+        remove_module_preparation(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.main_replay_traffic().is_none());
@@ -864,10 +970,61 @@ mod tests {
         json.as_object_mut()
             .unwrap()
             .remove("main_replay_executed_native_item_count");
+        remove_module_preparation(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.main_replay_executed_native_item_count().is_none());
         assert!(report.main_replay_traffic().is_some());
+    }
+
+    #[test]
+    fn version_four_report_without_module_preparation_still_decodes() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V4);
+        remove_module_preparation(&mut json);
+        let report =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(report.main().rendered_entry_count(), 0);
+    }
+
+    #[test]
+    fn current_report_authenticates_module_preparation_evidence() {
+        let report = zero_report();
+        assert_eq!(report.main().rendered_entry_count(), 2);
+        assert_eq!(report.main().loaded_module_count(), 1);
+        assert_eq!(report.main().durable_artifact_cache_miss_count(), 1);
+        assert_eq!(report.main().compiler_invocation_count(), 1);
+
+        for field in [
+            "rendered_entry_count",
+            "loaded_module_count",
+            "durable_artifact_cache_miss_count",
+            "compiler_invocation_count",
+        ] {
+            let mut json = serde_json::to_value(zero_report()).unwrap();
+            json["main"][field] = serde_json::json!(0);
+            assert!(
+                NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+                "tampered {field} must reject"
+            );
+        }
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json["main"]["durable_artifact_cache_hit_count"] = serde_json::json!(1);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "one loaded artifact cannot be both a durable hit and miss"
+        );
+
+        for (hit_count, reason) in [(1, "durable hit"), (0, "in-memory reuse")] {
+            let mut json = serde_json::to_value(zero_report()).unwrap();
+            json["main"]["durable_artifact_cache_hit_count"] = serde_json::json!(hit_count);
+            json["main"]["durable_artifact_cache_miss_count"] = serde_json::json!(0);
+            json["main"]["compiler_invocation_count"] = serde_json::json!(0);
+            assert!(
+                NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_ok(),
+                "{reason} module preparation must remain representable"
+            );
+        }
     }
 
     #[test]

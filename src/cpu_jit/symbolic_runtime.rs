@@ -902,7 +902,7 @@ fn prologue(capture_identity: u64, item: u64) -> Vec<String> {
         format!("/* runtime-symbolic capture={capture_identity:016x} item={item:016x} */"),
         true,
         true,
-        vec!["static int64_t rg_floor_div(int64_t a,int64_t b){int64_t q=a/b,r=a%b;return(r&&((r<0)!=(b<0)))?q-1:q;} static int64_t rg_floor_mod(int64_t a,int64_t b){int64_t r=a%b;return(r&&((r<0)!=(b<0)))?r+b:r;}".into()],
+        true,
         "int rustgrad_kernel(void **buffers,const int64_t *symbols,uint64_t *failure){failure[0]=UINT64_MAX;failure[1]=0;".into(),
     )
 }
