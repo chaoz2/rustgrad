@@ -359,6 +359,7 @@ pub(crate) struct NativeMixedPreparationTrace {
     pub(crate) item_count: usize,
     pub(crate) cache_hit_count: usize,
     pub(crate) cache_miss_count: usize,
+    pub(crate) module: crate::backend::NativeScheduleModulePreparation,
 }
 
 /// Reusable strict-native ownership for one recurrent mixed capture. It keeps
@@ -400,6 +401,7 @@ impl PreparedRecurrentNativeReplay {
         if trace.item_count != plan.item_count()
             || trace.cache_hit_count != plan.cache_hit_count()
             || trace.cache_miss_count != plan.cache_miss_count()
+            || trace.module != plan.module_preparation()
             || trace.replay.vectorized != plan.vectorized()
             || trace.replay.pure_item_cache_keys.as_slice() != plan.schedule_cache_keys()
             || requested.iter().any(|id| !pure.requested.contains(id))
@@ -1027,6 +1029,7 @@ impl CapturedMixedSchedule {
             item_count: planned.item_count(),
             cache_hit_count: planned.cache_hit_count(),
             cache_miss_count: planned.cache_miss_count(),
+            module: planned.plan.module_preparation(),
         };
         PreparedRecurrentNativeReplay::new(
             trace,

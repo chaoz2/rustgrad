@@ -59,9 +59,16 @@ pub struct CpuJitBackend {
     fallback: JitFallback,
     vectorized: bool,
     cache: Mutex<HashMap<String, Arc<JitKernel>>>,
+    schedule_modules: Mutex<HashMap<NativeScheduleWrapperKey, Vec<Arc<JitKernel>>>>,
     // Zero-domain work has no kernel to compile, but the validated skip is a
     // prepared plan whose cache ownership belongs to this backend.
     zero_domain_cache: Mutex<HashSet<u64>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct NativeScheduleWrapperKey {
+    artifact: String,
+    entries: Vec<String>,
 }
 pub(crate) struct PreparedScheduleItem {
     kernel: Arc<JitKernel>,
@@ -70,6 +77,15 @@ pub(crate) struct PreparedScheduleItem {
     pub(crate) vector: VectorPlan,
     schedule_cache_key: u64,
     native_layout: NativeScheduleLayout,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeScheduleModulePreparation {
+    pub(crate) rendered_entry_count: usize,
+    pub(crate) loaded_module_count: usize,
+    pub(crate) durable_artifact_cache_hit_count: usize,
+    pub(crate) durable_artifact_cache_miss_count: usize,
+    pub(crate) compiler_invocation_count: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -378,6 +394,7 @@ impl CpuJitBackend {
             fallback,
             vectorized: false,
             cache: Mutex::new(HashMap::new()),
+            schedule_modules: Mutex::new(HashMap::new()),
             zero_domain_cache: Mutex::new(HashSet::new()),
         }
     }
@@ -491,6 +508,17 @@ impl CpuJitBackend {
         &self,
         item: &ScheduleItem,
     ) -> Result<(), JitBackendError> {
+        let layout = schedule_native_layout(item)?;
+        validate_native_layout(item, &layout)?;
+        let (_, rendered, _) = self.render_schedule_kernel(item, &layout)?;
+        self.validate_rendered_schedule_item(item, &rendered)
+    }
+
+    fn validate_rendered_schedule_item(
+        &self,
+        item: &ScheduleItem,
+        rendered: &crate::cpu_jit::RenderedC,
+    ) -> Result<(), JitBackendError> {
         if !item.outputs.is_single() {
             return Err(JitBackendError::Unsupported(
                 "native CPU JIT has no multi-output schedule ABI".into(),
@@ -498,8 +526,6 @@ impl CpuJitBackend {
         }
         item.validate_input_bindings()
             .map_err(|e| JitBackendError::Binding(e.to_string()))?;
-        let layout = schedule_native_layout(item)?;
-        let (_, rendered, _) = self.render_schedule_kernel(item, &layout)?;
         for (index, binding) in item.ordered_inputs().iter().enumerate() {
             if binding.abi_index != index {
                 return Err(JitBackendError::Binding(
@@ -588,9 +614,9 @@ impl CpuJitBackend {
         item: &ScheduleItem,
         native_layout: NativeScheduleLayout,
     ) -> Result<PreparedScheduleItem, JitBackendError> {
-        self.validate_schedule_item(item)?;
         validate_native_layout(item, &native_layout)?;
         let (vector, rendered, _) = self.render_schedule_kernel(item, &native_layout)?;
+        self.validate_rendered_schedule_item(item, &rendered)?;
         let native_cache_key = format!("{}-schedule-{:016x}", rendered.cache_key, item.cache_key);
         let (kernel, cache_hit) = self.compile_cached(&rendered, &native_cache_key)?;
         Ok(PreparedScheduleItem {
@@ -601,6 +627,130 @@ impl CpuJitBackend {
             schedule_cache_key: item.cache_key,
             native_layout,
         })
+    }
+
+    pub(crate) fn prepare_schedule_module(
+        &self,
+        items: &[ScheduleItem],
+        layouts: Vec<NativeScheduleLayout>,
+    ) -> Result<(Vec<PreparedScheduleItem>, NativeScheduleModulePreparation), JitBackendError> {
+        if items.len() != layouts.len() {
+            return Err(JitBackendError::Binding(
+                "native schedule module layout count mismatch".into(),
+            ));
+        }
+        struct RenderedEntry {
+            vector: VectorPlan,
+            rendered: crate::cpu_jit::RenderedC,
+            native_cache_key: String,
+            layout: NativeScheduleLayout,
+        }
+        let entries = items
+            .iter()
+            .zip(layouts)
+            .map(|(item, layout)| {
+                validate_native_layout(item, &layout)?;
+                let (vector, rendered, _) = self.render_schedule_kernel(item, &layout)?;
+                self.validate_rendered_schedule_item(item, &rendered)?;
+                let native_cache_key =
+                    format!("{}-schedule-{:016x}", rendered.cache_key, item.cache_key);
+                Ok(RenderedEntry {
+                    vector,
+                    rendered,
+                    native_cache_key,
+                    layout,
+                })
+            })
+            .collect::<Result<Vec<_>, JitBackendError>>()?;
+        if entries.is_empty() {
+            return Ok((Vec::new(), NativeScheduleModulePreparation::default()));
+        }
+        let rendered = entries
+            .iter()
+            .map(|entry| entry.rendered.clone())
+            .collect::<Vec<_>>();
+        // The durable binary is source/compiler-addressed, but these wrappers
+        // also carry the current schedule's concrete buffer ABI. Do not let an
+        // isomorphic capture reuse wrappers authenticated for different IDs.
+        let module_key = NativeScheduleWrapperKey {
+            artifact: crate::cpu_jit::schedule_module_cache_key(&rendered),
+            entries: entries
+                .iter()
+                .map(|entry| entry.native_cache_key.clone())
+                .collect(),
+        };
+        let cached_module = self
+            .schedule_modules
+            .lock()
+            .map_err(|_| JitBackendError::Native("schedule module cache lock poisoned".into()))?
+            .get(&module_key)
+            .cloned();
+        let (kernels, load) = match cached_module {
+            Some(kernels) => {
+                if kernels.len() != rendered.len()
+                    || kernels
+                        .iter()
+                        .zip(&rendered)
+                        .any(|(kernel, rendered)| kernel.abi() != &rendered.abi)
+                {
+                    return Err(JitBackendError::Binding(
+                        "cached native schedule module ABI mismatch".into(),
+                    ));
+                }
+                (kernels, None)
+            }
+            None => {
+                let (kernels, load) =
+                    JitKernel::load_schedule_module(&rendered).map_err(jit_error)?;
+                let kernels = kernels.into_iter().map(Arc::new).collect::<Vec<_>>();
+                self.schedule_modules
+                    .lock()
+                    .map_err(|_| {
+                        JitBackendError::Native("schedule module cache lock poisoned".into())
+                    })?
+                    .insert(module_key, kernels.clone());
+                (kernels, Some(load))
+            }
+        };
+        if kernels.len() != entries.len() {
+            return Err(JitBackendError::Binding(
+                "native schedule module entry count mismatch".into(),
+            ));
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| JitBackendError::Native("cache lock poisoned".into()))?;
+        let mut prepared = Vec::with_capacity(entries.len());
+        for ((item, entry), kernel) in items.iter().zip(entries).zip(kernels) {
+            let cache_hit = cache
+                .insert(entry.native_cache_key.clone(), kernel.clone())
+                .is_some();
+            prepared.push(PreparedScheduleItem {
+                kernel,
+                native_cache_key: entry.native_cache_key,
+                cache_hit,
+                vector: entry.vector,
+                schedule_cache_key: item.cache_key,
+                native_layout: entry.layout,
+            });
+        }
+        Ok((
+            prepared,
+            NativeScheduleModulePreparation {
+                rendered_entry_count: rendered.len(),
+                loaded_module_count: 1,
+                durable_artifact_cache_hit_count: load
+                    .map(|load| usize::from(load.durable_cache_hit))
+                    .unwrap_or(0),
+                durable_artifact_cache_miss_count: load
+                    .map(|load| usize::from(!load.durable_cache_hit))
+                    .unwrap_or(0),
+                compiler_invocation_count: load
+                    .map(|load| load.compiler_invocation_count)
+                    .unwrap_or(0),
+            },
+        ))
     }
 
     pub(crate) fn execute_prepared_schedule_item<V: TensorValueStore>(

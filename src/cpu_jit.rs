@@ -626,6 +626,18 @@ pub struct JitKernel {
     _library: Arc<Library>,
     call: unsafe extern "C" fn(*mut *mut c_void, *const i64, *mut u64) -> c_int,
 }
+
+/// Private evidence from loading one ordered native schedule module.
+///
+/// A module is one content-addressed shared library even though every entry
+/// retains its own schedule ABI and call pointer. The durable-cache fact is
+/// observational and never participates in capture or replay identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JitScheduleModuleLoad {
+    pub(crate) durable_cache_hit: bool,
+    pub(crate) compiler_invocation_count: usize,
+}
+
 impl JitKernel {
     pub(crate) fn load(r: &RenderedC) -> Result<Self, JitError> {
         let path = compile_cached(r)?;
@@ -652,6 +664,58 @@ impl JitKernel {
             _library: lib,
             call,
         })
+    }
+
+    /// Loads one ordered set of rendered entries from one shared library.
+    /// Each entry symbol is generated declaratively by a preprocessor binding;
+    /// the public `RenderedC` source remains a standalone `rustgrad_kernel`.
+    pub(crate) fn load_schedule_module(
+        rendered: &[RenderedC],
+    ) -> Result<(Vec<Self>, JitScheduleModuleLoad), JitError> {
+        if rendered.is_empty() {
+            return Ok((
+                Vec::new(),
+                JitScheduleModuleLoad {
+                    durable_cache_hit: false,
+                    compiler_invocation_count: 0,
+                },
+            ));
+        }
+        let (path, mut preparation) = compile_cached_schedule_module(rendered)?;
+        let load = |path: &Path| -> Result<Vec<Self>, JitError> {
+            let library = Arc::new(Library::open(path)?);
+            rendered
+                .iter()
+                .enumerate()
+                .map(|(index, rendered)| {
+                    let symbol = CString::new(schedule_module_entry_symbol(index))
+                        .map_err(|error| JitError::Loader(error.to_string()))?;
+                    let call = unsafe { library.symbol(symbol.as_bytes_with_nul())? };
+                    Ok(Self {
+                        abi: rendered.abi.clone(),
+                        _library: library.clone(),
+                        call,
+                    })
+                })
+                .collect()
+        };
+        let kernels = match load(&path) {
+            Ok(kernels) => kernels,
+            Err(_) => {
+                evict_cached_library(&path)?;
+                let (rebuilt, rebuilt_preparation) = compile_cached_schedule_module(rendered)?;
+                debug_assert!(!rebuilt_preparation.durable_cache_hit);
+                preparation = rebuilt_preparation;
+                match load(&rebuilt) {
+                    Ok(kernels) => kernels,
+                    Err(error) => {
+                        let _ = evict_cached_library(&rebuilt);
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        Ok((kernels, preparation))
     }
     pub fn abi(&self) -> &KernelAbi {
         &self.abi
@@ -1297,7 +1361,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         ),
         needs_f8_encode,
         needs_erf,
-        Vec::new(),
+        false,
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
     );
     lines.push(if plan.enabled {
@@ -1418,7 +1482,13 @@ fn render_prefix_scan(value: &crate::PrefixScanValue) -> Result<RenderedC, JitEr
             "/* {RENDERER_VERSION} prefix-scan {:?} axis={} source={:?} result={:?} */",
             plan.kind, plan.axis, plan.input_dtype, plan.output_dtype
         ),
-        "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
+        [
+            C11LocalHelper::I8.definition("static int8_t __RUSTGRAD_LOCAL_HELPER__(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;}"),
+            C11LocalHelper::I16.definition("static int16_t __RUSTGRAD_LOCAL_HELPER__(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;}"),
+            C11LocalHelper::I32.definition("static int32_t __RUSTGRAD_LOCAL_HELPER__(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;}"),
+            C11LocalHelper::I64.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}"),
+        ]
+        .join(" "),
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
     ];
     lines.splice(6..6, scalar_storage_helpers(true));
@@ -1506,13 +1576,82 @@ fn render_prefix_scan(value: &crate::PrefixScanValue) -> Result<RenderedC, JitEr
     })
 }
 
+// One typed catalog owns every file-local helper name. Helper definitions are
+// built through the same identity that shared modules use for namespacing and
+// durable-cache manifests.
+macro_rules! define_c11_local_helpers {
+    ($($variant:ident => $name:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum C11LocalHelper {
+            $($variant),+
+        }
+
+        impl C11LocalHelper {
+            const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            const fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name),+
+                }
+            }
+        }
+    };
+}
+
+define_c11_local_helpers! {
+    Bf16ToF32 => "rg_bf16_to_f32",
+    Erf => "rg_erf",
+    F16ToF32 => "rg_f16_to_f32",
+    F32ToBf16 => "rg_f32_to_bf16",
+    F32ToF16 => "rg_f32_to_f16",
+    F8Decode => "rg_f8_decode",
+    F8Encode => "rg_f8_encode",
+    Fail => "rg_fail",
+    FloorDiv => "rg_floor_div",
+    FloorMod => "rg_floor_mod",
+    Half => "rg_half",
+    I8 => "rg_i8",
+    I16 => "rg_i16",
+    I32 => "rg_i32",
+    I64 => "rg_i64",
+    RoundTiesEven => "rg_round_ties_even",
+    SDiv => "rg_sdiv",
+    SfDiv => "rg_sfdiv",
+    Shl => "rg_shl",
+    Shr => "rg_shr",
+    SMod => "rg_smod",
+    SRem => "rg_srem",
+    SShr => "rg_sshr",
+    UDiv => "rg_udiv",
+    UMod => "rg_umod",
+    UShr => "rg_ushr",
+}
+
+const C11_LOCAL_HELPER_MARKER: &str = "__RUSTGRAD_LOCAL_HELPER__";
+
+impl C11LocalHelper {
+    /// Builds a helper definition from the helper's typed identity. The marker
+    /// is mandatory and unique, so a definition cannot silently drift from the
+    /// catalog used to namespace a shared schedule module.
+    fn definition(self, template: &str) -> String {
+        let (prefix, suffix) = template
+            .split_once(C11_LOCAL_HELPER_MARKER)
+            .expect("C11 local helper definition must contain its name marker");
+        assert!(
+            !suffix.contains(C11_LOCAL_HELPER_MARKER),
+            "C11 local helper definition must contain one name marker"
+        );
+        format!("{prefix}{}{suffix}", self.name())
+    }
+}
+
 /// Shared C11 scalar support for ordinary and runtime-symbolic kernels.
 /// Keeping one ordered source fragment prevents renderer/cache drift.
 pub(crate) fn scalar_kernel_prologue(
     comment: String,
     include_float8_encode: bool,
     include_erf: bool,
-    extra_helpers: Vec<String>,
+    include_symbolic_integer_helpers: bool,
     kernel: String,
 ) -> Vec<String> {
     let mut lines = vec![
@@ -1525,36 +1664,49 @@ pub(crate) fn scalar_kernel_prologue(
     ];
     lines.extend(scalar_storage_helpers(false));
     lines.extend([
-        "static double rg_round_ties_even(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}".into(),
-        "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
-        "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}".into(),
-        "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}".into(),
-        "static int64_t rg_sfdiv(int64_t a,int64_t b,uint64_t i,uint64_t *f){int64_t q=rg_sdiv(a,b,i,f),r;if(!b||(a==INT64_MIN&&b==-1))return q;r=a%b;return r<0?q-(b>0?1:-1):q;}".into(),
-        "static int64_t rg_srem(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;}".into(),
-        "static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t *f){int64_t r=rg_srem(a,b,i,f);if(!b||r>=0)return r;return b>0?r+b:r-b;}".into(),
-        "static uint64_t rg_umod(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a%b;}".into(),
-        "static uint64_t rg_shl(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a<<b;}".into(),
-        "static uint64_t rg_shr(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a>>b;}".into(),
-        "static int64_t rg_sshr(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){uint64_t mask,r,mag;if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}mask=bits==64?UINT64_MAX:((UINT64_C(1)<<bits)-1);r=(a&mask)>>(unsigned)b;if(!((a>>(bits-1))&1))return(int64_t)r;if(b)r|=mask^(mask>>((unsigned)b));mag=(~r+1)&mask;if(bits==64&&mag==(UINT64_C(1)<<63))return INT64_MIN;return-(int64_t)mag;}".into(),
+        C11LocalHelper::RoundTiesEven.definition("static double __RUSTGRAD_LOCAL_HELPER__(double x){double lo,frac,out;if(!isfinite(x)||x==0.0)return x;lo=floor(x);frac=x-lo;if(frac<0.5)out=lo;else if(frac>0.5)out=lo+1.0;else out=fmod(lo,2.0)==0.0?lo:lo+1.0;return out==0.0?copysign(0.0,x):out;}"),
+        [
+            C11LocalHelper::I8.definition("static int8_t __RUSTGRAD_LOCAL_HELPER__(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;}"),
+            C11LocalHelper::I16.definition("static int16_t __RUSTGRAD_LOCAL_HELPER__(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;}"),
+            C11LocalHelper::I32.definition("static int32_t __RUSTGRAD_LOCAL_HELPER__(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;}"),
+            C11LocalHelper::I64.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}"),
+        ].join(" "),
+        C11LocalHelper::SDiv.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?INT64_MIN:a/b;}"),
+        C11LocalHelper::UDiv.definition("static uint64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a/b;}"),
+        C11LocalHelper::SfDiv.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(int64_t a,int64_t b,uint64_t i,uint64_t *f){int64_t q=rg_sdiv(a,b,i,f),r;if(!b||(a==INT64_MIN&&b==-1))return q;r=a%b;return r<0?q-(b>0?1:-1):q;}"),
+        C11LocalHelper::SRem.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(int64_t a,int64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;}"),
+        C11LocalHelper::SMod.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(int64_t a,int64_t b,uint64_t i,uint64_t *f){int64_t r=rg_srem(a,b,i,f);if(!b||r>=0)return r;return b>0?r+b:r-b;}"),
+        C11LocalHelper::UMod.definition("static uint64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t a,uint64_t b,uint64_t i,uint64_t *f){if(!b){if(!f[1]){f[0]=i;f[1]=1;}return 0;}return a%b;}"),
+        C11LocalHelper::Shl.definition("static uint64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a<<b;}"),
+        C11LocalHelper::Shr.definition("static uint64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}return a>>b;}"),
+        C11LocalHelper::SShr.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t a,int64_t b,unsigned bits,uint64_t i,uint64_t *f){uint64_t mask,r,mag;if(b<0||(uint64_t)b>=bits){if(!f[1]){f[0]=i;f[1]=2;}return 0;}mask=bits==64?UINT64_MAX:((UINT64_C(1)<<bits)-1);r=(a&mask)>>(unsigned)b;if(!((a>>(bits-1))&1))return(int64_t)r;if(b)r|=mask^(mask>>((unsigned)b));mag=(~r+1)&mask;if(bits==64&&mag==(UINT64_C(1)<<63))return INT64_MIN;return-(int64_t)mag;}"),
     ]);
     if include_float8_encode {
         lines.push(scalar_float8_encode_helper());
     }
     if include_erf {
-        lines.push("static double rg_erf(double x){double t,p;if(isnan(x))return x;t=1.0/(1.0+0.3275911*fabs(x));p=((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t;return copysign(1.0,x)*(1.0-p*exp((-x)*x));}".into());
+        lines.push(C11LocalHelper::Erf.definition("static double __RUSTGRAD_LOCAL_HELPER__(double x){double t,p;if(isnan(x))return x;t=1.0/(1.0+0.3275911*fabs(x));p=((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t;return copysign(1.0,x)*(1.0-p*exp((-x)*x));}"));
     }
-    lines.extend(extra_helpers);
+    if include_symbolic_integer_helpers {
+        lines.push(
+            [
+                C11LocalHelper::FloorDiv.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(int64_t a,int64_t b){int64_t q=a/b,r=a%b;return(r&&((r<0)!=(b<0)))?q-1:q;}"),
+                C11LocalHelper::FloorMod.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(int64_t a,int64_t b){int64_t r=a%b;return(r&&((r<0)!=(b<0)))?r+b:r;}"),
+            ]
+            .join(" "),
+        );
+    }
     lines.push(kernel);
     lines
 }
 
 fn scalar_storage_helpers(include_float8_encode: bool) -> Vec<String> {
     let mut helpers = vec![
-        "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}".into(),
-        "static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff;r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}".into(),
-        "static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}".into(),
-        "static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
-        "static double rg_f8_decode(uint8_t x,int bias,unsigned mb,unsigned mode){unsigned em=(1u<<(7u-mb))-1u,mm=(1u<<mb)-1u,e=(x>>mb)&em,m=x&mm,s=x>>7;if(mode==2u&&x==0x80u)return NAN;if((x&0x7fu)==0u)return s?-0.0:0.0;if(mode!=2u&&e==em){if(mode==1u){double v=m?NAN:INFINITY;return s?-v:v;}if(m==mm)return NAN;}double v=e?ldexp(1.0+(double)m/(double)(mm+1u),(int)e-bias):ldexp((double)m/(double)(mm+1u),1-bias);return s?-v:v;}".into(),
+        C11LocalHelper::F16ToF32.definition("static float __RUSTGRAD_LOCAL_HELPER__(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}"),
+        C11LocalHelper::F32ToF16.definition("static uint16_t __RUSTGRAD_LOCAL_HELPER__(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff;r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}"),
+        C11LocalHelper::Bf16ToF32.definition("static float __RUSTGRAD_LOCAL_HELPER__(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}"),
+        C11LocalHelper::F32ToBf16.definition("static uint16_t __RUSTGRAD_LOCAL_HELPER__(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}"),
+        C11LocalHelper::F8Decode.definition("static double __RUSTGRAD_LOCAL_HELPER__(uint8_t x,int bias,unsigned mb,unsigned mode){unsigned em=(1u<<(7u-mb))-1u,mm=(1u<<mb)-1u,e=(x>>mb)&em,m=x&mm,s=x>>7;if(mode==2u&&x==0x80u)return NAN;if((x&0x7fu)==0u)return s?-0.0:0.0;if(mode!=2u&&e==em){if(mode==1u){double v=m?NAN:INFINITY;return s?-v:v;}if(m==mm)return NAN;}double v=e?ldexp(1.0+(double)m/(double)(mm+1u),(int)e-bias):ldexp((double)m/(double)(mm+1u),1-bias);return s?-v:v;}"),
     ];
     if include_float8_encode {
         helpers.push(scalar_float8_encode_helper());
@@ -1563,7 +1715,7 @@ fn scalar_storage_helpers(include_float8_encode: bool) -> Vec<String> {
 }
 
 fn scalar_float8_encode_helper() -> String {
-    "static uint8_t rg_f8_encode(double x,int bias,unsigned sb,unsigned mode,uint64_t min_half,uint64_t overflow,uint8_t max_normal,uint64_t min_normal){if(mode==2u&&!isfinite(x))return 0x80u;if(mode==2u&&x==0.0)return 0u;uint8_t sign=signbit(x)?0x80u:0u;if(mode==0u&&!isfinite(x))return sign?0xffu:0x7fu;if(mode==1u&&!isfinite(x))return(uint8_t)(sign|(isinf(x)?0x7cu:0x7fu));union{double f;uint64_t u;}v={x};uint64_t bits=v.u,abs=bits&UINT64_C(0x7fffffffffffffff),mask=(UINT64_C(1)<<(sb-1u))-1u,mantissa=(bits>>(53u-sb))&mask,half=UINT64_C(1)<<(52u-sb),result;int exponent=(int)((bits>>52)&0x7ffu)-1023+bias;if(abs<=min_half)result=0;else if(abs>overflow)result=max_normal;else if(abs>=min_normal){result=((uint64_t)exponent<<(sb-1u))|mantissa;uint64_t round_bits=bits&((half<<1u)-1u);if(round_bits>half||(round_bits==half&&(mantissa&1u)))result++;}else{unsigned shift=(unsigned)(1-exponent);mantissa|=UINT64_C(1)<<(sb-1u);result=mantissa>>shift;uint64_t h=half<<shift,round_bits=(bits|(UINT64_C(1)<<52))&((h<<1u)-1u);if(round_bits>h||(round_bits==h&&(result&1u)))result++;}if(mode==2u&&result==0)return 0;return(uint8_t)(result|sign);}".into()
+    C11LocalHelper::F8Encode.definition("static uint8_t __RUSTGRAD_LOCAL_HELPER__(double x,int bias,unsigned sb,unsigned mode,uint64_t min_half,uint64_t overflow,uint8_t max_normal,uint64_t min_normal){if(mode==2u&&!isfinite(x))return 0x80u;if(mode==2u&&x==0.0)return 0u;uint8_t sign=signbit(x)?0x80u:0u;if(mode==0u&&!isfinite(x))return sign?0xffu:0x7fu;if(mode==1u&&!isfinite(x))return(uint8_t)(sign|(isinf(x)?0x7cu:0x7fu));union{double f;uint64_t u;}v={x};uint64_t bits=v.u,abs=bits&UINT64_C(0x7fffffffffffffff),mask=(UINT64_C(1)<<(sb-1u))-1u,mantissa=(bits>>(53u-sb))&mask,half=UINT64_C(1)<<(52u-sb),result;int exponent=(int)((bits>>52)&0x7ffu)-1023+bias;if(abs<=min_half)result=0;else if(abs>overflow)result=max_normal;else if(abs>=min_normal){result=((uint64_t)exponent<<(sb-1u))|mantissa;uint64_t round_bits=bits&((half<<1u)-1u);if(round_bits>half||(round_bits==half&&(mantissa&1u)))result++;}else{unsigned shift=(unsigned)(1-exponent);mantissa|=UINT64_C(1)<<(sb-1u);result=mantissa>>shift;uint64_t h=half<<shift,round_bits=(bits|(UINT64_C(1)<<52))&((h<<1u)-1u);if(round_bits>h||(round_bits==h&&(result&1u)))result++;}if(mode==2u&&result==0)return 0;return(uint8_t)(result|sign);}")
 }
 
 fn scan_accumulator_type(dtype: DType) -> &'static str {
@@ -2106,7 +2258,7 @@ fn render_quantized_matmul(plan: &crate::QuantizedMatmulPlan) -> Result<Rendered
     };
     let source = [
         "#include <stdint.h>\n#include <stddef.h>\n",
-        "static float rg_half(const uint8_t *p){uint16_t h=(uint16_t)p[0]|((uint16_t)p[1]<<8);uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e){if(!m)o=s;else{unsigned sh=0;while(!(m&0x400)){m<<=1;sh++;}m&=0x3ff;o=s|((uint32_t)(113-sh)<<23)|(m<<13);}}else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}\n",
+        &C11LocalHelper::Half.definition("static float __RUSTGRAD_LOCAL_HELPER__(const uint8_t *p){uint16_t h=(uint16_t)p[0]|((uint16_t)p[1]<<8);uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e){if(!m)o=s;else{unsigned sh=0;while(!(m&0x400)){m<<=1;sh++;}m&=0x3ff;o=s|((uint32_t)(113-sh)<<23)|(m<<13);}}else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}\n"),
         &format!(
             "/* {RENDERER_VERSION} quantized-matmul plan={} type={} bytes={} */\n",
             plan.cache_key,
@@ -2191,7 +2343,7 @@ fn render_quantized_row_gather(
     };
     let source = [
         "#include <stdint.h>\n#include <stddef.h>\n",
-        "static float rg_half(const uint8_t *p){uint16_t h=(uint16_t)p[0]|((uint16_t)p[1]<<8);uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e){if(!m)o=s;else{unsigned sh=0;while(!(m&0x400)){m<<=1;sh++;}m&=0x3ff;o=s|((uint32_t)(113-sh)<<23)|(m<<13);}}else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}\n",
+        &C11LocalHelper::Half.definition("static float __RUSTGRAD_LOCAL_HELPER__(const uint8_t *p){uint16_t h=(uint16_t)p[0]|((uint16_t)p[1]<<8);uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e){if(!m)o=s;else{unsigned sh=0;while(!(m&0x400)){m<<=1;sh++;}m&=0x3ff;o=s|((uint32_t)(113-sh)<<23)|(m<<13);}}else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}\n"),
         &format!(
             "/* {RENDERER_VERSION} quantized-row-gather plan={} type={} bytes={} */\n",
             plan.cache_key,
@@ -2739,12 +2891,34 @@ fn render_vector_program(
     let mut lines = vec![
         "#include <stdint.h>".into(), "#include <stddef.h>".into(), "#include <math.h>".into(), "#include <string.h>".into(), "#include <limits.h>".into(),
         format!("/* {RENDERER_VERSION} B2 VectorProgram key={} lanes={} */", program.cache_key, lanes),
-        "static int8_t rg_i8(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;} static int16_t rg_i16(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;} static int32_t rg_i32(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;} static int64_t rg_i64(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}".into(),
-        "static void rg_fail(uint64_t*f,uint64_t i,uint64_t c){if(!f[1]||i<f[0]){f[0]=i;f[1]=c;}}".into(),
-        "static uint64_t rg_udiv(uint64_t a,uint64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return a/b;} static uint64_t rg_umod(uint64_t a,uint64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return a%b;}".into(),
-        "static int64_t rg_sdiv(int64_t a,int64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}if(a==INT64_MIN&&b==-1)return INT64_MIN;return a/b;} static int64_t rg_sfdiv(int64_t a,int64_t b,uint64_t i,uint64_t*f){int64_t q=rg_sdiv(a,b,i,f),r;if(!b|| (a==INT64_MIN&&b==-1))return q;r=a%b;return r<0?q-(b>0?1:-1):q;} static int64_t rg_srem(int64_t a,int64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;} static int64_t rg_smod(int64_t a,int64_t b,uint64_t i,uint64_t*f){int64_t r=rg_srem(a,b,i,f);if(!b||r>=0)return r;return b>0?r+b:r-b;}".into(),
-        "static uint64_t rg_shl(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}return a<<(unsigned)b;} static uint64_t rg_ushr(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}return a>>(unsigned)b;} static uint64_t rg_sshr(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){uint64_t mask=n==64?UINT64_MAX:((UINT64_C(1)<<n)-1),r;if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}r=(a&mask)>>(unsigned)b;if(b&&((a>>(n-1))&1))r|=mask^(mask>>((unsigned)b));return r;}".into(),
-        "static float rg_f16_to_f32(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;} static uint16_t rg_f32_to_f16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff;r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);} static float rg_bf16_to_f32(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;} static uint16_t rg_f32_to_bf16(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}".into(),
+        [
+            C11LocalHelper::I8.definition("static int8_t __RUSTGRAD_LOCAL_HELPER__(uint8_t x){int8_t r;memcpy(&r,&x,1);return r;}"),
+            C11LocalHelper::I16.definition("static int16_t __RUSTGRAD_LOCAL_HELPER__(uint16_t x){int16_t r;memcpy(&r,&x,2);return r;}"),
+            C11LocalHelper::I32.definition("static int32_t __RUSTGRAD_LOCAL_HELPER__(uint32_t x){int32_t r;memcpy(&r,&x,4);return r;}"),
+            C11LocalHelper::I64.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t x){int64_t r;memcpy(&r,&x,8);return r;}"),
+        ].join(" "),
+        C11LocalHelper::Fail.definition("static void __RUSTGRAD_LOCAL_HELPER__(uint64_t*f,uint64_t i,uint64_t c){if(!f[1]||i<f[0]){f[0]=i;f[1]=c;}}"),
+        [
+            C11LocalHelper::UDiv.definition("static uint64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t a,uint64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return a/b;}"),
+            C11LocalHelper::UMod.definition("static uint64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t a,uint64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return a%b;}"),
+        ].join(" "),
+        [
+            C11LocalHelper::SDiv.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(int64_t a,int64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}if(a==INT64_MIN&&b==-1)return INT64_MIN;return a/b;}"),
+            C11LocalHelper::SfDiv.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(int64_t a,int64_t b,uint64_t i,uint64_t*f){int64_t q=rg_sdiv(a,b,i,f),r;if(!b|| (a==INT64_MIN&&b==-1))return q;r=a%b;return r<0?q-(b>0?1:-1):q;}"),
+            C11LocalHelper::SRem.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(int64_t a,int64_t b,uint64_t i,uint64_t*f){if(!b){rg_fail(f,i,1);return 0;}return(a==INT64_MIN&&b==-1)?0:a%b;}"),
+            C11LocalHelper::SMod.definition("static int64_t __RUSTGRAD_LOCAL_HELPER__(int64_t a,int64_t b,uint64_t i,uint64_t*f){int64_t r=rg_srem(a,b,i,f);if(!b||r>=0)return r;return b>0?r+b:r-b;}"),
+        ].join(" "),
+        [
+            C11LocalHelper::Shl.definition("static uint64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}return a<<(unsigned)b;}"),
+            C11LocalHelper::UShr.definition("static uint64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}return a>>(unsigned)b;}"),
+            C11LocalHelper::SShr.definition("static uint64_t __RUSTGRAD_LOCAL_HELPER__(uint64_t a,int64_t b,unsigned n,uint64_t i,uint64_t*f){uint64_t mask=n==64?UINT64_MAX:((UINT64_C(1)<<n)-1),r;if(b<0||(uint64_t)b>=n){rg_fail(f,i,2);return 0;}r=(a&mask)>>(unsigned)b;if(b&&((a>>(n-1))&1))r|=mask^(mask>>((unsigned)b));return r;}"),
+        ].join(" "),
+        [
+            C11LocalHelper::F16ToF32.definition("static float __RUSTGRAD_LOCAL_HELPER__(uint16_t h){uint32_t s=(uint32_t)(h&0x8000)<<16,e=(h>>10)&31,m=h&1023,o;if(!e)o=m? s|((uint32_t)(113-__builtin_clz(m))<<23)|((uint32_t)(m<<(126-__builtin_clz(m)))<<13):s;else o=e==31?s|0x7f800000|(m<<13):s|((e+112)<<23)|(m<<13);union{uint32_t u;float f;}v={o};return v.f;}"),
+            C11LocalHelper::F32ToF16.definition("static uint16_t __RUSTGRAD_LOCAL_HELPER__(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,s=(b>>16)&0x8000,e=(b>>23)&255,m=b&0x7fffff;if(e==255)return(uint16_t)(s|0x7c00|(m?((m>>13)|1):0));int q=(int)e-112;if(q<=0){if(q<-10)return(uint16_t)s;uint32_t z=m|0x800000,sh=(uint32_t)(14-q),r=z>>sh,rem=z&((1u<<sh)-1),half=1u<<(sh-1);return(uint16_t)(s+r+(rem>half||(rem==half&&(r&1))));}if(q>=31)return(uint16_t)(s|0x7c00);uint32_t r=m>>13,rem=m&0x1fff;r+=rem>0x1000||(rem==0x1000&&(r&1));if(r==0x400){if(q==30)return(uint16_t)(s|0x7c00);q++;r=0;}return(uint16_t)(s|((uint32_t)q<<10)|r);}"),
+            C11LocalHelper::Bf16ToF32.definition("static float __RUSTGRAD_LOCAL_HELPER__(uint16_t b){union{uint32_t u;float f;}v={(uint32_t)b<<16};return v.f;}"),
+            C11LocalHelper::F32ToBf16.definition("static uint16_t __RUSTGRAD_LOCAL_HELPER__(float x){union{float f;uint32_t u;}v={x};uint32_t b=v.u,hi=b>>16;if((b&0x7f800000)==0x7f800000&&(b&0x007fffff))return(uint16_t)((hi&0x7f)?hi:(hi|1));return(uint16_t)((b+0x7fff+((b>>16)&1))>>16);}"),
+        ].join(" "),
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         format!("  for (size_t rg_base=0; rg_base<{}u; rg_base+={}u) {{", program.main_elements, lanes),
     ];
@@ -4140,6 +4314,160 @@ fn cache_dir() -> PathBuf {
 }
 static COMPILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static COMPILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn schedule_module_entry_symbol(index: usize) -> String {
+    format!("rustgrad_schedule_entry_{index:08x}")
+}
+
+fn schedule_module_local_symbol(index: usize, symbol: &str) -> String {
+    format!("rustgrad_schedule_{index:08x}_{symbol}")
+}
+
+fn render_schedule_module_source(rendered: &[RenderedC]) -> String {
+    let mut source = String::new();
+    for (index, entry) in rendered.iter().enumerate() {
+        source.push_str(&format!(
+            "#define rustgrad_kernel {}\n",
+            schedule_module_entry_symbol(index)
+        ));
+        for helper in C11LocalHelper::ALL {
+            let symbol = helper.name();
+            source.push_str(&format!(
+                "#define {symbol} {}\n",
+                schedule_module_local_symbol(index, symbol)
+            ));
+        }
+        source.push_str(&format!(
+            "#line 1 \"{}\"\n",
+            schedule_module_entry_symbol(index)
+        ));
+        source.push_str(&entry.source);
+        source.push_str("\n#undef rustgrad_kernel\n");
+        for helper in C11LocalHelper::ALL {
+            let symbol = helper.name();
+            source.push_str(&format!("#undef {symbol}\n"));
+        }
+    }
+    source
+}
+
+fn schedule_module_manifest(rendered: &[RenderedC]) -> String {
+    let mut manifest = format!("rustgrad-c11-schedule-module-v2\u{1f}{}", rendered.len());
+    for helper in C11LocalHelper::ALL {
+        manifest.push('\u{1f}');
+        manifest.push_str(helper.name());
+    }
+    for (index, entry) in rendered.iter().enumerate() {
+        manifest.push('\u{1f}');
+        manifest.push_str(&schedule_module_entry_symbol(index));
+        manifest.push('\u{1f}');
+        manifest.push_str(&entry.cache_key);
+    }
+    manifest
+}
+
+pub(crate) fn schedule_module_cache_key(rendered: &[RenderedC]) -> String {
+    native_cache_key("schedule-module-v2", &schedule_module_manifest(rendered))
+}
+
+/// Compiles one helper-isolated C translation unit into one shared schedule
+/// module. Declarative macros bind the renderer's public entry and closed local
+/// symbol set without parsing or rewriting generated C.
+fn compile_cached_schedule_module(
+    rendered: &[RenderedC],
+) -> Result<(PathBuf, JitScheduleModuleLoad), JitError> {
+    let _guard = COMPILE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| JitError::Io("compile lock poisoned".into()))?;
+    let directory = cache_dir();
+    fs::create_dir_all(&directory).map_err(|error| JitError::Io(error.to_string()))?;
+    let cache_key = schedule_module_cache_key(rendered);
+    let library = directory.join(format!(
+        "{cache_key}.{}",
+        if cfg!(target_os = "macos") {
+            "dylib"
+        } else {
+            "so"
+        }
+    ));
+    match fs::symlink_metadata(&library) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            return Ok((
+                library,
+                JitScheduleModuleLoad {
+                    durable_cache_hit: true,
+                    compiler_invocation_count: 0,
+                },
+            ));
+        }
+        Ok(_) => {
+            return Err(JitError::Io(format!(
+                "CPU JIT cache entry is not a regular file: {}",
+                library.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(JitError::Io(error.to_string())),
+    }
+    let sequence = COMPILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let stem = format!(".{cache_key}-{}-{sequence}", std::process::id());
+    let source = directory.join(format!("{stem}.c"));
+    fs::write(&source, render_schedule_module_source(rendered))
+        .map_err(|error| JitError::Io(error.to_string()))?;
+    let temporary = directory.join(format!("{stem}.tmp"));
+    let result = (|| {
+        let output = Command::new(C11_COMPILER_COMMAND)
+            .args(C11_COMPILER_FLAGS)
+            .arg("-o")
+            .arg(&temporary)
+            .arg(&source)
+            .output()
+            .map_err(|error| JitError::Compiler {
+                status: None,
+                stderr: error.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(JitError::Compiler {
+                status: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(8192)
+                    .collect(),
+            });
+        }
+        fs::File::open(&temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| JitError::Io(error.to_string()))?;
+        match fs::rename(&temporary, &library) {
+            Ok(()) => Ok((
+                library.clone(),
+                JitScheduleModuleLoad {
+                    durable_cache_hit: false,
+                    compiler_invocation_count: 1,
+                },
+            )),
+            Err(error) => match fs::symlink_metadata(&library) {
+                // Another process won publication after this process compiled.
+                // The accepted artifact is reusable, but preparation still did
+                // one real compiler invocation and therefore was not a durable
+                // cache hit for this caller.
+                Ok(metadata) if metadata.file_type().is_file() => Ok((
+                    library.clone(),
+                    JitScheduleModuleLoad {
+                        durable_cache_hit: false,
+                        compiler_invocation_count: 1,
+                    },
+                )),
+                _ => Err(JitError::Io(error.to_string())),
+            },
+        }
+    })();
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&temporary);
+    result
+}
+
 fn compile_cached(r: &RenderedC) -> Result<PathBuf, JitError> {
     let _guard = COMPILE_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -5820,6 +6148,113 @@ mod tests {
             native_cache_key("b1", "source"),
             native_cache_key("b1", "source+tail")
         );
+    }
+
+    #[test]
+    fn schedule_module_namespaces_and_authenticates_the_helper_catalog() {
+        let helper_source = C11LocalHelper::ALL
+            .iter()
+            .map(|helper| {
+                helper.definition("static int __RUSTGRAD_LOCAL_HELPER__(void){return 0;}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered = ["first", "second"].map(|cache_key| RenderedC {
+            source: format!(
+                "{helper_source}\nint rustgrad_kernel(void **b,const int64_t *s,uint64_t *f){{(void)b;(void)s;(void)f;return 0;}}\n"
+            ),
+            source_map: BTreeMap::new(),
+            abi: KernelAbi {
+                version: ABI_VERSION,
+                buffers: Vec::new(),
+                quantized_buffers: Vec::new(),
+                pointer_order: Vec::new(),
+                symbol_count: 0,
+            },
+            cache_key: cache_key.into(),
+        });
+        let module = render_schedule_module_source(&rendered);
+        let manifest = schedule_module_manifest(&rendered);
+
+        for (index, _) in rendered.iter().enumerate() {
+            for helper in C11LocalHelper::ALL {
+                let symbol = helper.name();
+                assert!(module.contains(&format!(
+                    "#define {symbol} {}\n",
+                    schedule_module_local_symbol(index, symbol)
+                )));
+            }
+        }
+        for helper in C11LocalHelper::ALL {
+            let symbol = helper.name();
+            assert!(helper_source.contains(&format!("static int {symbol}(void)")));
+            assert_eq!(module.matches(&format!("#define {symbol} ")).count(), 2);
+            assert_eq!(module.matches(&format!("#undef {symbol}\n")).count(), 2);
+            assert_eq!(
+                manifest
+                    .split('\u{1f}')
+                    .filter(|part| *part == symbol)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            schedule_module_cache_key(&rendered),
+            native_cache_key("schedule-module-v2", &manifest)
+        );
+    }
+
+    #[test]
+    fn ordered_schedule_module_loads_distinct_entries_from_one_durable_artifact() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", Shape::from([1]));
+        let neg = graph.neg(input).unwrap();
+        let square = graph.square(input).unwrap();
+        let mut rendered = vec![
+            CpuJit::render(&crate::lower_graph_elementwise(&graph, neg).unwrap()).unwrap(),
+            CpuJit::render(&crate::lower_graph_elementwise(&graph, square).unwrap()).unwrap(),
+        ];
+        for (index, entry) in rendered.iter_mut().enumerate() {
+            entry.cache_key = format!("{}-schedule-module-test-{index}", entry.cache_key);
+        }
+        let cache_key = schedule_module_cache_key(&rendered);
+        let path = cache_dir().join(format!(
+            "{cache_key}.{}",
+            if cfg!(target_os = "macos") {
+                "dylib"
+            } else {
+                "so"
+            }
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let (kernels, cold) = JitKernel::load_schedule_module(&rendered).unwrap();
+        assert_eq!(kernels.len(), 2);
+        assert!(!cold.durable_cache_hit);
+        assert_eq!(cold.compiler_invocation_count, 1);
+        assert!(Arc::ptr_eq(&kernels[0]._library, &kernels[1]._library));
+        assert_eq!(kernels[0].abi, rendered[0].abi);
+        assert_eq!(kernels[1].abi, rendered[1].abi);
+        let values = TensorData::new([1], vec![2.0]).unwrap();
+        for (kernel, expected) in kernels.iter().zip([-2.0, 4.0]) {
+            let mut buffers = [
+                JitBuffer::from_tensor(&values, false),
+                JitBuffer::zeroed(DType::F32, 1, true),
+            ];
+            kernel.call(&mut buffers, &[]).unwrap();
+            assert_eq!(
+                buffers[1].clone().into_tensor(Shape::from([1])).unwrap(),
+                TensorData::new([1], vec![expected]).unwrap()
+            );
+        }
+        drop(kernels);
+
+        let (restored, warm) = JitKernel::load_schedule_module(&rendered).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert!(warm.durable_cache_hit);
+        assert_eq!(warm.compiler_invocation_count, 0);
+        drop(restored);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -1277,6 +1277,64 @@ pub struct CompiledEvaluationResult {
 ///
 /// Stable identities and cache counts describe compilation only. Wall time is
 /// deliberately observational and does not participate in either identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCpuPreparationWork {
+    rendered_entry_count: usize,
+    loaded_module_count: usize,
+    durable_artifact_cache_hit_count: usize,
+    durable_artifact_cache_miss_count: usize,
+    compiler_invocation_count: usize,
+}
+
+impl NativeCpuPreparationWork {
+    fn from_module(module: crate::backend::NativeScheduleModulePreparation) -> Self {
+        Self {
+            rendered_entry_count: module.rendered_entry_count,
+            loaded_module_count: module.loaded_module_count,
+            durable_artifact_cache_hit_count: module.durable_artifact_cache_hit_count,
+            durable_artifact_cache_miss_count: module.durable_artifact_cache_miss_count,
+            compiler_invocation_count: module.compiler_invocation_count,
+        }
+    }
+
+    pub const fn rendered_entry_count(&self) -> usize {
+        self.rendered_entry_count
+    }
+
+    pub const fn loaded_module_count(&self) -> usize {
+        self.loaded_module_count
+    }
+
+    pub const fn durable_artifact_cache_hit_count(&self) -> usize {
+        self.durable_artifact_cache_hit_count
+    }
+
+    pub const fn durable_artifact_cache_miss_count(&self) -> usize {
+        self.durable_artifact_cache_miss_count
+    }
+
+    pub const fn compiler_invocation_count(&self) -> usize {
+        self.compiler_invocation_count
+    }
+
+    fn validate(&self, native_item_count: usize) -> Result<()> {
+        let durable_access_count = self
+            .durable_artifact_cache_hit_count
+            .checked_add(self.durable_artifact_cache_miss_count)
+            .ok_or_else(|| training("compiled native CPU durable cache count overflows"))?;
+        if self.rendered_entry_count != native_item_count
+            || self.loaded_module_count != usize::from(native_item_count != 0)
+            || durable_access_count > self.loaded_module_count
+            || self.compiler_invocation_count != self.durable_artifact_cache_miss_count
+        {
+            return Err(training(
+                "compiled native CPU module preparation evidence mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeCpuProgramPreparationReport {
     capture_identity: u64,
@@ -1285,11 +1343,16 @@ pub struct NativeCpuProgramPreparationReport {
     native_item_count: usize,
     cache_hit_count: usize,
     cache_miss_count: usize,
+    work: NativeCpuPreparationWork,
     execution_plan: ExecutionPlanSummary,
     wall_time: Duration,
 }
 
 impl NativeCpuProgramPreparationReport {
+    fn validate_work(&self) -> Result<()> {
+        self.work.validate(self.native_item_count)
+    }
+
     pub const fn capture_identity(&self) -> u64 {
         self.capture_identity
     }
@@ -1314,6 +1377,12 @@ impl NativeCpuProgramPreparationReport {
 
     pub const fn cache_miss_count(&self) -> usize {
         self.cache_miss_count
+    }
+
+    /// Concrete rendering, shared-module, durable-cache, and compiler work
+    /// performed while attaching this pure program.
+    pub const fn work(&self) -> &NativeCpuPreparationWork {
+        &self.work
     }
 
     /// Strict preparation never admits an interpreter fallback item.
@@ -1409,6 +1478,8 @@ impl PreparedNativeCpuEvaluation {
             || self.report.native_item_count != self.plan.item_count()
             || self.report.cache_hit_count != self.plan.cache_hit_count()
             || self.report.cache_miss_count != self.plan.cache_miss_count()
+            || self.report.work
+                != NativeCpuPreparationWork::from_module(self.plan.module_preparation())
             || self.report.vectorized != self.plan.vectorized()
             || capture.items.iter().map(|item| item.cache_key).ne(self
                 .plan
@@ -1420,6 +1491,7 @@ impl PreparedNativeCpuEvaluation {
                 "compiled native CPU evaluation preparation identity mismatch",
             ));
         }
+        self.report.validate_work()?;
         if parameter_buffers.len() != self.parameter_inputs.len() {
             return Err(training(
                 "compiled native CPU evaluation parameter mapping mismatch",
@@ -5251,6 +5323,7 @@ impl CompiledEvaluationPlan {
         let plan = executor
             .plan_native_items(capture, &inputs, vectorized)
             .map_err(replay_error)?;
+        let work = NativeCpuPreparationWork::from_module(plan.module_preparation());
         let execution_plan = ExecutionPlanSummary::from_capture(capture, true)
             .map_err(|error| training(format!("compiled native CPU summary: {error}")))?;
         let report = NativeCpuProgramPreparationReport {
@@ -5264,6 +5337,7 @@ impl CompiledEvaluationPlan {
             native_item_count: plan.item_count(),
             cache_hit_count: plan.cache_hit_count(),
             cache_miss_count: plan.cache_miss_count(),
+            work,
             execution_plan,
             wall_time: started.elapsed(),
         };
@@ -5522,9 +5596,11 @@ impl CpuCompiledTrainingProgram {
             native_item_count: trace.item_count,
             cache_hit_count: trace.cache_hit_count,
             cache_miss_count: trace.cache_miss_count,
+            work: NativeCpuPreparationWork::from_module(trace.module),
             execution_plan: self.recurrent_capture.execution_plan().clone(),
             wall_time: started.elapsed(),
         };
+        report.validate_work()?;
         Ok(PreparedNativeCpuProgram { report, replay })
     }
 
@@ -6085,9 +6161,11 @@ impl CpuCompiledTrainingProgram {
             native_item_count: trace.item_count,
             cache_hit_count: trace.cache_hit_count,
             cache_miss_count: trace.cache_miss_count,
+            work: NativeCpuPreparationWork::from_module(trace.module),
             execution_plan: transition.recurrent_capture.execution_plan().clone(),
             wall_time: started.elapsed(),
         };
+        report.validate_work()?;
         Ok(PreparedNativeCpuProgram { report, replay })
     }
 
@@ -12333,6 +12411,12 @@ mod tests {
             preparation.main().cache_hit_count() + preparation.main().cache_miss_count(),
             preparation.main().native_item_count()
         );
+        assert_eq!(
+            preparation.main().work().rendered_entry_count(),
+            preparation.main().native_item_count()
+        );
+        assert_eq!(preparation.main().work().loaded_module_count(), 1);
+        assert!(preparation.main().work().compiler_invocation_count() <= 1);
         assert!(preparation.main().cache_miss_count() > 0);
         assert!(preparation.partial_flush().is_none());
         assert!(preparation.zero_grad().is_none());
@@ -12345,6 +12429,14 @@ mod tests {
         let cached = target.prepare(&plan).unwrap();
         assert_eq!(executor.native_item_plan_count(), 2);
         assert_eq!(cached.preparation_report().main().cache_miss_count(), 0);
+        assert_eq!(
+            cached
+                .preparation_report()
+                .main()
+                .work()
+                .compiler_invocation_count(),
+            0
+        );
         assert_eq!(
             cached.preparation_report().main().native_identity(),
             prepared_native_identity
@@ -12731,6 +12823,21 @@ mod tests {
         let mut interpreted = plan.prepare_cpu().unwrap();
         assert!(native.preparation_report().partial_flush().is_some());
         assert!(native.preparation_report().zero_grad().is_some());
+        for program in [
+            Some(native.preparation_report().main()),
+            native.preparation_report().partial_flush(),
+            native.preparation_report().zero_grad(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert_eq!(
+                program.work().rendered_entry_count(),
+                program.native_item_count()
+            );
+            assert_eq!(program.work().loaded_module_count(), 1);
+            assert!(program.work().compiler_invocation_count() <= 1);
+        }
 
         let actual = native.step(batch(), lr()).unwrap();
         let expected = interpreted.step(batch(), lr()).unwrap();

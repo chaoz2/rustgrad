@@ -1724,6 +1724,11 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
     let prepare_started = Instant::now();
     let mut session = plan.prepare(&target)?;
+    let main_preparation = session.preparation_report().main();
+    assert_eq!(main_preparation.native_item_count(), 787);
+    assert_eq!(main_preparation.work().rendered_entry_count(), 787);
+    assert_eq!(main_preparation.work().loaded_module_count(), 1);
+    assert!(main_preparation.work().compiler_invocation_count() <= 1);
     let prepare_wall_time = prepare_started.elapsed();
     let mut scoreboard = NativeTrainingScoreboard::new(
         inspection.clone(),
@@ -1760,6 +1765,10 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let executed_native_items = report
         .main_replay_executed_native_item_count()
         .expect("current native CPU scoreboard reports executed JIT items");
+    assert_eq!(executed_native_items, 786);
+    assert_eq!(report.main().rendered_entry_count(), 787);
+    assert_eq!(report.main().loaded_module_count(), 1);
+    assert!(report.main().compiler_invocation_count() <= 1);
     assert_eq!(report.successful_replay_count(), SAMPLES);
     assert_eq!(
         Some(executed_native_items as usize),
@@ -1809,6 +1818,14 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     {
         assert_eq!(program.cache_miss_count(), 0);
         assert_eq!(program.cache_hit_count(), program.native_item_count());
+        assert_eq!(
+            program.work().rendered_entry_count(),
+            program.native_item_count()
+        );
+        assert_eq!(program.work().loaded_module_count(), 1);
+        assert_eq!(program.work().durable_artifact_cache_hit_count(), 0);
+        assert_eq!(program.work().durable_artifact_cache_miss_count(), 0);
+        assert_eq!(program.work().compiler_invocation_count(), 0);
     }
     let restored_step = restored_session.step_batch_scheduled(masked_batch(SAMPLES + 1)?)?;
     let restored_report = restored_step.report();

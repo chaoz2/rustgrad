@@ -807,6 +807,7 @@ impl PreparedPrunedNativeReplay {
 /// in the existing executor's ownership domain until detached execution.
 pub(crate) struct PlannedNativeItems {
     items: Vec<PreparedScheduleItem>,
+    module_preparation: crate::backend::NativeScheduleModulePreparation,
     workspace: NativeReplayWorkspace,
     vectorized: bool,
     capture_identity: u64,
@@ -842,6 +843,10 @@ impl PlannedNativeItems {
 
     pub(crate) fn schedule_cache_keys(&self) -> &[u64] {
         &self.schedule_cache_keys
+    }
+
+    pub(crate) fn module_preparation(&self) -> crate::backend::NativeScheduleModulePreparation {
+        self.module_preparation
     }
 
     pub(crate) fn validate_structure(&self, capture: &CapturedSchedule) -> Result<(), ReplayError> {
@@ -945,6 +950,10 @@ impl SealedPlannedNativeItems {
 
     pub(super) fn schedule_cache_keys(&self) -> &[u64] {
         self.plan.schedule_cache_keys()
+    }
+
+    pub(super) fn module_preparation(&self) -> crate::backend::NativeScheduleModulePreparation {
+        self.plan.module_preparation()
     }
 
     #[cfg(test)]
@@ -1183,22 +1192,14 @@ impl CapturedReplayExecutor {
             }
         }
         let layouts = native_schedule_layouts(capture)?;
-        let jit = self.jit(vectorized);
-        for item in &capture.items {
-            jit.validate_schedule_item(item).map_err(backend_error)?;
-        }
-        let items = capture
-            .items
-            .iter()
-            .zip(layouts)
-            .map(|(item, layout)| {
-                jit.prepare_schedule_item_with_layout(item, layout)
-                    .map_err(backend_error)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let (items, module_preparation) = self
+            .jit(vectorized)
+            .prepare_schedule_module(&capture.items, layouts)
+            .map_err(backend_error)?;
         let workspace = NativeReplayWorkspace::new(capture, &items)?;
         Ok(PlannedNativeItems {
             items,
+            module_preparation,
             workspace,
             vectorized,
             capture_identity: capture.identity,
@@ -1938,6 +1939,68 @@ mod tests {
                 if message == "prepared native item count mismatch"
         ));
         assert_eq!(executor.native_item_plan_count(), 1);
+    }
+
+    #[test]
+    fn isomorphic_native_modules_rebuild_schedule_specific_abi_wrappers() {
+        fn shifted_capture(prefix_nodes: usize) -> CapturedSchedule {
+            let mut graph = Graph::new();
+            for value in 0..prefix_nodes {
+                graph.constant(TensorData::scalar(value as f32));
+            }
+            let input = graph.input("input", [2]);
+            let output = graph.square(input).unwrap();
+            captured(&graph, &[output])
+        }
+
+        let first = shifted_capture(0);
+        let second = shifted_capture(3);
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(second.items.len(), 1);
+        assert_ne!(first.inputs[0].desc.id, second.inputs[0].desc.id);
+        assert_ne!(
+            first.items[0].primary_output().id,
+            second.items[0].primary_output().id
+        );
+
+        let bindings = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([2], vec![-2.0, 3.0]).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let first_plan = executor
+            .plan_native_items(&first, &bindings, false)
+            .unwrap();
+        assert_eq!(first_plan.module_preparation().loaded_module_count, 1);
+
+        let mut second_plan = executor
+            .plan_native_items(&second, &bindings, false)
+            .unwrap();
+        let preparation = second_plan.module_preparation();
+        assert_eq!(preparation.loaded_module_count, 1);
+        assert_eq!(preparation.durable_artifact_cache_hit_count, 1);
+        assert_eq!(preparation.durable_artifact_cache_miss_count, 0);
+        assert_eq!(preparation.compiler_invocation_count, 0);
+        assert_ne!(
+            first_plan.items[0].native_cache_key,
+            second_plan.items[0].native_cache_key
+        );
+        assert_eq!(
+            second_plan.items[0].abi().buffers[0].id,
+            second.inputs[0].desc.id
+        );
+        assert_eq!(
+            second_plan.items[0].abi().buffers[1].id,
+            second.items[0].primary_output().id
+        );
+
+        let values = executor
+            .execute_planned_native_items(&second, &bindings, &mut second_plan)
+            .unwrap();
+        assert_eq!(
+            values.requested(&second.requested).unwrap()[0],
+            TensorData::new([2], vec![4.0, 9.0]).unwrap()
+        );
     }
 
     #[test]
