@@ -1268,6 +1268,7 @@ pub struct CompiledTrainingStepResult {
 pub struct CompiledEvaluationResult {
     loss: TensorData,
     outputs: BTreeMap<String, TensorData>,
+    loss_weight: u64,
     capture_identity: u64,
 }
 
@@ -1583,6 +1584,14 @@ impl CompiledEvaluationResult {
         self.outputs.get(name)
     }
 
+    /// Exact aggregation weight for this normalized evaluation loss.
+    ///
+    /// Ordinary scalar objectives report one. Compiler-owned token-mean
+    /// objectives report the validated number of live tokens in this batch.
+    pub fn loss_weight(&self) -> u64 {
+        self.loss_weight
+    }
+
     pub fn capture_identity(&self) -> u64 {
         self.capture_identity
     }
@@ -1598,6 +1607,12 @@ pub trait CompiledEvaluation {
         self.outputs().get(name)
     }
 
+    /// Exact aggregation weight for this normalized evaluation loss.
+    /// Historical and custom scalar evaluation results retain weight one.
+    fn loss_weight(&self) -> u64 {
+        1
+    }
+
     fn capture_identity(&self) -> u64;
 }
 
@@ -1608,6 +1623,10 @@ impl CompiledEvaluation for CompiledEvaluationResult {
 
     fn outputs(&self) -> &BTreeMap<String, TensorData> {
         self.outputs()
+    }
+
+    fn loss_weight(&self) -> u64 {
+        self.loss_weight()
     }
 
     fn capture_identity(&self) -> u64 {
@@ -1634,6 +1653,10 @@ impl MetalCompiledEvaluationResult {
         self.inner.output(name)
     }
 
+    pub fn loss_weight(&self) -> u64 {
+        self.inner.loss_weight()
+    }
+
     pub fn capture_identity(&self) -> u64 {
         self.inner.capture_identity()
     }
@@ -1650,6 +1673,10 @@ impl CompiledEvaluation for MetalCompiledEvaluationResult {
 
     fn outputs(&self) -> &BTreeMap<String, TensorData> {
         self.outputs()
+    }
+
+    fn loss_weight(&self) -> u64 {
+        self.loss_weight()
     }
 
     fn capture_identity(&self) -> u64 {
@@ -1676,6 +1703,10 @@ impl NativeCpuCompiledEvaluationResult {
         self.inner.output(name)
     }
 
+    pub fn loss_weight(&self) -> u64 {
+        self.inner.loss_weight()
+    }
+
     pub fn capture_identity(&self) -> u64 {
         self.inner.capture_identity()
     }
@@ -1692,6 +1723,10 @@ impl CompiledEvaluation for NativeCpuCompiledEvaluationResult {
 
     fn outputs(&self) -> &BTreeMap<String, TensorData> {
         self.inner.outputs()
+    }
+
+    fn loss_weight(&self) -> u64 {
+        self.inner.loss_weight()
     }
 
     fn capture_identity(&self) -> u64 {
@@ -2978,7 +3013,8 @@ pub struct CompiledAdamWPlan {
     learning_rate: CompiledLearningRatePolicy,
 }
 
-/// Explicit differentiation objective returned by a module training builder.
+/// Explicit scalar or token-mean objective returned by a compiled module
+/// training or evaluation builder.
 ///
 /// [`Scalar`](Self::Scalar) is the already-normalized scalar loss used by the
 /// ordinary compiled AdamW policy. [`TokenMean`](Self::TokenMean) is a
@@ -3007,7 +3043,8 @@ impl CompiledAdamWObjective {
     }
 }
 
-/// Compact result of building one compiled AdamW module graph.
+/// Compact result of building one compiled AdamW module training or evaluation
+/// graph.
 ///
 /// The objective makes scalar-loss versus compiler-owned token-mean policy
 /// explicit at the builder boundary. Named outputs retain their existing
@@ -3762,6 +3799,7 @@ struct CompiledEvaluationPlan {
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
     parameter_inputs: BTreeMap<String, String>,
+    loss_weight_mask_input: Option<String>,
     capture_identity: u64,
 }
 
@@ -4874,6 +4912,65 @@ impl CompiledEvaluationPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
+        Self::compile_with_parameter_plan_inner(
+            module,
+            training_plan,
+            parameter_plan,
+            |module, graph, inputs| {
+                let (loss, outputs) = build(module, graph, inputs)?;
+                Ok((loss, outputs, None))
+            },
+        )
+    }
+
+    fn compile_graph_with_parameter_plan<M, F>(
+        module: &M,
+        training_plan: &CompiledAdamWPlan,
+        parameter_plan: ModuleParameterPlan,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(&M, &mut Graph, &BTreeMap<String, NodeId>) -> Result<CompiledAdamWGraph>,
+    {
+        Self::compile_with_parameter_plan_inner(
+            module,
+            training_plan,
+            parameter_plan,
+            |module, graph, inputs| {
+                let (objective, outputs) = build(module, graph, inputs)?.into_parts();
+                let loss_weight_mask_input = match objective {
+                    CompiledAdamWObjective::Scalar(_) => None,
+                    CompiledAdamWObjective::TokenMean(_) => {
+                        training_plan.token_weight_mask_input.clone()
+                    }
+                };
+                let loss = lower_compiled_adamw_objective_for_policy(
+                    graph,
+                    inputs,
+                    objective,
+                    training_plan.token_weight_mask_input.as_deref(),
+                    &training_plan.inner.inputs,
+                )?;
+                Ok((loss, outputs, loss_weight_mask_input))
+            },
+        )
+    }
+
+    fn compile_with_parameter_plan_inner<M, F>(
+        module: &M,
+        training_plan: &CompiledAdamWPlan,
+        parameter_plan: ModuleParameterPlan,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>, Option<String>)>,
+    {
         let mut graph = Graph::new();
         let inputs = training_plan
             .inner
@@ -4913,8 +5010,11 @@ impl CompiledEvaluationPlan {
             parameter_inputs.insert(init.name().to_owned(), input_name.clone());
             residents.insert(input_name, (node, value));
         }
+        let mut loss_weight_mask_input = None;
         let (loss, outputs) = parameter_plan.lower(&mut graph, &parameters, |graph| {
-            build(module, graph, &inputs)
+            let (loss, outputs, mask_input) = build(module, graph, &inputs)?;
+            loss_weight_mask_input = mask_input;
+            Ok((loss, outputs))
         })?;
         validate_loss(&graph, loss)?;
         validate_outputs(
@@ -4956,6 +5056,7 @@ impl CompiledEvaluationPlan {
             inputs: training_plan.inner.inputs.clone(),
             output_names: outputs.keys().cloned().collect(),
             parameter_inputs,
+            loss_weight_mask_input,
             capture_identity,
         })
     }
@@ -4979,18 +5080,29 @@ impl CompiledEvaluationPlan {
         Ok(inputs)
     }
 
+    fn validate_loss_weight(&self, inputs: &BTreeMap<String, TensorData>) -> Result<u64> {
+        validate_evaluation_inputs(&self.inputs, inputs)?;
+        validate_token_weight_mask(inputs, self.loss_weight_mask_input.as_deref())
+    }
+
     fn evaluate(
         &self,
         inputs: BTreeMap<String, TensorData>,
         parameters: BTreeMap<String, TensorData>,
     ) -> Result<CompiledEvaluationResult> {
+        let loss_weight = self.validate_loss_weight(&inputs)?;
         let inputs = self.bind(inputs, parameters)?;
         let values = self
             .inference
             .capture()
             .replay(&inputs)
             .map_err(replay_error)?;
-        evaluation_result(values, &self.output_names, self.capture_identity)
+        evaluation_result(
+            values,
+            &self.output_names,
+            loss_weight,
+            self.capture_identity,
+        )
     }
 
     fn prepare_native(
@@ -5031,6 +5143,7 @@ impl CompiledEvaluationPlan {
         executor: &CapturedReplayExecutor,
         prepared: &mut PreparedNativeCpuEvaluation,
     ) -> Result<(CompiledEvaluationResult, NativeCpuRunReport)> {
+        let loss_weight = self.validate_loss_weight(&inputs)?;
         let inputs = self.bind(inputs, parameters)?;
         let started = Instant::now();
         let capture = self.inference.capture();
@@ -5051,7 +5164,12 @@ impl CompiledEvaluationPlan {
             wall_time: started.elapsed(),
         };
         Ok((
-            evaluation_result(outputs, &self.output_names, self.capture_identity)?,
+            evaluation_result(
+                outputs,
+                &self.output_names,
+                loss_weight,
+                self.capture_identity,
+            )?,
             report,
         ))
     }
@@ -5125,6 +5243,7 @@ const fn native_cpu_replay_traffic(traffic: NativeReplayTraffic) -> NativeCpuRep
 fn evaluation_result(
     values: Vec<TensorData>,
     output_names: &[String],
+    loss_weight: u64,
     capture_identity: u64,
 ) -> Result<CompiledEvaluationResult> {
     if values.len() != 1 + output_names.len() {
@@ -5137,6 +5256,7 @@ fn evaluation_result(
     Ok(CompiledEvaluationResult {
         loss,
         outputs: output_names.iter().cloned().zip(values).collect(),
+        loss_weight,
         capture_identity,
     })
 }
@@ -7186,6 +7306,48 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         }
     }
 
+    /// Attaches a read-only evaluator using the training plan's authenticated
+    /// scalar or compiler-owned token-mean objective policy.
+    ///
+    /// Token-mean evaluation reuses the configured F32 mask input, lowers
+    /// `sum(mask * losses) / sum(mask)` inside the captured graph, and reports
+    /// the exact validated token count for weighted aggregation. Invalid masks
+    /// fail before replay. The legacy [`Self::with_evaluation`] scalar surface
+    /// remains behavior-compatible, including on token-weighted training plans.
+    pub fn with_evaluation_graph<F>(
+        mut self,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWEvaluationError<M>>
+    where
+        F: FnOnce(&M, &mut Graph, &BTreeMap<String, NodeId>) -> Result<CompiledAdamWGraph>,
+    {
+        let result = (|| {
+            if self.plan.evaluation.is_some() {
+                return Err(training("compiled evaluation is already attached"));
+            }
+            self.seal.validate_unchanged(&self.module)?;
+            let parameter_plan = self.seal.parameter_plan(&self.module)?;
+            let evaluation = CompiledEvaluationPlan::compile_graph_with_parameter_plan(
+                &self.module,
+                &self.plan,
+                parameter_plan,
+                build,
+            )?;
+            self.seal.validate_unchanged(&self.module)?;
+            Ok(evaluation)
+        })();
+        match result {
+            Ok(evaluation) => {
+                self.plan.evaluation = Some(evaluation);
+                Ok(self)
+            }
+            Err(source) => Err(CompiledModuleAdamWEvaluationError {
+                plan: Box::new(self),
+                source,
+            }),
+        }
+    }
+
     /// Consumes this owner into a target-specific session. A preparation error
     /// retains the complete plan and module for inspection or retry.
     pub fn prepare<T>(
@@ -9122,7 +9284,7 @@ impl MetalCompiledTrainingProgram {
             .run(self.session.state_epoch(), &inputs)
             .map_err(metal_training_error)?;
         let (values, report) = run.into_parts();
-        let inner = evaluation_result(values, output_names, *capture_identity)?;
+        let inner = evaluation_result(values, output_names, 1, *capture_identity)?;
         Ok(MetalCompiledEvaluationResult { inner, report })
     }
 
@@ -10089,17 +10251,47 @@ fn lower_compiled_adamw_objective(
     inputs: &BTreeMap<String, NodeId>,
     objective: CompiledAdamWObjective,
 ) -> Result<NodeId> {
+    lower_compiled_adamw_objective_for_policy(
+        graph,
+        inputs,
+        objective,
+        config.token_weight_mask_input.as_deref(),
+        &config.inputs,
+    )
+}
+
+fn lower_compiled_adamw_objective_for_policy(
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    objective: CompiledAdamWObjective,
+    token_weight_mask_input: Option<&str>,
+    input_descriptors: &BTreeMap<String, (Shape, DType)>,
+) -> Result<NodeId> {
     match objective {
         CompiledAdamWObjective::Scalar(loss) => {
-            reject_token_weighted_scalar_loss(config)?;
+            if token_weight_mask_input.is_some() {
+                return Err(training(
+                    "compiled AdamW token-weighted accumulation requires the token-mean-loss compile surface",
+                ));
+            }
             Ok(loss)
         }
         CompiledAdamWObjective::TokenMean(losses) => {
-            let (mask_input, mask_shape) = token_mean_loss_descriptor(config)?;
-            let mask = inputs.get(&mask_input).copied().ok_or_else(|| {
+            let mask_input = token_weight_mask_input.ok_or_else(|| {
+                training("compiled AdamW token-mean-loss compilation requires token weighting")
+            })?;
+            let (mask_shape, mask_dtype) = input_descriptors.get(mask_input).ok_or_else(|| {
+                training("compiled AdamW token-weight mask must name an existing input")
+            })?;
+            if *mask_dtype != DType::F32 {
+                return Err(training(
+                    "compiled AdamW token-weight mask must be nonempty fixed-shape F32",
+                ));
+            }
+            let mask = inputs.get(mask_input).copied().ok_or_else(|| {
                 training("compiled AdamW token-weight mask input is absent during compilation")
             })?;
-            lower_token_mean_loss(graph, losses, mask, &mask_shape)
+            lower_token_mean_loss(graph, losses, mask, mask_shape)
         }
     }
 }
@@ -13974,6 +14166,192 @@ mod tests {
             ),
             ("mask".into(), TensorData::new([3], mask.to_vec()).unwrap()),
         ])
+    }
+
+    fn token_evaluation_config() -> CompiledAdamWConfig {
+        CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+            .unwrap()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_input("features", [6], DType::F32)
+            .unwrap()
+            .with_input("mask", [6], DType::F32)
+            .unwrap()
+            .with_token_weighted_gradient_accumulation("mask")
+            .unwrap()
+    }
+
+    fn compile_token_training_owner() -> CompiledModuleAdamWPlan<TokenMeanModule> {
+        CompiledModuleAdamWPlan::compile_graph(
+            token_evaluation_config(),
+            TokenMeanModule::new(),
+            |module, graph, inputs| {
+                let weight = module.weight.bind(graph)?;
+                let losses = graph.mul(weight, inputs["features"])?;
+                Ok(CompiledAdamWGraph::token_mean(losses, BTreeMap::new()))
+            },
+        )
+        .unwrap()
+    }
+
+    fn compile_token_evaluation_plan() -> CompiledModuleAdamWPlan<TokenMeanModule> {
+        compile_token_training_owner()
+            .with_evaluation_graph(|module, graph, inputs| {
+                let weight = module.weight.bind(graph)?;
+                let losses = graph.mul(weight, inputs["features"])?;
+                Ok(CompiledAdamWGraph::token_mean(
+                    losses,
+                    BTreeMap::from([("losses".into(), losses)]),
+                ))
+            })
+            .unwrap()
+    }
+
+    fn token_evaluation_batch(mask: [f32; 6]) -> BTreeMap<String, TensorData> {
+        BTreeMap::from([
+            (
+                "features".into(),
+                TensorData::new([6], vec![1.0, 2.0, 3.0, 4.0, 5.0, 100.0]).unwrap(),
+            ),
+            ("mask".into(), TensorData::new([6], mask.to_vec()).unwrap()),
+        ])
+    }
+
+    #[test]
+    fn unified_token_mean_evaluation_weights_batches_and_preserves_frontier() {
+        let masks = [
+            [1.0, 1.0, 1.0, 1.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+        ];
+        let mut interpreted = compile_token_evaluation_plan()
+            .prepare(&CpuSessionTarget::new())
+            .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut native = compile_token_evaluation_plan().prepare(&target).unwrap();
+        assert_eq!(
+            interpreted.evaluation_capture_identity(),
+            native.evaluation_capture_identity()
+        );
+        let interpreted_checkpoint = interpreted.checkpoint().unwrap();
+        let native_checkpoint = native.checkpoint().unwrap();
+        let interpreted_accumulators = interpreted.gradient_accumulator_snapshots().unwrap();
+        let native_accumulators = native.gradient_accumulator_snapshots().unwrap();
+
+        for mask in [
+            [1.0, 1.0, 0.5, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ] {
+            assert!(interpreted.evaluate(token_evaluation_batch(mask)).is_err());
+            assert!(native.evaluate(token_evaluation_batch(mask)).is_err());
+        }
+        assert_eq!(interpreted.checkpoint().unwrap(), interpreted_checkpoint);
+        assert_eq!(native.checkpoint().unwrap(), native_checkpoint);
+
+        let mut interpreted_weighted_loss = 0.0;
+        let mut native_weighted_loss = 0.0;
+        let mut total_weight = 0_u64;
+        for (invocation, (mask, expected_weight)) in masks.into_iter().zip([5, 3, 3]).enumerate() {
+            let expected = interpreted.evaluate(token_evaluation_batch(mask)).unwrap();
+            let actual = native.evaluate(token_evaluation_batch(mask)).unwrap();
+            assert_eq!(expected.loss_weight(), expected_weight);
+            assert_eq!(actual.loss_weight(), expected_weight);
+            assert_cross_engine_tensor_close(
+                "token-mean evaluation loss",
+                actual.loss(),
+                expected.loss(),
+            );
+            assert_cross_engine_tensor_maps_close(
+                "token-mean evaluation outputs",
+                actual.outputs(),
+                expected.outputs(),
+            );
+            assert_eq!(
+                actual.report().successful_invocation(),
+                invocation as u64 + 1
+            );
+            interpreted_weighted_loss +=
+                expected.loss().scalar_at(0).as_f64() * expected_weight as f64;
+            native_weighted_loss += actual.loss().scalar_at(0).as_f64() * expected_weight as f64;
+            total_weight += expected_weight;
+        }
+        assert_eq!(total_weight, 11);
+        assert!((interpreted_weighted_loss / total_weight as f64 - 54.0 / 11.0).abs() < 1e-6);
+        assert!((native_weighted_loss - interpreted_weighted_loss).abs() < 1e-5);
+        assert_eq!(interpreted.checkpoint().unwrap(), interpreted_checkpoint);
+        assert_eq!(native.checkpoint().unwrap(), native_checkpoint);
+        assert_eq!(
+            interpreted.gradient_accumulator_snapshots().unwrap(),
+            interpreted_accumulators
+        );
+        assert_eq!(
+            native.gradient_accumulator_snapshots().unwrap(),
+            native_accumulators
+        );
+        assert_eq!(interpreted.step_count(), 0);
+        assert_eq!(native.step_count(), 0);
+    }
+
+    #[test]
+    fn legacy_scalar_evaluation_keeps_unit_weight() {
+        let legacy = CompiledModuleAdamWPlan::compile(
+            module_config(),
+            TiedFrozenModule::new([0.1, -0.2]),
+            build_tied_frozen,
+        )
+        .unwrap()
+        .with_evaluation(build_tied_frozen)
+        .unwrap();
+        let unified = CompiledModuleAdamWPlan::compile_graph(
+            module_config(),
+            TiedFrozenModule::new([0.1, -0.2]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap()
+        .with_evaluation_graph(|module, graph, inputs| {
+            let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+            Ok(CompiledAdamWGraph::scalar(loss, outputs))
+        })
+        .unwrap();
+        assert_eq!(legacy.capture_identity(), unified.capture_identity());
+        assert_eq!(
+            legacy.evaluation_capture_identity(),
+            unified.evaluation_capture_identity()
+        );
+        let mut legacy = legacy.prepare(&CpuSessionTarget::new()).unwrap();
+        let mut unified = unified.prepare(&CpuSessionTarget::new()).unwrap();
+        let inputs =
+            || BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 2.0]).unwrap())]);
+        let expected = legacy.evaluate(inputs()).unwrap();
+        let actual = unified.evaluate(inputs()).unwrap();
+        assert_eq!(expected.loss_weight(), 1);
+        assert_eq!(actual.loss_weight(), 1);
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+
+        let mismatch =
+            compile_token_training_owner().with_evaluation_graph(|module, graph, inputs| {
+                let weight = module.weight.bind(graph)?;
+                let losses = graph.mul(weight, inputs["features"])?;
+                Ok(CompiledAdamWGraph::scalar(
+                    graph.sum_all(losses)?,
+                    BTreeMap::new(),
+                ))
+            });
+        let error = match mismatch {
+            Ok(_) => panic!("scalar evaluation bypassed token-mean policy"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .source_error()
+                .to_string()
+                .contains("requires the token-mean-loss compile surface")
+        );
     }
 
     #[test]
