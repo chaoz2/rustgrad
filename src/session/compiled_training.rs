@@ -5657,13 +5657,11 @@ impl CpuCompiledTrainingProgram {
         let clip_report_start = 1 + self.output_names.len();
         let window_loss_report = self.window_loss_report;
         let window_loss_report_start = clip_report_start + usize::from(clip_report) * 2;
-        let replay = self
-            .capture
-            .replay_recurrent_native_checked(
+        let replay = native
+            .replay_recurrent_checked(
                 &mut self.runtime,
                 &mut self.cursor,
                 &provided,
-                native,
                 injected_failure,
                 |outputs, successors| {
                     validate_staged_transition(
@@ -6107,13 +6105,11 @@ impl CpuCompiledTrainingProgram {
         let clip_report = transition.clip_report;
         let window_loss_report = transition.window_loss_report;
         let window_loss_report_start = usize::from(clip_report) * 2;
-        let replay = transition
-            .capture
-            .replay_recurrent_native_checked(
+        let replay = native
+            .replay_recurrent_checked(
                 &mut self.runtime,
                 &mut prepared.cursor,
                 &prepared.provided,
-                native,
                 injected_failure,
                 |outputs, successors| {
                     validate_staged_transition(
@@ -12320,6 +12316,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(executor.native_item_plan_count(), 1);
+        assert_eq!(native.main_replay.structure_validation_count(), 1);
         let workspace = native.main_replay.workspace_stats();
         assert!(workspace.allocation_count > 0);
         assert_eq!(workspace.input_import_count, 0);
@@ -12488,6 +12485,7 @@ mod tests {
             retried_workspace.borrowed_recurrent_output_bytes,
             failed_workspace.borrowed_recurrent_output_bytes + recurrent_state_bytes
         );
+        assert_eq!(native.main_replay.structure_validation_count(), 1);
     }
 
     #[test]
@@ -12711,6 +12709,23 @@ mod tests {
             .unwrap()
             .workspace_stats();
         let reset_workspace = native.zero_grad_replay.as_ref().unwrap().workspace_stats();
+        assert_eq!(native.main_replay.structure_validation_count(), 1);
+        assert_eq!(
+            native
+                .partial_flush_replay
+                .as_ref()
+                .unwrap()
+                .structure_validation_count(),
+            1
+        );
+        assert_eq!(
+            native
+                .zero_grad_replay
+                .as_ref()
+                .unwrap()
+                .structure_validation_count(),
+            1
+        );
         assert!(flush_workspace.allocation_count > 0);
         assert!(reset_workspace.allocation_count > 0);
         let mut interpreted = plan.prepare_cpu().unwrap();
@@ -12868,6 +12883,23 @@ mod tests {
             used_flush_workspace.borrowed_recurrent_output_bytes
         );
         assert_eq!(used_flush_workspace.intermediate_materialization_count, 0);
+        assert_eq!(native.main_replay.structure_validation_count(), 1);
+        assert_eq!(
+            native
+                .partial_flush_replay
+                .as_ref()
+                .unwrap()
+                .structure_validation_count(),
+            1
+        );
+        assert_eq!(
+            native
+                .zero_grad_replay
+                .as_ref()
+                .unwrap()
+                .structure_validation_count(),
+            1
+        );
     }
 
     #[test]

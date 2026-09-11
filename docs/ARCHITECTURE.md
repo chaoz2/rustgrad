@@ -949,7 +949,12 @@ not a mode on the interpreter session. It precompiles the main replay and every
 attached partial-flush/zero-grad/evaluation pure program through the existing
 `CapturedReplayExecutor` before returning mutable state, then reuses the same
 mixed staging and single `EffectRuntime` commit with interpreter fallback
-disabled. Its typed preparation/run reports expose only CPU facts: native item
+disabled. Each prepared recurrent program seals its validated RGSM identity,
+pure cache/layout inventory, replacement map, and initial frontier descriptor
+once. Main, partial-flush, and zero-grad hot replay therefore repeats only
+call-dependent cursor, input, active-bank, quantized-index, successor, and
+transaction admission; generic artifact replay retains full per-call artifact
+validation. Its typed preparation/run reports expose only CPU facts: native item
 and cache counts, static execution summaries, recurrent logical bytes, stable
 capture/native identities, and call-local wall times excluded from identity.
 Unsupported preparation and failed execution or commit publish neither state
