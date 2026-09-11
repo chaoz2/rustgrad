@@ -383,6 +383,55 @@ pub(crate) struct PreparedRecurrentNativeReplay {
     replacements: PreparedRecurrentReplacementPlan,
 }
 
+pub(crate) struct RecurrentNativePreparation {
+    pure: CapturedSchedule,
+    inputs: Option<BTreeMap<String, crate::TensorData>>,
+    requested: Vec<u64>,
+    replacements: PreparedRecurrentReplacementPlan,
+    replay: NativeMixedReplayTrace,
+}
+
+impl RecurrentNativePreparation {
+    pub(crate) fn pure(&self) -> &CapturedSchedule {
+        &self.pure
+    }
+
+    pub(crate) fn pure_and_inputs(
+        &self,
+    ) -> (&CapturedSchedule, &BTreeMap<String, crate::TensorData>) {
+        (
+            &self.pure,
+            self.inputs
+                .as_ref()
+                .expect("native recurrent input witnesses were already released"),
+        )
+    }
+
+    pub(crate) fn release_input_witnesses(&mut self) {
+        self.inputs = None;
+    }
+
+    pub(crate) fn finish(
+        self,
+        plan: super::captured_replay::PlannedNativeItems,
+    ) -> Result<PreparedRecurrentNativeReplay, ReplayError> {
+        let trace = NativeMixedPreparationTrace {
+            replay: self.replay,
+            item_count: plan.item_count(),
+            cache_hit_count: plan.cache_hit_count(),
+            cache_miss_count: plan.cache_miss_count(),
+            module: plan.module_preparation(),
+        };
+        PreparedRecurrentNativeReplay::new(
+            trace,
+            plan,
+            self.pure,
+            self.requested,
+            self.replacements,
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PreparedRecurrentReplacement {
     step: u64,
@@ -1002,6 +1051,7 @@ impl CapturedMixedSchedule {
     /// Compiles the exact recurrent pure prefix without executing it or
     /// publishing any persistent state. The supplied values are descriptor
     /// witnesses only; native cache identity never depends on their bytes.
+    #[cfg(test)]
     pub(crate) fn prepare_recurrent_native(
         &self,
         runtime: &crate::EffectRuntime,
@@ -1010,6 +1060,19 @@ impl CapturedMixedSchedule {
         executor: &super::captured_replay::CapturedReplayExecutor,
         vectorized: bool,
     ) -> Result<PreparedRecurrentNativeReplay, ReplayError> {
+        let preparation = self.preflight_recurrent_native(runtime, cursor, provided, vectorized)?;
+        let (pure, inputs) = preparation.pure_and_inputs();
+        let plan = executor.plan_native_items(pure, inputs, vectorized)?;
+        preparation.finish(plan)
+    }
+
+    pub(crate) fn preflight_recurrent_native(
+        &self,
+        runtime: &crate::EffectRuntime,
+        cursor: &MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        vectorized: bool,
+    ) -> Result<RecurrentNativePreparation, ReplayError> {
         validate(self, true)?;
         validate_recurrent_cursor(self, cursor)?;
         let starts = recurrent_rebase_starts(self, cursor)?;
@@ -1023,8 +1086,8 @@ impl CapturedMixedSchedule {
                 .clone();
             candidates.insert(state.clone(), value);
         }
-        let planned = BoundMixedCapture::bind(self, &candidates, starts, provided)?
-            .plan_native(executor, vectorized)?;
+        let bound = BoundMixedCapture::bind(self, &candidates, starts, provided)?;
+        let inputs = bound.inputs;
         let mut pure = self.schedule.clone();
         let split = pure
             .items
@@ -1043,20 +1106,13 @@ impl CapturedMixedSchedule {
             }
         }
         pure.identity = 0;
-        let trace = NativeMixedPreparationTrace {
-            replay: self.native_replay_trace(vectorized)?,
-            item_count: planned.item_count(),
-            cache_hit_count: planned.cache_hit_count(),
-            cache_miss_count: planned.cache_miss_count(),
-            module: planned.plan.module_preparation(),
-        };
-        PreparedRecurrentNativeReplay::new(
-            trace,
-            planned.plan,
+        Ok(RecurrentNativePreparation {
             pure,
-            self.schedule.requested.clone(),
+            inputs: Some(inputs),
+            requested: self.schedule.requested.clone(),
             replacements,
-        )
+            replay: self.native_replay_trace(vectorized)?,
+        })
     }
 
     fn replay_recurrent_checked_impl<F>(

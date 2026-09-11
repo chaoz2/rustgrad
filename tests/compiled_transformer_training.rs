@@ -4042,6 +4042,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
     let mut session = plan.prepare(&target).unwrap();
     let preparation = session.preparation_report();
+    let preparation_parallel_module_overlap = preparation.parallel_module_overlap_wall_time();
     let prepare_wall_time = std::iter::once(preparation.main())
         .chain(preparation.partial_flush())
         .chain(preparation.zero_grad())
@@ -4120,8 +4121,16 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         total.checked_add(timing.total().to_duration().unwrap())
     })
     .unwrap();
+    let parallel_module_overlap = report
+        .prepare_parallel_module_overlap_wall_time()
+        .expect("current scoreboard reports parallel module overlap")
+        .to_duration()
+        .unwrap();
+    assert_eq!(parallel_module_overlap, preparation_parallel_module_overlap);
     assert_eq!(
         program_prepare_total
+            .checked_sub(parallel_module_overlap)
+            .expect("parallel module overlap fits program preparation")
             .checked_add(
                 report
                     .prepare_runtime_overhead_wall_time()

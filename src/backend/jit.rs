@@ -9,9 +9,10 @@ use crate::{
     CpuJit, Graph, JitBuffer, JitError, JitKernel, NodeId, Op, ScheduleItem, TensorData, VectorPlan,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -77,6 +78,47 @@ struct NativeScheduleModule {
     kernels: Vec<Arc<JitKernel>>,
     dispatcher: Arc<JitScheduleDispatcher>,
 }
+
+struct RenderedScheduleEntry {
+    vector: VectorPlan,
+    rendered: crate::cpu_jit::RenderedC,
+    native_cache_key: String,
+    layout: NativeScheduleLayout,
+    output_initialization: crate::cpu_jit::NativeOutputInitialization,
+}
+
+struct RenderedScheduleModule {
+    entries: Vec<RenderedScheduleEntry>,
+    render_wall_time: Duration,
+}
+
+type NativeScheduleModuleJob = (
+    usize,
+    Result<(NativeScheduleModule, crate::cpu_jit::JitScheduleModuleLoad), JitError>,
+    (Instant, Instant),
+);
+type PreparedNativeScheduleModule = (Vec<PreparedScheduleItem>, NativeScheduleModulePreparation);
+type PreparedNativeScheduleModules = (
+    Vec<PreparedNativeScheduleModule>,
+    NativeScheduleCompilationBatch,
+);
+
+fn load_schedule_module_job(
+    index: usize,
+    rendered: Vec<crate::cpu_jit::RenderedC>,
+) -> NativeScheduleModuleJob {
+    let started = Instant::now();
+    let loaded = JitKernel::load_schedule_module(&rendered).map(|(kernels, dispatcher, load)| {
+        (
+            NativeScheduleModule {
+                kernels: kernels.into_iter().map(Arc::new).collect(),
+                dispatcher: Arc::new(dispatcher),
+            },
+            load,
+        )
+    });
+    (index, loaded, (started, Instant::now()))
+}
 pub(crate) struct PreparedScheduleItem {
     kernel: Arc<JitKernel>,
     dispatcher: Option<Arc<JitScheduleDispatcher>>,
@@ -108,6 +150,15 @@ pub(crate) struct NativeScheduleModulePreparation {
     pub(crate) render_wall_time: Duration,
     pub(crate) compiler_process_wall_time: Duration,
     pub(crate) module_load_wall_time: Duration,
+    pub(crate) residual_wall_time: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeScheduleCompilationBatch {
+    pub(crate) parallel_work_overlap_wall_time: Duration,
+    pub(crate) compiler_process_overlap_wall_time: Duration,
+    pub(crate) compiler_process_count: usize,
+    pub(crate) max_parallel_compiler_process_count: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -115,6 +166,94 @@ pub(crate) struct NativeScheduleLayout {
     pub(crate) matmul: Option<crate::cpu_jit::NativeMatmulLayouts>,
     pub(crate) retained_matmul_sources: BTreeMap<u64, u64>,
     pub(crate) elided_output_source: Option<u64>,
+}
+
+fn render_schedule_module_entries(
+    backend: &CpuJitBackend,
+    items: &[ScheduleItem],
+    layouts: Vec<NativeScheduleLayout>,
+) -> Result<RenderedScheduleModule, JitBackendError> {
+    if items.len() != layouts.len() {
+        return Err(JitBackendError::Binding(
+            "native schedule module layout count mismatch".into(),
+        ));
+    }
+    let started = Instant::now();
+    let entries = items
+        .iter()
+        .zip(layouts)
+        .map(|(item, layout)| {
+            validate_native_layout(item, &layout)?;
+            let (vector, rendered, _) = backend.render_schedule_kernel(item, &layout)?;
+            backend.validate_rendered_schedule_item(item, &rendered)?;
+            let native_cache_key =
+                format!("{}-schedule-{:016x}", rendered.cache_key, item.cache_key);
+            Ok(RenderedScheduleEntry {
+                vector,
+                rendered,
+                native_cache_key,
+                layout,
+                output_initialization: crate::cpu_jit::native_output_initialization(&item.kernel),
+            })
+        })
+        .collect::<Result<Vec<_>, JitBackendError>>()?;
+    Ok(RenderedScheduleModule {
+        entries,
+        render_wall_time: started.elapsed(),
+    })
+}
+
+fn overlapping_wall_time(
+    intervals: &[(Instant, Instant)],
+) -> Result<(Duration, usize), JitBackendError> {
+    let mut intervals = intervals.to_vec();
+    intervals.sort_by_key(|(start, _)| *start);
+    let individual = intervals
+        .iter()
+        .try_fold(Duration::ZERO, |total, (start, end)| {
+            total
+                .checked_add(end.duration_since(*start))
+                .ok_or_else(|| JitBackendError::Native("compiler-process duration overflow".into()))
+        })?;
+    let mut union = Duration::ZERO;
+    let mut current: Option<(Instant, Instant)> = None;
+    for (start, end) in &intervals {
+        match current {
+            Some((range_start, range_end)) if *start <= range_end => {
+                current = Some((range_start, range_end.max(*end)));
+            }
+            Some((range_start, range_end)) => {
+                union = union
+                    .checked_add(range_end.duration_since(range_start))
+                    .ok_or_else(|| {
+                        JitBackendError::Native("compiler-process union overflow".into())
+                    })?;
+                current = Some((*start, *end));
+            }
+            None => current = Some((*start, *end)),
+        }
+    }
+    if let Some((start, end)) = current {
+        union = union
+            .checked_add(end.duration_since(start))
+            .ok_or_else(|| JitBackendError::Native("compiler-process union overflow".into()))?;
+    }
+    let max_parallel = intervals
+        .iter()
+        .map(|(candidate, _)| {
+            intervals
+                .iter()
+                .filter(|(start, end)| *start <= *candidate && *candidate < *end)
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    Ok((
+        individual.checked_sub(union).ok_or_else(|| {
+            JitBackendError::Native("compiler-process overlap exceeds duration".into())
+        })?,
+        max_parallel,
+    ))
 }
 
 impl PreparedScheduleItem {
@@ -832,129 +971,243 @@ impl CpuJitBackend {
         })
     }
 
-    pub(crate) fn prepare_schedule_module(
+    pub(crate) fn prepare_schedule_modules(
         &self,
-        items: &[ScheduleItem],
-        layouts: Vec<NativeScheduleLayout>,
-    ) -> Result<(Vec<PreparedScheduleItem>, NativeScheduleModulePreparation), JitBackendError> {
-        if items.len() != layouts.len() {
-            return Err(JitBackendError::Binding(
-                "native schedule module layout count mismatch".into(),
-            ));
-        }
-        struct RenderedEntry {
-            vector: VectorPlan,
-            rendered: crate::cpu_jit::RenderedC,
-            native_cache_key: String,
-            layout: NativeScheduleLayout,
-            output_initialization: crate::cpu_jit::NativeOutputInitialization,
-        }
-        let render_started = Instant::now();
-        let entries = items
+        programs: Vec<(&[ScheduleItem], Vec<NativeScheduleLayout>)>,
+    ) -> Result<PreparedNativeScheduleModules, JitBackendError> {
+        let rendered = programs
             .iter()
-            .zip(layouts)
-            .map(|(item, layout)| {
-                validate_native_layout(item, &layout)?;
-                let (vector, rendered, _) = self.render_schedule_kernel(item, &layout)?;
-                self.validate_rendered_schedule_item(item, &rendered)?;
-                let native_cache_key =
-                    format!("{}-schedule-{:016x}", rendered.cache_key, item.cache_key);
-                Ok(RenderedEntry {
-                    vector,
-                    rendered,
-                    native_cache_key,
-                    layout,
-                    output_initialization: crate::cpu_jit::native_output_initialization(
-                        &item.kernel,
+            .map(|(items, layouts)| render_schedule_module_entries(self, items, layouts.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let wrapper_keys = rendered
+            .iter()
+            .map(|module| {
+                (!module.entries.is_empty()).then(|| NativeScheduleWrapperKey {
+                    artifact: crate::cpu_jit::schedule_module_cache_key(
+                        &module
+                            .entries
+                            .iter()
+                            .map(|entry| entry.rendered.clone())
+                            .collect::<Vec<_>>(),
                     ),
+                    entries: module
+                        .entries
+                        .iter()
+                        .map(|entry| (entry.native_cache_key.clone(), entry.output_initialization))
+                        .collect(),
                 })
             })
-            .collect::<Result<Vec<_>, JitBackendError>>()?;
-        let render_wall_time = render_started.elapsed();
-        if entries.is_empty() {
-            return Ok((Vec::new(), NativeScheduleModulePreparation::default()));
-        }
-        let rendered = entries
-            .iter()
-            .map(|entry| entry.rendered.clone())
             .collect::<Vec<_>>();
-        // The durable binary is source/compiler-addressed, but these wrappers
-        // also carry the current schedule's concrete buffer ABI and typed
-        // output-initialization contract. Do not let an isomorphic capture
-        // reuse wrappers authenticated for different IDs or write coverage.
-        let module_key = NativeScheduleWrapperKey {
-            artifact: crate::cpu_jit::schedule_module_cache_key(&rendered),
-            entries: entries
+        let cached = {
+            let modules = self.schedule_modules.lock().map_err(|_| {
+                JitBackendError::Native("schedule module cache lock poisoned".into())
+            })?;
+            wrapper_keys
                 .iter()
-                .map(|entry| (entry.native_cache_key.clone(), entry.output_initialization))
-                .collect(),
+                .map(|key| key.as_ref().and_then(|key| modules.get(key).cloned()))
+                .collect::<Vec<_>>()
         };
-        let cached_module = self
+        let mut jobs = rendered
+            .iter()
+            .enumerate()
+            .filter(|(index, module)| !module.entries.is_empty() && cached[*index].is_none())
+            .map(|(index, module)| {
+                (
+                    index,
+                    module
+                        .entries
+                        .iter()
+                        .map(|entry| entry.rendered.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut compiled = BTreeMap::new();
+        if jobs.len() == 1 {
+            let (index, rendered) = jobs.pop().expect("one native module job is present");
+            let (_, result, interval) = load_schedule_module_job(index, rendered);
+            compiled.insert(index, (result, interval));
+        } else if jobs.len() > 1 {
+            let worker_count = 2;
+            let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
+            let results = thread::scope(|scope| -> Result<Vec<_>, JitBackendError> {
+                let handles = (0..worker_count)
+                    .map(|worker| {
+                        let queue = queue.clone();
+                        thread::Builder::new()
+                            .name(format!("rustgrad-native-compile-{worker}"))
+                            .spawn_scoped(scope, move || {
+                                let mut results = Vec::new();
+                                loop {
+                                    let job = queue
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .pop_front();
+                                    let Some((index, rendered)) = job else {
+                                        break;
+                                    };
+                                    results.push(load_schedule_module_job(index, rendered));
+                                }
+                                results
+                            })
+                            .map_err(|error| {
+                                JitBackendError::Native(format!(
+                                    "native schedule compiler worker spawn failed: {error}"
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut results = Vec::new();
+                for handle in handles {
+                    results.extend(handle.join().map_err(|_| {
+                        JitBackendError::Native("native schedule compiler worker panicked".into())
+                    })?);
+                }
+                Ok(results)
+            })?;
+            for (index, result, interval) in results {
+                compiled.insert(index, (result, interval));
+            }
+        }
+        let compiler_intervals = compiled
+            .values()
+            .filter_map(|(result, _)| {
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|(_, load)| load.compiler_process_interval)
+            })
+            .collect::<Vec<_>>();
+        let work_intervals = compiled
+            .values()
+            .map(|(_, interval)| *interval)
+            .collect::<Vec<_>>();
+        let (compiler_process_overlap_wall_time, max_parallel_compiler_process_count) =
+            overlapping_wall_time(&compiler_intervals)?;
+        let (parallel_work_overlap_wall_time, _) = overlapping_wall_time(&work_intervals)?;
+        let compilation = NativeScheduleCompilationBatch {
+            parallel_work_overlap_wall_time,
+            compiler_process_overlap_wall_time,
+            compiler_process_count: compiler_intervals.len(),
+            max_parallel_compiler_process_count,
+        };
+
+        // Resolve every worker result and authenticate every module ABI before
+        // publishing any wrapper or entry into this backend's in-memory caches.
+        // Durable artifacts are process-external cache evidence and may remain
+        // after failure, but a failed batch must leave this backend retry-clean.
+        let mut resolved = Vec::with_capacity(programs.len());
+        for (index, module) in rendered.iter().enumerate() {
+            if module.entries.is_empty() {
+                resolved.push(None);
+                continue;
+            }
+            let (candidate, load, job_interval) = match cached[index].clone() {
+                Some(module) => (module, None, None),
+                None => {
+                    let (result, interval) = compiled.remove(&index).ok_or_else(|| {
+                        JitBackendError::Binding("compiled native schedule module is absent".into())
+                    })?;
+                    let (module, load) = result.map_err(jit_error)?;
+                    (module, Some(load), Some(interval))
+                }
+            };
+            if candidate.kernels.len() != module.entries.len()
+                || candidate
+                    .kernels
+                    .iter()
+                    .zip(&module.entries)
+                    .any(|(kernel, entry)| kernel.abi() != &entry.rendered.abi)
+            {
+                return Err(JitBackendError::Binding(
+                    "cached native schedule module ABI mismatch".into(),
+                ));
+            }
+            resolved.push(Some((candidate, load, job_interval)));
+        }
+
+        let mut modules = self
             .schedule_modules
             .lock()
-            .map_err(|_| JitBackendError::Native("schedule module cache lock poisoned".into()))?
-            .get(&module_key)
-            .cloned();
-        let (module, load) = match cached_module {
-            Some(module) => {
-                if module.kernels.len() != rendered.len()
-                    || module
-                        .kernels
-                        .iter()
-                        .zip(&rendered)
-                        .any(|(kernel, rendered)| kernel.abi() != &rendered.abi)
-                {
-                    return Err(JitBackendError::Binding(
-                        "cached native schedule module ABI mismatch".into(),
-                    ));
-                }
-                (module, None)
-            }
-            None => {
-                let (kernels, dispatcher, load) =
-                    JitKernel::load_schedule_module(&rendered).map_err(jit_error)?;
-                let module = NativeScheduleModule {
-                    kernels: kernels.into_iter().map(Arc::new).collect::<Vec<_>>(),
-                    dispatcher: Arc::new(dispatcher),
-                };
-                self.schedule_modules
-                    .lock()
-                    .map_err(|_| {
-                        JitBackendError::Native("schedule module cache lock poisoned".into())
-                    })?
-                    .insert(module_key, module.clone());
-                (module, Some(load))
-            }
-        };
-        if module.kernels.len() != entries.len() {
-            return Err(JitBackendError::Binding(
-                "native schedule module entry count mismatch".into(),
-            ));
-        }
+            .map_err(|_| JitBackendError::Native("schedule module cache lock poisoned".into()))?;
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| JitBackendError::Native("cache lock poisoned".into()))?;
-        let mut prepared = Vec::with_capacity(entries.len());
-        for ((item, entry), kernel) in items.iter().zip(entries).zip(module.kernels) {
-            let cache_hit = cache
-                .insert(entry.native_cache_key.clone(), kernel.clone())
-                .is_some();
-            prepared.push(PreparedScheduleItem {
-                kernel,
-                dispatcher: Some(module.dispatcher.clone()),
-                native_cache_key: entry.native_cache_key,
-                cache_hit,
-                vector: entry.vector,
-                schedule_cache_key: item.cache_key,
-                native_layout: entry.layout,
-                output_initialization: entry.output_initialization,
-            });
-        }
-        Ok((
-            prepared,
-            NativeScheduleModulePreparation {
-                rendered_entry_count: rendered.len(),
+        let mut staged_modules = HashMap::new();
+        let mut staged_entries = Vec::new();
+        let mut staged_entry_keys = HashSet::new();
+        let mut out = Vec::with_capacity(programs.len());
+        for (index, (((items, _), module), resolved)) in
+            programs.into_iter().zip(rendered).zip(resolved).enumerate()
+        {
+            let Some((candidate, load, job_interval)) = resolved else {
+                out.push((Vec::new(), NativeScheduleModulePreparation::default()));
+                continue;
+            };
+            let finalized = Instant::now();
+            let key = wrapper_keys[index]
+                .clone()
+                .expect("nonempty rendered schedule has a wrapper key");
+            let selected = modules
+                .get(&key)
+                .or_else(|| staged_modules.get(&key))
+                .cloned()
+                .unwrap_or_else(|| {
+                    staged_modules.insert(key, candidate.clone());
+                    candidate
+                });
+            if selected.kernels.len() != module.entries.len()
+                || selected
+                    .kernels
+                    .iter()
+                    .zip(&module.entries)
+                    .any(|(kernel, entry)| kernel.abi() != &entry.rendered.abi)
+            {
+                return Err(JitBackendError::Binding(
+                    "cached native schedule module ABI mismatch".into(),
+                ));
+            }
+            let mut prepared = Vec::with_capacity(module.entries.len());
+            for ((item, entry), kernel) in items.iter().zip(module.entries).zip(selected.kernels) {
+                let cache_hit = cache.contains_key(&entry.native_cache_key)
+                    || !staged_entry_keys.insert(entry.native_cache_key.clone());
+                staged_entries.push((entry.native_cache_key.clone(), kernel.clone()));
+                prepared.push(PreparedScheduleItem {
+                    kernel,
+                    dispatcher: Some(selected.dispatcher.clone()),
+                    native_cache_key: entry.native_cache_key,
+                    cache_hit,
+                    vector: entry.vector,
+                    schedule_cache_key: item.cache_key,
+                    native_layout: entry.layout,
+                    output_initialization: entry.output_initialization,
+                });
+            }
+            let compiler_process_wall_time = load
+                .map(|load| load.compiler_process_wall_time)
+                .unwrap_or(Duration::ZERO);
+            let module_load_wall_time = load
+                .map(|load| load.module_load_wall_time)
+                .unwrap_or(Duration::ZERO);
+            let job_residual = job_interval
+                .map(|(start, end)| end.duration_since(start))
+                .unwrap_or(Duration::ZERO)
+                .checked_sub(compiler_process_wall_time)
+                .and_then(|duration| duration.checked_sub(module_load_wall_time))
+                .ok_or_else(|| {
+                    JitBackendError::Native(
+                        "native schedule module phases exceed worker wall time".into(),
+                    )
+                })?;
+            let residual_wall_time =
+                job_residual
+                    .checked_add(finalized.elapsed())
+                    .ok_or_else(|| {
+                        JitBackendError::Native("native schedule module residual overflows".into())
+                    })?;
+            let preparation = NativeScheduleModulePreparation {
+                rendered_entry_count: prepared.len(),
                 loaded_module_count: 1,
                 durable_artifact_cache_hit_count: load
                     .map(|load| usize::from(load.durable_cache_hit))
@@ -966,15 +1219,16 @@ impl CpuJitBackend {
                     .map(|load| load.compiler_invocation_count)
                     .unwrap_or(0),
                 layout_wall_time: Duration::ZERO,
-                render_wall_time,
-                compiler_process_wall_time: load
-                    .map(|load| load.compiler_process_wall_time)
-                    .unwrap_or(Duration::ZERO),
-                module_load_wall_time: load
-                    .map(|load| load.module_load_wall_time)
-                    .unwrap_or(Duration::ZERO),
-            },
-        ))
+                render_wall_time: module.render_wall_time,
+                compiler_process_wall_time,
+                module_load_wall_time,
+                residual_wall_time,
+            };
+            out.push((prepared, preparation));
+        }
+        modules.extend(staged_modules);
+        cache.extend(staged_entries);
+        Ok((out, compilation))
     }
 
     pub(crate) fn execute_prepared_schedule_item<V: TensorValueStore>(

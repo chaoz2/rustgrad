@@ -29,7 +29,9 @@ use super::target::{
     NativeCpuSessionTarget, SessionTarget,
 };
 use crate::effects::runtime::RecurrentTransactionError;
-use crate::engine::mixed_capture::{NativeReplayContext, PreparedRecurrentNativeReplay};
+use crate::engine::mixed_capture::{
+    NativeReplayContext, PreparedRecurrentNativeReplay, RecurrentNativePreparation,
+};
 use crate::engine::{NativeReplayTraffic, PlannedNativeItems};
 use crate::nn::{
     Parameter, ParameterRestore, ParameterSnapshot, StateKind, TrainingDropoutProvider,
@@ -1424,6 +1426,26 @@ impl NativeCpuPreparationPhases {
     }
 }
 
+fn native_preparation_wall_time(
+    module: crate::backend::NativeScheduleModulePreparation,
+    residual_wall_time: Duration,
+) -> Result<Duration> {
+    [
+        module.layout_wall_time,
+        module.render_wall_time,
+        module.compiler_process_wall_time,
+        module.module_load_wall_time,
+        module.residual_wall_time,
+        residual_wall_time,
+    ]
+    .into_iter()
+    .try_fold(Duration::ZERO, |total, duration| {
+        total
+            .checked_add(duration)
+            .ok_or_else(|| training("compiled native CPU preparation wall time overflows"))
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeCpuProgramPreparationReport {
     capture_identity: u64,
@@ -1504,6 +1526,10 @@ pub struct NativeCpuCompiledAdamWPreparationReport {
     evaluation: Option<NativeCpuProgramPreparationReport>,
     recurrent_state_count: usize,
     recurrent_state_bytes: usize,
+    parallel_module_overlap_wall_time: Duration,
+    compiler_process_overlap_wall_time: Duration,
+    compiler_process_count: usize,
+    max_parallel_compiler_process_count: usize,
 }
 
 impl NativeCpuCompiledAdamWPreparationReport {
@@ -1531,6 +1557,26 @@ impl NativeCpuCompiledAdamWPreparationReport {
     pub const fn recurrent_state_bytes(&self) -> usize {
         self.recurrent_state_bytes
     }
+
+    /// Exact overlap among independently authenticated native module compiler
+    /// processes. Program preparation times remain their actual durations.
+    pub const fn compiler_process_overlap_wall_time(&self) -> Duration {
+        self.compiler_process_overlap_wall_time
+    }
+
+    /// Exact overlap among complete compiler-and-loader module jobs. This is
+    /// the overlap subtracted when partitioning caller-observed preparation.
+    pub const fn parallel_module_overlap_wall_time(&self) -> Duration {
+        self.parallel_module_overlap_wall_time
+    }
+
+    pub const fn compiler_process_count(&self) -> usize {
+        self.compiler_process_count
+    }
+
+    pub const fn max_parallel_compiler_process_count(&self) -> usize {
+        self.max_parallel_compiler_process_count
+    }
 }
 
 struct PreparedNativeCpuProgram {
@@ -1542,6 +1588,12 @@ struct PreparedNativeCpuEvaluation {
     report: NativeCpuProgramPreparationReport,
     plan: PlannedNativeItems,
     parameter_inputs: Vec<PreparedNativeEvaluationParameterInput>,
+}
+
+struct NativeCpuEvaluationPreparation {
+    inputs: Option<BTreeMap<String, TensorData>>,
+    parameter_inputs: Vec<PreparedNativeEvaluationParameterInput>,
+    residual_wall_time: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5402,13 +5454,11 @@ impl CompiledEvaluationPlan {
         )
     }
 
-    fn prepare_native(
+    fn preflight_native(
         &self,
         parameters: BTreeMap<String, TensorData>,
         parameter_buffers: &BTreeMap<String, u64>,
-        executor: &CapturedReplayExecutor,
-        vectorized: bool,
-    ) -> Result<PreparedNativeCpuEvaluation> {
+    ) -> Result<NativeCpuEvaluationPreparation> {
         let started = Instant::now();
         if parameter_buffers.keys().ne(self.parameter_inputs.keys()) {
             return Err(training(
@@ -5455,22 +5505,34 @@ impl CompiledEvaluationPlan {
             })
             .collect::<Result<Vec<_>>>()?;
         let inputs = self.bind(zero_inputs(&self.inputs)?, parameters)?;
-        let plan = executor
-            .plan_native_items(capture, &inputs, vectorized)
-            .map_err(replay_error)?;
+        Ok(NativeCpuEvaluationPreparation {
+            inputs: Some(inputs),
+            parameter_inputs,
+            residual_wall_time: started.elapsed(),
+        })
+    }
+
+    fn finish_native(
+        &self,
+        preparation: NativeCpuEvaluationPreparation,
+        parameter_buffers: &BTreeMap<String, u64>,
+        plan: PlannedNativeItems,
+    ) -> Result<PreparedNativeCpuEvaluation> {
+        let capture = self.inference.capture();
         let module_preparation = plan.module_preparation();
         let work = NativeCpuPreparationWork::from_module(module_preparation);
         let execution_plan = ExecutionPlanSummary::from_capture(capture, true)
             .map_err(|error| training(format!("compiled native CPU summary: {error}")))?;
-        let wall_time = started.elapsed();
+        let wall_time =
+            native_preparation_wall_time(module_preparation, preparation.residual_wall_time)?;
         let report = NativeCpuProgramPreparationReport {
             capture_identity: self.capture_identity,
             native_identity: native_cpu_identity(
                 self.capture_identity,
-                vectorized,
+                plan.vectorized(),
                 capture.items.iter().map(|item| item.cache_key),
             ),
-            vectorized,
+            vectorized: plan.vectorized(),
             native_item_count: plan.item_count(),
             cache_hit_count: plan.cache_hit_count(),
             cache_miss_count: plan.cache_miss_count(),
@@ -5482,7 +5544,7 @@ impl CompiledEvaluationPlan {
         let prepared = PreparedNativeCpuEvaluation {
             report,
             plan,
-            parameter_inputs,
+            parameter_inputs: preparation.parameter_inputs,
         };
         prepared.validate(self.capture_identity, capture, parameter_buffers)?;
         Ok(prepared)
@@ -5735,12 +5797,11 @@ fn take_compiled_window_loss_value(
 }
 
 impl CpuCompiledTrainingProgram {
-    fn prepare_native(
+    fn preflight_native(
         &self,
-        executor: &CapturedReplayExecutor,
         vectorized: bool,
         external_learning_rate: bool,
-    ) -> Result<PreparedNativeCpuProgram> {
+    ) -> Result<(RecurrentNativePreparation, Duration)> {
         let started = Instant::now();
         let mut provided = zero_inputs(&self.inputs)?;
         if external_learning_rate {
@@ -5749,16 +5810,26 @@ impl CpuCompiledTrainingProgram {
                 TensorData::zeros_with_dtype(Shape::from([]), DType::F32)?,
             );
         }
-        let replay = self
+        let preparation = self
             .capture
-            .prepare_recurrent_native(&self.runtime, &self.cursor, &provided, executor, vectorized)
+            .preflight_recurrent_native(&self.runtime, &self.cursor, &provided, vectorized)
             .map_err(replay_error)?;
+        Ok((preparation, started.elapsed()))
+    }
+
+    fn finish_native(
+        &self,
+        preparation: RecurrentNativePreparation,
+        plan: PlannedNativeItems,
+        residual_wall_time: Duration,
+    ) -> Result<PreparedNativeCpuProgram> {
+        let replay = preparation.finish(plan).map_err(replay_error)?;
         let trace = replay.preparation_trace();
-        let wall_time = started.elapsed();
+        let wall_time = native_preparation_wall_time(trace.module, residual_wall_time)?;
         let report = NativeCpuProgramPreparationReport {
             capture_identity: self.capture_identity(),
             native_identity: trace.replay.identity,
-            vectorized,
+            vectorized: trace.replay.vectorized,
             native_item_count: trace.item_count,
             cache_hit_count: trace.cache_hit_count,
             cache_miss_count: trace.cache_miss_count,
@@ -6300,34 +6371,43 @@ impl CpuCompiledTrainingProgram {
         })
     }
 
-    fn prepare_native_auxiliary_transition(
+    fn preflight_native_auxiliary_transition(
         &self,
         transition: &CompiledAdamWAuxiliaryPlan,
-        executor: &CapturedReplayExecutor,
         vectorized: bool,
         external_learning_rate: bool,
-    ) -> Result<PreparedNativeCpuProgram> {
+    ) -> Result<(RecurrentNativePreparation, Duration)> {
         let started = Instant::now();
         let learning_rate = external_learning_rate
             .then(|| TensorData::zeros_with_dtype(Shape::from([]), DType::F32))
             .transpose()?;
         let prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
-        let replay = transition
+        let preparation = transition
             .capture
-            .prepare_recurrent_native(
+            .preflight_recurrent_native(
                 &self.runtime,
                 &prepared.cursor,
                 &prepared.provided,
-                executor,
                 vectorized,
             )
             .map_err(replay_error)?;
+        Ok((preparation, started.elapsed()))
+    }
+
+    fn finish_native_auxiliary_transition(
+        &self,
+        transition: &CompiledAdamWAuxiliaryPlan,
+        preparation: RecurrentNativePreparation,
+        plan: PlannedNativeItems,
+        residual_wall_time: Duration,
+    ) -> Result<PreparedNativeCpuProgram> {
+        let replay = preparation.finish(plan).map_err(replay_error)?;
         let trace = replay.preparation_trace();
-        let wall_time = started.elapsed();
+        let wall_time = native_preparation_wall_time(trace.module, residual_wall_time)?;
         let report = NativeCpuProgramPreparationReport {
             capture_identity: transition.capture_identity(),
             native_identity: trace.replay.identity,
-            vectorized,
+            vectorized: trace.replay.vectorized,
             native_item_count: trace.item_count,
             cache_hit_count: trace.cache_hit_count,
             cache_miss_count: trace.cache_miss_count,
@@ -8659,42 +8739,184 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
     ) -> Result<Self> {
         let external_learning_rate =
             matches!(&inner.learning_rate, CompiledLearningRatePolicy::External);
-        let main = inner
+        let mut drafts = Vec::with_capacity(
+            1 + usize::from(inner.partial_flush.is_some())
+                + usize::from(inner.zero_grad.is_some())
+                + usize::from(inner.evaluation.is_some()),
+        );
+        let (mut main_preparation, main_residual) = inner
             .inner
-            .prepare_native(executor, vectorized, external_learning_rate)?;
-        let partial_flush = inner
-            .partial_flush
-            .as_ref()
-            .map(|transition| {
-                inner.inner.prepare_native_auxiliary_transition(
-                    transition,
-                    executor,
-                    vectorized,
-                    external_learning_rate,
-                )
-            })
-            .transpose()?;
-        let zero_grad = inner
-            .zero_grad
-            .as_ref()
-            .map(|transition| {
-                inner
+            .preflight_native(vectorized, external_learning_rate)?;
+        {
+            let (pure, inputs) = main_preparation.pure_and_inputs();
+            drafts.push(
+                executor
+                    .preflight_native_items(pure, inputs)
+                    .map_err(replay_error)?,
+            );
+        }
+        main_preparation.release_input_witnesses();
+        let partial_flush_preparation = match inner.partial_flush.as_ref() {
+            Some(transition) => {
+                let (mut preparation, residual) =
+                    inner.inner.preflight_native_auxiliary_transition(
+                        transition,
+                        vectorized,
+                        external_learning_rate,
+                    )?;
+                {
+                    let (pure, inputs) = preparation.pure_and_inputs();
+                    drafts.push(
+                        executor
+                            .preflight_native_items(pure, inputs)
+                            .map_err(replay_error)?,
+                    );
+                }
+                preparation.release_input_witnesses();
+                Some((preparation, residual))
+            }
+            None => None,
+        };
+        let zero_grad_preparation = match inner.zero_grad.as_ref() {
+            Some(transition) => {
+                let (mut preparation, residual) = inner
                     .inner
-                    .prepare_native_auxiliary_transition(transition, executor, vectorized, false)
-            })
-            .transpose()?;
-        let evaluation = inner
-            .evaluation
-            .as_ref()
-            .map(|evaluation| {
-                evaluation.plan.prepare_native(
+                    .preflight_native_auxiliary_transition(transition, vectorized, false)?;
+                {
+                    let (pure, inputs) = preparation.pure_and_inputs();
+                    drafts.push(
+                        executor
+                            .preflight_native_items(pure, inputs)
+                            .map_err(replay_error)?,
+                    );
+                }
+                preparation.release_input_witnesses();
+                Some((preparation, residual))
+            }
+            None => None,
+        };
+        let evaluation_preparation = match inner.evaluation.as_ref() {
+            Some(evaluation) => {
+                let mut preparation = evaluation.plan.preflight_native(
                     inner.parameter_snapshots()?,
                     &inner.inner.parameter_buffers,
-                    executor,
-                    vectorized,
-                )
-            })
-            .transpose()?;
+                )?;
+                drafts.push(
+                    executor
+                        .preflight_native_items(
+                            evaluation.plan.inference.capture(),
+                            preparation
+                                .inputs
+                                .as_ref()
+                                .expect("native evaluation input witnesses are present"),
+                        )
+                        .map_err(replay_error)?,
+                );
+                preparation.inputs = None;
+                Some(preparation)
+            }
+            None => None,
+        };
+        let mut programs = Vec::with_capacity(drafts.len());
+        let mut drafts = drafts.into_iter();
+        programs.push((
+            main_preparation.pure(),
+            drafts
+                .next()
+                .expect("native main planning draft is present"),
+        ));
+        if let Some((preparation, _)) = &partial_flush_preparation {
+            programs.push((
+                preparation.pure(),
+                drafts
+                    .next()
+                    .expect("native partial-flush planning draft is present"),
+            ));
+        }
+        if let Some((preparation, _)) = &zero_grad_preparation {
+            programs.push((
+                preparation.pure(),
+                drafts
+                    .next()
+                    .expect("native zero-grad planning draft is present"),
+            ));
+        }
+        if let Some(evaluation) = inner.evaluation.as_ref() {
+            programs.push((
+                evaluation.plan.inference.capture(),
+                drafts
+                    .next()
+                    .expect("native evaluation planning draft is present"),
+            ));
+        }
+        debug_assert!(drafts.next().is_none());
+        let (plans, compilation) = executor
+            .plan_native_item_drafts(programs, vectorized)
+            .map_err(replay_error)?;
+        let mut plans = plans.into_iter();
+        let main = inner.inner.finish_native(
+            main_preparation,
+            plans
+                .next()
+                .ok_or_else(|| training("compiled native CPU main plan is absent"))?,
+            main_residual,
+        )?;
+        let partial_flush = match (inner.partial_flush.as_ref(), partial_flush_preparation) {
+            (Some(transition), Some((preparation, residual))) => {
+                Some(inner.inner.finish_native_auxiliary_transition(
+                    transition,
+                    preparation,
+                    plans.next().ok_or_else(|| {
+                        training("compiled native CPU partial-flush plan is absent")
+                    })?,
+                    residual,
+                )?)
+            }
+            (None, None) => None,
+            _ => {
+                return Err(training(
+                    "compiled native CPU partial-flush preparation differs",
+                ));
+            }
+        };
+        let zero_grad = match (inner.zero_grad.as_ref(), zero_grad_preparation) {
+            (Some(transition), Some((preparation, residual))) => Some(
+                inner.inner.finish_native_auxiliary_transition(
+                    transition,
+                    preparation,
+                    plans
+                        .next()
+                        .ok_or_else(|| training("compiled native CPU zero-grad plan is absent"))?,
+                    residual,
+                )?,
+            ),
+            (None, None) => None,
+            _ => {
+                return Err(training(
+                    "compiled native CPU zero-grad preparation differs",
+                ));
+            }
+        };
+        let evaluation = match (inner.evaluation.as_ref(), evaluation_preparation) {
+            (Some(evaluation), Some(preparation)) => Some(
+                evaluation.plan.finish_native(
+                    preparation,
+                    &inner.inner.parameter_buffers,
+                    plans
+                        .next()
+                        .ok_or_else(|| training("compiled native CPU evaluation plan is absent"))?,
+                )?,
+            ),
+            (None, None) => None,
+            _ => {
+                return Err(training(
+                    "compiled native CPU evaluation preparation differs",
+                ));
+            }
+        };
+        if plans.next().is_some() {
+            return Err(training("compiled native CPU plan inventory is excessive"));
+        }
         let (recurrent_state_count, recurrent_state_bytes) = checked_recurrent_state_extent(
             inner
                 .inner
@@ -8728,6 +8950,11 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 evaluation: evaluation_report,
                 recurrent_state_count,
                 recurrent_state_bytes,
+                parallel_module_overlap_wall_time: compilation.parallel_work_overlap_wall_time,
+                compiler_process_overlap_wall_time: compilation.compiler_process_overlap_wall_time,
+                compiler_process_count: compilation.compiler_process_count,
+                max_parallel_compiler_process_count: compilation
+                    .max_parallel_compiler_process_count,
             },
             successful_steps: 0,
             successful_flushes: 0,
@@ -12678,6 +12905,12 @@ mod tests {
         );
         assert_eq!(preparation.main().work().loaded_module_count(), 1);
         assert!(preparation.main().work().compiler_invocation_count() <= 1);
+        assert!(preparation.compiler_process_count() <= 1);
+        assert!(preparation.max_parallel_compiler_process_count() <= 1);
+        assert_eq!(
+            preparation.parallel_module_overlap_wall_time(),
+            Duration::ZERO
+        );
         let phases = preparation.main().phases();
         assert_eq!(
             phases
@@ -13165,6 +13398,13 @@ mod tests {
         let mut interpreted = plan.prepare_cpu().unwrap();
         assert!(native.preparation_report().partial_flush().is_some());
         assert!(native.preparation_report().zero_grad().is_some());
+        assert!(native.preparation_report().compiler_process_count() <= 3);
+        assert!(
+            native
+                .preparation_report()
+                .max_parallel_compiler_process_count()
+                <= 2
+        );
         for program in [
             Some(native.preparation_report().main()),
             native.preparation_report().partial_flush(),
