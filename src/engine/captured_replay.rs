@@ -884,6 +884,11 @@ impl PlannedNativeItems {
     }
 
     #[cfg(test)]
+    pub(crate) fn poison_outputs(&mut self, byte: u8) {
+        self.workspace.poison_outputs(byte);
+    }
+
+    #[cfg(test)]
     pub(crate) fn use_per_item_fallback(&mut self, index: usize) -> Result<(), ReplayError> {
         self.workspace.use_per_item_fallback(index)
     }
@@ -1892,6 +1897,7 @@ mod tests {
         assert_eq!(prepared.input_import_count, 0);
         assert_eq!(prepared.borrowed_external_input_bytes, 0);
         assert_eq!(prepared.intermediate_materialization_count, 0);
+        plan.poison_outputs(0xa5);
 
         let (first, first_traffic) = executor
             .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
@@ -1914,6 +1920,8 @@ mod tests {
         assert_eq!(first_stats.input_import_count, 0);
         assert_eq!(first_stats.borrowed_external_input_bytes, 8);
         assert_eq!(first_stats.intermediate_materialization_count, 0);
+        assert_eq!(first_stats.output_clear_count, 0);
+        assert_eq!(first_stats.skipped_output_clear_count, 1);
         assert_eq!(bindings["input"], input_value);
         assert_eq!(first.requested(&capture.requested).unwrap()[1], input_value);
         drop(bindings);
@@ -1921,6 +1929,7 @@ mod tests {
             "input".into(),
             TensorData::new([2], vec![3.0, -4.0]).unwrap(),
         )]);
+        plan.poison_outputs(0x5a);
         let (second, second_traffic) = executor
             .execute_planned_native_items_observed(&capture, &changed, &mut plan)
             .unwrap();
@@ -1962,6 +1971,49 @@ mod tests {
                 if message == "prepared native item count mismatch"
         ));
         assert_eq!(executor.native_item_plan_count(), 1);
+    }
+
+    #[test]
+    fn native_full_writer_retries_over_poisoned_vector_tail_without_clearing() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [5], DType::F32);
+        let output = graph.relu(input).unwrap();
+        let capture = captured(&graph, &[output]);
+        assert_eq!(capture.items.len(), 1);
+        let executor = CapturedReplayExecutor::default();
+        let original = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([5], vec![-2.0, -1.0, 0.0, 3.0, 4.0]).unwrap(),
+        )]);
+        let mut plan = executor
+            .plan_native_items(&capture, &original, true)
+            .unwrap();
+        assert!(plan.items[0].vector.enabled);
+        assert_eq!(plan.items[0].vector.lanes, 4);
+
+        plan.poison_outputs(0x7f);
+        plan.inject_dispatch_failure(0);
+        assert!(matches!(
+            executor.execute_planned_native_items(&capture, &original, &mut plan),
+            Err(ReplayError::Backend(reason)) if reason.contains("injected dispatcher failure")
+        ));
+
+        let changed = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([5], vec![5.0, -4.0, 3.0, -2.0, 1.0]).unwrap(),
+        )]);
+        let (retried, traffic) = executor
+            .execute_planned_native_items_observed(&capture, &changed, &mut plan)
+            .unwrap();
+        assert_eq!(
+            retried.requested(&capture.requested).unwrap()[0].storage(),
+            &Storage::F32(vec![5.0, 0.0, 3.0, 0.0, 1.0])
+        );
+        assert_eq!(traffic.executed_native_item_count, 1);
+        assert_eq!(traffic.skipped_output_clear_count, 1);
+        let stats = plan.workspace_stats();
+        assert_eq!(stats.output_clear_count, 0);
+        assert_eq!(stats.skipped_output_clear_count, 1);
     }
 
     #[test]
@@ -2049,6 +2101,48 @@ mod tests {
         );
         assert_eq!(traffic.module_dispatch_count, 1);
         assert_eq!(traffic.module_dispatched_native_item_count, 1);
+        let stats = plan.workspace_stats();
+        assert_eq!(stats.output_clear_count, 2);
+        assert_eq!(stats.skipped_output_clear_count, 0);
+    }
+
+    #[test]
+    fn native_module_tape_keeps_additive_scatter_zero_initialization() {
+        let mut graph = Graph::new();
+        let base = graph.input_dtype("base", [1, 3], DType::F32);
+        let index = graph.input_dtype("index", [1, 2], DType::I64);
+        let updates = graph.input_dtype("updates", [1, 2], DType::F32);
+        let output = graph.scatter_add(base, index, updates, 1).unwrap();
+        let capture = captured(&graph, &[output]);
+        let bindings = BTreeMap::from([
+            (
+                "base".into(),
+                TensorData::new([1, 3], vec![1.0, 2.0, 3.0]).unwrap(),
+            ),
+            (
+                "index".into(),
+                TensorData::from_scalars([1, 2], DType::I64, [2_i64, 0].map(Scalar::I)).unwrap(),
+            ),
+            (
+                "updates".into(),
+                TensorData::new([1, 2], vec![10.0, 20.0]).unwrap(),
+            ),
+        ]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        plan.poison_outputs(0x7f);
+        let actual = executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(
+            actual.requested(&capture.requested).unwrap()[0].storage(),
+            &Storage::F32(vec![21.0, 2.0, 13.0])
+        );
+        let stats = plan.workspace_stats();
+        assert_eq!(stats.output_clear_count, 1);
+        assert_eq!(stats.skipped_output_clear_count, 0);
     }
 
     #[test]

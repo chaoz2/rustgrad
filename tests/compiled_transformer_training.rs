@@ -4053,6 +4053,11 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     assert!(session.step(malformed, learning_rate()).is_err());
     for replay in 1..=3 {
         let step = session.step(batch(replay), learning_rate()).unwrap();
+        assert!(step.report().skipped_output_clear_count() > 0);
+        assert!(
+            step.report().skipped_output_clear_count()
+                <= step.report().executed_native_item_count()
+        );
         scoreboard.record(step.report()).unwrap();
     }
     let checkpoint = session.checkpoint().unwrap();

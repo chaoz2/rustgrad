@@ -33,6 +33,7 @@ struct WorkspaceItem {
     output: usize,
     elided: bool,
     dispatch: Option<PreparedScheduleDispatch>,
+    output_initialization: crate::cpu_jit::NativeOutputInitialization,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +51,7 @@ pub(crate) struct NativeReplayTraffic {
     pub(crate) executed_native_item_count: usize,
     pub(crate) module_dispatch_count: usize,
     pub(crate) module_dispatched_native_item_count: usize,
+    pub(crate) skipped_output_clear_count: usize,
 }
 
 /// Private scratch owned by one authenticated prepared native program.
@@ -82,6 +84,10 @@ pub(super) struct NativeReplayWorkspace {
     #[cfg(test)]
     affine_matmul_materialization_bytes: usize,
     #[cfg(test)]
+    output_clear_count: usize,
+    #[cfg(test)]
+    skipped_output_clear_count: usize,
+    #[cfg(test)]
     injected_dispatch_failure: Option<usize>,
 }
 
@@ -108,6 +114,8 @@ pub(crate) struct NativeReplayWorkspaceStats {
     pub(crate) borrowed_recurrent_output_bytes: usize,
     pub(crate) retained_transpose_matmul_input_count: usize,
     pub(crate) affine_matmul_materialization_bytes: usize,
+    pub(crate) output_clear_count: usize,
+    pub(crate) skipped_output_clear_count: usize,
 }
 
 impl NativeReplayWorkspace {
@@ -140,6 +148,10 @@ impl NativeReplayWorkspace {
             retained_transpose_matmul_input_count: 0,
             #[cfg(test)]
             affine_matmul_materialization_bytes: 0,
+            #[cfg(test)]
+            output_clear_count: 0,
+            #[cfg(test)]
+            skipped_output_clear_count: 0,
             #[cfg(test)]
             injected_dispatch_failure: None,
         };
@@ -232,6 +244,7 @@ impl NativeReplayWorkspace {
                 output: source,
                 elided: true,
                 dispatch: None,
+                output_initialization: crate::cpu_jit::NativeOutputInitialization::NeedsZero,
             });
             return Ok(());
         }
@@ -263,11 +276,15 @@ impl NativeReplayWorkspace {
         let dispatch = prepared
             .prepare_workspace_dispatch(item, &self.buffers, &slots, quantized)
             .map_err(backend_error)?;
+        let output_initialization = prepared
+            .output_initialization(item)
+            .map_err(backend_error)?;
         self.items.push(WorkspaceItem {
             slots,
             output: output_slot,
             elided: false,
             dispatch,
+            output_initialization,
         });
         Ok(())
     }
@@ -756,15 +773,7 @@ impl NativeReplayWorkspace {
                 self.prepare_slot(slot, borrowed)?;
             }
         }
-        self.valid[output] = false;
-        // Fresh per-item JIT buffers have historically been zero-filled;
-        // reductions and scatter-style kernels may rely on that initialization.
-        match borrowed.slots.get_mut(&output) {
-            Some(binding) => binding
-                .clear()
-                .map_err(|error| ReplayError::Backend(error.to_string()))?,
-            None => self.buffers[output].clear(),
-        }
+        self.initialize_output(index, borrowed)?;
         let execution = if borrowed.slots.is_empty() {
             backend
                 .execute_prepared_schedule_item_in_workspace(
@@ -800,12 +809,37 @@ impl NativeReplayWorkspace {
         Ok(())
     }
 
-    fn clear_output(
+    fn initialize_output(
         &mut self,
-        output: usize,
+        index: usize,
         borrowed: &mut NativeReplayBindings<'_>,
     ) -> Result<(), ReplayError> {
+        let (output, output_initialization) = self
+            .items
+            .get(index)
+            .map(|item| (item.output, item.output_initialization))
+            .ok_or_else(|| {
+                ReplayError::Corrupt("native workspace initialization item is absent".into())
+            })?;
         self.valid[output] = false;
+        if output_initialization == crate::cpu_jit::NativeOutputInitialization::FullyOverwritten {
+            self.current_traffic.skipped_output_clear_count = self
+                .current_traffic
+                .skipped_output_clear_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ReplayError::Descriptor("native skipped output clear count overflows".into())
+                })?;
+            #[cfg(test)]
+            {
+                self.skipped_output_clear_count = self.skipped_output_clear_count.saturating_add(1);
+            }
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            self.output_clear_count = self.output_clear_count.saturating_add(1);
+        }
         match borrowed.slots.get_mut(&output) {
             Some(binding) => binding
                 .clear()
@@ -880,8 +914,7 @@ impl NativeReplayWorkspace {
             produced.insert(output);
         }
         for &index in indices {
-            let output = self.items[index].output;
-            self.clear_output(output, borrowed)?;
+            self.initialize_output(index, borrowed)?;
         }
 
         let next_dispatch_count = self
@@ -1054,6 +1087,16 @@ impl NativeReplayWorkspace {
     }
 
     #[cfg(test)]
+    pub(super) fn poison_outputs(&mut self, byte: u8) {
+        for item in &self.items {
+            if !item.elided {
+                self.buffers[item.output].bytes_mut().fill(byte);
+                self.valid[item.output] = false;
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(super) const fn last_module_dispatch_counts(&self) -> (usize, usize) {
         (
             self.current_traffic.module_dispatch_count,
@@ -1140,6 +1183,8 @@ impl NativeReplayWorkspace {
             borrowed_recurrent_output_bytes: self.borrowed_recurrent_output_bytes,
             retained_transpose_matmul_input_count: self.retained_transpose_matmul_input_count,
             affine_matmul_materialization_bytes: self.affine_matmul_materialization_bytes,
+            output_clear_count: self.output_clear_count,
+            skipped_output_clear_count: self.skipped_output_clear_count,
         }
     }
 }

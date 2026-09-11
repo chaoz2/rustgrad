@@ -1614,6 +1614,7 @@ pub struct NativeCpuRunReport {
     executed_native_item_count: usize,
     module_dispatch_count: usize,
     module_dispatched_native_item_count: usize,
+    skipped_output_clear_count: usize,
     schedule_cache_keys: Vec<u64>,
     traffic: NativeCpuReplayTraffic,
     executor_wall_time: Duration,
@@ -1663,6 +1664,12 @@ impl NativeCpuRunReport {
     /// metadata rather than the conservative per-item binding path.
     pub const fn module_dispatched_native_item_count(&self) -> usize {
         self.module_dispatched_native_item_count
+    }
+
+    /// Output clears skipped because the prepared native kernel is
+    /// authenticated as fully overwriting every output lane on success.
+    pub const fn skipped_output_clear_count(&self) -> usize {
+        self.skipped_output_clear_count
     }
 
     /// Strict replay never executes an interpreter fallback item.
@@ -5461,12 +5468,13 @@ impl CompiledEvaluationPlan {
             executed_native_item_count: traffic.executed_native_item_count,
             module_dispatch_count: traffic.module_dispatch_count,
             module_dispatched_native_item_count: traffic.module_dispatched_native_item_count,
+            skipped_output_clear_count: traffic.skipped_output_clear_count,
             schedule_cache_keys,
             traffic: native_cpu_replay_traffic(traffic),
             executor_wall_time,
             wall_time,
         };
-        debug_assert!(validate_native_cpu_run_timing(&report).is_ok());
+        debug_assert!(validate_native_cpu_run_report(&report).is_ok());
         Ok((
             evaluation_result(
                 outputs,
@@ -5533,16 +5541,22 @@ fn native_cpu_run_report(
         executed_native_item_count: traffic.executed_native_item_count,
         module_dispatch_count: traffic.module_dispatch_count,
         module_dispatched_native_item_count: traffic.module_dispatched_native_item_count,
+        skipped_output_clear_count: traffic.skipped_output_clear_count,
         schedule_cache_keys: trace.pure_item_cache_keys.clone(),
         traffic: native_cpu_replay_traffic(traffic),
         executor_wall_time,
         wall_time,
     };
-    debug_assert!(validate_native_cpu_run_timing(&report).is_ok());
+    debug_assert!(validate_native_cpu_run_report(&report).is_ok());
     report
 }
 
-fn validate_native_cpu_run_timing(report: &NativeCpuRunReport) -> Result<()> {
+fn validate_native_cpu_run_report(report: &NativeCpuRunReport) -> Result<()> {
+    if report.skipped_output_clear_count > report.executed_native_item_count {
+        return Err(training(
+            "native CPU skipped output clear count exceeds executed items",
+        ));
+    }
     report
         .wall_time
         .checked_sub(report.executor_wall_time)
@@ -12434,6 +12448,11 @@ mod tests {
         assert!(
             actual.report().executed_native_item_count() <= actual.report().native_item_count()
         );
+        assert!(actual.report().skipped_output_clear_count() > 0);
+        assert!(
+            actual.report().skipped_output_clear_count()
+                <= actual.report().executed_native_item_count()
+        );
         assert!(actual.report().module_dispatch_count() > 0);
         assert_eq!(
             actual.report().module_dispatched_native_item_count(),
@@ -12626,11 +12645,15 @@ mod tests {
         malformed_report.executed_native_item_count = malformed_report.native_item_count + 1;
         assert!(scoreboard.record(&malformed_report).is_err());
         let mut malformed_report = actual.report().clone();
+        malformed_report.skipped_output_clear_count =
+            malformed_report.executed_native_item_count + 1;
+        assert!(validate_native_cpu_run_report(&malformed_report).is_err());
+        let mut malformed_report = actual.report().clone();
         malformed_report.executor_wall_time = malformed_report
             .wall_time
             .checked_add(Duration::from_nanos(1))
             .unwrap();
-        assert!(validate_native_cpu_run_timing(&malformed_report).is_err());
+        assert!(validate_native_cpu_run_report(&malformed_report).is_err());
         assert!(scoreboard.record(&malformed_report).is_err());
         scoreboard.record(actual.report()).unwrap();
         assert_native_adamw_state_close(&native, &interpreted);
@@ -13083,6 +13106,7 @@ mod tests {
             used_reset_workspace.borrowed_recurrent_output_bytes
         );
         assert_eq!(used_reset_workspace.intermediate_materialization_count, 0);
+        assert!(used_reset_workspace.skipped_output_clear_count > 0);
 
         let before_empty_reset = native.checkpoint().unwrap();
         let before_empty_reset_counts = native_recurrent_test_counts(&native);
@@ -13140,6 +13164,7 @@ mod tests {
                 <= actual.report().unwrap().native_item_count()
         );
         assert!(actual.report().unwrap().module_dispatch_count() > 0);
+        assert!(actual.report().unwrap().skipped_output_clear_count() > 0);
         assert_eq!(
             actual
                 .report()
@@ -13365,6 +13390,7 @@ mod tests {
                 <= evaluation.report().native_item_count()
         );
         assert!(evaluation.report().module_dispatch_count() > 0);
+        assert!(evaluation.report().skipped_output_clear_count() > 0);
         assert_eq!(
             evaluation.report().module_dispatched_native_item_count(),
             evaluation.report().executed_native_item_count()

@@ -106,6 +106,16 @@ pub struct RenderedC {
     pub abi: KernelAbi,
     pub cache_key: String,
 }
+
+/// Private initialization contract for one successfully completed native
+/// kernel call. Unknown, reduction, and update-style renderers deliberately
+/// retain the historical zero-filled output contract.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub(crate) enum NativeOutputInitialization {
+    #[default]
+    NeedsZero,
+    FullyOverwritten,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VectorPlan {
     pub lanes: usize,
@@ -1147,6 +1157,61 @@ impl JitScheduleDispatcher {
 
 fn render(root: &UOp) -> Result<RenderedC, JitError> {
     render_with_policy(root, false)
+}
+
+/// Derives output write coverage from the same typed operation families and
+/// dense Store shape used by the native renderers. This never inspects emitted
+/// C and therefore cannot be fooled by spelling or formatting changes.
+pub(crate) fn native_output_initialization(root: &UOp) -> NativeOutputInitialization {
+    use NativeOutputInitialization::{FullyOverwritten, NeedsZero};
+
+    match root.operation() {
+        Operation::Matmul(_)
+        | Operation::Conv2d(_)
+        | Operation::Random(_)
+        | Operation::Threefry(_) => FullyOverwritten,
+        Operation::Movement(MovementValue::QuantizedRowGather(_)) => FullyOverwritten,
+        Operation::Movement(MovementValue::Plan(plan)) => match &plan.kind {
+            crate::MovementKernelKind::AffineCopy { .. }
+            | crate::MovementKernelKind::Pad { .. }
+            | crate::MovementKernelKind::Concat { .. }
+            | crate::MovementKernelKind::Gather { .. }
+            | crate::MovementKernelKind::Bitcast { .. }
+            | crate::MovementKernelKind::Contiguous { .. } => FullyOverwritten,
+            crate::MovementKernelKind::Scatter { .. }
+            | crate::MovementKernelKind::ScatterPositions { .. } => NeedsZero,
+        },
+        Operation::Sink if dense_assignment_fully_overwrites(root) => FullyOverwritten,
+        _ => NeedsZero,
+    }
+}
+
+fn dense_assignment_fully_overwrites(root: &UOp) -> bool {
+    let Ok(nodes) = root.topological() else {
+        return false;
+    };
+    if nodes.iter().any(|node| {
+        matches!(
+            node.operation(),
+            Operation::ReduceInit(_) | Operation::ReduceAccumulate | Operation::ReduceFinalize
+        )
+    }) {
+        return false;
+    }
+    let mut stores = root
+        .sources()
+        .iter()
+        .filter(|node| matches!(node.operation(), Operation::Store));
+    let Some(store) = stores.next() else {
+        return false;
+    };
+    if stores.next().is_some() {
+        return false;
+    }
+    store
+        .sources()
+        .first()
+        .is_some_and(|index| linear_store_iteration(index).is_ok())
 }
 fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
     if matches!(

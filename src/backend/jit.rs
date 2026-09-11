@@ -69,7 +69,7 @@ pub struct CpuJitBackend {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct NativeScheduleWrapperKey {
     artifact: String,
-    entries: Vec<String>,
+    entries: Vec<(String, crate::cpu_jit::NativeOutputInitialization)>,
 }
 #[derive(Clone)]
 struct NativeScheduleModule {
@@ -84,6 +84,7 @@ pub(crate) struct PreparedScheduleItem {
     pub(crate) vector: VectorPlan,
     schedule_cache_key: u64,
     native_layout: NativeScheduleLayout,
+    output_initialization: crate::cpu_jit::NativeOutputInitialization,
 }
 
 /// Immutable dispatch metadata for one entry in an authenticated retained
@@ -121,7 +122,25 @@ impl PreparedScheduleItem {
         item: &ScheduleItem,
         layout: &NativeScheduleLayout,
     ) -> bool {
-        self.schedule_cache_key == item.cache_key && &self.native_layout == layout
+        self.schedule_cache_key == item.cache_key
+            && &self.native_layout == layout
+            && self.output_initialization
+                == crate::cpu_jit::native_output_initialization(&item.kernel)
+    }
+
+    pub(crate) fn output_initialization(
+        &self,
+        item: &ScheduleItem,
+    ) -> Result<crate::cpu_jit::NativeOutputInitialization, JitBackendError> {
+        if self.schedule_cache_key != item.cache_key
+            || self.output_initialization
+                != crate::cpu_jit::native_output_initialization(&item.kernel)
+        {
+            return Err(JitBackendError::Binding(
+                "prepared native output initialization mismatch".into(),
+            ));
+        }
+        Ok(self.output_initialization)
     }
 
     pub(crate) fn retained_matmul_source(
@@ -804,6 +823,7 @@ impl CpuJitBackend {
             vector,
             schedule_cache_key: item.cache_key,
             native_layout,
+            output_initialization: crate::cpu_jit::native_output_initialization(&item.kernel),
         })
     }
 
@@ -822,6 +842,7 @@ impl CpuJitBackend {
             rendered: crate::cpu_jit::RenderedC,
             native_cache_key: String,
             layout: NativeScheduleLayout,
+            output_initialization: crate::cpu_jit::NativeOutputInitialization,
         }
         let entries = items
             .iter()
@@ -837,6 +858,9 @@ impl CpuJitBackend {
                     rendered,
                     native_cache_key,
                     layout,
+                    output_initialization: crate::cpu_jit::native_output_initialization(
+                        &item.kernel,
+                    ),
                 })
             })
             .collect::<Result<Vec<_>, JitBackendError>>()?;
@@ -848,13 +872,14 @@ impl CpuJitBackend {
             .map(|entry| entry.rendered.clone())
             .collect::<Vec<_>>();
         // The durable binary is source/compiler-addressed, but these wrappers
-        // also carry the current schedule's concrete buffer ABI. Do not let an
-        // isomorphic capture reuse wrappers authenticated for different IDs.
+        // also carry the current schedule's concrete buffer ABI and typed
+        // output-initialization contract. Do not let an isomorphic capture
+        // reuse wrappers authenticated for different IDs or write coverage.
         let module_key = NativeScheduleWrapperKey {
             artifact: crate::cpu_jit::schedule_module_cache_key(&rendered),
             entries: entries
                 .iter()
-                .map(|entry| entry.native_cache_key.clone())
+                .map(|entry| (entry.native_cache_key.clone(), entry.output_initialization))
                 .collect(),
         };
         let cached_module = self
@@ -916,6 +941,7 @@ impl CpuJitBackend {
                 vector: entry.vector,
                 schedule_cache_key: item.cache_key,
                 native_layout: entry.layout,
+                output_initialization: entry.output_initialization,
             });
         }
         Ok((
@@ -1234,6 +1260,44 @@ fn jit_error(e: JitError) -> JitBackendError {
 mod tests {
     use super::*;
     use crate::{DType, Scalar, Shape};
+
+    #[test]
+    fn native_output_initialization_is_typed_and_fail_closed() {
+        for len in [0usize, 5] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [len], DType::F32);
+            let output = graph.relu(input).unwrap();
+            let schedule = crate::schedule(&graph, output).unwrap();
+            assert_eq!(schedule.items.len(), 1);
+            assert_eq!(
+                crate::cpu_jit::native_output_initialization(&schedule.items[0].kernel),
+                crate::cpu_jit::NativeOutputInitialization::FullyOverwritten
+            );
+        }
+
+        let mut reduction = Graph::new();
+        let input = reduction.input_dtype("input", [2, 3], DType::F32);
+        let output = reduction.sum(input, 1).unwrap();
+        let schedule = crate::schedule(&reduction, output).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(
+            crate::cpu_jit::native_output_initialization(&schedule.items[0].kernel),
+            crate::cpu_jit::NativeOutputInitialization::NeedsZero
+        );
+
+        let mut scatter = Graph::new();
+        let base = scatter.input_dtype("base", [1, 3], DType::F32);
+        let index = scatter.input_dtype("index", [1, 2], DType::I64);
+        let updates = scatter.input_dtype("updates", [1, 2], DType::F32);
+        let output = scatter.scatter_add(base, index, updates, 1).unwrap();
+        let schedule = crate::schedule(&scatter, output).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        assert_eq!(
+            crate::cpu_jit::native_output_initialization(&schedule.items[0].kernel),
+            crate::cpu_jit::NativeOutputInitialization::NeedsZero
+        );
+    }
+
     #[test]
     fn native_graph_boundary_matches_oracle_and_caches() {
         let mut g = Graph::new();
