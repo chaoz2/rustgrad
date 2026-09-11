@@ -952,7 +952,10 @@ mixed staging and single `EffectRuntime` commit with interpreter fallback
 disabled. Each attached schedule renders its ordered native entries once and
 loads them as uniquely named functions in one content-addressed shared module;
 preparation also authenticates an immutable workspace tape for fixed ABI slots,
-derived affine reads, output clearing, and quantized resources. Replay binds
+derived affine reads, typed output-initialization coverage, and quantized
+resources. Proven dense full writers skip the retained output clear; reduction,
+scatter, prefix-scan, and unknown families keep the conservative zero-filled
+contract. Replay binds
 external and recurrent pointers only for the synchronous call, dispatches
 admitted contiguous tape segments through those existing module entries, and
 uses the conservative per-item path around any entry that cannot join a segment.
@@ -969,9 +972,9 @@ transaction admission; generic artifact replay retains full per-call artifact
 validation. Its typed preparation/run reports expose only CPU facts: native item
 and cache counts, rendered entries, loaded modules, durable artifact hits/misses,
 actual compiler invocations, per-run module segment/entry dispatch counts,
-static execution summaries, recurrent logical
-bytes, stable capture/native identities, and call-local wall times excluded from
-identity.
+successful full-writer clear-elision counts, static execution summaries,
+recurrent logical bytes, stable capture/native identities, and call-local wall
+times excluded from identity.
 Unsupported preparation and failed execution or commit publish neither state
 nor progress; checkpoint bytes and capture identity are shared with the
 interpreter and strict-Metal targets.
