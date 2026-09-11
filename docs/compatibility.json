@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:a63072203c9086b5",
+  "source_fingerprint": "fnv1a64:44617b29313097e8",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -441,7 +441,7 @@
       "subject": "Compiled in-session evaluation",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CompiledModuleAdamWPlan::with_evaluation` attaches one pure fixed-shape scalar evaluation capture to the exact owned training/module lifecycle. Its backward-compatible results report aggregation weight one. The opt-in `with_evaluation_graph` reuses `CompiledAdamWGraph` and the training plan's authenticated scalar/token-mean policy; CPU token-mean evaluation owns `sum(mask * losses) / sum(mask)` and reports the exact validated live-token count for variable-length aggregation. Invalid masks reject before replay and remain retryable. Interpreter CPU evaluation binds current runtime parameter snapshots; strict-native CPU evaluation instead authenticates and borrows the active recurrent parameter bank for one synchronous replay with no parameter snapshot or state commit, while strict Metal continues to support the legacy scalar evaluator and aliases the active epoch parameter bank with no trainable-parameter H2D/D2H. Evaluation changes no replay, optimizer, accumulator, dropout, checkpoint, module-version, epoch, or training-scoreboard state. The maintained two-row Transformer evaluates its three fixed microbatches before consuming finish and checks the published module against that result. Dynamic evaluation shapes, independent evaluator ownership, validation dataloaders, distributed metrics, and asynchronous overlap remain out of scope."
+        "Acceptance requirement": "`CompiledModuleAdamWPlan::with_evaluation` attaches one pure fixed-shape scalar evaluation capture to the exact owned training/module lifecycle. Its backward-compatible results report aggregation weight one. The opt-in `with_evaluation_graph` reuses `CompiledAdamWGraph` and the training plan's authenticated scalar/token-mean policy; CPU token-mean evaluation owns `sum(mask * losses) / sum(mask)` and reports the exact validated live-token count for variable-length aggregation. Invalid masks reject before replay and remain retryable. Interpreter CPU evaluation binds current runtime parameter snapshots; strict-native CPU evaluation instead authenticates and borrows the active recurrent parameter bank for one synchronous replay with no parameter snapshot or state commit, while strict Metal continues to support the legacy scalar evaluator and aliases the active epoch parameter bank with no trainable-parameter H2D/D2H. Evaluation changes no replay, optimizer, accumulator, dropout, checkpoint, module-version, epoch, or training-scoreboard state. The maintained two-row Transformer evaluates its three fixed microbatches before consuming finish and checks the published module against that result. Complete-module checkpoints without evaluation retain exact v1 envelopes; an attached evaluator emits v2 with its capture identity, and fresh-module restoration rejects preparation until that exact evaluator is attached while retaining missing or mismatched plans for retry. Dynamic evaluation shapes, independent evaluator ownership, validation dataloaders, distributed metrics, and asynchronous overlap remain out of scope."
       }
     },
     {

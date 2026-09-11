@@ -9,16 +9,16 @@ use rustgrad::runtime::metal::{
 use rustgrad::{
     Backend, BinaryOp, CapturedReplayExecutor, CapturedReplayOptions, CapturedSchedule, CompareOp,
     CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWFlush, CompiledAdamWFlushRuntime,
-    CompiledAdamWGraph, CompiledAdamWPlan, CompiledAdamWRuntime, CompiledAdamWStep,
-    CompiledAdamWStepResult, CompiledAdamWWindowLossReport, CompiledCheckpointRuntime,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
-    CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan, CompiledMultiStepLr,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
-    CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions, MetalCompiledAdamWPlan,
-    Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget,
-    NativeTrainingReport, NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result,
-    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy,
-    load_safetensors, save_safetensors, schedule_many,
+    CompiledAdamWGraph, CompiledAdamWObjective, CompiledAdamWPlan, CompiledAdamWRuntime,
+    CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWWindowLossReport,
+    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
+    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan,
+    CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
+    CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions,
+    MetalCompiledAdamWPlan, Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult,
+    NativeCpuSessionTarget, NativeTrainingReport, NativeTrainingScoreboard, NodeId, Op, Parameter,
+    Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
+    UnaryOp, cross_entropy, load_safetensors, save_safetensors, schedule_many,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -304,6 +304,23 @@ impl TwoBlockPositionalGpt {
         dropout: &mut dyn TrainingDropoutProvider,
     ) -> Result<NodeId> {
         self.forward_with_optional_attention_mask(graph, tokens, Some(attention_mask), dropout)
+    }
+
+    fn forward_eval(&self, graph: &mut Graph, tokens: NodeId) -> Result<NodeId> {
+        let token_hidden = self.tokens.forward(graph, tokens)?;
+        let positions = graph.constant(TensorData::from_scalars(
+            [BATCH, TIME],
+            DType::I32,
+            [0, 1, 2, 0, 1, 2].into_iter().map(Scalar::I),
+        )?);
+        let position_hidden = self.positions.forward(graph, positions)?;
+        let hidden = graph.add(token_hidden, position_hidden)?;
+        let hidden = self.first.forward_mode(graph, hidden, Mode::Eval)?.output;
+        let hidden = self.second.forward_mode(graph, hidden, Mode::Eval)?.output;
+        let hidden = self.norm.forward(graph, hidden)?;
+        let tied_weight = self.tokens.weight.bind(graph)?;
+        let tied_weight = graph.permute(tied_weight, [1, 0])?;
+        graph.matmul(hidden, tied_weight)
     }
 
     fn forward_with_optional_attention_mask(
@@ -690,6 +707,34 @@ fn build_two_block_with_attention_dropout(
     let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
     let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
     Ok((graph.add(loss, guard)?, outputs))
+}
+
+fn build_two_block_checkpoint_evaluation(
+    model: &TwoBlockPositionalGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+) -> Result<CompiledAdamWGraph> {
+    let logits = model.forward_eval(graph, inputs["tokens"])?;
+    let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
+    let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
+    let loss = graph.add(loss, guard)?;
+    Ok(CompiledAdamWGraph::scalar(
+        loss,
+        BTreeMap::from([("logits".into(), logits)]),
+    ))
+}
+
+fn build_wrong_two_block_checkpoint_evaluation(
+    model: &TwoBlockPositionalGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+) -> Result<CompiledAdamWGraph> {
+    let evaluation = build_two_block_checkpoint_evaluation(model, graph, inputs)?;
+    let (objective, outputs) = evaluation.into_parts();
+    let CompiledAdamWObjective::Scalar(loss) = objective else {
+        unreachable!("the checkpoint evaluator is scalar")
+    };
+    Ok(CompiledAdamWGraph::scalar(graph.neg(loss)?, outputs))
 }
 
 fn build_two_block_with_attention_mask(
@@ -5640,9 +5685,14 @@ fn compiled_two_block_module_checkpoint_restores_different_immutable_state() {
             Ok(CompiledAdamWGraph::scalar(loss, outputs))
         },
     )
+    .unwrap()
+    .with_evaluation_graph(build_two_block_checkpoint_evaluation)
     .unwrap();
     assert_eq!(source_compile_count.get(), 1);
     let capture_identity = source_plan.capture_identity();
+    let evaluation_capture_identity = source_plan
+        .evaluation_capture_identity()
+        .expect("the source lifecycle has an evaluator");
     let mut uninterrupted = source_plan
         .prepare(
             &CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition),
@@ -5656,6 +5706,18 @@ fn compiled_two_block_module_checkpoint_restores_different_immutable_state() {
     assert_eq!(
         module_checkpoint.optimizer_checkpoint(),
         &uninterrupted.checkpoint().unwrap()
+    );
+    let module_checkpoint =
+        rustgrad::CompiledModuleAdamWCheckpoint::from_bytes(module_checkpoint.as_bytes().to_vec())
+            .unwrap();
+    let (_, module_checkpoint_metadata) = load_safetensors(module_checkpoint.as_bytes()).unwrap();
+    assert_eq!(
+        module_checkpoint_metadata.get("format").map(String::as_str),
+        Some("rustgrad-compiled-module-adamw-v2")
+    );
+    assert_eq!(
+        module_checkpoint.evaluation_capture_identity(),
+        Some(evaluation_capture_identity)
     );
 
     let wrong_policy =
@@ -5732,6 +5794,54 @@ fn compiled_two_block_module_checkpoint_restores_different_immutable_state() {
         assert_eq!(after.data, before.data);
     }
 
+    let missing_evaluation = match restored_plan.prepare(
+        &CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition),
+    ) {
+        Ok(_) => panic!("a v2 module checkpoint prepared without its evaluator"),
+        Err(error) => error,
+    };
+    assert!(
+        missing_evaluation
+            .source_error()
+            .to_string()
+            .contains("requires its authenticated evaluation capture")
+    );
+    let restored_plan = missing_evaluation.into_plan();
+    for (_, parameter, _, before) in &destination_states {
+        let after = parameter.snapshot().unwrap();
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.trainable, before.trainable);
+        assert_eq!(after.data, before.data);
+    }
+
+    let wrong_evaluation =
+        match restored_plan.with_evaluation_graph(build_wrong_two_block_checkpoint_evaluation) {
+            Ok(_) => panic!("a different evaluator matched the module checkpoint"),
+            Err(error) => error,
+        };
+    assert!(
+        wrong_evaluation
+            .source_error()
+            .to_string()
+            .contains("evaluation capture identity mismatch")
+    );
+    let restored_plan = wrong_evaluation.into_plan();
+    for (_, parameter, _, before) in &destination_states {
+        let after = parameter.snapshot().unwrap();
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.trainable, before.trainable);
+        assert_eq!(after.data, before.data);
+    }
+    let restored_plan = restored_plan
+        .with_evaluation_graph(build_two_block_checkpoint_evaluation)
+        .unwrap();
+    assert_eq!(
+        restored_plan.evaluation_capture_identity(),
+        Some(evaluation_capture_identity)
+    );
+
     let mut resumed = restored_plan
         .prepare(
             &CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition),
@@ -5741,10 +5851,25 @@ fn compiled_two_block_module_checkpoint_restores_different_immutable_state() {
         resumed.checkpoint().unwrap(),
         uninterrupted.checkpoint().unwrap()
     );
+    assert_eq!(resumed.module_checkpoint().unwrap(), module_checkpoint);
     assert_eq!(
         resumed.dropout_block_counter().unwrap(),
         uninterrupted.dropout_block_counter().unwrap()
     );
+    let before_evaluation = uninterrupted.checkpoint().unwrap();
+    let expected_evaluation = uninterrupted
+        .evaluate(attention_dropout_batch(1.0))
+        .unwrap();
+    let actual_evaluation = resumed.evaluate(attention_dropout_batch(1.0)).unwrap();
+    assert_eq!(actual_evaluation.loss(), expected_evaluation.loss());
+    assert_eq!(actual_evaluation.outputs(), expected_evaluation.outputs());
+    assert_eq!(actual_evaluation.loss_weight(), 1);
+    assert_eq!(
+        actual_evaluation.capture_identity(),
+        evaluation_capture_identity
+    );
+    assert_eq!(uninterrupted.checkpoint().unwrap(), before_evaluation);
+    assert_eq!(resumed.checkpoint().unwrap(), before_evaluation);
     let uninterrupted_step = uninterrupted
         .step(attention_dropout_batch(1.0), TensorData::scalar(1e-3))
         .unwrap();

@@ -3284,6 +3284,7 @@ pub struct CompiledModuleAdamWPlan<M> {
     module: M,
     plan: CompiledAdamWPlan,
     seal: CompiledModuleSeal,
+    required_evaluation_capture_identity: Option<u64>,
 }
 
 /// Prepared compiled AdamW session that owns its source module for the complete
@@ -3292,6 +3293,7 @@ pub struct CompiledModuleAdamWSession<M, R> {
     module: M,
     runtime: R,
     seal: CompiledModuleSeal,
+    evaluation_capture_identity: Option<u64>,
 }
 
 /// Recoverable compilation failure retaining the exact uncompiled module.
@@ -7314,7 +7316,12 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             Ok((plan, seal))
         })();
         match result {
-            Ok((plan, seal)) => Ok(Self { module, plan, seal }),
+            Ok((plan, seal)) => Ok(Self {
+                module,
+                plan,
+                seal,
+                required_evaluation_capture_identity: None,
+            }),
             Err(source) => Err(CompiledModuleAdamWCompileError { module, source }),
         }
     }
@@ -7328,8 +7335,9 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
     where
         F: FnOnce(&M, ModuleParameterPlan) -> Result<CompiledAdamWPlan>,
     {
-        let result: Result<(CompiledAdamWPlan, CompiledModuleSeal)> = (|| {
+        let result: Result<(CompiledAdamWPlan, CompiledModuleSeal, Option<u64>)> = (|| {
             let decoded = decode_module_adamw_checkpoint(checkpoint.as_bytes())?;
+            let required_evaluation_capture_identity = decoded.evaluation_capture_identity;
             let mut seal = CompiledModuleSeal::capture(&module, &config.frozen_parameters)?;
             let immutable_values = seal.apply_module_checkpoint(&decoded)?;
             let parameter_plan = ModuleParameterPlan::new(&module, &config.frozen_parameters)?
@@ -7337,12 +7345,38 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             let plan = build(&module, parameter_plan)?
                 .restore_checkpoint(checkpoint.optimizer_checkpoint())?;
             seal.validate_unchanged(&module)?;
-            Ok((plan, seal))
+            Ok((plan, seal, required_evaluation_capture_identity))
         })();
         match result {
-            Ok((plan, seal)) => Ok(Self { module, plan, seal }),
+            Ok((plan, seal, required_evaluation_capture_identity)) => Ok(Self {
+                module,
+                plan,
+                seal,
+                required_evaluation_capture_identity,
+            }),
             Err(source) => Err(CompiledModuleAdamWCompileError { module, source }),
         }
+    }
+
+    fn authenticate_restored_evaluation(&self, evaluation: &CompiledEvaluationPlan) -> Result<()> {
+        if let Some(expected) = self.required_evaluation_capture_identity
+            && evaluation.capture_identity != expected
+        {
+            return Err(training(
+                "compiled module checkpoint evaluation capture identity mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_ready_for_preparation(&self) -> Result<()> {
+        self.seal.validate_unchanged(&self.module)?;
+        if self.required_evaluation_capture_identity.is_some() {
+            return Err(training(
+                "compiled module checkpoint requires its authenticated evaluation capture",
+            ));
+        }
+        Ok(())
     }
 
     /// Compiles AdamW from, and takes ownership of, one exact module value.
@@ -7429,7 +7463,9 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
     ///
     /// Saved frozen parameters and buffers are used as capture constants.
     /// Destination topology, ties, kinds, and source trainability must match;
-    /// optimizer and immutable values are published together only by finish.
+    /// optimizer and immutable values are published together only by finish. A
+    /// v2 checkpoint carrying an evaluator identity must attach that exact
+    /// evaluator before target preparation.
     pub fn compile_graph_from_module_checkpoint<F>(
         config: CompiledAdamWConfig,
         module: M,
@@ -7457,6 +7493,8 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
 
     /// Recompiles a recurrent-dropout unified owned module program from a
     /// complete module checkpoint without mutating the destination module.
+    /// A v2 checkpoint carrying an evaluator identity must attach that exact
+    /// evaluator before target preparation.
     pub fn compile_graph_with_dropout_from_module_checkpoint<F>(
         config: CompiledAdamWConfig,
         dropout: CompiledDropoutConfig,
@@ -7588,7 +7626,9 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
     /// Attaches one read-only evaluation capture to this exact owned plan.
     /// The evaluator reuses the training input schema and live canonical
     /// trainable frontier; frozen parameters and buffers remain capture-owned
-    /// constants. Failure retains the unconsumed plan for retry or recovery.
+    /// constants. When fresh-module restoration requires a v2-authenticated
+    /// evaluator, a different capture identity rejects without consuming the
+    /// plan. Failure retains the unconsumed plan for retry or recovery.
     pub fn with_evaluation<F>(
         mut self,
         build: F,
@@ -7613,11 +7653,13 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 build,
             )?;
             self.seal.validate_unchanged(&self.module)?;
+            self.authenticate_restored_evaluation(&evaluation)?;
             Ok(evaluation)
         })();
         match result {
             Ok(evaluation) => {
                 self.plan.evaluation = Some(evaluation);
+                self.required_evaluation_capture_identity = None;
                 Ok(self)
             }
             Err(source) => Err(CompiledModuleAdamWEvaluationError {
@@ -7635,6 +7677,8 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
     /// the exact validated token count for weighted aggregation. Invalid masks
     /// fail before replay. The legacy [`Self::with_evaluation`] scalar surface
     /// remains behavior-compatible, including on token-weighted training plans.
+    /// A v2-authenticated fresh-module restore accepts only the saved evaluator
+    /// identity and retains the plan for retry on mismatch.
     pub fn with_evaluation_graph<F>(
         mut self,
         build: F,
@@ -7655,11 +7699,13 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 build,
             )?;
             self.seal.validate_unchanged(&self.module)?;
+            self.authenticate_restored_evaluation(&evaluation)?;
             Ok(evaluation)
         })();
         match result {
             Ok(evaluation) => {
                 self.plan.evaluation = Some(evaluation);
+                self.required_evaluation_capture_identity = None;
                 Ok(self)
             }
             Err(source) => Err(CompiledModuleAdamWEvaluationError {
@@ -7790,13 +7836,20 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
     ///
     /// This does not publish into or release the sealed host module. The
     /// embedded optimizer checkpoint is reused byte-for-byte across v1--v8;
-    /// report-disabled programs retain their existing v1--v7 bytes.
+    /// report-disabled programs retain their existing v1--v7 bytes. The module
+    /// envelope remains v1 when no evaluator is attached and uses v2 only to
+    /// authenticate an attached evaluator's capture identity.
     pub fn module_checkpoint(&self) -> Result<CompiledModuleAdamWCheckpoint> {
         self.seal.validate_unchanged(&self.module)?;
         let optimizer = self.runtime.checkpoint()?;
         self.seal.validate_unchanged(&self.module)?;
         let (states, visits) = self.seal.checkpoint_inventory();
-        encode_module_adamw_checkpoint(&optimizer, &states, &visits)
+        encode_module_adamw_checkpoint(
+            &optimizer,
+            self.evaluation_capture_identity,
+            &states,
+            &visits,
+        )
     }
 
     /// Atomically publishes and returns the exact checkpointed AdamW frontier.
@@ -7875,7 +7928,12 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
             }
         };
         let (states, visits) = self.seal.checkpoint_inventory();
-        let checkpoint = match encode_module_adamw_checkpoint(&optimizer, &states, &visits) {
+        let checkpoint = match encode_module_adamw_checkpoint(
+            &optimizer,
+            self.evaluation_capture_identity,
+            &states,
+            &visits,
+        ) {
             Ok(checkpoint) => checkpoint,
             Err(source) => {
                 return Err(CompiledModuleAdamWFinishError {
@@ -9331,9 +9389,10 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for CpuSessionTarget {
         &self,
         plan: CompiledModuleAdamWPlan<M>,
     ) -> std::result::Result<Self::Session, Self::Error> {
-        if let Err(source) = plan.seal.validate_unchanged(&plan.module) {
+        if let Err(source) = plan.validate_ready_for_preparation() {
             return Err(CompiledModuleAdamWPrepareError { plan, source });
         }
+        let evaluation_capture_identity = plan.evaluation_capture_identity();
         let runtime = match plan.plan.prepare_cpu() {
             Ok(runtime) => runtime,
             Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
@@ -9342,11 +9401,13 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for CpuSessionTarget {
             module,
             seal,
             plan: _,
+            required_evaluation_capture_identity: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
             module,
             runtime,
             seal,
+            evaluation_capture_identity,
         })
     }
 }
@@ -9359,9 +9420,10 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for ConfiguredCpuSessi
         &self,
         plan: CompiledModuleAdamWPlan<M>,
     ) -> std::result::Result<Self::Session, Self::Error> {
-        if let Err(source) = plan.seal.validate_unchanged(&plan.module) {
+        if let Err(source) = plan.validate_ready_for_preparation() {
             return Err(CompiledModuleAdamWPrepareError { plan, source });
         }
+        let evaluation_capture_identity = plan.evaluation_capture_identity();
         let runtime = match plan
             .plan
             .prepare_cpu_with_non_finite_policy(self.non_finite_policy())
@@ -9373,11 +9435,13 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for ConfiguredCpuSessi
             module,
             seal,
             plan: _,
+            required_evaluation_capture_identity: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
             module,
             runtime,
             seal,
+            evaluation_capture_identity,
         })
     }
 }
@@ -9392,9 +9456,10 @@ impl<'executor, M: Module> SessionTarget<CompiledModuleAdamWPlan<M>>
         &self,
         plan: CompiledModuleAdamWPlan<M>,
     ) -> std::result::Result<Self::Session, Self::Error> {
-        if let Err(source) = plan.seal.validate_unchanged(&plan.module) {
+        if let Err(source) = plan.validate_ready_for_preparation() {
             return Err(CompiledModuleAdamWPrepareError { plan, source });
         }
+        let evaluation_capture_identity = plan.evaluation_capture_identity();
         let runtime = match plan.plan.prepare_native_cpu(self) {
             Ok(runtime) => runtime,
             Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
@@ -9403,11 +9468,13 @@ impl<'executor, M: Module> SessionTarget<CompiledModuleAdamWPlan<M>>
             module,
             seal,
             plan: _,
+            required_evaluation_capture_identity: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
             module,
             runtime,
             seal,
+            evaluation_capture_identity,
         })
     }
 }
@@ -9420,9 +9487,10 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for MetalSessionTarget
         &self,
         plan: CompiledModuleAdamWPlan<M>,
     ) -> std::result::Result<Self::Session, Self::Error> {
-        if let Err(source) = plan.seal.validate_unchanged(&plan.module) {
+        if let Err(source) = plan.validate_ready_for_preparation() {
             return Err(CompiledModuleAdamWPrepareError { plan, source });
         }
+        let evaluation_capture_identity = plan.evaluation_capture_identity();
         let runtime = match <Self as SessionTarget<&CompiledAdamWPlan>>::prepare(self, &plan.plan) {
             Ok(runtime) => runtime,
             Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
@@ -9431,11 +9499,13 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for MetalSessionTarget
             module,
             seal,
             plan: _,
+            required_evaluation_capture_identity: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
             module,
             runtime,
             seal,
+            evaluation_capture_identity,
         })
     }
 }
@@ -16506,13 +16576,19 @@ mod tests {
             checkpoint.optimizer_checkpoint(),
             &source.checkpoint().unwrap()
         );
+        assert_eq!(checkpoint.evaluation_capture_identity(), None);
         assert_eq!(
             CompiledModuleAdamWCheckpoint::from_bytes(checkpoint.as_bytes().to_vec()).unwrap(),
             checkpoint
         );
-        let (envelope_tensors, _) = load_safetensors(checkpoint.as_bytes()).unwrap();
+        let (envelope_tensors, envelope_metadata) =
+            load_safetensors(checkpoint.as_bytes()).unwrap();
         assert_eq!(envelope_tensors.len(), 3);
         assert!(envelope_tensors.contains_key("optimizer_checkpoint"));
+        assert_eq!(
+            envelope_metadata.get("format").map(String::as_str),
+            Some("rustgrad-compiled-module-adamw-v1")
+        );
 
         let schema_destination = TiedFrozenModule::new([4.0, 5.0]);
         let schema_shared_before = schema_destination.shared.snapshot().unwrap();
@@ -16802,6 +16878,7 @@ mod tests {
             module,
             runtime,
             seal,
+            evaluation_capture_identity,
         } = source;
         let checkpoint_calls = Rc::new(Cell::new(0));
         let source = CompiledModuleAdamWSession {
@@ -16811,6 +16888,7 @@ mod tests {
                 checkpoint_calls: Rc::clone(&checkpoint_calls),
             },
             seal,
+            evaluation_capture_identity,
         };
         let (source_module, completed) = source.finish_with_module_checkpoint().unwrap();
         assert_eq!(checkpoint_calls.get(), 1);

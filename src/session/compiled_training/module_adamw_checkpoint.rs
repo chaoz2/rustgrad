@@ -3,6 +3,7 @@ use crate::{DType, Metadata, Result, StateDict, TensorData, load_safetensors, sa
 use std::collections::BTreeSet;
 
 const MODULE_ADAMW_CHECKPOINT_FORMAT_V1: &str = "rustgrad-compiled-module-adamw-v1";
+const MODULE_ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-module-adamw-v2";
 const OPTIMIZER_TENSOR: &str = "optimizer_checkpoint";
 const MAX_MODULE_STATE_COUNT: usize = 1 << 20;
 
@@ -55,6 +56,7 @@ pub(super) struct ModuleCheckpointVisit {
 #[derive(Clone, Debug)]
 pub(super) struct DecodedModuleAdamWCheckpoint {
     pub(super) optimizer: CompiledAdamWCheckpoint,
+    pub(super) evaluation_capture_identity: Option<u64>,
     pub(super) states: Vec<ModuleCheckpointState>,
     pub(super) visits: Vec<ModuleCheckpointVisit>,
 }
@@ -63,13 +65,16 @@ pub(super) struct DecodedModuleAdamWCheckpoint {
 ///
 /// The embedded [`CompiledAdamWCheckpoint`] bytes are preserved exactly. The
 /// surrounding deterministic safetensors envelope adds only canonical module
-/// topology and deduplicated immutable parameter/buffer values. Executable
-/// graphs, captures, runtime resources, host identities, and versions are not
-/// serialized.
+/// topology and deduplicated immutable parameter/buffer values. When an
+/// evaluator is attached, v2 also authenticates its capture identity so fresh
+/// recompilation cannot silently attach a different read-only program.
+/// Executable graphs, runtime resources, host identities, and versions are not
+/// serialized. A lifecycle without evaluation retains its exact v1 bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledModuleAdamWCheckpoint {
     bytes: Vec<u8>,
     optimizer: CompiledAdamWCheckpoint,
+    evaluation_capture_identity: Option<u64>,
 }
 
 impl CompiledModuleAdamWCheckpoint {
@@ -80,12 +85,21 @@ impl CompiledModuleAdamWCheckpoint {
         Ok(Self {
             bytes,
             optimizer: decoded.optimizer,
+            evaluation_capture_identity: decoded.evaluation_capture_identity,
         })
     }
 
     /// Returns the unchanged embedded optimizer checkpoint.
     pub fn optimizer_checkpoint(&self) -> &CompiledAdamWCheckpoint {
         &self.optimizer
+    }
+
+    /// Required evaluator capture identity for a v2 checkpoint.
+    ///
+    /// `None` denotes a v1 envelope with no authenticated evaluator requirement,
+    /// including checkpoints written by older versions.
+    pub fn evaluation_capture_identity(&self) -> Option<u64> {
+        self.evaluation_capture_identity
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -131,6 +145,7 @@ fn parse_bool(metadata: &Metadata, key: &str) -> Result<bool> {
 
 pub(super) fn encode_module_adamw_checkpoint(
     optimizer: &CompiledAdamWCheckpoint,
+    evaluation_capture_identity: Option<u64>,
     states: &[ModuleCheckpointState],
     visits: &[ModuleCheckpointVisit],
 ) -> Result<CompiledModuleAdamWCheckpoint> {
@@ -142,14 +157,22 @@ pub(super) fn encode_module_adamw_checkpoint(
         OPTIMIZER_TENSOR.to_owned(),
         TensorData::from_le_bytes([optimizer_bytes.len()], DType::U8, optimizer_bytes)?,
     )]);
+    let format = if evaluation_capture_identity.is_some() {
+        MODULE_ADAMW_CHECKPOINT_FORMAT_V2
+    } else {
+        MODULE_ADAMW_CHECKPOINT_FORMAT_V1
+    };
     let mut metadata = Metadata::from([
-        (
-            "format".to_owned(),
-            MODULE_ADAMW_CHECKPOINT_FORMAT_V1.to_owned(),
-        ),
+        ("format".to_owned(), format.to_owned()),
         ("state_count".to_owned(), states.len().to_string()),
         ("visit_count".to_owned(), visits.len().to_string()),
     ]);
+    if let Some(identity) = evaluation_capture_identity {
+        metadata.insert(
+            "evaluation_capture_identity".to_owned(),
+            identity.to_string(),
+        );
+    }
     for (index, state) in states.iter().enumerate() {
         metadata.insert(state_metadata_key(index, "name"), state.name.clone());
         metadata.insert(
@@ -186,9 +209,21 @@ pub(super) fn encode_module_adamw_checkpoint(
 
 pub(super) fn decode_module_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedModuleAdamWCheckpoint> {
     let (mut tensors, metadata) = load_safetensors(bytes)?;
-    if metadata.get("format").map(String::as_str) != Some(MODULE_ADAMW_CHECKPOINT_FORMAT_V1) {
-        return Err(training("compiled module checkpoint format mismatch"));
-    }
+    let evaluation_capture_identity = match metadata.get("format").map(String::as_str) {
+        Some(MODULE_ADAMW_CHECKPOINT_FORMAT_V1) => None,
+        Some(MODULE_ADAMW_CHECKPOINT_FORMAT_V2) => Some(
+            metadata
+                .get("evaluation_capture_identity")
+                .ok_or_else(|| {
+                    training("compiled module checkpoint evaluation identity is absent")
+                })?
+                .parse::<u64>()
+                .map_err(|_| {
+                    training("compiled module checkpoint evaluation identity is invalid")
+                })?,
+        ),
+        _ => return Err(training("compiled module checkpoint format mismatch")),
+    };
     let state_count = parse_count(&metadata, "state_count")?;
     let visit_count = parse_count(&metadata, "visit_count")?;
     if state_count == 0 || visit_count < state_count {
@@ -210,6 +245,9 @@ pub(super) fn decode_module_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedModu
         "state_count".to_owned(),
         "visit_count".to_owned(),
     ]);
+    if evaluation_capture_identity.is_some() {
+        expected_metadata.insert("evaluation_capture_identity".to_owned());
+    }
     let mut states = Vec::with_capacity(state_count);
     let mut state_names = BTreeSet::new();
     let mut trainable_names = BTreeSet::new();
@@ -336,6 +374,7 @@ pub(super) fn decode_module_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedModu
     }
     Ok(DecodedModuleAdamWCheckpoint {
         optimizer,
+        evaluation_capture_identity,
         states,
         visits,
     })
