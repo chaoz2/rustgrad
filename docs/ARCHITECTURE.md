@@ -963,8 +963,11 @@ preparation and committed main-replay reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
 sample set into versioned JSON. It reports deterministic
 schedule/native-item/cache inventories, logical temporary/state peaks, and the
-stable per-commit external-input import count/bytes plus borrowed recurrent
-input/output bytes. Rejected attempts expose no traffic sample. CPU
+stable per-commit fallback external-input import count/bytes plus borrowed
+recurrent input/output bytes. Dense F32/I32 inputs bind caller-owned storage
+read-only for exactly one replay call, so their successful import counts are
+zero; unsupported storage retains the owned-copy fallback. Rejected attempts
+expose no traffic sample. CPU
 kernel launches, host/device transfers, and measured physical peak host memory
 remain unavailable (`null`). Durations
 do not change any plan, capture, checkpoint, or native identity, and the report

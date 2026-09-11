@@ -108,7 +108,9 @@ Its
 `native-cpu-scoreboard` mode emits bounded versioned JSON for caller-timed
 compile, prepare, and checkpoint phases plus runtime-timed first/steady replay,
 together with authenticated main, partial-flush, captured-zero-grad, evaluation,
-cache, recurrent-state, and per-commit logical input/recurrent-traffic facts.
+cache, recurrent-state, and per-commit logical fallback-import/recurrent-traffic
+facts. Dense F32/I32 batches bind read-only for the replay call rather than
+copying into retained CPU workspace storage.
 Nonempty CPU `zero_grad` uses an authenticated
 compile-once state-only replay, while an empty window remains an exact no-op.
 CPU kernel-launch, transfer, and physical peak-memory fields remain `null`

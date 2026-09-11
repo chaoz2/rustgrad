@@ -1154,8 +1154,8 @@ impl CapturedReplayExecutor {
         plan: &mut PlannedNativeItems,
     ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
         plan.validate_replay(capture, provided)?;
-        plan.workspace.begin(provided)?;
-        let mut borrowed = super::native_replay_workspace::NativeReplayBorrowedState::new();
+        let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
+        plan.workspace.begin(provided, &mut borrowed)?;
         for index in 0..capture.items.len() {
             let item = &capture.items[index];
             plan.workspace.execute_item(
@@ -1175,16 +1175,16 @@ impl CapturedReplayExecutor {
         &self,
         capture: &CapturedSchedule,
         plan: &mut PlannedNativeItems,
-        borrowed: &mut super::native_replay_workspace::NativeReplayBorrowedState<'a>,
+        borrowed: &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         selected: Option<&BTreeSet<u64>>,
         setup: impl FnOnce(
             &mut NativeReplayWorkspace,
-            &mut super::native_replay_workspace::NativeReplayBorrowedState<'a>,
+            &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         ) -> Result<(), ReplayError>,
         mut import: impl FnMut(
             &crate::ReplayInput,
             &mut NativeReplayWorkspace,
-            &mut super::native_replay_workspace::NativeReplayBorrowedState<'a>,
+            &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         ) -> Result<(), ReplayError>,
     ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
         plan.validate_replay_structure(capture)?;
@@ -1683,11 +1683,9 @@ mod tests {
         let mut graph = Graph::new();
         let input = graph.input("input", [2]);
         let output = graph.relu(input).unwrap();
-        let capture = captured(&graph, &[output]);
-        let bindings = BTreeMap::from([(
-            "input".into(),
-            TensorData::new([2], vec![-1.0, 2.0]).unwrap(),
-        )]);
+        let capture = captured(&graph, &[output, input]);
+        let input_value = TensorData::new([2], vec![-1.0, 2.0]).unwrap();
+        let bindings = BTreeMap::from([("input".into(), input_value.clone())]);
         let executor = CapturedReplayExecutor::default();
         let mut plan = executor
             .plan_native_items(&capture, &bindings, false)
@@ -1696,19 +1694,24 @@ mod tests {
         let prepared = plan.workspace_stats();
         assert!(prepared.allocation_count >= capture.inputs.len() + capture.items.len());
         assert_eq!(prepared.input_import_count, 0);
+        assert_eq!(prepared.borrowed_external_input_bytes, 0);
         assert_eq!(prepared.intermediate_materialization_count, 0);
 
         let (first, first_traffic) = executor
             .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
             .unwrap();
-        assert_eq!(first_traffic.external_input_import_count, 1);
-        assert_eq!(first_traffic.external_input_import_bytes, 8);
+        assert_eq!(first_traffic.external_input_import_count, 0);
+        assert_eq!(first_traffic.external_input_import_bytes, 0);
         assert_eq!(first_traffic.borrowed_recurrent_input_bytes, 0);
         assert_eq!(first_traffic.borrowed_recurrent_output_bytes, 0);
         let first_stats = plan.workspace_stats();
         assert_eq!(first_stats.allocation_count, prepared.allocation_count);
-        assert_eq!(first_stats.input_import_count, capture.inputs.len());
+        assert_eq!(first_stats.input_import_count, 0);
+        assert_eq!(first_stats.borrowed_external_input_bytes, 8);
         assert_eq!(first_stats.intermediate_materialization_count, 0);
+        assert_eq!(bindings["input"], input_value);
+        assert_eq!(first.requested(&capture.requested).unwrap()[1], input_value);
+        drop(bindings);
         let changed = BTreeMap::from([(
             "input".into(),
             TensorData::new([2], vec![3.0, -4.0]).unwrap(),
@@ -1719,7 +1722,8 @@ mod tests {
         assert_eq!(second_traffic, first_traffic);
         let second_stats = plan.workspace_stats();
         assert_eq!(second_stats.allocation_count, prepared.allocation_count);
-        assert_eq!(second_stats.input_import_count, capture.inputs.len() * 2);
+        assert_eq!(second_stats.input_import_count, 0);
+        assert_eq!(second_stats.borrowed_external_input_bytes, 16);
         assert_eq!(second_stats.intermediate_materialization_count, 0);
         assert_ne!(
             first.requested(&capture.requested).unwrap(),
@@ -1737,17 +1741,81 @@ mod tests {
         assert_eq!(executor.native_item_plan_count(), 1);
 
         let (_, retried_traffic) = executor
-            .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
+            .execute_planned_native_items_observed(
+                &capture,
+                &BTreeMap::from([("input".into(), input_value)]),
+                &mut plan,
+            )
             .unwrap();
         assert_eq!(retried_traffic, first_traffic);
+        assert_eq!(plan.workspace_stats().borrowed_external_input_bytes, 24);
 
         plan.items.pop();
         assert!(matches!(
-            executor.execute_planned_native_items(&capture, &bindings, &mut plan),
+            executor.execute_planned_native_items(&capture, &changed, &mut plan),
             Err(ReplayError::Corrupt(message))
                 if message == "prepared native item count mismatch"
         ));
         assert_eq!(executor.native_item_plan_count(), 1);
+    }
+
+    #[test]
+    fn planned_native_items_copy_unsupported_external_storage_and_report_exact_bytes() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [2], DType::I64);
+        let output = graph.relu(input).unwrap();
+        let capture = captured(&graph, &[output]);
+        let bindings = BTreeMap::from([(
+            "input".into(),
+            TensorData::from_storage([2], Storage::I64(vec![-3, 7])).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+
+        let (values, traffic) = executor
+            .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(
+            values.requested(&capture.requested).unwrap()[0].storage(),
+            &Storage::I64(vec![0, 7])
+        );
+        assert_eq!(traffic.external_input_import_count, 1);
+        assert_eq!(traffic.external_input_import_bytes, 16);
+        assert_eq!(traffic.borrowed_recurrent_input_bytes, 0);
+        assert_eq!(traffic.borrowed_recurrent_output_bytes, 0);
+        let stats = plan.workspace_stats();
+        assert_eq!(stats.input_import_count, 1);
+        assert_eq!(stats.borrowed_external_input_bytes, 0);
+    }
+
+    #[test]
+    fn planned_native_items_borrow_dense_i32_input_without_mutating_it() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3], DType::I32);
+        let output = graph.relu(input).unwrap();
+        let capture = captured(&graph, &[output]);
+        let input_value = TensorData::from_storage([3], Storage::I32(vec![-4, 0, 9])).unwrap();
+        let bindings = BTreeMap::from([("input".into(), input_value.clone())]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+
+        let (values, traffic) = executor
+            .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(bindings["input"], input_value);
+        assert_eq!(
+            values.requested(&capture.requested).unwrap()[0].storage(),
+            &Storage::I32(vec![0, 0, 9])
+        );
+        assert_eq!(traffic.external_input_import_count, 0);
+        assert_eq!(traffic.external_input_import_bytes, 0);
+        let stats = plan.workspace_stats();
+        assert_eq!(stats.input_import_count, 0);
+        assert_eq!(stats.borrowed_external_input_bytes, 12);
     }
 
     #[test]

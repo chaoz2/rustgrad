@@ -124,9 +124,10 @@ pub struct JitBuffer {
     bytes: Vec<u8>,
 }
 
-/// One call-scoped dense binding for retained native replay. Persistent state
-/// may borrow typed tensor storage directly; the compiled kernel never retains
-/// the pointer after [`JitKernel::call_indexed_detached_borrowed`] returns.
+/// One call-scoped dense binding for retained native replay. Caller inputs and
+/// persistent state may borrow typed tensor storage directly; the compiled
+/// kernel never retains the pointer after
+/// [`JitKernel::call_indexed_detached_borrowed`] returns.
 pub(crate) enum BorrowedJitBuffer<'a> {
     Read(&'a crate::TensorData),
     Write(&'a mut crate::TensorData),

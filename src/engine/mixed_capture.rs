@@ -817,7 +817,7 @@ impl CapturedMixedSchedule {
                     active.insert(buffer, current);
                     inactive.insert(buffer, successor);
                 }
-                let mut borrowed = super::native_replay_workspace::NativeReplayBorrowedState::new();
+                let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
                 native.executor.execute_planned_native_items_resolved(
                     capture,
                     &mut native.prepared.plan,
@@ -857,7 +857,7 @@ impl CapturedMixedSchedule {
                                 .get(&input.name)
                                 .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
                             super::captured_replay::validate_input_value(capture, input, value)?;
-                            workspace.import_input(&input.name, value)?;
+                            workspace.bind_external_input(&input.name, value, borrowed)?;
                         }
                         Ok(())
                     },
@@ -2418,8 +2418,8 @@ mod recurrent_tests {
         assert_eq!(after.0, before.0, "native replay must not snapshot state");
         assert_eq!(after.1, before.1 + 1);
         assert_eq!(replay.replay.committed, cursor.frontier());
-        assert_eq!(replay.traffic.external_input_import_count, 1);
-        assert_eq!(replay.traffic.external_input_import_bytes, 8);
+        assert_eq!(replay.traffic.external_input_import_count, 0);
+        assert_eq!(replay.traffic.external_input_import_bytes, 0);
         assert_eq!(replay.traffic.borrowed_recurrent_input_bytes, 8);
         assert_eq!(replay.traffic.borrowed_recurrent_output_bytes, 8);
         let expected_traffic = replay.traffic;
