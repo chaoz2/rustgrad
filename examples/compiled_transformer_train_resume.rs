@@ -20,6 +20,13 @@
 //! cargo run --example compiled_transformer_train_resume -- cpu-file-resume
 //! ```
 //!
+//! Run that complete-module file-resume lifecycle through strict native CPU JIT
+//! replay with no fallback:
+//!
+//! ```text
+//! cargo run --release --example compiled_transformer_train_resume -- native-cpu-file-resume
+//! ```
+//!
 //! Emit a bounded strict-native CPU training scoreboard from that same
 //! compile-once path:
 //!
@@ -53,8 +60,10 @@ use rustgrad::{
     CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig,
     CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
     CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
-    CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep,
-    CpuBackend, CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, MetalSessionTarget, Module,
+    CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledScheduledAdamWRuntime,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
+    CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, MetalSessionTarget, Module,
+    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuCompiledEvaluationResult,
     NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Parameter, Result, Scalar, Shape,
     TensorData, TrainingDropoutProvider, TransformerBlock,
 };
@@ -763,10 +772,11 @@ fn evaluate_mean_masked_sparse_loss(model: &TinyCausalTransformer) -> Result<f64
     Ok(weighted_loss_sum / loss_weight_sum as f64)
 }
 
-fn evaluate_mean_file_resume_loss<R>(runtime: &mut R) -> Result<f64>
+fn evaluate_mean_file_resume_loss<R, V>(runtime: &mut R, mut validate: V) -> Result<f64>
 where
     R: CompiledEvaluationRuntime,
     R::Evaluation: CompiledEvaluation,
+    V: FnMut(&R::Evaluation),
 {
     let mut weighted_loss_sum = 0.0;
     let mut loss_weight_sum = 0_u64;
@@ -774,6 +784,7 @@ where
         let batch = file_resume_batch(replay)?;
         assert_eq!(loss_mask_weight(batch.loss_mask()), expected_weight);
         let evaluation = runtime.evaluate_batch(batch)?;
+        validate(&evaluation);
         assert_eq!(evaluation.loss_weight(), expected_weight);
         assert_eq!(
             evaluation
@@ -1302,6 +1313,77 @@ fn run_cpu_reuse() -> Result<()> {
 }
 
 fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
+    let target =
+        CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    run_file_resume::<CpuCompiledAdamW, _, _, _, _>(
+        "CPU file resume",
+        |plan| plan.prepare(&target).map_err(|error| error.into_parts().1),
+        |_| {},
+        |_| {},
+        |_| {},
+    )
+}
+
+fn assert_native_file_resume_preparation(
+    session: &CompiledModuleAdamWSession<FileResumeTransformer, NativeCpuCompiledAdamW<'_>>,
+) {
+    let preparation = session.native_cpu_preparation_report();
+    for program in [
+        Some(preparation.main()),
+        preparation.partial_flush(),
+        preparation.zero_grad(),
+        preparation.evaluation(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(program.native_item_count() > 0);
+        assert_eq!(program.fallback_count(), 0);
+    }
+}
+
+fn assert_native_file_resume_step(step: &NativeCpuCompiledAdamWStepResult) {
+    assert!(step.report().native_item_count() > 0);
+    assert!(step.report().executed_native_item_count() > 0);
+    assert_eq!(step.report().fallback_count(), 0);
+}
+
+fn assert_native_file_resume_evaluation(evaluation: &NativeCpuCompiledEvaluationResult) {
+    assert!(evaluation.report().native_item_count() > 0);
+    assert!(evaluation.report().executed_native_item_count() > 0);
+    assert_eq!(evaluation.report().fallback_count(), 0);
+}
+
+fn run_native_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor)
+        .vectorized(true)
+        .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    run_file_resume::<NativeCpuCompiledAdamW<'_>, _, _, _, _>(
+        "native CPU file resume",
+        |plan| plan.prepare(&target).map_err(|error| error.into_parts().1),
+        assert_native_file_resume_preparation,
+        assert_native_file_resume_step,
+        assert_native_file_resume_evaluation,
+    )
+}
+
+fn run_file_resume<R, P, V, S, E>(
+    target_name: &str,
+    mut prepare: P,
+    mut validate_preparation: V,
+    mut validate_step: S,
+    mut validate_evaluation: E,
+) -> std::result::Result<(), Box<dyn Error>>
+where
+    R: CompiledScheduledAdamWRuntime + CompiledEvaluationRuntime,
+    P: FnMut(
+        CompiledModuleAdamWPlan<FileResumeTransformer>,
+    ) -> Result<CompiledModuleAdamWSession<FileResumeTransformer, R>>,
+    V: FnMut(&CompiledModuleAdamWSession<FileResumeTransformer, R>),
+    S: FnMut(&R::Step),
+    E: FnMut(&R::Evaluation),
+{
     const LAST_REPLAY: u64 = 9;
     const WINDOW_LOSS_WEIGHT: u64 = 11;
 
@@ -1329,18 +1411,17 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         .evaluation_capture_identity()
         .expect("the compiler-owned token-mean evaluator is attached");
     assert_eq!(source_plan.captured_multi_step_lr(), Some(&schedule));
-    let target =
-        CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
-    let mut uninterrupted = source_plan
-        .prepare(&target)
-        .map_err(|error| error.into_parts().1)?;
+    let mut uninterrupted = prepare(source_plan)?;
+    validate_preparation(&uninterrupted);
     let before_initial_evaluation = uninterrupted.checkpoint()?;
-    let initial_loss = evaluate_mean_file_resume_loss(&mut uninterrupted)?;
+    let initial_loss =
+        evaluate_mean_file_resume_loss(&mut uninterrupted, &mut validate_evaluation)?;
     assert_eq!(uninterrupted.checkpoint()?, before_initial_evaluation);
     for replay in 1..=4 {
         let batch = file_resume_batch(replay)?;
         let loss_weight = loss_mask_weight(batch.loss_mask());
         let step = uninterrupted.step_batch_scheduled(batch)?;
+        validate_step(&step);
         assert_eq!(step.loss_weight(), loss_weight);
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
         assert_eq!(step.clip_report().is_some(), step.did_update());
@@ -1458,9 +1539,8 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         assert_eq!(after.trainable, before.trainable);
     }
 
-    let mut resumed = restored_plan
-        .prepare(&target)
-        .map_err(|error| error.into_parts().1)?;
+    let mut resumed = prepare(restored_plan)?;
+    validate_preparation(&resumed);
     assert_eq!(
         resumed.checkpoint()?,
         decoded.optimizer_checkpoint().clone()
@@ -1472,6 +1552,8 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
     for replay in 5..=LAST_REPLAY {
         let expected = uninterrupted.step_batch_scheduled(file_resume_batch(replay)?)?;
         let actual = resumed.step_batch_scheduled(file_resume_batch(replay)?)?;
+        validate_step(&expected);
+        validate_step(&actual);
         assert_eq!(actual.loss(), expected.loss());
         assert_eq!(actual.outputs(), expected.outputs());
         assert_eq!(
@@ -1518,13 +1600,17 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
     }
 
     let before_evaluation_checkpoint = resumed.checkpoint()?;
-    let before_evaluation_counter = resumed.dropout_block_counter()?;
+    let before_evaluation_counter = before_evaluation_checkpoint.info().dropout_block_counter();
     let before_evaluation_accumulators = resumed.gradient_accumulator_snapshots()?;
-    let uninterrupted_final_loss = evaluate_mean_file_resume_loss(&mut uninterrupted)?;
-    let final_loss = evaluate_mean_file_resume_loss(&mut resumed)?;
+    let uninterrupted_final_loss =
+        evaluate_mean_file_resume_loss(&mut uninterrupted, &mut validate_evaluation)?;
+    let final_loss = evaluate_mean_file_resume_loss(&mut resumed, &mut validate_evaluation)?;
     assert_eq!(final_loss.to_bits(), uninterrupted_final_loss.to_bits());
     assert_eq!(resumed.checkpoint()?, before_evaluation_checkpoint);
-    assert_eq!(resumed.dropout_block_counter()?, before_evaluation_counter);
+    assert_eq!(
+        resumed.checkpoint()?.info().dropout_block_counter(),
+        before_evaluation_counter
+    );
     assert_eq!(
         resumed.gradient_accumulator_snapshots()?,
         before_evaluation_accumulators
@@ -1606,7 +1692,7 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         "file-resumed two-block causal Transformer loss did not decrease: {initial_loss} -> {final_loss}"
     );
     println!(
-        "CPU file resume: capture={capture_identity:016x}, checkpoint=(replay=4, optimizer=1, accumulation=1), optimizer_steps=3, eval_mean_sparse_loss={initial_loss:.6} -> {final_loss:.6}, exact_resume=true, different_init=true, published=true"
+        "{target_name}: capture={capture_identity:016x}, checkpoint=(replay=4, optimizer=1, accumulation=1), optimizer_steps=3, eval_mean_sparse_loss={initial_loss:.6} -> {final_loss:.6}, exact_resume=true, different_init=true, published=true"
     );
     Ok(())
 }
@@ -1755,6 +1841,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         "native-cpu-scoreboard" => run_native_cpu_scoreboard()?,
         "cpu-reuse" => run_cpu_reuse()?,
         "cpu-file-resume" => run_cpu_file_resume()?,
+        "native-cpu-file-resume" => run_native_cpu_file_resume()?,
         "cpu" => {
             let target = CpuSessionTarget::new();
             run_exact_resume("CPU", |plan| {
@@ -1782,7 +1869,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         }
         other => {
             return Err(format!(
-                "unknown target {other:?}; expected `native-cpu-scoreboard`, `cpu-reuse`, `cpu-file-resume`, `cpu`, `native-cpu`, or `metal`"
+                "unknown target {other:?}; expected `native-cpu-scoreboard`, `cpu-reuse`, `cpu-file-resume`, `native-cpu-file-resume`, `cpu`, `native-cpu`, or `metal`"
             )
             .into());
         }
