@@ -12,7 +12,7 @@ use crate::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -818,6 +818,11 @@ pub(crate) struct PlannedNativeItems {
     structure_validation_count: std::sync::atomic::AtomicUsize,
 }
 
+pub(crate) struct NativeItemPlanDraft {
+    layouts: Vec<crate::backend::NativeScheduleLayout>,
+    layout_wall_time: Duration,
+}
+
 /// One native pure plan whose immutable capture schema, cache keys, and
 /// operand layouts have already been authenticated. Only the recurrent mixed
 /// replay owner can construct and execute this form.
@@ -1190,12 +1195,11 @@ fn native_schedule_layouts(
 }
 
 impl CapturedReplayExecutor {
-    pub(crate) fn plan_native_items(
+    pub(crate) fn preflight_native_items(
         &self,
         capture: &CapturedSchedule,
         provided: &BTreeMap<String, TensorData>,
-        vectorized: bool,
-    ) -> Result<PlannedNativeItems, ReplayError> {
+    ) -> Result<NativeItemPlanDraft, ReplayError> {
         #[cfg(test)]
         self.native_item_plan_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1222,26 +1226,90 @@ impl CapturedReplayExecutor {
                 ));
             }
         }
-        let layout_started = Instant::now();
+        let started = Instant::now();
         let layouts = native_schedule_layouts(capture)?;
-        let layout_wall_time = layout_started.elapsed();
-        let (items, mut module_preparation) = self
-            .jit(vectorized)
-            .prepare_schedule_module(&capture.items, layouts)
-            .map_err(backend_error)?;
-        module_preparation.layout_wall_time = layout_wall_time;
-        let workspace = NativeReplayWorkspace::new(capture, &items)?;
-        Ok(PlannedNativeItems {
-            items,
-            module_preparation,
-            workspace,
-            vectorized,
-            capture_identity: capture.identity,
-            input_schema: capture.inputs.clone(),
-            schedule_cache_keys: capture.items.iter().map(|item| item.cache_key).collect(),
-            #[cfg(test)]
-            structure_validation_count: std::sync::atomic::AtomicUsize::new(0),
+        Ok(NativeItemPlanDraft {
+            layouts,
+            layout_wall_time: started.elapsed(),
         })
+    }
+
+    pub(crate) fn plan_native_items(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+        vectorized: bool,
+    ) -> Result<PlannedNativeItems, ReplayError> {
+        let (mut plans, _) = self.plan_native_items_batch(vec![(capture, provided)], vectorized)?;
+        plans
+            .pop()
+            .ok_or_else(|| ReplayError::Corrupt("native plan result is absent".into()))
+    }
+
+    pub(crate) fn plan_native_items_batch<'a>(
+        &self,
+        programs: Vec<(&'a CapturedSchedule, &'a BTreeMap<String, TensorData>)>,
+        vectorized: bool,
+    ) -> Result<
+        (
+            Vec<PlannedNativeItems>,
+            crate::backend::NativeScheduleCompilationBatch,
+        ),
+        ReplayError,
+    > {
+        let drafts = programs
+            .iter()
+            .map(|(capture, provided)| self.preflight_native_items(capture, provided))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.plan_native_item_drafts(
+            programs
+                .into_iter()
+                .zip(drafts)
+                .map(|((capture, _), draft)| (capture, draft))
+                .collect(),
+            vectorized,
+        )
+    }
+
+    pub(crate) fn plan_native_item_drafts(
+        &self,
+        programs: Vec<(&CapturedSchedule, NativeItemPlanDraft)>,
+        vectorized: bool,
+    ) -> Result<
+        (
+            Vec<PlannedNativeItems>,
+            crate::backend::NativeScheduleCompilationBatch,
+        ),
+        ReplayError,
+    > {
+        let requests = programs
+            .iter()
+            .map(|(capture, draft)| (capture.items.as_slice(), draft.layouts.clone()))
+            .collect::<Vec<_>>();
+        let (prepared, compilation) = self
+            .jit(vectorized)
+            .prepare_schedule_modules(requests)
+            .map_err(backend_error)?;
+        let plans = programs
+            .into_iter()
+            .zip(prepared)
+            .map(|((capture, draft), (items, mut module_preparation))| {
+                module_preparation.layout_wall_time = draft.layout_wall_time;
+                let workspace = NativeReplayWorkspace::new(capture, &items)?;
+                Ok(PlannedNativeItems {
+                    items,
+                    module_preparation,
+                    workspace,
+                    vectorized,
+                    capture_identity: capture.identity,
+                    input_schema: capture.inputs.clone(),
+                    schedule_cache_keys: capture.items.iter().map(|item| item.cache_key).collect(),
+                    #[cfg(test)]
+                    structure_validation_count: std::sync::atomic::AtomicUsize::new(0),
+                })
+            })
+            .collect::<Result<Vec<_>, ReplayError>>()?;
+        Ok((plans, compilation))
     }
 
     pub(crate) fn execute_planned_native_items(

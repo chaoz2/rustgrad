@@ -112,6 +112,9 @@ shared-module preparation/cache/compiler work, recurrent-state, successful
 native-item execution, exact preparation/replay phase partitions, and per-commit
 logical fallback-import/recurrent-traffic facts. Dense F32/I32 batches bind read-only for
 the replay call rather than copying into retained CPU workspace storage.
+Strict-native preparation validates each attached program in order and can
+compile two independent cache-miss modules concurrently; cache and publication
+identities remain per program and warm restoration performs no compiler work.
 Nonempty CPU `zero_grad` uses an authenticated
 compile-once state-only replay, while an empty window remains an exact no-op.
 CPU device-kernel-launch, transfer, and physical peak-memory fields remain

@@ -91,7 +91,7 @@ write_lscpu_field() {
   cc --version
 } > "$provenance_path"
 
-TMPDIR="$measurement_tmpdir" CARGO_INCREMENTAL=0 \
+TMPDIR="$measurement_tmpdir" CARGO_INCREMENTAL=0 RUSTGRAD_REQUIRE_COLD_NATIVE_SCOREBOARD=1 \
   cargo run --locked --release --quiet \
     --example compiled_transformer_train_resume -- native-cpu-scoreboard \
   | tee "$scoreboard_path"

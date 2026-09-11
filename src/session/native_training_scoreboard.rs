@@ -20,7 +20,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V3: u32 = 3;
 const NATIVE_TRAINING_REPORT_FORMAT_V4: u32 = 4;
 const NATIVE_TRAINING_REPORT_FORMAT_V5: u32 = 5;
 const NATIVE_TRAINING_REPORT_FORMAT_V6: u32 = 6;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 7;
+const NATIVE_TRAINING_REPORT_FORMAT_V7: u32 = 7;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 8;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -302,7 +303,10 @@ impl NativeTrainingProgramReport {
         }
         match (format_version, &self.preparation_timing) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, None) => {}
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(timing)) => timing.validate(self)?,
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V7 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(timing),
+            ) => timing.validate(self)?,
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, Some(_)) => {
                 return Err(invalid(
                     "legacy native program has preparation phase timing",
@@ -461,6 +465,14 @@ pub struct NativeTrainingReport {
     prepare_wall_time: BenchmarkDuration,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepare_runtime_overhead_wall_time: Option<BenchmarkDuration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_parallel_module_overlap_wall_time: Option<BenchmarkDuration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_compiler_process_overlap_wall_time: Option<BenchmarkDuration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_compiler_process_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_max_parallel_compiler_process_count: Option<u64>,
     initial_replay_step: u64,
     successful_replay_count: u64,
     main: NativeTrainingProgramReport,
@@ -503,6 +515,23 @@ impl NativeTrainingReport {
     /// Whole-prepare time outside the attached native program preparations.
     pub const fn prepare_runtime_overhead_wall_time(&self) -> Option<BenchmarkDuration> {
         self.prepare_runtime_overhead_wall_time
+    }
+
+    /// Exact overlap among complete native module compiler/loader jobs.
+    pub const fn prepare_parallel_module_overlap_wall_time(&self) -> Option<BenchmarkDuration> {
+        self.prepare_parallel_module_overlap_wall_time
+    }
+
+    pub const fn prepare_compiler_process_overlap_wall_time(&self) -> Option<BenchmarkDuration> {
+        self.prepare_compiler_process_overlap_wall_time
+    }
+
+    pub const fn prepare_compiler_process_count(&self) -> Option<u64> {
+        self.prepare_compiler_process_count
+    }
+
+    pub const fn prepare_max_parallel_compiler_process_count(&self) -> Option<u64> {
+        self.prepare_max_parallel_compiler_process_count
     }
 
     pub const fn main(&self) -> &NativeTrainingProgramReport {
@@ -610,6 +639,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V4
                 | NATIVE_TRAINING_REPORT_FORMAT_V5
                 | NATIVE_TRAINING_REPORT_FORMAT_V6
+                | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -648,6 +678,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V4
                 | NATIVE_TRAINING_REPORT_FORMAT_V5
                 | NATIVE_TRAINING_REPORT_FORMAT_V6
+                | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -667,6 +698,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V4
                 | NATIVE_TRAINING_REPORT_FORMAT_V5
                 | NATIVE_TRAINING_REPORT_FORMAT_V6
+                | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executed),
             ) if executed <= self.main.native_item_count => {}
@@ -686,9 +718,119 @@ impl NativeTrainingReport {
                 return Err(invalid("native program vectorization policy differs"));
             }
         }
-        match (self.format_version, self.prepare_runtime_overhead_wall_time) {
-            (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, None) => {}
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(overhead)) => {
+        let parallel_evidence = match self.format_version {
+            1..=NATIVE_TRAINING_REPORT_FORMAT_V7 => {
+                if self.prepare_compiler_process_overlap_wall_time.is_some()
+                    || self.prepare_compiler_process_count.is_some()
+                    || self.prepare_max_parallel_compiler_process_count.is_some()
+                {
+                    return Err(invalid(
+                        "legacy native report has parallel compiler evidence",
+                    ));
+                }
+                None
+            }
+            NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
+                let compiler_overlap = self
+                    .prepare_compiler_process_overlap_wall_time
+                    .ok_or_else(|| invalid("native compiler overlap timing is absent"))?
+                    .as_nanos()
+                    .map_err(|_| invalid("invalid native compiler overlap duration"))?;
+                let compiler_count = self
+                    .prepare_compiler_process_count
+                    .ok_or_else(|| invalid("native compiler process count is absent"))?;
+                let max_parallel = self
+                    .prepare_max_parallel_compiler_process_count
+                    .ok_or_else(|| invalid("native compiler concurrency is absent"))?;
+                let (expected_count, module_job_count, compiler_time_sum, compiler_time_max) =
+                    std::iter::once(&self.main)
+                        .chain(self.partial_flush.iter())
+                        .chain(&self.zero_grad)
+                        .chain(&self.evaluation)
+                        .try_fold(
+                            (0u64, 0u64, 0u128, 0u128),
+                            |(compiler_total, job_total, time_sum, time_max), program| {
+                                let compiler_total = compiler_total
+                                    .checked_add(program.compiler_invocation_count)
+                                    .ok_or_else(|| {
+                                        invalid("native compiler process count overflows")
+                                    })?;
+                                let jobs = program
+                                    .durable_artifact_cache_hit_count
+                                    .checked_add(program.durable_artifact_cache_miss_count)
+                                    .ok_or_else(|| invalid("native module job count overflows"))?;
+                                let job_total = job_total
+                                    .checked_add(jobs)
+                                    .ok_or_else(|| invalid("native module job count overflows"))?;
+                                let compiler_time = program
+                                    .preparation_timing
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        invalid("native program preparation timing is absent")
+                                    })?
+                                    .compiler_process
+                                    .as_nanos()
+                                    .map_err(|_| {
+                                        invalid("invalid native compiler process duration")
+                                    })?;
+                                let time_sum =
+                                    time_sum.checked_add(compiler_time).ok_or_else(|| {
+                                        invalid("native compiler process duration overflows")
+                                    })?;
+                                Ok((
+                                    compiler_total,
+                                    job_total,
+                                    time_sum,
+                                    time_max.max(compiler_time),
+                                ))
+                            },
+                        )?;
+                let maximum_compiler_overlap = compiler_time_sum
+                    .checked_sub(compiler_time_max)
+                    .ok_or_else(|| invalid("native compiler process overlap underflows"))?;
+                if compiler_count != expected_count
+                    || max_parallel > 2
+                    || max_parallel > compiler_count
+                    || (compiler_count == 0) != (max_parallel == 0)
+                    || (compiler_overlap == 0) != (max_parallel <= 1)
+                    || compiler_overlap > maximum_compiler_overlap
+                {
+                    return Err(invalid("native parallel compiler evidence differs"));
+                }
+                Some((compiler_overlap, module_job_count))
+            }
+            _ => unreachable!("format version was validated"),
+        };
+        match (
+            self.format_version,
+            self.prepare_runtime_overhead_wall_time,
+            self.prepare_parallel_module_overlap_wall_time,
+        ) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, None, None) => {}
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V7 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(overhead),
+                overlap,
+            ) => {
+                let overlap = match (self.format_version, overlap) {
+                    (NATIVE_TRAINING_REPORT_FORMAT_V7, None) => 0,
+                    (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(overlap)) => overlap
+                        .as_nanos()
+                        .map_err(|_| invalid("invalid native prepare overlap duration"))?,
+                    _ => return Err(invalid("native prepare overlap timing differs")),
+                };
+                if let Some((compiler_overlap, module_job_count)) = parallel_evidence {
+                    if compiler_overlap > overlap {
+                        return Err(invalid(
+                            "native compiler overlap exceeds parallel module overlap",
+                        ));
+                    }
+                    if overlap > 0 && module_job_count < 2 {
+                        return Err(invalid(
+                            "native parallel module overlap lacks two module jobs",
+                        ));
+                    }
+                }
                 let prepare_total = self
                     .prepare_wall_time
                     .as_nanos()
@@ -709,16 +851,19 @@ impl NativeTrainingReport {
                         .checked_add(total)
                         .ok_or_else(|| invalid("native program preparation duration overflows"))
                 })?;
+                let effective_program_total = program_total
+                    .checked_sub(overlap)
+                    .ok_or_else(|| invalid("native prepare overlap exceeds program duration"))?;
                 let partitioned = overhead
                     .as_nanos()
                     .map_err(|_| invalid("invalid native prepare overhead duration"))?
-                    .checked_add(program_total)
+                    .checked_add(effective_program_total)
                     .ok_or_else(|| invalid("native prepare duration overflows"))?;
                 if partitioned != prepare_total {
                     return Err(invalid("native prepare phases do not partition total"));
                 }
             }
-            (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, Some(_)) => {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, _, _) => {
                 return Err(invalid("legacy native report has preparation timing"));
             }
             _ => return Err(invalid("native prepare timing differs")),
@@ -745,7 +890,9 @@ impl NativeTrainingReport {
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V5, None, None) => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V6 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V6
+                | NATIVE_TRAINING_REPORT_FORMAT_V7
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
             ) => {
@@ -814,6 +961,10 @@ pub struct NativeTrainingScoreboard {
     compile_wall_time: Duration,
     prepare_wall_time: Duration,
     prepare_runtime_overhead_wall_time: Duration,
+    prepare_parallel_module_overlap_wall_time: Duration,
+    prepare_compiler_process_overlap_wall_time: Duration,
+    prepare_compiler_process_count: u64,
+    prepare_max_parallel_compiler_process_count: u64,
     inspection: CompiledAdamWInspection,
     main: NativeTrainingProgramReport,
     partial_flush: Option<NativeTrainingProgramReport>,
@@ -867,13 +1018,31 @@ impl NativeTrainingScoreboard {
                     .checked_add(program.wall_time())
                     .ok_or_else(|| invalid("native program preparation duration overflows"))
             })?;
+        let prepare_parallel_module_overlap_wall_time =
+            preparation.parallel_module_overlap_wall_time();
+        let prepare_compiler_process_count = count(
+            preparation.compiler_process_count(),
+            "native compiler process",
+        )?;
+        let prepare_max_parallel_compiler_process_count = count(
+            preparation.max_parallel_compiler_process_count(),
+            "parallel native compiler process",
+        )?;
+        let effective_program_prepare_wall_time = program_prepare_wall_time
+            .checked_sub(prepare_parallel_module_overlap_wall_time)
+            .ok_or_else(|| invalid("native parallel module overlap exceeds program time"))?;
         let prepare_runtime_overhead_wall_time = prepare_wall_time
-            .checked_sub(program_prepare_wall_time)
+            .checked_sub(effective_program_prepare_wall_time)
             .ok_or_else(|| invalid("native program preparation exceeds whole prepare time"))?;
         Ok(Self {
             compile_wall_time,
             prepare_wall_time,
             prepare_runtime_overhead_wall_time,
+            prepare_parallel_module_overlap_wall_time,
+            prepare_compiler_process_overlap_wall_time: preparation
+                .compiler_process_overlap_wall_time(),
+            prepare_compiler_process_count,
+            prepare_max_parallel_compiler_process_count,
             inspection,
             main,
             partial_flush,
@@ -1006,6 +1175,16 @@ impl NativeTrainingScoreboard {
             prepare_runtime_overhead_wall_time: Some(BenchmarkDuration::from_duration(
                 self.prepare_runtime_overhead_wall_time,
             )),
+            prepare_parallel_module_overlap_wall_time: Some(BenchmarkDuration::from_duration(
+                self.prepare_parallel_module_overlap_wall_time,
+            )),
+            prepare_compiler_process_overlap_wall_time: Some(BenchmarkDuration::from_duration(
+                self.prepare_compiler_process_overlap_wall_time,
+            )),
+            prepare_compiler_process_count: Some(self.prepare_compiler_process_count),
+            prepare_max_parallel_compiler_process_count: Some(
+                self.prepare_max_parallel_compiler_process_count,
+            ),
             initial_replay_step: self.inspection.initial_replay_step,
             successful_replay_count: self.replay_timings.len() as u64,
             main: self.main.clone(),
@@ -1250,6 +1429,16 @@ mod tests {
         json.as_object_mut()
             .unwrap()
             .remove("prepare_runtime_overhead_wall_time");
+        json.as_object_mut()
+            .unwrap()
+            .remove("prepare_parallel_module_overlap_wall_time");
+        for field in [
+            "prepare_compiler_process_overlap_wall_time",
+            "prepare_compiler_process_count",
+            "prepare_max_parallel_compiler_process_count",
+        ] {
+            json.as_object_mut().unwrap().remove(field);
+        }
         for program in ["main", "partial_flush", "zero_grad", "evaluation"] {
             if let Some(program) = json[program].as_object_mut() {
                 program.remove("preparation_timing");
@@ -1263,6 +1452,10 @@ mod tests {
             compile_wall_time: zero_duration(),
             prepare_wall_time: zero_duration(),
             prepare_runtime_overhead_wall_time: Some(zero_duration()),
+            prepare_parallel_module_overlap_wall_time: Some(zero_duration()),
+            prepare_compiler_process_overlap_wall_time: Some(zero_duration()),
+            prepare_compiler_process_count: Some(1),
+            prepare_max_parallel_compiler_process_count: Some(1),
             initial_replay_step: 0,
             successful_replay_count: 2,
             main: NativeTrainingProgramReport {
@@ -1346,6 +1539,12 @@ mod tests {
         assert_eq!(json["main_replay_executed_native_item_count"], 1);
         assert_eq!(json["main"]["preparation_timing"]["layout"]["secs"], 0);
         assert_eq!(json["prepare_runtime_overhead_wall_time"]["nanos"], 0);
+        assert_eq!(
+            json["prepare_parallel_module_overlap_wall_time"]["nanos"],
+            0
+        );
+        assert_eq!(json["prepare_compiler_process_count"], 1);
+        assert_eq!(json["prepare_max_parallel_compiler_process_count"], 1);
         assert_eq!(json["main_replay_executor_wall_time"]["first"]["secs"], 0);
         assert_eq!(
             json["main_replay_recurrent_overhead_wall_time"]["steady"]["sample_count"],
@@ -1443,17 +1642,53 @@ mod tests {
     }
 
     #[test]
+    fn version_seven_report_without_parallel_module_overlap_still_decodes() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V7);
+        json.as_object_mut()
+            .unwrap()
+            .remove("prepare_parallel_module_overlap_wall_time");
+        for field in [
+            "prepare_compiler_process_overlap_wall_time",
+            "prepare_compiler_process_count",
+            "prepare_max_parallel_compiler_process_count",
+        ] {
+            json.as_object_mut().unwrap().remove(field);
+        }
+        let report =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(report.prepare_parallel_module_overlap_wall_time().is_none());
+        assert!(report.prepare_runtime_overhead_wall_time().is_some());
+    }
+
+    #[test]
     fn current_report_authenticates_preparation_phase_partition() {
         let mut report = zero_report();
-        report.prepare_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(11));
+        report.prepare_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(10));
         report.prepare_runtime_overhead_wall_time =
-            Some(BenchmarkDuration::from_duration(Duration::from_nanos(4)));
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(3)));
+        report.prepare_parallel_module_overlap_wall_time =
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(2)));
+        report.prepare_compiler_process_overlap_wall_time =
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(1)));
+        report.prepare_compiler_process_count = Some(2);
+        report.prepare_max_parallel_compiler_process_count = Some(2);
         let timing = report.main.preparation_timing.as_mut().unwrap();
         timing.total = BenchmarkDuration::from_duration(Duration::from_nanos(7));
         timing.render = BenchmarkDuration::from_duration(Duration::from_nanos(2));
         timing.compiler_process = BenchmarkDuration::from_duration(Duration::from_nanos(3));
         timing.module_load = BenchmarkDuration::from_duration(Duration::from_nanos(1));
         timing.residual = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        let mut evaluation = report.main.clone();
+        evaluation.preparation_timing = Some(NativeTrainingPreparationTiming {
+            total: BenchmarkDuration::from_duration(Duration::from_nanos(2)),
+            layout: zero_duration(),
+            render: zero_duration(),
+            compiler_process: BenchmarkDuration::from_duration(Duration::from_nanos(1)),
+            module_load: zero_duration(),
+            residual: BenchmarkDuration::from_duration(Duration::from_nanos(1)),
+        });
+        report.evaluation = Some(evaluation);
         assert!(report.validate().is_ok());
         let valid = report.clone();
 
@@ -1461,9 +1696,60 @@ mod tests {
             BenchmarkDuration::from_duration(Duration::from_nanos(2));
         assert!(report.validate().is_err());
 
-        let mut report = valid;
+        let mut report = valid.clone();
         report.prepare_runtime_overhead_wall_time =
-            Some(BenchmarkDuration::from_duration(Duration::from_nanos(5)));
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(6)));
+        assert!(report.validate().is_err());
+
+        let mut report = valid.clone();
+        report.prepare_parallel_module_overlap_wall_time =
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(8)));
+        assert!(report.validate().is_err());
+
+        let mut report = valid.clone();
+        report.prepare_compiler_process_overlap_wall_time =
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(2)));
+        assert!(report.validate().is_err());
+
+        let mut report = valid.clone();
+        let main = report.main.preparation_timing.as_mut().unwrap();
+        main.compiler_process = zero_duration();
+        main.residual = BenchmarkDuration::from_duration(Duration::from_nanos(4));
+        let evaluation = report
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .preparation_timing
+            .as_mut()
+            .unwrap();
+        evaluation.compiler_process = zero_duration();
+        evaluation.residual = BenchmarkDuration::from_duration(Duration::from_nanos(2));
+        assert!(report.validate().is_err());
+
+        let mut report = valid;
+        report.prepare_compiler_process_overlap_wall_time = Some(zero_duration());
+        assert!(report.validate().is_err());
+
+        let mut report = zero_report();
+        report.prepare_parallel_module_overlap_wall_time =
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(1)));
+        report.main.preparation_timing.as_mut().unwrap().total =
+            BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        report.main.preparation_timing.as_mut().unwrap().residual =
+            BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        assert!(report.validate().is_err());
+
+        let mut report = zero_report();
+        report.prepare_compiler_process_count = Some(0);
+        assert!(report.validate().is_err());
+
+        let mut report = zero_report();
+        report.prepare_max_parallel_compiler_process_count = Some(3);
+        assert!(report.validate().is_err());
+
+        let mut report = zero_report();
+        report.prepare_compiler_process_overlap_wall_time =
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(1)));
         assert!(report.validate().is_err());
 
         let mut json = serde_json::to_value(zero_report()).unwrap();
@@ -1544,6 +1830,8 @@ mod tests {
             json["main"]["durable_artifact_cache_hit_count"] = serde_json::json!(hit_count);
             json["main"]["durable_artifact_cache_miss_count"] = serde_json::json!(0);
             json["main"]["compiler_invocation_count"] = serde_json::json!(0);
+            json["prepare_compiler_process_count"] = serde_json::json!(0);
+            json["prepare_max_parallel_compiler_process_count"] = serde_json::json!(0);
             assert!(
                 NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_ok(),
                 "{reason} module preparation must remain representable"

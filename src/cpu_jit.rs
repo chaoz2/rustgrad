@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -667,11 +667,16 @@ pub(crate) struct JitScheduleModuleLoad {
     pub(crate) compiler_invocation_count: usize,
     pub(crate) compiler_process_wall_time: Duration,
     pub(crate) module_load_wall_time: Duration,
+    pub(crate) compiler_process_interval: Option<(Instant, Instant)>,
 }
 
 impl JitKernel {
     pub(crate) fn load(r: &RenderedC) -> Result<Self, JitError> {
-        let path = compile_cached(r)?;
+        let gate = compile_gate(format!("kernel:{}", r.cache_key))?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| JitError::Io("kernel compile gate poisoned".into()))?;
+        let path = compile_cached_under_gate(r)?;
         let (lib, call) = match load_library_call(&path) {
             Ok(loaded) => loaded,
             Err(_) => {
@@ -680,7 +685,7 @@ impl JitKernel {
                 // before rebuilding so a truncated or stale artifact cannot
                 // poison every later compile for this source identity.
                 evict_cached_library(&path)?;
-                let rebuilt = compile_cached(r)?;
+                let rebuilt = compile_cached_under_gate(r)?;
                 match load_library_call(&rebuilt) {
                     Ok(loaded) => loaded,
                     Err(error) => {
@@ -708,7 +713,12 @@ impl JitKernel {
                 "empty native schedule module has no dispatcher".into(),
             ));
         }
-        let (path, mut preparation) = compile_cached_schedule_module(rendered)?;
+        let cache_key = schedule_module_cache_key(rendered);
+        let gate = compile_gate(format!("schedule:{cache_key}"))?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| JitError::Io("schedule-module compile gate poisoned".into()))?;
+        let (path, mut preparation) = compile_cached_schedule_module_under_gate(rendered)?;
         let load = |path: &Path| -> Result<(Vec<Self>, JitScheduleDispatcher), JitError> {
             let library = Arc::new(Library::open(path)?);
             let kernels = rendered
@@ -743,9 +753,10 @@ impl JitKernel {
         let mut module_load_wall_time = load_started.elapsed();
         let (kernels, dispatcher) = match loaded {
             Ok(module) => module,
-            Err(_) => {
+            Err(_) if preparation.durable_cache_hit => {
                 evict_cached_library(&path)?;
-                let (rebuilt, rebuilt_preparation) = compile_cached_schedule_module(rendered)?;
+                let (rebuilt, rebuilt_preparation) =
+                    compile_cached_schedule_module_under_gate(rendered)?;
                 debug_assert!(!rebuilt_preparation.durable_cache_hit);
                 preparation = rebuilt_preparation;
                 let load_started = Instant::now();
@@ -761,6 +772,10 @@ impl JitKernel {
                         return Err(error);
                     }
                 }
+            }
+            Err(error) => {
+                let _ = evict_cached_library(&path);
+                return Err(error);
             }
         };
         preparation.module_load_wall_time = module_load_wall_time;
@@ -4492,8 +4507,66 @@ fn native_cache_key(discriminator: &str, source: &str) -> String {
 fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("rustgrad-cpu-jit-v1")
 }
-static COMPILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static COMPILE_GATES: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+static COMPILER_PROCESS_LIMIT: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
 static COMPILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn compile_gate(identity: String) -> Result<Arc<Mutex<()>>, JitError> {
+    let mut gates = COMPILE_GATES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| JitError::Io("compile-gate registry poisoned".into()))?;
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    if let Some(gate) = gates.get(&identity).and_then(Weak::upgrade) {
+        return Ok(gate);
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(identity, Arc::downgrade(&gate));
+    Ok(gate)
+}
+
+struct CompilerProcessPermit;
+
+impl CompilerProcessPermit {
+    fn acquire() -> std::io::Result<Self> {
+        let (active, available) =
+            COMPILER_PROCESS_LIMIT.get_or_init(|| (Mutex::new(0), Condvar::new()));
+        let mut active = active
+            .lock()
+            .map_err(|_| std::io::Error::other("compiler-process limiter poisoned"))?;
+        while *active >= 2 {
+            active = available
+                .wait(active)
+                .map_err(|_| std::io::Error::other("compiler-process limiter poisoned"))?;
+        }
+        *active += 1;
+        Ok(Self)
+    }
+}
+
+impl Drop for CompilerProcessPermit {
+    fn drop(&mut self) {
+        let (active, available) =
+            COMPILER_PROCESS_LIMIT.get_or_init(|| (Mutex::new(0), Condvar::new()));
+        let mut active = active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = active
+            .checked_sub(1)
+            .expect("compiler-process permit count underflowed");
+        available.notify_one();
+    }
+}
+
+fn run_compiler(
+    command: &mut Command,
+) -> std::io::Result<(std::process::Output, (Instant, Instant))> {
+    let _permit = CompilerProcessPermit::acquire()?;
+    let started = Instant::now();
+    command
+        .output()
+        .map(|output| (output, (started, Instant::now())))
+}
 
 fn schedule_module_entry_symbol(index: usize) -> String {
     format!("rustgrad_schedule_entry_{index:08x}")
@@ -4565,16 +4638,12 @@ pub(crate) fn schedule_module_cache_key(rendered: &[RenderedC]) -> String {
 /// Compiles one helper-isolated C translation unit into one shared schedule
 /// module. Declarative macros bind the renderer's public entry and closed local
 /// symbol set without parsing or rewriting generated C.
-fn compile_cached_schedule_module(
+fn compile_cached_schedule_module_under_gate(
     rendered: &[RenderedC],
 ) -> Result<(PathBuf, JitScheduleModuleLoad), JitError> {
-    let _guard = COMPILE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .map_err(|_| JitError::Io("compile lock poisoned".into()))?;
+    let cache_key = schedule_module_cache_key(rendered);
     let directory = cache_dir();
     fs::create_dir_all(&directory).map_err(|error| JitError::Io(error.to_string()))?;
-    let cache_key = schedule_module_cache_key(rendered);
     let library = directory.join(format!(
         "{cache_key}.{}",
         if cfg!(target_os = "macos") {
@@ -4592,6 +4661,7 @@ fn compile_cached_schedule_module(
                     compiler_invocation_count: 0,
                     compiler_process_wall_time: Duration::ZERO,
                     module_load_wall_time: Duration::ZERO,
+                    compiler_process_interval: None,
                 },
             ));
         }
@@ -4611,18 +4681,18 @@ fn compile_cached_schedule_module(
         .map_err(|error| JitError::Io(error.to_string()))?;
     let temporary = directory.join(format!("{stem}.tmp"));
     let result = (|| {
-        let compiler_started = Instant::now();
-        let output = Command::new(C11_COMPILER_COMMAND)
-            .args(C11_COMPILER_FLAGS)
-            .arg("-o")
-            .arg(&temporary)
-            .arg(&source)
-            .output()
-            .map_err(|error| JitError::Compiler {
-                status: None,
-                stderr: error.to_string(),
-            })?;
-        let compiler_process_wall_time = compiler_started.elapsed();
+        let (output, (compiler_started, compiler_finished)) = run_compiler(
+            Command::new(C11_COMPILER_COMMAND)
+                .args(C11_COMPILER_FLAGS)
+                .arg("-o")
+                .arg(&temporary)
+                .arg(&source),
+        )
+        .map_err(|error| JitError::Compiler {
+            status: None,
+            stderr: error.to_string(),
+        })?;
+        let compiler_process_wall_time = compiler_finished.duration_since(compiler_started);
         if !output.status.success() {
             return Err(JitError::Compiler {
                 status: output.status.code(),
@@ -4643,6 +4713,7 @@ fn compile_cached_schedule_module(
                     compiler_invocation_count: 1,
                     compiler_process_wall_time,
                     module_load_wall_time: Duration::ZERO,
+                    compiler_process_interval: Some((compiler_started, compiler_finished)),
                 },
             )),
             Err(error) => match fs::symlink_metadata(&library) {
@@ -4657,6 +4728,7 @@ fn compile_cached_schedule_module(
                         compiler_invocation_count: 1,
                         compiler_process_wall_time,
                         module_load_wall_time: Duration::ZERO,
+                        compiler_process_interval: Some((compiler_started, compiler_finished)),
                     },
                 )),
                 _ => Err(JitError::Io(error.to_string())),
@@ -4668,11 +4740,16 @@ fn compile_cached_schedule_module(
     result
 }
 
+#[cfg(test)]
 fn compile_cached(r: &RenderedC) -> Result<PathBuf, JitError> {
-    let _guard = COMPILE_LOCK
-        .get_or_init(|| Mutex::new(()))
+    let gate = compile_gate(format!("kernel:{}", r.cache_key))?;
+    let _guard = gate
         .lock()
-        .map_err(|_| JitError::Io("compile lock poisoned".into()))?;
+        .map_err(|_| JitError::Io("kernel compile gate poisoned".into()))?;
+    compile_cached_under_gate(r)
+}
+
+fn compile_cached_under_gate(r: &RenderedC) -> Result<PathBuf, JitError> {
     let d = cache_dir();
     fs::create_dir_all(&d).map_err(|e| JitError::Io(e.to_string()))?;
     let lib = d.join(format!(
@@ -4701,16 +4778,17 @@ fn compile_cached(r: &RenderedC) -> Result<PathBuf, JitError> {
     let temp = d.join(format!("{stem}.tmp"));
     let result = (|| {
         fs::write(&source, &r.source).map_err(|e| JitError::Io(e.to_string()))?;
-        let out = Command::new(C11_COMPILER_COMMAND)
-            .args(C11_COMPILER_FLAGS)
-            .arg("-o")
-            .arg(&temp)
-            .arg(&source)
-            .output()
-            .map_err(|e| JitError::Compiler {
-                status: None,
-                stderr: e.to_string(),
-            })?;
+        let (out, _) = run_compiler(
+            Command::new(C11_COMPILER_COMMAND)
+                .args(C11_COMPILER_FLAGS)
+                .arg("-o")
+                .arg(&temp)
+                .arg(&source),
+        )
+        .map_err(|e| JitError::Compiler {
+            status: None,
+            stderr: e.to_string(),
+        })?;
         if !out.status.success() {
             return Err(JitError::Compiler {
                 status: out.status.code(),
@@ -6547,6 +6625,65 @@ mod tests {
         assert_eq!(compile_cached(&rendered).unwrap(), path);
 
         drop(kernel);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_same_module_key_serializes_corrupt_recovery_and_compiles_once() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", Shape::from([1]));
+        let output = graph.neg(input).unwrap();
+        let mut rendered =
+            CpuJit::render(&crate::lower_graph_elementwise(&graph, output).unwrap()).unwrap();
+        rendered.cache_key = format!("{}-concurrent-corruption-retry", rendered.cache_key);
+        let rendered = vec![rendered];
+        let cache_key = schedule_module_cache_key(&rendered);
+        let path = cache_dir().join(format!(
+            "{cache_key}.{}",
+            if cfg!(target_os = "macos") {
+                "dylib"
+            } else {
+                "so"
+            }
+        ));
+        std::fs::create_dir_all(cache_dir()).unwrap();
+        std::fs::write(&path, b"not a shared module").unwrap();
+
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let loads = std::thread::scope(|scope| {
+            let handles = (0..2)
+                .map(|_| {
+                    let start = start.clone();
+                    let rendered = rendered.clone();
+                    scope.spawn(move || {
+                        start.wait();
+                        JitKernel::load_schedule_module(&rendered).unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            loads
+                .iter()
+                .map(|(_, _, load)| load.compiler_invocation_count)
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            loads
+                .iter()
+                .filter(|(_, _, load)| load.durable_cache_hit)
+                .count(),
+            1
+        );
+        assert!(loads.iter().all(|(kernels, _, _)| kernels.len() == 1));
+
+        drop(loads);
         std::fs::remove_file(path).unwrap();
     }
 

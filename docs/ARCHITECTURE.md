@@ -949,7 +949,13 @@ not a mode on the interpreter session. It precompiles the main replay and every
 attached partial-flush/zero-grad/evaluation pure program through the existing
 `CapturedReplayExecutor` before returning mutable state, then reuses the same
 mixed staging and single `EffectRuntime` commit with interpreter fallback
-disabled. Each attached schedule renders its ordered native entries once and
+disabled. Capture/recurrent witnesses, layouts, rendering, ABI, and cache
+preflight remain sequential. Distinct durable cache misses then enter
+per-artifact compile/load gates through a process-wide two-permit compiler pool;
+complete jobs finalize in canonical main/partial-flush/zero-grad/evaluation
+order. Identical keys cannot race loading or damaged-cache recovery, and
+optional programs do not perturb another program's artifact key. Each attached
+schedule renders its ordered native entries once and
 loads them as uniquely named functions in one content-addressed shared module;
 preparation also authenticates an immutable workspace tape for fixed ABI slots,
 derived affine reads, typed output-initialization coverage, and quantized
@@ -981,13 +987,15 @@ interpreter and strict-Metal targets.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v7 validates those facts against strict-native
+separate `NativeTrainingScoreboard` v8 validates those facts against strict-native
 preparation and committed main-replay reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
 sample set into versioned JSON. Every attached native program partitions its
 runtime-observed preparation total exactly into layout, rendering, compiler
-process, module load, and residual host work; the caller-observed whole-prepare
-remainder is reported separately. Main replay wall time is partitioned exactly
+process, module load, and residual host work. V8 records exact overlap across
+complete parallel module jobs plus compiler-process-only overlap and concurrency;
+the caller-observed whole-prepare remainder is checked after subtracting the
+complete-job overlap from summed program totals. Main replay wall time is partitioned exactly
 between the sealed native executor and the checked recurrent
 staging/validation/commit remainder; failed calls publish neither phase. It
 reports deterministic
@@ -1012,8 +1020,8 @@ matching workload, toolchain/compiler, runner image, and CPU-hardware
 provenance; they never gate CI. Legacy v1 reports without zero-grad
 inventory, v2 reports without replay traffic, v3 reports without executed
 native-item counts, v4 reports without shared-module preparation evidence, and
-v5 reports without replay-phase timing, and v6 reports without preparation-phase
-timing remain readable.
+v5 reports without replay-phase timing, v6 reports without preparation-phase
+timing, and v7 reports without parallel-module evidence remain readable.
 CPU targets may opt into `CpuNonFinitePolicy::RejectTransition`. The historical
 unit `CpuSessionTarget` remains the propagation default and returns a separate
 `ConfiguredCpuSessionTarget` when that policy is selected; strict-native CPU

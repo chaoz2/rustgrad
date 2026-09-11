@@ -1741,6 +1741,50 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(main_preparation.work().rendered_entry_count(), 787);
     assert_eq!(main_preparation.work().loaded_module_count(), 1);
     assert!(main_preparation.work().compiler_invocation_count() <= 1);
+    assert_eq!(
+        session
+            .preparation_report()
+            .partial_flush()
+            .expect("scoreboard configuration captures partial flush")
+            .native_item_count(),
+        357
+    );
+    assert_eq!(
+        session
+            .preparation_report()
+            .zero_grad()
+            .expect("scoreboard configuration captures zero grad")
+            .native_item_count(),
+        74
+    );
+    assert!(session.preparation_report().compiler_process_count() <= 3);
+    assert!(
+        session
+            .preparation_report()
+            .max_parallel_compiler_process_count()
+            <= 2
+    );
+    if env::var_os("RUSTGRAD_REQUIRE_COLD_NATIVE_SCOREBOARD").is_some() {
+        assert_eq!(session.preparation_report().compiler_process_count(), 3);
+        assert_eq!(
+            session
+                .preparation_report()
+                .max_parallel_compiler_process_count(),
+            2
+        );
+        assert!(
+            session
+                .preparation_report()
+                .compiler_process_overlap_wall_time()
+                > Duration::ZERO
+        );
+        assert!(
+            session
+                .preparation_report()
+                .parallel_module_overlap_wall_time()
+                > Duration::ZERO
+        );
+    }
     let mut scoreboard = NativeTrainingScoreboard::new(
         inspection.clone(),
         session.preparation_report(),
@@ -1810,6 +1854,13 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     });
     assert_eq!(
         program_prepare_wall_time
+            .checked_sub(
+                report
+                    .prepare_parallel_module_overlap_wall_time()
+                    .expect("current native CPU scoreboard reports parallel module overlap")
+                    .to_duration()?,
+            )
+            .expect("parallel module overlap fits program preparation")
             .checked_add(
                 report
                     .prepare_runtime_overhead_wall_time()
@@ -1879,6 +1930,15 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(builds.get(), 1, "checkpoint restore must not rebuild");
     let mut restored_session = restored.prepare(&target)?;
     let restored_preparation = restored_session.preparation_report();
+    assert_eq!(restored_preparation.compiler_process_count(), 0);
+    assert_eq!(
+        restored_preparation.max_parallel_compiler_process_count(),
+        0
+    );
+    assert_eq!(
+        restored_preparation.parallel_module_overlap_wall_time(),
+        Duration::ZERO
+    );
     for program in [
         Some(restored_preparation.main()),
         restored_preparation.partial_flush(),
