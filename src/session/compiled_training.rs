@@ -13193,6 +13193,7 @@ mod tests {
         assert!(validate_native_cpu_run_report(&malformed_report).is_err());
         assert!(scoreboard.record(&malformed_report).is_err());
         scoreboard.record(actual.report()).unwrap();
+        assert!(scoreboard.record_step(&actual).is_err());
         assert_native_adamw_state_close(&native, &interpreted);
         let first_workspace = native.main_replay.workspace_stats();
         assert_eq!(first_workspace.allocation_count, workspace.allocation_count);
@@ -13266,6 +13267,10 @@ mod tests {
                 .main_replay_executed_native_item_count(),
             Some(u64::try_from(first_executed_native_item_count).unwrap())
         );
+        let raw_json: serde_json::Value =
+            serde_json::from_slice(&scoreboard.report().unwrap().to_json_bytes().unwrap()).unwrap();
+        assert_eq!(raw_json["format_version"], 9);
+        assert!(raw_json.get("step_phases").is_none());
         assert_native_adamw_state_close(&native, &interpreted);
         assert_eq!(executor.native_item_plan_count(), 2);
         let retried_workspace = native.main_replay.workspace_stats();

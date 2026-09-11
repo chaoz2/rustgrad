@@ -997,7 +997,7 @@ interpreter and strict-Metal targets.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v9 validates those facts against strict-native
+separate `NativeTrainingScoreboard` v10 validates those facts against strict-native
 preparation and committed main-replay reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
 sample set into versioned JSON. Every attached native program partitions its
@@ -1008,7 +1008,12 @@ the caller-observed whole-prepare remainder is checked after subtracting the
 complete-job overlap from summed program totals. V9 separately authenticates
 logical schedule/cache coverage and grouped physical rendered/executed entry
 counts; v5-v8 retain their original one-rendered-entry-per-logical-item wire
-invariant. Main replay wall time is partitioned exactly
+invariant. Raw report recording continues to emit v9, while `record_step`
+emits v10 and classifies successful main replays solely from `did_update`:
+the first replay remains separate and warm accumulation-only and optimizer-commit
+samples have disjoint, exact timing partitions. V1-v9 JSON remains readable,
+and one scoreboard rejects mixed raw/classified recording without consuming a
+sample. Partial flush is not a main-step sample. Main replay wall time is partitioned exactly
 between the sealed native executor and the checked recurrent
 staging/validation/commit remainder; failed calls publish neither phase. It
 reports deterministic

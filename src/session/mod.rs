@@ -52,9 +52,10 @@ pub(crate) use inference::{
     CapturedHostGather, CapturedHostIndexedMovement, CapturedHostIndexedMovementKind,
 };
 pub use native_training_scoreboard::{
-    CompiledAdamWInspection, NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+    CompiledAdamWInspection, NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeTrainingFirstStepReport,
     NativeTrainingPreparationTiming, NativeTrainingProgramReport, NativeTrainingReplayTiming,
-    NativeTrainingReport, NativeTrainingScoreboard,
+    NativeTrainingReport, NativeTrainingScoreboard, NativeTrainingStepPhase,
+    NativeTrainingStepPhaseReport, NativeTrainingWarmStepReport,
 };
 pub use target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,
