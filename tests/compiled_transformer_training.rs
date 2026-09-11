@@ -3808,6 +3808,11 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         inspection.zero_grad().unwrap().0
     );
     assert_eq!(report.fallback_count(), 0);
+    let executed_native_item_count = report
+        .main_replay_executed_native_item_count()
+        .expect("current scoreboard reports successful CPU JIT calls");
+    assert!(executed_native_item_count > 0);
+    assert!(executed_native_item_count <= report.main().native_item_count());
     let traffic = report.main_replay_traffic().unwrap();
     assert_eq!(traffic.external_input_import_count(), 0);
     assert_eq!(traffic.external_input_import_bytes(), 0);
@@ -3837,6 +3842,10 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
             .is_none_or(|rate| rate.is_finite() && rate > 0.0)
     );
     assert!(json["kernel_launch_count"].is_null());
+    assert_eq!(
+        json["main_replay_executed_native_item_count"],
+        executed_native_item_count
+    );
     assert!(json["host_to_device"].is_null());
     assert!(json["device_to_host"].is_null());
     assert!(json["measured_peak_host_memory_bytes"].is_null());

@@ -958,21 +958,22 @@ interpreter and strict-Metal targets.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v3 validates those facts against strict-native
+separate `NativeTrainingScoreboard` v4 validates those facts against strict-native
 preparation and committed main-replay reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
 sample set into versioned JSON. It reports deterministic
-schedule/native-item/cache inventories, logical temporary/state peaks, and the
-stable per-commit fallback external-input import count/bytes plus borrowed
-recurrent input/output bytes. Dense F32/I32 inputs bind caller-owned storage
+schedule/native-item/cache inventories, the stable successful main-replay CPU
+JIT item-execution count, logical temporary/state peaks, and the per-commit
+fallback external-input import count/bytes plus borrowed recurrent input/output
+bytes. Dense F32/I32 inputs bind caller-owned storage
 read-only for exactly one replay call, so their successful import counts are
 zero; unsupported storage retains the owned-copy fallback. Rejected attempts
-expose no traffic sample. CPU
-kernel launches, host/device transfers, and measured physical peak host memory
-remain unavailable (`null`). Durations
+expose no report sample. CPU device kernel launches, host/device transfers, and
+measured physical peak host memory remain unavailable (`null`). Durations
 do not change any plan, capture, checkpoint, or native identity, and the report
 makes no threshold or speedup claim. Legacy v1 reports without zero-grad
-inventory and v2 reports without replay traffic remain readable.
+inventory, v2 reports without replay traffic, and v3 reports without executed
+native-item counts remain readable.
 CPU targets may opt into `CpuNonFinitePolicy::RejectTransition`. The historical
 unit `CpuSessionTarget` remains the propagation default and returns a separate
 `ConfiguredCpuSessionTarget` when that policy is selected; strict-native CPU

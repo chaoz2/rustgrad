@@ -41,6 +41,7 @@ pub(crate) struct NativeReplayTraffic {
     pub(crate) external_input_import_bytes: u64,
     pub(crate) borrowed_recurrent_input_bytes: u64,
     pub(crate) borrowed_recurrent_output_bytes: u64,
+    pub(crate) executed_native_item_count: usize,
 }
 
 /// Private scratch owned by one authenticated prepared native program.
@@ -763,6 +764,13 @@ impl NativeReplayWorkspace {
             )
         };
         execution.map_err(backend_error)?;
+        self.current_traffic.executed_native_item_count = self
+            .current_traffic
+            .executed_native_item_count
+            .checked_add(1)
+            .ok_or_else(|| {
+                ReplayError::Descriptor("native item execution count overflows".into())
+            })?;
         self.valid[output] = true;
         Ok(())
     }
@@ -812,6 +820,11 @@ impl NativeReplayWorkspace {
 
     pub(super) const fn traffic(&self) -> NativeReplayTraffic {
         self.current_traffic
+    }
+
+    #[cfg(test)]
+    pub(super) const fn last_executed_native_item_count(&self) -> usize {
+        self.current_traffic.executed_native_item_count
     }
 
     #[cfg(test)]

@@ -197,6 +197,11 @@ impl PreparedRecurrentNativeReplay {
         self.plan.workspace_stats()
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_executed_native_item_count(&self) -> usize {
+        self.plan.last_executed_native_item_count()
+    }
+
     fn validate_capture(
         &self,
         capture: &CapturedMixedSchedule,
