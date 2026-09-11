@@ -835,6 +835,10 @@ impl PlannedNativeItems {
         &self.schedule_cache_keys
     }
 
+    pub(crate) fn validate_structure(&self, capture: &CapturedSchedule) -> Result<(), ReplayError> {
+        self.validate_replay_structure(capture)
+    }
+
     #[cfg(test)]
     pub(crate) fn workspace_stats(
         &self,
@@ -1171,6 +1175,40 @@ impl CapturedReplayExecutor {
         Ok((values, plan.workspace.traffic()))
     }
 
+    /// Executes one pure prepared program with ordinary caller inputs and an
+    /// authenticated subset borrowed from recurrent active-state storage.
+    /// Every borrow is call-scoped and only requested public outputs are
+    /// materialized into owned `TensorData`.
+    pub(crate) fn execute_planned_native_items_with_recurrent_inputs<'a>(
+        &self,
+        capture: &CapturedSchedule,
+        external: &'a BTreeMap<String, TensorData>,
+        recurrent: &BTreeMap<String, &'a TensorData>,
+        plan: &mut PlannedNativeItems,
+    ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
+        let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
+        let public = capture.requested.iter().copied().collect::<BTreeSet<_>>();
+        self.execute_planned_native_items_resolved(
+            capture,
+            plan,
+            &mut borrowed,
+            Some(&public),
+            |_workspace, _borrowed| Ok(()),
+            |input, workspace, borrowed| {
+                if let Some(value) = recurrent.get(&input.name).copied() {
+                    validate_input_value(capture, input, value)?;
+                    workspace.borrow_recurrent_input(&input.name, value, borrowed)
+                } else {
+                    let value = external
+                        .get(&input.name)
+                        .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
+                    validate_input_value(capture, input, value)?;
+                    workspace.bind_external_input(&input.name, value, borrowed)
+                }
+            },
+        )
+    }
+
     pub(super) fn execute_planned_native_items_resolved<'a>(
         &self,
         capture: &CapturedSchedule,
@@ -1453,7 +1491,7 @@ fn validate_quantized_index_inputs(capture: &CapturedSchedule) -> Result<(), Rep
     Ok(())
 }
 
-pub(super) fn validate_input_value(
+pub(crate) fn validate_input_value(
     capture: &CapturedSchedule,
     input: &crate::ReplayInput,
     value: &TensorData,

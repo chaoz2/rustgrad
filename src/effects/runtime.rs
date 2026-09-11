@@ -3,7 +3,7 @@ use super::{BufferState, EffectBatch, EffectBatchStep, EffectError, EffectPlan};
 use crate::TensorData;
 use crate::host_buffer::{
     HostBufferBank, HostBufferBankTransactionError, HostBufferDesc, HostBufferError,
-    HostBufferLease, HostPoolStats, HostSlotPool,
+    HostBufferLease, HostBufferRead, HostBufferReadError, HostPoolStats, HostSlotPool,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -236,6 +236,56 @@ impl EffectRuntime {
             state: state.clone(),
             value: view.tensor()?,
         })
+    }
+
+    /// Borrows the exact active values named by `states` for one non-escaping
+    /// callback. The complete requested frontier is authenticated before the
+    /// callback, and this path never stages, flips, or versions a state bank.
+    pub(crate) fn with_active_state_tensors<T, E>(
+        &mut self,
+        states: &[BufferState],
+        read: impl FnOnce(&[HostBufferRead<'_>]) -> Result<T, E>,
+    ) -> Result<T, RecurrentTransactionError<E>> {
+        if states.is_empty() {
+            return Err(RecurrentTransactionError::Contract(
+                "active state frontier is empty",
+            ));
+        }
+        let mut requests = Vec::with_capacity(states.len());
+        let mut seen = BTreeSet::new();
+        for state in states {
+            super::validate_buffer_state(state)
+                .map_err(RuntimeError::Effect)
+                .map_err(RecurrentTransactionError::Runtime)?;
+            if !seen.insert(state.buffer) {
+                return Err(RecurrentTransactionError::Contract(
+                    "active state frontier contains duplicate buffers",
+                ));
+            }
+            let slot = self
+                .slots
+                .get(&state.buffer)
+                .ok_or(RuntimeError::MissingBuffer(state.buffer))
+                .map_err(RecurrentTransactionError::Runtime)?;
+            if slot.state != *state {
+                return Err(RecurrentTransactionError::Runtime(
+                    RuntimeError::StaleState {
+                        buffer: state.buffer,
+                        version: state.version,
+                    },
+                ));
+            }
+            requests.push(slot.lease.read_request());
+        }
+        match self.pool.with_active_tensors(&requests, read) {
+            Ok(value) => Ok(value),
+            Err(HostBufferReadError::Host(error)) => Err(RecurrentTransactionError::Runtime(
+                RuntimeError::Host(error),
+            )),
+            Err(HostBufferReadError::Callback(error)) => {
+                Err(RecurrentTransactionError::Stage(error))
+            }
+        }
     }
 
     /// Runs one native recurrent transition with direct, call-scoped borrows
@@ -1070,6 +1120,102 @@ mod tests {
             runtime.snapshot(&second[1]).unwrap().tensor(),
             &data([], Storage::U64(vec![11]))
         );
+    }
+
+    #[test]
+    fn active_state_reads_are_exact_retryable_and_do_not_publish_state() {
+        let mut runtime = EffectRuntime::new();
+        let left = runtime
+            .register(41, data([2], Storage::F32(vec![1.0, 2.0])))
+            .unwrap();
+        let right = runtime
+            .register(42, data([], Storage::U64(vec![3])))
+            .unwrap();
+        let states = vec![left.clone(), right.clone()];
+        let identities = [
+            runtime.slot_identity(&left).unwrap(),
+            runtime.slot_identity(&right).unwrap(),
+        ];
+        let stats = runtime.stats().unwrap();
+        let counts = runtime.recurrent_test_counts();
+
+        let staged = std::cell::Cell::new(false);
+        assert!(matches!(
+            runtime.with_active_state_tensors(&[left.clone(), left.clone()], |_| {
+                staged.set(true);
+                Ok::<_, ()>(())
+            }),
+            Err(RecurrentTransactionError::Contract(
+                "active state frontier contains duplicate buffers"
+            ))
+        ));
+        assert!(!staged.get());
+
+        let mut stale = left.clone();
+        stale.version += 1;
+        assert!(matches!(
+            runtime
+                .with_active_state_tensors(std::slice::from_ref(&stale), |_| { Ok::<_, ()>(()) }),
+            Err(RecurrentTransactionError::Runtime(
+                RuntimeError::StaleState { buffer: 41, .. }
+            ))
+        ));
+
+        let mut malformed = left.clone();
+        malformed.bytes = 4;
+        assert!(matches!(
+            runtime.with_active_state_tensors(std::slice::from_ref(&malformed), |_| {
+                Ok::<_, ()>(())
+            }),
+            Err(RecurrentTransactionError::Runtime(RuntimeError::Effect(_)))
+        ));
+
+        let mut foreign = left.clone();
+        foreign.buffer = 99;
+        assert!(matches!(
+            runtime
+                .with_active_state_tensors(std::slice::from_ref(&foreign), |_| { Ok::<_, ()>(()) }),
+            Err(RecurrentTransactionError::Runtime(
+                RuntimeError::MissingBuffer(99)
+            ))
+        ));
+
+        assert!(matches!(
+            runtime.with_active_state_tensors(&states, |reads| {
+                assert_eq!(reads.len(), 2);
+                assert_eq!(reads[0].ordinal(), 0);
+                assert_eq!(reads[0].buffer_id(), 41);
+                assert_eq!(reads[0].tensor(), &data([2], Storage::F32(vec![1.0, 2.0])));
+                assert_eq!(reads[1].ordinal(), 1);
+                assert_eq!(reads[1].buffer_id(), 42);
+                assert_eq!(reads[1].tensor(), &data([], Storage::U64(vec![3])));
+                Err::<(), _>("retry")
+            }),
+            Err(RecurrentTransactionError::Stage("retry"))
+        ));
+        let values = runtime
+            .with_active_state_tensors(&states, |reads| {
+                Ok::<_, ()>(
+                    reads
+                        .iter()
+                        .map(|read| read.tensor().clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            values,
+            vec![
+                data([2], Storage::F32(vec![1.0, 2.0])),
+                data([], Storage::U64(vec![3]))
+            ]
+        );
+        assert_eq!(runtime.recurrent_test_counts(), counts);
+        assert_eq!(runtime.stats().unwrap(), stats);
+        assert_eq!(runtime.slot_identity(&left).unwrap(), identities[0]);
+        assert_eq!(runtime.slot_identity(&right).unwrap(), identities[1]);
+        assert_eq!(runtime.snapshot(&left).unwrap().state, left);
+        assert_eq!(runtime.snapshot(&right).unwrap().state, right);
     }
 
     #[test]

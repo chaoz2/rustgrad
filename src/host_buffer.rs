@@ -324,6 +324,77 @@ impl HostSlotPool {
         }
         Ok(value)
     }
+
+    /// Borrows an authenticated set of active persistent values for exactly
+    /// one callback while holding the pool lock. References cannot escape the
+    /// callback, and this read-only path never stages or flips a bank.
+    pub(crate) fn with_active_tensors<T, E>(
+        &self,
+        requests: &[HostBufferReadRequest],
+        read: impl FnOnce(&[HostBufferRead<'_>]) -> Result<T, E>,
+    ) -> Result<T, HostBufferReadError<E>> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| HostBufferReadError::Host(HostBufferError::OwnerMismatch))?;
+        let mut seen = std::collections::BTreeSet::new();
+        for request in requests {
+            if !Arc::ptr_eq(&self.inner, &request.inner) || !seen.insert(request.slot) {
+                return Err(HostBufferReadError::Host(HostBufferError::OwnerMismatch));
+            }
+            let slot = state
+                .slots
+                .get(&request.slot)
+                .ok_or(HostBufferError::MissingSlot(request.slot))
+                .map_err(HostBufferReadError::Host)?;
+            if slot.generation != request.generation || !slot.leased {
+                return Err(HostBufferReadError::Host(
+                    HostBufferError::StaleGeneration {
+                        slot: request.slot,
+                        generation: request.generation,
+                    },
+                ));
+            }
+            if slot.mutable_window {
+                return Err(HostBufferReadError::Host(
+                    HostBufferError::OutstandingBorrow { slot: request.slot },
+                ));
+            }
+            if slot.descriptor.as_ref() != Some(&request.descriptor) {
+                return Err(HostBufferReadError::Host(
+                    HostBufferError::IncompatibleDescriptor,
+                ));
+            }
+            let active = slot.values[slot.active]
+                .as_ref()
+                .ok_or(HostBufferError::MissingValue(request.descriptor.buffer_id))
+                .map_err(HostBufferReadError::Host)?;
+            if !tensor_matches_descriptor(active, &request.descriptor) {
+                return Err(HostBufferReadError::Host(
+                    HostBufferError::IncompatibleDescriptor,
+                ));
+            }
+        }
+
+        let reads = requests
+            .iter()
+            .enumerate()
+            .map(|(ordinal, request)| {
+                let slot = state
+                    .slots
+                    .get(&request.slot)
+                    .expect("authenticated active host slot remains registered");
+                HostBufferRead {
+                    ordinal,
+                    buffer_id: request.descriptor.buffer_id,
+                    tensor: slot.values[slot.active]
+                        .as_ref()
+                        .expect("authenticated active host value remains present"),
+                }
+            })
+            .collect::<Vec<_>>();
+        read(&reads).map_err(HostBufferReadError::Callback)
+    }
 }
 
 fn tensor_matches_descriptor(value: &TensorData, descriptor: &HostBufferDesc) -> bool {
@@ -336,6 +407,40 @@ fn tensor_matches_descriptor(value: &TensorData, descriptor: &HostBufferDesc) ->
 pub(crate) enum HostBufferBankTransactionError<E> {
     Host(HostBufferError),
     Stage(E),
+}
+
+#[derive(Debug)]
+pub(crate) enum HostBufferReadError<E> {
+    Host(HostBufferError),
+    Callback(E),
+}
+
+pub(crate) struct HostBufferReadRequest {
+    inner: Arc<Mutex<PoolState>>,
+    slot: u64,
+    generation: u64,
+    descriptor: HostBufferDesc,
+}
+
+/// Non-cloneable active-bank borrow valid only for one pool-locked callback.
+pub(crate) struct HostBufferRead<'a> {
+    ordinal: usize,
+    buffer_id: u64,
+    tensor: &'a TensorData,
+}
+
+impl<'a> HostBufferRead<'a> {
+    pub(crate) fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    pub(crate) fn buffer_id(&self) -> u64 {
+        self.buffer_id
+    }
+
+    pub(crate) fn tensor(&self) -> &'a TensorData {
+        self.tensor
+    }
 }
 
 pub(crate) struct HostBufferBankRequest {
@@ -424,6 +529,15 @@ impl HostBufferLease {
 
     pub(crate) fn bank_request(&self) -> HostBufferBankRequest {
         HostBufferBankRequest {
+            inner: self.inner.clone(),
+            slot: self.slot,
+            generation: self.generation,
+            descriptor: self.descriptor.clone(),
+        }
+    }
+
+    pub(crate) fn read_request(&self) -> HostBufferReadRequest {
+        HostBufferReadRequest {
             inner: self.inner.clone(),
             slot: self.slot,
             generation: self.generation,
@@ -811,6 +925,86 @@ mod tests {
             lease.view().unwrap().tensor().unwrap().to_vec_f64(),
             vec![5.0, 6.0]
         );
+    }
+
+    #[test]
+    fn active_tensor_reads_authenticate_complete_requests_and_never_flip() {
+        let pool = HostSlotPool::new();
+        let lease = pool.lease(Some(7), desc(7, [2])).unwrap();
+        lease
+            .write(TensorData::new([2], vec![1.0, 2.0]).unwrap())
+            .unwrap();
+        let request = lease.read_request();
+        let rejected = pool.with_active_tensors(std::slice::from_ref(&request), |reads| {
+            assert_eq!(reads.len(), 1);
+            assert_eq!(reads[0].ordinal(), 0);
+            assert_eq!(reads[0].buffer_id(), 7);
+            assert_eq!(reads[0].tensor().to_vec_f64(), vec![1.0, 2.0]);
+            Err::<(), _>("reject")
+        });
+        assert!(matches!(
+            rejected,
+            Err(HostBufferReadError::Callback("reject"))
+        ));
+        assert_eq!(
+            lease.view().unwrap().tensor().unwrap().to_vec_f64(),
+            vec![1.0, 2.0]
+        );
+        assert_eq!(
+            pool.with_active_tensors(std::slice::from_ref(&request), |reads| {
+                Ok::<_, ()>(reads[0].tensor().to_vec_f64())
+            })
+            .unwrap(),
+            vec![1.0, 2.0]
+        );
+
+        assert!(matches!(
+            pool.with_active_tensors(&[lease.read_request(), lease.read_request()], |_| {
+                Ok::<_, ()>(())
+            }),
+            Err(HostBufferReadError::Host(HostBufferError::OwnerMismatch))
+        ));
+
+        let foreign_pool = HostSlotPool::new();
+        assert!(matches!(
+            foreign_pool.with_active_tensors(std::slice::from_ref(&request), |_| Ok::<_, ()>(())),
+            Err(HostBufferReadError::Host(HostBufferError::OwnerMismatch))
+        ));
+
+        let mut malformed = lease.read_request();
+        malformed.descriptor.shape = Shape::from([1]);
+        malformed.descriptor.bytes = 4;
+        assert!(matches!(
+            pool.with_active_tensors(std::slice::from_ref(&malformed), |_| Ok::<_, ()>(())),
+            Err(HostBufferReadError::Host(
+                HostBufferError::IncompatibleDescriptor
+            ))
+        ));
+
+        let window = lease.view().unwrap();
+        let mutable = window.mutable_window(0, 4).unwrap();
+        assert!(matches!(
+            pool.with_active_tensors(std::slice::from_ref(&request), |_| Ok::<_, ()>(())),
+            Err(HostBufferReadError::Host(
+                HostBufferError::OutstandingBorrow { slot: 7 }
+            ))
+        ));
+        drop(mutable);
+        drop(window);
+
+        let mut stale_lease = lease;
+        let stale = stale_lease.read_request();
+        stale_lease.release().unwrap();
+        let replacement = pool.lease(Some(7), desc(7, [2])).unwrap();
+        replacement
+            .write(TensorData::new([2], vec![8.0, 9.0]).unwrap())
+            .unwrap();
+        assert!(matches!(
+            pool.with_active_tensors(std::slice::from_ref(&stale), |_| Ok::<_, ()>(())),
+            Err(HostBufferReadError::Host(
+                HostBufferError::StaleGeneration { slot: 7, .. }
+            ))
+        ));
     }
 
     #[test]
