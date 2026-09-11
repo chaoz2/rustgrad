@@ -1618,6 +1618,11 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let checkpoint_wall_time = checkpoint_started.elapsed();
     scoreboard.observe_checkpoint(&checkpoint, checkpoint_wall_time)?;
     let report = scoreboard.report()?;
+    let executed_native_items = report
+        .main_replay_executed_native_item_count()
+        .expect("current native CPU scoreboard reports executed JIT items");
+    assert!(executed_native_items > 0);
+    assert!(executed_native_items <= report.main().native_item_count());
 
     let restored = plan.restore_checkpoint(&checkpoint)?;
     let restored_inspection = restored.inspection()?;

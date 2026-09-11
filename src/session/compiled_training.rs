@@ -1302,6 +1302,8 @@ impl NativeCpuProgramPreparationReport {
         self.vectorized
     }
 
+    /// Prepared native-item inventory, including retained workspace entries
+    /// whose execution may be elided during replay.
     pub const fn native_item_count(&self) -> usize {
         self.native_item_count
     }
@@ -1534,7 +1536,10 @@ pub struct NativeCpuRunReport {
     native_identity: u64,
     vectorized: bool,
     successful_invocation: u64,
+    /// Prepared native items include authenticated entries whose execution may
+    /// be elided by the retained workspace.
     native_item_count: usize,
+    executed_native_item_count: usize,
     schedule_cache_keys: Vec<u64>,
     traffic: NativeCpuReplayTraffic,
     wall_time: Duration,
@@ -1561,8 +1566,16 @@ impl NativeCpuRunReport {
         self.successful_invocation == 1
     }
 
+    /// Prepared native-item inventory authenticated for this replay. Retained
+    /// workspace entries can be valid members without invoking a JIT function.
     pub const fn native_item_count(&self) -> usize {
         self.native_item_count
+    }
+
+    /// Native CPU items that actually invoked a prepared JIT function during
+    /// this successfully published replay.
+    pub const fn executed_native_item_count(&self) -> usize {
+        self.executed_native_item_count
     }
 
     /// Strict replay never executes an interpreter fallback item.
@@ -5337,6 +5350,7 @@ impl CompiledEvaluationPlan {
             vectorized: prepared.plan.vectorized(),
             successful_invocation: 0,
             native_item_count: prepared.plan.item_count(),
+            executed_native_item_count: traffic.executed_native_item_count,
             schedule_cache_keys,
             traffic: native_cpu_replay_traffic(traffic),
             wall_time: started.elapsed(),
@@ -5403,6 +5417,7 @@ fn native_cpu_run_report(
         vectorized: trace.vectorized,
         successful_invocation,
         native_item_count: trace.pure_item_cache_keys.len(),
+        executed_native_item_count: traffic.executed_native_item_count,
         schedule_cache_keys: trace.pure_item_cache_keys.clone(),
         traffic: native_cpu_replay_traffic(traffic),
         wall_time,
@@ -12217,6 +12232,10 @@ mod tests {
             .unwrap();
         assert_cross_engine_tensor_close("guarded retry loss", actual.loss(), expected.loss());
         assert_eq!(actual.report().successful_invocation(), 1);
+        assert!(actual.report().executed_native_item_count() > 0);
+        assert!(
+            actual.report().executed_native_item_count() <= actual.report().native_item_count()
+        );
         assert_eq!(actual.report().traffic().external_input_import_count(), 0);
         assert_eq!(actual.report().traffic().external_input_import_bytes(), 0);
         assert_eq!(native.successful_steps, 1);
@@ -12355,6 +12374,11 @@ mod tests {
         assert_eq!(actual.report().successful_invocation(), 1);
         assert!(actual.report().first_successful_invocation());
         assert_eq!(actual.report().native_identity(), prepared_native_identity);
+        assert!(actual.report().executed_native_item_count() > 0);
+        assert!(
+            actual.report().executed_native_item_count() <= actual.report().native_item_count()
+        );
+        let first_executed_native_item_count = actual.report().executed_native_item_count();
         let first_traffic = *actual.report().traffic();
         assert_eq!(first_traffic.external_input_import_count(), 1);
         assert_eq!(first_traffic.external_input_import_bytes(), 32);
@@ -12368,6 +12392,9 @@ mod tests {
         );
         let mut malformed_report = actual.report().clone();
         malformed_report.traffic.borrowed_recurrent_output_bytes -= 1;
+        assert!(scoreboard.record(&malformed_report).is_err());
+        let mut malformed_report = actual.report().clone();
+        malformed_report.executed_native_item_count = malformed_report.native_item_count + 1;
         assert!(scoreboard.record(&malformed_report).is_err());
         scoreboard.record(actual.report()).unwrap();
         assert_native_adamw_state_close(&native, &interpreted);
@@ -12423,11 +12450,25 @@ mod tests {
         assert_eq!(expected.loss_weight(), 1);
         assert_eq!(actual.loss_weight(), 1);
         assert_eq!(actual.report().successful_invocation(), 2);
+        assert_eq!(
+            actual.report().executed_native_item_count(),
+            first_executed_native_item_count
+        );
         assert_eq!(actual.report().traffic(), &first_traffic);
+        let mut changed_execution_report = actual.report().clone();
+        changed_execution_report.executed_native_item_count = first_executed_native_item_count - 1;
+        assert!(scoreboard.record(&changed_execution_report).is_err());
         scoreboard.record(actual.report()).unwrap();
         assert_eq!(
             scoreboard.report().unwrap().main_replay_traffic().unwrap(),
             &first_traffic
+        );
+        assert_eq!(
+            scoreboard
+                .report()
+                .unwrap()
+                .main_replay_executed_native_item_count(),
+            Some(u64::try_from(first_executed_native_item_count).unwrap())
         );
         assert_native_adamw_state_close(&native, &interpreted);
         assert_eq!(executor.native_item_plan_count(), 2);
@@ -12702,6 +12743,14 @@ mod tests {
         assert_eq!(after_reset.0, before_reset.0);
         assert_eq!(after_reset.1, before_reset.1 + 1);
         assert_eq!(native.successful_zero_grads, 1);
+        assert!(
+            native
+                .zero_grad_replay
+                .as_ref()
+                .unwrap()
+                .last_executed_native_item_count()
+                > 0
+        );
         assert_native_adamw_state_close(&native, &interpreted);
         let used_reset_workspace = native.zero_grad_replay.as_ref().unwrap().workspace_stats();
         assert_eq!(
@@ -12765,6 +12814,11 @@ mod tests {
         );
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
         assert_eq!(actual.report().unwrap().successful_invocation(), 1);
+        assert!(actual.report().unwrap().executed_native_item_count() > 0);
+        assert!(
+            actual.report().unwrap().executed_native_item_count()
+                <= actual.report().unwrap().native_item_count()
+        );
         let flush_traffic = actual.report().unwrap().traffic();
         assert_eq!(flush_traffic.external_input_import_count(), 0);
         assert_eq!(flush_traffic.external_input_import_bytes(), 0);
@@ -12954,6 +13008,11 @@ mod tests {
             .unwrap();
         assert_eq!(evaluation.report().successful_invocation(), 1);
         assert!(evaluation.report().first_successful_invocation());
+        assert!(evaluation.report().executed_native_item_count() > 0);
+        assert!(
+            evaluation.report().executed_native_item_count()
+                <= evaluation.report().native_item_count()
+        );
         assert_eq!(
             evaluation.report().traffic().external_input_import_count(),
             0
@@ -13015,6 +13074,10 @@ mod tests {
             )]))
             .unwrap();
         assert_eq!(updated_evaluation.report().successful_invocation(), 2);
+        assert_eq!(
+            updated_evaluation.report().executed_native_item_count(),
+            evaluation.report().executed_native_item_count()
+        );
         assert_ne!(updated_evaluation.outputs()["output"], first_output);
         assert_eq!(
             native_recurrent_test_counts(&session.runtime),

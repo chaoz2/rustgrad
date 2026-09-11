@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const NATIVE_TRAINING_REPORT_FORMAT_V2: u32 = 2;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 3;
+const NATIVE_TRAINING_REPORT_FORMAT_V3: u32 = 3;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 4;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -225,6 +226,8 @@ pub struct NativeTrainingReport {
     recurrent_logical_state_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     main_replay_traffic: Option<NativeCpuReplayTraffic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    main_replay_executed_native_item_count: Option<u64>,
     first_replay_wall_time: BenchmarkDuration,
     steady_replay_total_wall_time: BenchmarkDuration,
     steady_replay_wall_time: BenchmarkLatencySummary,
@@ -299,6 +302,12 @@ impl NativeTrainingReport {
         self.main_replay_traffic.as_ref()
     }
 
+    /// Stable number of prepared CPU JIT items actually invoked by each
+    /// successfully published main replay.
+    pub const fn main_replay_executed_native_item_count(&self) -> Option<u64> {
+        self.main_replay_executed_native_item_count
+    }
+
     pub const fn checkpoint_byte_count(&self) -> Option<u64> {
         match &self.checkpoint {
             Some(checkpoint) => Some(checkpoint.byte_count),
@@ -328,7 +337,9 @@ impl NativeTrainingReport {
     fn validate(&self) -> Result<()> {
         if !matches!(
             self.format_version,
-            1 | NATIVE_TRAINING_REPORT_FORMAT_V2 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
+            1 | NATIVE_TRAINING_REPORT_FORMAT_V2
+                | NATIVE_TRAINING_REPORT_FORMAT_V3
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
         }
@@ -361,15 +372,28 @@ impl NativeTrainingReport {
         self.main.validate()?;
         match (self.format_version, &self.main_replay_traffic) {
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2, None) => {}
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(traffic))
-                if traffic.borrowed_recurrent_input_bytes()
-                    == self.recurrent_logical_state_bytes
-                    && traffic.borrowed_recurrent_output_bytes()
-                        == self.recurrent_logical_state_bytes => {}
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V3 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(traffic),
+            ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
+                && traffic.borrowed_recurrent_output_bytes()
+                    == self.recurrent_logical_state_bytes => {}
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2, Some(_)) => {
                 return Err(invalid("legacy native training report has replay traffic"));
             }
             _ => return Err(invalid("native training replay traffic differs")),
+        }
+        match (
+            self.format_version,
+            self.main_replay_executed_native_item_count,
+        ) {
+            (1 | NATIVE_TRAINING_REPORT_FORMAT_V2 | NATIVE_TRAINING_REPORT_FORMAT_V3, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(executed))
+                if executed <= self.main.native_item_count => {}
+            (1 | NATIVE_TRAINING_REPORT_FORMAT_V2 | NATIVE_TRAINING_REPORT_FORMAT_V3, Some(_)) => {
+                return Err(invalid("legacy native training report has execution count"));
+            }
+            _ => return Err(invalid("native training execution count differs")),
         }
         for program in self
             .partial_flush
@@ -448,6 +472,7 @@ pub struct NativeTrainingScoreboard {
     durations: Vec<Duration>,
     schedule_cache_keys: Option<Vec<u64>>,
     main_replay_traffic: Option<NativeCpuReplayTraffic>,
+    main_replay_executed_native_item_count: Option<u64>,
     checkpoint: Option<CheckpointReport>,
 }
 
@@ -490,6 +515,7 @@ impl NativeTrainingScoreboard {
             durations: Vec::new(),
             schedule_cache_keys: None,
             main_replay_traffic: None,
+            main_replay_executed_native_item_count: None,
             checkpoint: None,
         })
     }
@@ -505,6 +531,7 @@ impl NativeTrainingScoreboard {
             || report.native_identity() != self.main.native_identity
             || report.is_vectorized() != self.main.vectorized
             || count(report.native_item_count(), "native item")? != self.main.native_item_count
+            || report.executed_native_item_count() > report.native_item_count()
             || report.fallback_count() != 0
             || report.successful_invocation() != expected_invocation
             || report.schedule_cache_keys().len() != report.native_item_count()
@@ -534,11 +561,20 @@ impl NativeTrainingScoreboard {
         {
             return Err(invalid("native replay traffic changed"));
         }
+        let executed = count(report.executed_native_item_count(), "executed native item")?;
+        if let Some(expected) = self.main_replay_executed_native_item_count
+            && expected != executed
+        {
+            return Err(invalid("native replay execution count changed"));
+        }
         if self.schedule_cache_keys.is_none() {
             self.schedule_cache_keys = Some(report.schedule_cache_keys().to_vec());
         }
         if self.main_replay_traffic.is_none() {
             self.main_replay_traffic = Some(*report.traffic());
+        }
+        if self.main_replay_executed_native_item_count.is_none() {
+            self.main_replay_executed_native_item_count = Some(executed);
         }
         self.durations.push(report.wall_time());
         Ok(())
@@ -597,6 +633,7 @@ impl NativeTrainingScoreboard {
                 "recurrent state byte",
             )?,
             main_replay_traffic: self.main_replay_traffic,
+            main_replay_executed_native_item_count: self.main_replay_executed_native_item_count,
             first_replay_wall_time: BenchmarkDuration::from_duration(first),
             steady_replay_total_wall_time,
             steady_replay_wall_time: latency_summary(steady)?,
@@ -738,6 +775,7 @@ mod tests {
             recurrent_logical_state_count: 4,
             recurrent_logical_state_bytes: 16,
             main_replay_traffic: Some(NativeCpuReplayTraffic::new(2, 12, 16, 16)),
+            main_replay_executed_native_item_count: Some(1),
             first_replay_wall_time: zero_duration(),
             steady_replay_wall_time: BenchmarkLatencySummary {
                 sample_count: 1,
@@ -785,6 +823,7 @@ mod tests {
             json["main_replay_traffic"]["borrowed_recurrent_output_bytes"],
             16
         );
+        assert_eq!(json["main_replay_executed_native_item_count"], 1);
         assert_eq!(
             NativeTrainingReport::from_json_bytes(&bytes).unwrap(),
             report
@@ -797,6 +836,9 @@ mod tests {
         json["format_version"] = serde_json::json!(1);
         json.as_object_mut().unwrap().remove("zero_grad");
         json.as_object_mut().unwrap().remove("main_replay_traffic");
+        json.as_object_mut()
+            .unwrap()
+            .remove("main_replay_executed_native_item_count");
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.zero_grad().is_none());
@@ -807,9 +849,25 @@ mod tests {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V2);
         json.as_object_mut().unwrap().remove("main_replay_traffic");
+        json.as_object_mut()
+            .unwrap()
+            .remove("main_replay_executed_native_item_count");
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.main_replay_traffic().is_none());
+    }
+
+    #[test]
+    fn version_three_report_without_execution_count_still_decodes() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V3);
+        json.as_object_mut()
+            .unwrap()
+            .remove("main_replay_executed_native_item_count");
+        let report =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(report.main_replay_executed_native_item_count().is_none());
+        assert!(report.main_replay_traffic().is_some());
     }
 
     #[test]
@@ -822,6 +880,21 @@ mod tests {
 
         let mut report = zero_report();
         report.main_replay_traffic = Some(NativeCpuReplayTraffic::new(2, 12, 16, 15));
+        assert!(report.validate().is_err());
+    }
+
+    #[test]
+    fn current_report_requires_bounded_execution_count() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("main_replay_executed_native_item_count");
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+
+        let mut report = zero_report();
+        report.main_replay_executed_native_item_count = Some(3);
         assert!(report.validate().is_err());
     }
 

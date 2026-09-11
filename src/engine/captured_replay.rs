@@ -846,6 +846,11 @@ impl PlannedNativeItems {
         self.workspace.stats()
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_executed_native_item_count(&self) -> usize {
+        self.workspace.last_executed_native_item_count()
+    }
+
     fn validate_replay_structure(&self, capture: &CapturedSchedule) -> Result<(), ReplayError> {
         reject_multi_output_items(capture)?;
         if capture.identity != self.capture_identity {
@@ -1742,6 +1747,10 @@ mod tests {
         assert_eq!(first_traffic.external_input_import_bytes, 0);
         assert_eq!(first_traffic.borrowed_recurrent_input_bytes, 0);
         assert_eq!(first_traffic.borrowed_recurrent_output_bytes, 0);
+        assert_eq!(
+            first_traffic.executed_native_item_count,
+            capture.items.len()
+        );
         let first_stats = plan.workspace_stats();
         assert_eq!(first_stats.allocation_count, prepared.allocation_count);
         assert_eq!(first_stats.input_import_count, 0);
@@ -1915,8 +1924,8 @@ mod tests {
         assert_eq!(prepared.retained_transpose_matmul_input_count, 1);
         assert_eq!(prepared.affine_matmul_materialization_bytes, 0);
 
-        let actual = executor
-            .execute_planned_native_items(&capture, &bindings, &mut plan)
+        let (actual, traffic) = executor
+            .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
             .unwrap();
         let expected = CpuBackend
             .execute(
@@ -1935,6 +1944,7 @@ mod tests {
         let first = plan.workspace_stats();
         assert_eq!(first.allocation_count, prepared.allocation_count);
         assert_eq!(first.affine_matmul_materialization_bytes, 0);
+        assert_eq!(traffic.executed_native_item_count + 1, capture.items.len());
 
         let malformed = BTreeMap::from([
             ("lhs".into(), TensorData::new([1, 3], vec![1.0; 3]).unwrap()),
