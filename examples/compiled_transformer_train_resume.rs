@@ -360,7 +360,8 @@ fn file_resume_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConf
         .with_token_weighted_gradient_accumulation(LOSS_MASK)?
         .with_frozen_parameters([FILE_RESUME_POLICY_FROZEN])?
         .with_captured_multi_step_lr(schedule)
-        .with_clip_report())
+        .with_clip_report()
+        .with_window_loss_report())
 }
 
 fn dropout_config() -> CompiledDropoutConfig {
@@ -1249,10 +1250,12 @@ fn run_cpu_reuse() -> Result<()> {
 
 fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
     const LAST_REPLAY: u64 = 9;
+    const WINDOW_LOSS_WEIGHT: u64 = 11;
 
     let schedule = CompiledMultiStepLr::new(1e-3, 0.5, [1])?;
     let config = file_resume_config(schedule.clone())?;
     assert!(config.clip_report_enabled());
+    assert!(config.window_loss_report_enabled());
     assert!(
         file_resume_batch(3)?.has_fully_masked_sample(),
         "the zero-length row must exercise fully masked attention"
@@ -1281,9 +1284,15 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         assert_eq!(step.loss_weight(), loss_weight);
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
         assert_eq!(step.clip_report().is_some(), step.did_update());
+        assert_eq!(step.window_loss_report().is_some(), step.did_update());
         if let Some(report) = step.clip_report() {
             assert!(report.is_finite());
             assert!(report.did_clip().is_some());
+        }
+        if let Some(report) = step.window_loss_report() {
+            assert!(report.is_finite());
+            assert_eq!(report.microbatch_count(), ACCUMULATION_STEPS);
+            assert_eq!(report.loss_weight(), WINDOW_LOSS_WEIGHT);
         }
     }
     assert_eq!(uninterrupted.step_count(), 4);
@@ -1321,6 +1330,19 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         checkpoint_file.write_then_read(checkpoint.as_bytes())?,
     )?;
     assert_eq!(decoded, checkpoint);
+    assert!(
+        decoded
+            .optimizer_checkpoint()
+            .info()
+            .window_loss_report_enabled()
+    );
+    let pending_loss_numerator = decoded
+        .optimizer_checkpoint()
+        .info()
+        .accumulated_loss_numerator()
+        .expect("window-loss reporting checkpoints its pending F32 numerator");
+    assert!(pending_loss_numerator.is_finite());
+    assert_ne!(pending_loss_numerator, 0.0);
 
     let destination = FileResumeTransformer::new(0x9abc)?;
     destination.frozen_scale.replace(TensorData::scalar(7.0))?;
@@ -1399,10 +1421,18 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         assert_eq!(actual.loss_weight(), expected.loss_weight());
         assert_eq!(actual.did_update(), expected.did_update());
         assert_eq!(actual.clip_report(), expected.clip_report());
+        assert_eq!(actual.window_loss_report(), expected.window_loss_report());
         assert_eq!(
             actual.clip_report().is_some(),
             actual.accumulation_index() == 0
         );
+        assert_eq!(actual.window_loss_report().is_some(), actual.did_update());
+        if let Some(report) = actual.window_loss_report() {
+            assert!(matches!(replay, 6 | 9));
+            assert!(report.is_finite());
+            assert_eq!(report.microbatch_count(), ACCUMULATION_STEPS);
+            assert_eq!(report.loss_weight(), WINDOW_LOSS_WEIGHT);
+        }
         let actual_checkpoint = resumed.checkpoint()?;
         let expected_checkpoint = uninterrupted.checkpoint()?;
         assert_eq!(
