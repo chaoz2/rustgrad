@@ -812,6 +812,15 @@ pub(crate) struct PlannedNativeItems {
     capture_identity: u64,
     input_schema: Vec<crate::ReplayInput>,
     schedule_cache_keys: Vec<u64>,
+    #[cfg(test)]
+    structure_validation_count: std::sync::atomic::AtomicUsize,
+}
+
+/// One native pure plan whose immutable capture schema, cache keys, and
+/// operand layouts have already been authenticated. Only the recurrent mixed
+/// replay owner can construct and execute this form.
+pub(super) struct SealedPlannedNativeItems {
+    plan: PlannedNativeItems,
 }
 
 impl PlannedNativeItems {
@@ -839,6 +848,14 @@ impl PlannedNativeItems {
         self.validate_replay_structure(capture)
     }
 
+    pub(super) fn seal(
+        self,
+        capture: &CapturedSchedule,
+    ) -> Result<SealedPlannedNativeItems, ReplayError> {
+        self.validate_replay_structure(capture)?;
+        Ok(SealedPlannedNativeItems { plan: self })
+    }
+
     #[cfg(test)]
     pub(crate) fn workspace_stats(
         &self,
@@ -852,6 +869,9 @@ impl PlannedNativeItems {
     }
 
     fn validate_replay_structure(&self, capture: &CapturedSchedule) -> Result<(), ReplayError> {
+        #[cfg(test)]
+        self.structure_validation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         reject_multi_output_items(capture)?;
         if capture.identity != self.capture_identity {
             return Err(ReplayError::Corrupt(
@@ -903,6 +923,47 @@ impl PlannedNativeItems {
         // plan. Revalidate the current invocation before importing it into
         // invalidatable scratch, including quantized row-gather index bounds.
         validate_inputs(capture, provided)
+    }
+}
+
+impl SealedPlannedNativeItems {
+    pub(super) fn item_count(&self) -> usize {
+        self.plan.item_count()
+    }
+
+    pub(super) fn cache_hit_count(&self) -> usize {
+        self.plan.cache_hit_count()
+    }
+
+    pub(super) fn cache_miss_count(&self) -> usize {
+        self.plan.cache_miss_count()
+    }
+
+    pub(super) fn vectorized(&self) -> bool {
+        self.plan.vectorized()
+    }
+
+    pub(super) fn schedule_cache_keys(&self) -> &[u64] {
+        self.plan.schedule_cache_keys()
+    }
+
+    #[cfg(test)]
+    pub(super) fn workspace_stats(
+        &self,
+    ) -> super::native_replay_workspace::NativeReplayWorkspaceStats {
+        self.plan.workspace_stats()
+    }
+
+    #[cfg(test)]
+    pub(super) fn last_executed_native_item_count(&self) -> usize {
+        self.plan.last_executed_native_item_count()
+    }
+
+    #[cfg(test)]
+    pub(super) fn structure_validation_count(&self) -> usize {
+        self.plan
+            .structure_validation_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -1143,6 +1204,8 @@ impl CapturedReplayExecutor {
             capture_identity: capture.identity,
             input_schema: capture.inputs.clone(),
             schedule_cache_keys: capture.items.iter().map(|item| item.cache_key).collect(),
+            #[cfg(test)]
+            structure_validation_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1224,13 +1287,84 @@ impl CapturedReplayExecutor {
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         ) -> Result<(), ReplayError>,
-        mut import: impl FnMut(
+        import: impl FnMut(
             &crate::ReplayInput,
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         ) -> Result<(), ReplayError>,
     ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
         plan.validate_replay_structure(capture)?;
+        self.execute_authenticated_native_items_resolved(
+            capture, plan, borrowed, selected, setup, import,
+        )
+    }
+
+    pub(super) fn execute_sealed_planned_native_items_resolved<'a>(
+        &self,
+        capture: &CapturedSchedule,
+        plan: &mut SealedPlannedNativeItems,
+        borrowed: &mut super::native_replay_workspace::NativeReplayBindings<'a>,
+        selected: Option<&BTreeSet<u64>>,
+        setup: impl FnOnce(
+            &mut NativeReplayWorkspace,
+            &mut super::native_replay_workspace::NativeReplayBindings<'a>,
+        ) -> Result<(), ReplayError>,
+        import: impl FnMut(
+            &crate::ReplayInput,
+            &mut NativeReplayWorkspace,
+            &mut super::native_replay_workspace::NativeReplayBindings<'a>,
+        ) -> Result<(), ReplayError>,
+    ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
+        self.execute_authenticated_native_items_resolved(
+            capture,
+            &mut plan.plan,
+            borrowed,
+            selected,
+            setup,
+            import,
+        )
+    }
+
+    pub(super) fn execute_sealed_planned_native_items(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+        plan: &mut SealedPlannedNativeItems,
+    ) -> Result<ReplayValues, ReplayError> {
+        validate_inputs(capture, provided)?;
+        let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
+        self.execute_authenticated_native_items_resolved(
+            capture,
+            &mut plan.plan,
+            &mut borrowed,
+            None,
+            |_workspace, _borrowed| Ok(()),
+            |input, workspace, borrowed| {
+                let value = provided
+                    .get(&input.name)
+                    .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
+                workspace.bind_external_input(&input.name, value, borrowed)
+            },
+        )
+        .map(|(values, _)| values)
+    }
+
+    fn execute_authenticated_native_items_resolved<'a>(
+        &self,
+        capture: &CapturedSchedule,
+        plan: &mut PlannedNativeItems,
+        borrowed: &mut super::native_replay_workspace::NativeReplayBindings<'a>,
+        selected: Option<&BTreeSet<u64>>,
+        setup: impl FnOnce(
+            &mut NativeReplayWorkspace,
+            &mut super::native_replay_workspace::NativeReplayBindings<'a>,
+        ) -> Result<(), ReplayError>,
+        mut import: impl FnMut(
+            &crate::ReplayInput,
+            &mut NativeReplayWorkspace,
+            &mut super::native_replay_workspace::NativeReplayBindings<'a>,
+        ) -> Result<(), ReplayError>,
+    ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
         validate_quantized_index_inputs(capture)?;
         plan.workspace.begin_resolved();
         setup(&mut plan.workspace, borrowed)?;
