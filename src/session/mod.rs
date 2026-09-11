@@ -33,8 +33,8 @@ pub use compiled_training::{
     MetalCompiledAdamWFlushResult, MetalCompiledAdamWPlan, MetalCompiledAdamWStepResult,
     MetalCompiledEvaluationResult, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWFlushResult,
     NativeCpuCompiledAdamWPreparationReport, NativeCpuCompiledAdamWStepResult,
-    NativeCpuCompiledEvaluationResult, NativeCpuProgramPreparationReport, NativeCpuRunReport,
-    TrainingParameterInit,
+    NativeCpuCompiledEvaluationResult, NativeCpuProgramPreparationReport, NativeCpuReplayTraffic,
+    NativeCpuRunReport, TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,

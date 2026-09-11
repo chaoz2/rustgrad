@@ -2,6 +2,7 @@
 //!
 //! This type intentionally owns only logical schedule/state metadata. Runtime
 //! leases, slot generations, pointers, and current bytes remain caller-owned.
+use super::NativeReplayTraffic;
 use super::persistent_inputs::bind_persistent_inputs;
 use crate::uop::artifact::{ArtifactError, Reader, Writer, checksum};
 use crate::{
@@ -48,6 +49,12 @@ pub struct MixedReplayResult {
     /// This is a logical cache/trace identity: it deliberately contains no
     /// runtime slot, generation, pointer, or current storage byte.
     pub native_trace: Option<NativeMixedReplayTrace>,
+}
+
+#[derive(Debug)]
+pub(crate) struct NativeMixedReplayResult {
+    pub(crate) replay: MixedReplayResult,
+    pub(crate) traffic: NativeReplayTraffic,
 }
 
 /// Logical persistent-state frontier for recurrent replay of one exact mixed
@@ -772,7 +779,7 @@ impl CapturedMixedSchedule {
         native: NativeReplayContext<'_>,
         injected_failure: Option<u64>,
         validate_transition: F,
-    ) -> Result<MixedReplayResult, ReplayError>
+    ) -> Result<NativeMixedReplayResult, ReplayError>
     where
         F: FnOnce(&[crate::TensorData], &[&crate::TensorData]) -> Result<(), String>,
     {
@@ -801,7 +808,7 @@ impl CapturedMixedSchedule {
             .copied()
             .collect::<BTreeSet<_>>();
         let staged = runtime.transact_recurrent_native_banks(&current, &next, |banks| {
-            let mut values = {
+            let (mut values, traffic) = {
                 let mut active = BTreeMap::new();
                 let mut inactive = BTreeMap::new();
                 for bank in banks.iter_mut() {
@@ -903,10 +910,10 @@ impl CapturedMixedSchedule {
                     crate::RuntimeError::InjectedFailure(step)
                 )));
             }
-            Ok(outputs)
+            Ok((outputs, traffic))
         });
-        let outputs = match staged {
-            Ok(outputs) => outputs,
+        let (outputs, traffic) = match staged {
+            Ok(staged) => staged,
             Err(crate::effects::runtime::RecurrentTransactionError::Stage(error)) => {
                 return Err(error);
             }
@@ -920,10 +927,13 @@ impl CapturedMixedSchedule {
             }
         };
         cursor.frontier = next.clone();
-        Ok(MixedReplayResult {
-            outputs,
-            committed: next,
-            native_trace: Some(native_trace),
+        Ok(NativeMixedReplayResult {
+            replay: MixedReplayResult {
+                outputs,
+                committed: next,
+                native_trace: Some(native_trace),
+            },
+            traffic,
         })
     }
 
@@ -2407,7 +2417,12 @@ mod recurrent_tests {
         let after = runtime.recurrent_test_counts();
         assert_eq!(after.0, before.0, "native replay must not snapshot state");
         assert_eq!(after.1, before.1 + 1);
-        assert_eq!(replay.committed, cursor.frontier());
+        assert_eq!(replay.replay.committed, cursor.frontier());
+        assert_eq!(replay.traffic.external_input_import_count, 1);
+        assert_eq!(replay.traffic.external_input_import_bytes, 8);
+        assert_eq!(replay.traffic.borrowed_recurrent_input_bytes, 8);
+        assert_eq!(replay.traffic.borrowed_recurrent_output_bytes, 8);
+        let expected_traffic = replay.traffic;
 
         let checkpoint = frontier_values(&runtime, &cursor);
         let failed_cursor = cursor.clone();
@@ -2456,7 +2471,11 @@ mod recurrent_tests {
                 |_, _| Ok(()),
             )
             .unwrap();
-        assert_eq!(retried.outputs[0].storage(), &Storage::F32(vec![2.0, 2.0]));
+        assert_eq!(retried.traffic, expected_traffic);
+        assert_eq!(
+            retried.replay.outputs[0].storage(),
+            &Storage::F32(vec![2.0, 2.0])
+        );
         assert_eq!(
             frontier_values(&runtime, &cursor)[0].storage(),
             &Storage::F32(vec![2.0, 2.0])

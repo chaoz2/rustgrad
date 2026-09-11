@@ -108,7 +108,8 @@ Its
 `native-cpu-scoreboard` mode emits bounded versioned JSON for caller-timed
 compile, prepare, and checkpoint phases plus runtime-timed first/steady replay,
 together with authenticated main, partial-flush, captured-zero-grad, evaluation,
-cache, and recurrent-state facts. Nonempty CPU `zero_grad` uses an authenticated
+cache, recurrent-state, and per-commit logical input/recurrent-traffic facts.
+Nonempty CPU `zero_grad` uses an authenticated
 compile-once state-only replay, while an empty window remains an exact no-op.
 CPU kernel-launch, transfer, and physical peak-memory fields remain `null`
 because this path does not measure them. This is workload evidence, not a
