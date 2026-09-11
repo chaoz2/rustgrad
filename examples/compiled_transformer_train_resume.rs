@@ -1788,6 +1788,28 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(report.main().loaded_module_count(), 1);
     assert!(report.main().compiler_invocation_count() <= 1);
     assert_eq!(report.successful_replay_count(), SAMPLES);
+    let executor_timing = report
+        .main_replay_executor_wall_time()
+        .expect("current native CPU scoreboard reports sealed executor timing");
+    let overhead_timing = report
+        .main_replay_recurrent_overhead_wall_time()
+        .expect("current native CPU scoreboard reports recurrent overhead timing");
+    assert_eq!(
+        executor_timing
+            .first()
+            .to_duration()?
+            .checked_add(overhead_timing.first().to_duration()?)
+            .expect("first replay phase durations fit"),
+        report.first_replay_wall_time().to_duration()?
+    );
+    assert_eq!(
+        executor_timing
+            .steady_total()
+            .to_duration()?
+            .checked_add(overhead_timing.steady_total().to_duration()?)
+            .expect("steady replay phase durations fit"),
+        report.steady_replay_total_wall_time().to_duration()?
+    );
     assert_eq!(
         Some(executed_native_items as usize),
         stable_executed_native_items

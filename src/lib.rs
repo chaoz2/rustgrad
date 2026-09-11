@@ -284,9 +284,9 @@ pub use session::{
     NativeCpuCompiledEvaluationResult, NativeCpuPreparationWork, NativeCpuProgramPreparationReport,
     NativeCpuReplayTraffic, NativeCpuRunReport, NativeCpuSessionTarget,
     NativeModuleExecutionReport, NativeModuleInferenceResult, NativeModuleInferenceTrace,
-    NativeTrainingProgramReport, NativeTrainingReport, NativeTrainingScoreboard,
-    ReportedNativeModuleInferenceResult, SessionDevice, SessionTarget, Tensor,
-    TrainingParameterInit, infer_module_cpu, infer_module_native_cpu,
+    NativeTrainingProgramReport, NativeTrainingReplayTiming, NativeTrainingReport,
+    NativeTrainingScoreboard, ReportedNativeModuleInferenceResult, SessionDevice, SessionTarget,
+    Tensor, TrainingParameterInit, infer_module_cpu, infer_module_native_cpu,
     infer_module_native_cpu_with_report, summarize_binary_classification, summarize_classification,
 };
 pub use sharded_cuda_execute::{

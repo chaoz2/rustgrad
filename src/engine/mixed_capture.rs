@@ -9,7 +9,10 @@ use crate::{
     BufferDesc, BufferState, CapturedSchedule, EffectPayload, MixedStateRebinding, NodeId,
     Operation, ReplayError, ReplayInput, Schedule, ScheduleStateBinding, ScheduleValueBinding, UOp,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant},
+};
 
 const MAGIC: &[u8; 4] = b"RGSM";
 /// v3 adopts canonical schedule item/state-binding keys. v1-v2 retain opaque
@@ -94,6 +97,7 @@ pub struct MixedReplayResult {
 pub(crate) struct NativeMixedReplayResult {
     pub(crate) replay: MixedReplayResult,
     pub(crate) traffic: NativeReplayTraffic,
+    pub(crate) executor_wall_time: Duration,
 }
 
 /// Logical persistent-state frontier for recurrent replay of one exact mixed
@@ -212,7 +216,7 @@ impl<'a> NativeReplayContext<'a> {
         replacements.validate_external_inputs(provided)?;
         let public = requested.iter().copied().collect::<BTreeSet<_>>();
         let staged = runtime.transact_recurrent_native_banks(&current, &next, |banks| {
-            let (mut values, traffic) = {
+            let (mut values, traffic, executor_wall_time) = {
                 let mut active = BTreeMap::new();
                 let mut inactive = BTreeMap::new();
                 for bank in banks.iter_mut() {
@@ -222,7 +226,8 @@ impl<'a> NativeReplayContext<'a> {
                     inactive.insert(buffer, successor);
                 }
                 let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
-                executor.execute_sealed_planned_native_items_resolved(
+                let executor_started = Instant::now();
+                let executed = executor.execute_sealed_planned_native_items_resolved(
                     pure,
                     plan,
                     &mut borrowed,
@@ -265,7 +270,10 @@ impl<'a> NativeReplayContext<'a> {
                         }
                         Ok(())
                     },
-                )?
+                );
+                let executor_wall_time = executor_started.elapsed();
+                let (values, traffic) = executed?;
+                (values, traffic, executor_wall_time)
             };
             let outputs = requested
                 .iter()
@@ -312,9 +320,9 @@ impl<'a> NativeReplayContext<'a> {
                     crate::RuntimeError::InjectedFailure(step)
                 )));
             }
-            Ok((outputs, traffic))
+            Ok((outputs, traffic, executor_wall_time))
         });
-        let (outputs, traffic) = match staged {
+        let (outputs, traffic, executor_wall_time) = match staged {
             Ok(staged) => staged,
             Err(crate::effects::runtime::RecurrentTransactionError::Stage(error)) => {
                 return Err(error);
@@ -336,6 +344,7 @@ impl<'a> NativeReplayContext<'a> {
                 native_trace: Some(trace.replay.clone()),
             },
             traffic,
+            executor_wall_time,
         })
     }
 }
@@ -2540,6 +2549,7 @@ mod recurrent_tests {
         assert_eq!(frontier_values(&runtime, &cursor), initial_values);
         assert_eq!(prepared.structure_validation_count(), 1);
         let before = runtime.recurrent_test_counts();
+        let replay_started = Instant::now();
         let replay = NativeReplayContext::new(&executor, &mut prepared)
             .replay_recurrent_checked(
                 &mut runtime,
@@ -2553,6 +2563,7 @@ mod recurrent_tests {
                 },
             )
             .unwrap();
+        assert!(replay.executor_wall_time <= replay_started.elapsed());
         let after = runtime.recurrent_test_counts();
         assert_eq!(after.0, before.0, "native replay must not snapshot state");
         assert_eq!(after.1, before.1 + 1);
