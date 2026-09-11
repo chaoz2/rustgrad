@@ -1324,8 +1324,9 @@ impl NativeCpuPreparationWork {
             .durable_artifact_cache_hit_count
             .checked_add(self.durable_artifact_cache_miss_count)
             .ok_or_else(|| training("compiled native CPU durable cache count overflows"))?;
-        if self.rendered_entry_count != native_item_count
-            || self.loaded_module_count != usize::from(native_item_count != 0)
+        if self.rendered_entry_count > native_item_count
+            || (self.rendered_entry_count == 0) != (native_item_count == 0)
+            || self.loaded_module_count != usize::from(self.rendered_entry_count != 0)
             || durable_access_count > self.loaded_module_count
             || self.compiler_invocation_count != self.durable_artifact_cache_miss_count
         {
@@ -1478,8 +1479,9 @@ impl NativeCpuProgramPreparationReport {
         self.vectorized
     }
 
-    /// Prepared native-item inventory, including retained workspace entries
-    /// whose execution may be elided during replay.
+    /// Authenticated logical schedule-item inventory. Cache hit and miss counts
+    /// use this same logical coverage; [`NativeCpuPreparationWork::rendered_entry_count`]
+    /// reports the physical compiled-entry inventory.
     pub const fn native_item_count(&self) -> usize {
         self.native_item_count
     }
@@ -1790,14 +1792,14 @@ impl NativeCpuRunReport {
         self.successful_invocation == 1
     }
 
-    /// Prepared native-item inventory authenticated for this replay. Retained
-    /// workspace entries can be valid members without invoking a JIT function.
+    /// Authenticated logical schedule-item inventory for this replay. Retained
+    /// or grouped logical items need not each invoke a physical JIT entry.
     pub const fn native_item_count(&self) -> usize {
         self.native_item_count
     }
 
-    /// Native CPU items that actually invoked a prepared JIT function during
-    /// this successfully published replay.
+    /// Physical native entries that actually invoked a prepared JIT function
+    /// during this successfully published replay.
     pub const fn executed_native_item_count(&self) -> usize {
         self.executed_native_item_count
     }
@@ -1808,8 +1810,8 @@ impl NativeCpuRunReport {
         self.module_dispatch_count
     }
 
-    /// Prepared native entries invoked through authenticated module tape
-    /// metadata rather than the conservative per-item binding path.
+    /// Physical native entries invoked through authenticated module tape
+    /// metadata rather than the conservative per-entry binding path.
     pub const fn module_dispatched_native_item_count(&self) -> usize {
         self.module_dispatched_native_item_count
     }
@@ -4127,6 +4129,7 @@ struct CompiledTrainingPlan {
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
     state_values: BTreeMap<RecurrentStateKey, TensorData>,
     state_versions: BTreeMap<RecurrentStateKey, u64>,
+    adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
     frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
 }
@@ -4137,6 +4140,7 @@ struct CompiledAdamWAuxiliaryPlan {
     recurrent_capture: CapturedStatefulInference,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
+    adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
     capture_identity: u64,
     clip_report: bool,
     window_loss_report: bool,
@@ -4172,6 +4176,7 @@ struct CpuCompiledTrainingProgram {
     workload_buffers: BTreeMap<RecurrentStateKey, u64>,
     state_input_buffers: BTreeMap<String, u64>,
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
+    adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
     frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
 }
@@ -4281,6 +4286,92 @@ fn materialize_compiled_state_aliases(
             }
         })
         .collect()
+}
+
+/// Builds an exact zero that retains the old recurrent value as an
+/// authenticated dependency. Unlike subtraction, this remains zero for
+/// non-finite floating-point state.
+fn state_dependent_zero(graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+    let shape = graph.shape(input)?.clone();
+    let dtype = graph.dtype(input)?;
+    let zero_value = if dtype == DType::F32 {
+        Scalar::F(0.0)
+    } else if dtype == DType::U64 {
+        Scalar::U(0)
+    } else {
+        return Err(training(
+            "compiled recurrent zero state dtype is unsupported",
+        ));
+    };
+    let zero = graph.lazy_full_with_dtype(shape, zero_value, dtype)?;
+    let false_condition = if dtype == DType::F32 {
+        // F32 addition by +0 deliberately remains a graph operation because
+        // it changes -0 to +0. Every ordered input compares equal to the
+        // shifted value, while NaN makes ordered Lt false.
+        let shifted = graph.add(input, zero)?;
+        graph.compare(CompareOp::Lt, input, shifted)?
+    } else if dtype == DType::U64 {
+        // U64 subtraction is defined modulo 2^64. Casting its exact zero
+        // avoids a native C self-comparison rejected by Apple Clang.
+        let difference = graph.sub(input, input)?;
+        graph.cast(difference, DType::Bool)?
+    } else {
+        unreachable!("state-dependent zero dtype was preflighted")
+    };
+    graph.select(false_condition, input, zero)
+}
+
+fn adamw_native_update_manifests(
+    parameters: impl Iterator<Item = String>,
+    updates: &BTreeMap<RecurrentStateKey, NodeId>,
+    state_buffers: &BTreeMap<RecurrentStateKey, u64>,
+) -> Result<Vec<crate::engine::AdamWNativeUpdateManifest>> {
+    let mut manifests = Vec::new();
+    for name in parameters {
+        let accumulator =
+            RecurrentStateKey::adamw_parameter(&name, AdamWParameterState::GradientAccumulator);
+        if !state_buffers.contains_key(&accumulator) && !updates.contains_key(&accumulator) {
+            continue;
+        }
+        let keys = [
+            (
+                crate::engine::AdamWNativeUpdateRole::Parameter,
+                RecurrentStateKey::parameter(&name),
+            ),
+            (
+                crate::engine::AdamWNativeUpdateRole::FirstMoment,
+                RecurrentStateKey::adamw_parameter(&name, AdamWParameterState::FirstMoment),
+            ),
+            (
+                crate::engine::AdamWNativeUpdateRole::SecondMoment,
+                RecurrentStateKey::adamw_parameter(&name, AdamWParameterState::SecondMoment),
+            ),
+            (
+                crate::engine::AdamWNativeUpdateRole::GradientAccumulator,
+                accumulator,
+            ),
+        ];
+        let members = keys
+            .iter()
+            .map(|(role, key)| {
+                let output = updates
+                    .get(key)
+                    .ok_or_else(|| training("compiled AdamW native update successor is absent"))?;
+                let state_buffer = state_buffers
+                    .get(key)
+                    .ok_or_else(|| training("compiled AdamW native update state is absent"))?;
+                Ok(crate::engine::AdamWNativeUpdateSuccessor {
+                    role: *role,
+                    output: output.index() as u64,
+                    state_buffer: *state_buffer,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .map_err(|_| training("compiled AdamW native update inventory differs"))?;
+        manifests.push(crate::engine::AdamWNativeUpdateManifest { members });
+    }
+    Ok(manifests)
 }
 
 impl CompiledTrainingPlan {
@@ -4508,6 +4599,16 @@ impl CompiledTrainingPlan {
                 item.node.index()
             )));
         }
+        let state_buffers = specs
+            .iter()
+            .zip(&state_values)
+            .map(|(spec, (buffer, _))| (spec.key.clone(), *buffer))
+            .collect::<BTreeMap<_, _>>();
+        let adamw_native_updates = adamw_native_update_manifests(
+            parameter_nodes.keys().cloned(),
+            &updates,
+            &state_buffers,
+        )?;
         let mut captured =
             CapturedSchedule::capture(&graph, &pure, &requested[..public_output_count])
                 .map_err(replay_error)?;
@@ -4573,6 +4674,7 @@ impl CompiledTrainingPlan {
                 .map(|spec| (spec.key.clone(), spec.value.clone()))
                 .collect(),
             state_versions: specs.iter().map(|spec| (spec.key.clone(), 0)).collect(),
+            adamw_native_updates,
             frozen_parameter_nodes: BTreeSet::new(),
             step: 0,
         })
@@ -4783,6 +4885,7 @@ impl CompiledTrainingPlan {
             workload_buffers: self.workload_buffers.clone(),
             state_input_buffers: self.state_input_buffers.clone(),
             state_input_keys: self.state_input_keys.clone(),
+            adamw_native_updates: self.adamw_native_updates.clone(),
             frozen_parameter_nodes: self.frozen_parameter_nodes.clone(),
             step: 0,
         };
@@ -4931,14 +5034,14 @@ impl CompiledAdamWAuxiliaryPlan {
         if let Some((key, _)) = &window_loss_report {
             updates.insert(key.clone(), scalar_f32(&mut graph, 0.0)?);
         }
-        for (name, parameter) in &parameters {
+        for name in parameters.keys() {
             let key =
                 RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
-            let zero = graph.lazy_full_with_dtype(
-                graph.shape(*parameter)?.clone(),
-                Scalar::I(0),
-                DType::F32,
-            )?;
+            let accumulator = state_nodes
+                .get(&key)
+                .copied()
+                .ok_or_else(|| training("compiled partial flush accumulator is absent"))?;
+            let zero = state_dependent_zero(&mut graph, accumulator)?;
             updates.insert(key, zero);
         }
         let successor_keys = specs
@@ -5049,6 +5152,8 @@ impl CompiledAdamWAuxiliaryPlan {
             .initial_recurrent_cursor()
             .map_err(replay_error)?
             .capture_identity();
+        let adamw_native_updates =
+            adamw_native_update_manifests(parameters.keys().cloned(), &updates, &state_buffers)?;
         Ok(Self {
             capture,
             recurrent_capture,
@@ -5057,6 +5162,7 @@ impl CompiledAdamWAuxiliaryPlan {
                 .into_iter()
                 .map(|(input, key, ..)| (input, key))
                 .collect(),
+            adamw_native_updates,
             capture_identity,
             clip_report: clipped.report.is_some(),
             window_loss_report: window_loss_report.is_some(),
@@ -5095,25 +5201,7 @@ impl CompiledAdamWAuxiliaryPlan {
                 value.dtype(),
                 false,
             );
-            // Retain the old state as an authenticated dependency without
-            // deriving zero as `input - input`, which would preserve NaN/Inf.
-            let false_condition = if value.dtype() == DType::F32 {
-                let finite = graph.isfinite(input)?;
-                let not_finite = graph.logical_not(finite)?;
-                graph.logical_and(finite, not_finite)?
-            } else if value.dtype() == DType::U64 {
-                // U64 subtraction is defined modulo 2^64, so this remains
-                // false for every value while retaining the state dependency.
-                // Casting the difference avoids a native C self-comparison,
-                // which Apple Clang rejects under -Wtautological-compare.
-                let zero = graph.sub(input, input)?;
-                graph.cast(zero, DType::Bool)?
-            } else {
-                return Err(training("compiled zero-grad state dtype is unsupported"));
-            };
-            let zero =
-                graph.lazy_full_with_dtype(value.shape().clone(), Scalar::I(0), value.dtype())?;
-            let successor = graph.select(false_condition, input, zero)?;
+            let successor = state_dependent_zero(&mut graph, input)?;
             state_by_input.insert(input, state_for(buffer, &value)?);
             successors.insert(key.clone(), successor);
             specs.push((input_name.clone(), key.clone(), value, input, buffer));
@@ -5214,6 +5302,7 @@ impl CompiledAdamWAuxiliaryPlan {
                 .into_iter()
                 .map(|(input, key, ..)| (input, key))
                 .collect(),
+            adamw_native_updates: Vec::new(),
             capture_identity,
             clip_report: false,
             window_loss_report: false,
@@ -5713,9 +5802,13 @@ fn native_cpu_run_report(
 }
 
 fn validate_native_cpu_run_report(report: &NativeCpuRunReport) -> Result<()> {
-    if report.skipped_output_clear_count > report.executed_native_item_count {
+    if report.module_dispatch_count > report.module_dispatched_native_item_count
+        || report.module_dispatched_native_item_count > report.executed_native_item_count
+        || report.executed_native_item_count > report.native_item_count
+        || report.skipped_output_clear_count > report.native_item_count
+    {
         return Err(training(
-            "native CPU skipped output clear count exceeds executed items",
+            "native CPU physical execution evidence exceeds logical coverage",
         ));
     }
     report
@@ -6094,6 +6187,7 @@ impl CpuCompiledTrainingProgram {
                 .into_iter()
                 .map(|(key, (_, version))| (key, version))
                 .collect(),
+            adamw_native_updates: self.adamw_native_updates.clone(),
             frozen_parameter_nodes: self.frozen_parameter_nodes.clone(),
             step: self.step,
         })
@@ -8751,7 +8845,11 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             let (pure, inputs) = main_preparation.pure_and_inputs();
             drafts.push(
                 executor
-                    .preflight_native_items(pure, inputs)
+                    .preflight_native_items_with_adamw_updates(
+                        pure,
+                        inputs,
+                        &inner.inner.adamw_native_updates,
+                    )
                     .map_err(replay_error)?,
             );
         }
@@ -8768,7 +8866,11 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     let (pure, inputs) = preparation.pure_and_inputs();
                     drafts.push(
                         executor
-                            .preflight_native_items(pure, inputs)
+                            .preflight_native_items_with_adamw_updates(
+                                pure,
+                                inputs,
+                                &transition.adamw_native_updates,
+                            )
                             .map_err(replay_error)?,
                     );
                 }
@@ -11339,6 +11441,73 @@ mod tests {
     }
 
     #[test]
+    fn state_dependent_f32_zero_is_exact_and_retains_backend_neutral_scalar_ops() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype_requires_grad("state", [5], DType::F32, false);
+        let output = state_dependent_zero(&mut graph, input).unwrap();
+        let Op::Select {
+            condition, on_true, ..
+        } = graph.op(output).unwrap()
+        else {
+            panic!("state-dependent zero must retain Select");
+        };
+        assert_eq!(*on_true, input);
+        let Op::Compare {
+            op: CompareOp::Lt,
+            lhs,
+            rhs,
+        } = graph.op(*condition).unwrap()
+        else {
+            panic!("state-dependent zero must retain ordered Lt");
+        };
+        assert_eq!(*lhs, input);
+        assert!(matches!(
+            graph.op(*rhs).unwrap(),
+            Op::Binary {
+                op: crate::BinaryOp::Add,
+                lhs: shifted_input,
+                ..
+            } if *shifted_input == input
+        ));
+
+        let schedule = schedule_many(&graph, &[output]).unwrap();
+        assert_eq!(schedule.items.len(), 1);
+        let kernel = &schedule.items[0].kernel;
+        assert!(matches!(kernel.operation(), crate::Operation::Sink));
+        let operations = kernel.topological().unwrap();
+        assert!(operations.iter().any(|node| matches!(
+            node.operation(),
+            crate::Operation::GraphBinary(crate::BinaryOp::Add)
+        )));
+        assert!(operations.iter().any(|node| matches!(
+            node.operation(),
+            crate::Operation::GraphCompare(CompareOp::Lt)
+        )));
+        assert!(
+            operations
+                .iter()
+                .any(|node| matches!(node.operation(), crate::Operation::Ternary(_)))
+        );
+
+        let values = TensorData::from_storage(
+            [5],
+            crate::Storage::F32(vec![3.5, -0.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY]),
+        )
+        .unwrap();
+        let actual = CpuBackend
+            .execute(&graph, output, &HashMap::from([("state".into(), values)]))
+            .unwrap();
+        let crate::Storage::F32(values) = actual.storage() else {
+            panic!("state-dependent F32 zero changed dtype");
+        };
+        assert!(
+            values
+                .iter()
+                .all(|value| value.to_bits() == 0.0f32.to_bits())
+        );
+    }
+
+    #[test]
     fn compiled_dropout_reserves_source_order_blocks_only_for_active_f32_draws() {
         let mut graph = Graph::new();
         let counter = graph.input_dtype_requires_grad("counter", [], DType::U64, false);
@@ -12780,8 +12949,7 @@ mod tests {
         );
         assert!(actual.report().skipped_output_clear_count() > 0);
         assert!(
-            actual.report().skipped_output_clear_count()
-                <= actual.report().executed_native_item_count()
+            actual.report().skipped_output_clear_count() <= actual.report().native_item_count()
         );
         assert!(actual.report().module_dispatch_count() > 0);
         assert_eq!(
@@ -13007,8 +13175,15 @@ mod tests {
         malformed_report.executed_native_item_count = malformed_report.native_item_count + 1;
         assert!(scoreboard.record(&malformed_report).is_err());
         let mut malformed_report = actual.report().clone();
-        malformed_report.skipped_output_clear_count =
+        malformed_report.skipped_output_clear_count = malformed_report.native_item_count + 1;
+        assert!(validate_native_cpu_run_report(&malformed_report).is_err());
+        let mut malformed_report = actual.report().clone();
+        malformed_report.module_dispatched_native_item_count =
             malformed_report.executed_native_item_count + 1;
+        assert!(validate_native_cpu_run_report(&malformed_report).is_err());
+        let mut malformed_report = actual.report().clone();
+        malformed_report.module_dispatch_count =
+            malformed_report.module_dispatched_native_item_count + 1;
         assert!(validate_native_cpu_run_report(&malformed_report).is_err());
         let mut malformed_report = actual.report().clone();
         malformed_report.executor_wall_time = malformed_report
@@ -13152,6 +13327,104 @@ mod tests {
                 replay.report().module_dispatched_native_item_count(),
                 replay.report().executed_native_item_count()
             );
+        }
+    }
+
+    #[test]
+    fn native_cpu_adamw_state_update_groups_preserve_logical_failure_atomicity() {
+        let plan = CompiledAdamWPlan::compile(
+            accumulated_adamw_config(2),
+            initial_parameters(),
+            build_tinybob,
+        )
+        .unwrap();
+        let partial_flush = plan.partial_flush.as_ref().unwrap();
+        for manifest in &partial_flush.adamw_native_updates {
+            let accumulator = manifest
+                .members
+                .iter()
+                .find(|member| {
+                    member.role == crate::engine::AdamWNativeUpdateRole::GradientAccumulator
+                })
+                .unwrap();
+            let item = partial_flush
+                .capture
+                .schedule
+                .items
+                .iter()
+                .find(|item| item.primary_output().id == accumulator.output)
+                .unwrap();
+            assert!(
+                matches!(item.kernel.operation(), crate::Operation::Sink)
+                    && matches!(
+                        item.kernel.sources(),
+                        [store, end_range]
+                            if matches!(store.operation(), crate::Operation::Store)
+                                && matches!(end_range.operation(), crate::Operation::EndRange)
+                    ),
+                "partial-flush accumulator reset must retain a scalar native root"
+            );
+        }
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+        let native = plan.prepare(&target).unwrap();
+        let main_updates = native.main_replay.adamw_native_update_indices();
+        let main_update_admissions = native
+            .main_replay
+            .adamw_native_update_admission_diagnostics();
+        let flush_updates = native
+            .partial_flush_replay
+            .as_ref()
+            .unwrap()
+            .adamw_native_update_indices();
+        let flush_update_admissions = native
+            .partial_flush_replay
+            .as_ref()
+            .unwrap()
+            .adamw_native_update_admission_diagnostics();
+        assert!(
+            main_updates.len() == 2 && flush_updates.len() == 2,
+            "AdamW native update admissions:\nmain: {main_update_admissions:#?}\npartial flush: {flush_update_admissions:#?}"
+        );
+        let preparation = native.preparation_report();
+        assert_eq!(
+            preparation.main().native_item_count()
+                - preparation.main().work().rendered_entry_count(),
+            main_updates.len() * 3
+        );
+        let flush = preparation.partial_flush().unwrap();
+        assert_eq!(
+            flush.native_item_count() - flush.work().rendered_entry_count(),
+            flush_updates.len() * 3
+        );
+
+        for index in main_updates[0] {
+            let mut native = plan.prepare(&target).unwrap();
+            let checkpoint = native.checkpoint().unwrap();
+            let cursor = native.inner.inner.cursor.clone();
+            let counts = native_recurrent_test_counts(&native);
+            native.main_replay.inject_dispatch_failure(index);
+            let error = match native.step(batch(), lr()) {
+                Ok(_) => panic!("injected native store-group failure must be reported"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("native schedule item {index}"))
+            );
+            assert_eq!(native.inner.inner.cursor, cursor);
+            assert_eq!(native_recurrent_test_counts(&native), counts);
+            assert_eq!(native.checkpoint().unwrap(), checkpoint);
+            let mut interpreted = plan.prepare_cpu().unwrap();
+            let expected = interpreted.step(batch(), lr()).unwrap();
+            let actual = native.step(batch(), lr()).unwrap();
+            assert_cross_engine_tensor_close(
+                "AdamW state update group retry loss",
+                actual.loss(),
+                expected.loss(),
+            );
+            assert_native_adamw_state_close(&native, &interpreted);
         }
     }
 
@@ -13413,10 +13686,7 @@ mod tests {
         .into_iter()
         .flatten()
         {
-            assert_eq!(
-                program.work().rendered_entry_count(),
-                program.native_item_count()
-            );
+            assert!(program.work().rendered_entry_count() <= program.native_item_count());
             assert_eq!(program.work().loaded_module_count(), 1);
             assert!(program.work().compiler_invocation_count() <= 1);
         }

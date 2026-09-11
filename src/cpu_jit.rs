@@ -23,6 +23,7 @@ use std::{
 };
 #[path = "cpu_jit_random.rs"]
 mod random;
+mod store_group;
 pub(crate) mod symbolic_runtime;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
@@ -1185,6 +1186,23 @@ impl JitScheduleDispatcher {
 
 fn render(root: &UOp) -> Result<RenderedC, JitError> {
     render_with_policy(root, false)
+}
+
+pub(crate) use store_group::render_native_store_group;
+
+fn native_scalar_operation_can_signal(operation: &Operation, output: Option<DType>) -> bool {
+    matches!(
+        operation,
+        Operation::GraphBinary(
+            crate::BinaryOp::Div
+                | crate::BinaryOp::FloorDiv
+                | crate::BinaryOp::TruncDiv
+                | crate::BinaryOp::Mod
+                | crate::BinaryOp::FMod
+                | crate::BinaryOp::Shl
+                | crate::BinaryOp::Shr
+        )
+    ) && output.is_some_and(|dtype| !dtype.is_float())
 }
 
 /// Derives output write coverage from the same typed operation families and

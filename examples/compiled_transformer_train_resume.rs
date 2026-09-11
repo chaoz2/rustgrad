@@ -1711,6 +1711,12 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     const SAMPLES: u64 = 3;
     const EXPECTED_LOSS_WEIGHTS: [u64; SAMPLES as usize] = [5, 3, 3];
     const EXPECTED_MODULE_DISPATCHES: usize = 38;
+    // The module exposes 37 parameter traversal entries. The tied LM head
+    // deduplicates with tokens.weight, and positions.weight is policy-frozen.
+    const EXPECTED_ADAMW_UPDATE_GROUPS: usize = 35;
+    const EXPECTED_MAIN_RENDERED_ENTRIES: usize = 787 - EXPECTED_ADAMW_UPDATE_GROUPS * 3;
+    // One accumulator per update group, plus loss numerator, index, and token count.
+    const EXPECTED_ZERO_GRAD_ENTRIES: usize = EXPECTED_ADAMW_UPDATE_GROUPS + 3;
 
     let source = FileResumeTransformer::new(7)?;
     let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1])?;
@@ -1738,16 +1744,20 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let prepare_wall_time = prepare_started.elapsed();
     let main_preparation = session.preparation_report().main();
     assert_eq!(main_preparation.native_item_count(), 787);
-    assert_eq!(main_preparation.work().rendered_entry_count(), 787);
+    assert_eq!(
+        main_preparation.work().rendered_entry_count(),
+        EXPECTED_MAIN_RENDERED_ENTRIES
+    );
     assert_eq!(main_preparation.work().loaded_module_count(), 1);
     assert!(main_preparation.work().compiler_invocation_count() <= 1);
+    let partial_preparation = session
+        .preparation_report()
+        .partial_flush()
+        .expect("scoreboard configuration captures partial flush");
+    assert_eq!(partial_preparation.native_item_count(), 357);
     assert_eq!(
-        session
-            .preparation_report()
-            .partial_flush()
-            .expect("scoreboard configuration captures partial flush")
-            .native_item_count(),
-        357
+        partial_preparation.work().rendered_entry_count(),
+        357 - EXPECTED_ADAMW_UPDATE_GROUPS * 3
     );
     assert_eq!(
         session
@@ -1755,7 +1765,16 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             .zero_grad()
             .expect("scoreboard configuration captures zero grad")
             .native_item_count(),
-        74
+        EXPECTED_ZERO_GRAD_ENTRIES
+    );
+    assert_eq!(
+        session
+            .preparation_report()
+            .zero_grad()
+            .expect("scoreboard configuration captures zero grad")
+            .work()
+            .rendered_entry_count(),
+        EXPECTED_ZERO_GRAD_ENTRIES
     );
     assert!(session.preparation_report().compiler_process_count() <= 3);
     assert!(
@@ -1827,8 +1846,15 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let executed_native_items = report
         .main_replay_executed_native_item_count()
         .expect("current native CPU scoreboard reports executed JIT items");
-    assert_eq!(executed_native_items, 786);
-    assert_eq!(report.main().rendered_entry_count(), 787);
+    let expected_main_rendered_entries = u64::try_from(EXPECTED_MAIN_RENDERED_ENTRIES)?;
+    let expected_executed_native_items = expected_main_rendered_entries
+        .checked_sub(1)
+        .expect("the main program has one nonexecuted native entry");
+    assert_eq!(executed_native_items, expected_executed_native_items);
+    assert_eq!(
+        report.main().rendered_entry_count(),
+        expected_main_rendered_entries
+    );
     assert_eq!(report.main().loaded_module_count(), 1);
     assert!(report.main().compiler_invocation_count() <= 1);
     let program_prepare_wall_time = [
@@ -1950,10 +1976,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     {
         assert_eq!(program.cache_miss_count(), 0);
         assert_eq!(program.cache_hit_count(), program.native_item_count());
-        assert_eq!(
-            program.work().rendered_entry_count(),
-            program.native_item_count()
-        );
+        assert!(program.work().rendered_entry_count() <= program.native_item_count());
         assert_eq!(program.work().loaded_module_count(), 1);
         assert_eq!(program.work().durable_artifact_cache_hit_count(), 0);
         assert_eq!(program.work().durable_artifact_cache_miss_count(), 0);

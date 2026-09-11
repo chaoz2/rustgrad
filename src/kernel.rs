@@ -425,6 +425,195 @@ pub(crate) fn lower_graph_elementwise_with_materialized(
     )
 }
 
+/// Builds one private dense multi-store kernel from already-scheduled scalar
+/// roots. The original materialization boundaries and arithmetic expressions
+/// remain intact; only the identical iteration domains are interned so native
+/// execution can traverse them once. This is deliberately not a general
+/// executable multi-output schedule lowering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeStoreGroupFusionInvariant {
+    RootArity,
+    StoreArity,
+    IndexArity,
+    EndRangeArity,
+    RootOperation,
+    StoreOperation,
+    EndRangeOperation,
+    ClosedIteration,
+    CanonicalRange,
+    OutputIndex,
+    OutputDType,
+    NonemptyOutput,
+    DenseOutput,
+    CommonExtent,
+    CommonShape,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeStoreGroupFusionError {
+    MemberCount {
+        actual: usize,
+    },
+    Member {
+        index: usize,
+        invariant: NativeStoreGroupFusionInvariant,
+    },
+    FusedValidation(UOpError),
+}
+
+impl NativeStoreGroupFusionError {
+    fn member(index: usize, invariant: NativeStoreGroupFusionInvariant) -> Self {
+        Self::Member { index, invariant }
+    }
+}
+
+impl std::fmt::Display for NativeStoreGroupFusionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MemberCount { actual } => {
+                write!(f, "requires at least two members, got {actual}")
+            }
+            Self::Member { index, invariant } => {
+                write!(f, "member {index} violates {invariant:?}")
+            }
+            Self::FusedValidation(error) => write!(f, "fused validation: {error}"),
+        }
+    }
+}
+
+pub(crate) fn fuse_native_store_group(
+    kernels: &[&UOp],
+) -> std::result::Result<UOp, NativeStoreGroupFusionError> {
+    if kernels.len() < 2 {
+        return Err(NativeStoreGroupFusionError::MemberCount {
+            actual: kernels.len(),
+        });
+    }
+    let mut stores = Vec::with_capacity(kernels.len());
+    let mut ranges = Vec::with_capacity(kernels.len());
+    let mut extent = None;
+    let mut shape = None;
+    for (member, kernel) in kernels.iter().enumerate() {
+        let [store, end_range] = kernel.sources() else {
+            return Err(NativeStoreGroupFusionError::member(
+                member,
+                NativeStoreGroupFusionInvariant::RootArity,
+            ));
+        };
+        let [index, _] = store.sources() else {
+            return Err(NativeStoreGroupFusionError::member(
+                member,
+                NativeStoreGroupFusionInvariant::StoreArity,
+            ));
+        };
+        let [_, range] = index.sources() else {
+            return Err(NativeStoreGroupFusionError::member(
+                member,
+                NativeStoreGroupFusionInvariant::IndexArity,
+            ));
+        };
+        let [ended] = end_range.sources() else {
+            return Err(NativeStoreGroupFusionError::member(
+                member,
+                NativeStoreGroupFusionInvariant::EndRangeArity,
+            ));
+        };
+        let Operation::Index(IndexValue::Buffer {
+            elements,
+            input_shape,
+            output_shape,
+            addressing: crate::IndexAddressing::Broadcast,
+            ..
+        }) = index.operation()
+        else {
+            return Err(NativeStoreGroupFusionError::member(
+                member,
+                NativeStoreGroupFusionInvariant::OutputIndex,
+            ));
+        };
+        let canonical_bound = i64::try_from(*elements).ok();
+        let canonical_range = matches!(range.operation(), Operation::Range(0))
+            && range.ty() == Some(UType::scalar(DType::I64))
+            && matches!(
+                range.sources(),
+                [bound]
+                    if bound.ty() == Some(UType::scalar(DType::I64))
+                        && matches!(
+                            bound.operation(),
+                            Operation::Const(crate::LiteralValue::Int(value))
+                                if Some(*value) == canonical_bound
+                        )
+            );
+        let failed = if !matches!(kernel.operation(), Operation::Sink) {
+            Some(NativeStoreGroupFusionInvariant::RootOperation)
+        } else if !matches!(store.operation(), Operation::Store) {
+            Some(NativeStoreGroupFusionInvariant::StoreOperation)
+        } else if !matches!(end_range.operation(), Operation::EndRange) {
+            Some(NativeStoreGroupFusionInvariant::EndRangeOperation)
+        } else if !ended.shares_node_with(range) {
+            Some(NativeStoreGroupFusionInvariant::ClosedIteration)
+        } else if !canonical_range {
+            Some(NativeStoreGroupFusionInvariant::CanonicalRange)
+        } else if index.ty().map(|ty| ty.scalar) != Some(DType::F32) {
+            Some(NativeStoreGroupFusionInvariant::OutputDType)
+        } else if *elements == 0 {
+            Some(NativeStoreGroupFusionInvariant::NonemptyOutput)
+        } else if input_shape != output_shape {
+            Some(NativeStoreGroupFusionInvariant::DenseOutput)
+        } else if extent.is_some_and(|expected| expected != *elements) {
+            Some(NativeStoreGroupFusionInvariant::CommonExtent)
+        } else if shape
+            .as_ref()
+            .is_some_and(|expected| expected != output_shape)
+        {
+            Some(NativeStoreGroupFusionInvariant::CommonShape)
+        } else {
+            None
+        };
+        if let Some(invariant) = failed {
+            return Err(NativeStoreGroupFusionError::member(member, invariant));
+        }
+        extent = Some(*elements);
+        shape = Some(output_shape.clone());
+        stores.push(store.clone());
+        ranges.push(range.clone());
+    }
+
+    let common_range = ranges[0].clone();
+    fn intern(node: &UOp, ranges: &[UOp], common_range: &UOp, memo: &mut HashMap<UOp, UOp>) -> UOp {
+        if ranges.iter().any(|range| node.shares_node_with(range)) {
+            return common_range.clone();
+        }
+        if let Some(value) = memo.get(node) {
+            return value.clone();
+        }
+        let sources = node
+            .sources()
+            .iter()
+            .map(|source| intern(source, ranges, common_range, memo))
+            .collect();
+        let value = UOp::from_operation(node.operation().clone(), node.ty(), sources)
+            .retag(node.tag().cloned());
+        memo.insert(node.clone(), value.clone());
+        value
+    }
+    let mut memo = HashMap::new();
+    let mut sources = stores
+        .iter()
+        .map(|store| intern(store, &ranges, &common_range, &mut memo))
+        .collect::<Vec<_>>();
+    sources.push(UOp::from_operation(
+        Operation::EndRange,
+        None,
+        vec![common_range],
+    ));
+    let fused = UOp::sink(sources);
+    fused
+        .validate()
+        .map_err(NativeStoreGroupFusionError::FusedValidation)?;
+    Ok(fused)
+}
+
 /// Lowers one ordinary scalar root while absorbing exact computed aliases
 /// selected by the scheduler. Affine producer roots are evaluated under their
 /// branch-local read maps; projected aliases expose their dense source through

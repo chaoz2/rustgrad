@@ -82,47 +82,37 @@ layers:
 - [`examples/llama_chat.rs`](examples/llama_chat.rs)
 - [`examples/metal_scoreboard.rs`](examples/metal_scoreboard.rs)
 
-For repeated training, the compiled runtime captures
-`forward → loss → backward → optimizer update` once and keeps parameters
-and optimizer slots in one atomic recurrent frontier. `CompiledTrainingRuntime`
-is the small optimizer-neutral loop contract; checkpointing and AdamW policy are
-separate capabilities, and concrete Metal sessions keep their device reports.
-The maintained tiny causal Transformer example compiles a backend-neutral
-`CompiledAdamWPlan` for each fresh owned-module lifecycle, runs and resumes
-through the same generic loop, and selects interpreter CPU, strict-native CPU,
-or strict Metal only at target preparation. Its portable resume deliberately
-rebuilds the same topology and authenticates it against the checkpoint. Within
-one process, a caller can instead reuse a borrowed `CompiledAdamWPlan` and call
-`restore_checkpoint` without rebuilding its graph, gradients, schedules, or
-captures. The example's `cpu-reuse` mode demonstrates that path with a captured
-learning-rate policy, guarded CPU transitions, and fixed-capacity right-padded
-batches whose F32 mask lets the compiler derive the scalar token-mean loss and
-keeps unequal valid lengths unbiased across opt-in accumulation; each step
-reports its exact valid-token aggregation weight. Its
-`cpu-file-resume` mode demonstrates the portable different-initialization path:
-it writes a complete owned-module checkpoint, recompiles the same two-block
-attention-dropout topology from that file, derives its attention keep mask from
-the right-padding loss mask, and publishes saved immutable and trained values
-into the untouched destination only after exact CPU continuation.
-Its
-`native-cpu-scoreboard` mode emits bounded versioned JSON for caller-timed
-compile, prepare, and checkpoint phases plus runtime-timed first/steady replay,
-together with authenticated main, partial-flush, captured-zero-grad, evaluation,
-shared-module preparation/cache/compiler work, recurrent-state, successful
-native-item execution, exact preparation/replay phase partitions, and per-commit
-logical fallback-import/recurrent-traffic facts. Dense F32/I32 batches bind read-only for
-the replay call rather than copying into retained CPU workspace storage.
-Strict-native preparation validates each attached program in order and can
-compile two independent cache-miss modules concurrently; cache and publication
-identities remain per program and warm restoration performs no compiler work.
-Nonempty CPU `zero_grad` uses an authenticated
-compile-once state-only replay, while an empty window remains an exact no-op.
-CPU device-kernel-launch, transfer, and physical peak-memory fields remain
-`null` because this path does not measure them. This is workload evidence, not
-a speedup or performance threshold. Its Metal form selects the first visible
-device explicitly, verifies strict zero-fallback admission before allocation, and
-keeps the checkpoint bytes portable through the same
-authenticated recompile boundary as CPU.
+### Repeated compiled training
+
+RustGrad captures
+`forward → loss → backward → optimizer update` once, then replays it with
+persistent model and optimizer state behind an atomic commit boundary. The
+[`compiled_transformer_train_resume`](examples/compiled_transformer_train_resume.rs)
+example covers masked Transformer training, dropout, token-weighted
+accumulation, clipping, freezing, tied weights, and checkpoint continuation.
+
+- **Backends:** `cpu` and `native-cpu` run the maintained CPU training path;
+  `metal` selects the corresponding device path.
+- **Reuse and resume:** `cpu-reuse` restores a plan in the same process, while
+  `cpu-file-resume` and `native-cpu-file-resume` rebuild and authenticate a
+  portable checkpoint before continuing.
+- **Evidence:** `native-cpu-scoreboard` emits versioned strict-native CPU
+  results for the maintained workload.
+
+Guarantees and boundaries:
+
+- Failed replay or restore does not publish a partial parameter or optimizer
+  transition.
+- File resume authenticates rebuilt topology before mutating the destination.
+- Scoreboard timings are observational, not speedup claims or CI performance
+  thresholds.
+
+Metal training shares the checkpoint boundary but is separate from the CPU
+scoreboard contract.
+
+The detailed runtime, compatibility, and reporting contracts live in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
 ## Run ResNet on a persistent Metal session
 
