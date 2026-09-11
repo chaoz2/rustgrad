@@ -1612,6 +1612,8 @@ pub struct NativeCpuRunReport {
     /// be elided by the retained workspace.
     native_item_count: usize,
     executed_native_item_count: usize,
+    module_dispatch_count: usize,
+    module_dispatched_native_item_count: usize,
     schedule_cache_keys: Vec<u64>,
     traffic: NativeCpuReplayTraffic,
     wall_time: Duration,
@@ -1648,6 +1650,18 @@ impl NativeCpuRunReport {
     /// this successfully published replay.
     pub const fn executed_native_item_count(&self) -> usize {
         self.executed_native_item_count
+    }
+
+    /// Contiguous authenticated native-module tape segments entered during
+    /// this replay. Logical item accounting and failure ordinals are unchanged.
+    pub const fn module_dispatch_count(&self) -> usize {
+        self.module_dispatch_count
+    }
+
+    /// Prepared native entries invoked through authenticated module tape
+    /// metadata rather than the conservative per-item binding path.
+    pub const fn module_dispatched_native_item_count(&self) -> usize {
+        self.module_dispatched_native_item_count
     }
 
     /// Strict replay never executes an interpreter fallback item.
@@ -5425,6 +5439,8 @@ impl CompiledEvaluationPlan {
             successful_invocation: 0,
             native_item_count: prepared.plan.item_count(),
             executed_native_item_count: traffic.executed_native_item_count,
+            module_dispatch_count: traffic.module_dispatch_count,
+            module_dispatched_native_item_count: traffic.module_dispatched_native_item_count,
             schedule_cache_keys,
             traffic: native_cpu_replay_traffic(traffic),
             wall_time: started.elapsed(),
@@ -5492,6 +5508,8 @@ fn native_cpu_run_report(
         successful_invocation,
         native_item_count: trace.pure_item_cache_keys.len(),
         executed_native_item_count: traffic.executed_native_item_count,
+        module_dispatch_count: traffic.module_dispatch_count,
+        module_dispatched_native_item_count: traffic.module_dispatched_native_item_count,
         schedule_cache_keys: trace.pure_item_cache_keys.clone(),
         traffic: native_cpu_replay_traffic(traffic),
         wall_time,
@@ -12310,6 +12328,11 @@ mod tests {
         assert!(
             actual.report().executed_native_item_count() <= actual.report().native_item_count()
         );
+        assert!(actual.report().module_dispatch_count() > 0);
+        assert_eq!(
+            actual.report().module_dispatched_native_item_count(),
+            actual.report().executed_native_item_count()
+        );
         assert_eq!(actual.report().traffic().external_input_import_count(), 0);
         assert_eq!(actual.report().traffic().external_input_import_bytes(), 0);
         assert_eq!(native.successful_steps, 1);
@@ -12578,6 +12601,49 @@ mod tests {
             failed_workspace.borrowed_recurrent_output_bytes + recurrent_state_bytes
         );
         assert_eq!(native.main_replay.structure_validation_count(), 1);
+    }
+
+    #[test]
+    fn native_cpu_module_dispatch_failures_keep_recurrent_publication_atomic() {
+        let plan = CompiledAdamWPlan::compile(adamw_config(), initial_parameters(), build_tinybob)
+            .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+        let item_count = plan
+            .prepare(&target)
+            .unwrap()
+            .preparation_report()
+            .main()
+            .native_item_count();
+        assert!(item_count >= 3);
+
+        for index in [0, item_count / 2, item_count - 1] {
+            let mut native = plan.prepare(&target).unwrap();
+            let checkpoint = native.checkpoint().unwrap();
+            let cursor = native.inner.inner.cursor.clone();
+            let counts = native_recurrent_test_counts(&native);
+            native.main_replay.inject_dispatch_failure(index);
+            let error = match native.step(batch(), lr()) {
+                Ok(_) => panic!("injected dispatcher failure must reject"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("native schedule item {index}")),
+                "failure must retain the logical schedule ordinal: {error}"
+            );
+            assert_eq!(native.inner.inner.cursor, cursor);
+            assert_eq!(native_recurrent_test_counts(&native), counts);
+            assert_eq!(native.checkpoint().unwrap(), checkpoint);
+
+            let replay = native.step(batch(), lr()).unwrap();
+            assert!(replay.report().module_dispatch_count() > 0);
+            assert_eq!(
+                replay.report().module_dispatched_native_item_count(),
+                replay.report().executed_native_item_count()
+            );
+        }
     }
 
     #[test]
@@ -12873,6 +12939,13 @@ mod tests {
                 .last_executed_native_item_count()
                 > 0
         );
+        let reset_replay = native.zero_grad_replay.as_ref().unwrap();
+        let reset_dispatch = reset_replay.last_module_dispatch_counts();
+        assert!(reset_dispatch.0 > 0);
+        assert_eq!(
+            reset_dispatch.1,
+            reset_replay.last_executed_native_item_count()
+        );
         assert_native_adamw_state_close(&native, &interpreted);
         let used_reset_workspace = native.zero_grad_replay.as_ref().unwrap().workspace_stats();
         assert_eq!(
@@ -12940,6 +13013,19 @@ mod tests {
         assert!(
             actual.report().unwrap().executed_native_item_count()
                 <= actual.report().unwrap().native_item_count()
+        );
+        assert!(actual.report().unwrap().module_dispatch_count() > 0);
+        assert_eq!(
+            actual
+                .report()
+                .unwrap()
+                .module_dispatched_native_item_count(),
+            actual.report().unwrap().executed_native_item_count()
+        );
+        let flush_replay = native.partial_flush_replay.as_ref().unwrap();
+        assert_eq!(
+            flush_replay.last_module_dispatch_counts().1,
+            flush_replay.last_executed_native_item_count()
         );
         let flush_traffic = actual.report().unwrap().traffic();
         assert_eq!(flush_traffic.external_input_import_count(), 0);
@@ -13151,6 +13237,11 @@ mod tests {
         assert!(
             evaluation.report().executed_native_item_count()
                 <= evaluation.report().native_item_count()
+        );
+        assert!(evaluation.report().module_dispatch_count() > 0);
+        assert_eq!(
+            evaluation.report().module_dispatched_native_item_count(),
+            evaluation.report().executed_native_item_count()
         );
         assert_eq!(
             evaluation.report().traffic().external_input_import_count(),

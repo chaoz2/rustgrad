@@ -873,6 +873,21 @@ impl PlannedNativeItems {
         self.workspace.last_executed_native_item_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_module_dispatch_counts(&self) -> (usize, usize) {
+        self.workspace.last_module_dispatch_counts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_dispatch_failure(&mut self, index: usize) {
+        self.workspace.inject_dispatch_failure(index);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn use_per_item_fallback(&mut self, index: usize) -> Result<(), ReplayError> {
+        self.workspace.use_per_item_fallback(index)
+    }
+
     fn validate_replay_structure(&self, capture: &CapturedSchedule) -> Result<(), ReplayError> {
         #[cfg(test)]
         self.structure_validation_count
@@ -966,6 +981,16 @@ impl SealedPlannedNativeItems {
     #[cfg(test)]
     pub(super) fn last_executed_native_item_count(&self) -> usize {
         self.plan.last_executed_native_item_count()
+    }
+
+    #[cfg(test)]
+    pub(super) fn last_module_dispatch_counts(&self) -> (usize, usize) {
+        self.plan.last_module_dispatch_counts()
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_dispatch_failure(&mut self, index: usize) {
+        self.plan.inject_dispatch_failure(index);
     }
 
     #[cfg(test)]
@@ -1229,17 +1254,13 @@ impl CapturedReplayExecutor {
         plan.validate_replay(capture, provided)?;
         let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
         plan.workspace.begin(provided, &mut borrowed)?;
-        for index in 0..capture.items.len() {
-            let item = &capture.items[index];
-            plan.workspace.execute_item(
-                index,
-                item,
-                self.jit(plan.vectorized),
-                &capture.quantized_constants,
-                &plan.items[index],
-                &mut borrowed,
-            )?;
-        }
+        plan.workspace.execute_items(
+            capture,
+            self.jit(plan.vectorized),
+            &capture.quantized_constants,
+            &plan.items,
+            &mut borrowed,
+        )?;
         let values = plan.workspace.materialize(capture, &borrowed, None)?;
         Ok((values, plan.workspace.traffic()))
     }
@@ -1373,17 +1394,13 @@ impl CapturedReplayExecutor {
             import(input, &mut plan.workspace, borrowed)?;
         }
         plan.workspace.finish_inputs()?;
-        for index in 0..capture.items.len() {
-            let item = &capture.items[index];
-            plan.workspace.execute_item(
-                index,
-                item,
-                self.jit(plan.vectorized),
-                &capture.quantized_constants,
-                &plan.items[index],
-                borrowed,
-            )?;
-        }
+        plan.workspace.execute_items(
+            capture,
+            self.jit(plan.vectorized),
+            &capture.quantized_constants,
+            &plan.items,
+            borrowed,
+        )?;
         let values = plan.workspace.materialize(capture, borrowed, selected)?;
         Ok((values, plan.workspace.traffic()))
     }
@@ -1781,6 +1798,7 @@ pub(super) fn backend_error(error: JitBackendError) -> ReplayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::capture::QuantizedCaptureBinding;
     use crate::{
         Backend, CpuBackend, DType, Float8Format, Float8Storage, Graph, Scalar, Shape, Storage,
     };
@@ -1886,6 +1904,11 @@ mod tests {
             first_traffic.executed_native_item_count,
             capture.items.len()
         );
+        assert_eq!(first_traffic.module_dispatch_count, 1);
+        assert_eq!(
+            first_traffic.module_dispatched_native_item_count,
+            first_traffic.executed_native_item_count
+        );
         let first_stats = plan.workspace_stats();
         assert_eq!(first_stats.allocation_count, prepared.allocation_count);
         assert_eq!(first_stats.input_import_count, 0);
@@ -1939,6 +1962,154 @@ mod tests {
                 if message == "prepared native item count mismatch"
         ));
         assert_eq!(executor.native_item_plan_count(), 1);
+    }
+
+    #[test]
+    fn native_module_tape_partitions_around_authenticated_per_item_fallback() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [4]);
+        let first = graph.square(input).unwrap();
+        let first = graph.contiguous(first).unwrap();
+        let second = graph.relu(first).unwrap();
+        let second = graph.contiguous(second).unwrap();
+        let output = graph.square(second).unwrap();
+        let output = graph.contiguous(output).unwrap();
+        let capture = captured(&graph, &[output]);
+        assert!(capture.items.len() >= 3);
+        let bindings = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([4], vec![-2.0, -1.0, 3.0, 4.0]).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let fallback = capture.items.len() / 2;
+        plan.use_per_item_fallback(fallback).unwrap();
+
+        let (actual, traffic) = executor
+            .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(
+            actual.requested(&capture.requested).unwrap()[0].storage(),
+            &Storage::F32(vec![16.0, 1.0, 81.0, 256.0])
+        );
+        assert_eq!(traffic.executed_native_item_count, capture.items.len());
+        assert_eq!(
+            traffic.module_dispatched_native_item_count + 1,
+            traffic.executed_native_item_count
+        );
+        assert_eq!(traffic.module_dispatch_count, 2);
+    }
+
+    #[test]
+    fn native_module_tape_clears_reduction_outputs_before_reuse() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let output = graph.sum(input, 1).unwrap();
+        let capture = captured(&graph, &[output]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(
+                &capture,
+                &BTreeMap::from([(
+                    "input".into(),
+                    TensorData::new([2, 3], vec![1.0; 6]).unwrap(),
+                )]),
+                false,
+            )
+            .unwrap();
+        let first = executor
+            .execute_planned_native_items(
+                &capture,
+                &BTreeMap::from([(
+                    "input".into(),
+                    TensorData::new([2, 3], vec![1.0; 6]).unwrap(),
+                )]),
+                &mut plan,
+            )
+            .unwrap();
+        assert_eq!(
+            first.requested(&capture.requested).unwrap()[0].storage(),
+            &Storage::F32(vec![3.0, 3.0])
+        );
+        let (second, traffic) = executor
+            .execute_planned_native_items_observed(
+                &capture,
+                &BTreeMap::from([(
+                    "input".into(),
+                    TensorData::new([2, 3], vec![0.0; 6]).unwrap(),
+                )]),
+                &mut plan,
+            )
+            .unwrap();
+        assert_eq!(
+            second.requested(&capture.requested).unwrap()[0].storage(),
+            &Storage::F32(vec![0.0, 0.0])
+        );
+        assert_eq!(traffic.module_dispatch_count, 1);
+        assert_eq!(traffic.module_dispatched_native_item_count, 1);
+    }
+
+    #[test]
+    fn native_module_tape_rejects_changed_same_id_quantized_owner_before_dispatch() {
+        let mut graph = Graph::new();
+        let activation = graph.input("activation", Shape::from([1, 32]));
+        let weight = graph.input("weight", Shape::from([2, 32]));
+        let transposed = graph.permute(weight, [1, 0]).unwrap();
+        let output = graph.matmul(activation, transposed).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let expected = crate::QuantizedTensorData::new(
+            crate::GgmlType::Q4_0,
+            Shape::from([2, 32]),
+            vec![0; 36],
+        )
+        .unwrap();
+        let mut capture = CapturedSchedule::capture_with_quantized_bindings(
+            &graph,
+            &schedule,
+            &[output],
+            &[QuantizedCaptureBinding::Matmul {
+                output,
+                activation,
+                weight,
+                value: expected.clone(),
+            }],
+        )
+        .unwrap();
+        let bindings = BTreeMap::from([(
+            "activation".into(),
+            TensorData::new([1, 32], vec![1.0; 32]).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+
+        let id = weight.index() as u64;
+        let mut changed_bytes = vec![0; 36];
+        changed_bytes[2] = 1;
+        capture.quantized_constants.insert(
+            id,
+            crate::QuantizedTensorData::new(
+                crate::GgmlType::Q4_0,
+                Shape::from([2, 32]),
+                changed_bytes,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            executor.execute_planned_native_items(&capture, &bindings, &mut plan),
+            Err(ReplayError::Backend(reason))
+                if reason.contains("changed after preparation")
+        ));
+        assert_eq!(plan.last_module_dispatch_counts(), (0, 0));
+
+        capture.quantized_constants.insert(id, expected);
+        executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(plan.last_module_dispatch_counts(), (1, 1));
     }
 
     #[test]
@@ -2142,6 +2313,11 @@ mod tests {
         assert_eq!(first.allocation_count, prepared.allocation_count);
         assert_eq!(first.affine_matmul_materialization_bytes, 0);
         assert_eq!(traffic.executed_native_item_count + 1, capture.items.len());
+        assert_eq!(traffic.module_dispatch_count, 1);
+        assert_eq!(
+            traffic.module_dispatched_native_item_count,
+            traffic.executed_native_item_count
+        );
 
         let malformed = BTreeMap::from([
             ("lhs".into(), TensorData::new([1, 3], vec![1.0; 3]).unwrap()),
@@ -3687,12 +3863,31 @@ mod tests {
         };
         let first = executor.replay(&capture, &bindings, options).unwrap();
         let second = executor.replay(&capture, &bindings, options).unwrap();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let (dispatched, traffic) = executor
+            .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
+            .unwrap();
         for ((actual, again), node) in first.outputs.iter().zip(&second.outputs).zip([left, right])
         {
             let expected = CpuBackend.execute(&graph, node, &oracle_bindings).unwrap();
             assert_eq!(actual.storage(), expected.storage());
             assert_eq!(again.storage(), expected.storage());
         }
+        for (actual, expected) in dispatched
+            .requested(&capture.requested)
+            .unwrap()
+            .iter()
+            .zip(&first.outputs)
+        {
+            assert_eq!(actual.storage(), expected.storage());
+        }
+        assert_eq!(traffic.module_dispatch_count, 1);
+        assert_eq!(
+            traffic.module_dispatched_native_item_count,
+            traffic.executed_native_item_count
+        );
         assert!(first.trace.items.iter().all(|x| {
             x.backend == ItemBackend::NativeJit
                 && !x.cache_hit

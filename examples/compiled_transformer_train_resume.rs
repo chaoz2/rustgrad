@@ -1345,12 +1345,22 @@ fn assert_native_file_resume_preparation(
 fn assert_native_file_resume_step(step: &NativeCpuCompiledAdamWStepResult) {
     assert!(step.report().native_item_count() > 0);
     assert!(step.report().executed_native_item_count() > 0);
+    assert!(step.report().module_dispatch_count() > 0);
+    assert_eq!(
+        step.report().module_dispatched_native_item_count(),
+        step.report().executed_native_item_count()
+    );
     assert_eq!(step.report().fallback_count(), 0);
 }
 
 fn assert_native_file_resume_evaluation(evaluation: &NativeCpuCompiledEvaluationResult) {
     assert!(evaluation.report().native_item_count() > 0);
     assert!(evaluation.report().executed_native_item_count() > 0);
+    assert!(evaluation.report().module_dispatch_count() > 0);
+    assert_eq!(
+        evaluation.report().module_dispatched_native_item_count(),
+        evaluation.report().executed_native_item_count()
+    );
     assert_eq!(evaluation.report().fallback_count(), 0);
 }
 
@@ -1700,6 +1710,7 @@ where
 fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     const SAMPLES: u64 = 3;
     const EXPECTED_LOSS_WEIGHTS: [u64; SAMPLES as usize] = [5, 3, 3];
+    const EXPECTED_MODULE_DISPATCHES: usize = 38;
 
     let source = FileResumeTransformer::new(7)?;
     let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1])?;
@@ -1749,6 +1760,13 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         let executed = report.executed_native_item_count();
         assert!(executed > 0);
         assert!(executed <= report.native_item_count());
+        assert_eq!(
+            report.module_dispatch_count(),
+            EXPECTED_MODULE_DISPATCHES,
+            "the fixed workspace must retain its authenticated safe-segment partition"
+        );
+        assert_eq!(report.module_dispatched_native_item_count(), executed);
+        assert!(report.module_dispatch_count() < executed);
         if let Some(expected) = stable_executed_native_items {
             assert_eq!(executed, expected);
         } else {

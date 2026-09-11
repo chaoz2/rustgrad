@@ -951,15 +951,25 @@ attached partial-flush/zero-grad/evaluation pure program through the existing
 mixed staging and single `EffectRuntime` commit with interpreter fallback
 disabled. Each attached schedule renders its ordered native entries once and
 loads them as uniquely named functions in one content-addressed shared module;
-replay keeps item-level execution and error attribution. Each prepared recurrent
-program seals its validated RGSM identity,
+preparation also authenticates an immutable workspace tape for fixed ABI slots,
+derived affine reads, output clearing, and quantized resources. Replay binds
+external and recurrent pointers only for the synchronous call, dispatches
+admitted contiguous tape segments through those existing module entries, and
+uses the conservative per-item path around any entry that cannot join a segment.
+Segments close before a physical output slot is reused or when a Rust-prepared
+affine input depends on an output inside the open segment; crossing either
+boundary would clear a live value or derive it before its producer executes.
+The reported segment count is therefore the actual Rust-to-C call count, while
+logical item order and exact failing-item attribution remain unchanged. Each
+prepared recurrent program seals its validated RGSM identity,
 pure cache/layout inventory, replacement map, and initial frontier descriptor
 once. Main, partial-flush, and zero-grad hot replay therefore repeats only
 call-dependent cursor, input, active-bank, quantized-index, successor, and
 transaction admission; generic artifact replay retains full per-call artifact
 validation. Its typed preparation/run reports expose only CPU facts: native item
 and cache counts, rendered entries, loaded modules, durable artifact hits/misses,
-actual compiler invocations, static execution summaries, recurrent logical
+actual compiler invocations, per-run module segment/entry dispatch counts,
+static execution summaries, recurrent logical
 bytes, stable capture/native identities, and call-local wall times excluded from
 identity.
 Unsupported preparation and failed execution or commit publish neither state

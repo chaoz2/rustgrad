@@ -4,6 +4,7 @@
 //! this same validated ABI boundary later; this module intentionally does not
 //! change scheduling or lazily realize graphs.
 use super::{Backend, CpuBackend};
+use crate::cpu_jit::JitScheduleDispatcher;
 use crate::{
     CpuJit, Graph, JitBuffer, JitError, JitKernel, NodeId, Op, ScheduleItem, TensorData, VectorPlan,
 };
@@ -59,7 +60,7 @@ pub struct CpuJitBackend {
     fallback: JitFallback,
     vectorized: bool,
     cache: Mutex<HashMap<String, Arc<JitKernel>>>,
-    schedule_modules: Mutex<HashMap<NativeScheduleWrapperKey, Vec<Arc<JitKernel>>>>,
+    schedule_modules: Mutex<HashMap<NativeScheduleWrapperKey, NativeScheduleModule>>,
     // Zero-domain work has no kernel to compile, but the validated skip is a
     // prepared plan whose cache ownership belongs to this backend.
     zero_domain_cache: Mutex<HashSet<u64>>,
@@ -70,13 +71,28 @@ struct NativeScheduleWrapperKey {
     artifact: String,
     entries: Vec<String>,
 }
+#[derive(Clone)]
+struct NativeScheduleModule {
+    kernels: Vec<Arc<JitKernel>>,
+    dispatcher: Arc<JitScheduleDispatcher>,
+}
 pub(crate) struct PreparedScheduleItem {
     kernel: Arc<JitKernel>,
+    dispatcher: Option<Arc<JitScheduleDispatcher>>,
     pub(crate) native_cache_key: String,
     pub(crate) cache_hit: bool,
     pub(crate) vector: VectorPlan,
     schedule_cache_key: u64,
     native_layout: NativeScheduleLayout,
+}
+
+/// Immutable dispatch metadata for one entry in an authenticated retained
+/// native schedule workspace. It never contains replay-call tensor pointers.
+pub(crate) struct PreparedScheduleDispatch {
+    kernel: Arc<JitKernel>,
+    dispatcher: Arc<JitScheduleDispatcher>,
+    slots: Vec<usize>,
+    quantized: Vec<(u64, crate::QuantizedTensorData)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -149,6 +165,167 @@ impl PreparedScheduleItem {
         }
         Ok(self.native_layout.elided_output_source)
     }
+
+    pub(crate) fn prepare_workspace_dispatch(
+        &self,
+        item: &ScheduleItem,
+        buffers: &[JitBuffer],
+        slots: &[usize],
+        quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
+    ) -> Result<Option<PreparedScheduleDispatch>, JitBackendError> {
+        if self.schedule_cache_key != item.cache_key
+            || slots.len() != self.kernel.abi().buffers.len()
+        {
+            return Err(JitBackendError::Binding(
+                "prepared workspace schedule identity mismatch".into(),
+            ));
+        }
+        self.retained_matmul_source(item, u64::MAX)?;
+        if self.kernel.abi().symbol_count != 0 {
+            return Ok(None);
+        }
+        let Some(dispatcher) = &self.dispatcher else {
+            return Ok(None);
+        };
+        for (index, (slot, want)) in slots
+            .iter()
+            .copied()
+            .zip(&self.kernel.abi().buffers)
+            .enumerate()
+        {
+            if slots[..index].contains(&slot) {
+                return Err(JitBackendError::Binding(
+                    "prepared workspace slot aliases within one kernel".into(),
+                ));
+            }
+            let buffer = buffers.get(slot).ok_or_else(|| {
+                JitBackendError::Binding("prepared workspace slot is absent".into())
+            })?;
+            if buffer.dtype != want.dtype
+                || buffer.elements != want.elements
+                || (want.mutable && !buffer.mutable)
+            {
+                return Err(JitBackendError::Binding(format!(
+                    "prepared workspace buffer {} descriptor mismatch",
+                    want.id
+                )));
+            }
+        }
+        let quantized = self
+            .kernel
+            .abi()
+            .quantized_buffers
+            .iter()
+            .map(|want| {
+                let value = quantized.get(&want.id).ok_or_else(|| {
+                    JitBackendError::Binding(format!("missing packed captured buffer {}", want.id))
+                })?;
+                value
+                    .validate()
+                    .map_err(|error| JitBackendError::Binding(error.to_string()))?;
+                if value.descriptor() != &want.desc {
+                    return Err(JitBackendError::Binding(format!(
+                        "quantized buffer {} descriptor mismatch",
+                        want.id
+                    )));
+                }
+                Ok((want.id, value.clone()))
+            })
+            .collect::<Result<Vec<_>, JitBackendError>>()?;
+        Ok(Some(PreparedScheduleDispatch {
+            kernel: self.kernel.clone(),
+            dispatcher: dispatcher.clone(),
+            slots: slots.to_vec(),
+            quantized,
+        }))
+    }
+}
+
+impl PreparedScheduleDispatch {
+    pub(crate) fn authenticate_segment(
+        entries: &[&Self],
+        quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
+    ) -> Result<(), PreparedScheduleDispatchFailure> {
+        let Some(first) = entries.first() else {
+            return Ok(());
+        };
+        if entries
+            .iter()
+            .any(|entry| !Arc::ptr_eq(&entry.dispatcher, &first.dispatcher))
+        {
+            return Err(PreparedScheduleDispatchFailure {
+                entry: 0,
+                error: JitBackendError::Binding(
+                    "native schedule segment spans multiple modules".into(),
+                ),
+            });
+        }
+        for (entry, prepared) in entries.iter().enumerate() {
+            for (id, expected) in &prepared.quantized {
+                let actual = quantized
+                    .get(id)
+                    .ok_or_else(|| PreparedScheduleDispatchFailure {
+                        entry,
+                        error: JitBackendError::Binding(format!(
+                            "missing packed captured buffer {id}"
+                        )),
+                    })?;
+                if actual != expected {
+                    return Err(PreparedScheduleDispatchFailure {
+                        entry,
+                        error: JitBackendError::Binding(format!(
+                            "packed captured buffer {id} changed after preparation"
+                        )),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execute_segment(
+        entries: &[&Self],
+        buffers: &mut [JitBuffer],
+        borrowed: Option<&mut BTreeMap<usize, crate::cpu_jit::BorrowedJitBuffer<'_>>>,
+        quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
+    ) -> Result<(), PreparedScheduleDispatchFailure> {
+        let Some(first) = entries.first() else {
+            return Ok(());
+        };
+        Self::authenticate_segment(entries, quantized)?;
+        let mut resolved = Vec::with_capacity(entries.len());
+        for (entry, prepared) in entries.iter().enumerate() {
+            let resources = prepared
+                .quantized
+                .iter()
+                .map(|(id, expected)| {
+                    let actual = quantized.get(id).ok_or_else(|| {
+                        JitBackendError::Binding(format!("missing packed captured buffer {id}"))
+                    })?;
+                    if actual != expected {
+                        return Err(JitBackendError::Binding(format!(
+                            "packed captured buffer {id} changed after preparation"
+                        )));
+                    }
+                    Ok(expected)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| PreparedScheduleDispatchFailure { entry, error })?;
+            resolved.push((&*prepared.kernel, prepared.slots.as_slice(), resources));
+        }
+        first
+            .dispatcher
+            .call(&resolved, buffers, borrowed)
+            .map_err(|(entry, error)| PreparedScheduleDispatchFailure {
+                entry,
+                error: jit_error(error),
+            })
+    }
+}
+
+pub(crate) struct PreparedScheduleDispatchFailure {
+    pub(crate) entry: usize,
+    pub(crate) error: JitBackendError,
 }
 
 fn matmul_plan(item: &ScheduleItem) -> Option<&crate::MatmulKernelPlan> {
@@ -621,6 +798,7 @@ impl CpuJitBackend {
         let (kernel, cache_hit) = self.compile_cached(&rendered, &native_cache_key)?;
         Ok(PreparedScheduleItem {
             kernel,
+            dispatcher: None,
             native_cache_key,
             cache_hit,
             vector,
@@ -685,10 +863,11 @@ impl CpuJitBackend {
             .map_err(|_| JitBackendError::Native("schedule module cache lock poisoned".into()))?
             .get(&module_key)
             .cloned();
-        let (kernels, load) = match cached_module {
-            Some(kernels) => {
-                if kernels.len() != rendered.len()
-                    || kernels
+        let (module, load) = match cached_module {
+            Some(module) => {
+                if module.kernels.len() != rendered.len()
+                    || module
+                        .kernels
                         .iter()
                         .zip(&rendered)
                         .any(|(kernel, rendered)| kernel.abi() != &rendered.abi)
@@ -697,22 +876,25 @@ impl CpuJitBackend {
                         "cached native schedule module ABI mismatch".into(),
                     ));
                 }
-                (kernels, None)
+                (module, None)
             }
             None => {
-                let (kernels, load) =
+                let (kernels, dispatcher, load) =
                     JitKernel::load_schedule_module(&rendered).map_err(jit_error)?;
-                let kernels = kernels.into_iter().map(Arc::new).collect::<Vec<_>>();
+                let module = NativeScheduleModule {
+                    kernels: kernels.into_iter().map(Arc::new).collect::<Vec<_>>(),
+                    dispatcher: Arc::new(dispatcher),
+                };
                 self.schedule_modules
                     .lock()
                     .map_err(|_| {
                         JitBackendError::Native("schedule module cache lock poisoned".into())
                     })?
-                    .insert(module_key, kernels.clone());
-                (kernels, Some(load))
+                    .insert(module_key, module.clone());
+                (module, Some(load))
             }
         };
-        if kernels.len() != entries.len() {
+        if module.kernels.len() != entries.len() {
             return Err(JitBackendError::Binding(
                 "native schedule module entry count mismatch".into(),
             ));
@@ -722,12 +904,13 @@ impl CpuJitBackend {
             .lock()
             .map_err(|_| JitBackendError::Native("cache lock poisoned".into()))?;
         let mut prepared = Vec::with_capacity(entries.len());
-        for ((item, entry), kernel) in items.iter().zip(entries).zip(kernels) {
+        for ((item, entry), kernel) in items.iter().zip(entries).zip(module.kernels) {
             let cache_hit = cache
                 .insert(entry.native_cache_key.clone(), kernel.clone())
                 .is_some();
             prepared.push(PreparedScheduleItem {
                 kernel,
+                dispatcher: Some(module.dispatcher.clone()),
                 native_cache_key: entry.native_cache_key,
                 cache_hit,
                 vector: entry.vector,

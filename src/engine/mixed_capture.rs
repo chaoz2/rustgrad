@@ -435,6 +435,16 @@ impl PreparedRecurrentNativeReplay {
         self.plan.last_executed_native_item_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn last_module_dispatch_counts(&self) -> (usize, usize) {
+        self.plan.last_module_dispatch_counts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_dispatch_failure(&mut self, index: usize) {
+        self.plan.inject_dispatch_failure(index);
+    }
+
     fn validate_cursor(&self, cursor: &MixedReplayCursor) -> Result<(), ReplayError> {
         if cursor.capture_identity != self.trace.replay.artifact_identity {
             return Err(ReplayError::Descriptor(
