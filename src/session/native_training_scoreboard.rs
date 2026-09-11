@@ -4,9 +4,17 @@
 //! only checks and aggregates detached reports; it does not time calls, execute
 //! programs, or infer unavailable device and allocator measurements.
 
+mod step_phases;
+
+pub use step_phases::{
+    NativeTrainingFirstStepReport, NativeTrainingStepPhase, NativeTrainingStepPhaseReport,
+    NativeTrainingWarmStepReport,
+};
+
 use super::{
     CompiledAdamWCheckpoint, NativeCpuCompiledAdamWPreparationReport,
-    NativeCpuProgramPreparationReport, NativeCpuReplayTraffic, NativeCpuRunReport,
+    NativeCpuCompiledAdamWStepResult, NativeCpuProgramPreparationReport, NativeCpuReplayTraffic,
+    NativeCpuRunReport,
 };
 use crate::{
     BenchmarkDuration, BenchmarkLatencySummary, BenchmarkTransfer, Error, ExecutionPlanSummary,
@@ -22,7 +30,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V5: u32 = 5;
 const NATIVE_TRAINING_REPORT_FORMAT_V6: u32 = 6;
 const NATIVE_TRAINING_REPORT_FORMAT_V7: u32 = 7;
 const NATIVE_TRAINING_REPORT_FORMAT_V8: u32 = 8;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 9;
+const NATIVE_TRAINING_REPORT_FORMAT_V9: u32 = 9;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 10;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -314,6 +323,7 @@ impl NativeTrainingProgramReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
+                | NATIVE_TRAINING_REPORT_FORMAT_V9
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self)?,
@@ -470,6 +480,13 @@ struct ReplayTiming {
     overhead: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplayRecordingMode {
+    Unset,
+    Raw,
+    Phased,
+}
+
 /// Versioned strict-native CPU compiled-training observation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -504,6 +521,8 @@ pub struct NativeTrainingReport {
     main_replay_executor_wall_time: Option<NativeTrainingReplayTiming>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     main_replay_recurrent_overhead_wall_time: Option<NativeTrainingReplayTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step_phases: Option<NativeTrainingStepPhaseReport>,
     first_replay_wall_time: BenchmarkDuration,
     steady_replay_total_wall_time: BenchmarkDuration,
     steady_replay_wall_time: BenchmarkLatencySummary,
@@ -619,6 +638,12 @@ impl NativeTrainingReport {
         self.main_replay_recurrent_overhead_wall_time.as_ref()
     }
 
+    /// First replay and warm replay timings classified solely by whether the
+    /// successful main replay committed an optimizer update.
+    pub const fn step_phases(&self) -> Option<&NativeTrainingStepPhaseReport> {
+        self.step_phases.as_ref()
+    }
+
     pub const fn checkpoint_byte_count(&self) -> Option<u64> {
         match &self.checkpoint {
             Some(checkpoint) => Some(checkpoint.byte_count),
@@ -655,6 +680,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
+                | NATIVE_TRAINING_REPORT_FORMAT_V9
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -695,6 +721,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
+                | NATIVE_TRAINING_REPORT_FORMAT_V9
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -716,7 +743,8 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V5
                 | NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
-                | NATIVE_TRAINING_REPORT_FORMAT_V8,
+                | NATIVE_TRAINING_REPORT_FORMAT_V8
+                | NATIVE_TRAINING_REPORT_FORMAT_V9,
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
             (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(executed))
@@ -749,7 +777,9 @@ impl NativeTrainingReport {
                 }
                 None
             }
-            NATIVE_TRAINING_REPORT_FORMAT_V8 | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
+            NATIVE_TRAINING_REPORT_FORMAT_V8
+            | NATIVE_TRAINING_REPORT_FORMAT_V9
+            | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
                     .ok_or_else(|| invalid("native compiler overlap timing is absent"))?
@@ -829,6 +859,7 @@ impl NativeTrainingReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
+                | NATIVE_TRAINING_REPORT_FORMAT_V9
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
@@ -836,7 +867,9 @@ impl NativeTrainingReport {
                 let overlap = match (self.format_version, overlap) {
                     (NATIVE_TRAINING_REPORT_FORMAT_V7, None) => 0,
                     (
-                        NATIVE_TRAINING_REPORT_FORMAT_V8 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                        NATIVE_TRAINING_REPORT_FORMAT_V8
+                        | NATIVE_TRAINING_REPORT_FORMAT_V9
+                        | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                         Some(overlap),
                     ) => overlap
                         .as_nanos()
@@ -917,6 +950,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
+                | NATIVE_TRAINING_REPORT_FORMAT_V9
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -941,6 +975,24 @@ impl NativeTrainingReport {
                 return Err(invalid("legacy native training report has replay phases"));
             }
             _ => return Err(invalid("native training replay phases differ")),
+        }
+        match (self.format_version, &self.step_phases) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V9, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(phases)) => phases.validate(
+                self.successful_replay_count,
+                self.first_replay_wall_time,
+                self.steady_replay_total_wall_time,
+                self.main_replay_executor_wall_time
+                    .as_ref()
+                    .ok_or_else(|| invalid("classified replay executor timing is absent"))?,
+                self.main_replay_recurrent_overhead_wall_time
+                    .as_ref()
+                    .ok_or_else(|| invalid("classified replay overhead timing is absent"))?,
+            )?,
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V9, Some(_)) => {
+                return Err(invalid("legacy native training report has step phases"));
+            }
+            _ => return Err(invalid("native training step phases differ")),
         }
         let expected_rate = rate_from_total(
             self.steady_replay_wall_time.sample_count,
@@ -995,7 +1047,9 @@ pub struct NativeTrainingScoreboard {
     partial_flush: Option<NativeTrainingProgramReport>,
     zero_grad: Option<NativeTrainingProgramReport>,
     evaluation: Option<NativeTrainingProgramReport>,
+    recording_mode: ReplayRecordingMode,
     replay_timings: Vec<ReplayTiming>,
+    replay_step_phases: Vec<NativeTrainingStepPhase>,
     schedule_cache_keys: Option<Vec<u64>>,
     main_replay_traffic: Option<NativeCpuReplayTraffic>,
     main_replay_executed_native_item_count: Option<u64>,
@@ -1073,7 +1127,9 @@ impl NativeTrainingScoreboard {
             partial_flush,
             zero_grad,
             evaluation,
+            recording_mode: ReplayRecordingMode::Unset,
             replay_timings: Vec::new(),
+            replay_step_phases: Vec::new(),
             schedule_cache_keys: None,
             main_replay_traffic: None,
             main_replay_executed_native_item_count: None,
@@ -1081,9 +1137,38 @@ impl NativeTrainingScoreboard {
         })
     }
 
-    /// Records one report returned by a committed native training step. Failed
-    /// or rejected steps expose no report and therefore cannot become samples.
+    /// Records one unclassified report returned by a committed native training
+    /// step. A scoreboard cannot mix this raw mode with [`Self::record_step`].
     pub fn record(&mut self, report: &NativeCpuRunReport) -> Result<()> {
+        if self.recording_mode == ReplayRecordingMode::Phased {
+            return Err(invalid("cannot mix raw and classified replay samples"));
+        }
+        let (timing, executed) = self.validate_replay(report)?;
+        self.commit_replay(report, timing, executed);
+        self.recording_mode = ReplayRecordingMode::Raw;
+        Ok(())
+    }
+
+    /// Records and classifies one successful compiled AdamW main replay using
+    /// only its authenticated public `did_update` result. Partial flushes are
+    /// deliberately outside this main-step scoreboard.
+    pub fn record_step(&mut self, step: &NativeCpuCompiledAdamWStepResult) -> Result<()> {
+        if self.recording_mode == ReplayRecordingMode::Raw {
+            return Err(invalid("cannot mix raw and classified replay samples"));
+        }
+        let (timing, executed) = self.validate_replay(step.report())?;
+        let phase = if step.did_update() {
+            NativeTrainingStepPhase::OptimizerCommit
+        } else {
+            NativeTrainingStepPhase::AccumulationOnly
+        };
+        self.commit_replay(step.report(), timing, executed);
+        self.replay_step_phases.push(phase);
+        self.recording_mode = ReplayRecordingMode::Phased;
+        Ok(())
+    }
+
+    fn validate_replay(&self, report: &NativeCpuRunReport) -> Result<(ReplayTiming, u64)> {
         if self.replay_timings.len() >= MAX_REPLAY_SAMPLES {
             return Err(invalid("native training replay sample limit exceeded"));
         }
@@ -1135,6 +1220,17 @@ impl NativeTrainingScoreboard {
         let overhead = total
             .checked_sub(executor)
             .ok_or_else(|| invalid("native executor time exceeds replay time"))?;
+        Ok((
+            ReplayTiming {
+                total,
+                executor,
+                overhead,
+            },
+            executed,
+        ))
+    }
+
+    fn commit_replay(&mut self, report: &NativeCpuRunReport, timing: ReplayTiming, executed: u64) {
         if self.schedule_cache_keys.is_none() {
             self.schedule_cache_keys = Some(report.schedule_cache_keys().to_vec());
         }
@@ -1144,12 +1240,7 @@ impl NativeTrainingScoreboard {
         if self.main_replay_executed_native_item_count.is_none() {
             self.main_replay_executed_native_item_count = Some(executed);
         }
-        self.replay_timings.push(ReplayTiming {
-            total,
-            executor,
-            overhead,
-        });
-        Ok(())
+        self.replay_timings.push(timing);
     }
 
     pub fn observe_checkpoint(
@@ -1195,8 +1286,21 @@ impl NativeTrainingScoreboard {
             .map(|timing| timing.overhead)
             .collect::<Vec<_>>();
         let (steady_replay_total_wall_time, steady_microbatches_per_second) = rate(&totals)?;
+        let (format_version, step_phases) = match self.recording_mode {
+            ReplayRecordingMode::Raw => (NATIVE_TRAINING_REPORT_FORMAT_V9, None),
+            ReplayRecordingMode::Phased => (
+                NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(NativeTrainingStepPhaseReport::from_timings(
+                    &self.replay_timings,
+                    &self.replay_step_phases,
+                )?),
+            ),
+            ReplayRecordingMode::Unset => {
+                return Err(invalid("native training scoreboard has no replay mode"));
+            }
+        };
         let report = NativeTrainingReport {
-            format_version: NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+            format_version,
             compile_wall_time: BenchmarkDuration::from_duration(self.compile_wall_time),
             prepare_wall_time: BenchmarkDuration::from_duration(self.prepare_wall_time),
             prepare_runtime_overhead_wall_time: Some(BenchmarkDuration::from_duration(
@@ -1235,6 +1339,7 @@ impl NativeTrainingScoreboard {
             main_replay_recurrent_overhead_wall_time: Some(
                 NativeTrainingReplayTiming::from_durations(first.overhead, &overheads)?,
             ),
+            step_phases,
             first_replay_wall_time: BenchmarkDuration::from_duration(first.total),
             steady_replay_total_wall_time,
             steady_replay_wall_time: latency_summary(&totals)?,
@@ -1424,6 +1529,18 @@ mod tests {
         executor.steady_total = elapsed;
         executor.steady = summary;
         report.steady_microbatches_per_second = rate_from_total(1, elapsed).unwrap();
+        let phase = report
+            .step_phases
+            .as_mut()
+            .unwrap()
+            .warm_optimizer_commit
+            .as_mut()
+            .unwrap();
+        phase.total_wall_time = elapsed;
+        phase.wall_time = report.steady_replay_wall_time.clone();
+        phase.steps_per_second = report.steady_microbatches_per_second;
+        phase.executor_total_wall_time = elapsed;
+        phase.executor_wall_time = report.steady_replay_wall_time.clone();
     }
 
     fn remove_module_preparation(json: &mut serde_json::Value) {
@@ -1450,6 +1567,10 @@ mod tests {
         json.as_object_mut()
             .unwrap()
             .remove("main_replay_recurrent_overhead_wall_time");
+    }
+
+    fn remove_step_phases(json: &mut serde_json::Value) {
+        json.as_object_mut().unwrap().remove("step_phases");
     }
 
     fn remove_preparation_phase_timing(json: &mut serde_json::Value) {
@@ -1512,6 +1633,42 @@ mod tests {
             main_replay_executed_native_item_count: Some(1),
             main_replay_executor_wall_time: Some(zero_replay_timing()),
             main_replay_recurrent_overhead_wall_time: Some(zero_replay_timing()),
+            step_phases: Some(NativeTrainingStepPhaseReport {
+                first: NativeTrainingFirstStepReport {
+                    phase: NativeTrainingStepPhase::AccumulationOnly,
+                    total_wall_time: zero_duration(),
+                    executor_wall_time: zero_duration(),
+                    recurrent_overhead_wall_time: zero_duration(),
+                },
+                warm_accumulation_only: None,
+                warm_optimizer_commit: Some(NativeTrainingWarmStepReport {
+                    total_wall_time: zero_duration(),
+                    wall_time: BenchmarkLatencySummary {
+                        sample_count: 1,
+                        min: zero_duration(),
+                        nearest_rank_p50: zero_duration(),
+                        nearest_rank_p95: zero_duration(),
+                        max: zero_duration(),
+                    },
+                    steps_per_second: None,
+                    executor_total_wall_time: zero_duration(),
+                    executor_wall_time: BenchmarkLatencySummary {
+                        sample_count: 1,
+                        min: zero_duration(),
+                        nearest_rank_p50: zero_duration(),
+                        nearest_rank_p95: zero_duration(),
+                        max: zero_duration(),
+                    },
+                    recurrent_overhead_total_wall_time: zero_duration(),
+                    recurrent_overhead_wall_time: BenchmarkLatencySummary {
+                        sample_count: 1,
+                        min: zero_duration(),
+                        nearest_rank_p50: zero_duration(),
+                        nearest_rank_p95: zero_duration(),
+                        max: zero_duration(),
+                    },
+                }),
+            }),
             first_replay_wall_time: zero_duration(),
             steady_replay_wall_time: BenchmarkLatencySummary {
                 sample_count: 1,
@@ -1577,6 +1734,12 @@ mod tests {
             json["main_replay_recurrent_overhead_wall_time"]["steady"]["sample_count"],
             1
         );
+        assert_eq!(json["step_phases"]["first"]["phase"], "accumulation_only");
+        assert!(json["step_phases"]["warm_accumulation_only"].is_null());
+        assert_eq!(
+            json["step_phases"]["warm_optimizer_commit"]["wall_time"]["sample_count"],
+            1
+        );
         assert_eq!(
             NativeTrainingReport::from_json_bytes(&bytes).unwrap(),
             report
@@ -1587,6 +1750,7 @@ mod tests {
     fn legacy_report_without_zero_grad_evidence_still_decodes() {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(1);
+        remove_step_phases(&mut json);
         json.as_object_mut().unwrap().remove("zero_grad");
         json.as_object_mut().unwrap().remove("main_replay_traffic");
         json.as_object_mut()
@@ -1604,6 +1768,7 @@ mod tests {
     fn version_two_report_without_replay_traffic_still_decodes() {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V2);
+        remove_step_phases(&mut json);
         json.as_object_mut().unwrap().remove("main_replay_traffic");
         json.as_object_mut()
             .unwrap()
@@ -1620,6 +1785,7 @@ mod tests {
     fn version_three_report_without_execution_count_still_decodes() {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V3);
+        remove_step_phases(&mut json);
         json.as_object_mut()
             .unwrap()
             .remove("main_replay_executed_native_item_count");
@@ -1636,6 +1802,7 @@ mod tests {
     fn version_four_report_without_module_preparation_still_decodes() {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V4);
+        remove_step_phases(&mut json);
         remove_module_preparation(&mut json);
         remove_replay_phase_timing(&mut json);
         remove_preparation_phase_timing(&mut json);
@@ -1648,6 +1815,7 @@ mod tests {
     fn version_five_report_without_replay_phase_timing_still_decodes() {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V5);
+        remove_step_phases(&mut json);
         remove_replay_phase_timing(&mut json);
         remove_preparation_phase_timing(&mut json);
         let report =
@@ -1660,6 +1828,7 @@ mod tests {
     fn version_six_report_without_preparation_phase_timing_still_decodes() {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V6);
+        remove_step_phases(&mut json);
         remove_preparation_phase_timing(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
@@ -1672,6 +1841,7 @@ mod tests {
     fn version_seven_report_without_parallel_module_overlap_still_decodes() {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V7);
+        remove_step_phases(&mut json);
         json.as_object_mut()
             .unwrap()
             .remove("prepare_parallel_module_overlap_wall_time");
@@ -1692,11 +1862,23 @@ mod tests {
     fn version_eight_report_with_exact_native_inventory_still_decodes() {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V8);
+        remove_step_phases(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert_eq!(report.main().native_item_count(), 2);
         assert_eq!(report.main().rendered_entry_count(), 2);
         assert_eq!(report.main_replay_executed_native_item_count(), Some(1));
+    }
+
+    #[test]
+    fn version_nine_report_without_step_phases_still_decodes() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V9);
+        remove_step_phases(&mut json);
+        let report =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(report.step_phases().is_none());
+        assert_eq!(report.main().rendered_entry_count(), 2);
     }
 
     #[test]
@@ -1709,6 +1891,7 @@ mod tests {
         ] {
             let mut json = serde_json::to_value(zero_report()).unwrap();
             json["format_version"] = serde_json::json!(version);
+            remove_step_phases(&mut json);
             if version == NATIVE_TRAINING_REPORT_FORMAT_V5 {
                 remove_replay_phase_timing(&mut json);
             }
@@ -1885,6 +2068,10 @@ mod tests {
             .as_mut()
             .unwrap()
             .first = overhead;
+        let classified = &mut report.step_phases.as_mut().unwrap().first;
+        classified.total_wall_time = total;
+        classified.executor_wall_time = executor;
+        classified.recurrent_overhead_wall_time = overhead;
         assert!(report.validate().is_ok());
 
         report
@@ -1893,6 +2080,45 @@ mod tests {
             .unwrap()
             .first = BenchmarkDuration::from_duration(Duration::from_nanos(5));
         assert!(report.validate().is_err());
+    }
+
+    #[test]
+    fn current_report_requires_complete_classified_step_phases() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json.as_object_mut().unwrap().remove("step_phases");
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+
+        let mut report = zero_report();
+        report
+            .step_phases
+            .as_mut()
+            .unwrap()
+            .warm_optimizer_commit
+            .as_mut()
+            .unwrap()
+            .executor_wall_time
+            .sample_count = 2;
+        assert!(report.validate().is_err());
+
+        let mut report = zero_report();
+        report
+            .step_phases
+            .as_mut()
+            .unwrap()
+            .warm_optimizer_commit
+            .as_mut()
+            .unwrap()
+            .recurrent_overhead_total_wall_time =
+            BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        assert!(report.validate().is_err());
+
+        let mut legacy = serde_json::to_value(zero_report()).unwrap();
+        legacy["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V9);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&legacy).unwrap()).is_err()
+        );
     }
 
     #[test]

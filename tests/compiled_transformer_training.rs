@@ -4063,12 +4063,16 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     assert!(session.step(malformed, learning_rate()).is_err());
     for replay in 1..=3 {
         let step = session.step(batch(replay), learning_rate()).unwrap();
+        assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
         assert!(step.report().skipped_output_clear_count() > 0);
         assert!(
             step.report().skipped_output_clear_count()
                 <= step.report().executed_native_item_count()
         );
-        scoreboard.record(step.report()).unwrap();
+        scoreboard.record_step(&step).unwrap();
+        if replay == 1 {
+            assert!(scoreboard.record(step.report()).is_err());
+        }
     }
     let checkpoint = session.checkpoint().unwrap();
     let checkpoint_bytes = checkpoint.as_bytes().len();
@@ -4079,6 +4083,19 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let bytes = report.to_json_bytes().unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(report.successful_replay_count(), 3);
+    let step_phases = report.step_phases().unwrap();
+    assert_eq!(
+        step_phases.first().phase(),
+        rustgrad::NativeTrainingStepPhase::AccumulationOnly
+    );
+    assert_eq!(
+        step_phases.warm_accumulation_only().unwrap().sample_count(),
+        1
+    );
+    assert_eq!(
+        step_phases.warm_optimizer_commit().unwrap().sample_count(),
+        1
+    );
     assert_eq!(report.steady_replay_wall_time().sample_count, 2);
     assert_eq!(report.main().capture_identity(), inspection.main().0);
     assert_eq!(
@@ -4210,6 +4227,15 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     );
     assert!(json["main_replay_executor_wall_time"].is_object());
     assert!(json["main_replay_recurrent_overhead_wall_time"].is_object());
+    assert_eq!(json["format_version"], 10);
+    assert_eq!(
+        json["step_phases"]["warm_accumulation_only"]["wall_time"]["sample_count"],
+        1
+    );
+    assert_eq!(
+        json["step_phases"]["warm_optimizer_commit"]["wall_time"]["sample_count"],
+        1
+    );
     assert!(json["host_to_device"].is_null());
     assert!(json["device_to_host"].is_null());
     assert!(json["measured_peak_host_memory_bytes"].is_null());

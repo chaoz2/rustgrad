@@ -1819,6 +1819,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             EXPECTED_LOSS_WEIGHTS[(replay - 1) as usize]
         );
         let step = session.step_batch_scheduled(batch)?;
+        assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
         let report = step.report();
         let executed = report.executed_native_item_count();
         assert!(executed > 0);
@@ -1835,7 +1836,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         } else {
             stable_executed_native_items = Some(executed);
         }
-        scoreboard.record(step.report())?;
+        scoreboard.record_step(&step)?;
     }
 
     let checkpoint_started = Instant::now();
@@ -1897,6 +1898,43 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         report.prepare_wall_time().to_duration()?
     );
     assert_eq!(report.successful_replay_count(), SAMPLES);
+    let step_phases = report
+        .step_phases()
+        .expect("phase-aware scoreboard reports successful main-step classes");
+    assert_eq!(
+        step_phases.first().phase(),
+        rustgrad::NativeTrainingStepPhase::AccumulationOnly
+    );
+    assert_eq!(
+        step_phases
+            .warm_accumulation_only()
+            .expect("the second replay remains accumulation-only")
+            .sample_count(),
+        1
+    );
+    assert_eq!(
+        step_phases
+            .warm_optimizer_commit()
+            .expect("the third replay commits the accumulated window")
+            .sample_count(),
+        1
+    );
+    for phase in [
+        step_phases.warm_accumulation_only(),
+        step_phases.warm_optimizer_commit(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert_eq!(
+            phase
+                .executor_total_wall_time()
+                .to_duration()?
+                .checked_add(phase.recurrent_overhead_total_wall_time().to_duration()?)
+                .expect("classified warm replay phase durations fit"),
+            phase.total_wall_time().to_duration()?
+        );
+    }
     let executor_timing = report
         .main_replay_executor_wall_time()
         .expect("current native CPU scoreboard reports sealed executor timing");

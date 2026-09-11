@@ -284,10 +284,11 @@ pub use session::{
     NativeCpuCompiledEvaluationResult, NativeCpuPreparationPhases, NativeCpuPreparationWork,
     NativeCpuProgramPreparationReport, NativeCpuReplayTraffic, NativeCpuRunReport,
     NativeCpuSessionTarget, NativeModuleExecutionReport, NativeModuleInferenceResult,
-    NativeModuleInferenceTrace, NativeTrainingPreparationTiming, NativeTrainingProgramReport,
-    NativeTrainingReplayTiming, NativeTrainingReport, NativeTrainingScoreboard,
-    ReportedNativeModuleInferenceResult, SessionDevice, SessionTarget, Tensor,
-    TrainingParameterInit, infer_module_cpu, infer_module_native_cpu,
+    NativeModuleInferenceTrace, NativeTrainingFirstStepReport, NativeTrainingPreparationTiming,
+    NativeTrainingProgramReport, NativeTrainingReplayTiming, NativeTrainingReport,
+    NativeTrainingScoreboard, NativeTrainingStepPhase, NativeTrainingStepPhaseReport,
+    NativeTrainingWarmStepReport, ReportedNativeModuleInferenceResult, SessionDevice,
+    SessionTarget, Tensor, TrainingParameterInit, infer_module_cpu, infer_module_native_cpu,
     infer_module_native_cpu_with_report, summarize_binary_classification, summarize_classification,
 };
 pub use sharded_cuda_execute::{
