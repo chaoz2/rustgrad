@@ -20,12 +20,12 @@ use crate::{
     Backend, BufferRole, CpuJitBackend, Graph, JitFallback, KernelBindings, KernelBufferDesc,
     MemoryPlan, NodeId, Op, Schedule, Shape, TensorData,
 };
-pub(crate) use captured_replay::PlannedNativeItems;
 pub use captured_replay::{
     CapturedBackendPolicy, CapturedBatch, CapturedBatchResult, CapturedInvocation,
     CapturedItemTrace, CapturedReplayExecutor, CapturedReplayOptions, CapturedReplayResult,
     CapturedReplayTrace, CapturedSpecialization, CapturedSpecializationTrace,
 };
+pub(crate) use captured_replay::{PlannedNativeItems, validate_input_value};
 pub use mixed::realize_mixed_effects;
 pub(crate) use native_replay_workspace::NativeReplayTraffic;
 use std::{

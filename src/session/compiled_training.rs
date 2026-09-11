@@ -28,6 +28,7 @@ use super::target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,
     NativeCpuSessionTarget, SessionTarget,
 };
+use crate::effects::runtime::RecurrentTransactionError;
 use crate::engine::mixed_capture::{NativeReplayContext, PreparedRecurrentNativeReplay};
 use crate::engine::{NativeReplayTraffic, PlannedNativeItems};
 use crate::nn::{
@@ -1373,10 +1374,29 @@ struct PreparedNativeCpuProgram {
 struct PreparedNativeCpuEvaluation {
     report: NativeCpuProgramPreparationReport,
     plan: PlannedNativeItems,
+    parameter_inputs: Vec<PreparedNativeEvaluationParameterInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedNativeEvaluationParameterInput {
+    parameter: String,
+    input: String,
+    buffer: u64,
+    shape: Shape,
+    dtype: DType,
+    bytes: usize,
 }
 
 impl PreparedNativeCpuEvaluation {
-    fn validate(&self, capture_identity: u64, capture: &CapturedSchedule) -> Result<()> {
+    fn validate(
+        &self,
+        capture_identity: u64,
+        capture: &CapturedSchedule,
+        parameter_buffers: &BTreeMap<String, u64>,
+    ) -> Result<()> {
+        self.plan
+            .validate_structure(capture)
+            .map_err(replay_error)?;
         let native_identity = native_cpu_identity(
             capture_identity,
             self.plan.vectorized(),
@@ -1398,7 +1418,64 @@ impl PreparedNativeCpuEvaluation {
                 "compiled native CPU evaluation preparation identity mismatch",
             ));
         }
+        if parameter_buffers.len() != self.parameter_inputs.len() {
+            return Err(training(
+                "compiled native CPU evaluation parameter mapping mismatch",
+            ));
+        }
+        let mut parameters = BTreeSet::new();
+        let mut inputs = BTreeSet::new();
+        let mut buffers = BTreeSet::new();
+        for binding in &self.parameter_inputs {
+            let input = capture
+                .inputs
+                .iter()
+                .find(|input| input.name == binding.input)
+                .ok_or_else(|| {
+                    training("compiled native CPU evaluation parameter input is absent")
+                })?;
+            if !parameters.insert(binding.parameter.as_str())
+                || parameter_buffers.get(&binding.parameter) != Some(&binding.buffer)
+                || !inputs.insert(binding.input.as_str())
+                || !buffers.insert(binding.buffer)
+                || input.desc.shape != binding.shape
+                || input.desc.dtype != binding.dtype
+                || input.desc.bytes != binding.bytes
+            {
+                return Err(training(
+                    "compiled native CPU evaluation parameter mapping mismatch",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    fn active_parameter_states(&self, frontier: &[BufferState]) -> Result<Vec<BufferState>> {
+        let mut frontier_by_buffer = BTreeMap::new();
+        for state in frontier {
+            if frontier_by_buffer.insert(state.buffer, state).is_some() {
+                return Err(training(
+                    "compiled native CPU recurrent frontier contains duplicate buffers",
+                ));
+            }
+        }
+        self.parameter_inputs
+            .iter()
+            .map(|binding| {
+                let state = frontier_by_buffer.get(&binding.buffer).ok_or_else(|| {
+                    training("compiled native CPU evaluation parameter state is absent")
+                })?;
+                if state.shape != binding.shape
+                    || state.dtype != binding.dtype
+                    || state.bytes != binding.bytes
+                {
+                    return Err(training(
+                        "compiled native CPU evaluation parameter state descriptor mismatch",
+                    ));
+                }
+                Ok((*state).clone())
+            })
+            .collect()
     }
 }
 
@@ -5108,12 +5185,56 @@ impl CompiledEvaluationPlan {
     fn prepare_native(
         &self,
         parameters: BTreeMap<String, TensorData>,
+        parameter_buffers: &BTreeMap<String, u64>,
         executor: &CapturedReplayExecutor,
         vectorized: bool,
     ) -> Result<PreparedNativeCpuEvaluation> {
         let started = Instant::now();
-        let inputs = self.bind(zero_inputs(&self.inputs)?, parameters)?;
+        if parameter_buffers.keys().ne(self.parameter_inputs.keys()) {
+            return Err(training(
+                "compiled native CPU evaluation parameter buffer inventory differs",
+            ));
+        }
         let capture = self.inference.capture();
+        let parameter_inputs = self
+            .parameter_inputs
+            .iter()
+            .map(|(parameter, input_name)| {
+                let value = parameters.get(parameter).ok_or_else(|| {
+                    training("compiled native CPU evaluation parameter value is absent")
+                })?;
+                let input = capture
+                    .inputs
+                    .iter()
+                    .find(|input| input.name == *input_name)
+                    .ok_or_else(|| {
+                        training("compiled native CPU evaluation parameter input is absent")
+                    })?;
+                let bytes = value
+                    .len()
+                    .checked_mul(value.dtype().itemsize())
+                    .ok_or_else(|| {
+                        training("compiled native CPU evaluation parameter bytes overflow")
+                    })?;
+                if value.shape() != &input.desc.shape
+                    || value.dtype() != input.desc.dtype
+                    || bytes != input.desc.bytes
+                {
+                    return Err(training(
+                        "compiled native CPU evaluation parameter descriptor mismatch",
+                    ));
+                }
+                Ok(PreparedNativeEvaluationParameterInput {
+                    parameter: parameter.clone(),
+                    input: input_name.clone(),
+                    buffer: parameter_buffers[parameter],
+                    shape: value.shape().clone(),
+                    dtype: value.dtype(),
+                    bytes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let inputs = self.bind(zero_inputs(&self.inputs)?, parameters)?;
         let plan = executor
             .plan_native_items(capture, &inputs, vectorized)
             .map_err(replay_error)?;
@@ -5133,23 +5254,80 @@ impl CompiledEvaluationPlan {
             execution_plan,
             wall_time: started.elapsed(),
         };
-        Ok(PreparedNativeCpuEvaluation { report, plan })
+        let prepared = PreparedNativeCpuEvaluation {
+            report,
+            plan,
+            parameter_inputs,
+        };
+        prepared.validate(self.capture_identity, capture, parameter_buffers)?;
+        Ok(prepared)
     }
 
-    fn evaluate_native(
+    fn preflight_native_borrowed(
         &self,
-        inputs: BTreeMap<String, TensorData>,
-        parameters: BTreeMap<String, TensorData>,
+        inputs: &BTreeMap<String, TensorData>,
+        frontier: &[BufferState],
+        prepared: &PreparedNativeCpuEvaluation,
+        parameter_buffers: &BTreeMap<String, u64>,
+    ) -> Result<(u64, Vec<BufferState>)> {
+        let loss_weight = self.validate_loss_weight(inputs)?;
+        let capture = self.inference.capture();
+        prepared.validate(self.capture_identity, capture, parameter_buffers)?;
+        let parameter_inputs = prepared
+            .parameter_inputs
+            .iter()
+            .map(|binding| binding.input.as_str())
+            .collect::<BTreeSet<_>>();
+        for input in &capture.inputs {
+            if parameter_inputs.contains(input.name.as_str()) {
+                continue;
+            }
+            let value = inputs
+                .get(&input.name)
+                .ok_or_else(|| training("compiled evaluation input is absent"))?;
+            crate::engine::validate_input_value(capture, input, value).map_err(replay_error)?;
+        }
+        Ok((loss_weight, prepared.active_parameter_states(frontier)?))
+    }
+
+    fn evaluate_native_borrowed(
+        &self,
+        inputs: &BTreeMap<String, TensorData>,
+        reads: &[crate::host_buffer::HostBufferRead<'_>],
+        loss_weight: u64,
         executor: &CapturedReplayExecutor,
         prepared: &mut PreparedNativeCpuEvaluation,
     ) -> Result<(CompiledEvaluationResult, NativeCpuRunReport)> {
-        let loss_weight = self.validate_loss_weight(&inputs)?;
-        let inputs = self.bind(inputs, parameters)?;
+        if reads.len() != prepared.parameter_inputs.len() {
+            return Err(training(
+                "compiled native CPU evaluation active parameter cardinality mismatch",
+            ));
+        }
+        let mut recurrent = BTreeMap::new();
+        for (binding, read) in prepared.parameter_inputs.iter().zip(reads) {
+            if read.ordinal() != recurrent.len() || read.buffer_id() != binding.buffer {
+                return Err(training(
+                    "compiled native CPU evaluation active parameter mapping mismatch",
+                ));
+            }
+            if recurrent
+                .insert(binding.input.clone(), read.tensor())
+                .is_some()
+            {
+                return Err(training(
+                    "compiled native CPU evaluation active parameter input is duplicated",
+                ));
+            }
+        }
         let started = Instant::now();
         let capture = self.inference.capture();
-        prepared.validate(self.capture_identity, capture)?;
         let (values, traffic) = executor
-            .execute_planned_native_items_observed(capture, &inputs, &mut prepared.plan)
+            .execute_planned_native_items_with_recurrent_inputs(
+                capture,
+                inputs,
+                &recurrent,
+                &mut prepared.plan,
+            )
             .map_err(replay_error)?;
         let outputs = values.requested(&capture.requested).map_err(replay_error)?;
         let schedule_cache_keys = prepared.plan.schedule_cache_keys().to_vec();
@@ -8191,9 +8369,12 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .evaluation
             .as_ref()
             .map(|evaluation| {
-                evaluation
-                    .plan
-                    .prepare_native(inner.parameter_snapshots()?, executor, vectorized)
+                evaluation.plan.prepare_native(
+                    inner.parameter_snapshots()?,
+                    &inner.inner.parameter_buffers,
+                    executor,
+                    vectorized,
+                )
             })
             .transpose()?;
         let (recurrent_state_count, recurrent_state_bytes) = checked_recurrent_state_extent(
@@ -8322,27 +8503,50 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         &mut self,
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<NativeCpuCompiledEvaluationResult> {
-        let successful_invocation = self
-            .successful_evaluations
+        let NativeCpuCompiledAdamW {
+            inner,
+            executor,
+            evaluation_replay,
+            successful_evaluations,
+            ..
+        } = self;
+        let successful_invocation = (*successful_evaluations)
             .checked_add(1)
             .ok_or_else(|| training("compiled native CPU evaluation count overflow"))?;
-        let evaluation = self
-            .inner
+        let executor = *executor;
+        let evaluation = inner
             .evaluation
             .as_ref()
             .ok_or_else(|| training("compiled evaluation is not attached"))?;
-        let prepared = self
-            .evaluation_replay
+        let prepared = evaluation_replay
             .as_mut()
             .ok_or_else(|| training("compiled native CPU evaluation preparation is absent"))?;
-        let (inner, mut report) = evaluation.plan.evaluate_native(
-            inputs,
-            self.inner.inner.parameter_snapshots()?,
-            self.executor,
+        let program = &mut inner.inner;
+        let (loss_weight, parameter_states) = evaluation.plan.preflight_native_borrowed(
+            &inputs,
+            program.cursor.frontier(),
             prepared,
+            &program.parameter_buffers,
         )?;
+        let evaluated = program
+            .runtime
+            .with_active_state_tensors(&parameter_states, |reads| {
+                evaluation.plan.evaluate_native_borrowed(
+                    &inputs,
+                    reads,
+                    loss_weight,
+                    executor,
+                    prepared,
+                )
+            });
+        let (inner, mut report) = match evaluated {
+            Ok(evaluated) => evaluated,
+            Err(RecurrentTransactionError::Runtime(error)) => return Err(runtime_error(error)),
+            Err(RecurrentTransactionError::Stage(error)) => return Err(error),
+            Err(RecurrentTransactionError::Contract(reason)) => return Err(training(reason)),
+        };
         report.successful_invocation = successful_invocation;
-        self.successful_evaluations = successful_invocation;
+        *successful_evaluations = successful_invocation;
         Ok(NativeCpuCompiledEvaluationResult { inner, report })
     }
 
@@ -12655,7 +12859,7 @@ mod tests {
     }
 
     #[test]
-    fn native_cpu_adamw_evaluation_input_failure_is_atomic_and_retryable() {
+    fn native_cpu_adamw_evaluation_borrows_active_parameters_and_retries() {
         let plan = CompiledModuleAdamWPlan::compile(
             module_config(),
             TiedFrozenModule::new([0.1, -0.2]),
@@ -12678,10 +12882,14 @@ mod tests {
             .workspace_stats();
         assert!(workspace.allocation_count > 0);
         assert_eq!(workspace.input_import_count, 0);
+        let before_invalid_counts = native_recurrent_test_counts(&session.runtime);
 
         assert!(session.evaluate(BTreeMap::new()).is_err());
-        assert_eq!(session.checkpoint().unwrap(), checkpoint);
         assert_eq!(session.runtime.successful_evaluations, 0);
+        assert_eq!(
+            native_recurrent_test_counts(&session.runtime),
+            before_invalid_counts
+        );
         assert_eq!(
             session
                 .runtime
@@ -12692,6 +12900,51 @@ mod tests {
                 .workspace_stats(),
             workspace
         );
+        let binding = session
+            .runtime
+            .evaluation_replay
+            .as_ref()
+            .unwrap()
+            .parameter_inputs[0]
+            .clone();
+        session
+            .runtime
+            .evaluation_replay
+            .as_mut()
+            .unwrap()
+            .parameter_inputs[0]
+            .buffer ^= 1;
+        assert!(
+            session
+                .evaluate(BTreeMap::from([(
+                    "x".into(),
+                    TensorData::new([2], vec![1.0, 2.0]).unwrap(),
+                )]))
+                .is_err()
+        );
+        session
+            .runtime
+            .evaluation_replay
+            .as_mut()
+            .unwrap()
+            .parameter_inputs[0] = binding;
+        assert_eq!(session.runtime.successful_evaluations, 0);
+        assert_eq!(
+            native_recurrent_test_counts(&session.runtime),
+            before_invalid_counts
+        );
+        assert_eq!(
+            session
+                .runtime
+                .evaluation_replay
+                .as_ref()
+                .unwrap()
+                .plan
+                .workspace_stats(),
+            workspace
+        );
+        assert_eq!(session.checkpoint().unwrap(), checkpoint);
+        let before_evaluation_counts = native_recurrent_test_counts(&session.runtime);
 
         let evaluation = session
             .evaluate(BTreeMap::from([(
@@ -12714,7 +12967,7 @@ mod tests {
                 .report()
                 .traffic()
                 .borrowed_recurrent_input_bytes(),
-            0
+            8
         );
         assert_eq!(
             evaluation
@@ -12723,6 +12976,11 @@ mod tests {
                 .borrowed_recurrent_output_bytes(),
             0
         );
+        assert_eq!(
+            native_recurrent_test_counts(&session.runtime),
+            before_evaluation_counts
+        );
+        let first_output = evaluation.outputs()["output"].clone();
         assert_eq!(session.checkpoint().unwrap(), checkpoint);
         assert_eq!(executor.native_item_plan_count(), 2);
         let evaluated_workspace = session
@@ -12737,11 +12995,42 @@ mod tests {
             workspace.allocation_count
         );
         assert_eq!(evaluated_workspace.input_import_count, 0);
-        // Evaluation borrows both the 8-byte batch and the current 8-byte
-        // parameter snapshot as ordinary external inputs. Leasing the active
-        // parameter bank directly is intentionally deferred to the next PR.
-        assert_eq!(evaluated_workspace.borrowed_external_input_bytes, 16);
+        assert_eq!(evaluated_workspace.borrowed_external_input_bytes, 8);
+        assert_eq!(evaluated_workspace.borrowed_recurrent_input_bytes, 8);
+        assert_eq!(evaluated_workspace.borrowed_recurrent_output_bytes, 0);
         assert_eq!(evaluated_workspace.intermediate_materialization_count, 0);
+
+        session
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 2.0]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        let updated = session.checkpoint().unwrap();
+        let before_updated_evaluation = native_recurrent_test_counts(&session.runtime);
+        let updated_evaluation = session
+            .evaluate(BTreeMap::from([(
+                "x".into(),
+                TensorData::new([2], vec![1.0, 2.0]).unwrap(),
+            )]))
+            .unwrap();
+        assert_eq!(updated_evaluation.report().successful_invocation(), 2);
+        assert_ne!(updated_evaluation.outputs()["output"], first_output);
+        assert_eq!(
+            native_recurrent_test_counts(&session.runtime),
+            before_updated_evaluation
+        );
+        assert_eq!(session.checkpoint().unwrap(), updated);
+        let updated_workspace = session
+            .runtime
+            .evaluation_replay
+            .as_ref()
+            .unwrap()
+            .plan
+            .workspace_stats();
+        assert_eq!(updated_workspace.borrowed_external_input_bytes, 16);
+        assert_eq!(updated_workspace.borrowed_recurrent_input_bytes, 16);
+        assert_eq!(updated_workspace.borrowed_recurrent_output_bytes, 0);
     }
 
     #[test]
@@ -14238,6 +14527,14 @@ mod tests {
         let native_checkpoint = native.checkpoint().unwrap();
         let interpreted_accumulators = interpreted.gradient_accumulator_snapshots().unwrap();
         let native_accumulators = native.gradient_accumulator_snapshots().unwrap();
+        let native_evaluation_workspace = native
+            .runtime
+            .evaluation_replay
+            .as_ref()
+            .unwrap()
+            .plan
+            .workspace_stats();
+        let native_recurrent_counts = native_recurrent_test_counts(&native.runtime);
 
         for mask in [
             [1.0, 1.0, 0.5, 0.0, 0.0, 0.0],
@@ -14246,6 +14543,21 @@ mod tests {
             assert!(interpreted.evaluate(token_evaluation_batch(mask)).is_err());
             assert!(native.evaluate(token_evaluation_batch(mask)).is_err());
         }
+        assert_eq!(native.runtime.successful_evaluations, 0);
+        assert_eq!(
+            native_recurrent_test_counts(&native.runtime),
+            native_recurrent_counts
+        );
+        assert_eq!(
+            native
+                .runtime
+                .evaluation_replay
+                .as_ref()
+                .unwrap()
+                .plan
+                .workspace_stats(),
+            native_evaluation_workspace
+        );
         assert_eq!(interpreted.checkpoint().unwrap(), interpreted_checkpoint);
         assert_eq!(native.checkpoint().unwrap(), native_checkpoint);
 
@@ -14254,7 +14566,12 @@ mod tests {
         let mut total_weight = 0_u64;
         for (invocation, (mask, expected_weight)) in masks.into_iter().zip([5, 3, 3]).enumerate() {
             let expected = interpreted.evaluate(token_evaluation_batch(mask)).unwrap();
+            let before_native_evaluation = native_recurrent_test_counts(&native.runtime);
             let actual = native.evaluate(token_evaluation_batch(mask)).unwrap();
+            assert_eq!(
+                native_recurrent_test_counts(&native.runtime),
+                before_native_evaluation
+            );
             assert_eq!(expected.loss_weight(), expected_weight);
             assert_eq!(actual.loss_weight(), expected_weight);
             assert_cross_engine_tensor_close(
@@ -14270,6 +14587,16 @@ mod tests {
             assert_eq!(
                 actual.report().successful_invocation(),
                 invocation as u64 + 1
+            );
+            assert_eq!(actual.report().traffic().external_input_import_count(), 0);
+            assert_eq!(actual.report().traffic().external_input_import_bytes(), 0);
+            assert_eq!(
+                actual.report().traffic().borrowed_recurrent_input_bytes(),
+                4
+            );
+            assert_eq!(
+                actual.report().traffic().borrowed_recurrent_output_bytes(),
+                0
             );
             interpreted_weighted_loss +=
                 expected.loss().scalar_at(0).as_f64() * expected_weight as f64;
@@ -14291,6 +14618,26 @@ mod tests {
         );
         assert_eq!(interpreted.step_count(), 0);
         assert_eq!(native.step_count(), 0);
+        let native_evaluation_workspace = native
+            .runtime
+            .evaluation_replay
+            .as_ref()
+            .unwrap()
+            .plan
+            .workspace_stats();
+        assert_eq!(native_evaluation_workspace.input_import_count, 0);
+        assert_eq!(
+            native_evaluation_workspace.borrowed_external_input_bytes,
+            144
+        );
+        assert_eq!(
+            native_evaluation_workspace.borrowed_recurrent_input_bytes,
+            12
+        );
+        assert_eq!(
+            native_evaluation_workspace.borrowed_recurrent_output_bytes,
+            0
+        );
     }
 
     #[test]
