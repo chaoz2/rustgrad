@@ -1158,6 +1158,14 @@ conversion and the original exact-map methods stay intact.
 `CompiledAdamWRuntime` and `CompiledAdamWStep` extend those smaller contracts
 with accumulation, clipping, loss-scaling, moment, and optimizer-step
 inspection. Concrete Metal results retain their exact device reports.
+CPU AdamW may opt into completed-window loss reporting. The captured program
+then retains one F32 weighted-loss numerator beside its gradient-accumulation
+state: scalar objectives add one normalized loss per replay, while token-mean
+objectives reuse the validated token count for both loss and gradient weights.
+Only a full-window commit or nonempty partial flush returns the immutable mean,
+total weight, and microbatch count; commit, flush, and `zero_grad` reset the
+numerator atomically. Checkpoint v8 authenticates and restores that lane, while
+programs without the option preserve their existing capture and v1--v7 bytes.
 The concrete `MetalCompiledAdamW` additionally exposes
 `step_without_host_outputs` for training iterations whose loss and named
 outputs do not need host observation. It executes the identical authenticated
