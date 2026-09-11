@@ -981,7 +981,16 @@ zero; unsupported storage retains the owned-copy fallback. Rejected attempts
 expose no report sample. CPU device kernel launches, host/device transfers, and
 measured physical peak host memory remain unavailable (`null`). Durations
 do not change any plan, capture, checkpoint, or native identity, and the report
-makes no threshold or speedup claim. Legacy v1 reports without zero-grad
+makes no threshold or speedup claim. Protected CI keeps the debug invocation as
+a correctness smoke. After that test matrix passes, protected-main pushes alone
+run the same bounded scoreboard once in release mode on pinned Ubuntu and Rust,
+under a fresh SHA-scoped temporary cache, and upload its JSON beside exact
+runner/toolchain/compiler provenance plus normalized `lscpu` CPU model,
+topology, and architectural identity. Missing or ambiguous required CPU fields
+fail the evidence job rather than creating an under-specified artifact.
+Hosted-runner durations remain observational and are comparable only with
+matching workload, toolchain/compiler, runner image, and CPU-hardware
+provenance; they never gate CI. Legacy v1 reports without zero-grad
 inventory, v2 reports without replay traffic, v3 reports without executed
 native-item counts, and v4 reports without shared-module preparation evidence
 remain readable.

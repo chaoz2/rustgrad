@@ -106,6 +106,28 @@ jobs:
           retention-days: 30
       - run: cargo test --doc
 
+  native-transformer-release-scoreboard:
+    name: Native Transformer release scoreboard (Linux)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Record release-mode native Transformer evidence
+        shell: bash
+        run: bash .github/scripts/record-native-transformer-release-scoreboard.sh
+      - name: Upload release-mode native Transformer evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-cpu-training-scoreboard-release-${{ github.sha }}
+          path: |
+            native-cpu-training-scoreboard-release/native-cpu-training-scoreboard.json
+            native-cpu-training-scoreboard-release/provenance.txt
+          if-no-files-found: error
+          retention-days: 30
+
   address-sanitizer:
     name: AddressSanitizer (Linux)
     runs-on: ubuntu-latest
