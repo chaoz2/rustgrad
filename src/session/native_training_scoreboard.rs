@@ -19,13 +19,95 @@ const NATIVE_TRAINING_REPORT_FORMAT_V2: u32 = 2;
 const NATIVE_TRAINING_REPORT_FORMAT_V3: u32 = 3;
 const NATIVE_TRAINING_REPORT_FORMAT_V4: u32 = 4;
 const NATIVE_TRAINING_REPORT_FORMAT_V5: u32 = 5;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 6;
+const NATIVE_TRAINING_REPORT_FORMAT_V6: u32 = 6;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 7;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProgramInspection {
     capture_identity: u64,
     execution_plan: ExecutionPlanSummary,
+}
+
+/// Exact host wall-time partition for preparing one strict-native CPU program.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTrainingPreparationTiming {
+    total: BenchmarkDuration,
+    layout: BenchmarkDuration,
+    render: BenchmarkDuration,
+    compiler_process: BenchmarkDuration,
+    module_load: BenchmarkDuration,
+    residual: BenchmarkDuration,
+}
+
+impl NativeTrainingPreparationTiming {
+    fn from_preparation(preparation: &NativeCpuProgramPreparationReport) -> Self {
+        let phases = preparation.phases();
+        Self {
+            total: BenchmarkDuration::from_duration(preparation.wall_time()),
+            layout: BenchmarkDuration::from_duration(phases.layout_wall_time()),
+            render: BenchmarkDuration::from_duration(phases.render_wall_time()),
+            compiler_process: BenchmarkDuration::from_duration(phases.compiler_process_wall_time()),
+            module_load: BenchmarkDuration::from_duration(phases.module_load_wall_time()),
+            residual: BenchmarkDuration::from_duration(phases.residual_wall_time()),
+        }
+    }
+
+    fn validate(&self, work: &NativeTrainingProgramReport) -> Result<()> {
+        let total = self
+            .total
+            .as_nanos()
+            .map_err(|_| invalid("invalid native preparation total duration"))?;
+        let partitioned = [
+            self.layout,
+            self.render,
+            self.compiler_process,
+            self.module_load,
+            self.residual,
+        ]
+        .into_iter()
+        .try_fold(0u128, |total, duration| {
+            duration
+                .as_nanos()
+                .map_err(|_| invalid("invalid native preparation phase duration"))?
+                .checked_add(total)
+                .ok_or_else(|| invalid("native preparation phase duration overflows"))
+        })?;
+        if partitioned != total
+            || (work.compiler_invocation_count == 0
+                && self.compiler_process != BenchmarkDuration::from_duration(Duration::ZERO))
+            || (work.loaded_module_count == 0
+                && self.module_load != BenchmarkDuration::from_duration(Duration::ZERO))
+        {
+            return Err(invalid("native preparation phases do not match work"));
+        }
+        Ok(())
+    }
+
+    pub const fn total(&self) -> BenchmarkDuration {
+        self.total
+    }
+
+    pub const fn layout(&self) -> BenchmarkDuration {
+        self.layout
+    }
+
+    pub const fn render(&self) -> BenchmarkDuration {
+        self.render
+    }
+
+    pub const fn compiler_process(&self) -> BenchmarkDuration {
+        self.compiler_process
+    }
+
+    pub const fn module_load(&self) -> BenchmarkDuration {
+        self.module_load
+    }
+
+    pub const fn residual(&self) -> BenchmarkDuration {
+        self.residual
+    }
 }
 
 /// Immutable logical work and recurrent-state facts for one compiled AdamW
@@ -125,6 +207,8 @@ pub struct NativeTrainingProgramReport {
     durable_artifact_cache_miss_count: u64,
     #[serde(default)]
     compiler_invocation_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preparation_timing: Option<NativeTrainingPreparationTiming>,
 }
 
 impl NativeTrainingProgramReport {
@@ -172,6 +256,9 @@ impl NativeTrainingProgramReport {
                 preparation.work().compiler_invocation_count(),
                 "compiler invocation",
             )?,
+            preparation_timing: Some(NativeTrainingPreparationTiming::from_preparation(
+                preparation,
+            )),
         })
     }
 
@@ -212,6 +299,16 @@ impl NativeTrainingProgramReport {
                     "native program module preparation evidence differs",
                 ));
             }
+        }
+        match (format_version, &self.preparation_timing) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(timing)) => timing.validate(self)?,
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, Some(_)) => {
+                return Err(invalid(
+                    "legacy native program has preparation phase timing",
+                ));
+            }
+            _ => return Err(invalid("native program preparation timing differs")),
         }
         Ok(())
     }
@@ -274,6 +371,10 @@ impl NativeTrainingProgramReport {
 
     pub const fn compiler_invocation_count(&self) -> u64 {
         self.compiler_invocation_count
+    }
+
+    pub const fn preparation_timing(&self) -> Option<&NativeTrainingPreparationTiming> {
+        self.preparation_timing.as_ref()
     }
 }
 
@@ -358,6 +459,8 @@ pub struct NativeTrainingReport {
     format_version: u32,
     compile_wall_time: BenchmarkDuration,
     prepare_wall_time: BenchmarkDuration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_runtime_overhead_wall_time: Option<BenchmarkDuration>,
     initial_replay_step: u64,
     successful_replay_count: u64,
     main: NativeTrainingProgramReport,
@@ -395,6 +498,11 @@ impl NativeTrainingReport {
 
     pub const fn prepare_wall_time(&self) -> BenchmarkDuration {
         self.prepare_wall_time
+    }
+
+    /// Whole-prepare time outside the attached native program preparations.
+    pub const fn prepare_runtime_overhead_wall_time(&self) -> Option<BenchmarkDuration> {
+        self.prepare_runtime_overhead_wall_time
     }
 
     pub const fn main(&self) -> &NativeTrainingProgramReport {
@@ -501,6 +609,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V3
                 | NATIVE_TRAINING_REPORT_FORMAT_V4
                 | NATIVE_TRAINING_REPORT_FORMAT_V5
+                | NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -538,6 +647,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V3
                 | NATIVE_TRAINING_REPORT_FORMAT_V4
                 | NATIVE_TRAINING_REPORT_FORMAT_V5
+                | NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -556,6 +666,7 @@ impl NativeTrainingReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V4
                 | NATIVE_TRAINING_REPORT_FORMAT_V5
+                | NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executed),
             ) if executed <= self.main.native_item_count => {}
@@ -574,6 +685,43 @@ impl NativeTrainingReport {
             if program.vectorized != self.main.vectorized {
                 return Err(invalid("native program vectorization policy differs"));
             }
+        }
+        match (self.format_version, self.prepare_runtime_overhead_wall_time) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(overhead)) => {
+                let prepare_total = self
+                    .prepare_wall_time
+                    .as_nanos()
+                    .map_err(|_| invalid("invalid native prepare duration"))?;
+                let mut programs = std::iter::once(&self.main)
+                    .chain(self.partial_flush.iter())
+                    .chain(&self.zero_grad)
+                    .chain(&self.evaluation);
+                let program_total = programs.try_fold(0u128, |total, program| {
+                    let timing = program
+                        .preparation_timing
+                        .as_ref()
+                        .ok_or_else(|| invalid("native program preparation timing is absent"))?;
+                    timing
+                        .total
+                        .as_nanos()
+                        .map_err(|_| invalid("invalid native program preparation duration"))?
+                        .checked_add(total)
+                        .ok_or_else(|| invalid("native program preparation duration overflows"))
+                })?;
+                let partitioned = overhead
+                    .as_nanos()
+                    .map_err(|_| invalid("invalid native prepare overhead duration"))?
+                    .checked_add(program_total)
+                    .ok_or_else(|| invalid("native prepare duration overflows"))?;
+                if partitioned != prepare_total {
+                    return Err(invalid("native prepare phases do not partition total"));
+                }
+            }
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, Some(_)) => {
+                return Err(invalid("legacy native report has preparation timing"));
+            }
+            _ => return Err(invalid("native prepare timing differs")),
         }
         if self.successful_replay_count < 2
             || self.successful_replay_count > MAX_REPLAY_SAMPLES as u64
@@ -596,7 +744,11 @@ impl NativeTrainingReport {
             &self.main_replay_recurrent_overhead_wall_time,
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V5, None, None) => {}
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(executor), Some(overhead)) => {
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V6 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(executor),
+                Some(overhead),
+            ) => {
                 let steady_count = self.successful_replay_count - 1;
                 executor.validate(steady_count)?;
                 overhead.validate(steady_count)?;
@@ -661,6 +813,7 @@ impl NativeTrainingReport {
 pub struct NativeTrainingScoreboard {
     compile_wall_time: Duration,
     prepare_wall_time: Duration,
+    prepare_runtime_overhead_wall_time: Duration,
     inspection: CompiledAdamWInspection,
     main: NativeTrainingProgramReport,
     partial_flush: Option<NativeTrainingProgramReport>,
@@ -674,6 +827,10 @@ pub struct NativeTrainingScoreboard {
 }
 
 impl NativeTrainingScoreboard {
+    /// Starts a bounded observation from one complete strict-native
+    /// preparation. `prepare_wall_time` is caller-observed around the whole
+    /// target preparation and must contain every attached program's measured
+    /// preparation time.
     pub fn new(
         inspection: CompiledAdamWInspection,
         preparation: &NativeCpuCompiledAdamWPreparationReport,
@@ -701,9 +858,22 @@ impl NativeTrainingScoreboard {
         {
             return Err(invalid("plan and prepared recurrent state differ"));
         }
+        let program_prepare_wall_time = std::iter::once(preparation.main())
+            .chain(preparation.partial_flush())
+            .chain(preparation.zero_grad())
+            .chain(preparation.evaluation())
+            .try_fold(Duration::ZERO, |total, program| {
+                total
+                    .checked_add(program.wall_time())
+                    .ok_or_else(|| invalid("native program preparation duration overflows"))
+            })?;
+        let prepare_runtime_overhead_wall_time = prepare_wall_time
+            .checked_sub(program_prepare_wall_time)
+            .ok_or_else(|| invalid("native program preparation exceeds whole prepare time"))?;
         Ok(Self {
             compile_wall_time,
             prepare_wall_time,
+            prepare_runtime_overhead_wall_time,
             inspection,
             main,
             partial_flush,
@@ -833,6 +1003,9 @@ impl NativeTrainingScoreboard {
             format_version: NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             compile_wall_time: BenchmarkDuration::from_duration(self.compile_wall_time),
             prepare_wall_time: BenchmarkDuration::from_duration(self.prepare_wall_time),
+            prepare_runtime_overhead_wall_time: Some(BenchmarkDuration::from_duration(
+                self.prepare_runtime_overhead_wall_time,
+            )),
             initial_replay_step: self.inspection.initial_replay_step,
             successful_replay_count: self.replay_timings.len() as u64,
             main: self.main.clone(),
@@ -1014,6 +1187,17 @@ mod tests {
         }
     }
 
+    fn zero_preparation_timing() -> NativeTrainingPreparationTiming {
+        NativeTrainingPreparationTiming {
+            total: zero_duration(),
+            layout: zero_duration(),
+            render: zero_duration(),
+            compiler_process: zero_duration(),
+            module_load: zero_duration(),
+            residual: zero_duration(),
+        }
+    }
+
     fn set_single_steady_replay_duration(
         report: &mut NativeTrainingReport,
         elapsed: BenchmarkDuration,
@@ -1062,11 +1246,23 @@ mod tests {
             .remove("main_replay_recurrent_overhead_wall_time");
     }
 
+    fn remove_preparation_phase_timing(json: &mut serde_json::Value) {
+        json.as_object_mut()
+            .unwrap()
+            .remove("prepare_runtime_overhead_wall_time");
+        for program in ["main", "partial_flush", "zero_grad", "evaluation"] {
+            if let Some(program) = json[program].as_object_mut() {
+                program.remove("preparation_timing");
+            }
+        }
+    }
+
     fn zero_report() -> NativeTrainingReport {
         NativeTrainingReport {
             format_version: NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             compile_wall_time: zero_duration(),
             prepare_wall_time: zero_duration(),
+            prepare_runtime_overhead_wall_time: Some(zero_duration()),
             initial_replay_step: 0,
             successful_replay_count: 2,
             main: NativeTrainingProgramReport {
@@ -1085,6 +1281,7 @@ mod tests {
                 durable_artifact_cache_hit_count: 0,
                 durable_artifact_cache_miss_count: 1,
                 compiler_invocation_count: 1,
+                preparation_timing: Some(zero_preparation_timing()),
             },
             partial_flush: None,
             zero_grad: None,
@@ -1125,6 +1322,10 @@ mod tests {
         let report = zero_report();
         let bytes = report.to_json_bytes().unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["format_version"],
+            NATIVE_TRAINING_REPORT_FORMAT_VERSION
+        );
         for field in [
             "kernel_launch_count",
             "host_to_device",
@@ -1143,6 +1344,8 @@ mod tests {
             16
         );
         assert_eq!(json["main_replay_executed_native_item_count"], 1);
+        assert_eq!(json["main"]["preparation_timing"]["layout"]["secs"], 0);
+        assert_eq!(json["prepare_runtime_overhead_wall_time"]["nanos"], 0);
         assert_eq!(json["main_replay_executor_wall_time"]["first"]["secs"], 0);
         assert_eq!(
             json["main_replay_recurrent_overhead_wall_time"]["steady"]["sample_count"],
@@ -1165,6 +1368,7 @@ mod tests {
             .remove("main_replay_executed_native_item_count");
         remove_module_preparation(&mut json);
         remove_replay_phase_timing(&mut json);
+        remove_preparation_phase_timing(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.zero_grad().is_none());
@@ -1180,6 +1384,7 @@ mod tests {
             .remove("main_replay_executed_native_item_count");
         remove_module_preparation(&mut json);
         remove_replay_phase_timing(&mut json);
+        remove_preparation_phase_timing(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.main_replay_traffic().is_none());
@@ -1194,6 +1399,7 @@ mod tests {
             .remove("main_replay_executed_native_item_count");
         remove_module_preparation(&mut json);
         remove_replay_phase_timing(&mut json);
+        remove_preparation_phase_timing(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.main_replay_executed_native_item_count().is_none());
@@ -1206,6 +1412,7 @@ mod tests {
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V4);
         remove_module_preparation(&mut json);
         remove_replay_phase_timing(&mut json);
+        remove_preparation_phase_timing(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert_eq!(report.main().rendered_entry_count(), 0);
@@ -1216,10 +1423,57 @@ mod tests {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V5);
         remove_replay_phase_timing(&mut json);
+        remove_preparation_phase_timing(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.main_replay_executor_wall_time().is_none());
         assert!(report.main_replay_recurrent_overhead_wall_time().is_none());
+    }
+
+    #[test]
+    fn version_six_report_without_preparation_phase_timing_still_decodes() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V6);
+        remove_preparation_phase_timing(&mut json);
+        let report =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(report.main().preparation_timing().is_none());
+        assert!(report.prepare_runtime_overhead_wall_time().is_none());
+        assert!(report.main_replay_executor_wall_time().is_some());
+    }
+
+    #[test]
+    fn current_report_authenticates_preparation_phase_partition() {
+        let mut report = zero_report();
+        report.prepare_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(11));
+        report.prepare_runtime_overhead_wall_time =
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(4)));
+        let timing = report.main.preparation_timing.as_mut().unwrap();
+        timing.total = BenchmarkDuration::from_duration(Duration::from_nanos(7));
+        timing.render = BenchmarkDuration::from_duration(Duration::from_nanos(2));
+        timing.compiler_process = BenchmarkDuration::from_duration(Duration::from_nanos(3));
+        timing.module_load = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        timing.residual = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        assert!(report.validate().is_ok());
+        let valid = report.clone();
+
+        report.main.preparation_timing.as_mut().unwrap().residual =
+            BenchmarkDuration::from_duration(Duration::from_nanos(2));
+        assert!(report.validate().is_err());
+
+        let mut report = valid;
+        report.prepare_runtime_overhead_wall_time =
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(5)));
+        assert!(report.validate().is_err());
+
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json["main"]
+            .as_object_mut()
+            .unwrap()
+            .remove("preparation_timing");
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
     }
 
     #[test]

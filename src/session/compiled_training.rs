@@ -1335,6 +1335,95 @@ impl NativeCpuPreparationWork {
     }
 }
 
+/// Observed wall-time partition for one strict-native CPU program preparation.
+///
+/// These durations describe host preparation only. They are excluded from
+/// every capture, native-program, cache, and checkpoint identity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NativeCpuPreparationPhases {
+    layout_wall_time: Duration,
+    render_wall_time: Duration,
+    compiler_process_wall_time: Duration,
+    module_load_wall_time: Duration,
+    residual_wall_time: Duration,
+}
+
+impl NativeCpuPreparationPhases {
+    fn from_module(
+        module: crate::backend::NativeScheduleModulePreparation,
+        total_wall_time: Duration,
+    ) -> Result<Self> {
+        let accounted = [
+            module.layout_wall_time,
+            module.render_wall_time,
+            module.compiler_process_wall_time,
+            module.module_load_wall_time,
+        ]
+        .into_iter()
+        .try_fold(Duration::ZERO, |total, duration| {
+            total
+                .checked_add(duration)
+                .ok_or_else(|| training("compiled native CPU preparation wall time overflows"))
+        })?;
+        let residual_wall_time = total_wall_time.checked_sub(accounted).ok_or_else(|| {
+            training("compiled native CPU preparation phases exceed total wall time")
+        })?;
+        Ok(Self {
+            layout_wall_time: module.layout_wall_time,
+            render_wall_time: module.render_wall_time,
+            compiler_process_wall_time: module.compiler_process_wall_time,
+            module_load_wall_time: module.module_load_wall_time,
+            residual_wall_time,
+        })
+    }
+
+    fn validate(&self, total_wall_time: Duration, work: &NativeCpuPreparationWork) -> Result<()> {
+        let total = [
+            self.layout_wall_time,
+            self.render_wall_time,
+            self.compiler_process_wall_time,
+            self.module_load_wall_time,
+            self.residual_wall_time,
+        ]
+        .into_iter()
+        .try_fold(Duration::ZERO, |total, duration| {
+            total
+                .checked_add(duration)
+                .ok_or_else(|| training("compiled native CPU preparation wall time overflows"))
+        })?;
+        if total != total_wall_time
+            || (work.compiler_invocation_count == 0
+                && self.compiler_process_wall_time != Duration::ZERO)
+            || (work.loaded_module_count == 0 && self.module_load_wall_time != Duration::ZERO)
+        {
+            return Err(training(
+                "compiled native CPU preparation phase evidence mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    pub const fn layout_wall_time(&self) -> Duration {
+        self.layout_wall_time
+    }
+
+    pub const fn render_wall_time(&self) -> Duration {
+        self.render_wall_time
+    }
+
+    pub const fn compiler_process_wall_time(&self) -> Duration {
+        self.compiler_process_wall_time
+    }
+
+    pub const fn module_load_wall_time(&self) -> Duration {
+        self.module_load_wall_time
+    }
+
+    pub const fn residual_wall_time(&self) -> Duration {
+        self.residual_wall_time
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeCpuProgramPreparationReport {
     capture_identity: u64,
@@ -1344,13 +1433,15 @@ pub struct NativeCpuProgramPreparationReport {
     cache_hit_count: usize,
     cache_miss_count: usize,
     work: NativeCpuPreparationWork,
+    phases: NativeCpuPreparationPhases,
     execution_plan: ExecutionPlanSummary,
     wall_time: Duration,
 }
 
 impl NativeCpuProgramPreparationReport {
     fn validate_work(&self) -> Result<()> {
-        self.work.validate(self.native_item_count)
+        self.work.validate(self.native_item_count)?;
+        self.phases.validate(self.wall_time, &self.work)
     }
 
     pub const fn capture_identity(&self) -> u64 {
@@ -1383,6 +1474,11 @@ impl NativeCpuProgramPreparationReport {
     /// performed while attaching this pure program.
     pub const fn work(&self) -> &NativeCpuPreparationWork {
         &self.work
+    }
+
+    /// Observed host-time phases within this program's total preparation.
+    pub const fn phases(&self) -> &NativeCpuPreparationPhases {
+        &self.phases
     }
 
     /// Strict preparation never admits an interpreter fallback item.
@@ -5362,9 +5458,11 @@ impl CompiledEvaluationPlan {
         let plan = executor
             .plan_native_items(capture, &inputs, vectorized)
             .map_err(replay_error)?;
-        let work = NativeCpuPreparationWork::from_module(plan.module_preparation());
+        let module_preparation = plan.module_preparation();
+        let work = NativeCpuPreparationWork::from_module(module_preparation);
         let execution_plan = ExecutionPlanSummary::from_capture(capture, true)
             .map_err(|error| training(format!("compiled native CPU summary: {error}")))?;
+        let wall_time = started.elapsed();
         let report = NativeCpuProgramPreparationReport {
             capture_identity: self.capture_identity,
             native_identity: native_cpu_identity(
@@ -5377,8 +5475,9 @@ impl CompiledEvaluationPlan {
             cache_hit_count: plan.cache_hit_count(),
             cache_miss_count: plan.cache_miss_count(),
             work,
+            phases: NativeCpuPreparationPhases::from_module(module_preparation, wall_time)?,
             execution_plan,
-            wall_time: started.elapsed(),
+            wall_time,
         };
         let prepared = PreparedNativeCpuEvaluation {
             report,
@@ -5655,6 +5754,7 @@ impl CpuCompiledTrainingProgram {
             .prepare_recurrent_native(&self.runtime, &self.cursor, &provided, executor, vectorized)
             .map_err(replay_error)?;
         let trace = replay.preparation_trace();
+        let wall_time = started.elapsed();
         let report = NativeCpuProgramPreparationReport {
             capture_identity: self.capture_identity(),
             native_identity: trace.replay.identity,
@@ -5663,8 +5763,9 @@ impl CpuCompiledTrainingProgram {
             cache_hit_count: trace.cache_hit_count,
             cache_miss_count: trace.cache_miss_count,
             work: NativeCpuPreparationWork::from_module(trace.module),
+            phases: NativeCpuPreparationPhases::from_module(trace.module, wall_time)?,
             execution_plan: self.recurrent_capture.execution_plan().clone(),
-            wall_time: started.elapsed(),
+            wall_time,
         };
         report.validate_work()?;
         Ok(PreparedNativeCpuProgram { report, replay })
@@ -6222,6 +6323,7 @@ impl CpuCompiledTrainingProgram {
             )
             .map_err(replay_error)?;
         let trace = replay.preparation_trace();
+        let wall_time = started.elapsed();
         let report = NativeCpuProgramPreparationReport {
             capture_identity: transition.capture_identity(),
             native_identity: trace.replay.identity,
@@ -6230,8 +6332,9 @@ impl CpuCompiledTrainingProgram {
             cache_hit_count: trace.cache_hit_count,
             cache_miss_count: trace.cache_miss_count,
             work: NativeCpuPreparationWork::from_module(trace.module),
+            phases: NativeCpuPreparationPhases::from_module(trace.module, wall_time)?,
             execution_plan: transition.recurrent_capture.execution_plan().clone(),
-            wall_time: started.elapsed(),
+            wall_time,
         };
         report.validate_work()?;
         Ok(PreparedNativeCpuProgram { report, replay })
@@ -12548,7 +12651,7 @@ mod tests {
             inspection,
             native.preparation_report(),
             Duration::ZERO,
-            Duration::ZERO,
+            native.preparation_report().main().wall_time(),
         )
         .unwrap();
         assert_eq!(executor.native_item_plan_count(), 1);
@@ -12575,6 +12678,16 @@ mod tests {
         );
         assert_eq!(preparation.main().work().loaded_module_count(), 1);
         assert!(preparation.main().work().compiler_invocation_count() <= 1);
+        let phases = preparation.main().phases();
+        assert_eq!(
+            phases
+                .layout_wall_time()
+                .checked_add(phases.render_wall_time())
+                .and_then(|elapsed| elapsed.checked_add(phases.compiler_process_wall_time()))
+                .and_then(|elapsed| elapsed.checked_add(phases.module_load_wall_time()))
+                .and_then(|elapsed| elapsed.checked_add(phases.residual_wall_time())),
+            Some(preparation.main().wall_time())
+        );
         assert!(preparation.main().cache_miss_count() > 0);
         assert!(preparation.partial_flush().is_none());
         assert!(preparation.zero_grad().is_none());
@@ -12594,6 +12707,22 @@ mod tests {
                 .work()
                 .compiler_invocation_count(),
             0
+        );
+        assert_eq!(
+            cached
+                .preparation_report()
+                .main()
+                .phases()
+                .compiler_process_wall_time(),
+            Duration::ZERO
+        );
+        assert_eq!(
+            cached
+                .preparation_report()
+                .main()
+                .phases()
+                .module_load_wall_time(),
+            Duration::ZERO
         );
         assert_eq!(
             cached.preparation_report().main().native_identity(),

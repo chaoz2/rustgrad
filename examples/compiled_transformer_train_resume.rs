@@ -74,7 +74,7 @@ use std::{
     error::Error,
     fs,
     path::PathBuf,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const VOCAB: usize = 3;
@@ -1735,12 +1735,12 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
     let prepare_started = Instant::now();
     let mut session = plan.prepare(&target)?;
+    let prepare_wall_time = prepare_started.elapsed();
     let main_preparation = session.preparation_report().main();
     assert_eq!(main_preparation.native_item_count(), 787);
     assert_eq!(main_preparation.work().rendered_entry_count(), 787);
     assert_eq!(main_preparation.work().loaded_module_count(), 1);
     assert!(main_preparation.work().compiler_invocation_count() <= 1);
-    let prepare_wall_time = prepare_started.elapsed();
     let mut scoreboard = NativeTrainingScoreboard::new(
         inspection.clone(),
         session.preparation_report(),
@@ -1787,6 +1787,38 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(report.main().rendered_entry_count(), 787);
     assert_eq!(report.main().loaded_module_count(), 1);
     assert!(report.main().compiler_invocation_count() <= 1);
+    let program_prepare_wall_time = [
+        Some(report.main()),
+        report.partial_flush(),
+        report.zero_grad(),
+        report.evaluation(),
+    ]
+    .into_iter()
+    .flatten()
+    .fold(Duration::ZERO, |total, program| {
+        let timing = program
+            .preparation_timing()
+            .expect("current native CPU scoreboard reports every program preparation phase");
+        total
+            .checked_add(
+                timing
+                    .total()
+                    .to_duration()
+                    .expect("program preparation total is representable"),
+            )
+            .expect("program preparation totals fit")
+    });
+    assert_eq!(
+        program_prepare_wall_time
+            .checked_add(
+                report
+                    .prepare_runtime_overhead_wall_time()
+                    .expect("current native CPU scoreboard reports whole-prepare overhead")
+                    .to_duration()?,
+            )
+            .expect("whole preparation phases fit"),
+        report.prepare_wall_time().to_duration()?
+    );
     assert_eq!(report.successful_replay_count(), SAMPLES);
     let executor_timing = report
         .main_replay_executor_wall_time()
@@ -1866,6 +1898,10 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         assert_eq!(program.work().durable_artifact_cache_hit_count(), 0);
         assert_eq!(program.work().durable_artifact_cache_miss_count(), 0);
         assert_eq!(program.work().compiler_invocation_count(), 0);
+        assert_eq!(
+            program.phases().compiler_process_wall_time(),
+            Duration::ZERO
+        );
     }
     let restored_step = restored_session.step_batch_scheduled(masked_batch(SAMPLES + 1)?)?;
     let restored_report = restored_step.report();

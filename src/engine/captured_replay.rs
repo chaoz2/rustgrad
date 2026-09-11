@@ -12,6 +12,7 @@ use crate::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1221,11 +1222,14 @@ impl CapturedReplayExecutor {
                 ));
             }
         }
+        let layout_started = Instant::now();
         let layouts = native_schedule_layouts(capture)?;
-        let (items, module_preparation) = self
+        let layout_wall_time = layout_started.elapsed();
+        let (items, mut module_preparation) = self
             .jit(vectorized)
             .prepare_schedule_module(&capture.items, layouts)
             .map_err(backend_error)?;
+        module_preparation.layout_wall_time = layout_wall_time;
         let workspace = NativeReplayWorkspace::new(capture, &items)?;
         Ok(PlannedNativeItems {
             items,

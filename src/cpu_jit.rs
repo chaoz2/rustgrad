@@ -19,6 +19,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 #[path = "cpu_jit_random.rs"]
 mod random;
@@ -664,6 +665,8 @@ pub(crate) struct JitScheduleDispatcher {
 pub(crate) struct JitScheduleModuleLoad {
     pub(crate) durable_cache_hit: bool,
     pub(crate) compiler_invocation_count: usize,
+    pub(crate) compiler_process_wall_time: Duration,
+    pub(crate) module_load_wall_time: Duration,
 }
 
 impl JitKernel {
@@ -735,14 +738,23 @@ impl JitKernel {
                 },
             ))
         };
-        let (kernels, dispatcher) = match load(&path) {
+        let load_started = Instant::now();
+        let loaded = load(&path);
+        let mut module_load_wall_time = load_started.elapsed();
+        let (kernels, dispatcher) = match loaded {
             Ok(module) => module,
             Err(_) => {
                 evict_cached_library(&path)?;
                 let (rebuilt, rebuilt_preparation) = compile_cached_schedule_module(rendered)?;
                 debug_assert!(!rebuilt_preparation.durable_cache_hit);
                 preparation = rebuilt_preparation;
-                match load(&rebuilt) {
+                let load_started = Instant::now();
+                let loaded = load(&rebuilt);
+                module_load_wall_time =
+                    module_load_wall_time
+                        .checked_add(load_started.elapsed())
+                        .ok_or_else(|| JitError::Io("module-load wall time overflowed".into()))?;
+                match loaded {
                     Ok(module) => module,
                     Err(error) => {
                         let _ = evict_cached_library(&rebuilt);
@@ -751,6 +763,7 @@ impl JitKernel {
                 }
             }
         };
+        preparation.module_load_wall_time = module_load_wall_time;
         Ok((kernels, dispatcher, preparation))
     }
     pub fn abi(&self) -> &KernelAbi {
@@ -4577,6 +4590,8 @@ fn compile_cached_schedule_module(
                 JitScheduleModuleLoad {
                     durable_cache_hit: true,
                     compiler_invocation_count: 0,
+                    compiler_process_wall_time: Duration::ZERO,
+                    module_load_wall_time: Duration::ZERO,
                 },
             ));
         }
@@ -4596,6 +4611,7 @@ fn compile_cached_schedule_module(
         .map_err(|error| JitError::Io(error.to_string()))?;
     let temporary = directory.join(format!("{stem}.tmp"));
     let result = (|| {
+        let compiler_started = Instant::now();
         let output = Command::new(C11_COMPILER_COMMAND)
             .args(C11_COMPILER_FLAGS)
             .arg("-o")
@@ -4606,6 +4622,7 @@ fn compile_cached_schedule_module(
                 status: None,
                 stderr: error.to_string(),
             })?;
+        let compiler_process_wall_time = compiler_started.elapsed();
         if !output.status.success() {
             return Err(JitError::Compiler {
                 status: output.status.code(),
@@ -4624,6 +4641,8 @@ fn compile_cached_schedule_module(
                 JitScheduleModuleLoad {
                     durable_cache_hit: false,
                     compiler_invocation_count: 1,
+                    compiler_process_wall_time,
+                    module_load_wall_time: Duration::ZERO,
                 },
             )),
             Err(error) => match fs::symlink_metadata(&library) {
@@ -4636,6 +4655,8 @@ fn compile_cached_schedule_module(
                     JitScheduleModuleLoad {
                         durable_cache_hit: false,
                         compiler_invocation_count: 1,
+                        compiler_process_wall_time,
+                        module_load_wall_time: Duration::ZERO,
                     },
                 )),
                 _ => Err(JitError::Io(error.to_string())),
@@ -6457,6 +6478,7 @@ mod tests {
         assert_eq!(restored.len(), 2);
         assert!(warm.durable_cache_hit);
         assert_eq!(warm.compiler_invocation_count, 0);
+        assert_eq!(warm.compiler_process_wall_time, Duration::ZERO);
         drop(restored);
         std::fs::remove_file(path).unwrap();
     }
