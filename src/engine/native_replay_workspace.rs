@@ -44,8 +44,9 @@ pub(crate) struct NativeReplayTraffic {
 }
 
 /// Private scratch owned by one authenticated prepared native program.
-/// Slots keep allocations, not authoritative replay bindings: every external
-/// value is imported and every mutable derived value is invalidated per run.
+/// Slots keep allocations, not authoritative replay bindings: supported dense
+/// inputs borrow caller storage for one invocation, while every mutable derived
+/// value is invalidated per run.
 pub(super) struct NativeReplayWorkspace {
     buffers: Vec<crate::JitBuffer>,
     slots: Vec<WorkspaceSlot>,
@@ -59,6 +60,8 @@ pub(super) struct NativeReplayWorkspace {
     #[cfg(test)]
     input_import_count: usize,
     #[cfg(test)]
+    borrowed_external_input_bytes: usize,
+    #[cfg(test)]
     intermediate_materialization_count: usize,
     #[cfg(test)]
     borrowed_recurrent_input_bytes: usize,
@@ -70,11 +73,11 @@ pub(super) struct NativeReplayWorkspace {
     affine_matmul_materialization_bytes: usize,
 }
 
-pub(super) struct NativeReplayBorrowedState<'a> {
+pub(super) struct NativeReplayBindings<'a> {
     slots: BTreeMap<usize, crate::cpu_jit::BorrowedJitBuffer<'a>>,
 }
 
-impl<'a> NativeReplayBorrowedState<'a> {
+impl<'a> NativeReplayBindings<'a> {
     pub(super) fn new() -> Self {
         Self {
             slots: BTreeMap::new(),
@@ -87,6 +90,7 @@ impl<'a> NativeReplayBorrowedState<'a> {
 pub(crate) struct NativeReplayWorkspaceStats {
     pub(crate) allocation_count: usize,
     pub(crate) input_import_count: usize,
+    pub(crate) borrowed_external_input_bytes: usize,
     pub(crate) intermediate_materialization_count: usize,
     pub(crate) borrowed_recurrent_input_bytes: usize,
     pub(crate) borrowed_recurrent_output_bytes: usize,
@@ -111,6 +115,8 @@ impl NativeReplayWorkspace {
             current_traffic: NativeReplayTraffic::default(),
             #[cfg(test)]
             input_import_count: 0,
+            #[cfg(test)]
+            borrowed_external_input_bytes: 0,
             #[cfg(test)]
             intermediate_materialization_count: 0,
             #[cfg(test)]
@@ -166,7 +172,7 @@ impl NativeReplayWorkspace {
 
         workspace.valid.resize(workspace.buffers.len(), false);
         let immutable = workspace.immutable.iter().copied().collect::<Vec<_>>();
-        let borrowed = NativeReplayBorrowedState::new();
+        let borrowed = NativeReplayBindings::new();
         for slot in immutable {
             if workspace.slots[slot].source.is_none() {
                 workspace.valid[slot] = true;
@@ -415,13 +421,14 @@ impl NativeReplayWorkspace {
         Ok(())
     }
 
-    pub(super) fn begin(
+    pub(super) fn begin<'a>(
         &mut self,
-        provided: &BTreeMap<String, TensorData>,
+        provided: &'a BTreeMap<String, TensorData>,
+        bindings: &mut NativeReplayBindings<'a>,
     ) -> Result<(), ReplayError> {
         self.begin_resolved();
         for (name, value) in provided {
-            self.import_input(name, value)?;
+            self.bind_external_input(name, value, bindings)?;
         }
         self.finish_inputs()
     }
@@ -470,18 +477,65 @@ impl NativeReplayWorkspace {
         Ok(())
     }
 
+    /// Borrows the dense storage families used by fixed-shape CPU training
+    /// batches. Other storage keeps the established owned-import fallback.
+    pub(super) fn bind_external_input<'a>(
+        &mut self,
+        name: &str,
+        value: &'a TensorData,
+        bindings: &mut NativeReplayBindings<'a>,
+    ) -> Result<(), ReplayError> {
+        if !matches!(value.dtype(), crate::DType::F32 | crate::DType::I32)
+            || value.native_dense_ptr().is_none()
+        {
+            return self.import_input(name, value);
+        }
+        self.bind_read_input(name, value, bindings, "external")?;
+        #[cfg(test)]
+        {
+            self.borrowed_external_input_bytes = self
+                .borrowed_external_input_bytes
+                .saturating_add(value.len().saturating_mul(value.dtype().itemsize()));
+        }
+        Ok(())
+    }
+
     pub(super) fn borrow_recurrent_input<'a>(
         &mut self,
         name: &str,
         value: &'a TensorData,
-        borrowed: &mut NativeReplayBorrowedState<'a>,
+        bindings: &mut NativeReplayBindings<'a>,
+    ) -> Result<(), ReplayError> {
+        self.bind_read_input(name, value, bindings, "recurrent")?;
+        self.current_traffic.borrowed_recurrent_input_bytes = self
+            .current_traffic
+            .borrowed_recurrent_input_bytes
+            .checked_add(tensor_bytes(value)?)
+            .ok_or_else(|| {
+                ReplayError::Descriptor("native borrowed recurrent input bytes overflow".into())
+            })?;
+        #[cfg(test)]
+        {
+            self.borrowed_recurrent_input_bytes = self
+                .borrowed_recurrent_input_bytes
+                .saturating_add(value.len().saturating_mul(value.dtype().itemsize()));
+        }
+        Ok(())
+    }
+
+    fn bind_read_input<'a>(
+        &mut self,
+        name: &str,
+        value: &'a TensorData,
+        bindings: &mut NativeReplayBindings<'a>,
+        kind: &str,
     ) -> Result<(), ReplayError> {
         let slot = self
             .inputs
             .iter()
             .find_map(|(input, slot)| (input == name).then_some(*slot))
             .ok_or_else(|| ReplayError::Extra(name.to_owned()))?;
-        if self.valid[slot] || borrowed.slots.contains_key(&slot) {
+        if self.valid[slot] || bindings.slots.contains_key(&slot) {
             return Err(ReplayError::Corrupt(format!(
                 "native workspace input {name:?} was bound twice"
             )));
@@ -493,10 +547,10 @@ impl NativeReplayWorkspace {
             || value.native_dense_ptr().is_none()
         {
             return Err(ReplayError::Corrupt(format!(
-                "native workspace borrowed input {name:?} descriptor mismatch"
+                "native workspace borrowed {kind} input {name:?} descriptor mismatch"
             )));
         }
-        borrowed
+        bindings
             .slots
             .insert(slot, crate::cpu_jit::BorrowedJitBuffer::Read(value));
         self.valid[slot] = true;
@@ -519,25 +573,12 @@ impl NativeReplayWorkspace {
                 break;
             }
             for alias in aliases {
-                borrowed
+                bindings
                     .slots
                     .insert(alias, crate::cpu_jit::BorrowedJitBuffer::Read(value));
                 self.valid[alias] = true;
                 bound_slots.insert(alias);
             }
-        }
-        self.current_traffic.borrowed_recurrent_input_bytes = self
-            .current_traffic
-            .borrowed_recurrent_input_bytes
-            .checked_add(tensor_bytes(value)?)
-            .ok_or_else(|| {
-                ReplayError::Descriptor("native borrowed recurrent input bytes overflow".into())
-            })?;
-        #[cfg(test)]
-        {
-            self.borrowed_recurrent_input_bytes = self
-                .borrowed_recurrent_input_bytes
-                .saturating_add(value.len().saturating_mul(value.dtype().itemsize()));
         }
         Ok(())
     }
@@ -546,7 +587,7 @@ impl NativeReplayWorkspace {
         &mut self,
         buffer: u64,
         value: &'a mut TensorData,
-        borrowed: &mut NativeReplayBorrowedState<'a>,
+        borrowed: &mut NativeReplayBindings<'a>,
     ) -> Result<(), ReplayError> {
         let slot = self
             .owners
@@ -604,7 +645,7 @@ impl NativeReplayWorkspace {
     fn prepare_slot(
         &mut self,
         slot: usize,
-        borrowed: &NativeReplayBorrowedState<'_>,
+        borrowed: &NativeReplayBindings<'_>,
     ) -> Result<(), ReplayError> {
         if self.valid.get(slot).copied().unwrap_or(false) {
             return Ok(());
@@ -631,7 +672,7 @@ impl NativeReplayWorkspace {
                 })?;
                 match source {
                     SlotSource::Copy(_) => Err(crate::JitError::InvalidBuffer(
-                        "borrowed recurrent copy alias was not bound".into(),
+                        "borrowed dense copy alias was not bound".into(),
                     )),
                     SlotSource::Affine { view, .. } => {
                         target.copy_affine_from_tensor(binding.tensor(), &view)
@@ -671,7 +712,7 @@ impl NativeReplayWorkspace {
         backend: &CpuJitBackend,
         quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
         prepared: &PreparedScheduleItem,
-        borrowed: &mut NativeReplayBorrowedState<'_>,
+        borrowed: &mut NativeReplayBindings<'_>,
     ) -> Result<(), ReplayError> {
         let slot_count = self
             .items
@@ -729,7 +770,7 @@ impl NativeReplayWorkspace {
     pub(super) fn materialize(
         &self,
         capture: &CapturedSchedule,
-        borrowed: &NativeReplayBorrowedState<'_>,
+        borrowed: &NativeReplayBindings<'_>,
         selected: Option<&BTreeSet<u64>>,
     ) -> Result<ReplayValues, ReplayError> {
         let mut values = ReplayValues::default();
@@ -778,6 +819,7 @@ impl NativeReplayWorkspace {
         NativeReplayWorkspaceStats {
             allocation_count: self.buffers.len(),
             input_import_count: self.input_import_count,
+            borrowed_external_input_bytes: self.borrowed_external_input_bytes,
             intermediate_materialization_count: self.intermediate_materialization_count,
             borrowed_recurrent_input_bytes: self.borrowed_recurrent_input_bytes,
             borrowed_recurrent_output_bytes: self.borrowed_recurrent_output_bytes,

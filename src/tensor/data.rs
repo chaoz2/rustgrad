@@ -153,6 +153,7 @@ impl TensorData {
     pub(crate) fn native_dense_ptr(&self) -> Option<*const u8> {
         match &self.storage {
             Storage::F32(values) => Some(values.as_ptr().cast()),
+            Storage::I32(values) => Some(values.as_ptr().cast()),
             Storage::U64(values) => Some(values.as_ptr().cast()),
             _ => None,
         }

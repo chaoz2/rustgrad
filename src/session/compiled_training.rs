@@ -1403,9 +1403,11 @@ impl PreparedNativeCpuEvaluation {
 
 /// Logical host traffic completed by one successful strict-native CPU replay.
 ///
-/// External imports are owned copies into retained native workspace storage.
-/// Recurrent bytes are borrowed directly from the authoritative active and
-/// inactive host banks; they are not copies or host/device transfers.
+/// External imports count only fallback owned copies into retained workspace
+/// storage; supported dense F32/I32 inputs bind caller storage read-only for
+/// the invocation instead. Recurrent bytes are borrowed directly from the
+/// authoritative active and inactive host banks. None are host/device
+/// transfers.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeCpuReplayTraffic {
@@ -11788,6 +11790,8 @@ mod tests {
             native.non_finite_policy(),
             CpuNonFinitePolicy::RejectTransition
         );
+        let prepared_workspace = native.main_replay.workspace_stats();
+        assert_eq!(prepared_workspace.borrowed_external_input_bytes, 0);
         let before = native.checkpoint().unwrap();
         assert!(
             native
@@ -11796,6 +11800,9 @@ mod tests {
         );
         assert_eq!(native.checkpoint().unwrap(), before);
         assert_eq!(native.successful_steps, 0);
+        let rejected_workspace = native.main_replay.workspace_stats();
+        assert_eq!(rejected_workspace.input_import_count, 0);
+        assert_eq!(rejected_workspace.borrowed_external_input_bytes, 8);
         assert!(
             native
                 .step(scalar_batch(1.0), TensorData::scalar(f32::INFINITY))
@@ -11803,6 +11810,7 @@ mod tests {
         );
         assert_eq!(native.checkpoint().unwrap(), before);
         assert_eq!(native.successful_steps, 0);
+        assert_eq!(native.main_replay.workspace_stats(), rejected_workspace);
 
         let mut interpreted = plan.prepare(&rejecting_cpu_target()).unwrap();
         let expected = interpreted
@@ -11813,6 +11821,8 @@ mod tests {
             .unwrap();
         assert_cross_engine_tensor_close("guarded retry loss", actual.loss(), expected.loss());
         assert_eq!(actual.report().successful_invocation(), 1);
+        assert_eq!(actual.report().traffic().external_input_import_count(), 0);
+        assert_eq!(actual.report().traffic().external_input_import_bytes(), 0);
         assert_eq!(native.successful_steps, 1);
         assert_native_adamw_state_close(&native, &interpreted);
     }
@@ -11950,8 +11960,8 @@ mod tests {
         assert!(actual.report().first_successful_invocation());
         assert_eq!(actual.report().native_identity(), prepared_native_identity);
         let first_traffic = *actual.report().traffic();
-        assert!(first_traffic.external_input_import_count() > 0);
-        assert!(first_traffic.external_input_import_bytes() > 0);
+        assert_eq!(first_traffic.external_input_import_count(), 1);
+        assert_eq!(first_traffic.external_input_import_bytes(), 32);
         assert_eq!(
             first_traffic.borrowed_recurrent_input_bytes(),
             u64::try_from(recurrent_state_bytes).unwrap()
@@ -11967,7 +11977,8 @@ mod tests {
         assert_native_adamw_state_close(&native, &interpreted);
         let first_workspace = native.main_replay.workspace_stats();
         assert_eq!(first_workspace.allocation_count, workspace.allocation_count);
-        assert!(first_workspace.input_import_count > 0);
+        assert_eq!(first_workspace.input_import_count, 1);
+        assert_eq!(first_workspace.borrowed_external_input_bytes, 36);
         assert_eq!(first_workspace.intermediate_materialization_count, 0);
         assert_eq!(
             first_workspace.borrowed_recurrent_input_bytes,
@@ -11991,6 +12002,8 @@ mod tests {
             workspace.allocation_count
         );
         assert_eq!(failed_workspace.intermediate_materialization_count, 0);
+        assert_eq!(failed_workspace.input_import_count, 2);
+        assert_eq!(failed_workspace.borrowed_external_input_bytes, 72);
         assert_eq!(
             failed_workspace.borrowed_recurrent_input_bytes,
             first_workspace.borrowed_recurrent_input_bytes + recurrent_state_bytes
@@ -12027,7 +12040,8 @@ mod tests {
             retried_workspace.allocation_count,
             workspace.allocation_count
         );
-        assert!(retried_workspace.input_import_count > failed_workspace.input_import_count);
+        assert_eq!(retried_workspace.input_import_count, 3);
+        assert_eq!(retried_workspace.borrowed_external_input_bytes, 108);
         assert_eq!(retried_workspace.intermediate_materialization_count, 0);
         assert_eq!(
             retried_workspace.borrowed_recurrent_input_bytes,
@@ -12356,8 +12370,8 @@ mod tests {
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
         assert_eq!(actual.report().unwrap().successful_invocation(), 1);
         let flush_traffic = actual.report().unwrap().traffic();
-        assert!(flush_traffic.external_input_import_count() > 0);
-        assert!(flush_traffic.external_input_import_bytes() > 0);
+        assert_eq!(flush_traffic.external_input_import_count(), 0);
+        assert_eq!(flush_traffic.external_input_import_bytes(), 0);
         assert!(flush_traffic.borrowed_recurrent_input_bytes() > 0);
         assert_eq!(
             flush_traffic.borrowed_recurrent_input_bytes(),
@@ -12396,7 +12410,8 @@ mod tests {
             used_flush_workspace.allocation_count,
             flush_workspace.allocation_count
         );
-        assert!(used_flush_workspace.input_import_count > 0);
+        assert_eq!(used_flush_workspace.input_import_count, 0);
+        assert_eq!(used_flush_workspace.borrowed_external_input_bytes, 8);
         assert!(used_flush_workspace.borrowed_recurrent_input_bytes > 0);
         assert_eq!(
             used_flush_workspace.borrowed_recurrent_input_bytes,
@@ -12427,7 +12442,16 @@ mod tests {
                 actual.outputs(),
                 expected.outputs(),
             );
+            assert_eq!(actual.report().traffic().external_input_import_count(), 1);
+            assert_eq!(actual.report().traffic().external_input_import_bytes(), 32);
         }
+        assert_eq!(
+            native
+                .main_replay
+                .workspace_stats()
+                .borrowed_external_input_bytes,
+            64
+        );
         let actual = native.flush_partial_window_scheduled().unwrap();
         let expected = interpreted.flush_partial_window_scheduled().unwrap();
         assert_eq!(
@@ -12485,8 +12509,14 @@ mod tests {
             .unwrap();
         assert_eq!(evaluation.report().successful_invocation(), 1);
         assert!(evaluation.report().first_successful_invocation());
-        assert!(evaluation.report().traffic().external_input_import_count() > 0);
-        assert!(evaluation.report().traffic().external_input_import_bytes() > 0);
+        assert_eq!(
+            evaluation.report().traffic().external_input_import_count(),
+            0
+        );
+        assert_eq!(
+            evaluation.report().traffic().external_input_import_bytes(),
+            0
+        );
         assert_eq!(
             evaluation
                 .report()
@@ -12514,7 +12544,11 @@ mod tests {
             evaluated_workspace.allocation_count,
             workspace.allocation_count
         );
-        assert!(evaluated_workspace.input_import_count > 0);
+        assert_eq!(evaluated_workspace.input_import_count, 0);
+        // Evaluation borrows both the 8-byte batch and the current 8-byte
+        // parameter snapshot as ordinary external inputs. Leasing the active
+        // parameter bank directly is intentionally deferred to the next PR.
+        assert_eq!(evaluated_workspace.borrowed_external_input_bytes, 16);
         assert_eq!(evaluated_workspace.intermediate_materialization_count, 0);
     }
 

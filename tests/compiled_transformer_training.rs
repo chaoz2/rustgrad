@@ -3809,8 +3809,8 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     );
     assert_eq!(report.fallback_count(), 0);
     let traffic = report.main_replay_traffic().unwrap();
-    assert!(traffic.external_input_import_count() > 0);
-    assert!(traffic.external_input_import_bytes() > 0);
+    assert_eq!(traffic.external_input_import_count(), 0);
+    assert_eq!(traffic.external_input_import_bytes(), 0);
     assert_eq!(
         usize::try_from(traffic.borrowed_recurrent_input_bytes()).unwrap(),
         inspection.recurrent_state_bytes()
