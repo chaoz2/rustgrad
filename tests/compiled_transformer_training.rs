@@ -2785,6 +2785,12 @@ struct NumericalTwoBlockGptEvaluation {
     gradients: Vec<f64>,
 }
 
+struct NumericalTwoBlockDirectionalEvaluation {
+    loss: f64,
+    derivative: f64,
+    epsilon: f64,
+}
+
 fn numerical_multi_head_transformer_gradient_lanes(
     model: &MultiHeadCausalTransformer,
     inputs: BTreeMap<String, TensorData>,
@@ -2954,6 +2960,238 @@ fn numerical_two_block_attention_mask_gradient_lanes(
     let denominator = graph.sum_all(loss_mask).unwrap();
     let loss = graph.div(numerator, denominator).unwrap();
     numerical_two_block_gradient_lanes_from_forward(model, graph, loss, inputs, probes)
+}
+
+fn numerical_two_block_attention_mask_directional_derivative(
+    model: &TwoBlockPositionalGpt,
+    inputs: BTreeMap<String, TensorData>,
+    masks: [TensorData; 6],
+    direction: &BTreeMap<String, TensorData>,
+) -> NumericalTwoBlockDirectionalEvaluation {
+    const EPSILONS: [f64; 4] = [1e-2, 5e-3, 2.5e-3, 1e-3];
+    const RELU_MARGIN: f64 = 0.25;
+
+    // This is deliberately a forward-only reconstruction. In particular, it
+    // does not call Graph::gradient_default or any production reverse-mode
+    // helper used by compiled AdamW.
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let attention_mask =
+        graph.input_dtype(ATTENTION_KEEP_MASK, ATTENTION_KEEP_MASK_SHAPE, DType::Bool);
+    let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
+    let guard = graph.input_dtype(ATTENTION_DROPOUT_TRANSITION_GUARD, [], DType::F32);
+    let mut dropout = FixedResidualDropout::from_masks(masks);
+    let logits = model
+        .forward_with_attention_mask(&mut graph, tokens, attention_mask, &mut dropout)
+        .unwrap();
+    assert_eq!(dropout.next, 6);
+    let losses = multi_head_sparse_causal_losses(&mut graph, logits, targets).unwrap();
+    let guard = graph.reciprocal(guard).unwrap();
+    let losses = graph.add(losses, guard).unwrap();
+    let weighted = graph.mul(losses, loss_mask).unwrap();
+    let numerator = graph.sum_all(weighted).unwrap();
+    let denominator = graph.sum_all(loss_mask).unwrap();
+    let loss = graph.div(numerator, denominator).unwrap();
+    let relu_inputs = relu_inputs(&graph, loss);
+    assert_eq!(relu_inputs.len(), 2);
+
+    let parameter_inputs = model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| {
+            let node = parameter.node(&graph).unwrap();
+            let Op::Input { name: input_name } = graph.op(node).unwrap() else {
+                panic!("bound trainable parameter {name} must be a graph input");
+            };
+            (name, input_name.clone())
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert!(parameter_inputs.keys().eq(direction.keys()));
+    let mut bindings = model.input_bindings(&graph).unwrap();
+    for (name, input_name) in &parameter_inputs {
+        let value = bindings
+            .get(input_name)
+            .unwrap_or_else(|| panic!("parameter input for {name} must be bound"));
+        assert_eq!(direction[name].shape(), value.shape());
+        assert_eq!(direction[name].dtype(), value.dtype());
+    }
+
+    bindings.extend(inputs);
+    let mut outputs = Vec::with_capacity(1 + relu_inputs.len());
+    outputs.push(loss);
+    outputs.extend(relu_inputs);
+    let base = CpuBackend
+        .execute_many(&graph, &outputs, &bindings)
+        .unwrap();
+    assert!(
+        base.outputs[1..].iter().all(|relu| {
+            relu.to_vec_f64()
+                .into_iter()
+                .all(|value| value.abs() >= RELU_MARGIN)
+        }),
+        "the whole-frontier fixture must stay away from ReLU kinks"
+    );
+    let input_names = parameter_inputs.values().cloned().collect::<Vec<_>>();
+    let directions = parameter_inputs
+        .keys()
+        .map(|name| direction[name].clone())
+        .collect::<Vec<_>>();
+    let (derivative, epsilon) = EPSILONS
+        .into_iter()
+        .find_map(|epsilon| {
+            let plus = CpuBackend
+                .execute_many(
+                    &graph,
+                    &outputs,
+                    &directionally_perturbed_parameter_bindings(
+                        &bindings,
+                        &input_names,
+                        &directions,
+                        epsilon,
+                    ),
+                )
+                .unwrap();
+            let minus = CpuBackend
+                .execute_many(
+                    &graph,
+                    &outputs,
+                    &directionally_perturbed_parameter_bindings(
+                        &bindings,
+                        &input_names,
+                        &directions,
+                        -epsilon,
+                    ),
+                )
+                .unwrap();
+            let preserved = |perturbed: &[TensorData]| {
+                base.outputs[1..]
+                    .iter()
+                    .zip(&perturbed[1..])
+                    .all(|(base, perturbed)| relu_region_unchanged(base, perturbed))
+            };
+            if !preserved(&plus.outputs) || !preserved(&minus.outputs) {
+                return None;
+            }
+            let derivative = (plus.outputs[0].scalar_at(0).as_f64()
+                - minus.outputs[0].scalar_at(0).as_f64())
+                / (2.0 * epsilon);
+            derivative.is_finite().then_some((derivative, epsilon))
+        })
+        .expect("a bounded whole-frontier central difference must preserve both ReLU regions");
+    NumericalTwoBlockDirectionalEvaluation {
+        loss: base.outputs[0].scalar_at(0).as_f64(),
+        derivative,
+        epsilon,
+    }
+}
+
+fn two_block_dense_parameter_directions(
+    parameters: &BTreeMap<String, TensorData>,
+) -> [BTreeMap<String, TensorData>; 2] {
+    const VALUES: [f64; 8] = [
+        -0.125, -0.09375, -0.0625, -0.03125, 0.03125, 0.0625, 0.09375, 0.125,
+    ];
+    [(1, 0), (3, 1)].map(|(stride, phase)| {
+        let mut coordinate = 0;
+        parameters
+            .iter()
+            .map(|(name, value)| {
+                assert_eq!(value.dtype(), DType::F32);
+                let direction = TensorData::from_scalars(
+                    value.shape().clone(),
+                    DType::F32,
+                    (0..value.len()).map(|lane| {
+                        let value = VALUES[(coordinate + lane) * stride % VALUES.len()];
+                        Scalar::F(if phase == 0 { value } else { -value })
+                    }),
+                )
+                .unwrap();
+                coordinate += value.len();
+                (name.clone(), direction)
+            })
+            .collect()
+    })
+}
+
+fn two_block_gradient_family(name: &str) -> usize {
+    match name {
+        "tokens.weight" => 0,
+        "positions.weight" => 1,
+        name if ["first.query.", "first.key.", "first.value.", "first.out."]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)) =>
+        {
+            2
+        }
+        name if name.starts_with("first.ln1.") || name.starts_with("first.ln2.") => 3,
+        name if name.starts_with("first.ff1.") || name.starts_with("first.ff2.") => 4,
+        name if [
+            "second.query.",
+            "second.key.",
+            "second.value.",
+            "second.out.",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix)) =>
+        {
+            5
+        }
+        name if name.starts_with("second.ln1.") || name.starts_with("second.ln2.") => 6,
+        name if name.starts_with("second.ff1.") || name.starts_with("second.ff2.") => 7,
+        name if name.starts_with("norm.") => 8,
+        _ => panic!("unexpected two-block canonical trainable parameter {name}"),
+    }
+}
+
+fn assert_two_block_gradient_frontier_coverage(
+    gradients: &BTreeMap<String, TensorData>,
+    direction: &BTreeMap<String, TensorData>,
+) {
+    const FAMILIES: [(&str, usize); 9] = [
+        ("tied token embedding", 20),
+        ("positional embedding", 12),
+        ("first-block attention", 80),
+        ("first-block LayerNorm", 16),
+        ("first-block feed-forward", 76),
+        ("second-block attention", 80),
+        ("second-block LayerNorm", 16),
+        ("second-block feed-forward", 76),
+        ("final LayerNorm", 8),
+    ];
+    assert!(gradients.keys().eq(direction.keys()));
+    let mut coordinates = [0; FAMILIES.len()];
+    let mut has_nonzero_gradient = [false; FAMILIES.len()];
+    for (name, gradient) in gradients {
+        let family = two_block_gradient_family(name);
+        let direction = &direction[name];
+        assert_eq!(gradient.shape(), direction.shape());
+        assert_eq!(gradient.dtype(), DType::F32);
+        assert_eq!(direction.dtype(), DType::F32);
+        coordinates[family] += gradient.len();
+        for coordinate in 0..gradient.len() {
+            let gradient = gradient.scalar_at(coordinate).as_f64();
+            let direction = direction.scalar_at(coordinate).as_f64();
+            assert!(gradient.is_finite() && direction.is_finite());
+            assert_ne!(
+                direction, 0.0,
+                "{name}[{coordinate}] must be in the dense direction"
+            );
+            has_nonzero_gradient[family] |= gradient != 0.0;
+        }
+    }
+    for (family, ((label, expected), actual)) in FAMILIES.into_iter().zip(coordinates).enumerate() {
+        assert_eq!(
+            actual, expected,
+            "{label} canonical coordinate inventory changed"
+        );
+        assert!(
+            has_nonzero_gradient[family],
+            "{label} must contribute a nonzero captured gradient"
+        );
+    }
+    assert_eq!(coordinates.into_iter().sum::<usize>(), 384);
 }
 
 fn numerical_two_block_gradient_lanes_from_forward(
@@ -5149,6 +5387,125 @@ fn compiled_two_block_attention_mask_gradients_match_fixed_dropout_central_diffe
             probe.boundary,
             probe.parameter,
             probe.coordinate
+        );
+    }
+    assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_attention_mask_whole_gradient_frontier_matches_directional_oracle() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+    const ABSOLUTE_TOLERANCE: f64 = 6e-3;
+    const RELATIVE_TOLERANCE: f64 = 3e-3;
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let mut visited = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        visited.insert(name, (parameter.id(), parameter.is_trainable()));
+    });
+    assert_eq!(visited.len(), 37);
+    assert_eq!(visited["tokens.weight"].0, visited["lm_head.weight"].0);
+    assert!(visited["tokens.weight"].1 && visited["lm_head.weight"].1);
+
+    let parameters = model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.value().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    assert!(parameters.contains_key("tokens.weight"));
+    assert!(!parameters.contains_key("lm_head.weight"));
+    assert_eq!(parameters.len(), 36);
+    assert_eq!(parameters.values().map(TensorData::len).sum::<usize>(), 384);
+    let directions = two_block_dense_parameter_directions(&parameters);
+    assert_ne!(directions[0], directions[1]);
+
+    let compile_count = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+        two_block_attention_mask_config(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_with_attention_mask(model, graph, inputs, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_ne!(attention_keep_mask(1), attention_keep_mask(2));
+    assert_ne!(attention_loss_mask(1), attention_loss_mask(2));
+
+    let mut fixed_dropout_masks = None;
+    for (index, direction) in directions.iter().enumerate() {
+        let replay = index as u64 + 1;
+        let inputs = attention_masked_dropout_batch(replay, 1.0);
+        let token_count = attention_masked_loss_weight(replay);
+        let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
+        let step = runtime
+            .step(inputs.clone(), TensorData::scalar(1e-3))
+            .unwrap();
+        assert!(!step.did_update());
+        assert!(step.clip_report().is_none());
+        assert_eq!(step.loss_weight(), token_count);
+        assert_eq!(runtime.optimizer_step().unwrap(), 0);
+        assert_eq!(runtime.accumulation_index().unwrap(), 1);
+        assert_eq!(
+            runtime
+                .checkpoint()
+                .unwrap()
+                .info()
+                .accumulated_token_count(),
+            Some(token_count)
+        );
+        let captured = runtime.gradient_accumulator_snapshots().unwrap();
+        assert_two_block_gradient_frontier_coverage(&captured, direction);
+
+        let masks = observed_two_block_dropout_masks(step.outputs());
+        if let Some(expected) = &fixed_dropout_masks {
+            assert_eq!(
+                &masks, expected,
+                "fresh runtimes must replay the same six fixed dropout masks"
+            );
+        } else {
+            fixed_dropout_masks = Some(masks.clone());
+        }
+        let numerical = numerical_two_block_attention_mask_directional_derivative(
+            &model, inputs, masks, direction,
+        );
+        let captured_loss = step.loss().scalar_at(0).as_f64();
+        assert!(captured_loss.is_finite() && numerical.loss.is_finite());
+        assert!(
+            (captured_loss - numerical.loss).abs() <= 2e-5,
+            "direction {index} fixed-mask token-mean loss differs: captured={captured_loss}, numerical={}",
+            numerical.loss
+        );
+
+        let captured_derivative = captured
+            .iter()
+            .map(|(name, gradient)| {
+                let direction = &direction[name];
+                (0..gradient.len())
+                    .map(|coordinate| {
+                        gradient.scalar_at(coordinate).as_f64()
+                            * direction.scalar_at(coordinate).as_f64()
+                    })
+                    .sum::<f64>()
+            })
+            .sum::<f64>();
+        let expected_derivative = numerical.derivative * token_count as f64;
+        assert!(captured_derivative.is_finite() && expected_derivative.is_finite());
+        assert_ne!(captured_derivative, 0.0);
+        assert_ne!(numerical.derivative, 0.0);
+        let error = (captured_derivative - expected_derivative).abs();
+        let tolerance = ABSOLUTE_TOLERANCE * token_count as f64
+            + RELATIVE_TOLERANCE * captured_derivative.abs().max(expected_derivative.abs());
+        assert!(
+            error <= tolerance,
+            "direction {index} whole-frontier mismatch at epsilon {}: captured={captured_derivative}, numerical={}, token_count={token_count}, weighted={expected_derivative}, error={error}, tolerance={tolerance}",
+            numerical.epsilon,
+            numerical.derivative
         );
     }
     assert_eq!(compile_count.get(), 1);
