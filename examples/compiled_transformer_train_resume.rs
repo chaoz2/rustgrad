@@ -440,6 +440,23 @@ fn build_file_resume(
     ))
 }
 
+fn build_file_resume_evaluation(
+    model: &FileResumeTransformer,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+) -> Result<CompiledAdamWGraph> {
+    let logits = model.forward_eval(
+        graph,
+        inputs[MaskedTransformerBatch::TOKENS],
+        inputs[ATTENTION_KEEP_MASK],
+    )?;
+    let losses = sparse_causal_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
+    Ok(CompiledAdamWGraph::token_mean(
+        losses,
+        BTreeMap::from([("logits".into(), logits)]),
+    ))
+}
+
 fn build_evaluation(
     model: &TinyCausalTransformer,
     graph: &mut Graph,
@@ -710,30 +727,30 @@ fn evaluate_mean_masked_sparse_loss(model: &TinyCausalTransformer) -> Result<f64
     Ok(weighted_loss_sum / loss_weight_sum as f64)
 }
 
-fn evaluate_mean_file_resume_loss(model: &FileResumeTransformer) -> Result<f64> {
-    let mut graph = Graph::new();
-    let tokens = graph.input_dtype(MaskedTransformerBatch::TOKENS, [BATCH, TIME], DType::I32);
-    let targets = graph.input_dtype(MaskedTransformerBatch::TARGETS, [BATCH, TIME], DType::I32);
-    let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
-    let attention_keep_mask =
-        graph.input_dtype(ATTENTION_KEEP_MASK, ATTENTION_KEEP_MASK_SHAPE, DType::Bool);
-    let logits = model.forward_eval(&mut graph, tokens, attention_keep_mask)?;
-    let loss = masked_sparse_causal_loss(&mut graph, logits, targets, loss_mask)?;
-    let parameter_bindings = model.input_bindings(&graph)?;
+fn evaluate_mean_file_resume_loss<R>(runtime: &mut R) -> Result<f64>
+where
+    R: CompiledEvaluationRuntime,
+    R::Evaluation: CompiledEvaluation,
+{
     let mut weighted_loss_sum = 0.0;
-    let mut loss_weight_sum = 0;
-    for replay in 1..=ACCUMULATION_STEPS {
+    let mut loss_weight_sum = 0_u64;
+    for (replay, expected_weight) in (1..=ACCUMULATION_STEPS).zip([5, 3, 3]) {
         let batch = file_resume_batch(replay)?;
-        let loss_weight = loss_mask_weight(batch.loss_mask());
-        let mut bindings = parameter_bindings.clone();
-        bindings.extend(batch.into_compiled_inputs()?);
-        let normalized_loss = CpuBackend
-            .execute(&graph, loss, &bindings)?
-            .scalar_at(0)
-            .as_f64();
-        weighted_loss_sum += normalized_loss * loss_weight as f64;
-        loss_weight_sum += loss_weight;
+        assert_eq!(loss_mask_weight(batch.loss_mask()), expected_weight);
+        let evaluation = runtime.evaluate_batch(batch)?;
+        assert_eq!(evaluation.loss_weight(), expected_weight);
+        assert_eq!(
+            evaluation
+                .output("logits")
+                .expect("the file-resume evaluator exposes logits")
+                .shape(),
+            &Shape::new([BATCH, TIME, VOCAB])
+        );
+        weighted_loss_sum +=
+            evaluation.loss().scalar_at(0).as_f64() * evaluation.loss_weight() as f64;
+        loss_weight_sum += evaluation.loss_weight();
     }
+    assert_eq!(loss_weight_sum, 11);
     Ok(weighted_loss_sum / loss_weight_sum as f64)
 }
 
@@ -1262,21 +1279,28 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
     );
     let source = FileResumeTransformer::new(0x5678)?;
     let source_initial = source.state_dict()?;
-    let initial_loss = evaluate_mean_file_resume_loss(&source)?;
     let source_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout(
         config.clone(),
         dropout_config(),
         source,
         build_file_resume,
     )
+    .map_err(|error| error.into_parts().1)?
+    .with_evaluation_graph(build_file_resume_evaluation)
     .map_err(|error| error.into_parts().1)?;
     let capture_identity = source_plan.capture_identity();
+    let evaluation_identity = source_plan
+        .evaluation_capture_identity()
+        .expect("the compiler-owned token-mean evaluator is attached");
     assert_eq!(source_plan.captured_multi_step_lr(), Some(&schedule));
     let target =
         CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
     let mut uninterrupted = source_plan
         .prepare(&target)
         .map_err(|error| error.into_parts().1)?;
+    let before_initial_evaluation = uninterrupted.checkpoint()?;
+    let initial_loss = evaluate_mean_file_resume_loss(&mut uninterrupted)?;
+    assert_eq!(uninterrupted.checkpoint()?, before_initial_evaluation);
     for replay in 1..=4 {
         let batch = file_resume_batch(replay)?;
         let loss_weight = loss_mask_weight(batch.loss_mask());
@@ -1381,8 +1405,14 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         &decoded,
         build_file_resume,
     )
+    .map_err(|error| error.into_parts().1)?
+    .with_evaluation_graph(build_file_resume_evaluation)
     .map_err(|error| error.into_parts().1)?;
     assert_eq!(restored_plan.capture_identity(), capture_identity);
+    assert_eq!(
+        restored_plan.evaluation_capture_identity(),
+        Some(evaluation_identity)
+    );
     assert_eq!(restored_plan.captured_multi_step_lr(), Some(&schedule));
     for (_, parameter, _, before) in &destination_states {
         let after = parameter.snapshot()?;
@@ -1450,6 +1480,19 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         assert_eq!(after.identity, before.identity);
         assert_eq!(after.trainable, before.trainable);
     }
+
+    let before_evaluation_checkpoint = resumed.checkpoint()?;
+    let before_evaluation_counter = resumed.dropout_block_counter()?;
+    let before_evaluation_accumulators = resumed.gradient_accumulator_snapshots()?;
+    let uninterrupted_final_loss = evaluate_mean_file_resume_loss(&mut uninterrupted)?;
+    let final_loss = evaluate_mean_file_resume_loss(&mut resumed)?;
+    assert_eq!(final_loss.to_bits(), uninterrupted_final_loss.to_bits());
+    assert_eq!(resumed.checkpoint()?, before_evaluation_checkpoint);
+    assert_eq!(resumed.dropout_block_counter()?, before_evaluation_counter);
+    assert_eq!(
+        resumed.gradient_accumulator_snapshots()?,
+        before_evaluation_accumulators
+    );
 
     let (uninterrupted_model, uninterrupted_checkpoint) = uninterrupted
         .finish_with_module_checkpoint()
@@ -1522,7 +1565,6 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         uninterrupted_model.running_marker.value()?
     );
 
-    let final_loss = evaluate_mean_file_resume_loss(&resumed_model)?;
     assert!(
         final_loss < initial_loss,
         "file-resumed two-block causal Transformer loss did not decrease: {initial_loss} -> {final_loss}"
