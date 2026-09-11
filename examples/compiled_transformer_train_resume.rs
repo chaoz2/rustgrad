@@ -351,17 +351,27 @@ fn reuse_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
         .with_captured_multi_step_lr(schedule))
 }
 
-fn file_resume_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
+fn two_block_config<B: CompiledInputBatch>(
+    schedule: CompiledMultiStepLr,
+) -> Result<CompiledAdamWConfig> {
     Ok(CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)?
         .with_loss_scale(128.0)?
         .with_gradient_accumulation(ACCUMULATION_STEPS)?
         .with_max_gradient_norm(MAX_GRADIENT_NORM)?
-        .with_input_batch::<FileResumeBatch>()?
+        .with_input_batch::<B>()?
         .with_token_weighted_gradient_accumulation(LOSS_MASK)?
         .with_frozen_parameters([FILE_RESUME_POLICY_FROZEN])?
         .with_captured_multi_step_lr(schedule)
         .with_clip_report()
         .with_window_loss_report())
+}
+
+fn file_resume_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
+    two_block_config::<FileResumeBatch>(schedule)
+}
+
+fn scoreboard_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
+    two_block_config::<MaskedTransformerBatch>(schedule)
 }
 
 fn dropout_config() -> CompiledDropoutConfig {
@@ -455,6 +465,32 @@ fn build_file_resume_evaluation(
         losses,
         BTreeMap::from([("logits".into(), logits)]),
     ))
+}
+
+fn build_scoreboard(
+    model: &FileResumeTransformer,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<CompiledAdamWGraph> {
+    // Keep the Bool attention policy capture-owned so every varying replay
+    // input uses the native borrowed-input path measured by the scoreboard.
+    // The second sample's final key is padding in every accepted batch.
+    let attention_keep_mask = graph.constant(TensorData::from_scalars(
+        ATTENTION_KEEP_MASK_SHAPE,
+        DType::Bool,
+        [true, true, true, true, true, false]
+            .into_iter()
+            .map(Scalar::Bool),
+    )?);
+    let logits = model.forward(
+        graph,
+        inputs[MaskedTransformerBatch::TOKENS],
+        attention_keep_mask,
+        dropout,
+    )?;
+    let losses = sparse_causal_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
+    Ok(CompiledAdamWGraph::token_mean(losses, BTreeMap::new()))
 }
 
 fn build_evaluation(
@@ -1576,19 +1612,20 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
 }
 
 fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
-    const SAMPLES: u64 = 6;
+    const SAMPLES: u64 = 3;
+    const EXPECTED_LOSS_WEIGHTS: [u64; SAMPLES as usize] = [5, 3, 3];
 
-    let source = BufferedTinyCausalTransformer::new(7)?;
+    let source = FileResumeTransformer::new(7)?;
     let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1])?;
     let builds = Cell::new(0);
     let compile_started = Instant::now();
-    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
-        reuse_config(schedule)?,
+    let plan = CompiledAdamWPlan::compile_module_graph_with_dropout(
+        scoreboard_config(schedule)?,
         dropout_config(),
         &source,
         |model, graph, inputs, dropout| {
             builds.set(builds.get() + 1);
-            build_buffered(model, graph, inputs, dropout)
+            build_scoreboard(model, graph, inputs, dropout)
         },
     )?;
     let compile_wall_time = compile_started.elapsed();
@@ -1608,8 +1645,24 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         compile_wall_time,
         prepare_wall_time,
     )?;
+    let recurrent_state_bytes = u64::try_from(inspection.recurrent_state_bytes())?;
+    let mut stable_executed_native_items = None;
     for replay in 1..=SAMPLES {
-        let step = session.step_batch_scheduled(masked_batch(replay)?)?;
+        let batch = masked_batch(replay)?;
+        assert_eq!(
+            loss_mask_weight(&batch.loss_mask),
+            EXPECTED_LOSS_WEIGHTS[(replay - 1) as usize]
+        );
+        let step = session.step_batch_scheduled(batch)?;
+        let report = step.report();
+        let executed = report.executed_native_item_count();
+        assert!(executed > 0);
+        assert!(executed <= report.native_item_count());
+        if let Some(expected) = stable_executed_native_items {
+            assert_eq!(executed, expected);
+        } else {
+            stable_executed_native_items = Some(executed);
+        }
         scoreboard.record(step.report())?;
     }
 
@@ -1621,8 +1674,25 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let executed_native_items = report
         .main_replay_executed_native_item_count()
         .expect("current native CPU scoreboard reports executed JIT items");
-    assert!(executed_native_items > 0);
+    assert_eq!(report.successful_replay_count(), SAMPLES);
+    assert_eq!(
+        Some(executed_native_items as usize),
+        stable_executed_native_items
+    );
     assert!(executed_native_items <= report.main().native_item_count());
+    let replay_traffic = report
+        .main_replay_traffic()
+        .expect("current native CPU scoreboard reports replay traffic");
+    assert_eq!(replay_traffic.external_input_import_count(), 0);
+    assert_eq!(replay_traffic.external_input_import_bytes(), 0);
+    assert_eq!(
+        replay_traffic.borrowed_recurrent_input_bytes(),
+        recurrent_state_bytes
+    );
+    assert_eq!(
+        replay_traffic.borrowed_recurrent_output_bytes(),
+        recurrent_state_bytes
+    );
 
     let restored = plan.restore_checkpoint(&checkpoint)?;
     let restored_inspection = restored.inspection()?;
@@ -1640,13 +1710,40 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         inspection.recurrent_state_bytes()
     );
     assert_eq!(builds.get(), 1, "checkpoint restore must not rebuild");
-    let restored_session = restored.prepare(&target)?;
+    let mut restored_session = restored.prepare(&target)?;
+    let restored_preparation = restored_session.preparation_report();
+    for program in [
+        Some(restored_preparation.main()),
+        restored_preparation.partial_flush(),
+        restored_preparation.zero_grad(),
+        restored_preparation.evaluation(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert_eq!(program.cache_miss_count(), 0);
+        assert_eq!(program.cache_hit_count(), program.native_item_count());
+    }
+    let restored_step = restored_session.step_batch_scheduled(masked_batch(SAMPLES + 1)?)?;
+    let restored_report = restored_step.report();
+    assert_eq!(restored_report.fallback_count(), 0);
     assert_eq!(
-        restored_session
-            .preparation_report()
-            .main()
-            .cache_miss_count(),
-        0
+        u64::try_from(restored_report.native_item_count())?,
+        report.main().native_item_count()
+    );
+    assert_eq!(restored_report.traffic().external_input_import_count(), 0);
+    assert_eq!(restored_report.traffic().external_input_import_bytes(), 0);
+    assert_eq!(
+        restored_report.traffic().borrowed_recurrent_input_bytes(),
+        recurrent_state_bytes
+    );
+    assert_eq!(
+        restored_report.traffic().borrowed_recurrent_output_bytes(),
+        recurrent_state_bytes
+    );
+    assert_eq!(
+        restored_report.executed_native_item_count(),
+        stable_executed_native_items.expect("the scoreboard recorded successful replays")
     );
 
     print!("{}", String::from_utf8(report.to_json_bytes()?)?);
