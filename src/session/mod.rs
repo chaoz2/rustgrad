@@ -33,8 +33,9 @@ pub use compiled_training::{
     MetalCompiledAdamWFlushResult, MetalCompiledAdamWPlan, MetalCompiledAdamWStepResult,
     MetalCompiledEvaluationResult, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWFlushResult,
     NativeCpuCompiledAdamWPreparationReport, NativeCpuCompiledAdamWStepResult,
-    NativeCpuCompiledEvaluationResult, NativeCpuPreparationWork, NativeCpuProgramPreparationReport,
-    NativeCpuReplayTraffic, NativeCpuRunReport, TrainingParameterInit,
+    NativeCpuCompiledEvaluationResult, NativeCpuPreparationPhases, NativeCpuPreparationWork,
+    NativeCpuProgramPreparationReport, NativeCpuReplayTraffic, NativeCpuRunReport,
+    TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,
@@ -51,8 +52,9 @@ pub(crate) use inference::{
     CapturedHostGather, CapturedHostIndexedMovement, CapturedHostIndexedMovementKind,
 };
 pub use native_training_scoreboard::{
-    CompiledAdamWInspection, NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeTrainingProgramReport,
-    NativeTrainingReplayTiming, NativeTrainingReport, NativeTrainingScoreboard,
+    CompiledAdamWInspection, NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+    NativeTrainingPreparationTiming, NativeTrainingProgramReport, NativeTrainingReplayTiming,
+    NativeTrainingReport, NativeTrainingScoreboard,
 };
 pub use target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,

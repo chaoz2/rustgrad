@@ -981,10 +981,13 @@ interpreter and strict-Metal targets.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v6 validates those facts against strict-native
+separate `NativeTrainingScoreboard` v7 validates those facts against strict-native
 preparation and committed main-replay reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
-sample set into versioned JSON. Main replay wall time is partitioned exactly
+sample set into versioned JSON. Every attached native program partitions its
+runtime-observed preparation total exactly into layout, rendering, compiler
+process, module load, and residual host work; the caller-observed whole-prepare
+remainder is reported separately. Main replay wall time is partitioned exactly
 between the sealed native executor and the checked recurrent
 staging/validation/commit remainder; failed calls publish neither phase. It
 reports deterministic
@@ -1009,7 +1012,8 @@ matching workload, toolchain/compiler, runner image, and CPU-hardware
 provenance; they never gate CI. Legacy v1 reports without zero-grad
 inventory, v2 reports without replay traffic, v3 reports without executed
 native-item counts, v4 reports without shared-module preparation evidence, and
-v5 reports without replay-phase timing remain readable.
+v5 reports without replay-phase timing, and v6 reports without preparation-phase
+timing remain readable.
 CPU targets may opt into `CpuNonFinitePolicy::RejectTransition`. The historical
 unit `CpuSessionTarget` remains the propagation default and returns a separate
 `ConfiguredCpuSessionTarget` when that policy is selected; strict-native CPU

@@ -109,8 +109,8 @@ Its
 compile, prepare, and checkpoint phases plus runtime-timed first/steady replay,
 together with authenticated main, partial-flush, captured-zero-grad, evaluation,
 shared-module preparation/cache/compiler work, recurrent-state, successful
-native-item execution, and per-commit logical
-fallback-import/recurrent-traffic facts. Dense F32/I32 batches bind read-only for
+native-item execution, exact preparation/replay phase partitions, and per-commit
+logical fallback-import/recurrent-traffic facts. Dense F32/I32 batches bind read-only for
 the replay call rather than copying into retained CPU workspace storage.
 Nonempty CPU `zero_grad` uses an authenticated
 compile-once state-only replay, while an empty window remains an exact no-op.

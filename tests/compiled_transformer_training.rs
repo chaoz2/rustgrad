@@ -4041,11 +4041,19 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
     let mut session = plan.prepare(&target).unwrap();
+    let preparation = session.preparation_report();
+    let prepare_wall_time = std::iter::once(preparation.main())
+        .chain(preparation.partial_flush())
+        .chain(preparation.zero_grad())
+        .chain(preparation.evaluation())
+        .fold(Duration::ZERO, |total, program| {
+            total.checked_add(program.wall_time()).unwrap()
+        });
     let mut scoreboard = NativeTrainingScoreboard::new(
         inspection.clone(),
-        session.preparation_report(),
+        preparation,
         Duration::ZERO,
-        Duration::ZERO,
+        prepare_wall_time,
     )
     .unwrap();
 
@@ -4097,6 +4105,33 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         inspection.zero_grad().unwrap().0
     );
     assert_eq!(report.fallback_count(), 0);
+    let program_prepare_total = [
+        Some(report.main()),
+        report.partial_flush(),
+        report.zero_grad(),
+        report.evaluation(),
+    ]
+    .into_iter()
+    .flatten()
+    .try_fold(Duration::ZERO, |total, program| {
+        let timing = program
+            .preparation_timing()
+            .expect("current scoreboard reports native preparation phases");
+        total.checked_add(timing.total().to_duration().unwrap())
+    })
+    .unwrap();
+    assert_eq!(
+        program_prepare_total
+            .checked_add(
+                report
+                    .prepare_runtime_overhead_wall_time()
+                    .expect("current scoreboard reports whole-prepare overhead")
+                    .to_duration()
+                    .unwrap()
+            )
+            .unwrap(),
+        report.prepare_wall_time().to_duration().unwrap()
+    );
     let executed_native_item_count = report
         .main_replay_executed_native_item_count()
         .expect("current scoreboard reports successful CPU JIT calls");

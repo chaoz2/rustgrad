@@ -12,6 +12,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +104,10 @@ pub(crate) struct NativeScheduleModulePreparation {
     pub(crate) durable_artifact_cache_hit_count: usize,
     pub(crate) durable_artifact_cache_miss_count: usize,
     pub(crate) compiler_invocation_count: usize,
+    pub(crate) layout_wall_time: Duration,
+    pub(crate) render_wall_time: Duration,
+    pub(crate) compiler_process_wall_time: Duration,
+    pub(crate) module_load_wall_time: Duration,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -844,6 +849,7 @@ impl CpuJitBackend {
             layout: NativeScheduleLayout,
             output_initialization: crate::cpu_jit::NativeOutputInitialization,
         }
+        let render_started = Instant::now();
         let entries = items
             .iter()
             .zip(layouts)
@@ -864,6 +870,7 @@ impl CpuJitBackend {
                 })
             })
             .collect::<Result<Vec<_>, JitBackendError>>()?;
+        let render_wall_time = render_started.elapsed();
         if entries.is_empty() {
             return Ok((Vec::new(), NativeScheduleModulePreparation::default()));
         }
@@ -958,6 +965,14 @@ impl CpuJitBackend {
                 compiler_invocation_count: load
                     .map(|load| load.compiler_invocation_count)
                     .unwrap_or(0),
+                layout_wall_time: Duration::ZERO,
+                render_wall_time,
+                compiler_process_wall_time: load
+                    .map(|load| load.compiler_process_wall_time)
+                    .unwrap_or(Duration::ZERO),
+                module_load_wall_time: load
+                    .map(|load| load.module_load_wall_time)
+                    .unwrap_or(Duration::ZERO),
             },
         ))
     }
