@@ -1846,8 +1846,7 @@ fn literal_accumulated_compiled_clip_norm(
     descriptors: &BTreeMap<String, TensorData>,
     divisor: f32,
 ) -> LiteralAccumulatedClip {
-    assert_eq!(contributions.len(), ACCUMULATION_STEPS as usize);
-    assert_eq!(contributions.len(), 3);
+    assert!(!contributions.is_empty());
     for contribution in contributions {
         assert_eq!(
             contribution.keys().collect::<Vec<_>>(),
@@ -1859,18 +1858,20 @@ fn literal_accumulated_compiled_clip_norm(
     let mut gradients = BTreeMap::new();
     for (name, descriptor) in descriptors {
         assert_eq!(descriptor.dtype(), DType::F32);
-        let first = &contributions[0][name];
-        let second = &contributions[1][name];
-        let third = &contributions[2][name];
-        for contribution in [first, second, third] {
+        for contribution in contributions {
+            let contribution = &contribution[name];
             assert_eq!(contribution.shape(), descriptor.shape());
             assert_eq!(contribution.dtype(), DType::F32);
         }
-        let first = graph.constant(first.clone());
-        let second = graph.constant(second.clone());
-        let third = graph.constant(third.clone());
-        let accumulated = graph.add(first, second).unwrap();
-        let accumulated = graph.add(accumulated, third).unwrap();
+        let mut accumulated: Option<NodeId> = None;
+        for contribution in contributions {
+            let contribution = graph.constant(contribution[name].clone());
+            accumulated = Some(match accumulated {
+                Some(accumulated) => graph.add(accumulated, contribution).unwrap(),
+                None => contribution,
+            });
+        }
+        let accumulated = accumulated.unwrap();
         gradients.insert(name.clone(), graph.div(accumulated, divisor).unwrap());
     }
     let (norm, materialized_gradients) = literal_compiled_clip_norm_node(&mut graph, &gradients);
@@ -5558,6 +5559,201 @@ fn compiled_two_block_attention_mask_whole_gradient_frontier_matches_directional
             numerical.derivative
         );
     }
+    assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_attention_mask_accumulated_window_matches_adamw_oracle() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+    const LEARNING_RATE: f32 = 1e-3;
+    const TOKEN_COUNT_TOTAL: f32 = 9.0;
+
+    let optimizer = two_block_attention_mask_config().with_clip_report();
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let tied_identity = model.tokens.weight.id();
+    let compile_count = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+        optimizer.clone(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_with_attention_mask(model, graph, inputs, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+
+    let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
+    let initial_parameters = runtime.parameter_snapshots().unwrap();
+    let initial_first_moments = runtime.first_moment_snapshots().unwrap();
+    let initial_second_moments = runtime.second_moment_snapshots().unwrap();
+    assert_eq!(initial_parameters.len(), 36);
+    assert_eq!(
+        initial_parameters
+            .values()
+            .map(TensorData::len)
+            .sum::<usize>(),
+        384
+    );
+    assert!(initial_parameters.contains_key("tokens.weight"));
+    assert!(!initial_parameters.contains_key("lm_head.weight"));
+
+    let first_step = runtime
+        .step(
+            attention_masked_dropout_batch(1, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    assert!(!first_step.did_update());
+    assert!(first_step.clip_report().is_none());
+    assert_eq!(first_step.loss_weight(), 5);
+    assert_eq!(runtime.optimizer_step().unwrap(), 0);
+    assert_eq!(runtime.accumulation_index().unwrap(), 1);
+    assert_eq!(
+        runtime
+            .checkpoint()
+            .unwrap()
+            .info()
+            .accumulated_token_count(),
+        Some(5)
+    );
+    let first_contribution = runtime.gradient_accumulator_snapshots().unwrap();
+    assert_eq!(
+        first_contribution.keys().collect::<Vec<_>>(),
+        initial_parameters.keys().collect::<Vec<_>>()
+    );
+
+    let checkpoint = runtime.checkpoint().unwrap();
+    let mut isolated = plan
+        .restore_checkpoint(&checkpoint)
+        .unwrap()
+        .prepare(&CpuSessionTarget)
+        .unwrap();
+    let reset = isolated.zero_grad().unwrap();
+    assert!(reset.did_discard());
+    assert_eq!(reset.discarded_microbatches(), 1);
+    assert_eq!(isolated.optimizer_step().unwrap(), 0);
+    assert_eq!(isolated.accumulation_index().unwrap(), 0);
+    assert_eq!(isolated.dropout_block_counter().unwrap(), Some(84));
+
+    let second_inputs = attention_masked_dropout_batch(2, 1.0);
+    let isolated_step = isolated
+        .step(second_inputs.clone(), TensorData::scalar(LEARNING_RATE))
+        .unwrap();
+    assert!(!isolated_step.did_update());
+    assert!(isolated_step.clip_report().is_none());
+    assert_eq!(isolated_step.loss_weight(), 4);
+    assert_eq!(
+        isolated
+            .checkpoint()
+            .unwrap()
+            .info()
+            .accumulated_token_count(),
+        Some(4)
+    );
+    assert_eq!(isolated.dropout_block_counter().unwrap(), Some(168));
+    let second_contribution = isolated.gradient_accumulator_snapshots().unwrap();
+
+    let second_step = runtime
+        .step(second_inputs, TensorData::scalar(LEARNING_RATE))
+        .unwrap();
+    assert_eq!(second_step.loss(), isolated_step.loss());
+    assert_eq!(second_step.outputs(), isolated_step.outputs());
+    assert_eq!(
+        observed_two_block_dropout_masks(second_step.outputs()),
+        observed_two_block_dropout_masks(isolated_step.outputs())
+    );
+    assert!(second_step.did_update());
+    assert_eq!(second_step.loss_weight(), 4);
+    assert_eq!(
+        first_step.loss_weight() + second_step.loss_weight(),
+        TOKEN_COUNT_TOTAL as u64
+    );
+    assert_eq!(runtime.optimizer_step().unwrap(), 1);
+    assert_eq!(runtime.accumulation_index().unwrap(), 0);
+    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(168));
+    assert_eq!(
+        runtime
+            .checkpoint()
+            .unwrap()
+            .info()
+            .accumulated_token_count(),
+        Some(0)
+    );
+    assert!(
+        runtime
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .all(|value| value == 0.0)
+    );
+
+    let contributions = [first_contribution, second_contribution];
+    let accumulated = literal_accumulated_compiled_clip_norm(
+        &contributions,
+        &initial_parameters,
+        TOKEN_COUNT_TOTAL,
+    );
+    assert_eq!(
+        accumulated.averaged.keys().collect::<Vec<_>>(),
+        initial_parameters.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        accumulated.averaged.values().map(Vec::len).sum::<usize>(),
+        384
+    );
+    assert_eq!(accumulated.direct_norm, accumulated.captured_norm);
+    assert!(accumulated.direct_norm > TWO_BLOCK_MAX_GRADIENT_NORM);
+    let clip_report = second_step.clip_report().unwrap();
+    assert!(clip_report.is_finite());
+    assert_eq!(clip_report.did_clip(), Some(true));
+    assert_eq!(
+        clip_report.pre_clip_global_norm(),
+        accumulated.captured_norm
+    );
+    assert_eq!(
+        clip_report.applied_scale(),
+        graph_f32_div(TWO_BLOCK_MAX_GRADIENT_NORM, accumulated.captured_norm)
+    );
+
+    let expected_moments = reconstruct_adamw_moments(
+        &initial_first_moments,
+        &initial_second_moments,
+        &accumulated.averaged,
+        clip_report.applied_scale(),
+        &optimizer,
+    );
+    let actual_first_moments = runtime.first_moment_snapshots().unwrap();
+    let actual_second_moments = runtime.second_moment_snapshots().unwrap();
+    let first_mismatch =
+        f32_tensor_map_first_bit_mismatch(&actual_first_moments, &expected_moments.first_moments);
+    let second_mismatch =
+        f32_tensor_map_first_bit_mismatch(&actual_second_moments, &expected_moments.second_moments);
+    assert!(
+        first_mismatch.is_none() && second_mismatch.is_none(),
+        "the complete clipped AdamW moment frontier differs: first={first_mismatch:?}, second={second_mismatch:?}"
+    );
+
+    let expected_parameters = reconstruct_adamw_parameters_from_moments(
+        &initial_parameters,
+        &expected_moments.first_moments,
+        &expected_moments.second_moments,
+        &optimizer,
+        1,
+        LEARNING_RATE,
+    );
+    let actual_parameters = runtime.parameter_snapshots().unwrap();
+    let parameter_mismatch =
+        f32_tensor_map_first_bit_mismatch(&actual_parameters, &expected_parameters);
+    assert!(
+        parameter_mismatch.is_none(),
+        "the complete AdamW parameter successor differs: {parameter_mismatch:?}"
+    );
+    assert_eq!(model.tokens.weight.id(), tied_identity);
+    assert!(!actual_parameters.contains_key("lm_head.weight"));
     assert_eq!(compile_count.get(), 1);
 }
 
