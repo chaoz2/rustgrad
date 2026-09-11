@@ -8,7 +8,10 @@ use std::collections::HashMap;
 pub use cpu::CpuBackend;
 pub(crate) use cpu::{execute_prefix_scan, stable_sort_pair};
 pub use jit::{CpuJitBackend, JitBackendError, JitExecution, JitFallback};
-pub(crate) use jit::{PreparedScheduleItem, TensorValueStore};
+pub(crate) use jit::{
+    NativeScheduleLayout, PreparedScheduleItem, TensorValueStore, canonical_transpose_copy,
+    is_canonical_rank2_transpose, schedule_native_layout,
+};
 
 /// A deliberately thin execution boundary. CUDA-specific capabilities will
 /// be exposed by extension traits rather than erased from this common core.

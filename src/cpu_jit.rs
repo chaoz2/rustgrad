@@ -26,7 +26,7 @@ pub(crate) mod symbolic_runtime;
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v34";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v35";
 const MOVEMENT_RENDERER_VERSION: &str = "rustgrad-c11-movement-v2";
 const STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-c11-static-position-v1";
 const THREEFRY_RENDERER_VERSION: &str = "rustgrad-c11-live-threefry-v1";
@@ -527,6 +527,12 @@ impl CpuJit {
     }
     pub fn render_vectorized(kernel: &UOp) -> Result<RenderedC, JitError> {
         render_with_policy(kernel, true)
+    }
+    pub(crate) fn render_matmul_with_layouts(
+        plan: &crate::MatmulKernelPlan,
+        layouts: NativeMatmulLayouts,
+    ) -> Result<RenderedC, JitError> {
+        render_matmul(plan, layouts)
     }
     pub fn compile_vectorized(kernel: &UOp) -> Result<JitKernel, JitError> {
         let rendered = render_with_policy(kernel, true)?;
@@ -1043,7 +1049,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
         _ => None,
     };
     if let Some(plan) = matmul {
-        return render_matmul(plan);
+        return render_matmul(plan, NativeMatmulLayouts::default());
     }
     if let Operation::Conv2d(plan) = root.operation() {
         return render_static_conv2d(plan);
@@ -1854,7 +1860,23 @@ fn render_static_conv2d(plan: &crate::StaticConv2dPlan) -> Result<RenderedC, Jit
     })
 }
 
-fn render_matmul(plan: &crate::MatmulKernelPlan) -> Result<RenderedC, JitError> {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum NativeMatmulOperandLayout {
+    #[default]
+    Dense,
+    Transpose2d,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeMatmulLayouts {
+    pub(crate) lhs: NativeMatmulOperandLayout,
+    pub(crate) rhs: NativeMatmulOperandLayout,
+}
+
+fn render_matmul(
+    plan: &crate::MatmulKernelPlan,
+    layouts: NativeMatmulLayouts,
+) -> Result<RenderedC, JitError> {
     plan.validate()
         .map_err(|error| JitError::Unsupported(error.to_string()))?;
     if !matches!(
@@ -1863,6 +1885,15 @@ fn render_matmul(plan: &crate::MatmulKernelPlan) -> Result<RenderedC, JitError> 
     ) {
         return Err(JitError::Unsupported(
             "static matmul CPU JIT supports only homogeneous F32 or F64".into(),
+        ));
+    }
+    if (layouts.lhs == NativeMatmulOperandLayout::Transpose2d
+        && (plan.lhs_vector || plan.lhs_shape.rank() != 2))
+        || (layouts.rhs == NativeMatmulOperandLayout::Transpose2d
+            && (plan.rhs_vector || plan.rhs_shape.rank() != 2))
+    {
+        return Err(JitError::Unsupported(
+            "native matmul transpose layout requires one rank-2 matrix operand".into(),
         ));
     }
     let elements = |shape: &crate::Shape| {
@@ -1936,11 +1967,15 @@ fn render_matmul(plan: &crate::MatmulKernelPlan) -> Result<RenderedC, JitError> 
     let rhs_batch = batch_offset(&plan.rhs_shape, plan.rhs_vector);
     let lhs_offset = if plan.lhs_vector {
         "rg_k".into()
+    } else if layouts.lhs == NativeMatmulOperandLayout::Transpose2d {
+        format!("(rg_k * {}u + rg_row)", plan.m)
     } else {
         format!("((rg_lbatch * {}u + rg_row) * {}u + rg_k)", plan.m, plan.k)
     };
     let rhs_offset = if plan.rhs_vector {
         "rg_k".into()
+    } else if layouts.rhs == NativeMatmulOperandLayout::Transpose2d {
+        format!("(rg_col * {}u + rg_k)", plan.k)
     } else {
         format!("((rg_rbatch * {}u + rg_k) * {}u + rg_col)", plan.k, plan.n)
     };
@@ -1953,8 +1988,8 @@ fn render_matmul(plan: &crate::MatmulKernelPlan) -> Result<RenderedC, JitError> 
         "#include <stdint.h>".into(),
         "#include <stddef.h>".into(),
         format!(
-            "/* {RENDERER_VERSION} matmul plan={} M={} N={} K={} */",
-            plan.cache_key, plan.m, plan.n, plan.k
+            "/* {RENDERER_VERSION} matmul plan={} M={} N={} K={} lhs={:?} rhs={:?} */",
+            plan.cache_key, plan.m, plan.n, plan.k, layouts.lhs, layouts.rhs
         ),
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         format!("  const {storage} *rg_lhs = (const {storage}*)buffers[{}];", ids[&(plan.lhs.index() as u64)]),
@@ -4705,7 +4740,7 @@ mod tests {
 
     #[test]
     fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v34");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v35");
 
         let execute = |graph: &Graph,
                        output,
@@ -4873,7 +4908,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v34");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v35");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -7808,6 +7843,23 @@ mod tests {
             f32_rendered.cache_key,
             CpuJit::render(&f32_kernel).unwrap().cache_key
         );
+        let f32_plan = match f32_kernel.operation() {
+            Operation::Matmul(MatmulValue::Serial(plan)) => plan.as_ref(),
+            Operation::Matmul(MatmulValue::Tiled(payload)) => &payload.matmul,
+            Operation::Matmul(MatmulValue::TensorCore(payload)) => &payload.matmul,
+            _ => unreachable!(),
+        };
+        let transposed = CpuJit::render_matmul_with_layouts(
+            f32_plan,
+            NativeMatmulLayouts {
+                lhs: NativeMatmulOperandLayout::Dense,
+                rhs: NativeMatmulOperandLayout::Transpose2d,
+            },
+        )
+        .unwrap();
+        assert!(transposed.source.contains("rhs=Transpose2d"));
+        assert!(transposed.source.contains("rg_rhs[(rg_col * 3u + rg_k)]"));
+        assert_ne!(transposed.cache_key, f32_rendered.cache_key);
 
         // This adversarial contraction distinguishes per-step F32 storage
         // rounding from a double accumulator narrowed only at the end.
