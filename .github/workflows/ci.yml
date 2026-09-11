@@ -87,6 +87,9 @@ jobs:
       - name: Compiled Transformer complete-module file resume smoke
         if: matrix.os == 'ubuntu-latest'
         run: cargo run --quiet --example compiled_transformer_train_resume -- cpu-file-resume
+      - name: Compiled Transformer native CPU complete-module file resume smoke
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo run --quiet --example compiled_transformer_train_resume -- native-cpu-file-resume
       - name: Compiled Transformer native CPU scoreboard smoke
         if: matrix.os == 'ubuntu-latest'
         shell: bash
