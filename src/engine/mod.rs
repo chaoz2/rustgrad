@@ -27,6 +27,7 @@ pub use captured_replay::{
     CapturedReplayTrace, CapturedSpecialization, CapturedSpecializationTrace,
 };
 pub use mixed::realize_mixed_effects;
+pub(crate) use native_replay_workspace::NativeReplayTraffic;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,

@@ -1,6 +1,6 @@
 //! Graph-independent interpreter/native replay and deterministic batching.
 use super::capture::{CapturedSchedule, ReplayError};
-use super::native_replay_workspace::NativeReplayWorkspace;
+use super::native_replay_workspace::{NativeReplayTraffic, NativeReplayWorkspace};
 use super::replay_liveness::ReplayLivenessPlan;
 use crate::backend::{JitBackendError, PreparedScheduleItem, TensorValueStore};
 use crate::{
@@ -935,6 +935,16 @@ impl CapturedReplayExecutor {
         provided: &BTreeMap<String, TensorData>,
         plan: &mut PlannedNativeItems,
     ) -> Result<ReplayValues, ReplayError> {
+        self.execute_planned_native_items_observed(capture, provided, plan)
+            .map(|(values, _)| values)
+    }
+
+    pub(crate) fn execute_planned_native_items_observed(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+        plan: &mut PlannedNativeItems,
+    ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
         plan.validate_replay(capture, provided)?;
         plan.workspace.begin(provided)?;
         let mut borrowed = super::native_replay_workspace::NativeReplayBorrowedState::new();
@@ -949,7 +959,8 @@ impl CapturedReplayExecutor {
                 &mut borrowed,
             )?;
         }
-        plan.workspace.materialize(capture, &borrowed, None)
+        let values = plan.workspace.materialize(capture, &borrowed, None)?;
+        Ok((values, plan.workspace.traffic()))
     }
 
     pub(super) fn execute_planned_native_items_resolved<'a>(
@@ -967,7 +978,7 @@ impl CapturedReplayExecutor {
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBorrowedState<'a>,
         ) -> Result<(), ReplayError>,
-    ) -> Result<ReplayValues, ReplayError> {
+    ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
         plan.validate_replay_structure(capture)?;
         validate_quantized_index_inputs(capture)?;
         plan.workspace.begin_resolved();
@@ -987,7 +998,8 @@ impl CapturedReplayExecutor {
                 borrowed,
             )?;
         }
-        plan.workspace.materialize(capture, borrowed, selected)
+        let values = plan.workspace.materialize(capture, borrowed, selected)?;
+        Ok((values, plan.workspace.traffic()))
     }
 }
 
@@ -1478,9 +1490,13 @@ mod tests {
         assert_eq!(prepared.input_import_count, 0);
         assert_eq!(prepared.intermediate_materialization_count, 0);
 
-        let first = executor
-            .execute_planned_native_items(&capture, &bindings, &mut plan)
+        let (first, first_traffic) = executor
+            .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
             .unwrap();
+        assert_eq!(first_traffic.external_input_import_count, 1);
+        assert_eq!(first_traffic.external_input_import_bytes, 8);
+        assert_eq!(first_traffic.borrowed_recurrent_input_bytes, 0);
+        assert_eq!(first_traffic.borrowed_recurrent_output_bytes, 0);
         let first_stats = plan.workspace_stats();
         assert_eq!(first_stats.allocation_count, prepared.allocation_count);
         assert_eq!(first_stats.input_import_count, capture.inputs.len());
@@ -1489,9 +1505,10 @@ mod tests {
             "input".into(),
             TensorData::new([2], vec![3.0, -4.0]).unwrap(),
         )]);
-        let second = executor
-            .execute_planned_native_items(&capture, &changed, &mut plan)
+        let (second, second_traffic) = executor
+            .execute_planned_native_items_observed(&capture, &changed, &mut plan)
             .unwrap();
+        assert_eq!(second_traffic, first_traffic);
         let second_stats = plan.workspace_stats();
         assert_eq!(second_stats.allocation_count, prepared.allocation_count);
         assert_eq!(second_stats.input_import_count, capture.inputs.len() * 2);
@@ -1510,6 +1527,11 @@ mod tests {
         ));
         assert_eq!(plan.workspace_stats(), second_stats);
         assert_eq!(executor.native_item_plan_count(), 1);
+
+        let (_, retried_traffic) = executor
+            .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(retried_traffic, first_traffic);
 
         plan.items.pop();
         assert!(matches!(

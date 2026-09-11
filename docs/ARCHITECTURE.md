@@ -958,16 +958,18 @@ interpreter and strict-Metal targets.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v2 validates those facts against strict-native
+separate `NativeTrainingScoreboard` v3 validates those facts against strict-native
 preparation and committed main-replay reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
 sample set into versioned JSON. It reports deterministic
-schedule/native-item/cache inventories and logical temporary/state peaks; CPU
-kernel launches, host/device transfers,
-and measured physical peak host memory remain unavailable (`null`). Durations
+schedule/native-item/cache inventories, logical temporary/state peaks, and the
+stable per-commit external-input import count/bytes plus borrowed recurrent
+input/output bytes. Rejected attempts expose no traffic sample. CPU
+kernel launches, host/device transfers, and measured physical peak host memory
+remain unavailable (`null`). Durations
 do not change any plan, capture, checkpoint, or native identity, and the report
 makes no threshold or speedup claim. Legacy v1 reports without zero-grad
-inventory remain readable.
+inventory and v2 reports without replay traffic remain readable.
 CPU targets may opt into `CpuNonFinitePolicy::RejectTransition`. The historical
 unit `CpuSessionTarget` remains the propagation default and returns a separate
 `ConfiguredCpuSessionTarget` when that policy is selected; strict-native CPU

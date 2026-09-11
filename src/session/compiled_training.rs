@@ -28,8 +28,8 @@ use super::target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,
     NativeCpuSessionTarget, SessionTarget,
 };
-use crate::engine::PlannedNativeItems;
 use crate::engine::mixed_capture::{NativeReplayContext, PreparedRecurrentNativeReplay};
+use crate::engine::{NativeReplayTraffic, PlannedNativeItems};
 use crate::nn::{
     Parameter, ParameterRestore, ParameterSnapshot, StateKind, TrainingDropoutProvider,
     next_version, restore_parameters,
@@ -51,6 +51,7 @@ use crate::{
 };
 #[cfg(test)]
 use crate::{load_safetensors, save_safetensors};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -1400,6 +1401,52 @@ impl PreparedNativeCpuEvaluation {
     }
 }
 
+/// Logical host traffic completed by one successful strict-native CPU replay.
+///
+/// External imports are owned copies into retained native workspace storage.
+/// Recurrent bytes are borrowed directly from the authoritative active and
+/// inactive host banks; they are not copies or host/device transfers.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCpuReplayTraffic {
+    external_input_import_count: u64,
+    external_input_import_bytes: u64,
+    borrowed_recurrent_input_bytes: u64,
+    borrowed_recurrent_output_bytes: u64,
+}
+
+impl NativeCpuReplayTraffic {
+    pub(crate) const fn new(
+        external_input_import_count: u64,
+        external_input_import_bytes: u64,
+        borrowed_recurrent_input_bytes: u64,
+        borrowed_recurrent_output_bytes: u64,
+    ) -> Self {
+        Self {
+            external_input_import_count,
+            external_input_import_bytes,
+            borrowed_recurrent_input_bytes,
+            borrowed_recurrent_output_bytes,
+        }
+    }
+
+    pub const fn external_input_import_count(&self) -> u64 {
+        self.external_input_import_count
+    }
+
+    pub const fn external_input_import_bytes(&self) -> u64 {
+        self.external_input_import_bytes
+    }
+
+    pub const fn borrowed_recurrent_input_bytes(&self) -> u64 {
+        self.borrowed_recurrent_input_bytes
+    }
+
+    pub const fn borrowed_recurrent_output_bytes(&self) -> u64 {
+        self.borrowed_recurrent_output_bytes
+    }
+}
+
 /// Truthful per-invocation evidence for strict-native CPU replay.
 #[derive(Clone, Debug)]
 pub struct NativeCpuRunReport {
@@ -1409,6 +1456,7 @@ pub struct NativeCpuRunReport {
     successful_invocation: u64,
     native_item_count: usize,
     schedule_cache_keys: Vec<u64>,
+    traffic: NativeCpuReplayTraffic,
     wall_time: Duration,
 }
 
@@ -1444,6 +1492,10 @@ impl NativeCpuRunReport {
 
     pub fn schedule_cache_keys(&self) -> &[u64] {
         &self.schedule_cache_keys
+    }
+
+    pub const fn traffic(&self) -> &NativeCpuReplayTraffic {
+        &self.traffic
     }
 
     pub const fn wall_time(&self) -> Duration {
@@ -4981,8 +5033,8 @@ impl CompiledEvaluationPlan {
         let started = Instant::now();
         let capture = self.inference.capture();
         prepared.validate(self.capture_identity, capture)?;
-        let values = executor
-            .execute_planned_native_items(capture, &inputs, &mut prepared.plan)
+        let (values, traffic) = executor
+            .execute_planned_native_items_observed(capture, &inputs, &mut prepared.plan)
             .map_err(replay_error)?;
         let outputs = values.requested(&capture.requested).map_err(replay_error)?;
         let schedule_cache_keys = prepared.plan.schedule_cache_keys().to_vec();
@@ -4993,6 +5045,7 @@ impl CompiledEvaluationPlan {
             successful_invocation: 0,
             native_item_count: prepared.plan.item_count(),
             schedule_cache_keys,
+            traffic: native_cpu_replay_traffic(traffic),
             wall_time: started.elapsed(),
         };
         Ok((
@@ -5042,6 +5095,7 @@ fn native_cpu_identity(
 fn native_cpu_run_report(
     capture_identity: u64,
     trace: &NativeMixedReplayTrace,
+    traffic: NativeReplayTraffic,
     successful_invocation: u64,
     wall_time: Duration,
 ) -> NativeCpuRunReport {
@@ -5052,8 +5106,18 @@ fn native_cpu_run_report(
         successful_invocation,
         native_item_count: trace.pure_item_cache_keys.len(),
         schedule_cache_keys: trace.pure_item_cache_keys.clone(),
+        traffic: native_cpu_replay_traffic(traffic),
         wall_time,
     }
+}
+
+const fn native_cpu_replay_traffic(traffic: NativeReplayTraffic) -> NativeCpuReplayTraffic {
+    NativeCpuReplayTraffic::new(
+        traffic.external_input_import_count,
+        traffic.external_input_import_bytes,
+        traffic.borrowed_recurrent_input_bytes,
+        traffic.borrowed_recurrent_output_bytes,
+    )
 }
 
 fn evaluation_result(
@@ -5308,6 +5372,8 @@ impl CpuCompiledTrainingProgram {
                 },
             )
             .map_err(replay_error)?;
+        let traffic = replay.traffic;
+        let replay = replay.replay;
         let native = replay
             .native_trace
             .as_ref()
@@ -5315,6 +5381,7 @@ impl CpuCompiledTrainingProgram {
         let report = native_cpu_run_report(
             self.capture_identity(),
             native,
+            traffic,
             next_step,
             started.elapsed(),
         );
@@ -5750,6 +5817,8 @@ impl CpuCompiledTrainingProgram {
                 },
             )
             .map_err(replay_error)?;
+        let traffic = replay.traffic;
+        let replay = replay.replay;
         debug_assert_eq!(
             replay.outputs.len(),
             usize::from(transition.clip_report) * 2
@@ -5767,6 +5836,7 @@ impl CpuCompiledTrainingProgram {
         let report = native_cpu_run_report(
             transition.capture_identity(),
             native,
+            traffic,
             successful_invocation,
             started.elapsed(),
         );
@@ -11813,9 +11883,17 @@ mod tests {
     fn native_cpu_adamw_prepares_strictly_reuses_cache_and_commits_atomically() {
         let plan = CompiledAdamWPlan::compile(adamw_config(), initial_parameters(), build_tinybob)
             .unwrap();
+        let inspection = plan.inspection().unwrap();
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
         let mut native = target.prepare(&plan).unwrap();
+        let mut scoreboard = crate::NativeTrainingScoreboard::new(
+            inspection,
+            native.preparation_report(),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
         assert_eq!(executor.native_item_plan_count(), 1);
         let workspace = native.main_replay.workspace_stats();
         assert!(workspace.allocation_count > 0);
@@ -11871,6 +11949,21 @@ mod tests {
         assert_eq!(actual.report().successful_invocation(), 1);
         assert!(actual.report().first_successful_invocation());
         assert_eq!(actual.report().native_identity(), prepared_native_identity);
+        let first_traffic = *actual.report().traffic();
+        assert!(first_traffic.external_input_import_count() > 0);
+        assert!(first_traffic.external_input_import_bytes() > 0);
+        assert_eq!(
+            first_traffic.borrowed_recurrent_input_bytes(),
+            u64::try_from(recurrent_state_bytes).unwrap()
+        );
+        assert_eq!(
+            first_traffic.borrowed_recurrent_output_bytes(),
+            u64::try_from(recurrent_state_bytes).unwrap()
+        );
+        let mut malformed_report = actual.report().clone();
+        malformed_report.traffic.borrowed_recurrent_output_bytes -= 1;
+        assert!(scoreboard.record(&malformed_report).is_err());
+        scoreboard.record(actual.report()).unwrap();
         assert_native_adamw_state_close(&native, &interpreted);
         let first_workspace = native.main_replay.workspace_stats();
         assert_eq!(first_workspace.allocation_count, workspace.allocation_count);
@@ -11921,6 +12014,12 @@ mod tests {
         assert_eq!(expected.loss_weight(), 1);
         assert_eq!(actual.loss_weight(), 1);
         assert_eq!(actual.report().successful_invocation(), 2);
+        assert_eq!(actual.report().traffic(), &first_traffic);
+        scoreboard.record(actual.report()).unwrap();
+        assert_eq!(
+            scoreboard.report().unwrap().main_replay_traffic().unwrap(),
+            &first_traffic
+        );
         assert_native_adamw_state_close(&native, &interpreted);
         assert_eq!(executor.native_item_plan_count(), 2);
         let retried_workspace = native.main_replay.workspace_stats();
@@ -12064,6 +12163,14 @@ mod tests {
         );
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
         assert_eq!(actual.report().unwrap().successful_invocation(), 1);
+        let flush_traffic = actual.report().unwrap().traffic();
+        assert!(flush_traffic.external_input_import_count() > 0);
+        assert!(flush_traffic.external_input_import_bytes() > 0);
+        assert!(flush_traffic.borrowed_recurrent_input_bytes() > 0);
+        assert_eq!(
+            flush_traffic.borrowed_recurrent_input_bytes(),
+            flush_traffic.borrowed_recurrent_output_bytes()
+        );
         assert_native_adamw_state_close(&native, &interpreted);
 
         let before_empty_flush_workspace = native
@@ -12186,6 +12293,22 @@ mod tests {
             .unwrap();
         assert_eq!(evaluation.report().successful_invocation(), 1);
         assert!(evaluation.report().first_successful_invocation());
+        assert!(evaluation.report().traffic().external_input_import_count() > 0);
+        assert!(evaluation.report().traffic().external_input_import_bytes() > 0);
+        assert_eq!(
+            evaluation
+                .report()
+                .traffic()
+                .borrowed_recurrent_input_bytes(),
+            0
+        );
+        assert_eq!(
+            evaluation
+                .report()
+                .traffic()
+                .borrowed_recurrent_output_bytes(),
+            0
+        );
         assert_eq!(session.checkpoint().unwrap(), checkpoint);
         assert_eq!(executor.native_item_plan_count(), 2);
         let evaluated_workspace = session

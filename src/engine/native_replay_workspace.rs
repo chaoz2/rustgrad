@@ -34,6 +34,14 @@ struct WorkspaceItem {
     output: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeReplayTraffic {
+    pub(crate) external_input_import_count: u64,
+    pub(crate) external_input_import_bytes: u64,
+    pub(crate) borrowed_recurrent_input_bytes: u64,
+    pub(crate) borrowed_recurrent_output_bytes: u64,
+}
+
 /// Private scratch owned by one authenticated prepared native program.
 /// Slots keep allocations, not authoritative replay bindings: every external
 /// value is imported and every mutable derived value is invalidated per run.
@@ -46,6 +54,7 @@ pub(super) struct NativeReplayWorkspace {
     immutable: BTreeSet<usize>,
     egress: Vec<(u64, usize, crate::Shape)>,
     valid: Vec<bool>,
+    current_traffic: NativeReplayTraffic,
     #[cfg(test)]
     input_import_count: usize,
     #[cfg(test)]
@@ -92,6 +101,7 @@ impl NativeReplayWorkspace {
             immutable: BTreeSet::new(),
             egress: Vec::new(),
             valid: Vec::new(),
+            current_traffic: NativeReplayTraffic::default(),
             #[cfg(test)]
             input_import_count: 0,
             #[cfg(test)]
@@ -354,6 +364,7 @@ impl NativeReplayWorkspace {
     }
 
     pub(super) fn begin_resolved(&mut self) {
+        self.current_traffic = NativeReplayTraffic::default();
         self.valid.fill(false);
         for slot in &self.immutable {
             self.valid[*slot] = true;
@@ -379,6 +390,16 @@ impl NativeReplayWorkspace {
             .copy_from_tensor(value)
             .map_err(|error| ReplayError::Backend(error.to_string()))?;
         self.valid[slot] = true;
+        self.current_traffic.external_input_import_count = self
+            .current_traffic
+            .external_input_import_count
+            .checked_add(1)
+            .ok_or_else(|| ReplayError::Descriptor("native input import count overflows".into()))?;
+        self.current_traffic.external_input_import_bytes = self
+            .current_traffic
+            .external_input_import_bytes
+            .checked_add(tensor_bytes(value)?)
+            .ok_or_else(|| ReplayError::Descriptor("native input import bytes overflow".into()))?;
         #[cfg(test)]
         {
             self.input_import_count += 1;
@@ -442,6 +463,13 @@ impl NativeReplayWorkspace {
                 bound_slots.insert(alias);
             }
         }
+        self.current_traffic.borrowed_recurrent_input_bytes = self
+            .current_traffic
+            .borrowed_recurrent_input_bytes
+            .checked_add(tensor_bytes(value)?)
+            .ok_or_else(|| {
+                ReplayError::Descriptor("native borrowed recurrent input bytes overflow".into())
+            })?;
         #[cfg(test)]
         {
             self.borrowed_recurrent_input_bytes = self
@@ -478,15 +506,28 @@ impl NativeReplayWorkspace {
                 "native workspace borrowed output {buffer} descriptor mismatch"
             )));
         }
+        let bytes = tensor_bytes(value)?;
+        let next_traffic_bytes = self
+            .current_traffic
+            .borrowed_recurrent_output_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| {
+                ReplayError::Descriptor("native borrowed recurrent output bytes overflow".into())
+            })?;
+        #[cfg(test)]
+        let test_bytes = usize::try_from(bytes).map_err(|_| {
+            ReplayError::Descriptor("native test traffic bytes exceed usize".into())
+        })?;
+        borrowed
+            .slots
+            .insert(slot, crate::cpu_jit::BorrowedJitBuffer::Write(value));
+        self.current_traffic.borrowed_recurrent_output_bytes = next_traffic_bytes;
         #[cfg(test)]
         {
             self.borrowed_recurrent_output_bytes = self
                 .borrowed_recurrent_output_bytes
-                .saturating_add(value.len().saturating_mul(value.dtype().itemsize()));
+                .saturating_add(test_bytes);
         }
-        borrowed
-            .slots
-            .insert(slot, crate::cpu_jit::BorrowedJitBuffer::Write(value));
         Ok(())
     }
 
@@ -644,6 +685,10 @@ impl NativeReplayWorkspace {
         Ok(values)
     }
 
+    pub(super) const fn traffic(&self) -> NativeReplayTraffic {
+        self.current_traffic
+    }
+
     #[cfg(test)]
     pub(super) fn stats(&self) -> NativeReplayWorkspaceStats {
         NativeReplayWorkspaceStats {
@@ -654,6 +699,15 @@ impl NativeReplayWorkspace {
             borrowed_recurrent_output_bytes: self.borrowed_recurrent_output_bytes,
         }
     }
+}
+
+fn tensor_bytes(value: &TensorData) -> Result<u64, ReplayError> {
+    let bytes = value
+        .len()
+        .checked_mul(value.dtype().itemsize())
+        .ok_or_else(|| ReplayError::Descriptor("native replay tensor bytes overflow".into()))?;
+    u64::try_from(bytes)
+        .map_err(|_| ReplayError::Descriptor("native replay tensor bytes exceed u64".into()))
 }
 
 fn two_buffers(
