@@ -923,6 +923,9 @@ module/optimizer-name contract, realizes output/loss/gradients before the
 existing optimizer update, then advances a metric-free scheduler. Checkpoint
 ownership remains solely with `PortableTrainingCheckpoint`; this bridge adds no
 trainer, optimizer, state format, device fallback, or persistent gradient map.
+
+### Compiled recurrent training
+
 `session/compiled_training.rs` is the static recurrent-training seam.
 Its private optimizer-program interface separates optimizer state/update math
 from one shared compiler, capture, replay, and effect-commit engine. After
@@ -930,9 +933,26 @@ lowering, an optimizer-neutral Metal plan/runtime core likewise owns recurrent
 rendering, resource preparation, input validation, output projection,
 evaluation, scoreboard observation, and semantic state snapshots; the AdamW
 facade adds only its progress/policy interpretation and portable checkpoint.
-AdamW compilation with a multi-replay accumulation window also produces a
-separate authenticated state-only transition over the exact parameter,
-moment, accumulator, optimizer-step, and accumulation-index schema. The
+
+#### Phase-specialized AdamW accumulation
+
+AdamW compilation with a multi-replay accumulation window preserves the
+authoritative main capture while deriving a private CPU accumulation-only
+sibling from the same forward/loss/backward and recurrent schema. That sibling
+roots only gradient accumulators, accumulation index, optional token/loss
+totals, and source-ordered dropout advancement; parameters, moments, and
+optimizer step are complete authenticated pass-through successors. Host
+progress selects it only before the window-closing replay, while every
+successful transition still replaces the full frontier and advances every
+logical version once. Learning-rate values are validated even though neither
+external nor scheduled learning-rate/AdamW candidate work is reachable. The
+interpreter and strict-native CPU refrontier the sibling's atomic commit into
+the authoritative main cursor; checkpoint v9 authenticates both capture
+identities. The strict-Metal program and execution path remain the existing
+single main capture.
+AdamW accumulation also produces a separate authenticated state-only partial
+flush transition over the exact parameter, moment, accumulator,
+optimizer-step, and accumulation-index schema. The
 backend-neutral `CompiledAdamWFlushRuntime` capability is implemented by CPU
 and strict Metal: a nonempty flush consumes that live frontier plus an
 explicit scalar learning rate, averages by the retained microbatch count,
@@ -949,20 +969,24 @@ source frontier retryable. Flush count and flushed-microbatch count authenticate
 progress and reconstruct the distinct optimizer/workload logical versions on
 checkpoint restore. No live Apple-hardware flush result is claimed by this
 semantic implementation.
+
+#### Captured training and native replay
+
 `CpuCompiledMomentumSgd` and `CpuCompiledAdamW` consume detached named F32
 parameter values, build one private Graph with one batched reverse traversal,
 and capture the pure loss/output/update prefix together with ordered parameter
 and optimizer-state stores. AdamW keeps first and second moments plus its U64
 step counter inside that same captured recurrent frontier.
 `NativeCpuSessionTarget` is a separate strict-native AdamW preparation target,
-not a mode on the interpreter session. It precompiles the main replay and every
-attached partial-flush/zero-grad/evaluation pure program through the existing
+not a mode on the interpreter session. It precompiles the main replay, private
+accumulation sibling, and every attached partial-flush/zero-grad/evaluation pure
+program through the existing
 `CapturedReplayExecutor` before returning mutable state, then reuses the same
 mixed staging and single `EffectRuntime` commit with interpreter fallback
 disabled. Capture/recurrent witnesses, layouts, rendering, ABI, and cache
 preflight remain sequential. Distinct durable cache misses then enter
 per-artifact compile/load gates through a process-wide two-permit compiler pool;
-complete jobs finalize in canonical main/partial-flush/zero-grad/evaluation
+complete jobs finalize in canonical main/accumulation/partial-flush/zero-grad/evaluation
 order. Identical keys cannot race loading or damaged-cache recovery, and
 optional programs do not perturb another program's artifact key. Each attached
 schedule renders its ordered native entries once and
@@ -982,7 +1006,7 @@ The reported segment count is therefore the actual Rust-to-C call count, while
 logical item order and exact failing-item attribution remain unchanged. Each
 prepared recurrent program seals its validated RGSM identity,
 pure cache/layout inventory, replacement map, and initial frontier descriptor
-once. Main, partial-flush, and zero-grad hot replay therefore repeats only
+once. Main, accumulation, partial-flush, and zero-grad hot replay therefore repeats only
 call-dependent cursor, input, active-bank, quantized-index, successor, and
 transaction admission; generic artifact replay retains full per-call artifact
 validation. Its typed preparation/run reports expose only CPU facts: native item
@@ -994,11 +1018,14 @@ times excluded from identity.
 Unsupported preparation and failed execution or commit publish neither state
 nor progress; checkpoint bytes and capture identity are shared with the
 interpreter and strict-Metal targets.
+
+#### Native training evidence
+
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
-the main and optional flush/zero-grad/evaluation programs plus checked logical
+the main and optional accumulation/flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v10 validates those facts against strict-native
-preparation and committed main-replay reports, then aggregates caller-observed
+separate `NativeTrainingScoreboard` v11 validates those facts against strict-native
+preparation and successful training-step reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
 sample set into versioned JSON. Every attached native program partitions its
 runtime-observed preparation total exactly into layout, rendering, compiler
@@ -1008,17 +1035,20 @@ the caller-observed whole-prepare remainder is checked after subtracting the
 complete-job overlap from summed program totals. V9 separately authenticates
 logical schedule/cache coverage and grouped physical rendered/executed entry
 counts; v5-v8 retain their original one-rendered-entry-per-logical-item wire
-invariant. Raw report recording continues to emit v9, while `record_step`
-emits v10 and classifies successful main replays solely from `did_update`:
+invariant. Raw report recording continues to emit v9. Without a sibling,
+`record_step` emits v10; phase-specialized accumulation emits v11 and
+authenticates distinct program, cache, traffic, and executed-entry inventories
+for accumulation-only versus optimizer-commit replay. Both classify successful
+steps solely from `did_update`:
 the first replay remains separate and warm accumulation-only and optimizer-commit
-samples have disjoint, exact timing partitions. V1-v9 JSON remains readable,
+samples have disjoint, exact timing partitions. V1-v10 JSON remains readable,
 and one scoreboard rejects mixed raw/classified recording without consuming a
 sample. Partial flush is not a main-step sample. Main replay wall time is partitioned exactly
 between the sealed native executor and the checked recurrent
 staging/validation/commit remainder; failed calls publish neither phase. It
 reports deterministic
-schedule/native-item/cache inventories, the stable successful main-replay CPU
-JIT item-execution count, logical temporary/state peaks, and the per-commit
+schedule/native-item/cache inventories, stable phase-specific successful CPU
+JIT item-execution counts, logical temporary/state peaks, and per-step
 fallback external-input import count/bytes plus borrowed recurrent input/output
 bytes. Dense F32/I32 inputs bind caller-owned storage
 read-only for exactly one replay call, so their successful import counts are
@@ -1181,7 +1211,10 @@ successor selects a typed zero through a state-dependent false predicate, so
 NaN/Inf accumulators clear without `x - x`; empty windows remain exact no-ops.
 Checkpoint v7 authenticates successful reset history and its capture identity,
 allowing restore to reconstruct split state versions exactly while v1--v6
-decoding and historical bytes remain unchanged.
+decoding and historical bytes remain unchanged. Accumulation windows now emit
+v9 to authenticate the private CPU accumulation-only capture in addition to the
+unchanged authoritative main identity; v1--v8 remain readable for compatible
+legacy restore.
 Interpreter and strict-native inputs are preflighted as finite, binary, and
 nonempty without moving the batch-owned right-padding rule into the runtime.
 Metal rejects this CPU-first policy before resource planning.

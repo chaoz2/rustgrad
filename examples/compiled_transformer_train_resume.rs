@@ -837,6 +837,9 @@ where
     let initial_mean_sparse_loss = evaluate_mean_sparse_loss(&model)?;
     let plan = compile(model)?;
     let capture_identity = plan.capture_identity();
+    let flush_capture_identity = plan
+        .flush_capture_identity()
+        .expect("three-step accumulation exposes a partial-flush capture");
     let mut uninterrupted = prepare(plan)?;
     let evaluation_identity = uninterrupted
         .evaluation_capture_identity()
@@ -909,7 +912,14 @@ where
     assert_eq!(checkpoint_info.discarded_microbatches(), 2);
     assert_eq!(checkpoint_info.flushed_window_count(), 0);
     assert_eq!(checkpoint_info.flushed_microbatch_count(), 0);
-    assert_eq!(checkpoint_info.flush_capture_identity(), None);
+    assert_eq!(
+        checkpoint_info.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
+    assert_eq!(
+        uninterrupted.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
     assert_eq!(checkpoint_info.dropout_block_counter(), Some(48));
     let resumed_first_replay = checkpoint_info.replay_step() + 1;
     let resumed_last_replay = checkpoint_info.replay_step() + RESUMED_STEPS as u64;
@@ -1744,6 +1754,21 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     );
     assert_eq!(main_preparation.work().loaded_module_count(), 1);
     assert!(main_preparation.work().compiler_invocation_count() <= 1);
+    let accumulation_preparation = session
+        .preparation_report()
+        .accumulation()
+        .expect("scoreboard configuration captures accumulation-only replay");
+    assert_ne!(
+        accumulation_preparation.capture_identity(),
+        main_preparation.capture_identity()
+    );
+    assert!(accumulation_preparation.native_item_count() < main_preparation.native_item_count());
+    assert!(
+        accumulation_preparation.work().rendered_entry_count()
+            < main_preparation.work().rendered_entry_count()
+    );
+    assert_eq!(accumulation_preparation.work().loaded_module_count(), 1);
+    assert!(accumulation_preparation.work().compiler_invocation_count() <= 1);
     let partial_preparation = session
         .preparation_report()
         .partial_flush()
@@ -1770,7 +1795,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             .rendered_entry_count(),
         EXPECTED_ZERO_GRAD_ENTRIES
     );
-    assert!(session.preparation_report().compiler_process_count() <= 3);
+    assert!(session.preparation_report().compiler_process_count() <= 4);
     assert!(
         session
             .preparation_report()
@@ -1778,7 +1803,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             <= 2
     );
     if env::var_os("RUSTGRAD_REQUIRE_COLD_NATIVE_SCOREBOARD").is_some() {
-        assert_eq!(session.preparation_report().compiler_process_count(), 3);
+        assert_eq!(session.preparation_report().compiler_process_count(), 4);
         assert_eq!(
             session
                 .preparation_report()
@@ -1805,7 +1830,8 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         prepare_wall_time,
     )?;
     let recurrent_state_bytes = u64::try_from(inspection.recurrent_state_bytes())?;
-    let mut stable_executed_native_items = None;
+    let mut stable_accumulation_executed_native_items = None;
+    let mut committed_executed_native_items = None;
     for replay in 1..=SAMPLES {
         let batch = masked_batch(replay)?;
         assert_eq!(
@@ -1818,17 +1844,21 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         let executed = report.executed_native_item_count();
         assert!(executed > 0);
         assert!(executed <= report.native_item_count());
-        assert_eq!(
-            report.module_dispatch_count(),
-            EXPECTED_MODULE_DISPATCHES,
-            "the fixed workspace must retain its authenticated safe-segment partition"
-        );
+        if step.did_update() {
+            assert_eq!(
+                report.module_dispatch_count(),
+                EXPECTED_MODULE_DISPATCHES,
+                "the commit program must retain its authenticated safe-segment partition"
+            );
+        }
         assert_eq!(report.module_dispatched_native_item_count(), executed);
         assert!(report.module_dispatch_count() < executed);
-        if let Some(expected) = stable_executed_native_items {
+        if step.did_update() {
+            assert!(committed_executed_native_items.replace(executed).is_none());
+        } else if let Some(expected) = stable_accumulation_executed_native_items {
             assert_eq!(executed, expected);
         } else {
-            stable_executed_native_items = Some(executed);
+            stable_accumulation_executed_native_items = Some(executed);
         }
         scoreboard.record_step(&step)?;
     }
@@ -1854,6 +1884,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     assert!(report.main().compiler_invocation_count() <= 1);
     let program_prepare_wall_time = [
         Some(report.main()),
+        report.accumulation(),
         report.partial_flush(),
         report.zero_grad(),
         report.evaluation(),
@@ -1952,8 +1983,8 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         report.steady_replay_total_wall_time().to_duration()?
     );
     assert_eq!(
-        Some(executed_native_items as usize),
-        stable_executed_native_items
+        Some(usize::try_from(executed_native_items)?),
+        committed_executed_native_items
     );
     assert!(executed_native_items <= report.main().native_item_count());
     let replay_traffic = report
@@ -1969,10 +2000,42 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         replay_traffic.borrowed_recurrent_output_bytes(),
         recurrent_state_bytes
     );
+    let accumulation = report
+        .accumulation()
+        .expect("phase-specialized scoreboard reports the accumulation program");
+    let accumulation_executed = report
+        .accumulation_replay_executed_native_item_count()
+        .expect("phase-specialized scoreboard reports accumulation execution");
+    assert_eq!(
+        Some(usize::try_from(accumulation_executed)?),
+        stable_accumulation_executed_native_items
+    );
+    assert!(accumulation_executed < executed_native_items);
+    assert_eq!(
+        report.accumulation_schedule_cache_keys().len(),
+        usize::try_from(accumulation.native_item_count())?
+    );
+    let accumulation_traffic = report
+        .accumulation_replay_traffic()
+        .expect("phase-specialized scoreboard reports accumulation traffic");
+    assert_eq!(accumulation_traffic.external_input_import_count(), 0);
+    assert_eq!(accumulation_traffic.external_input_import_bytes(), 0);
+    assert_eq!(
+        accumulation_traffic.borrowed_recurrent_input_bytes(),
+        recurrent_state_bytes
+    );
+    assert_eq!(
+        accumulation_traffic.borrowed_recurrent_output_bytes(),
+        recurrent_state_bytes
+    );
 
     let restored = plan.restore_checkpoint(&checkpoint)?;
     let restored_inspection = restored.inspection()?;
     assert_eq!(restored_inspection.main(), inspection.main());
+    assert_eq!(
+        restored_inspection.accumulation(),
+        inspection.accumulation()
+    );
     assert_eq!(
         restored_inspection.partial_flush(),
         inspection.partial_flush()
@@ -1999,6 +2062,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     );
     for program in [
         Some(restored_preparation.main()),
+        restored_preparation.accumulation(),
         restored_preparation.partial_flush(),
         restored_preparation.zero_grad(),
         restored_preparation.evaluation(),
@@ -2023,7 +2087,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(restored_report.fallback_count(), 0);
     assert_eq!(
         u64::try_from(restored_report.native_item_count())?,
-        report.main().native_item_count()
+        accumulation.native_item_count()
     );
     assert_eq!(restored_report.traffic().external_input_import_count(), 0);
     assert_eq!(restored_report.traffic().external_input_import_bytes(), 0);
@@ -2037,7 +2101,8 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     );
     assert_eq!(
         restored_report.executed_native_item_count(),
-        stable_executed_native_items.expect("the scoreboard recorded successful replays")
+        stable_accumulation_executed_native_items
+            .expect("the scoreboard recorded successful accumulation replays")
     );
 
     print!("{}", String::from_utf8(report.to_json_bytes()?)?);

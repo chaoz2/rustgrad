@@ -2404,6 +2404,7 @@ fn assert_captured_cpu_reset_matches_metal_host_reset<C, M>(
             info.flush_capture_identity(),
             info.dropout_block_counter(),
             info.accumulated_token_count(),
+            info.accumulation_capture_identity(),
         )
     };
     assert_eq!(
@@ -2411,14 +2412,14 @@ fn assert_captured_cpu_reset_matches_metal_host_reset<C, M>(
         portable_progress(&metal_checkpoint)
     );
 
-    assert_eq!(cpu_metadata["format"], "rustgrad-compiled-adamw-v7");
+    assert_eq!(cpu_metadata["format"], "rustgrad-compiled-adamw-v9");
     assert_eq!(cpu_checkpoint.info().reset_transition_count(), 1);
     assert_eq!(
         cpu_checkpoint.info().reset_capture_identity(),
         cpu.zero_grad_capture_identity()
     );
     assert!(cpu.zero_grad_capture_identity().is_some());
-    assert_eq!(metal_metadata["format"], "rustgrad-compiled-adamw-v3");
+    assert_eq!(metal_metadata["format"], "rustgrad-compiled-adamw-v9");
     assert_eq!(metal_checkpoint.info().reset_transition_count(), 0);
     assert_eq!(metal_checkpoint.info().reset_capture_identity(), None);
     assert_eq!(metal.zero_grad_capture_identity(), None);

@@ -3556,6 +3556,12 @@ where
     let initial_mean_sparse_loss = evaluate_mean_sparse_loss(&model);
     let plan = owned_compiled_transformer(model);
     let capture_identity = plan.capture_identity();
+    let accumulation_capture_identity = plan
+        .accumulation_capture_identity()
+        .expect("three-step accumulation must expose its sibling capture identity");
+    let flush_capture_identity = plan
+        .flush_capture_identity()
+        .expect("three-step accumulation must expose its partial-flush capture identity");
     let mut uninterrupted = prepare(plan).unwrap();
     assert!(
         uninterrupted
@@ -3630,7 +3636,7 @@ where
     let saved = uninterrupted.checkpoint().unwrap();
     let checkpoint = CompiledAdamWCheckpoint::from_bytes(saved.into_bytes()).unwrap();
     let (_, checkpoint_metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
-    assert_eq!(checkpoint_metadata["format"], "rustgrad-compiled-adamw-v7");
+    assert_eq!(checkpoint_metadata["format"], "rustgrad-compiled-adamw-v9");
     let checkpoint_info = *checkpoint.info();
     assert_eq!(checkpoint_info.capture_identity(), capture_identity);
     assert_eq!(checkpoint_info.replay_step(), 4);
@@ -3641,11 +3647,22 @@ where
         uninterrupted.zero_grad_capture_identity()
     );
     assert_eq!(checkpoint_info.gradient_accumulation_steps(), 3);
+    assert_eq!(
+        checkpoint_info.accumulation_capture_identity(),
+        Some(accumulation_capture_identity)
+    );
     assert_eq!(checkpoint_info.accumulation_index(), 2);
     assert_eq!(checkpoint_info.discarded_microbatches(), 2);
     assert_eq!(checkpoint_info.flushed_window_count(), 0);
     assert_eq!(checkpoint_info.flushed_microbatch_count(), 0);
-    assert_eq!(checkpoint_info.flush_capture_identity(), None);
+    assert_eq!(
+        checkpoint_info.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
+    assert_eq!(
+        uninterrupted.flush_capture_identity(),
+        Some(flush_capture_identity)
+    );
     assert_eq!(checkpoint_info.dropout_block_counter(), Some(48));
     let resumed_model = TinyCausalTransformer::new(7).unwrap();
     let tied = resumed_model.tokens.weight.clone();
@@ -4032,6 +4049,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let inspection = plan.inspection().unwrap();
     assert!(inspection.main().1.schedule_item_count > 0);
     assert!(inspection.main().1.peak_logical_bytes > 0);
+    assert!(inspection.accumulation().is_some());
     assert!(inspection.partial_flush().is_some());
     assert!(inspection.zero_grad().is_some());
     assert!(inspection.evaluation().is_none());
@@ -4044,6 +4062,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let preparation = session.preparation_report();
     let preparation_parallel_module_overlap = preparation.parallel_module_overlap_wall_time();
     let prepare_wall_time = std::iter::once(preparation.main())
+        .chain(preparation.accumulation())
         .chain(preparation.partial_flush())
         .chain(preparation.zero_grad())
         .chain(preparation.evaluation())
@@ -4079,6 +4098,28 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     scoreboard
         .observe_checkpoint(&checkpoint, Duration::ZERO)
         .unwrap();
+    let observed_checkpoint_report = scoreboard.report().unwrap();
+    let (state, mut metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+    let mut wrong_accumulation_identity = checkpoint
+        .info()
+        .accumulation_capture_identity()
+        .unwrap()
+        .wrapping_add(1);
+    if wrong_accumulation_identity == checkpoint.info().capture_identity() {
+        wrong_accumulation_identity = wrong_accumulation_identity.wrapping_add(1);
+    }
+    metadata.insert(
+        "accumulation_capture_identity".into(),
+        wrong_accumulation_identity.to_string(),
+    );
+    let wrong_accumulation_checkpoint =
+        CompiledAdamWCheckpoint::from_bytes(save_safetensors(&state, &metadata).unwrap()).unwrap();
+    assert!(
+        scoreboard
+            .observe_checkpoint(&wrong_accumulation_checkpoint, Duration::from_nanos(1))
+            .is_err()
+    );
+    assert_eq!(scoreboard.report().unwrap(), observed_checkpoint_report);
     let report = scoreboard.report().unwrap();
     let bytes = report.to_json_bytes().unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -4114,6 +4155,45 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         report.schedule_cache_keys().len(),
         report.main().native_item_count() as usize
     );
+    let (accumulation_capture_identity, accumulation_execution_plan) =
+        inspection.accumulation().unwrap();
+    let accumulation = report.accumulation().unwrap();
+    assert_eq!(
+        accumulation.capture_identity(),
+        accumulation_capture_identity
+    );
+    assert_eq!(
+        accumulation.execution_plan_identity(),
+        accumulation_execution_plan.identity
+    );
+    assert_eq!(
+        accumulation.logical_schedule_item_count() as usize,
+        accumulation_execution_plan.schedule_item_count
+    );
+    assert_eq!(
+        accumulation.peak_logical_temporary_bytes() as usize,
+        accumulation_execution_plan.peak_logical_bytes
+    );
+    assert_eq!(
+        report.accumulation_schedule_cache_keys().len(),
+        accumulation.native_item_count() as usize
+    );
+    let accumulation_executed_native_item_count = report
+        .accumulation_replay_executed_native_item_count()
+        .unwrap();
+    assert!(accumulation_executed_native_item_count > 0);
+    assert!(accumulation_executed_native_item_count <= accumulation.native_item_count());
+    let accumulation_traffic = report.accumulation_replay_traffic().unwrap();
+    assert_eq!(accumulation_traffic.external_input_import_count(), 0);
+    assert_eq!(accumulation_traffic.external_input_import_bytes(), 0);
+    assert_eq!(
+        usize::try_from(accumulation_traffic.borrowed_recurrent_input_bytes()).unwrap(),
+        inspection.recurrent_state_bytes()
+    );
+    assert_eq!(
+        usize::try_from(accumulation_traffic.borrowed_recurrent_output_bytes()).unwrap(),
+        inspection.recurrent_state_bytes()
+    );
     assert_eq!(
         report.partial_flush().unwrap().capture_identity(),
         inspection.partial_flush().unwrap().0
@@ -4125,6 +4205,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     assert_eq!(report.fallback_count(), 0);
     let program_prepare_total = [
         Some(report.main()),
+        report.accumulation(),
         report.partial_flush(),
         report.zero_grad(),
         report.evaluation(),
@@ -4227,7 +4308,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     );
     assert!(json["main_replay_executor_wall_time"].is_object());
     assert!(json["main_replay_recurrent_overhead_wall_time"].is_object());
-    assert_eq!(json["format_version"], 10);
+    assert_eq!(json["format_version"], 11);
     assert_eq!(
         json["step_phases"]["warm_accumulation_only"]["wall_time"]["sample_count"],
         1
@@ -7370,6 +7451,7 @@ fn owned_compiled_transformer_flushes_a_partial_window_and_resumes_exactly() {
     let frozen_before = model.frozen_scale.snapshot().unwrap();
     let plan = owned_compiled_transformer(model);
     let flush_identity = plan.flush_capture_identity().unwrap();
+    let accumulation_capture_identity = plan.accumulation_capture_identity().unwrap();
     let mut session = plan.prepare(&CpuSessionTarget::new()).unwrap();
     let initial_parameters = session.parameter_snapshots().unwrap();
     for replay in 1..=2 {
@@ -7403,11 +7485,15 @@ fn owned_compiled_transformer_flushes_a_partial_window_and_resumes_exactly() {
 
     let checkpoint = session.checkpoint().unwrap();
     let (_, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
-    assert_eq!(metadata["format"], "rustgrad-compiled-adamw-v5");
+    assert_eq!(metadata["format"], "rustgrad-compiled-adamw-v9");
     let checkpoint_info = checkpoint.info();
     assert_eq!(checkpoint_info.replay_step(), 2);
     assert_eq!(checkpoint_info.optimizer_step(), 1);
     assert_eq!(checkpoint_info.gradient_accumulation_steps(), 3);
+    assert_eq!(
+        checkpoint_info.accumulation_capture_identity(),
+        Some(accumulation_capture_identity)
+    );
     assert_eq!(checkpoint_info.accumulation_index(), 0);
     assert_eq!(checkpoint_info.discarded_microbatches(), 0);
     assert_eq!(checkpoint_info.flushed_window_count(), 1);
@@ -7939,6 +8025,7 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     .with_evaluation(build_evaluation)
     .unwrap();
     let capture_identity = seed.capture_identity();
+    let accumulation_capture_identity = seed.accumulation_capture_identity().unwrap();
     let cpu_model = TinyCausalTransformer::new(7).unwrap();
     let cpu_seed = CompiledModuleAdamWPlan::compile_with_dropout(
         policy.clone(),
@@ -8289,12 +8376,20 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(partial_parameter_lanes, 58);
     assert_eq!(partial_accumulator_lanes, 58);
     let (checkpoint_state, checkpoint_metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
-    assert_eq!(checkpoint_metadata["format"], "rustgrad-compiled-adamw-v4");
+    assert_eq!(checkpoint_metadata["format"], "rustgrad-compiled-adamw-v9");
     assert_eq!(checkpoint_metadata["replay_step"], "4");
     assert_eq!(checkpoint_metadata["optimizer_step"], "0");
     assert_eq!(checkpoint_metadata["gradient_accumulation_steps"], "3");
     assert_eq!(checkpoint_metadata["accumulation_index"], "2");
     assert_eq!(checkpoint_metadata["discarded_microbatch_count"], "2");
+    assert_eq!(
+        checkpoint.info().accumulation_capture_identity(),
+        Some(accumulation_capture_identity)
+    );
+    assert_eq!(
+        cpu_checkpoint.info().accumulation_capture_identity(),
+        Some(accumulation_capture_identity)
+    );
     assert_frozen_embedding_checkpoint_inventory(&checkpoint, &initial_parameters, 48);
     assert_eq!(
         checkpoint_state["dropout_block_counter"]
@@ -8482,13 +8577,19 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
 
     let checkpoint_after_flush = resumed.checkpoint().unwrap();
     let (_, flush_metadata) = load_safetensors(checkpoint_after_flush.as_bytes()).unwrap();
-    assert_eq!(flush_metadata["format"], "rustgrad-compiled-adamw-v5");
+    assert_eq!(flush_metadata["format"], "rustgrad-compiled-adamw-v9");
     assert_eq!(flush_metadata["replay_step"], "4");
     assert_eq!(flush_metadata["optimizer_step"], "1");
     assert_eq!(flush_metadata["accumulation_index"], "0");
     assert_eq!(flush_metadata["discarded_microbatch_count"], "2");
     assert_eq!(flush_metadata["flushed_window_count"], "1");
     assert_eq!(flush_metadata["flushed_microbatch_count"], "2");
+    assert_eq!(
+        checkpoint_after_flush
+            .info()
+            .accumulation_capture_identity(),
+        Some(accumulation_capture_identity)
+    );
     assert_frozen_embedding_checkpoint_inventory(&checkpoint_after_flush, &initial_parameters, 48);
     let epoch_after_flush = resumed.metal_session().state_epoch();
     let scoreboard_after_flush = resumed.execution_scoreboard_report().unwrap().unwrap();
@@ -8675,13 +8776,21 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     }
     let (final_state, final_metadata) =
         load_safetensors(resumed.checkpoint().unwrap().as_bytes()).unwrap();
-    assert_eq!(final_metadata["format"], "rustgrad-compiled-adamw-v5");
+    assert_eq!(final_metadata["format"], "rustgrad-compiled-adamw-v9");
     assert_eq!(final_metadata["replay_step"], "7");
     assert_eq!(final_metadata["optimizer_step"], "2");
     assert_eq!(final_metadata["accumulation_index"], "0");
     assert_eq!(final_metadata["discarded_microbatch_count"], "2");
     assert_eq!(final_metadata["flushed_window_count"], "1");
     assert_eq!(final_metadata["flushed_microbatch_count"], "2");
+    assert_eq!(
+        resumed
+            .checkpoint()
+            .unwrap()
+            .info()
+            .accumulation_capture_identity(),
+        Some(accumulation_capture_identity)
+    );
     assert_frozen_embedding_checkpoint_inventory(
         &resumed.checkpoint().unwrap(),
         &initial_parameters,
