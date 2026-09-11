@@ -52,7 +52,7 @@ pub(crate) use inference::{
 };
 pub use native_training_scoreboard::{
     CompiledAdamWInspection, NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeTrainingProgramReport,
-    NativeTrainingReport, NativeTrainingScoreboard,
+    NativeTrainingReplayTiming, NativeTrainingReport, NativeTrainingScoreboard,
 };
 pub use target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,

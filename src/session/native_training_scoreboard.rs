@@ -18,7 +18,8 @@ use std::time::Duration;
 const NATIVE_TRAINING_REPORT_FORMAT_V2: u32 = 2;
 const NATIVE_TRAINING_REPORT_FORMAT_V3: u32 = 3;
 const NATIVE_TRAINING_REPORT_FORMAT_V4: u32 = 4;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 5;
+const NATIVE_TRAINING_REPORT_FORMAT_V5: u32 = 5;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 6;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,7 +191,7 @@ impl NativeTrainingProgramReport {
             self.durable_artifact_cache_miss_count,
             self.compiler_invocation_count,
         ];
-        if format_version < NATIVE_TRAINING_REPORT_FORMAT_VERSION {
+        if format_version < NATIVE_TRAINING_REPORT_FORMAT_V5 {
             if preparation.into_iter().any(|value| value != 0) {
                 return Err(invalid(
                     "legacy native program has module preparation evidence",
@@ -285,6 +286,71 @@ struct CheckpointReport {
     wall_time: BenchmarkDuration,
 }
 
+/// First-replay and bounded steady-replay wall time for one measured portion
+/// of successful strict-native CPU main replay.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTrainingReplayTiming {
+    first: BenchmarkDuration,
+    steady_total: BenchmarkDuration,
+    steady: BenchmarkLatencySummary,
+}
+
+impl NativeTrainingReplayTiming {
+    pub const fn first(&self) -> BenchmarkDuration {
+        self.first
+    }
+
+    pub const fn steady_total(&self) -> BenchmarkDuration {
+        self.steady_total
+    }
+
+    pub const fn steady(&self) -> &BenchmarkLatencySummary {
+        &self.steady
+    }
+
+    fn from_durations(first: Duration, steady: &[Duration]) -> Result<Self> {
+        Ok(Self {
+            first: BenchmarkDuration::from_duration(first),
+            steady_total: sum_durations(steady)?,
+            steady: latency_summary(steady)?,
+        })
+    }
+
+    fn validate(&self, steady_sample_count: u64) -> Result<()> {
+        self.first
+            .to_duration()
+            .map_err(|_| invalid("invalid native training phase duration"))?;
+        if self.steady.sample_count != steady_sample_count
+            || self.steady.min > self.steady.nearest_rank_p50
+            || self.steady.nearest_rank_p50 > self.steady.nearest_rank_p95
+            || self.steady.nearest_rank_p95 > self.steady.max
+            || self.steady_total < self.steady.max
+        {
+            return Err(invalid("invalid native training phase summary"));
+        }
+        for duration in [
+            self.steady_total,
+            self.steady.min,
+            self.steady.nearest_rank_p50,
+            self.steady.nearest_rank_p95,
+            self.steady.max,
+        ] {
+            duration
+                .to_duration()
+                .map_err(|_| invalid("invalid native training phase duration"))?;
+        }
+        validate_total_duration(&self.steady, self.steady_total)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReplayTiming {
+    total: Duration,
+    executor: Duration,
+    overhead: Duration,
+}
+
 /// Versioned strict-native CPU compiled-training observation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -305,6 +371,10 @@ pub struct NativeTrainingReport {
     main_replay_traffic: Option<NativeCpuReplayTraffic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     main_replay_executed_native_item_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    main_replay_executor_wall_time: Option<NativeTrainingReplayTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    main_replay_recurrent_overhead_wall_time: Option<NativeTrainingReplayTiming>,
     first_replay_wall_time: BenchmarkDuration,
     steady_replay_total_wall_time: BenchmarkDuration,
     steady_replay_wall_time: BenchmarkLatencySummary,
@@ -385,6 +455,19 @@ impl NativeTrainingReport {
         self.main_replay_executed_native_item_count
     }
 
+    /// Wall time inside the sealed native executor for committed main replays.
+    pub const fn main_replay_executor_wall_time(&self) -> Option<&NativeTrainingReplayTiming> {
+        self.main_replay_executor_wall_time.as_ref()
+    }
+
+    /// Checked end-to-end remainder outside the sealed native executor. This
+    /// covers recurrent staging, validation, and atomic commit/publication.
+    pub const fn main_replay_recurrent_overhead_wall_time(
+        &self,
+    ) -> Option<&NativeTrainingReplayTiming> {
+        self.main_replay_recurrent_overhead_wall_time.as_ref()
+    }
+
     pub const fn checkpoint_byte_count(&self) -> Option<u64> {
         match &self.checkpoint {
             Some(checkpoint) => Some(checkpoint.byte_count),
@@ -417,6 +500,7 @@ impl NativeTrainingReport {
             1 | NATIVE_TRAINING_REPORT_FORMAT_V2
                 | NATIVE_TRAINING_REPORT_FORMAT_V3
                 | NATIVE_TRAINING_REPORT_FORMAT_V4
+                | NATIVE_TRAINING_REPORT_FORMAT_V5
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -453,6 +537,7 @@ impl NativeTrainingReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V3
                 | NATIVE_TRAINING_REPORT_FORMAT_V4
+                | NATIVE_TRAINING_REPORT_FORMAT_V5
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -469,7 +554,9 @@ impl NativeTrainingReport {
         ) {
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2 | NATIVE_TRAINING_REPORT_FORMAT_V3, None) => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V4 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V4
+                | NATIVE_TRAINING_REPORT_FORMAT_V5
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executed),
             ) if executed <= self.main.native_item_count => {}
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2 | NATIVE_TRAINING_REPORT_FORMAT_V3, Some(_)) => {
@@ -503,6 +590,34 @@ impl NativeTrainingReport {
             &self.steady_replay_wall_time,
             self.steady_replay_total_wall_time,
         )?;
+        match (
+            self.format_version,
+            &self.main_replay_executor_wall_time,
+            &self.main_replay_recurrent_overhead_wall_time,
+        ) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V5, None, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(executor), Some(overhead)) => {
+                let steady_count = self.successful_replay_count - 1;
+                executor.validate(steady_count)?;
+                overhead.validate(steady_count)?;
+                validate_phase_partition(
+                    self.first_replay_wall_time,
+                    executor.first,
+                    overhead.first,
+                    "first replay",
+                )?;
+                validate_phase_partition(
+                    self.steady_replay_total_wall_time,
+                    executor.steady_total,
+                    overhead.steady_total,
+                    "steady replay",
+                )?;
+            }
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V5, _, _) => {
+                return Err(invalid("legacy native training report has replay phases"));
+            }
+            _ => return Err(invalid("native training replay phases differ")),
+        }
         let expected_rate = rate_from_total(
             self.steady_replay_wall_time.sample_count,
             self.steady_replay_total_wall_time,
@@ -551,7 +666,7 @@ pub struct NativeTrainingScoreboard {
     partial_flush: Option<NativeTrainingProgramReport>,
     zero_grad: Option<NativeTrainingProgramReport>,
     evaluation: Option<NativeTrainingProgramReport>,
-    durations: Vec<Duration>,
+    replay_timings: Vec<ReplayTiming>,
     schedule_cache_keys: Option<Vec<u64>>,
     main_replay_traffic: Option<NativeCpuReplayTraffic>,
     main_replay_executed_native_item_count: Option<u64>,
@@ -594,7 +709,7 @@ impl NativeTrainingScoreboard {
             partial_flush,
             zero_grad,
             evaluation,
-            durations: Vec::new(),
+            replay_timings: Vec::new(),
             schedule_cache_keys: None,
             main_replay_traffic: None,
             main_replay_executed_native_item_count: None,
@@ -605,10 +720,10 @@ impl NativeTrainingScoreboard {
     /// Records one report returned by a committed native training step. Failed
     /// or rejected steps expose no report and therefore cannot become samples.
     pub fn record(&mut self, report: &NativeCpuRunReport) -> Result<()> {
-        if self.durations.len() >= MAX_REPLAY_SAMPLES {
+        if self.replay_timings.len() >= MAX_REPLAY_SAMPLES {
             return Err(invalid("native training replay sample limit exceeded"));
         }
-        let expected_invocation = self.durations.len() as u64 + 1;
+        let expected_invocation = self.replay_timings.len() as u64 + 1;
         if report.capture_identity() != self.main.capture_identity
             || report.native_identity() != self.main.native_identity
             || report.is_vectorized() != self.main.vectorized
@@ -649,6 +764,11 @@ impl NativeTrainingScoreboard {
         {
             return Err(invalid("native replay execution count changed"));
         }
+        let total = report.wall_time();
+        let executor = report.executor_wall_time();
+        let overhead = total
+            .checked_sub(executor)
+            .ok_or_else(|| invalid("native executor time exceeds replay time"))?;
         if self.schedule_cache_keys.is_none() {
             self.schedule_cache_keys = Some(report.schedule_cache_keys().to_vec());
         }
@@ -658,7 +778,11 @@ impl NativeTrainingScoreboard {
         if self.main_replay_executed_native_item_count.is_none() {
             self.main_replay_executed_native_item_count = Some(executed);
         }
-        self.durations.push(report.wall_time());
+        self.replay_timings.push(ReplayTiming {
+            total,
+            executor,
+            overhead,
+        });
         Ok(())
     }
 
@@ -668,7 +792,7 @@ impl NativeTrainingScoreboard {
         wall_time: Duration,
     ) -> Result<()> {
         let info = checkpoint.info();
-        let replay_count = self.durations.len() as u64;
+        let replay_count = self.replay_timings.len() as u64;
         let expected_step = self
             .inspection
             .initial_replay_step
@@ -689,19 +813,28 @@ impl NativeTrainingScoreboard {
     }
 
     pub fn report(&self) -> Result<NativeTrainingReport> {
-        let Some((&first, steady)) = self.durations.split_first() else {
+        let Some((first, steady)) = self.replay_timings.split_first() else {
             return Err(invalid("native training scoreboard has no replay"));
         };
         if steady.is_empty() {
             return Err(invalid("native training scoreboard has no steady replay"));
         }
-        let (steady_replay_total_wall_time, steady_microbatches_per_second) = rate(steady)?;
+        let totals = steady.iter().map(|timing| timing.total).collect::<Vec<_>>();
+        let executors = steady
+            .iter()
+            .map(|timing| timing.executor)
+            .collect::<Vec<_>>();
+        let overheads = steady
+            .iter()
+            .map(|timing| timing.overhead)
+            .collect::<Vec<_>>();
+        let (steady_replay_total_wall_time, steady_microbatches_per_second) = rate(&totals)?;
         let report = NativeTrainingReport {
             format_version: NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             compile_wall_time: BenchmarkDuration::from_duration(self.compile_wall_time),
             prepare_wall_time: BenchmarkDuration::from_duration(self.prepare_wall_time),
             initial_replay_step: self.inspection.initial_replay_step,
-            successful_replay_count: self.durations.len() as u64,
+            successful_replay_count: self.replay_timings.len() as u64,
             main: self.main.clone(),
             partial_flush: self.partial_flush.clone(),
             zero_grad: self.zero_grad.clone(),
@@ -716,9 +849,16 @@ impl NativeTrainingScoreboard {
             )?,
             main_replay_traffic: self.main_replay_traffic,
             main_replay_executed_native_item_count: self.main_replay_executed_native_item_count,
-            first_replay_wall_time: BenchmarkDuration::from_duration(first),
+            main_replay_executor_wall_time: Some(NativeTrainingReplayTiming::from_durations(
+                first.executor,
+                &executors,
+            )?),
+            main_replay_recurrent_overhead_wall_time: Some(
+                NativeTrainingReplayTiming::from_durations(first.overhead, &overheads)?,
+            ),
+            first_replay_wall_time: BenchmarkDuration::from_duration(first.total),
             steady_replay_total_wall_time,
-            steady_replay_wall_time: latency_summary(steady)?,
+            steady_replay_wall_time: latency_summary(&totals)?,
             steady_microbatches_per_second,
             schedule_cache_keys: self.schedule_cache_keys.clone().unwrap_or_default(),
             checkpoint: self.checkpoint.clone(),
@@ -766,15 +906,19 @@ fn latency_summary(durations: &[Duration]) -> Result<BenchmarkLatencySummary> {
 }
 
 fn rate(durations: &[Duration]) -> Result<(BenchmarkDuration, Option<f64>)> {
+    let total = sum_durations(durations)?;
+    Ok((total, rate_from_total(durations.len() as u64, total)?))
+}
+
+fn sum_durations(durations: &[Duration]) -> Result<BenchmarkDuration> {
     let total = durations
         .iter()
         .try_fold(Duration::ZERO, |total, duration| {
             total
                 .checked_add(*duration)
-                .ok_or_else(|| invalid("steady replay duration overflows"))
+                .ok_or_else(|| invalid("replay duration overflows"))
         })?;
-    let total = BenchmarkDuration::from_duration(total);
-    Ok((total, rate_from_total(durations.len() as u64, total)?))
+    Ok(BenchmarkDuration::from_duration(total))
 }
 
 fn rate_from_total(sample_count: u64, total: BenchmarkDuration) -> Result<Option<f64>> {
@@ -814,6 +958,30 @@ fn validate_total_duration(
     Ok(())
 }
 
+fn validate_phase_partition(
+    total: BenchmarkDuration,
+    executor: BenchmarkDuration,
+    overhead: BenchmarkDuration,
+    label: &str,
+) -> Result<()> {
+    let total = total
+        .as_nanos()
+        .map_err(|_| invalid(format!("invalid {label} total duration")))?;
+    let partitioned = executor
+        .as_nanos()
+        .map_err(|_| invalid(format!("invalid {label} executor duration")))?
+        .checked_add(
+            overhead
+                .as_nanos()
+                .map_err(|_| invalid(format!("invalid {label} overhead duration")))?,
+        )
+        .ok_or_else(|| invalid(format!("{label} phase duration overflows")))?;
+    if partitioned != total {
+        return Err(invalid(format!("{label} phases do not partition total")));
+    }
+    Ok(())
+}
+
 fn count(value: usize, label: &str) -> Result<u64> {
     u64::try_from(value).map_err(|_| invalid(format!("{label} count overflows u64")))
 }
@@ -832,6 +1000,42 @@ mod tests {
         BenchmarkDuration::from_duration(Duration::ZERO)
     }
 
+    fn zero_replay_timing() -> NativeTrainingReplayTiming {
+        NativeTrainingReplayTiming {
+            first: zero_duration(),
+            steady_total: zero_duration(),
+            steady: BenchmarkLatencySummary {
+                sample_count: 1,
+                min: zero_duration(),
+                nearest_rank_p50: zero_duration(),
+                nearest_rank_p95: zero_duration(),
+                max: zero_duration(),
+            },
+        }
+    }
+
+    fn set_single_steady_replay_duration(
+        report: &mut NativeTrainingReport,
+        elapsed: BenchmarkDuration,
+    ) {
+        let summary = BenchmarkLatencySummary {
+            sample_count: 1,
+            min: elapsed,
+            nearest_rank_p50: elapsed,
+            nearest_rank_p95: elapsed,
+            max: elapsed,
+        };
+        report.steady_replay_total_wall_time = elapsed;
+        report.steady_replay_wall_time = summary.clone();
+        let executor = report
+            .main_replay_executor_wall_time
+            .as_mut()
+            .expect("current test report has executor timing");
+        executor.steady_total = elapsed;
+        executor.steady = summary;
+        report.steady_microbatches_per_second = rate_from_total(1, elapsed).unwrap();
+    }
+
     fn remove_module_preparation(json: &mut serde_json::Value) {
         for program in ["main", "partial_flush", "zero_grad", "evaluation"] {
             let Some(program) = json[program].as_object_mut() else {
@@ -847,6 +1051,15 @@ mod tests {
                 program.remove(field);
             }
         }
+    }
+
+    fn remove_replay_phase_timing(json: &mut serde_json::Value) {
+        json.as_object_mut()
+            .unwrap()
+            .remove("main_replay_executor_wall_time");
+        json.as_object_mut()
+            .unwrap()
+            .remove("main_replay_recurrent_overhead_wall_time");
     }
 
     fn zero_report() -> NativeTrainingReport {
@@ -880,6 +1093,8 @@ mod tests {
             recurrent_logical_state_bytes: 16,
             main_replay_traffic: Some(NativeCpuReplayTraffic::new(2, 12, 16, 16)),
             main_replay_executed_native_item_count: Some(1),
+            main_replay_executor_wall_time: Some(zero_replay_timing()),
+            main_replay_recurrent_overhead_wall_time: Some(zero_replay_timing()),
             first_replay_wall_time: zero_duration(),
             steady_replay_wall_time: BenchmarkLatencySummary {
                 sample_count: 1,
@@ -928,6 +1143,11 @@ mod tests {
             16
         );
         assert_eq!(json["main_replay_executed_native_item_count"], 1);
+        assert_eq!(json["main_replay_executor_wall_time"]["first"]["secs"], 0);
+        assert_eq!(
+            json["main_replay_recurrent_overhead_wall_time"]["steady"]["sample_count"],
+            1
+        );
         assert_eq!(
             NativeTrainingReport::from_json_bytes(&bytes).unwrap(),
             report
@@ -944,6 +1164,7 @@ mod tests {
             .unwrap()
             .remove("main_replay_executed_native_item_count");
         remove_module_preparation(&mut json);
+        remove_replay_phase_timing(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.zero_grad().is_none());
@@ -958,6 +1179,7 @@ mod tests {
             .unwrap()
             .remove("main_replay_executed_native_item_count");
         remove_module_preparation(&mut json);
+        remove_replay_phase_timing(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.main_replay_traffic().is_none());
@@ -971,6 +1193,7 @@ mod tests {
             .unwrap()
             .remove("main_replay_executed_native_item_count");
         remove_module_preparation(&mut json);
+        remove_replay_phase_timing(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(report.main_replay_executed_native_item_count().is_none());
@@ -982,9 +1205,56 @@ mod tests {
         let mut json = serde_json::to_value(zero_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V4);
         remove_module_preparation(&mut json);
+        remove_replay_phase_timing(&mut json);
         let report =
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert_eq!(report.main().rendered_entry_count(), 0);
+    }
+
+    #[test]
+    fn version_five_report_without_replay_phase_timing_still_decodes() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V5);
+        remove_replay_phase_timing(&mut json);
+        let report =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(report.main_replay_executor_wall_time().is_none());
+        assert!(report.main_replay_recurrent_overhead_wall_time().is_none());
+    }
+
+    #[test]
+    fn current_report_authenticates_replay_phase_partition() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("main_replay_executor_wall_time");
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+
+        let mut report = zero_report();
+        let total = BenchmarkDuration::from_duration(Duration::from_nanos(11));
+        let executor = BenchmarkDuration::from_duration(Duration::from_nanos(7));
+        let overhead = BenchmarkDuration::from_duration(Duration::from_nanos(4));
+        report.first_replay_wall_time = total;
+        report
+            .main_replay_executor_wall_time
+            .as_mut()
+            .unwrap()
+            .first = executor;
+        report
+            .main_replay_recurrent_overhead_wall_time
+            .as_mut()
+            .unwrap()
+            .first = overhead;
+        assert!(report.validate().is_ok());
+
+        report
+            .main_replay_recurrent_overhead_wall_time
+            .as_mut()
+            .unwrap()
+            .first = BenchmarkDuration::from_duration(Duration::from_nanos(5));
+        assert!(report.validate().is_err());
     }
 
     #[test]
@@ -1070,12 +1340,7 @@ mod tests {
 
         let mut report = zero_report();
         let elapsed = BenchmarkDuration::from_duration(Duration::from_nanos(10));
-        report.steady_replay_total_wall_time = elapsed;
-        report.steady_replay_wall_time.min = elapsed;
-        report.steady_replay_wall_time.nearest_rank_p50 = elapsed;
-        report.steady_replay_wall_time.nearest_rank_p95 = elapsed;
-        report.steady_replay_wall_time.max = elapsed;
-        report.steady_microbatches_per_second = rate_from_total(1, elapsed).unwrap();
+        set_single_steady_replay_duration(&mut report, elapsed);
         assert!(report.validate().is_ok());
         let mut json = serde_json::to_value(report).unwrap();
         json["steady_microbatches_per_second"] = serde_json::json!(1.0);
@@ -1088,12 +1353,7 @@ mod tests {
     fn positive_derived_rate_round_trips_exactly_and_rejects_tampering() {
         let mut report = zero_report();
         let elapsed = BenchmarkDuration::from_duration(Duration::from_nanos(63));
-        report.steady_replay_total_wall_time = elapsed;
-        report.steady_replay_wall_time.min = elapsed;
-        report.steady_replay_wall_time.nearest_rank_p50 = elapsed;
-        report.steady_replay_wall_time.nearest_rank_p95 = elapsed;
-        report.steady_replay_wall_time.max = elapsed;
-        report.steady_microbatches_per_second = rate_from_total(1, elapsed).unwrap();
+        set_single_steady_replay_duration(&mut report, elapsed);
 
         let bytes = report.to_json_bytes().unwrap();
         assert_eq!(

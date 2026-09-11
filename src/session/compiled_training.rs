@@ -1616,6 +1616,7 @@ pub struct NativeCpuRunReport {
     module_dispatched_native_item_count: usize,
     schedule_cache_keys: Vec<u64>,
     traffic: NativeCpuReplayTraffic,
+    executor_wall_time: Duration,
     wall_time: Duration,
 }
 
@@ -1677,6 +1678,21 @@ impl NativeCpuRunReport {
         &self.traffic
     }
 
+    /// Wall time spent inside the sealed native executor for this successful
+    /// invocation. Validation failures and uncommitted calls expose no report.
+    pub const fn executor_wall_time(&self) -> Duration {
+        self.executor_wall_time
+    }
+
+    /// End-to-end replay time outside the sealed native executor. For
+    /// recurrent programs this covers staging, validation, and atomic commit.
+    pub fn replay_overhead_wall_time(&self) -> Duration {
+        self.wall_time
+            .checked_sub(self.executor_wall_time)
+            .expect("native CPU run report validates nested executor timing")
+    }
+
+    /// End-to-end wall time for the successful invocation.
     pub const fn wall_time(&self) -> Duration {
         self.wall_time
     }
@@ -5422,16 +5438,18 @@ impl CompiledEvaluationPlan {
         }
         let started = Instant::now();
         let capture = self.inference.capture();
-        let (values, traffic) = executor
-            .execute_planned_native_items_with_recurrent_inputs(
-                capture,
-                inputs,
-                &recurrent,
-                &mut prepared.plan,
-            )
-            .map_err(replay_error)?;
+        let executor_started = Instant::now();
+        let executed = executor.execute_planned_native_items_with_recurrent_inputs(
+            capture,
+            inputs,
+            &recurrent,
+            &mut prepared.plan,
+        );
+        let executor_wall_time = executor_started.elapsed();
+        let (values, traffic) = executed.map_err(replay_error)?;
         let outputs = values.requested(&capture.requested).map_err(replay_error)?;
         let schedule_cache_keys = prepared.plan.schedule_cache_keys().to_vec();
+        let wall_time = started.elapsed();
         let report = NativeCpuRunReport {
             capture_identity: self.capture_identity,
             native_identity: prepared.report.native_identity,
@@ -5443,8 +5461,10 @@ impl CompiledEvaluationPlan {
             module_dispatched_native_item_count: traffic.module_dispatched_native_item_count,
             schedule_cache_keys,
             traffic: native_cpu_replay_traffic(traffic),
-            wall_time: started.elapsed(),
+            executor_wall_time,
+            wall_time,
         };
+        debug_assert!(validate_native_cpu_run_timing(&report).is_ok());
         Ok((
             evaluation_result(
                 outputs,
@@ -5498,10 +5518,11 @@ fn native_cpu_run_report(
     capture_identity: u64,
     trace: &NativeMixedReplayTrace,
     traffic: NativeReplayTraffic,
+    executor_wall_time: Duration,
     successful_invocation: u64,
     wall_time: Duration,
 ) -> NativeCpuRunReport {
-    NativeCpuRunReport {
+    let report = NativeCpuRunReport {
         capture_identity,
         native_identity: trace.identity,
         vectorized: trace.vectorized,
@@ -5512,8 +5533,19 @@ fn native_cpu_run_report(
         module_dispatched_native_item_count: traffic.module_dispatched_native_item_count,
         schedule_cache_keys: trace.pure_item_cache_keys.clone(),
         traffic: native_cpu_replay_traffic(traffic),
+        executor_wall_time,
         wall_time,
-    }
+    };
+    debug_assert!(validate_native_cpu_run_timing(&report).is_ok());
+    report
+}
+
+fn validate_native_cpu_run_timing(report: &NativeCpuRunReport) -> Result<()> {
+    report
+        .wall_time
+        .checked_sub(report.executor_wall_time)
+        .ok_or_else(|| training("native CPU executor time exceeds replay time"))?;
+    Ok(())
 }
 
 const fn native_cpu_replay_traffic(traffic: NativeReplayTraffic) -> NativeCpuReplayTraffic {
@@ -5780,6 +5812,7 @@ impl CpuCompiledTrainingProgram {
             )
             .map_err(replay_error)?;
         let traffic = replay.traffic;
+        let executor_wall_time = replay.executor_wall_time;
         let replay = replay.replay;
         let native = replay
             .native_trace
@@ -5789,6 +5822,7 @@ impl CpuCompiledTrainingProgram {
             self.capture_identity(),
             native,
             traffic,
+            executor_wall_time,
             next_step,
             started.elapsed(),
         );
@@ -6225,6 +6259,7 @@ impl CpuCompiledTrainingProgram {
             )
             .map_err(replay_error)?;
         let traffic = replay.traffic;
+        let executor_wall_time = replay.executor_wall_time;
         let replay = replay.replay;
         debug_assert_eq!(
             replay.outputs.len(),
@@ -6244,6 +6279,7 @@ impl CpuCompiledTrainingProgram {
             transition.capture_identity(),
             native,
             traffic,
+            executor_wall_time,
             successful_invocation,
             started.elapsed(),
         );
@@ -12401,6 +12437,16 @@ mod tests {
         native.inner.inner.runtime.recurrent_test_counts()
     }
 
+    fn assert_native_run_timing(report: &NativeCpuRunReport) {
+        assert_eq!(
+            report
+                .executor_wall_time()
+                .checked_add(report.replay_overhead_wall_time())
+                .unwrap(),
+            report.wall_time()
+        );
+    }
+
     #[test]
     fn native_cpu_adamw_prepares_strictly_reuses_cache_and_commits_atomically() {
         let plan = CompiledAdamWPlan::compile(adamw_config(), initial_parameters(), build_tinybob)
@@ -12485,6 +12531,7 @@ mod tests {
         assert_eq!(actual.loss_weight(), 1);
         assert_eq!(actual.report().successful_invocation(), 1);
         assert!(actual.report().first_successful_invocation());
+        assert_native_run_timing(actual.report());
         assert_eq!(actual.report().native_identity(), prepared_native_identity);
         assert!(actual.report().executed_native_item_count() > 0);
         assert!(
@@ -12507,6 +12554,13 @@ mod tests {
         assert!(scoreboard.record(&malformed_report).is_err());
         let mut malformed_report = actual.report().clone();
         malformed_report.executed_native_item_count = malformed_report.native_item_count + 1;
+        assert!(scoreboard.record(&malformed_report).is_err());
+        let mut malformed_report = actual.report().clone();
+        malformed_report.executor_wall_time = malformed_report
+            .wall_time
+            .checked_add(Duration::from_nanos(1))
+            .unwrap();
+        assert!(validate_native_cpu_run_timing(&malformed_report).is_err());
         assert!(scoreboard.record(&malformed_report).is_err());
         scoreboard.record(actual.report()).unwrap();
         assert_native_adamw_state_close(&native, &interpreted);
@@ -13009,6 +13063,7 @@ mod tests {
         );
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
         assert_eq!(actual.report().unwrap().successful_invocation(), 1);
+        assert_native_run_timing(actual.report().unwrap());
         assert!(actual.report().unwrap().executed_native_item_count() > 0);
         assert!(
             actual.report().unwrap().executed_native_item_count()
@@ -13233,6 +13288,7 @@ mod tests {
             .unwrap();
         assert_eq!(evaluation.report().successful_invocation(), 1);
         assert!(evaluation.report().first_successful_invocation());
+        assert_native_run_timing(evaluation.report());
         assert!(evaluation.report().executed_native_item_count() > 0);
         assert!(
             evaluation.report().executed_native_item_count()

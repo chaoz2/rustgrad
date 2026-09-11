@@ -3813,6 +3813,35 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         .expect("current scoreboard reports successful CPU JIT calls");
     assert!(executed_native_item_count > 0);
     assert!(executed_native_item_count <= report.main().native_item_count());
+    let executor_timing = report
+        .main_replay_executor_wall_time()
+        .expect("current scoreboard reports sealed executor timing");
+    let overhead_timing = report
+        .main_replay_recurrent_overhead_wall_time()
+        .expect("current scoreboard reports recurrent replay overhead");
+    assert_eq!(executor_timing.steady().sample_count, 2);
+    assert_eq!(overhead_timing.steady().sample_count, 2);
+    assert_eq!(
+        executor_timing
+            .first()
+            .to_duration()
+            .unwrap()
+            .checked_add(overhead_timing.first().to_duration().unwrap())
+            .unwrap(),
+        report.first_replay_wall_time().to_duration().unwrap()
+    );
+    assert_eq!(
+        executor_timing
+            .steady_total()
+            .to_duration()
+            .unwrap()
+            .checked_add(overhead_timing.steady_total().to_duration().unwrap())
+            .unwrap(),
+        report
+            .steady_replay_total_wall_time()
+            .to_duration()
+            .unwrap()
+    );
     let traffic = report.main_replay_traffic().unwrap();
     assert_eq!(traffic.external_input_import_count(), 0);
     assert_eq!(traffic.external_input_import_bytes(), 0);
@@ -3846,6 +3875,8 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         json["main_replay_executed_native_item_count"],
         executed_native_item_count
     );
+    assert!(json["main_replay_executor_wall_time"].is_object());
+    assert!(json["main_replay_recurrent_overhead_wall_time"].is_object());
     assert!(json["host_to_device"].is_null());
     assert!(json["device_to_host"].is_null());
     assert!(json["measured_peak_host_memory_bytes"].is_null());
