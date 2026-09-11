@@ -21,7 +21,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V4: u32 = 4;
 const NATIVE_TRAINING_REPORT_FORMAT_V5: u32 = 5;
 const NATIVE_TRAINING_REPORT_FORMAT_V6: u32 = 6;
 const NATIVE_TRAINING_REPORT_FORMAT_V7: u32 = 7;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 8;
+const NATIVE_TRAINING_REPORT_FORMAT_V8: u32 = 8;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 9;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -290,8 +291,15 @@ impl NativeTrainingProgramReport {
                 .durable_artifact_cache_hit_count
                 .checked_add(self.durable_artifact_cache_miss_count)
                 .ok_or_else(|| invalid("durable artifact cache count overflows"))?;
-            let expected_modules = u64::from(self.native_item_count != 0);
-            if self.rendered_entry_count != self.native_item_count
+            let expected_modules = u64::from(self.rendered_entry_count != 0);
+            let rendered_inventory_is_valid = if format_version <= NATIVE_TRAINING_REPORT_FORMAT_V8
+            {
+                self.rendered_entry_count == self.native_item_count
+            } else {
+                self.rendered_entry_count <= self.native_item_count
+                    && (self.rendered_entry_count == 0) == (self.native_item_count == 0)
+            };
+            if !rendered_inventory_is_valid
                 || self.loaded_module_count != expected_modules
                 || durable_access_count > self.loaded_module_count
                 || self.compiler_invocation_count != self.durable_artifact_cache_miss_count
@@ -304,7 +312,9 @@ impl NativeTrainingProgramReport {
         match (format_version, &self.preparation_timing) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, None) => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V7 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V7
+                | NATIVE_TRAINING_REPORT_FORMAT_V8
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self)?,
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, Some(_)) => {
@@ -345,18 +355,22 @@ impl NativeTrainingProgramReport {
         self.peak_logical_temporary_bytes
     }
 
+    /// Logical schedule-item coverage used by the cache inventory.
     pub const fn native_item_count(&self) -> u64 {
         self.native_item_count
     }
 
+    /// Logical schedule items covered by process-local cache hits.
     pub const fn cache_hit_count(&self) -> u64 {
         self.cache_hit_count
     }
 
+    /// Logical schedule items covered by process-local cache misses.
     pub const fn cache_miss_count(&self) -> u64 {
         self.cache_miss_count
     }
 
+    /// Physical compiled entries emitted for the logical schedule inventory.
     pub const fn rendered_entry_count(&self) -> u64 {
         self.rendered_entry_count
     }
@@ -640,6 +654,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V5
                 | NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
+                | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -679,6 +694,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V5
                 | NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
+                | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -694,14 +710,17 @@ impl NativeTrainingReport {
             self.main_replay_executed_native_item_count,
         ) {
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2 | NATIVE_TRAINING_REPORT_FORMAT_V3, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_V4, Some(executed))
+                if executed <= self.main.native_item_count => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V4
-                | NATIVE_TRAINING_REPORT_FORMAT_V5
+                NATIVE_TRAINING_REPORT_FORMAT_V5
                 | NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
-                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                | NATIVE_TRAINING_REPORT_FORMAT_V8,
                 Some(executed),
-            ) if executed <= self.main.native_item_count => {}
+            ) if executed <= self.main.rendered_entry_count => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(executed))
+                if executed <= self.main.rendered_entry_count => {}
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2 | NATIVE_TRAINING_REPORT_FORMAT_V3, Some(_)) => {
                 return Err(invalid("legacy native training report has execution count"));
             }
@@ -730,7 +749,7 @@ impl NativeTrainingReport {
                 }
                 None
             }
-            NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
+            NATIVE_TRAINING_REPORT_FORMAT_V8 | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
                     .ok_or_else(|| invalid("native compiler overlap timing is absent"))?
@@ -808,13 +827,18 @@ impl NativeTrainingReport {
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, None, None) => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V7 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V7
+                | NATIVE_TRAINING_REPORT_FORMAT_V8
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
             ) => {
                 let overlap = match (self.format_version, overlap) {
                     (NATIVE_TRAINING_REPORT_FORMAT_V7, None) => 0,
-                    (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(overlap)) => overlap
+                    (
+                        NATIVE_TRAINING_REPORT_FORMAT_V8 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                        Some(overlap),
+                    ) => overlap
                         .as_nanos()
                         .map_err(|_| invalid("invalid native prepare overlap duration"))?,
                     _ => return Err(invalid("native prepare overlap timing differs")),
@@ -892,6 +916,7 @@ impl NativeTrainingReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V6
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
+                | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -1067,7 +1092,9 @@ impl NativeTrainingScoreboard {
             || report.native_identity() != self.main.native_identity
             || report.is_vectorized() != self.main.vectorized
             || count(report.native_item_count(), "native item")? != self.main.native_item_count
-            || report.executed_native_item_count() > report.native_item_count()
+            || report.executed_native_item_count()
+                > usize::try_from(self.main.rendered_entry_count)
+                    .map_err(|_| invalid("native rendered entry count overflows usize"))?
             || report.fallback_count() != 0
             || report.successful_invocation() != expected_invocation
             || report.schedule_cache_keys().len() != report.native_item_count()
@@ -1662,6 +1689,77 @@ mod tests {
     }
 
     #[test]
+    fn version_eight_report_with_exact_native_inventory_still_decodes() {
+        let mut json = serde_json::to_value(zero_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V8);
+        let report =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(report.main().native_item_count(), 2);
+        assert_eq!(report.main().rendered_entry_count(), 2);
+        assert_eq!(report.main_replay_executed_native_item_count(), Some(1));
+    }
+
+    #[test]
+    fn legacy_reports_reject_reduced_rendered_and_executed_inventories() {
+        for version in [
+            NATIVE_TRAINING_REPORT_FORMAT_V5,
+            NATIVE_TRAINING_REPORT_FORMAT_V6,
+            NATIVE_TRAINING_REPORT_FORMAT_V7,
+            NATIVE_TRAINING_REPORT_FORMAT_V8,
+        ] {
+            let mut json = serde_json::to_value(zero_report()).unwrap();
+            json["format_version"] = serde_json::json!(version);
+            if version == NATIVE_TRAINING_REPORT_FORMAT_V5 {
+                remove_replay_phase_timing(&mut json);
+            }
+            if version <= NATIVE_TRAINING_REPORT_FORMAT_V6 {
+                remove_preparation_phase_timing(&mut json);
+            } else if version == NATIVE_TRAINING_REPORT_FORMAT_V7 {
+                json.as_object_mut()
+                    .unwrap()
+                    .remove("prepare_parallel_module_overlap_wall_time");
+                for field in [
+                    "prepare_compiler_process_overlap_wall_time",
+                    "prepare_compiler_process_count",
+                    "prepare_max_parallel_compiler_process_count",
+                ] {
+                    json.as_object_mut().unwrap().remove(field);
+                }
+            }
+            json["main_replay_executed_native_item_count"] = serde_json::json!(2);
+            assert!(
+                NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_ok(),
+                "legacy v{version} exact native inventory did not decode"
+            );
+            json["main"]["rendered_entry_count"] = serde_json::json!(1);
+            json["main_replay_executed_native_item_count"] = serde_json::json!(1);
+            assert!(
+                NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+                "legacy v{version} accepted reduced rendered/executed inventories"
+            );
+        }
+    }
+
+    #[test]
+    fn current_report_accepts_grouped_physical_native_inventory() {
+        let mut report = zero_report();
+        report.main.logical_schedule_item_count = 4;
+        report.main.native_item_count = 4;
+        report.main.cache_miss_count = 4;
+        report.main.rendered_entry_count = 1;
+        report.schedule_cache_keys.extend([23, 29]);
+        let bytes = report.to_json_bytes().unwrap();
+        let decoded = NativeTrainingReport::from_json_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded.format_version,
+            NATIVE_TRAINING_REPORT_FORMAT_VERSION
+        );
+        assert_eq!(decoded.main().native_item_count(), 4);
+        assert_eq!(decoded.main().rendered_entry_count(), 1);
+        assert_eq!(decoded.main_replay_executed_native_item_count(), Some(1));
+    }
+
+    #[test]
     fn current_report_authenticates_preparation_phase_partition() {
         let mut report = zero_report();
         report.prepare_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(10));
@@ -1863,6 +1961,13 @@ mod tests {
         );
 
         let mut report = zero_report();
+        report.main_replay_executed_native_item_count = Some(3);
+        assert!(report.validate().is_err());
+
+        let mut report = zero_report();
+        report.main.native_item_count = 3;
+        report.main.cache_miss_count = 3;
+        report.schedule_cache_keys.push(23);
         report.main_replay_executed_native_item_count = Some(3);
         assert!(report.validate().is_err());
     }

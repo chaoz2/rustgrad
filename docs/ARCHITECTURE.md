@@ -755,7 +755,17 @@ artifact, runs its supported pure prefix through the existing native JIT cache,
 and commits only detached outputs through that same transaction. Its stable
 trace identity binds RGSM contents, ABI sidecars, pure cache keys, renderer
 target, and vector policy—never leases, slots, generations, pointers, or
-current bytes. `MixedReplayCursor` adds an in-memory interpreter-only recurrent
+current bytes. Accumulated compiled AdamW additionally supplies a private
+semantic manifest for each canonical parameter's parameter, first-moment,
+second-moment, and gradient-accumulator successors. A native-only store-group
+sidecar admits the group only when every original single-output schedule item
+is a dense, same-shaped, fully overwriting, infallible F32 root with exact
+bindings and no escaping consumer. Capture, logical schedule/cache inventory,
+recurrent keys, and failure ordinals remain unchanged; only the physical module
+dispatch inventory is smaller. Unsupported topology retains every original
+entry, while malformed or overlapping semantic metadata rejects before
+publication. Single-microbatch and zero-grad programs do not use the sidecar.
+`MixedReplayCursor` adds an in-memory interpreter-only recurrent
 frontier for one exact RGSM identity. It contains only the canonical logical
 buffer/version descriptors required by persistent reads and writes. Each step
 uses those versions to snapshot detached candidates, preserves the requested
@@ -987,7 +997,7 @@ interpreter and strict-Metal targets.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v8 validates those facts against strict-native
+separate `NativeTrainingScoreboard` v9 validates those facts against strict-native
 preparation and committed main-replay reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
 sample set into versioned JSON. Every attached native program partitions its
@@ -995,7 +1005,10 @@ runtime-observed preparation total exactly into layout, rendering, compiler
 process, module load, and residual host work. V8 records exact overlap across
 complete parallel module jobs plus compiler-process-only overlap and concurrency;
 the caller-observed whole-prepare remainder is checked after subtracting the
-complete-job overlap from summed program totals. Main replay wall time is partitioned exactly
+complete-job overlap from summed program totals. V9 separately authenticates
+logical schedule/cache coverage and grouped physical rendered/executed entry
+counts; v5-v8 retain their original one-rendered-entry-per-logical-item wire
+invariant. Main replay wall time is partitioned exactly
 between the sealed native executor and the checked recurrent
 staging/validation/commit remainder; failed calls publish neither phase. It
 reports deterministic

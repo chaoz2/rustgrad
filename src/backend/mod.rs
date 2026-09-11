@@ -10,6 +10,7 @@ pub(crate) use cpu::{execute_prefix_scan, stable_sort_pair};
 pub use jit::{CpuJitBackend, JitBackendError, JitExecution, JitFallback};
 pub(crate) use jit::{
     NativeScheduleCompilationBatch, NativeScheduleLayout, NativeScheduleModulePreparation,
+    NativeStoreGroup, NativeStoreGroupMember, PreparedNativeDispatch, PreparedNativeStoreGroup,
     PreparedScheduleDispatch, PreparedScheduleItem, TensorValueStore, canonical_transpose_copy,
     is_canonical_rank2_transpose, schedule_native_layout,
 };

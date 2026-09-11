@@ -1,7 +1,7 @@
 //! Retained scratch storage for authenticated fixed-shape native replay.
 use super::capture::{CapturedSchedule, ReplayError};
 use super::captured_replay::{ReplayValues, backend_error};
-use crate::backend::{PreparedScheduleDispatch, PreparedScheduleItem};
+use crate::backend::{PreparedNativeDispatch, PreparedScheduleDispatch, PreparedScheduleItem};
 use crate::{CpuJitBackend, ScheduleItem, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,6 +31,8 @@ struct WorkspaceSlot {
 struct WorkspaceItem {
     slots: Vec<usize>,
     output: usize,
+    outputs: Vec<usize>,
+    logical_indices: Vec<usize>,
     elided: bool,
     dispatch: Option<PreparedScheduleDispatch>,
     output_initialization: crate::cpu_jit::NativeOutputInitialization,
@@ -121,7 +123,7 @@ pub(crate) struct NativeReplayWorkspaceStats {
 impl NativeReplayWorkspace {
     pub(super) fn new(
         capture: &CapturedSchedule,
-        items: &[PreparedScheduleItem],
+        items: &[PreparedNativeDispatch],
     ) -> Result<Self, ReplayError> {
         let mut workspace = Self {
             buffers: Vec::new(),
@@ -188,12 +190,45 @@ impl NativeReplayWorkspace {
                 .map_err(|error| ReplayError::Backend(error.to_string()))?;
             workspace.immutable.insert(slot);
         }
-        for (item, prepared) in capture.items.iter().zip(items) {
-            workspace.add_item(item, prepared, &capture.quantized_constants)?;
+        let mut covered = BTreeSet::new();
+        for prepared in items {
+            match prepared {
+                PreparedNativeDispatch::Item {
+                    logical_index,
+                    item: prepared,
+                } => {
+                    let item = capture.items.get(*logical_index).ok_or_else(|| {
+                        ReplayError::Corrupt("prepared native item is out of range".into())
+                    })?;
+                    if !covered.insert(*logical_index) {
+                        return Err(ReplayError::Corrupt(
+                            "prepared native logical item repeats".into(),
+                        ));
+                    }
+                    workspace.add_item(
+                        *logical_index,
+                        item,
+                        prepared,
+                        &capture.quantized_constants,
+                    )?;
+                }
+                PreparedNativeDispatch::StoreGroup(group) => {
+                    if group
+                        .members
+                        .iter()
+                        .any(|member| !covered.insert(member.logical_index))
+                    {
+                        return Err(ReplayError::Corrupt(
+                            "prepared native logical item repeats".into(),
+                        ));
+                    }
+                    workspace.add_store_group(capture, group)?;
+                }
+            }
         }
-        if capture.items.len() != items.len() {
+        if covered.len() != capture.items.len() {
             return Err(ReplayError::Corrupt(
-                "native workspace item count mismatch".into(),
+                "prepared native logical item is absent".into(),
             ));
         }
         workspace.rebuild_dispatch_segments();
@@ -214,6 +249,7 @@ impl NativeReplayWorkspace {
 
     fn add_item(
         &mut self,
+        index: usize,
         item: &ScheduleItem,
         prepared: &PreparedScheduleItem,
         quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
@@ -242,6 +278,8 @@ impl NativeReplayWorkspace {
             self.items.push(WorkspaceItem {
                 slots: Vec::new(),
                 output: source,
+                outputs: vec![source],
+                logical_indices: vec![index],
                 elided: true,
                 dispatch: None,
                 output_initialization: crate::cpu_jit::NativeOutputInitialization::NeedsZero,
@@ -282,11 +320,125 @@ impl NativeReplayWorkspace {
         self.items.push(WorkspaceItem {
             slots,
             output: output_slot,
+            outputs: vec![output_slot],
+            logical_indices: vec![index],
             elided: false,
             dispatch,
             output_initialization,
         });
         Ok(())
+    }
+
+    fn add_store_group(
+        &mut self,
+        capture: &CapturedSchedule,
+        group: &crate::backend::PreparedNativeStoreGroup,
+    ) -> Result<(), ReplayError> {
+        let mut outputs = Vec::with_capacity(group.members.len());
+        for member in &group.members {
+            let logical_index = member.logical_index;
+            let logical_item = capture.items.get(logical_index).ok_or_else(|| {
+                ReplayError::Corrupt("native store group item is out of range".into())
+            })?;
+            let output = logical_item.primary_output();
+            let elements = output
+                .shape
+                .numel()
+                .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+            if output.id != member.output_buffer {
+                return Err(ReplayError::Corrupt(
+                    "native store group output identity mismatch".into(),
+                ));
+            }
+            outputs.push(self.add_canonical(output.id, output.clone(), elements, true)?);
+        }
+        let mut slots = Vec::with_capacity(group.abi().buffers.len());
+        for abi in &group.abi().buffers {
+            if abi.mutable {
+                let slot = self.owners.get(&abi.id).copied().ok_or_else(|| {
+                    ReplayError::Corrupt("native store group output owner is absent".into())
+                })?;
+                if !group
+                    .members
+                    .iter()
+                    .any(|member| member.output_buffer == abi.id)
+                    || self.slots[slot].key.elements != abi.elements
+                    || self.slots[slot].key.descriptor.dtype != abi.dtype
+                {
+                    return Err(ReplayError::Corrupt(
+                        "native store group output descriptor mismatch".into(),
+                    ));
+                }
+                slots.push(slot);
+            } else {
+                slots.push(
+                    self.resolve_group_input(
+                        capture,
+                        &group
+                            .members
+                            .iter()
+                            .map(|member| member.logical_index)
+                            .collect::<Vec<_>>(),
+                        abi,
+                    )?,
+                );
+            }
+        }
+        let dispatch = group
+            .prepare_workspace_dispatch(&self.buffers, &slots)
+            .map_err(backend_error)?;
+        let output = *outputs
+            .last()
+            .ok_or_else(|| ReplayError::Corrupt("native store group is empty".into()))?;
+        self.items.push(WorkspaceItem {
+            slots,
+            output,
+            outputs,
+            logical_indices: group
+                .members
+                .iter()
+                .map(|member| member.logical_index)
+                .collect(),
+            elided: false,
+            dispatch: Some(dispatch),
+            output_initialization: group.output_initialization(),
+        });
+        Ok(())
+    }
+
+    fn resolve_group_input(
+        &mut self,
+        capture: &CapturedSchedule,
+        members: &[usize],
+        abi: &crate::cpu_jit::BufferAbi,
+    ) -> Result<usize, ReplayError> {
+        let bindings = members
+            .iter()
+            .flat_map(|index| {
+                capture.items[*index]
+                    .ordered_inputs()
+                    .iter()
+                    .filter(move |binding| binding.desc.id == abi.id)
+                    .map(move |binding| (*index, binding))
+            })
+            .collect::<Vec<_>>();
+        let Some((member, binding)) = bindings.first().copied() else {
+            return Err(ReplayError::Corrupt(format!(
+                "native store group input {} has no binding",
+                abi.id
+            )));
+        };
+        if bindings
+            .iter()
+            .any(|(_, candidate)| candidate.desc != binding.desc)
+            || binding.desc.view.is_some()
+            || abi.mutable
+        {
+            return Err(ReplayError::Corrupt(
+                "native store group input binding mismatch".into(),
+            ));
+        }
+        self.resolve_input(&capture.items[member], abi, false, None)
     }
 
     fn resolve_input(
@@ -814,25 +966,29 @@ impl NativeReplayWorkspace {
         index: usize,
         borrowed: &mut NativeReplayBindings<'_>,
     ) -> Result<(), ReplayError> {
-        let (output, output_initialization) = self
+        let (outputs, output_initialization) = self
             .items
             .get(index)
-            .map(|item| (item.output, item.output_initialization))
+            .map(|item| (item.outputs.clone(), item.output_initialization))
             .ok_or_else(|| {
                 ReplayError::Corrupt("native workspace initialization item is absent".into())
             })?;
-        self.valid[output] = false;
+        for output in &outputs {
+            self.valid[*output] = false;
+        }
         if output_initialization == crate::cpu_jit::NativeOutputInitialization::FullyOverwritten {
             self.current_traffic.skipped_output_clear_count = self
                 .current_traffic
                 .skipped_output_clear_count
-                .checked_add(1)
+                .checked_add(outputs.len())
                 .ok_or_else(|| {
                     ReplayError::Descriptor("native skipped output clear count overflows".into())
                 })?;
             #[cfg(test)]
             {
-                self.skipped_output_clear_count = self.skipped_output_clear_count.saturating_add(1);
+                self.skipped_output_clear_count = self
+                    .skipped_output_clear_count
+                    .saturating_add(outputs.len());
             }
             return Ok(());
         }
@@ -840,15 +996,15 @@ impl NativeReplayWorkspace {
         {
             self.output_clear_count = self.output_clear_count.saturating_add(1);
         }
-        match borrowed.slots.get_mut(&output) {
-            Some(binding) => binding
-                .clear()
-                .map_err(|error| ReplayError::Backend(error.to_string())),
-            None => {
-                self.buffers[output].clear();
-                Ok(())
+        for output in outputs {
+            match borrowed.slots.get_mut(&output) {
+                Some(binding) => binding
+                    .clear()
+                    .map_err(|error| ReplayError::Backend(error.to_string()))?,
+                None => self.buffers[output].clear(),
             }
         }
+        Ok(())
     }
 
     fn execute_dispatch_segment(
@@ -859,10 +1015,11 @@ impl NativeReplayWorkspace {
         borrowed: &mut NativeReplayBindings<'_>,
     ) -> Result<(), ReplayError> {
         #[cfg(test)]
-        if let Some(index) = self
-            .injected_dispatch_failure
-            .filter(|index| indices.contains(index))
-        {
+        if let Some(index) = self.injected_dispatch_failure.filter(|injected| {
+            indices
+                .iter()
+                .any(|index| self.items[*index].logical_indices.contains(injected))
+        }) {
             self.injected_dispatch_failure = None;
             let logical = capture.items[index].id;
             return Err(ReplayError::Backend(format!(
@@ -881,14 +1038,22 @@ impl NativeReplayWorkspace {
             crate::backend::PreparedScheduleDispatch::authenticate_segment(&entries, quantized)
                 .map_err(|failure| {
                     let index = indices.get(failure.entry).copied().unwrap_or(usize::MAX);
-                    let logical = capture
+                    let logical_index = self
                         .items
                         .get(index)
+                        .and_then(|item| item.logical_indices.first())
+                        .copied()
+                        .unwrap_or(usize::MAX);
+                    let logical = self
+                        .items
+                        .get(index)
+                        .and_then(|item| item.logical_indices.first())
+                        .and_then(|logical| capture.items.get(*logical))
                         .map(|item| item.id.to_string())
                         .unwrap_or_else(|| "unknown".into());
                     match backend_error(failure.error) {
                         ReplayError::Backend(reason) => ReplayError::Backend(format!(
-                            "native schedule item {index} logical {logical}: {reason}"
+                            "native schedule item {logical_index} logical {logical}: {reason}"
                         )),
                         other => other,
                     }
@@ -896,22 +1061,22 @@ impl NativeReplayWorkspace {
         }
         let mut produced = BTreeSet::new();
         for &index in indices {
-            let (slots, output) = self
+            let (slots, outputs) = self
                 .items
                 .get(index)
-                .map(|item| (item.slots.clone(), item.output))
+                .map(|item| (item.slots.clone(), item.outputs.clone()))
                 .ok_or_else(|| {
                     ReplayError::Corrupt("native dispatcher segment item is absent".into())
                 })?;
             for slot in slots {
-                if slot != output
+                if !outputs.contains(&slot)
                     && !self.valid.get(slot).copied().unwrap_or(false)
                     && !produced.contains(&slot)
                 {
                     self.prepare_slot(slot, borrowed)?;
                 }
             }
-            produced.insert(output);
+            produced.extend(outputs);
         }
         for &index in indices {
             self.initialize_output(index, borrowed)?;
@@ -954,21 +1119,31 @@ impl NativeReplayWorkspace {
         )
         .map_err(|failure| {
             let index = indices.get(failure.entry).copied().unwrap_or(usize::MAX);
-            let logical = capture
+            let logical_index = self
                 .items
                 .get(index)
+                .and_then(|item| item.logical_indices.first())
+                .copied()
+                .unwrap_or(usize::MAX);
+            let logical = self
+                .items
+                .get(index)
+                .and_then(|item| item.logical_indices.first())
+                .and_then(|logical| capture.items.get(*logical))
                 .map(|item| item.id.to_string())
                 .unwrap_or_else(|| "unknown".into());
             let reason = backend_error(failure.error);
             match reason {
                 ReplayError::Backend(reason) => ReplayError::Backend(format!(
-                    "native schedule item {index} logical {logical}: {reason}"
+                    "native schedule item {logical_index} logical {logical}: {reason}"
                 )),
                 other => other,
             }
         })?;
         for &index in indices {
-            self.valid[self.items[index].output] = true;
+            for output in &self.items[index].outputs {
+                self.valid[*output] = true;
+            }
         }
         self.current_traffic.module_dispatch_count = next_dispatch_count;
         self.current_traffic.module_dispatched_native_item_count = next_dispatched_items;
@@ -981,10 +1156,10 @@ impl NativeReplayWorkspace {
         capture: &CapturedSchedule,
         backend: &CpuJitBackend,
         quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
-        prepared: &[PreparedScheduleItem],
+        prepared: &[PreparedNativeDispatch],
         borrowed: &mut NativeReplayBindings<'_>,
     ) -> Result<(), ReplayError> {
-        if capture.items.len() != self.items.len() || prepared.len() != self.items.len() {
+        if prepared.len() != self.items.len() {
             return Err(ReplayError::Corrupt(
                 "native dispatcher item inventory mismatch".into(),
             ));
@@ -997,36 +1172,46 @@ impl NativeReplayWorkspace {
                 })?,
                 WorkspaceDispatchStep::PerItem(index) => *index,
             };
-            let item = &capture.items[index];
+            let logical_index = *self.items[index].logical_indices.first().ok_or_else(|| {
+                ReplayError::Corrupt("native dispatch has no logical item".into())
+            })?;
+            let logical_item = capture.items.get(logical_index).ok_or_else(|| {
+                ReplayError::Corrupt("native dispatch logical item is out of range".into())
+            })?;
             #[cfg(test)]
-            if !is_segment && self.injected_dispatch_failure == Some(index) {
+            if !is_segment && self.injected_dispatch_failure == Some(logical_index) {
                 self.injected_dispatch_failure = None;
                 return Err(ReplayError::Backend(format!(
-                    "native schedule item {index} logical {}: injected dispatcher failure",
-                    item.id
+                    "native schedule item {logical_index} logical {}: injected dispatcher failure",
+                    logical_item.id
                 )));
             }
             let execution = match step {
                 WorkspaceDispatchStep::Segment(indices) => {
                     self.execute_dispatch_segment(&indices, capture, quantized, borrowed)
                 }
-                WorkspaceDispatchStep::PerItem(index) => self.execute_item(
-                    index,
-                    &capture.items[index],
-                    backend,
-                    quantized,
-                    &prepared[index],
-                    borrowed,
-                ),
+                WorkspaceDispatchStep::PerItem(index) => {
+                    let prepared_item = prepared[index].item().ok_or_else(|| {
+                        ReplayError::Corrupt("prepared native dispatch kind mismatch".into())
+                    })?;
+                    self.execute_item(
+                        index,
+                        logical_item,
+                        backend,
+                        quantized,
+                        prepared_item,
+                        borrowed,
+                    )
+                }
             };
             execution.map_err(|error| match error {
                 ReplayError::Backend(reason) if !is_segment => ReplayError::Backend(format!(
-                    "native schedule item {index} logical {}: {reason}",
-                    item.id
+                    "native schedule item {logical_index} logical {}: {reason}",
+                    logical_item.id
                 )),
                 ReplayError::Execute(reason) if !is_segment => ReplayError::Execute(format!(
-                    "native schedule item {index} logical {}: {reason}",
-                    item.id
+                    "native schedule item {logical_index} logical {}: {reason}",
+                    logical_item.id
                 )),
                 other => other,
             })?;
@@ -1090,8 +1275,10 @@ impl NativeReplayWorkspace {
     pub(super) fn poison_outputs(&mut self, byte: u8) {
         for item in &self.items {
             if !item.elided {
-                self.buffers[item.output].bytes_mut().fill(byte);
-                self.valid[item.output] = false;
+                for output in &item.outputs {
+                    self.buffers[*output].bytes_mut().fill(byte);
+                    self.valid[*output] = false;
+                }
             }
         }
     }
@@ -1115,7 +1302,7 @@ impl NativeReplayWorkspace {
             .items
             .get_mut(index)
             .ok_or_else(|| ReplayError::Corrupt("native dispatcher item is absent".into()))?;
-        if item.elided || item.dispatch.take().is_none() {
+        if item.elided || item.logical_indices.len() != 1 || item.dispatch.take().is_none() {
             return Err(ReplayError::Corrupt(
                 "native dispatcher fallback item is not dispatchable".into(),
             ));
@@ -1156,7 +1343,12 @@ impl NativeReplayWorkspace {
                     segment_outputs.contains(&source)
                 })
             });
-            if segment_slots.contains(&item.output) || derived_depends_on_segment {
+            if item
+                .outputs
+                .iter()
+                .any(|output| segment_slots.contains(output))
+                || derived_depends_on_segment
+            {
                 self.dispatch_steps
                     .push(WorkspaceDispatchStep::Segment(std::mem::take(&mut segment)));
                 segment_slots.clear();
@@ -1164,7 +1356,7 @@ impl NativeReplayWorkspace {
             }
             segment.extend([index]);
             segment_slots.extend(item.slots.iter().copied());
-            segment_outputs.insert(item.output);
+            segment_outputs.extend(item.outputs.iter().copied());
         }
         if !segment.is_empty() {
             self.dispatch_steps

@@ -15,6 +15,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+mod store_group;
+pub(crate) use store_group::{NativeStoreGroup, NativeStoreGroupMember, PreparedNativeStoreGroup};
+use store_group::{PreparedNativeStoreGroupMember, render_schedule_module_entries};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JitFallback {
@@ -80,10 +83,10 @@ struct NativeScheduleModule {
 }
 
 struct RenderedScheduleEntry {
+    logical_indices: Vec<usize>,
     vector: VectorPlan,
     rendered: crate::cpu_jit::RenderedC,
     native_cache_key: String,
-    layout: NativeScheduleLayout,
     output_initialization: crate::cpu_jit::NativeOutputInitialization,
 }
 
@@ -97,7 +100,7 @@ type NativeScheduleModuleJob = (
     Result<(NativeScheduleModule, crate::cpu_jit::JitScheduleModuleLoad), JitError>,
     (Instant, Instant),
 );
-type PreparedNativeScheduleModule = (Vec<PreparedScheduleItem>, NativeScheduleModulePreparation);
+type PreparedNativeScheduleModule = (Vec<PreparedNativeDispatch>, NativeScheduleModulePreparation);
 type PreparedNativeScheduleModules = (
     Vec<PreparedNativeScheduleModule>,
     NativeScheduleCompilationBatch,
@@ -128,6 +131,14 @@ pub(crate) struct PreparedScheduleItem {
     schedule_cache_key: u64,
     native_layout: NativeScheduleLayout,
     output_initialization: crate::cpu_jit::NativeOutputInitialization,
+}
+
+pub(crate) enum PreparedNativeDispatch {
+    Item {
+        logical_index: usize,
+        item: PreparedScheduleItem,
+    },
+    StoreGroup(Arc<PreparedNativeStoreGroup>),
 }
 
 /// Immutable dispatch metadata for one entry in an authenticated retained
@@ -166,41 +177,6 @@ pub(crate) struct NativeScheduleLayout {
     pub(crate) matmul: Option<crate::cpu_jit::NativeMatmulLayouts>,
     pub(crate) retained_matmul_sources: BTreeMap<u64, u64>,
     pub(crate) elided_output_source: Option<u64>,
-}
-
-fn render_schedule_module_entries(
-    backend: &CpuJitBackend,
-    items: &[ScheduleItem],
-    layouts: Vec<NativeScheduleLayout>,
-) -> Result<RenderedScheduleModule, JitBackendError> {
-    if items.len() != layouts.len() {
-        return Err(JitBackendError::Binding(
-            "native schedule module layout count mismatch".into(),
-        ));
-    }
-    let started = Instant::now();
-    let entries = items
-        .iter()
-        .zip(layouts)
-        .map(|(item, layout)| {
-            validate_native_layout(item, &layout)?;
-            let (vector, rendered, _) = backend.render_schedule_kernel(item, &layout)?;
-            backend.validate_rendered_schedule_item(item, &rendered)?;
-            let native_cache_key =
-                format!("{}-schedule-{:016x}", rendered.cache_key, item.cache_key);
-            Ok(RenderedScheduleEntry {
-                vector,
-                rendered,
-                native_cache_key,
-                layout,
-                output_initialization: crate::cpu_jit::native_output_initialization(&item.kernel),
-            })
-        })
-        .collect::<Result<Vec<_>, JitBackendError>>()?;
-    Ok(RenderedScheduleModule {
-        entries,
-        render_wall_time: started.elapsed(),
-    })
 }
 
 fn overlapping_wall_time(
@@ -401,6 +377,117 @@ impl PreparedScheduleItem {
             slots: slots.to_vec(),
             quantized,
         }))
+    }
+}
+
+impl PreparedNativeStoreGroup {
+    pub(crate) fn abi(&self) -> &crate::KernelAbi {
+        self.kernel.abi()
+    }
+
+    pub(crate) const fn output_initialization(&self) -> crate::cpu_jit::NativeOutputInitialization {
+        self.output_initialization
+    }
+
+    pub(crate) fn prepare_workspace_dispatch(
+        &self,
+        buffers: &[JitBuffer],
+        slots: &[usize],
+    ) -> Result<PreparedScheduleDispatch, JitBackendError> {
+        if slots.len() != self.kernel.abi().buffers.len()
+            || self.kernel.abi().symbol_count != 0
+            || !self.kernel.abi().quantized_buffers.is_empty()
+        {
+            return Err(JitBackendError::Binding(
+                "prepared native store group ABI mismatch".into(),
+            ));
+        }
+        for (index, (slot, want)) in slots
+            .iter()
+            .copied()
+            .zip(&self.kernel.abi().buffers)
+            .enumerate()
+        {
+            if slots[..index].contains(&slot) {
+                return Err(JitBackendError::Binding(
+                    "prepared native store group slots alias".into(),
+                ));
+            }
+            let buffer = buffers.get(slot).ok_or_else(|| {
+                JitBackendError::Binding("prepared native store group slot is absent".into())
+            })?;
+            if buffer.dtype != want.dtype
+                || buffer.elements != want.elements
+                || (want.mutable && !buffer.mutable)
+            {
+                return Err(JitBackendError::Binding(
+                    "prepared native store group buffer descriptor mismatch".into(),
+                ));
+            }
+        }
+        Ok(PreparedScheduleDispatch {
+            kernel: self.kernel.clone(),
+            dispatcher: self.dispatcher.clone(),
+            slots: slots.to_vec(),
+            quantized: Vec::new(),
+        })
+    }
+}
+
+impl PreparedNativeDispatch {
+    pub(crate) fn item(&self) -> Option<&PreparedScheduleItem> {
+        match self {
+            Self::Item { item, .. } => Some(item),
+            Self::StoreGroup(_) => None,
+        }
+    }
+
+    pub(crate) fn logical_item_count(&self) -> usize {
+        match self {
+            Self::Item { .. } => 1,
+            Self::StoreGroup(update) => update.members.len(),
+        }
+    }
+
+    pub(crate) fn cache_hit(&self) -> bool {
+        match self {
+            Self::Item { item, .. } => item.cache_hit,
+            Self::StoreGroup(update) => update.cache_hit,
+        }
+    }
+
+    pub(crate) fn authenticates_layout(
+        &self,
+        index: usize,
+        item: &ScheduleItem,
+        layout: &NativeScheduleLayout,
+    ) -> bool {
+        match self {
+            Self::Item {
+                logical_index,
+                item: prepared,
+            } => *logical_index == index && prepared.authenticates_layout(item, layout),
+            Self::StoreGroup(_) => false,
+        }
+    }
+
+    pub(crate) fn authenticates_store_group_member(
+        &self,
+        member: usize,
+        index: usize,
+        item: &ScheduleItem,
+        layout: &NativeScheduleLayout,
+    ) -> bool {
+        let Self::StoreGroup(update) = self else {
+            return false;
+        };
+        update.members.get(member).is_some_and(|prepared| {
+            prepared.logical_index == index
+                && prepared.output_buffer == item.primary_output().id
+                && prepared.schedule_cache_key == item.cache_key
+                && prepared.layout == *layout
+        }) && crate::cpu_jit::native_output_initialization(&item.kernel)
+            == update.output_initialization
     }
 }
 
@@ -973,11 +1060,17 @@ impl CpuJitBackend {
 
     pub(crate) fn prepare_schedule_modules(
         &self,
-        programs: Vec<(&[ScheduleItem], Vec<NativeScheduleLayout>)>,
+        programs: Vec<(
+            &[ScheduleItem],
+            Vec<NativeScheduleLayout>,
+            Vec<NativeStoreGroup>,
+        )>,
     ) -> Result<PreparedNativeScheduleModules, JitBackendError> {
         let rendered = programs
             .iter()
-            .map(|(items, layouts)| render_schedule_module_entries(self, items, layouts.clone()))
+            .map(|(items, layouts, store_groups)| {
+                render_schedule_module_entries(self, items, layouts.clone(), store_groups)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let wrapper_keys = rendered
             .iter()
@@ -1138,7 +1231,7 @@ impl CpuJitBackend {
         let mut staged_entries = Vec::new();
         let mut staged_entry_keys = HashSet::new();
         let mut out = Vec::with_capacity(programs.len());
-        for (index, (((items, _), module), resolved)) in
+        for (index, (((items, layouts, store_groups), module), resolved)) in
             programs.into_iter().zip(rendered).zip(resolved).enumerate()
         {
             let Some((candidate, load, job_interval)) = resolved else {
@@ -1168,21 +1261,76 @@ impl CpuJitBackend {
                     "cached native schedule module ABI mismatch".into(),
                 ));
             }
+            let rendered_entry_count = module.entries.len();
             let mut prepared = Vec::with_capacity(module.entries.len());
-            for ((item, entry), kernel) in items.iter().zip(module.entries).zip(selected.kernels) {
+            let store_groups = store_groups
+                .into_iter()
+                .map(|group| {
+                    let anchor = group
+                        .members
+                        .last()
+                        .map(|member| member.logical_index)
+                        .expect("validated native store group has an anchor");
+                    (anchor, group)
+                })
+                .collect::<BTreeMap<_, _>>();
+            for (entry, kernel) in module.entries.into_iter().zip(selected.kernels) {
                 let cache_hit = cache.contains_key(&entry.native_cache_key)
                     || !staged_entry_keys.insert(entry.native_cache_key.clone());
                 staged_entries.push((entry.native_cache_key.clone(), kernel.clone()));
-                prepared.push(PreparedScheduleItem {
-                    kernel,
-                    dispatcher: Some(selected.dispatcher.clone()),
-                    native_cache_key: entry.native_cache_key,
+                if entry.logical_indices.len() == 1 {
+                    let logical = entry.logical_indices[0];
+                    let item = &items[logical];
+                    prepared.push(PreparedNativeDispatch::Item {
+                        logical_index: logical,
+                        item: PreparedScheduleItem {
+                            kernel,
+                            dispatcher: Some(selected.dispatcher.clone()),
+                            native_cache_key: entry.native_cache_key,
+                            cache_hit,
+                            vector: entry.vector,
+                            schedule_cache_key: item.cache_key,
+                            native_layout: layouts[logical].clone(),
+                            output_initialization: crate::cpu_jit::native_output_initialization(
+                                &item.kernel,
+                            ),
+                        },
+                    });
+                    continue;
+                }
+                let anchor = *entry.logical_indices.last().ok_or_else(|| {
+                    JitBackendError::Binding("native store group has no anchor".into())
+                })?;
+                let group = store_groups.get(&anchor).ok_or_else(|| {
+                    JitBackendError::Binding("native store group metadata is absent".into())
+                })?;
+                if entry
+                    .logical_indices
+                    .iter()
+                    .copied()
+                    .ne(group.members.iter().map(|member| member.logical_index))
+                {
+                    return Err(JitBackendError::Binding(
+                        "native store group member identity mismatch".into(),
+                    ));
+                }
+                let prepared_group = Arc::new(PreparedNativeStoreGroup {
+                    members: group
+                        .members
+                        .iter()
+                        .map(|member| PreparedNativeStoreGroupMember {
+                            logical_index: member.logical_index,
+                            output_buffer: member.output_buffer,
+                            schedule_cache_key: items[member.logical_index].cache_key,
+                            layout: layouts[member.logical_index].clone(),
+                        })
+                        .collect(),
                     cache_hit,
-                    vector: entry.vector,
-                    schedule_cache_key: item.cache_key,
-                    native_layout: entry.layout,
                     output_initialization: entry.output_initialization,
+                    kernel: kernel.clone(),
+                    dispatcher: selected.dispatcher.clone(),
                 });
+                prepared.push(PreparedNativeDispatch::StoreGroup(prepared_group));
             }
             let compiler_process_wall_time = load
                 .map(|load| load.compiler_process_wall_time)
@@ -1207,7 +1355,7 @@ impl CpuJitBackend {
                         JitBackendError::Native("native schedule module residual overflows".into())
                     })?;
             let preparation = NativeScheduleModulePreparation {
-                rendered_entry_count: prepared.len(),
+                rendered_entry_count,
                 loaded_module_count: 1,
                 durable_artifact_cache_hit_count: load
                     .map(|load| usize::from(load.durable_cache_hit))
@@ -1529,6 +1677,139 @@ fn jit_error(e: JitError) -> JitBackendError {
 mod tests {
     use super::*;
     use crate::{DType, Scalar, Shape};
+
+    #[test]
+    fn native_store_group_rejects_malformed_member_provenance_before_compilation() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], DType::F32);
+        let left = graph.relu(input).unwrap();
+        let right = graph.square(input).unwrap();
+        let schedule = crate::schedule_many(&graph, &[left, right]).unwrap();
+        assert_eq!(schedule.items.len(), 2);
+        let layouts = schedule
+            .items
+            .iter()
+            .map(schedule_native_layout)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let kernels = schedule
+            .items
+            .iter()
+            .map(|item| &item.kernel)
+            .collect::<Vec<_>>();
+        let kernel = crate::kernel::fuse_native_store_group(&kernels).unwrap();
+        let policy = crate::cpu_jit::render_native_store_group(&kernel)
+            .unwrap()
+            .1;
+        let backend = CpuJitBackend::new(JitFallback::Error);
+
+        let error = match backend.prepare_schedule_modules(vec![(
+            &schedule.items,
+            layouts.clone(),
+            vec![NativeStoreGroup {
+                members: vec![NativeStoreGroupMember {
+                    logical_index: 0,
+                    output_buffer: schedule.items[0].primary_output().id,
+                }],
+                kernel: kernel.clone(),
+                output_initialization: policy,
+            }],
+        )]) {
+            Ok(_) => panic!("single-member native store group must reject"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("multiple members"));
+
+        let error = match backend.prepare_schedule_modules(vec![(
+            &schedule.items,
+            layouts,
+            vec![NativeStoreGroup {
+                members: vec![
+                    NativeStoreGroupMember {
+                        logical_index: 0,
+                        output_buffer: schedule.items[1].primary_output().id,
+                    },
+                    NativeStoreGroupMember {
+                        logical_index: 1,
+                        output_buffer: schedule.items[1].primary_output().id,
+                    },
+                ],
+                kernel,
+                output_initialization: policy,
+            }],
+        )]) {
+            Ok(_) => panic!("mismatched native store-group output must reject"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("output identity"));
+    }
+
+    #[test]
+    fn native_store_group_preserves_an_independent_intervening_item() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], DType::F32);
+        let first = graph.relu(input).unwrap();
+        let intervening = graph.square(input).unwrap();
+        let last = graph.neg(input).unwrap();
+        let schedule = crate::schedule_many(&graph, &[first, intervening, last]).unwrap();
+        assert_eq!(schedule.items.len(), 3);
+        let layouts = schedule
+            .items
+            .iter()
+            .map(schedule_native_layout)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let grouped_kernels = [&schedule.items[0].kernel, &schedule.items[2].kernel];
+        let kernel = crate::kernel::fuse_native_store_group(&grouped_kernels).unwrap();
+        let output_initialization = crate::cpu_jit::render_native_store_group(&kernel)
+            .unwrap()
+            .1;
+        let group = NativeStoreGroup {
+            members: vec![
+                NativeStoreGroupMember {
+                    logical_index: 0,
+                    output_buffer: schedule.items[0].primary_output().id,
+                },
+                NativeStoreGroupMember {
+                    logical_index: 2,
+                    output_buffer: schedule.items[2].primary_output().id,
+                },
+            ],
+            kernel,
+            output_initialization,
+        };
+        let rendered = render_schedule_module_entries(
+            &CpuJitBackend::new(JitFallback::Error),
+            &schedule.items,
+            layouts.clone(),
+            std::slice::from_ref(&group),
+        )
+        .unwrap();
+        assert_eq!(rendered.entries.len(), 2);
+        assert_eq!(rendered.entries[0].logical_indices, vec![1]);
+        assert_eq!(rendered.entries[1].logical_indices, vec![0, 2]);
+
+        for members in [
+            vec![group.members[0].clone(), group.members[0].clone()],
+            vec![group.members[1].clone(), group.members[0].clone()],
+        ] {
+            let malformed = NativeStoreGroup {
+                members,
+                kernel: group.kernel.clone(),
+                output_initialization,
+            };
+            let error = match render_schedule_module_entries(
+                &CpuJitBackend::new(JitFallback::Error),
+                &schedule.items,
+                layouts.clone(),
+                &[malformed],
+            ) {
+                Ok(_) => panic!("duplicate or descending store-group members must reject"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("inventory mismatch"));
+        }
+    }
 
     #[test]
     fn native_output_initialization_is_typed_and_fail_closed() {

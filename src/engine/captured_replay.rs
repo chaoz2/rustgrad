@@ -3,7 +3,8 @@ use super::capture::{CapturedSchedule, ReplayError};
 use super::native_replay_workspace::{NativeReplayTraffic, NativeReplayWorkspace};
 use super::replay_liveness::ReplayLivenessPlan;
 use crate::backend::{
-    JitBackendError, NativeScheduleLayout, PreparedScheduleItem, TensorValueStore,
+    JitBackendError, NativeScheduleLayout, PreparedNativeDispatch, PreparedScheduleItem,
+    TensorValueStore,
 };
 use crate::{
     BufferRole, CpuJitBackend, ItemBackend, JitFallback, KernelBindings, KernelBufferDesc,
@@ -807,13 +808,17 @@ impl PreparedPrunedNativeReplay {
 /// Fully compiled strict-native pure prefix and reusable scratch storage, kept
 /// in the existing executor's ownership domain until detached execution.
 pub(crate) struct PlannedNativeItems {
-    items: Vec<PreparedScheduleItem>,
+    items: Vec<PreparedNativeDispatch>,
+    logical_item_count: usize,
     module_preparation: crate::backend::NativeScheduleModulePreparation,
     workspace: NativeReplayWorkspace,
     vectorized: bool,
     capture_identity: u64,
     input_schema: Vec<crate::ReplayInput>,
     schedule_cache_keys: Vec<u64>,
+    adamw_native_updates: Vec<AdamWNativeUpdateManifest>,
+    #[cfg(test)]
+    adamw_native_update_admissions: Vec<AdamWNativeUpdateAdmissionDiagnostic>,
     #[cfg(test)]
     structure_validation_count: std::sync::atomic::AtomicUsize,
 }
@@ -821,6 +826,158 @@ pub(crate) struct PlannedNativeItems {
 pub(crate) struct NativeItemPlanDraft {
     layouts: Vec<crate::backend::NativeScheduleLayout>,
     layout_wall_time: Duration,
+    adamw_native_updates: Vec<crate::backend::NativeStoreGroup>,
+    admitted_adamw_updates: Vec<AdamWNativeUpdateManifest>,
+    #[cfg(test)]
+    adamw_native_update_admissions: Vec<AdamWNativeUpdateAdmissionDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdamWNativeUpdateRole {
+    Parameter,
+    FirstMoment,
+    SecondMoment,
+    GradientAccumulator,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AdamWNativeUpdateSuccessor {
+    pub(crate) role: AdamWNativeUpdateRole,
+    pub(crate) output: u64,
+    pub(crate) state_buffer: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AdamWNativeUpdateManifest {
+    pub(crate) members: [AdamWNativeUpdateSuccessor; 4],
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AdamWNativeUpdateAdmissionDiagnostic {
+    Admitted { logical_indices: [usize; 4] },
+    Rejected(AdamWNativeUpdateRejection),
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AdamWNativeUpdateRejection {
+    MissingMember {
+        role: AdamWNativeUpdateRole,
+        output: u64,
+    },
+    MemberDescriptor {
+        role: AdamWNativeUpdateRole,
+        output: u64,
+        logical_index: usize,
+    },
+    EscapingConsumer {
+        logical_index: usize,
+        consumer: u64,
+    },
+    KernelFusion(crate::kernel::NativeStoreGroupFusionError),
+    KernelRendering(String),
+    MutableOutputAbi {
+        buffer: u64,
+    },
+    MissingInputBinding {
+        buffer: u64,
+    },
+    InputBindingDescriptor {
+        buffer: u64,
+    },
+    InputProducerOrder {
+        buffer: u64,
+        producer: usize,
+        dispatch_anchor: usize,
+    },
+    EffectiveInputOwnerCollision {
+        buffer: u64,
+        owner: u64,
+    },
+}
+
+#[cfg(test)]
+impl AdamWNativeUpdateAdmissionDiagnostic {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Admitted { logical_indices } => {
+                format!("admitted logical items {logical_indices:?}")
+            }
+            Self::Rejected(reason) => reason.describe(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl AdamWNativeUpdateRejection {
+    fn describe(&self) -> String {
+        match self {
+            Self::MissingMember { role, output } => {
+                format!("missing member: role={role:?}, output={output}")
+            }
+            Self::MemberDescriptor {
+                role,
+                output,
+                logical_index,
+            } => format!(
+                "member descriptor: role={role:?}, output={output}, logical_index={logical_index}"
+            ),
+            Self::EscapingConsumer {
+                logical_index,
+                consumer,
+            } => format!(
+                "escaping consumer: logical_index={logical_index}, consumer_item={consumer}"
+            ),
+            Self::KernelFusion(error) => format!("kernel fusion: {error}"),
+            Self::KernelRendering(error) => format!("kernel rendering: {error}"),
+            Self::MutableOutputAbi { buffer } => {
+                format!("mutable output ABI: buffer={buffer}")
+            }
+            Self::MissingInputBinding { buffer } => {
+                format!("missing input binding: buffer={buffer}")
+            }
+            Self::InputBindingDescriptor { buffer } => {
+                format!("input binding descriptor: buffer={buffer}")
+            }
+            Self::InputProducerOrder {
+                buffer,
+                producer,
+                dispatch_anchor,
+            } => format!(
+                "input producer order: buffer={buffer}, producer={producer}, dispatch_anchor={dispatch_anchor}"
+            ),
+            Self::EffectiveInputOwnerCollision { buffer, owner } => {
+                format!("effective input owner collision: buffer={buffer}, owner={owner}")
+            }
+        }
+    }
+}
+
+enum AdamWNativeUpdateAdmission {
+    Admitted {
+        group: crate::backend::NativeStoreGroup,
+        logical_indices: [usize; 4],
+    },
+    Rejected {
+        #[cfg(test)]
+        reason: AdamWNativeUpdateRejection,
+    },
+}
+
+struct AdamWNativeUpdateGroupPlan {
+    groups: Vec<(crate::backend::NativeStoreGroup, AdamWNativeUpdateManifest)>,
+    #[cfg(test)]
+    diagnostics: Vec<AdamWNativeUpdateAdmissionDiagnostic>,
+}
+
+macro_rules! reject_adamw_native_update {
+    ($reason:expr) => {
+        AdamWNativeUpdateAdmission::Rejected {
+            #[cfg(test)]
+            reason: $reason,
+        }
+    };
 }
 
 /// One native pure plan whose immutable capture schema, cache keys, and
@@ -832,19 +989,36 @@ pub(super) struct SealedPlannedNativeItems {
 
 impl PlannedNativeItems {
     pub(crate) fn item_count(&self) -> usize {
-        self.items.len()
+        self.logical_item_count
     }
 
     pub(crate) fn cache_hit_count(&self) -> usize {
-        self.items.iter().filter(|item| item.cache_hit).count()
+        self.items
+            .iter()
+            .filter(|item| item.cache_hit())
+            .map(PreparedNativeDispatch::logical_item_count)
+            .sum()
     }
 
     pub(crate) fn cache_miss_count(&self) -> usize {
-        self.items.iter().filter(|item| !item.cache_hit).count()
+        self.items
+            .iter()
+            .filter(|item| !item.cache_hit())
+            .map(PreparedNativeDispatch::logical_item_count)
+            .sum()
     }
 
     pub(crate) fn vectorized(&self) -> bool {
         self.vectorized
+    }
+
+    pub(crate) fn adamw_native_updates(&self) -> &[AdamWNativeUpdateManifest] {
+        &self.adamw_native_updates
+    }
+
+    #[cfg(test)]
+    pub(crate) fn adamw_native_update_admissions(&self) -> &[AdamWNativeUpdateAdmissionDiagnostic] {
+        &self.adamw_native_update_admissions
     }
 
     pub(crate) fn schedule_cache_keys(&self) -> &[u64] {
@@ -914,9 +1088,14 @@ impl PlannedNativeItems {
                 "prepared native input schema mismatch".into(),
             ));
         }
-        if capture.items.len() != self.items.len() {
+        if capture.items.len() != self.logical_item_count {
             return Err(ReplayError::Corrupt(
                 "prepared native item count mismatch".into(),
+            ));
+        }
+        if self.module_preparation.rendered_entry_count != self.items.len() {
+            return Err(ReplayError::Corrupt(
+                "prepared native physical entry count mismatch".into(),
             ));
         }
         if capture
@@ -930,15 +1109,62 @@ impl PlannedNativeItems {
             ));
         }
         let layouts = native_schedule_layouts(capture)?;
-        if capture
-            .items
-            .iter()
-            .zip(&self.items)
-            .zip(&layouts)
-            .any(|((item, prepared), layout)| !prepared.authenticates_layout(item, layout))
-        {
+        let mut covered = vec![false; capture.items.len()];
+        for prepared in &self.items {
+            match prepared {
+                PreparedNativeDispatch::Item { logical_index, .. } => {
+                    let Some((item, layout, slot)) = capture
+                        .items
+                        .get(*logical_index)
+                        .zip(layouts.get(*logical_index))
+                        .zip(covered.get_mut(*logical_index))
+                        .map(|((item, layout), slot)| (item, layout, slot))
+                    else {
+                        return Err(ReplayError::Corrupt(
+                            "prepared native logical item is out of range".into(),
+                        ));
+                    };
+                    if *slot || !prepared.authenticates_layout(*logical_index, item, layout) {
+                        return Err(ReplayError::Corrupt(
+                            "prepared native operand layout mismatch".into(),
+                        ));
+                    }
+                    *slot = true;
+                }
+                PreparedNativeDispatch::StoreGroup(update) => {
+                    for (member, prepared_member) in update.members.iter().enumerate() {
+                        let logical_index = prepared_member.logical_index;
+                        let Some((item, layout, slot)) = capture
+                            .items
+                            .get(logical_index)
+                            .zip(layouts.get(logical_index))
+                            .zip(covered.get_mut(logical_index))
+                            .map(|((item, layout), slot)| (item, layout, slot))
+                        else {
+                            return Err(ReplayError::Corrupt(
+                                "prepared AdamW update item is out of range".into(),
+                            ));
+                        };
+                        if *slot
+                            || !prepared.authenticates_store_group_member(
+                                member,
+                                logical_index,
+                                item,
+                                layout,
+                            )
+                        {
+                            return Err(ReplayError::Corrupt(
+                                "prepared AdamW update layout mismatch".into(),
+                            ));
+                        }
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        if covered.iter().any(|covered| !covered) {
             return Err(ReplayError::Corrupt(
-                "prepared native operand layout mismatch".into(),
+                "prepared native logical item is absent".into(),
             ));
         }
         Ok(())
@@ -980,6 +1206,35 @@ impl SealedPlannedNativeItems {
 
     pub(super) fn module_preparation(&self) -> crate::backend::NativeScheduleModulePreparation {
         self.plan.module_preparation()
+    }
+
+    #[cfg(test)]
+    pub(super) fn adamw_native_update_admissions(&self) -> &[AdamWNativeUpdateAdmissionDiagnostic] {
+        self.plan.adamw_native_update_admissions()
+    }
+
+    #[cfg(test)]
+    pub(super) fn adamw_native_update_indices(&self) -> Vec<[usize; 4]> {
+        self.plan
+            .adamw_native_updates
+            .iter()
+            .map(|manifest| {
+                manifest.members.map(|successor| {
+                    self.plan
+                        .items
+                        .iter()
+                        .find_map(|dispatch| match dispatch {
+                            PreparedNativeDispatch::StoreGroup(group) => group
+                                .members
+                                .iter()
+                                .find(|member| member.output_buffer == successor.output)
+                                .map(|member| member.logical_index),
+                            PreparedNativeDispatch::Item { .. } => None,
+                        })
+                        .expect("sealed AdamW native update has a physical store-group member")
+                })
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -1194,11 +1449,303 @@ fn native_schedule_layouts(
     Ok(layouts)
 }
 
+fn plan_adamw_native_update(
+    capture: &CapturedSchedule,
+    layouts: &[crate::backend::NativeScheduleLayout],
+    item_ids: &BTreeSet<u64>,
+    manifest: &AdamWNativeUpdateManifest,
+) -> Result<AdamWNativeUpdateAdmission, ReplayError> {
+    let mut indexed_members = Vec::with_capacity(manifest.members.len());
+    let mut outputs = BTreeSet::new();
+    let mut state_buffers = BTreeSet::new();
+    let mut descriptor = None;
+    for member in manifest.members {
+        let Some(index) = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == member.output)
+        else {
+            return Ok(reject_adamw_native_update!(
+                AdamWNativeUpdateRejection::MissingMember {
+                    role: member.role,
+                    output: member.output,
+                }
+            ));
+        };
+        let item = &capture.items[index];
+        let output = item.primary_output();
+        let elements = output
+            .shape
+            .numel()
+            .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        if !outputs.insert(member.output)
+            || !state_buffers.insert(member.state_buffer)
+            || !item.outputs.is_single()
+            || item.boundary.is_some()
+            || item.is_effect()
+            || !item.ordered_quantized_inputs().is_empty()
+            || output.dtype != crate::DType::F32
+            || elements == 0
+            || output.view.is_some()
+            || output.read_only
+            || descriptor
+                .as_ref()
+                .is_some_and(|expected: &crate::BufferDesc| {
+                    expected.shape != output.shape
+                        || expected.dtype != output.dtype
+                        || expected.bytes != output.bytes
+                        || expected.alignment != output.alignment
+                })
+            || crate::cpu_jit::native_output_initialization(&item.kernel)
+                != crate::cpu_jit::NativeOutputInitialization::FullyOverwritten
+        {
+            return Ok(reject_adamw_native_update!(
+                AdamWNativeUpdateRejection::MemberDescriptor {
+                    role: member.role,
+                    output: member.output,
+                    logical_index: index,
+                }
+            ));
+        }
+        descriptor = Some(output.clone());
+        indexed_members.push((index, member));
+    }
+    indexed_members.sort_unstable_by_key(|(index, _)| *index);
+    let indices = indexed_members
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
+    let member_ids = indices
+        .iter()
+        .map(|index| capture.items[*index].id)
+        .collect::<BTreeSet<_>>();
+    for index in &indices {
+        if let Some(_consumer) = capture.items[*index]
+            .consumers
+            .iter()
+            .find(|consumer| item_ids.contains(consumer) && !member_ids.contains(consumer))
+        {
+            return Ok(reject_adamw_native_update!(
+                AdamWNativeUpdateRejection::EscapingConsumer {
+                    logical_index: *index,
+                    consumer: *_consumer,
+                }
+            ));
+        }
+    }
+    let kernels = indices
+        .iter()
+        .map(|index| &capture.items[*index].kernel)
+        .collect::<Vec<_>>();
+    let kernel = match crate::kernel::fuse_native_store_group(&kernels) {
+        Ok(kernel) => kernel,
+        Err(_error) => {
+            return Ok(reject_adamw_native_update!(
+                AdamWNativeUpdateRejection::KernelFusion(_error)
+            ));
+        }
+    };
+    let (rendered, output_initialization) = match crate::cpu_jit::render_native_store_group(&kernel)
+    {
+        Ok(rendered) => rendered,
+        Err(_error) => {
+            return Ok(reject_adamw_native_update!(
+                AdamWNativeUpdateRejection::KernelRendering(_error.to_string())
+            ));
+        }
+    };
+    let dispatch_anchor = *indices
+        .last()
+        .expect("native update group has authenticated members");
+    let mut effective_input_owners = BTreeSet::new();
+    for abi in &rendered.abi.buffers {
+        if abi.mutable {
+            if !outputs.contains(&abi.id) {
+                return Ok(reject_adamw_native_update!(
+                    AdamWNativeUpdateRejection::MutableOutputAbi { buffer: abi.id }
+                ));
+            }
+            continue;
+        }
+        let bindings = indices
+            .iter()
+            .flat_map(|index| capture.items[*index].ordered_inputs())
+            .filter(|binding| binding.desc.id == abi.id)
+            .collect::<Vec<_>>();
+        let Some(binding) = bindings.first() else {
+            return Ok(reject_adamw_native_update!(
+                AdamWNativeUpdateRejection::MissingInputBinding { buffer: abi.id }
+            ));
+        };
+        if !bindings.iter().all(|candidate| {
+            candidate.desc == binding.desc
+                && candidate.desc.view.is_none()
+                && candidate.desc.dtype == abi.dtype
+                && candidate
+                    .desc
+                    .shape
+                    .numel()
+                    .is_ok_and(|elements| elements == abi.elements)
+        }) {
+            return Ok(reject_adamw_native_update!(
+                AdamWNativeUpdateRejection::InputBindingDescriptor { buffer: abi.id }
+            ));
+        }
+        let producer = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == abi.id);
+        if let Some(producer) = producer
+            && producer >= dispatch_anchor
+        {
+            return Ok(reject_adamw_native_update!(
+                AdamWNativeUpdateRejection::InputProducerOrder {
+                    buffer: abi.id,
+                    producer,
+                    dispatch_anchor,
+                }
+            ));
+        }
+        let effective_owner = producer
+            .and_then(|producer| layouts.get(producer))
+            .and_then(|layout| layout.elided_output_source)
+            .unwrap_or(abi.id);
+        if !effective_input_owners.insert(effective_owner) {
+            return Ok(reject_adamw_native_update!(
+                AdamWNativeUpdateRejection::EffectiveInputOwnerCollision {
+                    buffer: abi.id,
+                    owner: effective_owner,
+                }
+            ));
+        }
+    }
+    let member_indices: [usize; 4] = indices
+        .try_into()
+        .map_err(|_| ReplayError::Corrupt("AdamW native update cardinality changed".into()))?;
+    let members: [AdamWNativeUpdateSuccessor; 4] = indexed_members
+        .into_iter()
+        .map(|(_, member)| member)
+        .collect::<Vec<_>>()
+        .try_into()
+        .map_err(|_| ReplayError::Corrupt("AdamW native update cardinality changed".into()))?;
+    Ok(AdamWNativeUpdateAdmission::Admitted {
+        group: crate::backend::NativeStoreGroup {
+            members: member_indices
+                .into_iter()
+                .zip(members)
+                .map(
+                    |(logical_index, member)| crate::backend::NativeStoreGroupMember {
+                        logical_index,
+                        output_buffer: member.output,
+                    },
+                )
+                .collect(),
+            kernel,
+            output_initialization,
+        },
+        logical_indices: member_indices,
+    })
+}
+
+fn adamw_native_update_groups(
+    capture: &CapturedSchedule,
+    layouts: &[crate::backend::NativeScheduleLayout],
+    manifests: &[AdamWNativeUpdateManifest],
+) -> Result<AdamWNativeUpdateGroupPlan, ReplayError> {
+    let expected_roles = [
+        AdamWNativeUpdateRole::Parameter,
+        AdamWNativeUpdateRole::FirstMoment,
+        AdamWNativeUpdateRole::SecondMoment,
+        AdamWNativeUpdateRole::GradientAccumulator,
+    ];
+    let mut manifested_outputs = BTreeSet::new();
+    let mut manifested_states = BTreeSet::new();
+    for manifest in manifests {
+        if manifest
+            .members
+            .iter()
+            .map(|member| member.role)
+            .ne(expected_roles)
+        {
+            return Err(ReplayError::Corrupt(
+                "AdamW native update role inventory mismatch".into(),
+            ));
+        }
+        for member in manifest.members {
+            if !manifested_outputs.insert(member.output)
+                || !manifested_states.insert(member.state_buffer)
+                || capture
+                    .items
+                    .iter()
+                    .filter(|item| item.primary_output().id == member.output)
+                    .count()
+                    != 1
+            {
+                return Err(ReplayError::Corrupt(
+                    "AdamW native update successor inventory mismatch".into(),
+                ));
+            }
+        }
+    }
+    let item_ids = capture
+        .items
+        .iter()
+        .map(|item| item.id)
+        .collect::<BTreeSet<_>>();
+    let mut claimed_items = BTreeSet::new();
+    let mut groups = Vec::with_capacity(manifests.len());
+    #[cfg(test)]
+    let mut diagnostics = Vec::with_capacity(manifests.len());
+    for manifest in manifests {
+        match plan_adamw_native_update(capture, layouts, &item_ids, manifest)? {
+            AdamWNativeUpdateAdmission::Admitted {
+                group,
+                logical_indices,
+            } => {
+                if logical_indices
+                    .iter()
+                    .any(|index| claimed_items.contains(index))
+                {
+                    return Err(ReplayError::Corrupt(
+                        "AdamW native update schedule items overlap".into(),
+                    ));
+                }
+                claimed_items.extend(logical_indices);
+                #[cfg(test)]
+                diagnostics
+                    .push(AdamWNativeUpdateAdmissionDiagnostic::Admitted { logical_indices });
+                groups.push((group, manifest.clone()));
+            }
+            AdamWNativeUpdateAdmission::Rejected {
+                #[cfg(test)]
+                reason,
+            } => {
+                #[cfg(test)]
+                diagnostics.push(AdamWNativeUpdateAdmissionDiagnostic::Rejected(reason));
+            }
+        }
+    }
+    Ok(AdamWNativeUpdateGroupPlan {
+        groups,
+        #[cfg(test)]
+        diagnostics,
+    })
+}
+
 impl CapturedReplayExecutor {
     pub(crate) fn preflight_native_items(
         &self,
         capture: &CapturedSchedule,
         provided: &BTreeMap<String, TensorData>,
+    ) -> Result<NativeItemPlanDraft, ReplayError> {
+        self.preflight_native_items_with_adamw_updates(capture, provided, &[])
+    }
+
+    pub(crate) fn preflight_native_items_with_adamw_updates(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+        manifests: &[AdamWNativeUpdateManifest],
     ) -> Result<NativeItemPlanDraft, ReplayError> {
         #[cfg(test)]
         self.native_item_plan_count
@@ -1228,9 +1775,15 @@ impl CapturedReplayExecutor {
         }
         let started = Instant::now();
         let layouts = native_schedule_layouts(capture)?;
+        let admitted = adamw_native_update_groups(capture, &layouts, manifests)?;
+        let (adamw_native_updates, admitted_adamw_updates) = admitted.groups.into_iter().unzip();
         Ok(NativeItemPlanDraft {
             layouts,
             layout_wall_time: started.elapsed(),
+            adamw_native_updates,
+            admitted_adamw_updates,
+            #[cfg(test)]
+            adamw_native_update_admissions: admitted.diagnostics,
         })
     }
 
@@ -1284,7 +1837,13 @@ impl CapturedReplayExecutor {
     > {
         let requests = programs
             .iter()
-            .map(|(capture, draft)| (capture.items.as_slice(), draft.layouts.clone()))
+            .map(|(capture, draft)| {
+                (
+                    capture.items.as_slice(),
+                    draft.layouts.clone(),
+                    draft.adamw_native_updates.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         let (prepared, compilation) = self
             .jit(vectorized)
@@ -1298,12 +1857,16 @@ impl CapturedReplayExecutor {
                 let workspace = NativeReplayWorkspace::new(capture, &items)?;
                 Ok(PlannedNativeItems {
                     items,
+                    logical_item_count: capture.items.len(),
                     module_preparation,
                     workspace,
                     vectorized,
                     capture_identity: capture.identity,
                     input_schema: capture.inputs.clone(),
                     schedule_cache_keys: capture.items.iter().map(|item| item.cache_key).collect(),
+                    adamw_native_updates: draft.admitted_adamw_updates,
+                    #[cfg(test)]
+                    adamw_native_update_admissions: draft.adamw_native_update_admissions,
                     #[cfg(test)]
                     structure_validation_count: std::sync::atomic::AtomicUsize::new(0),
                 })
@@ -1952,6 +2515,101 @@ mod tests {
     }
 
     #[test]
+    fn adamw_update_admission_accepts_two_interleaved_parameter_frontiers() {
+        let mut graph = Graph::new();
+        let seed_a = graph.input("seed_a", [2]);
+        let seed_b = graph.input("seed_b", [2]);
+        let parameter_a = graph.input("parameter_a", [2]);
+        let first_moment_a = graph.input("first_moment_a", [2]);
+        let second_moment_a = graph.input("second_moment_a", [2]);
+        let accumulator_a = graph.input("accumulator_a", [2]);
+        let parameter_b = graph.input("parameter_b", [2]);
+        let first_moment_b = graph.input("first_moment_b", [2]);
+        let second_moment_b = graph.input("second_moment_b", [2]);
+        let accumulator_b = graph.input("accumulator_b", [2]);
+        let cleared_a = graph.sub(accumulator_a, accumulator_a).unwrap();
+        let cleared_b = graph.sub(accumulator_b, accumulator_b).unwrap();
+        let gradient_a = graph.square(seed_a).unwrap();
+        let gradient_a = graph.contiguous(gradient_a).unwrap();
+        let gradient_b = graph.square(seed_b).unwrap();
+        let gradient_b = graph.contiguous(gradient_b).unwrap();
+        let first_moment_a = graph.add(first_moment_a, gradient_a).unwrap();
+        let first_moment_b = graph.add(first_moment_b, gradient_b).unwrap();
+        let second_moment_a = graph.add(second_moment_a, gradient_a).unwrap();
+        let second_moment_b = graph.add(second_moment_b, gradient_b).unwrap();
+        let moment_sum_a = graph.add(first_moment_a, second_moment_a).unwrap();
+        let moment_sum_b = graph.add(first_moment_b, second_moment_b).unwrap();
+        let parameter_a = graph.sub(parameter_a, moment_sum_a).unwrap();
+        let parameter_b = graph.sub(parameter_b, moment_sum_b).unwrap();
+        let requested = [
+            parameter_a,
+            first_moment_a,
+            second_moment_a,
+            cleared_a,
+            parameter_b,
+            first_moment_b,
+            second_moment_b,
+            cleared_b,
+        ];
+        let capture = captured(&graph, &requested);
+        let layouts = native_schedule_layouts(&capture).unwrap();
+        let successor = |role, output: crate::NodeId, state_buffer| AdamWNativeUpdateSuccessor {
+            role,
+            output: output.index() as u64,
+            state_buffer,
+        };
+        let manifests = [
+            AdamWNativeUpdateManifest {
+                members: [
+                    successor(AdamWNativeUpdateRole::Parameter, parameter_a, 101),
+                    successor(AdamWNativeUpdateRole::FirstMoment, first_moment_a, 102),
+                    successor(AdamWNativeUpdateRole::SecondMoment, second_moment_a, 103),
+                    successor(AdamWNativeUpdateRole::GradientAccumulator, cleared_a, 104),
+                ],
+            },
+            AdamWNativeUpdateManifest {
+                members: [
+                    successor(AdamWNativeUpdateRole::Parameter, parameter_b, 201),
+                    successor(AdamWNativeUpdateRole::FirstMoment, first_moment_b, 202),
+                    successor(AdamWNativeUpdateRole::SecondMoment, second_moment_b, 203),
+                    successor(AdamWNativeUpdateRole::GradientAccumulator, cleared_b, 204),
+                ],
+            },
+        ];
+        let admitted = adamw_native_update_groups(&capture, &layouts, &manifests).unwrap();
+        assert_eq!(admitted.groups.len(), 2);
+
+        for ((group, manifest), gradient) in admitted.groups.iter().zip([gradient_a, gradient_b]) {
+            let indices = group
+                .members
+                .iter()
+                .map(|member| member.logical_index)
+                .collect::<Vec<_>>();
+            assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(indices.windows(2).any(|pair| pair[0] + 1 < pair[1]));
+            assert_eq!(
+                group
+                    .members
+                    .iter()
+                    .map(|member| member.output_buffer)
+                    .collect::<BTreeSet<_>>(),
+                manifest
+                    .members
+                    .iter()
+                    .map(|member| member.output)
+                    .collect::<BTreeSet<_>>()
+            );
+            let gradient_index = capture
+                .items
+                .iter()
+                .position(|item| item.primary_output().id == gradient.index() as u64)
+                .unwrap();
+            assert!(indices[0] < gradient_index);
+            assert!(gradient_index < *indices.last().unwrap());
+        }
+    }
+
+    #[test]
     fn planned_native_items_reuse_current_bindings_and_reject_truncated_plans() {
         let mut graph = Graph::new();
         let input = graph.input("input", [2]);
@@ -2040,7 +2698,7 @@ mod tests {
         assert!(matches!(
             executor.execute_planned_native_items(&capture, &changed, &mut plan),
             Err(ReplayError::Corrupt(message))
-                if message == "prepared native item count mismatch"
+                if message == "prepared native physical entry count mismatch"
         ));
         assert_eq!(executor.native_item_plan_count(), 1);
     }
@@ -2060,8 +2718,8 @@ mod tests {
         let mut plan = executor
             .plan_native_items(&capture, &original, true)
             .unwrap();
-        assert!(plan.items[0].vector.enabled);
-        assert_eq!(plan.items[0].vector.lanes, 4);
+        assert!(plan.items[0].item().unwrap().vector.enabled);
+        assert_eq!(plan.items[0].item().unwrap().vector.lanes, 4);
 
         plan.poison_outputs(0x7f);
         plan.inject_dispatch_failure(0);
@@ -2319,15 +2977,15 @@ mod tests {
         assert_eq!(preparation.durable_artifact_cache_miss_count, 0);
         assert_eq!(preparation.compiler_invocation_count, 0);
         assert_ne!(
-            first_plan.items[0].native_cache_key,
-            second_plan.items[0].native_cache_key
+            &first_plan.items[0].item().unwrap().native_cache_key,
+            &second_plan.items[0].item().unwrap().native_cache_key
         );
         assert_eq!(
-            second_plan.items[0].abi().buffers[0].id,
+            second_plan.items[0].item().unwrap().abi().buffers[0].id,
             second.inputs[0].desc.id
         );
         assert_eq!(
-            second_plan.items[0].abi().buffers[1].id,
+            second_plan.items[0].item().unwrap().abi().buffers[1].id,
             second.items[0].primary_output().id
         );
 

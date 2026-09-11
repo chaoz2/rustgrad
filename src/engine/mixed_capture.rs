@@ -455,6 +455,7 @@ impl PreparedRecurrentNativeReplay {
         requested: Vec<u64>,
         replacements: PreparedRecurrentReplacementPlan,
     ) -> Result<Self, ReplayError> {
+        replacements.authenticate_adamw_native_updates(plan.adamw_native_updates())?;
         let plan = plan.seal(&pure)?;
         if trace.item_count != plan.item_count()
             || trace.cache_hit_count != plan.cache_hit_count()
@@ -501,6 +502,21 @@ impl PreparedRecurrentNativeReplay {
     #[cfg(test)]
     pub(crate) fn inject_dispatch_failure(&mut self, index: usize) {
         self.plan.inject_dispatch_failure(index);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn adamw_native_update_indices(&self) -> Vec<[usize; 4]> {
+        self.plan.adamw_native_update_indices()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn adamw_native_update_admission_diagnostics(&self) -> Vec<String> {
+        self.plan
+            .adamw_native_update_admissions()
+            .iter()
+            .enumerate()
+            .map(|(manifest, diagnostic)| format!("manifest {manifest}: {}", diagnostic.describe()))
+            .collect()
     }
 
     fn validate_cursor(&self, cursor: &MixedReplayCursor) -> Result<(), ReplayError> {
@@ -556,6 +572,25 @@ impl PreparedRecurrentNativeReplay {
 }
 
 impl PreparedRecurrentReplacementPlan {
+    fn authenticate_adamw_native_updates(
+        &self,
+        updates: &[super::captured_replay::AdamWNativeUpdateManifest],
+    ) -> Result<(), ReplayError> {
+        let replacements = self
+            .replacements
+            .iter()
+            .map(|replacement| (replacement.producer, replacement.buffer))
+            .collect::<BTreeMap<_, _>>();
+        for member in updates.iter().flat_map(|update| update.members) {
+            if replacements.get(&member.output) != Some(&member.state_buffer) {
+                return Err(ReplayError::Corrupt(
+                    "prepared AdamW native update replacement mismatch".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn from_capture(capture: &CapturedMixedSchedule) -> Result<Self, ReplayError> {
         let frontier = recurrent_initial_frontier(capture)?;
         let frontier_by_buffer = frontier
