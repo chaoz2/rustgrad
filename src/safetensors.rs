@@ -594,6 +594,19 @@ pub fn load_safetensors_file_with_limits(
     path: impl AsRef<Path>,
     limits: SafetensorsReadLimits,
 ) -> std::result::Result<(StateDict, Metadata), SafetensorsFileError> {
+    let bytes = read_safetensors_file_bytes_with_limits(path, limits)?;
+    load_safetensors(&bytes).map_err(SafetensorsFileError::Format)
+}
+
+/// Reads one complete local safetensors envelope under an explicit byte limit.
+///
+/// This crate-private seam lets validated wrapper formats preserve their exact
+/// envelope bytes while sharing the same metadata-before-allocation and
+/// grow-during-read bounds as [`load_safetensors_file_with_limits`].
+pub(crate) fn read_safetensors_file_bytes_with_limits(
+    path: impl AsRef<Path>,
+    limits: SafetensorsReadLimits,
+) -> std::result::Result<Vec<u8>, SafetensorsFileError> {
     let path = path.as_ref();
     let metadata = fs::metadata(path).map_err(|error| SafetensorsFileError::Io {
         operation: "inspect",
@@ -629,9 +642,12 @@ pub fn load_safetensors_file_with_limits(
             maximum: limits.max_file_bytes,
         });
     }
-    load_safetensors(&bytes).map_err(SafetensorsFileError::Format)
+    Ok(bytes)
 }
-fn save_safetensors_file_bytes(path: impl AsRef<Path>, bytes: Vec<u8>) -> Result<()> {
+
+/// Atomically replaces a local safetensors envelope from already validated
+/// exact bytes after syncing its uniquely created staging file.
+pub(crate) fn save_safetensors_file_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
     let path = path.as_ref();
     let file_name = path
         .file_name()
@@ -651,7 +667,7 @@ fn save_safetensors_file_bytes(path: impl AsRef<Path>, bytes: Vec<u8>) -> Result
         {
             Ok(mut file) => {
                 let result = (|| {
-                    file.write_all(&bytes)
+                    file.write_all(bytes)
                         .map_err(|error| ser(error.to_string()))?;
                     file.sync_all().map_err(|error| ser(error.to_string()))
                 })();
@@ -680,7 +696,8 @@ pub fn save_safetensors_file(
     tensors: &StateDict,
     metadata: &Metadata,
 ) -> Result<()> {
-    save_safetensors_file_bytes(path, save_safetensors(tensors, metadata)?)
+    let bytes = save_safetensors(tensors, metadata)?;
+    save_safetensors_file_bytes(path, &bytes)
 }
 
 /// Atomically saves a state dictionary with optional raw JSON object metadata.
@@ -689,10 +706,8 @@ pub fn save_safetensors_file_with_json_metadata(
     tensors: &StateDict,
     metadata: Option<&Value>,
 ) -> Result<()> {
-    save_safetensors_file_bytes(
-        path,
-        save_safetensors_with_json_metadata(tensors, metadata)?,
-    )
+    let bytes = save_safetensors_with_json_metadata(tensors, metadata)?;
+    save_safetensors_file_bytes(path, &bytes)
 }
 
 #[cfg(test)]

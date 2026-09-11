@@ -1,6 +1,11 @@
 use super::{CompiledAdamWCheckpoint, checked_bytes, decode_adamw_checkpoint, training};
-use crate::{DType, Metadata, Result, StateDict, TensorData, load_safetensors, save_safetensors};
+use crate::safetensors::{read_safetensors_file_bytes_with_limits, save_safetensors_file_bytes};
+use crate::{
+    DType, Metadata, Result, SafetensorsFileError, SafetensorsReadLimits, StateDict, TensorData,
+    load_safetensors, save_safetensors,
+};
 use std::collections::BTreeSet;
+use std::path::Path;
 
 const MODULE_ADAMW_CHECKPOINT_FORMAT_V1: &str = "rustgrad-compiled-module-adamw-v1";
 const MODULE_ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-module-adamw-v2";
@@ -87,6 +92,32 @@ impl CompiledModuleAdamWCheckpoint {
             optimizer: decoded.optimizer,
             evaluation_capture_identity: decoded.evaluation_capture_identity,
         })
+    }
+
+    /// Loads and validates a local complete-module checkpoint under the
+    /// default safetensors file-size bound.
+    pub fn load_file(path: impl AsRef<Path>) -> Result<Self> {
+        match Self::load_file_with_limits(path, SafetensorsReadLimits::default()) {
+            Ok(checkpoint) => Ok(checkpoint),
+            Err(SafetensorsFileError::Format(error)) => Err(error),
+            Err(error) => Err(training(error.to_string())),
+        }
+    }
+
+    /// Loads and validates a local complete-module checkpoint under an
+    /// explicit byte bound.
+    pub fn load_file_with_limits(
+        path: impl AsRef<Path>,
+        limits: SafetensorsReadLimits,
+    ) -> std::result::Result<Self, SafetensorsFileError> {
+        let bytes = read_safetensors_file_bytes_with_limits(path, limits)?;
+        Self::from_bytes(bytes).map_err(SafetensorsFileError::Format)
+    }
+
+    /// Atomically replaces `path` with these exact checkpoint bytes after
+    /// syncing a uniquely created staging file.
+    pub fn save_file(&self, path: impl AsRef<Path>) -> Result<()> {
+        save_safetensors_file_bytes(path, self.as_bytes())
     }
 
     /// Returns the unchanged embedded optimizer checkpoint.

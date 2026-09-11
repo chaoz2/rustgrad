@@ -1126,6 +1126,14 @@ fresh-module restoration must attach that exact evaluator before preparation,
 and a missing or mismatched evaluator retains the untouched owned plan for
 retry. The envelope still contains no executable graph, schedule, runtime
 resource, host identity, or host version.
+Both compiled checkpoint wrappers expose the same bounded local-file boundary.
+The reader checks filesystem metadata before allocation, caps a possibly growing
+read at the caller's limit plus one byte, and then delegates the exact owned
+bytes to the existing checkpoint validator. The writer preserves those bytes
+unchanged, creates a unique same-directory staging file, writes and syncs it,
+and only then atomically renames it over the target. A failed read or write
+constructs no checkpoint and changes no runtime state. The successful rename
+does not claim parent-directory durability across a system crash.
 Compilation failure returns the exact module, including graph-build,
 checkpoint-admission, seal, and maximum-version preflight failures. Checkpoint
 snapshot, decode, or publication failure returns an error that retains the

@@ -11399,7 +11399,41 @@ fn training(reason: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::{Backend, CpuBackend, LossOptions, Op, Parameter, cross_entropy};
-    use std::{cell::Cell, collections::HashMap, rc::Rc};
+    use std::{
+        cell::Cell,
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+        rc::Rc,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct TemporaryCheckpointPath {
+        path: PathBuf,
+    }
+
+    impl TemporaryCheckpointPath {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+            Self {
+                path: std::env::temp_dir().join(format!(
+                    "rustgrad-{label}-{}-{ordinal}.safetensors",
+                    std::process::id()
+                )),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TemporaryCheckpointPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 
     #[test]
     fn compiled_state_aliases_receive_explicit_capture_owners() {
@@ -17251,6 +17285,51 @@ mod tests {
             CompiledModuleAdamWCheckpoint::from_bytes(checkpoint.as_bytes().to_vec()).unwrap(),
             checkpoint
         );
+        let module_file = TemporaryCheckpointPath::new("compiled-module-adamw-checkpoint");
+        checkpoint.save_file(module_file.path()).unwrap();
+        assert_eq!(fs::read(module_file.path()).unwrap(), checkpoint.as_bytes());
+        assert_eq!(
+            CompiledModuleAdamWCheckpoint::load_file(module_file.path()).unwrap(),
+            checkpoint
+        );
+        assert_eq!(
+            CompiledModuleAdamWCheckpoint::load_file_with_limits(
+                module_file.path(),
+                crate::SafetensorsReadLimits {
+                    max_file_bytes: checkpoint.as_bytes().len(),
+                },
+            )
+            .unwrap(),
+            checkpoint
+        );
+        assert!(matches!(
+            CompiledModuleAdamWCheckpoint::load_file_with_limits(
+                module_file.path(),
+                crate::SafetensorsReadLimits {
+                    max_file_bytes: checkpoint.as_bytes().len() - 1,
+                },
+            ),
+            Err(crate::SafetensorsFileError::Limit { .. })
+        ));
+
+        let optimizer_file = TemporaryCheckpointPath::new("compiled-adamw-checkpoint");
+        checkpoint
+            .optimizer_checkpoint()
+            .save_file(optimizer_file.path())
+            .unwrap();
+        assert_eq!(
+            CompiledAdamWCheckpoint::load_file(optimizer_file.path()).unwrap(),
+            checkpoint.optimizer_checkpoint().clone()
+        );
+        fs::write(module_file.path(), b"truncated checkpoint").unwrap();
+        assert!(matches!(
+            CompiledModuleAdamWCheckpoint::load_file_with_limits(
+                module_file.path(),
+                crate::SafetensorsReadLimits::default(),
+            ),
+            Err(crate::SafetensorsFileError::Format(_))
+        ));
+        assert_eq!(source.module_checkpoint().unwrap(), checkpoint);
         let (envelope_tensors, envelope_metadata) =
             load_safetensors(checkpoint.as_bytes()).unwrap();
         assert_eq!(envelope_tensors.len(), 3);

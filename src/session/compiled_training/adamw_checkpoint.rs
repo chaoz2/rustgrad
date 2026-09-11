@@ -2,11 +2,13 @@ use super::{
     AdamWProgress, MAX_EXACT_F32_INTEGER_COUNT, checked_bytes, training, validate_adamw_progress,
     validate_user_name,
 };
+use crate::safetensors::{read_safetensors_file_bytes_with_limits, save_safetensors_file_bytes};
 use crate::{
-    DType, Metadata, Result, Scalar, Shape, StateDict, TensorData, load_safetensors,
-    save_safetensors,
+    DType, Metadata, Result, SafetensorsFileError, SafetensorsReadLimits, Scalar, Shape, StateDict,
+    TensorData, load_safetensors, save_safetensors,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 pub(super) const ADAMW_CHECKPOINT_FORMAT_V1: &str = "rustgrad-compiled-adamw-v1";
 pub(super) const ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-adamw-v2";
@@ -46,6 +48,31 @@ impl CompiledAdamWCheckpoint {
         let decoded = decode_adamw_checkpoint(&bytes)?;
         let info = CompiledAdamWCheckpointInfo::from_decoded(&decoded);
         Ok(Self { bytes, info })
+    }
+
+    /// Loads and validates a local checkpoint under the default safetensors
+    /// file-size bound.
+    pub fn load_file(path: impl AsRef<Path>) -> Result<Self> {
+        match Self::load_file_with_limits(path, SafetensorsReadLimits::default()) {
+            Ok(checkpoint) => Ok(checkpoint),
+            Err(SafetensorsFileError::Format(error)) => Err(error),
+            Err(error) => Err(training(error.to_string())),
+        }
+    }
+
+    /// Loads and validates a local checkpoint under an explicit byte bound.
+    pub fn load_file_with_limits(
+        path: impl AsRef<Path>,
+        limits: SafetensorsReadLimits,
+    ) -> std::result::Result<Self, SafetensorsFileError> {
+        let bytes = read_safetensors_file_bytes_with_limits(path, limits)?;
+        Self::from_bytes(bytes).map_err(SafetensorsFileError::Format)
+    }
+
+    /// Atomically replaces `path` with these exact checkpoint bytes after
+    /// syncing a uniquely created staging file.
+    pub fn save_file(&self, path: impl AsRef<Path>) -> Result<()> {
+        save_safetensors_file_bytes(path, self.as_bytes())
     }
 
     /// Returns validated program identity and training progress without exposing

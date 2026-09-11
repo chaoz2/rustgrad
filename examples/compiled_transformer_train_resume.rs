@@ -803,7 +803,6 @@ where
 
 struct TemporaryCheckpointFile {
     path: PathBuf,
-    staged: PathBuf,
 }
 
 impl TemporaryCheckpointFile {
@@ -813,20 +812,16 @@ impl TemporaryCheckpointFile {
             "rustgrad-compiled-module-resume-{}-{nonce}.safetensors",
             std::process::id()
         ));
-        let staged = path.with_extension("safetensors.tmp");
-        Ok(Self { path, staged })
+        Ok(Self { path })
     }
 
-    fn write_then_read(&self, bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-        fs::write(&self.staged, bytes)?;
-        fs::rename(&self.staged, &self.path)?;
-        fs::read(&self.path)
+    fn path(&self) -> &std::path::Path {
+        &self.path
     }
 }
 
 impl Drop for TemporaryCheckpointFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.staged);
         let _ = fs::remove_file(&self.path);
     }
 }
@@ -1477,9 +1472,8 @@ where
         Some(5)
     );
     let checkpoint_file = TemporaryCheckpointFile::new()?;
-    let decoded = CompiledModuleAdamWCheckpoint::from_bytes(
-        checkpoint_file.write_then_read(checkpoint.as_bytes())?,
-    )?;
+    checkpoint.save_file(checkpoint_file.path())?;
+    let decoded = CompiledModuleAdamWCheckpoint::load_file(checkpoint_file.path())?;
     assert_eq!(decoded, checkpoint);
     assert!(
         decoded
