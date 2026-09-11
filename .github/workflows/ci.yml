@@ -87,6 +87,20 @@ jobs:
       - name: Compiled Transformer complete-module file resume smoke
         if: matrix.os == 'ubuntu-latest'
         run: cargo run --quiet --example compiled_transformer_train_resume -- cpu-file-resume
+      - name: Compiled Transformer native CPU scoreboard smoke
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo run --quiet --example compiled_transformer_train_resume -- native-cpu-scoreboard | tee native-cpu-training-scoreboard.json
+      - name: Upload native CPU training scoreboard
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-cpu-training-scoreboard-${{ github.sha }}
+          path: native-cpu-training-scoreboard.json
+          if-no-files-found: error
+          retention-days: 30
       - run: cargo test --doc
 
   address-sanitizer:
