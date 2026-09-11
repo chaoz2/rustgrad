@@ -1,7 +1,7 @@
 //! Retained scratch storage for authenticated fixed-shape native replay.
 use super::capture::{CapturedSchedule, ReplayError};
 use super::captured_replay::{ReplayValues, backend_error};
-use crate::backend::PreparedScheduleItem;
+use crate::backend::{PreparedScheduleDispatch, PreparedScheduleItem};
 use crate::{CpuJitBackend, ScheduleItem, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,11 +28,17 @@ struct WorkspaceSlot {
     source: Option<SlotSource>,
 }
 
-#[derive(Clone, Debug)]
 struct WorkspaceItem {
     slots: Vec<usize>,
     output: usize,
     elided: bool,
+    dispatch: Option<PreparedScheduleDispatch>,
+}
+
+#[derive(Clone, Debug)]
+enum WorkspaceDispatchStep {
+    Segment(Vec<usize>),
+    PerItem(usize),
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -42,6 +48,8 @@ pub(crate) struct NativeReplayTraffic {
     pub(crate) borrowed_recurrent_input_bytes: u64,
     pub(crate) borrowed_recurrent_output_bytes: u64,
     pub(crate) executed_native_item_count: usize,
+    pub(crate) module_dispatch_count: usize,
+    pub(crate) module_dispatched_native_item_count: usize,
 }
 
 /// Private scratch owned by one authenticated prepared native program.
@@ -52,6 +60,7 @@ pub(super) struct NativeReplayWorkspace {
     buffers: Vec<crate::JitBuffer>,
     slots: Vec<WorkspaceSlot>,
     items: Vec<WorkspaceItem>,
+    dispatch_steps: Vec<WorkspaceDispatchStep>,
     owners: BTreeMap<u64, usize>,
     inputs: Vec<(String, usize)>,
     immutable: BTreeSet<usize>,
@@ -72,6 +81,8 @@ pub(super) struct NativeReplayWorkspace {
     retained_transpose_matmul_input_count: usize,
     #[cfg(test)]
     affine_matmul_materialization_bytes: usize,
+    #[cfg(test)]
+    injected_dispatch_failure: Option<usize>,
 }
 
 pub(super) struct NativeReplayBindings<'a> {
@@ -108,6 +119,7 @@ impl NativeReplayWorkspace {
             buffers: Vec::new(),
             slots: Vec::new(),
             items: Vec::with_capacity(items.len()),
+            dispatch_steps: Vec::new(),
             owners: BTreeMap::new(),
             inputs: Vec::with_capacity(capture.inputs.len()),
             immutable: BTreeSet::new(),
@@ -128,6 +140,8 @@ impl NativeReplayWorkspace {
             retained_transpose_matmul_input_count: 0,
             #[cfg(test)]
             affine_matmul_materialization_bytes: 0,
+            #[cfg(test)]
+            injected_dispatch_failure: None,
         };
 
         for input in &capture.inputs {
@@ -163,13 +177,14 @@ impl NativeReplayWorkspace {
             workspace.immutable.insert(slot);
         }
         for (item, prepared) in capture.items.iter().zip(items) {
-            workspace.add_item(item, prepared)?;
+            workspace.add_item(item, prepared, &capture.quantized_constants)?;
         }
         if capture.items.len() != items.len() {
             return Err(ReplayError::Corrupt(
                 "native workspace item count mismatch".into(),
             ));
         }
+        workspace.rebuild_dispatch_segments();
 
         workspace.valid.resize(workspace.buffers.len(), false);
         let immutable = workspace.immutable.iter().copied().collect::<Vec<_>>();
@@ -189,6 +204,7 @@ impl NativeReplayWorkspace {
         &mut self,
         item: &ScheduleItem,
         prepared: &PreparedScheduleItem,
+        quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
     ) -> Result<(), ReplayError> {
         let output = item.primary_output();
         let output_elements = output
@@ -215,6 +231,7 @@ impl NativeReplayWorkspace {
                 slots: Vec::new(),
                 output: source,
                 elided: true,
+                dispatch: None,
             });
             return Ok(());
         }
@@ -243,10 +260,14 @@ impl NativeReplayWorkspace {
                 .map_err(backend_error)?;
             slots.push(self.resolve_input(item, abi, direct_matmul, retained_source)?);
         }
+        let dispatch = prepared
+            .prepare_workspace_dispatch(item, &self.buffers, &slots, quantized)
+            .map_err(backend_error)?;
         self.items.push(WorkspaceItem {
             slots,
             output: output_slot,
             elided: false,
+            dispatch,
         });
         Ok(())
     }
@@ -706,7 +727,7 @@ impl NativeReplayWorkspace {
         Ok(())
     }
 
-    pub(super) fn execute_item(
+    fn execute_item(
         &mut self,
         index: usize,
         item: &ScheduleItem,
@@ -745,23 +766,27 @@ impl NativeReplayWorkspace {
             None => self.buffers[output].clear(),
         }
         let execution = if borrowed.slots.is_empty() {
-            backend.execute_prepared_schedule_item_in_workspace(
-                item,
-                &mut self.buffers,
-                &self.items[index].slots,
-                None,
-                quantized,
-                prepared,
-            )
+            backend
+                .execute_prepared_schedule_item_in_workspace(
+                    item,
+                    &mut self.buffers,
+                    &self.items[index].slots,
+                    None,
+                    quantized,
+                    prepared,
+                )
+                .map(|_| ())
         } else {
-            backend.execute_prepared_schedule_item_in_workspace(
-                item,
-                &mut self.buffers,
-                &self.items[index].slots,
-                Some(&mut borrowed.slots),
-                quantized,
-                prepared,
-            )
+            backend
+                .execute_prepared_schedule_item_in_workspace(
+                    item,
+                    &mut self.buffers,
+                    &self.items[index].slots,
+                    Some(&mut borrowed.slots),
+                    quantized,
+                    prepared,
+                )
+                .map(|_| ())
         };
         execution.map_err(backend_error)?;
         self.current_traffic.executed_native_item_count = self
@@ -772,6 +797,207 @@ impl NativeReplayWorkspace {
                 ReplayError::Descriptor("native item execution count overflows".into())
             })?;
         self.valid[output] = true;
+        Ok(())
+    }
+
+    fn clear_output(
+        &mut self,
+        output: usize,
+        borrowed: &mut NativeReplayBindings<'_>,
+    ) -> Result<(), ReplayError> {
+        self.valid[output] = false;
+        match borrowed.slots.get_mut(&output) {
+            Some(binding) => binding
+                .clear()
+                .map_err(|error| ReplayError::Backend(error.to_string())),
+            None => {
+                self.buffers[output].clear();
+                Ok(())
+            }
+        }
+    }
+
+    fn execute_dispatch_segment(
+        &mut self,
+        indices: &[usize],
+        capture: &CapturedSchedule,
+        quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
+        borrowed: &mut NativeReplayBindings<'_>,
+    ) -> Result<(), ReplayError> {
+        #[cfg(test)]
+        if let Some(index) = self
+            .injected_dispatch_failure
+            .filter(|index| indices.contains(index))
+        {
+            self.injected_dispatch_failure = None;
+            let logical = capture.items[index].id;
+            return Err(ReplayError::Backend(format!(
+                "native schedule item {index} logical {logical}: injected dispatcher failure"
+            )));
+        }
+        {
+            let entries = indices
+                .iter()
+                .map(|&index| {
+                    self.items[index].dispatch.as_ref().ok_or_else(|| {
+                        ReplayError::Corrupt("native dispatcher segment entry is absent".into())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            crate::backend::PreparedScheduleDispatch::authenticate_segment(&entries, quantized)
+                .map_err(|failure| {
+                    let index = indices.get(failure.entry).copied().unwrap_or(usize::MAX);
+                    let logical = capture
+                        .items
+                        .get(index)
+                        .map(|item| item.id.to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    match backend_error(failure.error) {
+                        ReplayError::Backend(reason) => ReplayError::Backend(format!(
+                            "native schedule item {index} logical {logical}: {reason}"
+                        )),
+                        other => other,
+                    }
+                })?;
+        }
+        let mut produced = BTreeSet::new();
+        for &index in indices {
+            let (slots, output) = self
+                .items
+                .get(index)
+                .map(|item| (item.slots.clone(), item.output))
+                .ok_or_else(|| {
+                    ReplayError::Corrupt("native dispatcher segment item is absent".into())
+                })?;
+            for slot in slots {
+                if slot != output
+                    && !self.valid.get(slot).copied().unwrap_or(false)
+                    && !produced.contains(&slot)
+                {
+                    self.prepare_slot(slot, borrowed)?;
+                }
+            }
+            produced.insert(output);
+        }
+        for &index in indices {
+            let output = self.items[index].output;
+            self.clear_output(output, borrowed)?;
+        }
+
+        let next_dispatch_count = self
+            .current_traffic
+            .module_dispatch_count
+            .checked_add(1)
+            .ok_or_else(|| {
+                ReplayError::Descriptor("native module dispatch count overflows".into())
+            })?;
+        let next_dispatched_items = self
+            .current_traffic
+            .module_dispatched_native_item_count
+            .checked_add(indices.len())
+            .ok_or_else(|| {
+                ReplayError::Descriptor("native module dispatched item count overflows".into())
+            })?;
+        let next_executed_items = self
+            .current_traffic
+            .executed_native_item_count
+            .checked_add(indices.len())
+            .ok_or_else(|| {
+                ReplayError::Descriptor("native item execution count overflows".into())
+            })?;
+        let entries = indices
+            .iter()
+            .map(|&index| {
+                self.items[index].dispatch.as_ref().ok_or_else(|| {
+                    ReplayError::Corrupt("native dispatcher segment entry is absent".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::backend::PreparedScheduleDispatch::execute_segment(
+            &entries,
+            &mut self.buffers,
+            (!borrowed.slots.is_empty()).then_some(&mut borrowed.slots),
+            quantized,
+        )
+        .map_err(|failure| {
+            let index = indices.get(failure.entry).copied().unwrap_or(usize::MAX);
+            let logical = capture
+                .items
+                .get(index)
+                .map(|item| item.id.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let reason = backend_error(failure.error);
+            match reason {
+                ReplayError::Backend(reason) => ReplayError::Backend(format!(
+                    "native schedule item {index} logical {logical}: {reason}"
+                )),
+                other => other,
+            }
+        })?;
+        for &index in indices {
+            self.valid[self.items[index].output] = true;
+        }
+        self.current_traffic.module_dispatch_count = next_dispatch_count;
+        self.current_traffic.module_dispatched_native_item_count = next_dispatched_items;
+        self.current_traffic.executed_native_item_count = next_executed_items;
+        Ok(())
+    }
+
+    pub(super) fn execute_items(
+        &mut self,
+        capture: &CapturedSchedule,
+        backend: &CpuJitBackend,
+        quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
+        prepared: &[PreparedScheduleItem],
+        borrowed: &mut NativeReplayBindings<'_>,
+    ) -> Result<(), ReplayError> {
+        if capture.items.len() != self.items.len() || prepared.len() != self.items.len() {
+            return Err(ReplayError::Corrupt(
+                "native dispatcher item inventory mismatch".into(),
+            ));
+        }
+        for step in self.dispatch_steps.clone() {
+            let is_segment = matches!(&step, WorkspaceDispatchStep::Segment(_));
+            let index = match &step {
+                WorkspaceDispatchStep::Segment(indices) => *indices.first().ok_or_else(|| {
+                    ReplayError::Corrupt("native dispatcher segment is empty".into())
+                })?,
+                WorkspaceDispatchStep::PerItem(index) => *index,
+            };
+            let item = &capture.items[index];
+            #[cfg(test)]
+            if !is_segment && self.injected_dispatch_failure == Some(index) {
+                self.injected_dispatch_failure = None;
+                return Err(ReplayError::Backend(format!(
+                    "native schedule item {index} logical {}: injected dispatcher failure",
+                    item.id
+                )));
+            }
+            let execution = match step {
+                WorkspaceDispatchStep::Segment(indices) => {
+                    self.execute_dispatch_segment(&indices, capture, quantized, borrowed)
+                }
+                WorkspaceDispatchStep::PerItem(index) => self.execute_item(
+                    index,
+                    &capture.items[index],
+                    backend,
+                    quantized,
+                    &prepared[index],
+                    borrowed,
+                ),
+            };
+            execution.map_err(|error| match error {
+                ReplayError::Backend(reason) if !is_segment => ReplayError::Backend(format!(
+                    "native schedule item {index} logical {}: {reason}",
+                    item.id
+                )),
+                ReplayError::Execute(reason) if !is_segment => ReplayError::Execute(format!(
+                    "native schedule item {index} logical {}: {reason}",
+                    item.id
+                )),
+                other => other,
+            })?;
+        }
         Ok(())
     }
 
@@ -825,6 +1051,82 @@ impl NativeReplayWorkspace {
     #[cfg(test)]
     pub(super) const fn last_executed_native_item_count(&self) -> usize {
         self.current_traffic.executed_native_item_count
+    }
+
+    #[cfg(test)]
+    pub(super) const fn last_module_dispatch_counts(&self) -> (usize, usize) {
+        (
+            self.current_traffic.module_dispatch_count,
+            self.current_traffic.module_dispatched_native_item_count,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_dispatch_failure(&mut self, index: usize) {
+        self.injected_dispatch_failure = Some(index);
+    }
+
+    #[cfg(test)]
+    pub(super) fn use_per_item_fallback(&mut self, index: usize) -> Result<(), ReplayError> {
+        let item = self
+            .items
+            .get_mut(index)
+            .ok_or_else(|| ReplayError::Corrupt("native dispatcher item is absent".into()))?;
+        if item.elided || item.dispatch.take().is_none() {
+            return Err(ReplayError::Corrupt(
+                "native dispatcher fallback item is not dispatchable".into(),
+            ));
+        }
+        self.rebuild_dispatch_segments();
+        Ok(())
+    }
+
+    fn rebuild_dispatch_segments(&mut self) {
+        self.dispatch_steps.clear();
+        let mut segment = Vec::new();
+        let mut segment_slots = BTreeSet::new();
+        let mut segment_outputs = BTreeSet::new();
+        for (index, item) in self.items.iter().enumerate() {
+            if item.elided {
+                // The logical movement has no native call: every admitted
+                // consumer binds its authenticated physical source directly.
+                // Leaving it out of the tape also permits consumers on both
+                // sides to share one module invocation.
+                continue;
+            }
+            if item.dispatch.is_none() {
+                if !segment.is_empty() {
+                    self.dispatch_steps
+                        .push(WorkspaceDispatchStep::Segment(std::mem::take(&mut segment)));
+                    segment_slots.clear();
+                    segment_outputs.clear();
+                }
+                self.dispatch_steps
+                    .push(WorkspaceDispatchStep::PerItem(index));
+                continue;
+            }
+            let derived_depends_on_segment = item.slots.iter().any(|slot| {
+                self.slots[*slot].source.as_ref().is_some_and(|source| {
+                    let source = match source {
+                        SlotSource::Copy(source) | SlotSource::Affine { source, .. } => *source,
+                    };
+                    segment_outputs.contains(&source)
+                })
+            });
+            if segment_slots.contains(&item.output) || derived_depends_on_segment {
+                self.dispatch_steps
+                    .push(WorkspaceDispatchStep::Segment(std::mem::take(&mut segment)));
+                segment_slots.clear();
+                segment_outputs.clear();
+            }
+            segment.extend([index]);
+            segment_slots.extend(item.slots.iter().copied());
+            segment_outputs.insert(item.output);
+        }
+        if !segment.is_empty() {
+            self.dispatch_steps
+                .push(WorkspaceDispatchStep::Segment(segment));
+        }
     }
 
     #[cfg(test)]

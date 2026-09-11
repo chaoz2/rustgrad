@@ -627,6 +627,24 @@ pub struct JitKernel {
     call: unsafe extern "C" fn(*mut *mut c_void, *const i64, *mut u64) -> c_int,
 }
 
+type ScheduleDispatchFn =
+    unsafe extern "C" fn(*mut NativeScheduleDispatchCall, usize, *mut u64) -> c_int;
+
+#[repr(C)]
+struct NativeScheduleDispatchCall {
+    entry: unsafe extern "C" fn(*mut *mut c_void, *const i64, *mut u64) -> c_int,
+    buffers: *mut *mut c_void,
+    symbols: *const i64,
+}
+
+#[derive(Clone)]
+pub(crate) struct JitScheduleDispatcher {
+    _library: Arc<Library>,
+    call: ScheduleDispatchFn,
+    #[cfg(test)]
+    invocation_count: Arc<AtomicU64>,
+}
+
 /// Private evidence from loading one ordered native schedule module.
 ///
 /// A module is one content-addressed shared library even though every entry
@@ -671,20 +689,16 @@ impl JitKernel {
     /// the public `RenderedC` source remains a standalone `rustgrad_kernel`.
     pub(crate) fn load_schedule_module(
         rendered: &[RenderedC],
-    ) -> Result<(Vec<Self>, JitScheduleModuleLoad), JitError> {
+    ) -> Result<(Vec<Self>, JitScheduleDispatcher, JitScheduleModuleLoad), JitError> {
         if rendered.is_empty() {
-            return Ok((
-                Vec::new(),
-                JitScheduleModuleLoad {
-                    durable_cache_hit: false,
-                    compiler_invocation_count: 0,
-                },
+            return Err(JitError::InvalidBuffer(
+                "empty native schedule module has no dispatcher".into(),
             ));
         }
         let (path, mut preparation) = compile_cached_schedule_module(rendered)?;
-        let load = |path: &Path| -> Result<Vec<Self>, JitError> {
+        let load = |path: &Path| -> Result<(Vec<Self>, JitScheduleDispatcher), JitError> {
             let library = Arc::new(Library::open(path)?);
-            rendered
+            let kernels = rendered
                 .iter()
                 .enumerate()
                 .map(|(index, rendered)| {
@@ -697,17 +711,29 @@ impl JitKernel {
                         call,
                     })
                 })
-                .collect()
+                .collect::<Result<Vec<_>, _>>()?;
+            let symbol = CString::new("rustgrad_schedule_dispatch")
+                .map_err(|error| JitError::Loader(error.to_string()))?;
+            let call = unsafe { library.symbol(symbol.as_bytes_with_nul())? };
+            Ok((
+                kernels,
+                JitScheduleDispatcher {
+                    _library: library,
+                    call,
+                    #[cfg(test)]
+                    invocation_count: Arc::new(AtomicU64::new(0)),
+                },
+            ))
         };
-        let kernels = match load(&path) {
-            Ok(kernels) => kernels,
+        let (kernels, dispatcher) = match load(&path) {
+            Ok(module) => module,
             Err(_) => {
                 evict_cached_library(&path)?;
                 let (rebuilt, rebuilt_preparation) = compile_cached_schedule_module(rendered)?;
                 debug_assert!(!rebuilt_preparation.durable_cache_hit);
                 preparation = rebuilt_preparation;
                 match load(&rebuilt) {
-                    Ok(kernels) => kernels,
+                    Ok(module) => module,
                     Err(error) => {
                         let _ = evict_cached_library(&rebuilt);
                         return Err(error);
@@ -715,7 +741,7 @@ impl JitKernel {
                 }
             }
         };
-        Ok((kernels, preparation))
+        Ok((kernels, dispatcher, preparation))
     }
     pub fn abi(&self) -> &KernelAbi {
         &self.abi
@@ -990,6 +1016,35 @@ impl JitKernel {
         self.invoke(&mut ptrs, &[])
     }
 
+    fn indexed_authenticated_pointers(
+        &self,
+        arena: &mut [JitBuffer],
+        slots: &[usize],
+        mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
+        quantized: &[&crate::QuantizedTensorData],
+    ) -> Result<Vec<*mut c_void>, JitError> {
+        let mut ptrs = Vec::with_capacity(self.abi.pointer_order.len());
+        for entry in &self.abi.pointer_order {
+            let pointer = match entry {
+                KernelPointerAbi::Dense(index) => {
+                    let slot = slots[*index];
+                    match borrowed
+                        .as_mut()
+                        .and_then(|bindings| bindings.get_mut(&slot))
+                    {
+                        Some(binding) => binding.pointer()?,
+                        None => arena[slot].bytes.as_mut_ptr().cast(),
+                    }
+                }
+                KernelPointerAbi::Quantized(index) => {
+                    quantized[*index].bytes().as_ptr().cast_mut().cast()
+                }
+            };
+            ptrs.push(pointer);
+        }
+        Ok(ptrs)
+    }
+
     /// Native kernels may detect a domain failure after earlier loop iterations
     /// have stored results. Keep every ABI-declared mutable buffer private to
     /// the call until native completion succeeds, including intentional
@@ -1040,6 +1095,53 @@ impl JitKernel {
             _ => return Err(JitError::Loader(format!("unknown native status {status}"))),
         }
         Ok(())
+    }
+}
+
+impl JitScheduleDispatcher {
+    pub(crate) fn call(
+        &self,
+        entries: &[(&JitKernel, &[usize], Vec<&crate::QuantizedTensorData>)],
+        arena: &mut [JitBuffer],
+        mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
+    ) -> Result<(), (usize, JitError)> {
+        let mut pointers = Vec::with_capacity(entries.len());
+        for (entry, slots, quantized) in entries {
+            let pointers_for_entry = entry
+                .indexed_authenticated_pointers(arena, slots, borrowed.as_deref_mut(), quantized)
+                .map_err(|error| (pointers.len(), error))?;
+            pointers.push(pointers_for_entry);
+        }
+        let mut calls = entries
+            .iter()
+            .zip(&mut pointers)
+            .map(|((entry, _, _), pointers)| NativeScheduleDispatchCall {
+                entry: entry.call,
+                buffers: pointers.as_mut_ptr(),
+                symbols: std::ptr::null(),
+            })
+            .collect::<Vec<_>>();
+        let mut failure = [u64::MAX, u64::MAX, 0];
+        #[cfg(test)]
+        self.invocation_count.fetch_add(1, Ordering::Relaxed);
+        let status = unsafe { (self.call)(calls.as_mut_ptr(), calls.len(), failure.as_mut_ptr()) };
+        if status == 0 {
+            return Ok(());
+        }
+        let entry = usize::try_from(failure[0]).unwrap_or(usize::MAX);
+        let lane = usize::try_from(failure[1]).unwrap_or(usize::MAX);
+        let error = match status {
+            1 => JitError::DivisionByZero { index: lane },
+            2 => JitError::InvalidShift { index: lane },
+            3 => JitError::IndexOutOfBounds { index: lane },
+            _ => JitError::Loader(format!("unknown native status {status}")),
+        };
+        Err((entry, error))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invocation_count(&self) -> u64 {
+        self.invocation_count.load(Ordering::Relaxed)
     }
 }
 
@@ -4348,11 +4450,23 @@ fn render_schedule_module_source(rendered: &[RenderedC]) -> String {
             source.push_str(&format!("#undef {symbol}\n"));
         }
     }
+    source.push_str(
+        "typedef int (*rg_schedule_entry_fn)(void **,const int64_t *,uint64_t *);\n\
+typedef struct { rg_schedule_entry_fn entry; void **buffers; const int64_t *symbols; } rg_schedule_call;\n\
+int rustgrad_schedule_dispatch(rg_schedule_call *calls,size_t count,uint64_t *failure){\n\
+  for(size_t i=0;i<count;i++){\n\
+    uint64_t local[2]={UINT64_MAX,0};\n\
+    int status=calls[i].entry(calls[i].buffers,calls[i].symbols,local);\n\
+    if(status!=0){failure[0]=(uint64_t)i;failure[1]=local[0];failure[2]=local[1];return status;}\n\
+  }\n\
+  return 0;\n\
+}\n",
+    );
     source
 }
 
 fn schedule_module_manifest(rendered: &[RenderedC]) -> String {
-    let mut manifest = format!("rustgrad-c11-schedule-module-v2\u{1f}{}", rendered.len());
+    let mut manifest = format!("rustgrad-c11-schedule-module-v3\u{1f}{}", rendered.len());
     for helper in C11LocalHelper::ALL {
         manifest.push('\u{1f}');
         manifest.push_str(helper.name());
@@ -4367,7 +4481,7 @@ fn schedule_module_manifest(rendered: &[RenderedC]) -> String {
 }
 
 pub(crate) fn schedule_module_cache_key(rendered: &[RenderedC]) -> String {
-    native_cache_key("schedule-module-v2", &schedule_module_manifest(rendered))
+    native_cache_key("schedule-module-v3", &schedule_module_manifest(rendered))
 }
 
 /// Compiles one helper-isolated C translation unit into one shared schedule
@@ -6200,7 +6314,7 @@ mod tests {
         }
         assert_eq!(
             schedule_module_cache_key(&rendered),
-            native_cache_key("schedule-module-v2", &manifest)
+            native_cache_key("schedule-module-v3", &manifest)
         );
     }
 
@@ -6228,7 +6342,7 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
 
-        let (kernels, cold) = JitKernel::load_schedule_module(&rendered).unwrap();
+        let (kernels, dispatcher, cold) = JitKernel::load_schedule_module(&rendered).unwrap();
         assert_eq!(kernels.len(), 2);
         assert!(!cold.durable_cache_hit);
         assert_eq!(cold.compiler_invocation_count, 1);
@@ -6247,14 +6361,85 @@ mod tests {
                 TensorData::new([1], vec![expected]).unwrap()
             );
         }
+        let mut arena = vec![
+            JitBuffer::from_tensor(&values, false),
+            JitBuffer::zeroed(DType::F32, 1, true),
+            JitBuffer::zeroed(DType::F32, 1, true),
+        ];
+        let no_quantized = Vec::<&crate::QuantizedTensorData>::new();
+        dispatcher
+            .call(
+                &[
+                    (&kernels[0], &[0, 1], no_quantized.clone()),
+                    (&kernels[1], &[0, 2], no_quantized),
+                ],
+                &mut arena,
+                None,
+            )
+            .unwrap();
+        assert_eq!(dispatcher.invocation_count(), 1);
+        assert_eq!(
+            arena[1].clone().into_tensor(Shape::from([1])).unwrap(),
+            TensorData::new([1], vec![-2.0]).unwrap()
+        );
+        assert_eq!(
+            arena[2].clone().into_tensor(Shape::from([1])).unwrap(),
+            TensorData::new([1], vec![4.0]).unwrap()
+        );
         drop(kernels);
 
-        let (restored, warm) = JitKernel::load_schedule_module(&rendered).unwrap();
+        let (restored, _, warm) = JitKernel::load_schedule_module(&rendered).unwrap();
         assert_eq!(restored.len(), 2);
         assert!(warm.durable_cache_hit);
         assert_eq!(warm.compiler_invocation_count, 0);
         drop(restored);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn schedule_module_dispatch_reports_exact_failing_entry_in_one_native_call() {
+        let mut graph = Graph::new();
+        let numerator = graph.input_dtype("numerator", Shape::from([1]), DType::I64);
+        let denominator = graph.input_dtype("denominator", Shape::from([1]), DType::I64);
+        let quotient = graph
+            .binary(crate::BinaryOp::Div, numerator, denominator)
+            .unwrap();
+        let rendered =
+            CpuJit::render(&crate::lower_graph_elementwise(&graph, quotient).unwrap()).unwrap();
+        let (kernels, dispatcher, _) =
+            JitKernel::load_schedule_module(&[rendered.clone(), rendered.clone(), rendered])
+                .unwrap();
+
+        for failure in 0..3 {
+            let mut arena = Vec::new();
+            for entry in 0..3 {
+                let mut numerator = JitBuffer::zeroed(DType::I64, 1, false);
+                numerator.bytes_mut().copy_from_slice(&42i64.to_ne_bytes());
+                let mut denominator = JitBuffer::zeroed(DType::I64, 1, false);
+                denominator
+                    .bytes_mut()
+                    .copy_from_slice(&(if entry == failure { 0i64 } else { 1 }).to_ne_bytes());
+                arena.extend([
+                    numerator,
+                    denominator,
+                    JitBuffer::zeroed(DType::I64, 1, true),
+                ]);
+            }
+            let no_quantized = Vec::<&crate::QuantizedTensorData>::new();
+            assert_eq!(
+                dispatcher.call(
+                    &[
+                        (&kernels[0], &[0, 1, 2], no_quantized.clone()),
+                        (&kernels[1], &[3, 4, 5], no_quantized.clone()),
+                        (&kernels[2], &[6, 7, 8], no_quantized),
+                    ],
+                    &mut arena,
+                    None,
+                ),
+                Err((failure, JitError::DivisionByZero { index: 0 }))
+            );
+            assert_eq!(dispatcher.invocation_count(), (failure + 1) as u64);
+        }
     }
 
     #[test]
