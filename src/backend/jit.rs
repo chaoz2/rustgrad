@@ -346,6 +346,7 @@ impl CpuJitBackend {
         item: &ScheduleItem,
         buffers: &mut [JitBuffer],
         slots: &[usize],
+        borrowed: Option<&mut BTreeMap<usize, crate::cpu_jit::BorrowedJitBuffer<'_>>>,
         quantized_values: &BTreeMap<u64, crate::QuantizedTensorData>,
         prepared: &PreparedScheduleItem,
     ) -> Result<JitExecution, JitBackendError> {
@@ -367,10 +368,15 @@ impl CpuJitBackend {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        prepared
-            .kernel
-            .call_indexed_detached(buffers, slots, &quantized)
-            .map_err(jit_error)?;
+        match borrowed {
+            Some(borrowed) => prepared
+                .kernel
+                .call_indexed_detached_borrowed(buffers, slots, borrowed, &quantized),
+            None => prepared
+                .kernel
+                .call_indexed_detached(buffers, slots, &quantized),
+        }
+        .map_err(jit_error)?;
         let output_elements = item
             .primary_output()
             .shape

@@ -774,7 +774,7 @@ impl CapturedMixedSchedule {
         validate_transition: F,
     ) -> Result<MixedReplayResult, ReplayError>
     where
-        F: FnOnce(&[crate::TensorData], &[crate::TensorData]) -> Result<(), String>,
+        F: FnOnce(&[crate::TensorData], &[&crate::TensorData]) -> Result<(), String>,
     {
         validate(self, true)?;
         validate_recurrent_cursor(self, cursor)?;
@@ -794,40 +794,68 @@ impl CapturedMixedSchedule {
         let capture = &native.prepared.pure;
         let replacements = &native.prepared.replacements;
         replacements.validate_external_inputs(provided)?;
-        let staged = runtime.transact_recurrent_replacements(&current, &next, |reader| {
-            let mut values = native.executor.execute_planned_native_items_resolved(
-                capture,
-                &mut native.prepared.plan,
-                |input, workspace| {
-                    if let Some(buffer) = replacements.state_inputs.get(&input.name) {
-                        let state = current
-                            .iter()
-                            .find(|state| state.buffer == *buffer)
-                            .ok_or_else(|| {
+        let public = self
+            .schedule
+            .requested
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let staged = runtime.transact_recurrent_native_banks(&current, &next, |banks| {
+            let mut values = {
+                let mut active = BTreeMap::new();
+                let mut inactive = BTreeMap::new();
+                for bank in banks.iter_mut() {
+                    let buffer = bank.buffer_id();
+                    let (current, successor) = bank.tensors();
+                    active.insert(buffer, current);
+                    inactive.insert(buffer, successor);
+                }
+                let mut borrowed = super::native_replay_workspace::NativeReplayBorrowedState::new();
+                native.executor.execute_planned_native_items_resolved(
+                    capture,
+                    &mut native.prepared.plan,
+                    &mut borrowed,
+                    Some(&public),
+                    |workspace, borrowed| {
+                        for replacement in &replacements.replacements {
+                            let successor =
+                                inactive.remove(&replacement.buffer).ok_or_else(|| {
+                                    ReplayError::Missing(format!(
+                                        "recurrent successor state {}",
+                                        replacement.buffer
+                                    ))
+                                })?;
+                            workspace.borrow_recurrent_output(
+                                replacement.producer,
+                                successor,
+                                borrowed,
+                            )?;
+                        }
+                        if !inactive.is_empty() {
+                            return Err(ReplayError::Corrupt(
+                                "recurrent successor binding set mismatch".into(),
+                            ));
+                        }
+                        Ok(())
+                    },
+                    |input, workspace, borrowed| {
+                        if let Some(buffer) = replacements.state_inputs.get(&input.name) {
+                            let value = active.get(buffer).copied().ok_or_else(|| {
                                 ReplayError::Missing(format!("recurrent input state {buffer}"))
                             })?;
-                        reader
-                            .inspect(state, |value| {
-                                super::captured_replay::validate_input_value(
-                                    capture, input, value,
-                                )?;
-                                workspace.import_input(&input.name, value)
-                            })
-                            .map_err(|error| {
-                                ReplayError::Execute(format!(
-                                    "recurrent input preflight: {error:?}"
-                                ))
-                            })??;
-                    } else {
-                        let value = provided
-                            .get(&input.name)
-                            .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
-                        super::captured_replay::validate_input_value(capture, input, value)?;
-                        workspace.import_input(&input.name, value)?;
-                    }
-                    Ok(())
-                },
-            )?;
+                            super::captured_replay::validate_input_value(capture, input, value)?;
+                            workspace.borrow_recurrent_input(&input.name, value, borrowed)?;
+                        } else {
+                            let value = provided
+                                .get(&input.name)
+                                .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
+                            super::captured_replay::validate_input_value(capture, input, value)?;
+                            workspace.import_input(&input.name, value)?;
+                        }
+                        Ok(())
+                    },
+                )?
+            };
             let outputs = self
                 .schedule
                 .requested
@@ -838,20 +866,31 @@ impl CapturedMixedSchedule {
                         .iter()
                         .any(|replacement| replacement.producer == *id)
                     {
-                        // One value cannot be moved into persistent ownership
-                        // and returned publicly. Preserve the public result;
-                        // the unique successor is drained below.
+                        // A public state successor was materialized as an
+                        // independent snapshot; preserve it while the inactive
+                        // recurrent bank becomes authoritative.
                         values.tensor(*id, "requested mixed output").cloned()
                     } else {
                         values.take_tensor(*id, "requested mixed output")
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut successor_values = Vec::with_capacity(replacements.replacements.len());
-            for replacement in &replacements.replacements {
-                successor_values
-                    .push(values.take_tensor(replacement.producer, "recurrent successor")?);
-            }
+            let successor_values = replacements
+                .replacements
+                .iter()
+                .map(|replacement| {
+                    banks
+                        .iter()
+                        .find(|bank| bank.buffer_id() == replacement.buffer)
+                        .map(|bank| bank.inactive())
+                        .ok_or_else(|| {
+                            ReplayError::Missing(format!(
+                                "recurrent successor state {}",
+                                replacement.buffer
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             validate_transition(&outputs, &successor_values).map_err(ReplayError::Execute)?;
             if let Some(step) = injected_failure
                 && replacements
@@ -864,11 +903,7 @@ impl CapturedMixedSchedule {
                     crate::RuntimeError::InjectedFailure(step)
                 )));
             }
-            let successors = next.iter().cloned().zip(successor_values).collect();
-            Ok(crate::effects::runtime::RecurrentStateSuccessors {
-                value: outputs,
-                successors,
-            })
+            Ok(outputs)
         });
         let outputs = match staged {
             Ok(outputs) => outputs,
@@ -2364,7 +2399,7 @@ mod recurrent_tests {
                 None,
                 |outputs, successors| {
                     assert_eq!(outputs[0].storage(), &Storage::F32(vec![1.0, 1.0]));
-                    assert_eq!(successors[0], outputs[0]);
+                    assert_eq!(successors[0], &outputs[0]);
                     Ok(())
                 },
             )
@@ -2372,7 +2407,6 @@ mod recurrent_tests {
         let after = runtime.recurrent_test_counts();
         assert_eq!(after.0, before.0, "native replay must not snapshot state");
         assert_eq!(after.1, before.1 + 1);
-        assert_eq!(after.2, before.2 + 1);
         assert_eq!(replay.committed, cursor.frontier());
 
         let checkpoint = frontier_values(&runtime, &cursor);
@@ -2393,7 +2427,7 @@ mod recurrent_tests {
         let after_failure = runtime.recurrent_test_counts();
         assert_eq!(cursor, failed_cursor);
         assert_eq!(after_failure.0, before_failure.0);
-        assert_eq!(after_failure.2, before_failure.2);
+        assert_eq!(after_failure.1, before_failure.1);
         assert_eq!(frontier_values(&runtime, &cursor), checkpoint);
 
         let before_injected = runtime.recurrent_test_counts();
@@ -2410,7 +2444,7 @@ mod recurrent_tests {
         let after_injected = runtime.recurrent_test_counts();
         assert_eq!(cursor, failed_cursor);
         assert_eq!(after_injected.0, before_injected.0);
-        assert_eq!(after_injected.2, before_injected.2);
+        assert_eq!(after_injected.1, before_injected.1);
         assert_eq!(frontier_values(&runtime, &cursor), checkpoint);
         let retried = capture
             .replay_recurrent_native_checked(
