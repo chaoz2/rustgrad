@@ -12040,6 +12040,198 @@ mod tests {
     }
 
     #[test]
+    fn native_cpu_adamw_retains_transposed_parameter_storage() {
+        let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_input("x", [2, 3], DType::F32)
+            .unwrap()
+            .with_input("y", [2, 3], DType::F32)
+            .unwrap();
+        let parameter = TrainingParameterInit::new(
+            "weight",
+            TensorData::new(
+                [4, 3],
+                vec![
+                    0.2, -0.1, 0.3, 0.4, 0.05, -0.2, -0.3, 0.25, 0.1, 0.15, -0.4, 0.35,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let plan = CompiledAdamWPlan::compile(config, [parameter], |graph, inputs, parameters| {
+            let weight = graph.permute(parameters["weight"], [1, 0])?;
+            let output = graph.matmul(inputs["x"], weight)?;
+            let second = graph.matmul(inputs["y"], weight)?;
+            let combined = graph.add(output, second)?;
+            let loss = graph.sum_all(combined)?;
+            Ok((loss, BTreeMap::from([("output".into(), output)])))
+        })
+        .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut native = target.prepare(&plan).unwrap();
+        let mut interpreted = plan.prepare_cpu().unwrap();
+        let prepared = native.main_replay.workspace_stats();
+        assert!(prepared.retained_transpose_matmul_input_count >= 2);
+        assert_eq!(prepared.affine_matmul_materialization_bytes, 0);
+        assert_eq!(native.preparation_report().main().fallback_count(), 0);
+
+        let batch = BTreeMap::from([
+            (
+                "x".into(),
+                TensorData::new([2, 3], vec![1.0, -0.5, 0.25, -1.0, 0.75, 0.5]).unwrap(),
+            ),
+            (
+                "y".into(),
+                TensorData::new([2, 3], vec![0.5, 0.25, -1.0, 0.75, -0.5, 1.0]).unwrap(),
+            ),
+        ]);
+        let before = native.checkpoint().unwrap();
+        assert!(
+            native
+                .step_inner(batch.clone(), TensorData::scalar(0.01), Some(0))
+                .is_err()
+        );
+        assert_eq!(native.checkpoint().unwrap(), before);
+        assert_eq!(
+            native.main_replay.workspace_stats().allocation_count,
+            prepared.allocation_count
+        );
+        assert_eq!(
+            native
+                .main_replay
+                .workspace_stats()
+                .affine_matmul_materialization_bytes,
+            0
+        );
+
+        let expected = interpreted
+            .step(batch.clone(), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = native
+            .step(batch.clone(), TensorData::scalar(0.01))
+            .unwrap();
+        assert_cross_engine_tensor_close("retained transpose loss", actual.loss(), expected.loss());
+        assert_cross_engine_tensor_maps_close(
+            "retained transpose output",
+            actual.outputs(),
+            expected.outputs(),
+        );
+        let expected = interpreted
+            .step(batch.clone(), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = native.step(batch, TensorData::scalar(0.01)).unwrap();
+        assert_cross_engine_tensor_close(
+            "retained transpose update loss",
+            actual.loss(),
+            expected.loss(),
+        );
+        assert_native_adamw_state_close(&native, &interpreted);
+        let replayed = native.main_replay.workspace_stats();
+        assert_eq!(replayed.allocation_count, prepared.allocation_count);
+        assert_eq!(replayed.affine_matmul_materialization_bytes, 0);
+    }
+
+    #[test]
+    fn native_cpu_adamw_materializes_duplicate_transposes_of_recurrent_parameter() {
+        let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_input("x", [2, 2], DType::F32)
+            .unwrap();
+        let parameter = TrainingParameterInit::new(
+            "weight",
+            TensorData::new([2, 2], vec![0.2, -0.1, 0.3, 0.4]).unwrap(),
+        )
+        .unwrap();
+        let plan = CompiledAdamWPlan::compile(config, [parameter], |graph, inputs, parameters| {
+            let lhs = graph.permute(parameters["weight"], [1, 0])?;
+            let rhs = graph.permute(parameters["weight"], [1, 0])?;
+            let product = graph.matmul(lhs, rhs)?;
+            let weighted = graph.mul(product, inputs["x"])?;
+            let loss = graph.sum_all(weighted)?;
+            Ok((loss, BTreeMap::from([("output".into(), product)])))
+        })
+        .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut native = target.prepare(&plan).unwrap();
+        let mut interpreted = plan.prepare_cpu().unwrap();
+        assert_eq!(native.preparation_report().main().fallback_count(), 0);
+
+        let batch = BTreeMap::from([(
+            "x".into(),
+            TensorData::new([2, 2], vec![1.0, -0.5, 0.25, 2.0]).unwrap(),
+        )]);
+        let expected = interpreted
+            .step(batch.clone(), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = native.step(batch, TensorData::scalar(0.01)).unwrap();
+        assert_cross_engine_tensor_close(
+            "duplicate recurrent transpose loss",
+            actual.loss(),
+            expected.loss(),
+        );
+        assert_cross_engine_tensor_maps_close(
+            "duplicate recurrent transpose output",
+            actual.outputs(),
+            expected.outputs(),
+        );
+        assert_native_adamw_state_close(&native, &interpreted);
+        assert!(actual.report().traffic().borrowed_recurrent_input_bytes() > 0);
+        assert!(actual.report().traffic().borrowed_recurrent_output_bytes() > 0);
+    }
+
+    #[test]
+    fn native_cpu_adamw_materializes_transpose_colliding_with_dense_recurrent_parameter() {
+        let config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+            .unwrap()
+            .with_input("x", [2, 2], DType::F32)
+            .unwrap();
+        let parameter = TrainingParameterInit::new(
+            "weight",
+            TensorData::new([2, 2], vec![0.2, -0.1, 0.3, 0.4]).unwrap(),
+        )
+        .unwrap();
+        let plan = CompiledAdamWPlan::compile(config, [parameter], |graph, inputs, parameters| {
+            let transposed = graph.permute(parameters["weight"], [1, 0])?;
+            let product = graph.matmul(parameters["weight"], transposed)?;
+            let weighted = graph.mul(product, inputs["x"])?;
+            let loss = graph.sum_all(weighted)?;
+            Ok((loss, BTreeMap::from([("output".into(), product)])))
+        })
+        .unwrap();
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut native = target.prepare(&plan).unwrap();
+        let mut interpreted = plan.prepare_cpu().unwrap();
+        assert_eq!(native.preparation_report().main().fallback_count(), 0);
+
+        let batch = BTreeMap::from([(
+            "x".into(),
+            TensorData::new([2, 2], vec![1.0, -0.5, 0.25, 2.0]).unwrap(),
+        )]);
+        let expected = interpreted
+            .step(batch.clone(), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = native.step(batch, TensorData::scalar(0.01)).unwrap();
+        assert_cross_engine_tensor_close(
+            "dense recurrent transpose loss",
+            actual.loss(),
+            expected.loss(),
+        );
+        assert_cross_engine_tensor_maps_close(
+            "dense recurrent transpose output",
+            actual.outputs(),
+            expected.outputs(),
+        );
+        assert_native_adamw_state_close(&native, &interpreted);
+        assert!(actual.report().traffic().borrowed_recurrent_input_bytes() > 0);
+        assert!(actual.report().traffic().borrowed_recurrent_output_bytes() > 0);
+    }
+
+    #[test]
     fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
         let plan = CompiledAdamWPlan::compile(
             accumulated_adamw_config(3),

@@ -69,12 +69,309 @@ pub(crate) struct PreparedScheduleItem {
     pub(crate) cache_hit: bool,
     pub(crate) vector: VectorPlan,
     schedule_cache_key: u64,
+    native_layout: NativeScheduleLayout,
 }
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeScheduleLayout {
+    pub(crate) matmul: Option<crate::cpu_jit::NativeMatmulLayouts>,
+    pub(crate) retained_matmul_sources: BTreeMap<u64, u64>,
+    pub(crate) elided_output_source: Option<u64>,
+}
+
 impl PreparedScheduleItem {
     pub(crate) fn abi(&self) -> &crate::KernelAbi {
         self.kernel.abi()
     }
+
+    pub(crate) fn authenticates_layout(
+        &self,
+        item: &ScheduleItem,
+        layout: &NativeScheduleLayout,
+    ) -> bool {
+        self.schedule_cache_key == item.cache_key && &self.native_layout == layout
+    }
+
+    pub(crate) fn retained_matmul_source(
+        &self,
+        item: &ScheduleItem,
+        buffer: u64,
+    ) -> Result<Option<u64>, JitBackendError> {
+        if self.schedule_cache_key != item.cache_key {
+            return Err(JitBackendError::Binding(
+                "prepared schedule identity mismatch".into(),
+            ));
+        }
+        let Some((plan, layouts)) = matmul_plan(item).zip(self.native_layout.matmul) else {
+            return Ok(None);
+        };
+        let lhs = plan.lhs.index() as u64 == buffer
+            && layouts.lhs == crate::cpu_jit::NativeMatmulOperandLayout::Transpose2d;
+        let rhs = plan.rhs.index() as u64 == buffer
+            && layouts.rhs == crate::cpu_jit::NativeMatmulOperandLayout::Transpose2d;
+        let source = self
+            .native_layout
+            .retained_matmul_sources
+            .get(&buffer)
+            .copied();
+        if source.is_some() != (lhs || rhs) {
+            return Err(JitBackendError::Binding(
+                "prepared matmul source layout mismatch".into(),
+            ));
+        }
+        Ok(source)
+    }
+
+    pub(crate) fn elided_output_source(
+        &self,
+        item: &ScheduleItem,
+    ) -> Result<Option<u64>, JitBackendError> {
+        if self.schedule_cache_key != item.cache_key {
+            return Err(JitBackendError::Binding(
+                "prepared schedule identity mismatch".into(),
+            ));
+        }
+        Ok(self.native_layout.elided_output_source)
+    }
 }
+
+fn matmul_plan(item: &ScheduleItem) -> Option<&crate::MatmulKernelPlan> {
+    match item.kernel.operation() {
+        crate::Operation::Matmul(crate::MatmulValue::Serial(plan)) => Some(plan),
+        crate::Operation::Matmul(crate::MatmulValue::Tiled(payload)) => Some(&payload.matmul),
+        crate::Operation::Matmul(crate::MatmulValue::TensorCore(payload)) => Some(&payload.matmul),
+        _ => None,
+    }
+}
+
+fn canonical_transpose_layout(
+    item: &ScheduleItem,
+    node: NodeId,
+    expected: &crate::Shape,
+    vector: bool,
+) -> Result<crate::cpu_jit::NativeMatmulOperandLayout, JitBackendError> {
+    if vector || expected.rank() != 2 || expected.dims().contains(&0) {
+        return Ok(crate::cpu_jit::NativeMatmulOperandLayout::Dense);
+    }
+    let binding = item
+        .ordered_inputs()
+        .iter()
+        .find(|binding| binding.input_node == node)
+        .ok_or_else(|| JitBackendError::Binding("matmul operand binding is absent".into()))?;
+    let Some(view) = &binding.desc.view else {
+        return Ok(crate::cpu_jit::NativeMatmulOperandLayout::Dense);
+    };
+    if is_canonical_rank2_transpose(view, expected)? {
+        Ok(crate::cpu_jit::NativeMatmulOperandLayout::Transpose2d)
+    } else {
+        Ok(crate::cpu_jit::NativeMatmulOperandLayout::Dense)
+    }
+}
+
+pub(crate) fn is_canonical_rank2_transpose(
+    view: &crate::AffineView,
+    expected: &crate::Shape,
+) -> Result<bool, JitBackendError> {
+    view.validate_read()
+        .map_err(|error| JitBackendError::Binding(error.to_string()))?;
+    if expected.rank() != 2 || expected.dims().contains(&0) {
+        return Ok(false);
+    }
+    let rows = i64::try_from(expected.dims()[0]).map_err(|_| {
+        JitBackendError::Binding("matmul transpose stride exceeds native address range".into())
+    })?;
+    Ok(view.logical_shape == *expected
+        && view.source_shape.dims() == [expected.dims()[1], expected.dims()[0]]
+        && view.offset == 0
+        && view.strides.as_slice() == [1, rows])
+}
+
+fn canonical_scalar_transpose_copy(
+    item: &ScheduleItem,
+) -> Result<Option<(u64, u64, crate::AffineView)>, JitBackendError> {
+    let [binding] = item.ordered_inputs() else {
+        return Ok(None);
+    };
+    let output = item.primary_output();
+    if output.shape.rank() != 2 || output.shape.dims().contains(&0) {
+        return Ok(None);
+    }
+    let [store, end_range] = item.kernel.sources() else {
+        return Ok(None);
+    };
+    if !matches!(item.kernel.operation(), crate::Operation::Sink)
+        || !matches!(store.operation(), crate::Operation::Store)
+        || !matches!(end_range.operation(), crate::Operation::EndRange)
+    {
+        return Ok(None);
+    }
+    let [output_index, value] = store.sources() else {
+        return Ok(None);
+    };
+    let [input_index] = value.sources() else {
+        return Ok(None);
+    };
+    let crate::Operation::Index(crate::IndexValue::Buffer {
+        buffer: output_buffer,
+        elements: output_elements,
+        input_shape: output_input_shape,
+        output_shape,
+        addressing: crate::IndexAddressing::Broadcast,
+    }) = output_index.operation()
+    else {
+        return Ok(None);
+    };
+    let crate::Operation::Index(crate::IndexValue::View {
+        buffer: input_buffer,
+        elements: input_elements,
+        input_shape,
+        output_shape: input_output_shape,
+        view,
+    }) = input_index.operation()
+    else {
+        return Ok(None);
+    };
+    let [_, input_coordinate] = input_index.sources() else {
+        return Ok(None);
+    };
+    let [_, output_range] = output_index.sources() else {
+        return Ok(None);
+    };
+    let [end_range_source] = end_range.sources() else {
+        return Ok(None);
+    };
+    if !matches!(value.operation(), crate::Operation::Load)
+        || !end_range_source.shares_node_with(output_range)
+        || !input_coordinate.shares_node_with(output_range)
+        || *output_buffer != output.id
+        || *input_buffer != binding.desc.id
+        || binding.input_node.index() as u64 != binding.desc.id
+        || binding.desc.view.as_ref() != Some(view)
+        || binding.desc.shape != view.source_shape
+        || binding.desc.dtype != output.dtype
+        || *output_elements
+            != output.shape.numel().map_err(|error| {
+                JitBackendError::Binding(format!("native transpose output shape: {error}"))
+            })?
+        || *input_elements
+            != output.shape.numel().map_err(|error| {
+                JitBackendError::Binding(format!("native transpose view shape: {error}"))
+            })?
+        || output_input_shape != &output.shape
+        || output_shape != &output.shape
+        || input_output_shape != &output.shape
+        || input_shape != &view.logical_shape
+        || item.node.index() as u64 != output.id
+    {
+        return Ok(None);
+    }
+    if !is_canonical_rank2_transpose(view, &output.shape)? {
+        return Ok(None);
+    }
+    Ok(Some((binding.desc.id, output.id, view.clone())))
+}
+
+pub(crate) fn canonical_transpose_copy(
+    item: &ScheduleItem,
+) -> Result<Option<(u64, u64, crate::AffineView)>, JitBackendError> {
+    if let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = item.kernel.operation()
+        && let crate::MovementKernelKind::AffineCopy { input, view } = &plan.kind
+    {
+        plan.validate()
+            .map_err(|error| JitBackendError::Binding(error.to_string()))?;
+        if plan.output.index() as u64 == item.primary_output().id
+            && is_canonical_rank2_transpose(view, &plan.output_shape)?
+        {
+            return Ok(Some((
+                input.node.index() as u64,
+                item.primary_output().id,
+                view.clone(),
+            )));
+        }
+    }
+    canonical_scalar_transpose_copy(item)
+}
+
+fn schedule_matmul_layouts(
+    item: &ScheduleItem,
+) -> Result<Option<crate::cpu_jit::NativeMatmulLayouts>, JitBackendError> {
+    let Some(plan) = matmul_plan(item) else {
+        return Ok(None);
+    };
+    let layouts = crate::cpu_jit::NativeMatmulLayouts {
+        lhs: canonical_transpose_layout(item, plan.lhs, &plan.lhs_shape, plan.lhs_vector)?,
+        rhs: canonical_transpose_layout(item, plan.rhs, &plan.rhs_shape, plan.rhs_vector)?,
+    };
+    if plan.lhs == plan.rhs && layouts.lhs != layouts.rhs {
+        return Ok(Some(crate::cpu_jit::NativeMatmulLayouts::default()));
+    }
+    Ok(Some(layouts))
+}
+
+pub(crate) fn schedule_native_layout(
+    item: &ScheduleItem,
+) -> Result<NativeScheduleLayout, JitBackendError> {
+    let matmul = schedule_matmul_layouts(item)?;
+    let mut retained_matmul_sources = BTreeMap::new();
+    if let Some((plan, layouts)) = matmul_plan(item).zip(matmul) {
+        for (node, layout) in [(plan.lhs, layouts.lhs), (plan.rhs, layouts.rhs)] {
+            if layout == crate::cpu_jit::NativeMatmulOperandLayout::Transpose2d {
+                retained_matmul_sources.insert(node.index() as u64, node.index() as u64);
+            }
+        }
+    }
+    Ok(NativeScheduleLayout {
+        matmul,
+        retained_matmul_sources,
+        elided_output_source: None,
+    })
+}
+
+fn validate_native_layout(
+    item: &ScheduleItem,
+    layout: &NativeScheduleLayout,
+) -> Result<(), JitBackendError> {
+    match (matmul_plan(item), layout.matmul) {
+        (Some(plan), Some(layouts)) => {
+            let roles = [(plan.lhs, layouts.lhs), (plan.rhs, layouts.rhs)];
+            for (node, operand_layout) in roles {
+                let retained = layout
+                    .retained_matmul_sources
+                    .contains_key(&(node.index() as u64));
+                if retained
+                    != (operand_layout == crate::cpu_jit::NativeMatmulOperandLayout::Transpose2d)
+                {
+                    return Err(JitBackendError::Binding(
+                        "native matmul retained-source inventory mismatch".into(),
+                    ));
+                }
+            }
+            if layout.retained_matmul_sources.keys().any(|buffer| {
+                *buffer != plan.lhs.index() as u64 && *buffer != plan.rhs.index() as u64
+            }) {
+                return Err(JitBackendError::Binding(
+                    "native matmul retained-source role is invalid".into(),
+                ));
+            }
+        }
+        (None, None) if layout.retained_matmul_sources.is_empty() => {}
+        _ => {
+            return Err(JitBackendError::Binding(
+                "native matmul layout targets a non-matmul item".into(),
+            ));
+        }
+    }
+    if let Some(source) = layout.elided_output_source {
+        let candidate = canonical_transpose_copy(item)?;
+        if candidate.as_ref().map(|candidate| candidate.0) != Some(source) {
+            return Err(JitBackendError::Binding(
+                "native elided output source mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl CpuJitBackend {
     pub fn new(fallback: JitFallback) -> Self {
         Self {
@@ -139,9 +436,43 @@ impl CpuJitBackend {
         Ok((vector, rendered))
     }
 
+    fn render_schedule_kernel(
+        &self,
+        item: &ScheduleItem,
+        layout: &NativeScheduleLayout,
+    ) -> Result<
+        (
+            VectorPlan,
+            crate::cpu_jit::RenderedC,
+            Option<crate::cpu_jit::NativeMatmulLayouts>,
+        ),
+        JitBackendError,
+    > {
+        let layouts = layout.matmul;
+        let (vector, rendered) = match (matmul_plan(item), layouts) {
+            (Some(plan), Some(layouts)) => {
+                let vector = if self.vectorized {
+                    CpuJit::vector_plan(&item.kernel)
+                        .map_err(|error| JitBackendError::Unsupported(error.to_string()))?
+                } else {
+                    VectorPlan {
+                        lanes: 1,
+                        enabled: false,
+                        reason: "scalar policy disabled vector lanes".into(),
+                    }
+                };
+                let rendered = CpuJit::render_matmul_with_layouts(plan, layouts)
+                    .map_err(|error| JitBackendError::Unsupported(error.to_string()))?;
+                (vector, rendered)
+            }
+            _ => self.render_kernel(&item.kernel)?,
+        };
+        Ok((vector, rendered, layouts))
+    }
+
     fn compile_cached(
         &self,
-        kernel: &crate::UOp,
+        rendered: &crate::cpu_jit::RenderedC,
         cache_key: &str,
     ) -> Result<(Arc<JitKernel>, bool), JitBackendError> {
         let mut cache = self
@@ -151,14 +482,7 @@ impl CpuJitBackend {
         if let Some(compiled) = cache.get(cache_key) {
             return Ok((compiled.clone(), true));
         }
-        let compiled = Arc::new(
-            if self.vectorized {
-                CpuJit::compile_vectorized(kernel)
-            } else {
-                CpuJit::compile(kernel)
-            }
-            .map_err(jit_error)?,
-        );
+        let compiled = Arc::new(JitKernel::load(rendered).map_err(jit_error)?);
         cache.insert(cache_key.to_owned(), compiled.clone());
         Ok((compiled, false))
     }
@@ -174,7 +498,8 @@ impl CpuJitBackend {
         }
         item.validate_input_bindings()
             .map_err(|e| JitBackendError::Binding(e.to_string()))?;
-        let (_, rendered) = self.render_kernel(&item.kernel)?;
+        let layout = schedule_native_layout(item)?;
+        let (_, rendered, _) = self.render_schedule_kernel(item, &layout)?;
         for (index, binding) in item.ordered_inputs().iter().enumerate() {
             if binding.abi_index != index {
                 return Err(JitBackendError::Binding(
@@ -254,16 +579,27 @@ impl CpuJitBackend {
         &self,
         item: &ScheduleItem,
     ) -> Result<PreparedScheduleItem, JitBackendError> {
+        let native_layout = schedule_native_layout(item)?;
+        self.prepare_schedule_item_with_layout(item, native_layout)
+    }
+
+    pub(crate) fn prepare_schedule_item_with_layout(
+        &self,
+        item: &ScheduleItem,
+        native_layout: NativeScheduleLayout,
+    ) -> Result<PreparedScheduleItem, JitBackendError> {
         self.validate_schedule_item(item)?;
-        let (vector, rendered) = self.render_kernel(&item.kernel)?;
+        validate_native_layout(item, &native_layout)?;
+        let (vector, rendered, _) = self.render_schedule_kernel(item, &native_layout)?;
         let native_cache_key = format!("{}-schedule-{:016x}", rendered.cache_key, item.cache_key);
-        let (kernel, cache_hit) = self.compile_cached(&item.kernel, &native_cache_key)?;
+        let (kernel, cache_hit) = self.compile_cached(&rendered, &native_cache_key)?;
         Ok(PreparedScheduleItem {
             kernel,
             native_cache_key,
             cache_hit,
             vector,
             schedule_cache_key: item.cache_key,
+            native_layout,
         })
     }
 
@@ -279,6 +615,7 @@ impl CpuJitBackend {
                 "prepared schedule identity mismatch".into(),
             ));
         }
+        prepared.retained_matmul_source(item, u64::MAX)?;
         let mut buffers = Vec::with_capacity(prepared.kernel.abi().buffers.len());
         for desc in &prepared.kernel.abi().buffers {
             if desc.id == item.primary_output().id {
@@ -295,8 +632,18 @@ impl CpuJitBackend {
                             desc.id
                         ))
                     })?;
-                let logical = crate::engine::direct_matmul_input(item, binding, value)
-                    .map_err(JitBackendError::Binding)?;
+                let retained_source = prepared.retained_matmul_source(item, desc.id)?;
+                if retained_source.is_some_and(|source| source != desc.id) {
+                    return Err(JitBackendError::Binding(
+                        "cross-item retained matmul input requires prepared workspace".into(),
+                    ));
+                }
+                let logical = if retained_source.is_some() {
+                    std::borrow::Cow::Borrowed(value)
+                } else {
+                    crate::engine::direct_matmul_input(item, binding, value)
+                        .map_err(JitBackendError::Binding)?
+                };
                 buffers.push(JitBuffer::from_tensor(logical.as_ref(), false));
             }
         }
@@ -357,6 +704,7 @@ impl CpuJitBackend {
                 "prepared workspace schedule identity mismatch".into(),
             ));
         }
+        prepared.retained_matmul_source(item, u64::MAX)?;
         let quantized = prepared
             .kernel
             .abi()
@@ -425,7 +773,7 @@ impl CpuJitBackend {
         }
         .map_err(|e| JitBackendError::Unsupported(e.to_string()))?;
         let (vector, rendered) = self.render_kernel(&kernel)?;
-        let (compiled, _) = self.compile_cached(&kernel, &rendered.cache_key)?;
+        let (compiled, _) = self.compile_cached(&rendered, &rendered.cache_key)?;
         let mut buffers = Vec::with_capacity(compiled.abi().buffers.len());
         for desc in &compiled.abi().buffers {
             let id = NodeId::from_index(desc.id as usize);

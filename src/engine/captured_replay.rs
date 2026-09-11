@@ -2,7 +2,9 @@
 use super::capture::{CapturedSchedule, ReplayError};
 use super::native_replay_workspace::{NativeReplayTraffic, NativeReplayWorkspace};
 use super::replay_liveness::ReplayLivenessPlan;
-use crate::backend::{JitBackendError, PreparedScheduleItem, TensorValueStore};
+use crate::backend::{
+    JitBackendError, NativeScheduleLayout, PreparedScheduleItem, TensorValueStore,
+};
 use crate::{
     BufferRole, CpuJitBackend, ItemBackend, JitFallback, KernelBindings, KernelBufferDesc,
     ScheduleItem, TensorData,
@@ -867,6 +869,18 @@ impl PlannedNativeItems {
                 "prepared native schedule cache keys mismatch".into(),
             ));
         }
+        let layouts = native_schedule_layouts(capture)?;
+        if capture
+            .items
+            .iter()
+            .zip(&self.items)
+            .zip(&layouts)
+            .any(|((item, prepared), layout)| !prepared.authenticates_layout(item, layout))
+        {
+            return Err(ReplayError::Corrupt(
+                "prepared native operand layout mismatch".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -881,6 +895,188 @@ impl PlannedNativeItems {
         // invalidatable scratch, including quantized row-gather index bounds.
         validate_inputs(capture, provided)
     }
+}
+
+fn native_schedule_layouts(
+    capture: &CapturedSchedule,
+) -> Result<Vec<NativeScheduleLayout>, ReplayError> {
+    let mut layouts = capture
+        .items
+        .iter()
+        .map(|item| crate::backend::schedule_native_layout(item).map_err(backend_error))
+        .collect::<Result<Vec<_>, _>>()?;
+    let escapes = capture
+        .requested
+        .iter()
+        .copied()
+        .chain(
+            capture
+                .requested_passthroughs
+                .iter()
+                .flat_map(|alias| [alias.requested.index() as u64, alias.source.index() as u64]),
+        )
+        .collect::<BTreeSet<_>>();
+    let physical_inputs = capture
+        .inputs
+        .iter()
+        .map(|input| input.node.index() as u64)
+        .chain(capture.constants.keys().copied())
+        .collect::<BTreeSet<_>>();
+
+    struct Candidate {
+        producer: usize,
+        source: u64,
+        output: u64,
+        consumers: Vec<(usize, bool, bool)>,
+    }
+    let mut candidates = Vec::new();
+    for (producer_index, producer) in capture.items.iter().enumerate() {
+        if producer.consumers.is_empty() || escapes.contains(&producer.primary_output().id) {
+            continue;
+        }
+        let Some((source, output, view)) =
+            crate::backend::canonical_transpose_copy(producer).map_err(backend_error)?
+        else {
+            continue;
+        };
+        if !physical_inputs.contains(&source) {
+            continue;
+        }
+        let mut consumers = Vec::with_capacity(producer.consumers.len());
+        let mut compatible = true;
+        for consumer_id in &producer.consumers {
+            let Some((consumer_index, consumer)) = capture
+                .items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.id == *consumer_id)
+            else {
+                return Err(ReplayError::Corrupt(
+                    "native transpose consumer is absent".into(),
+                ));
+            };
+            let plan = match consumer.kernel.operation() {
+                crate::Operation::Matmul(crate::MatmulValue::Serial(plan)) => plan.as_ref(),
+                crate::Operation::Matmul(crate::MatmulValue::Tiled(payload)) => &payload.matmul,
+                crate::Operation::Matmul(crate::MatmulValue::TensorCore(payload)) => {
+                    &payload.matmul
+                }
+                _ => {
+                    compatible = false;
+                    break;
+                }
+            };
+            let lhs = plan.lhs.index() as u64 == output
+                && !plan.lhs_vector
+                && crate::backend::is_canonical_rank2_transpose(&view, &plan.lhs_shape)
+                    .map_err(backend_error)?;
+            let rhs = plan.rhs.index() as u64 == output
+                && !plan.rhs_vector
+                && crate::backend::is_canonical_rank2_transpose(&view, &plan.rhs_shape)
+                    .map_err(backend_error)?;
+            if !lhs && !rhs {
+                compatible = false;
+                break;
+            }
+            consumers.push((consumer_index, lhs, rhs));
+        }
+        if !compatible {
+            continue;
+        }
+        candidates.push(Candidate {
+            producer: producer_index,
+            source,
+            output,
+            consumers,
+        });
+    }
+
+    let mut proposed = layouts.clone();
+    for candidate in &candidates {
+        for &(consumer, lhs, rhs) in &candidate.consumers {
+            let matmul = proposed[consumer]
+                .matmul
+                .get_or_insert(crate::cpu_jit::NativeMatmulLayouts::default());
+            if lhs {
+                matmul.lhs = crate::cpu_jit::NativeMatmulOperandLayout::Transpose2d;
+            }
+            if rhs {
+                matmul.rhs = crate::cpu_jit::NativeMatmulOperandLayout::Transpose2d;
+            }
+            if proposed[consumer]
+                .retained_matmul_sources
+                .insert(candidate.output, candidate.source)
+                .is_some()
+            {
+                return Err(ReplayError::Corrupt(
+                    "native transpose retention has duplicate ownership".into(),
+                ));
+            }
+        }
+    }
+
+    // A producer can disappear only when all of its consumers retain the
+    // physical owner. Reject that producer as a unit if any consumer would
+    // bind two distinct logical ABI inputs to the same workspace slot.
+    let mut rejected = BTreeSet::new();
+    for (index, layout) in proposed.iter().enumerate() {
+        let plan = match capture.items[index].kernel.operation() {
+            crate::Operation::Matmul(crate::MatmulValue::Serial(plan)) => plan.as_ref(),
+            crate::Operation::Matmul(crate::MatmulValue::Tiled(payload)) => &payload.matmul,
+            crate::Operation::Matmul(crate::MatmulValue::TensorCore(payload)) => &payload.matmul,
+            _ => continue,
+        };
+        let lhs = plan.lhs.index() as u64;
+        let rhs = plan.rhs.index() as u64;
+        let lhs_source = layout
+            .retained_matmul_sources
+            .get(&lhs)
+            .copied()
+            .unwrap_or(lhs);
+        let rhs_source = layout
+            .retained_matmul_sources
+            .get(&rhs)
+            .copied()
+            .unwrap_or(rhs);
+        if lhs != rhs && lhs_source == rhs_source {
+            for candidate in &candidates {
+                if candidate
+                    .consumers
+                    .iter()
+                    .any(|consumer| consumer.0 == index)
+                {
+                    rejected.insert(candidate.producer);
+                }
+            }
+        }
+    }
+    for candidate in candidates {
+        if rejected.contains(&candidate.producer) {
+            continue;
+        }
+        layouts[candidate.producer].elided_output_source = Some(candidate.source);
+        for (consumer, lhs, rhs) in candidate.consumers {
+            let matmul = layouts[consumer]
+                .matmul
+                .get_or_insert(crate::cpu_jit::NativeMatmulLayouts::default());
+            if lhs {
+                matmul.lhs = crate::cpu_jit::NativeMatmulOperandLayout::Transpose2d;
+            }
+            if rhs {
+                matmul.rhs = crate::cpu_jit::NativeMatmulOperandLayout::Transpose2d;
+            }
+            if layouts[consumer]
+                .retained_matmul_sources
+                .insert(candidate.output, candidate.source)
+                .is_some()
+            {
+                return Err(ReplayError::Corrupt(
+                    "native transpose retention changed after admission".into(),
+                ));
+            }
+        }
+    }
+    Ok(layouts)
 }
 
 impl CapturedReplayExecutor {
@@ -904,18 +1100,30 @@ impl CapturedReplayExecutor {
                 "ordinary captured native replay cannot execute effect items".into(),
             ));
         }
-        let planned = self.plan(
-            capture,
-            CapturedBackendPolicy::NativeJit { vectorized },
-            None,
-        )?;
-        let items = planned
-            .into_iter()
-            .map(|item| match item {
-                PlannedItem::Native(item) => Ok(item),
-                _ => Err(ReplayError::Unsupported(
+        for item in &capture.items {
+            let elements = item
+                .primary_output()
+                .shape
+                .numel()
+                .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+            if elements == 0 {
+                return Err(ReplayError::Unsupported(
                     "strict native plan selected non-native item".into(),
-                )),
+                ));
+            }
+        }
+        let layouts = native_schedule_layouts(capture)?;
+        let jit = self.jit(vectorized);
+        for item in &capture.items {
+            jit.validate_schedule_item(item).map_err(backend_error)?;
+        }
+        let items = capture
+            .items
+            .iter()
+            .zip(layouts)
+            .map(|(item, layout)| {
+                jit.prepare_schedule_item_with_layout(item, layout)
+                    .map_err(backend_error)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let workspace = NativeReplayWorkspace::new(capture, &items)?;
@@ -1540,6 +1748,317 @@ mod tests {
                 if message == "prepared native item count mismatch"
         ));
         assert_eq!(executor.native_item_plan_count(), 1);
+    }
+
+    #[test]
+    fn planned_native_matmul_retains_one_canonical_transpose_owner() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2, 3], DType::F32);
+        let weight = graph.input_dtype("weight", [4, 3], DType::F32);
+        let transposed = graph.permute(weight, [1, 0]).unwrap();
+        let output = graph.matmul(lhs, transposed).unwrap();
+        let capture = captured(&graph, &[output]);
+        let transpose_index = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == transposed.index() as u64)
+            .unwrap();
+        let output_index = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == output.index() as u64)
+            .unwrap();
+        assert_eq!(
+            crate::backend::canonical_transpose_copy(&capture.items[transpose_index])
+                .unwrap()
+                .map(|(source, output, _)| (source, output)),
+            Some((weight.index() as u64, transposed.index() as u64))
+        );
+        let layouts = native_schedule_layouts(&capture).unwrap();
+        assert_eq!(
+            layouts[transpose_index].elided_output_source,
+            Some(weight.index() as u64)
+        );
+        assert_eq!(
+            layouts[output_index]
+                .retained_matmul_sources
+                .get(&(transposed.index() as u64)),
+            Some(&(weight.index() as u64))
+        );
+        let bindings = BTreeMap::from([
+            (
+                "lhs".into(),
+                TensorData::new([2, 3], vec![1.0, 2.0, 3.0, -1.0, 0.5, 4.0]).unwrap(),
+            ),
+            (
+                "weight".into(),
+                TensorData::new(
+                    [4, 3],
+                    vec![
+                        1.0, 0.0, 2.0, -1.0, 3.0, 0.5, 2.0, -2.0, 1.0, 0.25, 0.5, -1.0,
+                    ],
+                )
+                .unwrap(),
+            ),
+        ]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let prepared = plan.workspace_stats();
+        assert_eq!(prepared.retained_transpose_matmul_input_count, 1);
+        assert_eq!(prepared.affine_matmul_materialization_bytes, 0);
+
+        let actual = executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([
+                    ("lhs".into(), bindings["lhs"].clone()),
+                    ("weight".into(), bindings["weight"].clone()),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            actual.requested(&capture.requested).unwrap()[0].storage(),
+            expected.storage()
+        );
+        let first = plan.workspace_stats();
+        assert_eq!(first.allocation_count, prepared.allocation_count);
+        assert_eq!(first.affine_matmul_materialization_bytes, 0);
+
+        let malformed = BTreeMap::from([
+            ("lhs".into(), TensorData::new([1, 3], vec![1.0; 3]).unwrap()),
+            ("weight".into(), bindings["weight"].clone()),
+        ]);
+        assert!(
+            executor
+                .execute_planned_native_items(&capture, &malformed, &mut plan)
+                .is_err()
+        );
+        assert_eq!(plan.workspace_stats(), first);
+        let retried = executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(
+            retried.requested(&capture.requested).unwrap()[0].storage(),
+            expected.storage()
+        );
+        assert_eq!(
+            plan.workspace_stats().affine_matmul_materialization_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn planned_native_matmul_materializes_duplicate_transpose_sources() {
+        let mut graph = Graph::new();
+        let source = graph.input_dtype("source", [2, 2], DType::F32);
+        let lhs = graph.permute(source, [1, 0]).unwrap();
+        let rhs = graph.permute(source, [1, 0]).unwrap();
+        assert_ne!(lhs, rhs);
+        let output = graph.matmul(lhs, rhs).unwrap();
+        let capture = captured(&graph, &[output]);
+        let layouts = native_schedule_layouts(&capture).unwrap();
+        let lhs_index = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == lhs.index() as u64)
+            .unwrap();
+        let rhs_index = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == rhs.index() as u64)
+            .unwrap();
+        let output_index = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == output.index() as u64)
+            .unwrap();
+        for producer in [lhs_index, rhs_index] {
+            assert_eq!(
+                crate::backend::canonical_transpose_copy(&capture.items[producer])
+                    .unwrap()
+                    .map(|(source, _, _)| source),
+                Some(source.index() as u64)
+            );
+        }
+        assert_eq!(layouts[lhs_index].elided_output_source, None);
+        assert_eq!(layouts[rhs_index].elided_output_source, None);
+        assert!(layouts[output_index].retained_matmul_sources.is_empty());
+
+        let bindings = BTreeMap::from([(
+            "source".into(),
+            TensorData::new([2, 2], vec![1.0, 2.0, -0.5, 3.0]).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let prepared = plan.workspace_stats();
+        assert_eq!(prepared.retained_transpose_matmul_input_count, 0);
+        assert_eq!(
+            prepared.allocation_count,
+            capture.inputs.len() + capture.items.len() + 1
+        );
+        let actual = executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("source".into(), bindings["source"].clone())]),
+            )
+            .unwrap();
+        assert_eq!(
+            actual.requested(&capture.requested).unwrap()[0].storage(),
+            expected.storage()
+        );
+        assert_eq!(
+            plan.workspace_stats().retained_transpose_matmul_input_count,
+            0
+        );
+        assert_eq!(
+            plan.workspace_stats().allocation_count,
+            capture.inputs.len() + capture.items.len() + 1
+        );
+    }
+
+    #[test]
+    fn planned_native_matmul_materializes_transpose_colliding_with_dense_source() {
+        let mut graph = Graph::new();
+        let source = graph.input_dtype("source", [2, 2], DType::F32);
+        let transposed = graph.permute(source, [1, 0]).unwrap();
+        let output = graph.matmul(source, transposed).unwrap();
+        let capture = captured(&graph, &[output]);
+        let layouts = native_schedule_layouts(&capture).unwrap();
+        let transpose_index = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == transposed.index() as u64)
+            .unwrap();
+        let output_index = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == output.index() as u64)
+            .unwrap();
+        assert_eq!(
+            crate::backend::canonical_transpose_copy(&capture.items[transpose_index])
+                .unwrap()
+                .map(|(source, _, _)| source),
+            Some(source.index() as u64)
+        );
+        assert_eq!(layouts[transpose_index].elided_output_source, None);
+        assert!(layouts[output_index].retained_matmul_sources.is_empty());
+
+        let bindings = BTreeMap::from([(
+            "source".into(),
+            TensorData::new([2, 2], vec![1.0, 2.0, -0.5, 3.0]).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        assert_eq!(
+            plan.workspace_stats().retained_transpose_matmul_input_count,
+            0
+        );
+        assert_eq!(
+            plan.workspace_stats().allocation_count,
+            capture.inputs.len() + capture.items.len() + 1
+        );
+        let actual = executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([("source".into(), bindings["source"].clone())]),
+            )
+            .unwrap();
+        assert_eq!(
+            actual.requested(&capture.requested).unwrap()[0].storage(),
+            expected.storage()
+        );
+    }
+
+    #[test]
+    fn planned_native_matmul_keeps_noncanonical_affine_scratch() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", [2, 3], DType::F32);
+        let base = graph.input_dtype("base", [3, 8], DType::F32);
+        let strided = graph
+            .stride(
+                base,
+                [
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 1,
+                    },
+                    crate::Slice {
+                        start: None,
+                        stop: None,
+                        step: 2,
+                    },
+                ],
+            )
+            .unwrap();
+        let output = graph.matmul(lhs, strided).unwrap();
+        let capture = captured(&graph, &[output]);
+        let strided_index = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == strided.index() as u64)
+            .unwrap();
+        assert!(
+            crate::backend::canonical_transpose_copy(&capture.items[strided_index])
+                .unwrap()
+                .is_none()
+        );
+        let bindings = BTreeMap::from([
+            ("lhs".into(), TensorData::new([2, 3], vec![1.0; 6]).unwrap()),
+            (
+                "base".into(),
+                TensorData::new(
+                    [3, 8],
+                    (0..24).map(|value| value as f32).collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            ),
+        ]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let prepared = plan.workspace_stats();
+        assert_eq!(prepared.retained_transpose_matmul_input_count, 0);
+        assert_eq!(
+            prepared.allocation_count,
+            capture.inputs.len() + capture.items.len() + 1
+        );
+        let actual = executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap();
+        let expected = CpuBackend
+            .execute(
+                &graph,
+                output,
+                &HashMap::from([
+                    ("lhs".into(), bindings["lhs"].clone()),
+                    ("base".into(), bindings["base"].clone()),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            actual.requested(&capture.requested).unwrap()[0].storage(),
+            expected.storage()
+        );
     }
 
     fn assert_computed_affine_replay(

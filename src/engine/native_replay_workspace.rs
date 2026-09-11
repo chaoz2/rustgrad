@@ -32,6 +32,7 @@ struct WorkspaceSlot {
 struct WorkspaceItem {
     slots: Vec<usize>,
     output: usize,
+    elided: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -63,6 +64,10 @@ pub(super) struct NativeReplayWorkspace {
     borrowed_recurrent_input_bytes: usize,
     #[cfg(test)]
     borrowed_recurrent_output_bytes: usize,
+    #[cfg(test)]
+    retained_transpose_matmul_input_count: usize,
+    #[cfg(test)]
+    affine_matmul_materialization_bytes: usize,
 }
 
 pub(super) struct NativeReplayBorrowedState<'a> {
@@ -85,6 +90,8 @@ pub(crate) struct NativeReplayWorkspaceStats {
     pub(crate) intermediate_materialization_count: usize,
     pub(crate) borrowed_recurrent_input_bytes: usize,
     pub(crate) borrowed_recurrent_output_bytes: usize,
+    pub(crate) retained_transpose_matmul_input_count: usize,
+    pub(crate) affine_matmul_materialization_bytes: usize,
 }
 
 impl NativeReplayWorkspace {
@@ -110,6 +117,10 @@ impl NativeReplayWorkspace {
             borrowed_recurrent_input_bytes: 0,
             #[cfg(test)]
             borrowed_recurrent_output_bytes: 0,
+            #[cfg(test)]
+            retained_transpose_matmul_input_count: 0,
+            #[cfg(test)]
+            affine_matmul_materialization_bytes: 0,
         };
 
         for input in &capture.inputs {
@@ -177,6 +188,29 @@ impl NativeReplayWorkspace {
             .shape
             .numel()
             .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        if let Some(source_buffer) = prepared.elided_output_source(item).map_err(backend_error)? {
+            let source = self.owners.get(&source_buffer).copied().ok_or_else(|| {
+                ReplayError::Corrupt("elided native transpose source is absent".into())
+            })?;
+            let source_key = &self.slots[source].key;
+            if source_key.elements != output_elements || source_key.descriptor.dtype != output.dtype
+            {
+                return Err(ReplayError::Corrupt(
+                    "elided native transpose descriptor mismatch".into(),
+                ));
+            }
+            if self.owners.insert(output.id, source).is_some() {
+                return Err(ReplayError::Corrupt(
+                    "elided native transpose output has multiple owners".into(),
+                ));
+            }
+            self.items.push(WorkspaceItem {
+                slots: Vec::new(),
+                output: source,
+                elided: true,
+            });
+            return Ok(());
+        }
         let output_slot = self.add_canonical(output.id, output.clone(), output_elements, true)?;
         let direct_matmul = matches!(
             item.kernel.operation(),
@@ -197,11 +231,15 @@ impl NativeReplayWorkspace {
                 slots.push(output_slot);
                 continue;
             }
-            slots.push(self.resolve_input(item, abi, direct_matmul)?);
+            let retained_source = prepared
+                .retained_matmul_source(item, abi.id)
+                .map_err(backend_error)?;
+            slots.push(self.resolve_input(item, abi, direct_matmul, retained_source)?);
         }
         self.items.push(WorkspaceItem {
             slots,
             output: output_slot,
+            elided: false,
         });
         Ok(())
     }
@@ -211,6 +249,7 @@ impl NativeReplayWorkspace {
         item: &ScheduleItem,
         abi: &crate::cpu_jit::BufferAbi,
         direct_matmul: bool,
+        retained_source: Option<u64>,
     ) -> Result<usize, ReplayError> {
         let binding = item
             .ordered_inputs()
@@ -219,6 +258,30 @@ impl NativeReplayWorkspace {
             .ok_or_else(|| {
                 ReplayError::Corrupt(format!("native workspace input {} has no binding", abi.id))
             })?;
+        if let Some(source_buffer) = retained_source {
+            let source = self.owners.get(&source_buffer).copied().ok_or_else(|| {
+                ReplayError::Corrupt(format!(
+                    "retained native matmul source {source_buffer} is absent"
+                ))
+            })?;
+            let source_key = &self.slots[source].key;
+            if abi.dtype != binding.desc.dtype
+                || abi.elements != source_key.elements
+                || abi.mutable
+                || source_key.descriptor.dtype != binding.desc.dtype
+            {
+                return Err(ReplayError::Corrupt(format!(
+                    "retained native matmul input {} descriptor mismatch",
+                    abi.id
+                )));
+            }
+            #[cfg(test)]
+            {
+                self.retained_transpose_matmul_input_count =
+                    self.retained_transpose_matmul_input_count.saturating_add(1);
+            }
+            return Ok(source);
+        }
         let direct_view = direct_matmul.then(|| binding.desc.view.clone()).flatten();
         let source_shape = direct_view
             .as_ref()
@@ -559,6 +622,8 @@ impl NativeReplayWorkspace {
                 "native workspace source is unavailable".into(),
             ));
         }
+        #[cfg(test)]
+        let affine = matches!(&source, SlotSource::Affine { .. });
         let copied = match borrowed.slots.get(&source_slot) {
             Some(binding) => {
                 let target = self.buffers.get_mut(slot).ok_or_else(|| {
@@ -584,6 +649,17 @@ impl NativeReplayWorkspace {
             }
         };
         copied.map_err(|error| ReplayError::Backend(error.to_string()))?;
+        #[cfg(test)]
+        if affine {
+            let bytes = self
+                .buffers
+                .get(slot)
+                .map(|buffer| buffer.bytes().len())
+                .unwrap_or(0);
+            self.affine_matmul_materialization_bytes = self
+                .affine_matmul_materialization_bytes
+                .saturating_add(bytes);
+        }
         self.valid[slot] = true;
         Ok(())
     }
@@ -603,6 +679,14 @@ impl NativeReplayWorkspace {
             .map(|item| item.slots.len())
             .ok_or_else(|| ReplayError::Corrupt("native workspace item is absent".into()))?;
         let output = self.items[index].output;
+        if self.items[index].elided {
+            if !self.valid.get(output).copied().unwrap_or(false) {
+                return Err(ReplayError::Corrupt(
+                    "elided native transpose source is unavailable".into(),
+                ));
+            }
+            return Ok(());
+        }
         for offset in 0..slot_count {
             let slot = self.items[index].slots[offset];
             if slot != output {
@@ -697,6 +781,8 @@ impl NativeReplayWorkspace {
             intermediate_materialization_count: self.intermediate_materialization_count,
             borrowed_recurrent_input_bytes: self.borrowed_recurrent_input_bytes,
             borrowed_recurrent_output_bytes: self.borrowed_recurrent_output_bytes,
+            retained_transpose_matmul_input_count: self.retained_transpose_matmul_input_count,
+            affine_matmul_materialization_bytes: self.affine_matmul_materialization_bytes,
         }
     }
 }
