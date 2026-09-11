@@ -1087,8 +1087,12 @@ fresh module, injects saved immutable values only into capture constants, and
 restores the optimizer frontier without mutating the host destination. Finish
 then publishes restored immutable values and trained parameters together in the
 same all-lock transaction while retaining the destination's identities, ties,
-and trainability. The envelope still contains no executable graph, schedule,
-runtime resource, host identity, or host version.
+and trainability. Lifecycles without evaluation retain their exact v1 module
+envelope. When an evaluator is attached, v2 records only its capture identity;
+fresh-module restoration must attach that exact evaluator before preparation,
+and a missing or mismatched evaluator retains the untouched owned plan for
+retry. The envelope still contains no executable graph, schedule, runtime
+resource, host identity, or host version.
 Compilation failure returns the exact module, including graph-build,
 checkpoint-admission, seal, and maximum-version preflight failures. Checkpoint
 snapshot, decode, or publication failure returns an error that retains the
