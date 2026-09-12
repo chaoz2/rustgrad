@@ -657,6 +657,93 @@ pub(crate) struct JitScheduleDispatcher {
     invocation_count: Arc<AtomicU64>,
 }
 
+/// Capacity-owned pointer/call scratch for one synchronous schedule-module
+/// dispatch. Raw pointers are populated only for the duration of `call` and
+/// cleared on every success or error return.
+pub(crate) struct JitScheduleDispatchScratch {
+    pointers: Vec<*mut c_void>,
+    calls: Vec<NativeScheduleDispatchCall>,
+    #[cfg(test)]
+    capacity_growth_count: usize,
+}
+
+// SAFETY: raw pointers are populated only behind an exclusive scoped borrow
+// during one synchronous dispatcher call. The scope clears both vectors on
+// every return or unwind, so moving an idle prepared workspace between threads
+// cannot move or expose a caller-owned pointer.
+unsafe impl Send for JitScheduleDispatchScratch {}
+
+struct JitScheduleDispatchScratchScope<'a> {
+    scratch: &'a mut JitScheduleDispatchScratch,
+}
+
+impl std::ops::Deref for JitScheduleDispatchScratchScope<'_> {
+    type Target = JitScheduleDispatchScratch;
+
+    fn deref(&self) -> &Self::Target {
+        self.scratch
+    }
+}
+
+impl std::ops::DerefMut for JitScheduleDispatchScratchScope<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.scratch
+    }
+}
+
+impl Drop for JitScheduleDispatchScratchScope<'_> {
+    fn drop(&mut self) {
+        self.scratch.clear();
+    }
+}
+
+impl JitScheduleDispatchScratch {
+    pub(crate) fn with_capacity(entries: usize, pointers: usize) -> Self {
+        Self {
+            pointers: Vec::with_capacity(pointers),
+            calls: Vec::with_capacity(entries),
+            #[cfg(test)]
+            capacity_growth_count: 0,
+        }
+    }
+
+    pub(crate) fn ensure_capacity(&mut self, entries: usize, pointers: usize) {
+        #[cfg(test)]
+        let grew = entries > self.calls.capacity() || pointers > self.pointers.capacity();
+        if entries > self.calls.capacity() {
+            self.calls.reserve(entries);
+        }
+        if pointers > self.pointers.capacity() {
+            self.pointers.reserve(pointers);
+        }
+        #[cfg(test)]
+        if grew {
+            self.capacity_growth_count = self.capacity_growth_count.saturating_add(1);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.calls.clear();
+        self.pointers.clear();
+    }
+
+    fn scope(&mut self, entries: usize, pointers: usize) -> JitScheduleDispatchScratchScope<'_> {
+        self.clear();
+        self.ensure_capacity(entries, pointers);
+        JitScheduleDispatchScratchScope { scratch: self }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn capacity_growth_count(&self) -> usize {
+        self.capacity_growth_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.calls.is_empty() && self.pointers.is_empty()
+    }
+}
+
 /// Private evidence from loading one ordered native schedule module.
 ///
 /// A module is one content-addressed shared library even though every entry
@@ -1055,14 +1142,17 @@ impl JitKernel {
         self.invoke(&mut ptrs, &[])
     }
 
-    fn indexed_authenticated_pointers(
+    fn append_indexed_authenticated_pointers<'a, F>(
         &self,
         arena: &mut [JitBuffer],
         slots: &[usize],
         mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
-        quantized: &[&crate::QuantizedTensorData],
-    ) -> Result<Vec<*mut c_void>, JitError> {
-        let mut ptrs = Vec::with_capacity(self.abi.pointer_order.len());
+        mut quantized: F,
+        pointers: &mut Vec<*mut c_void>,
+    ) -> Result<(), JitError>
+    where
+        F: FnMut(usize) -> &'a crate::QuantizedTensorData,
+    {
         for entry in &self.abi.pointer_order {
             let pointer = match entry {
                 KernelPointerAbi::Dense(index) => {
@@ -1076,12 +1166,12 @@ impl JitKernel {
                     }
                 }
                 KernelPointerAbi::Quantized(index) => {
-                    quantized[*index].bytes().as_ptr().cast_mut().cast()
+                    quantized(*index).bytes().as_ptr().cast_mut().cast()
                 }
             };
-            ptrs.push(pointer);
+            pointers.push(pointer);
         }
-        Ok(ptrs)
+        Ok(())
     }
 
     /// Native kernels may detect a domain failure after earlier loop iterations
@@ -1138,16 +1228,104 @@ impl JitKernel {
 }
 
 impl JitScheduleDispatcher {
+    pub(crate) fn call_prepared<'a, F>(
+        &self,
+        entry_count: usize,
+        pointer_count: usize,
+        arena: &mut [JitBuffer],
+        mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
+        scratch: &mut JitScheduleDispatchScratch,
+        mut entry: F,
+    ) -> Result<(), (usize, JitError)>
+    where
+        F: FnMut(
+            usize,
+        ) -> (
+            &'a JitKernel,
+            &'a [usize],
+            &'a [crate::QuantizedTensorData],
+            usize,
+        ),
+    {
+        let mut scratch = scratch.scope(entry_count, pointer_count);
+        (|| {
+            for index in 0..entry_count {
+                let (kernel, slots, quantized, offset) = entry(index);
+                if scratch.pointers.len() != offset {
+                    return Err((
+                        index,
+                        JitError::InvalidBuffer(
+                            "prepared schedule dispatch pointer offset mismatch".into(),
+                        ),
+                    ));
+                }
+                kernel
+                    .append_indexed_authenticated_pointers(
+                        arena,
+                        slots,
+                        borrowed.as_deref_mut(),
+                        |index| &quantized[index],
+                        &mut scratch.pointers,
+                    )
+                    .map_err(|error| (index, error))?;
+            }
+            if scratch.pointers.len() != pointer_count {
+                return Err((
+                    0,
+                    JitError::InvalidBuffer(
+                        "prepared schedule dispatch pointer count mismatch".into(),
+                    ),
+                ));
+            }
+            for index in 0..entry_count {
+                let (kernel, _, _, offset) = entry(index);
+                let buffers = unsafe { scratch.pointers.as_mut_ptr().add(offset) };
+                scratch.calls.push(NativeScheduleDispatchCall {
+                    entry: kernel.call,
+                    buffers,
+                    symbols: std::ptr::null(),
+                });
+            }
+            let mut failure = [u64::MAX, u64::MAX, 0];
+            #[cfg(test)]
+            self.invocation_count.fetch_add(1, Ordering::Relaxed);
+            let call_count = scratch.calls.len();
+            let calls = scratch.calls.as_mut_ptr();
+            let status = unsafe { (self.call)(calls, call_count, failure.as_mut_ptr()) };
+            if status == 0 {
+                return Ok(());
+            }
+            let entry = usize::try_from(failure[0]).unwrap_or(usize::MAX);
+            let lane = usize::try_from(failure[1]).unwrap_or(usize::MAX);
+            let error = match status {
+                1 => JitError::DivisionByZero { index: lane },
+                2 => JitError::InvalidShift { index: lane },
+                3 => JitError::IndexOutOfBounds { index: lane },
+                _ => JitError::Loader(format!("unknown native status {status}")),
+            };
+            Err((entry, error))
+        })()
+    }
+
+    #[cfg(test)]
     pub(crate) fn call(
         &self,
         entries: &[(&JitKernel, &[usize], Vec<&crate::QuantizedTensorData>)],
         arena: &mut [JitBuffer],
-        mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
+        borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
     ) -> Result<(), (usize, JitError)> {
+        let mut borrowed = borrowed;
         let mut pointers = Vec::with_capacity(entries.len());
         for (entry, slots, quantized) in entries {
-            let pointers_for_entry = entry
-                .indexed_authenticated_pointers(arena, slots, borrowed.as_deref_mut(), quantized)
+            let mut pointers_for_entry = Vec::with_capacity(entry.abi.pointer_order.len());
+            entry
+                .append_indexed_authenticated_pointers(
+                    arena,
+                    slots,
+                    borrowed.as_deref_mut(),
+                    |index| quantized[index],
+                    &mut pointers_for_entry,
+                )
                 .map_err(|error| (pointers.len(), error))?;
             pointers.push(pointers_for_entry);
         }

@@ -2705,6 +2705,12 @@ mod tests {
         assert_eq!(prepared.input_import_count, 0);
         assert_eq!(prepared.borrowed_external_input_bytes, 0);
         assert_eq!(prepared.intermediate_materialization_count, 0);
+        assert_eq!(prepared.sealed_dispatch_step_count, 1);
+        assert_eq!(prepared.sealed_dispatch_segment_count, 1);
+        assert_eq!(prepared.sealed_prerequisite_slot_count, 1);
+        assert_eq!(prepared.dispatch_metadata_build_count, 1);
+        assert_eq!(prepared.dispatch_scratch_capacity_growth_count, 0);
+        assert!(prepared.dispatch_scratch_is_empty);
         plan.poison_outputs(0xa5);
 
         let (first, first_traffic) = executor
@@ -2730,6 +2736,9 @@ mod tests {
         assert_eq!(first_stats.intermediate_materialization_count, 0);
         assert_eq!(first_stats.output_clear_count, 0);
         assert_eq!(first_stats.skipped_output_clear_count, 1);
+        assert_eq!(first_stats.dispatch_metadata_build_count, 1);
+        assert_eq!(first_stats.dispatch_scratch_capacity_growth_count, 0);
+        assert!(first_stats.dispatch_scratch_is_empty);
         assert_eq!(bindings["input"], input_value);
         assert_eq!(first.requested(&capture.requested).unwrap()[1], input_value);
         drop(bindings);
@@ -2771,6 +2780,13 @@ mod tests {
             .unwrap();
         assert_eq!(retried_traffic, first_traffic);
         assert_eq!(plan.workspace_stats().borrowed_external_input_bytes, 24);
+        assert_eq!(plan.workspace_stats().dispatch_metadata_build_count, 1);
+        assert_eq!(
+            plan.workspace_stats()
+                .dispatch_scratch_capacity_growth_count,
+            0
+        );
+        assert!(plan.workspace_stats().dispatch_scratch_is_empty);
 
         plan.items.pop();
         assert!(matches!(
@@ -2796,6 +2812,10 @@ mod tests {
         let mut plan = executor
             .plan_native_items(&capture, &original, true)
             .unwrap();
+        let prepared = plan.workspace_stats();
+        assert_eq!(prepared.dispatch_metadata_build_count, 1);
+        assert_eq!(prepared.dispatch_scratch_capacity_growth_count, 0);
+        assert!(prepared.dispatch_scratch_is_empty);
         assert!(plan.items[0].item().unwrap().vector.enabled);
         assert_eq!(plan.items[0].item().unwrap().vector.lanes, 4);
 
@@ -2805,6 +2825,10 @@ mod tests {
             executor.execute_planned_native_items(&capture, &original, &mut plan),
             Err(ReplayError::Backend(reason)) if reason.contains("injected dispatcher failure")
         ));
+        let failed = plan.workspace_stats();
+        assert_eq!(failed.dispatch_metadata_build_count, 1);
+        assert_eq!(failed.dispatch_scratch_capacity_growth_count, 0);
+        assert!(failed.dispatch_scratch_is_empty);
 
         let changed = BTreeMap::from([(
             "input".into(),
@@ -2822,6 +2846,9 @@ mod tests {
         let stats = plan.workspace_stats();
         assert_eq!(stats.output_clear_count, 0);
         assert_eq!(stats.skipped_output_clear_count, 1);
+        assert_eq!(stats.dispatch_metadata_build_count, 1);
+        assert_eq!(stats.dispatch_scratch_capacity_growth_count, 0);
+        assert!(stats.dispatch_scratch_is_empty);
     }
 
     #[test]
@@ -2844,8 +2871,15 @@ mod tests {
         let mut plan = executor
             .plan_native_items(&capture, &bindings, false)
             .unwrap();
+        assert_eq!(plan.workspace_stats().dispatch_metadata_build_count, 1);
         let fallback = capture.items.len() / 2;
         plan.use_per_item_fallback(fallback).unwrap();
+        let sealed = plan.workspace_stats();
+        assert_eq!(sealed.dispatch_metadata_build_count, 2);
+        assert_eq!(sealed.sealed_dispatch_step_count, 3);
+        assert_eq!(sealed.sealed_dispatch_segment_count, 2);
+        assert_eq!(sealed.dispatch_scratch_capacity_growth_count, 0);
+        assert!(sealed.dispatch_scratch_is_empty);
 
         let (actual, traffic) = executor
             .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
@@ -2860,6 +2894,13 @@ mod tests {
             traffic.executed_native_item_count
         );
         assert_eq!(traffic.module_dispatch_count, 2);
+        assert_eq!(plan.workspace_stats().dispatch_metadata_build_count, 2);
+        assert_eq!(
+            plan.workspace_stats()
+                .dispatch_scratch_capacity_growth_count,
+            0
+        );
+        assert!(plan.workspace_stats().dispatch_scratch_is_empty);
     }
 
     #[test]
@@ -2940,6 +2981,10 @@ mod tests {
         let mut plan = executor
             .plan_native_items(&capture, &bindings, false)
             .unwrap();
+        let prepared = plan.workspace_stats();
+        assert_eq!(prepared.dispatch_metadata_build_count, 1);
+        assert_eq!(prepared.dispatch_scratch_capacity_growth_count, 0);
+        assert!(prepared.dispatch_scratch_is_empty);
         plan.poison_outputs(0x7f);
         let actual = executor
             .execute_planned_native_items(&capture, &bindings, &mut plan)
@@ -2989,6 +3034,10 @@ mod tests {
             .unwrap();
 
         let id = weight.index() as u64;
+        let prepared = plan.workspace_stats();
+        assert_eq!(prepared.dispatch_metadata_build_count, 1);
+        assert_eq!(prepared.dispatch_scratch_capacity_growth_count, 0);
+        assert!(prepared.dispatch_scratch_is_empty);
         let mut changed_bytes = vec![0; 36];
         changed_bytes[2] = 1;
         capture.quantized_constants.insert(
@@ -3006,12 +3055,23 @@ mod tests {
                 if reason.contains("changed after preparation")
         ));
         assert_eq!(plan.last_module_dispatch_counts(), (0, 0));
+        let rejected = plan.workspace_stats();
+        assert_eq!(rejected.dispatch_metadata_build_count, 1);
+        assert_eq!(rejected.dispatch_scratch_capacity_growth_count, 0);
+        assert!(rejected.dispatch_scratch_is_empty);
 
         capture.quantized_constants.insert(id, expected);
         executor
             .execute_planned_native_items(&capture, &bindings, &mut plan)
             .unwrap();
         assert_eq!(plan.last_module_dispatch_counts(), (1, 1));
+        assert_eq!(plan.workspace_stats().dispatch_metadata_build_count, 1);
+        assert_eq!(
+            plan.workspace_stats()
+                .dispatch_scratch_capacity_growth_count,
+            0
+        );
+        assert!(plan.workspace_stats().dispatch_scratch_is_empty);
     }
 
     #[test]
