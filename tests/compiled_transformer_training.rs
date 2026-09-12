@@ -1217,6 +1217,15 @@ fn masked_batch(replay: u64) -> MaskedTransformerBatch {
     )
 }
 
+fn zero_token_masked_inputs(replay: u64) -> BTreeMap<String, TensorData> {
+    let batch = MaskedTransformerBatch::right_padded(replay, [0; BATCH]);
+    BTreeMap::from([
+        (LOSS_MASK.into(), batch.loss_mask),
+        ("targets".into(), batch.targets),
+        ("tokens".into(), batch.tokens),
+    ])
+}
+
 fn loss_mask_weight(mask: &TensorData) -> u64 {
     mask.to_vec_f64().into_iter().sum::<f64>() as u64
 }
@@ -4017,6 +4026,352 @@ fn compiled_transformer_checkpoint_rebase_is_independent_and_owned_failure_is_re
 }
 
 #[test]
+fn compiled_transformer_zero_token_microbatches_are_unbiased_and_atomic() {
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let policy = masked_config()
+        .with_zero_valid_token_microbatches()
+        .unwrap()
+        .with_window_loss_report();
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+        policy,
+        dropout_config(),
+        &model,
+        build_masked_with_dropout_observations,
+    )
+    .unwrap();
+    assert!(plan.zero_valid_token_microbatches_enabled());
+
+    let cpu_target =
+        CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut interpreted = plan.prepare(&cpu_target).unwrap();
+    let initial_parameters = interpreted.parameter_snapshots().unwrap();
+    let initial_first = interpreted.first_moment_snapshots().unwrap();
+    let initial_second = interpreted.second_moment_snapshots().unwrap();
+    let initial_accumulators = interpreted.gradient_accumulator_snapshots().unwrap();
+    let empty = interpreted
+        .step(zero_token_masked_inputs(1), learning_rate())
+        .unwrap();
+    assert!(!empty.did_update());
+    assert_eq!(empty.loss_weight(), 0);
+    assert_eq!(
+        empty.loss().scalar_at(0).as_f64().to_bits(),
+        0.0_f64.to_bits()
+    );
+    assert!(empty.window_loss_report().is_none());
+    assert_eq!(
+        interpreted.parameter_snapshots().unwrap(),
+        initial_parameters
+    );
+    assert_eq!(interpreted.first_moment_snapshots().unwrap(), initial_first);
+    assert_eq!(
+        interpreted.second_moment_snapshots().unwrap(),
+        initial_second
+    );
+    assert_eq!(
+        interpreted.gradient_accumulator_snapshots().unwrap(),
+        initial_accumulators
+    );
+    let pending = interpreted.checkpoint().unwrap();
+    assert_eq!(pending.info().accumulation_index(), 1);
+    assert_eq!(pending.info().accumulated_token_count(), Some(0));
+    assert!(pending.info().dropout_block_counter().unwrap() > 0);
+    let (_, pending_metadata) = load_safetensors(pending.as_bytes()).unwrap();
+    assert_eq!(pending_metadata["format"], "rustgrad-compiled-adamw-v9");
+
+    let mut restored = plan
+        .restore_checkpoint(&pending)
+        .unwrap()
+        .prepare(&cpu_target)
+        .unwrap();
+    assert_eq!(restored.checkpoint().unwrap(), pending);
+    let executor = CapturedReplayExecutor::default();
+    let native_target = NativeCpuSessionTarget::new(&executor)
+        .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut native_uninterrupted = plan
+        .restore_checkpoint(&pending)
+        .unwrap()
+        .prepare_native_cpu(&native_target)
+        .unwrap();
+    let native_resume_point = native_uninterrupted.checkpoint().unwrap();
+    let mut native = plan
+        .restore_checkpoint(&native_resume_point)
+        .unwrap()
+        .prepare_native_cpu(&native_target)
+        .unwrap();
+    assert_eq!(native.checkpoint().unwrap(), native_resume_point);
+    for replay in 2..=3 {
+        let inputs = if replay == 2 {
+            masked_batch(replay).into_compiled_inputs().unwrap()
+        } else {
+            zero_token_masked_inputs(replay)
+        };
+        let expected = interpreted.step(inputs.clone(), learning_rate()).unwrap();
+        let restored_step = restored.step(inputs.clone(), learning_rate()).unwrap();
+        let native_uninterrupted_step = native_uninterrupted
+            .step(inputs.clone(), learning_rate())
+            .unwrap();
+        let actual = native.step(inputs, learning_rate()).unwrap();
+        assert_eq!(restored_step.loss_weight(), expected.loss_weight());
+        assert_eq!(
+            actual.loss_weight(),
+            native_uninterrupted_step.loss_weight()
+        );
+        assert_eq!(actual.loss(), native_uninterrupted_step.loss());
+        assert_eq!(actual.outputs(), native_uninterrupted_step.outputs());
+        assert_eq!(actual.loss_weight(), expected.loss_weight());
+        assert_eq!(actual.report().fallback_count(), 0);
+        assert_eq!(native_uninterrupted_step.report().fallback_count(), 0);
+        assert_eq!(restored_step.did_update(), replay == 3);
+        assert_eq!(actual.did_update(), replay == 3);
+        assert_eq!(native_uninterrupted_step.did_update(), replay == 3);
+        assert_eq!(
+            native.checkpoint().unwrap(),
+            native_uninterrupted.checkpoint().unwrap(),
+            "native restore diverged at replay {replay}"
+        );
+        if replay == 3 {
+            for report in [
+                expected.window_loss_report().unwrap(),
+                restored_step.window_loss_report().unwrap(),
+                native_uninterrupted_step.window_loss_report().unwrap(),
+                actual.window_loss_report().unwrap(),
+            ] {
+                assert_eq!(report.loss_weight(), 3);
+                assert_eq!(report.microbatch_count(), ACCUMULATION_STEPS);
+            }
+        }
+    }
+    assert_eq!(
+        restored.checkpoint().unwrap(),
+        interpreted.checkpoint().unwrap()
+    );
+    let committed = interpreted.checkpoint().unwrap();
+    assert_eq!(committed.info().accumulated_token_count(), Some(0));
+
+    let mut all_empty = plan.prepare(&cpu_target).unwrap();
+    let mut native_all_empty = plan.prepare_native_cpu(&native_target).unwrap();
+    for replay in 1..=2 {
+        let interpreted_parameters = all_empty.parameter_snapshots().unwrap();
+        let interpreted_first = all_empty.first_moment_snapshots().unwrap();
+        let interpreted_second = all_empty.second_moment_snapshots().unwrap();
+        let interpreted_accumulators = all_empty.gradient_accumulator_snapshots().unwrap();
+        let interpreted_info = *all_empty.checkpoint().unwrap().info();
+        let native_parameters = native_all_empty.parameter_snapshots().unwrap();
+        let native_first = native_all_empty.first_moment_snapshots().unwrap();
+        let native_second = native_all_empty.second_moment_snapshots().unwrap();
+        let native_accumulators = native_all_empty.gradient_accumulator_snapshots().unwrap();
+        let native_info = *native_all_empty.checkpoint().unwrap().info();
+
+        let interpreted_step = all_empty
+            .step(zero_token_masked_inputs(replay), learning_rate())
+            .unwrap();
+        assert!(!interpreted_step.did_update());
+        assert_eq!(interpreted_step.loss_weight(), 0);
+        let native_step = native_all_empty
+            .step(zero_token_masked_inputs(replay), learning_rate())
+            .unwrap();
+        assert!(!native_step.did_update());
+        assert_eq!(native_step.loss_weight(), 0);
+        assert_eq!(native_step.report().fallback_count(), 0);
+        assert_f32_tensor_maps_bitwise_equal(
+            "interpreted zero-token parameters",
+            &interpreted_parameters,
+            &all_empty.parameter_snapshots().unwrap(),
+        );
+        assert_f32_tensor_maps_bitwise_equal(
+            "interpreted zero-token first moments",
+            &interpreted_first,
+            &all_empty.first_moment_snapshots().unwrap(),
+        );
+        assert_f32_tensor_maps_bitwise_equal(
+            "interpreted zero-token second moments",
+            &interpreted_second,
+            &all_empty.second_moment_snapshots().unwrap(),
+        );
+        assert_f32_tensor_maps_bitwise_equal(
+            "interpreted zero-token accumulators",
+            &interpreted_accumulators,
+            &all_empty.gradient_accumulator_snapshots().unwrap(),
+        );
+        assert_f32_tensor_maps_bitwise_equal(
+            "native zero-token parameters",
+            &native_parameters,
+            &native_all_empty.parameter_snapshots().unwrap(),
+        );
+        assert_f32_tensor_maps_bitwise_equal(
+            "native zero-token first moments",
+            &native_first,
+            &native_all_empty.first_moment_snapshots().unwrap(),
+        );
+        assert_f32_tensor_maps_bitwise_equal(
+            "native zero-token second moments",
+            &native_second,
+            &native_all_empty.second_moment_snapshots().unwrap(),
+        );
+        assert_f32_tensor_maps_bitwise_equal(
+            "native zero-token accumulators",
+            &native_accumulators,
+            &native_all_empty.gradient_accumulator_snapshots().unwrap(),
+        );
+        let interpreted_after = all_empty.checkpoint().unwrap();
+        let native_after = native_all_empty.checkpoint().unwrap();
+        for (before, after) in [
+            (interpreted_info, *interpreted_after.info()),
+            (native_info, *native_after.info()),
+        ] {
+            assert_eq!(after.replay_step(), before.replay_step() + 1);
+            assert_eq!(after.optimizer_step(), before.optimizer_step());
+            assert_eq!(after.accumulation_index(), before.accumulation_index() + 1);
+            assert_eq!(after.accumulated_token_count(), Some(0));
+            assert_eq!(after.accumulated_loss_numerator(), Some(0.0));
+            assert!(
+                after.dropout_block_counter().unwrap() > before.dropout_block_counter().unwrap()
+            );
+            assert_eq!(
+                (
+                    after.capture_identity(),
+                    after.gradient_accumulation_steps(),
+                    after.discarded_microbatches(),
+                    after.flushed_window_count(),
+                    after.flushed_microbatch_count(),
+                    after.flush_capture_identity(),
+                    after.window_loss_report_enabled(),
+                    after.reset_transition_count(),
+                    after.reset_capture_identity(),
+                    after.accumulation_capture_identity(),
+                ),
+                (
+                    before.capture_identity(),
+                    before.gradient_accumulation_steps(),
+                    before.discarded_microbatches(),
+                    before.flushed_window_count(),
+                    before.flushed_microbatch_count(),
+                    before.flush_capture_identity(),
+                    before.window_loss_report_enabled(),
+                    before.reset_transition_count(),
+                    before.reset_capture_identity(),
+                    before.accumulation_capture_identity(),
+                )
+            );
+        }
+    }
+    let before_rejection = all_empty.checkpoint().unwrap();
+    let native_before_rejection = native_all_empty.checkpoint().unwrap();
+    let error = match all_empty.step(zero_token_masked_inputs(3), learning_rate()) {
+        Ok(_) => panic!("an all-empty completed window committed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("completed token window"));
+    let native_error = match native_all_empty.step(zero_token_masked_inputs(3), learning_rate()) {
+        Ok(_) => panic!("a native all-empty completed window committed"),
+        Err(error) => error,
+    };
+    assert!(native_error.to_string().contains("completed token window"));
+    assert_eq!(all_empty.checkpoint().unwrap(), before_rejection);
+    assert_eq!(
+        native_all_empty.checkpoint().unwrap(),
+        native_before_rejection
+    );
+    assert!(
+        all_empty
+            .step(
+                masked_batch(3).into_compiled_inputs().unwrap(),
+                learning_rate()
+            )
+            .unwrap()
+            .did_update()
+    );
+    let native_retry = native_all_empty
+        .step(
+            masked_batch(3).into_compiled_inputs().unwrap(),
+            learning_rate(),
+        )
+        .unwrap();
+    assert!(native_retry.did_update());
+    assert_eq!(native_retry.report().fallback_count(), 0);
+    assert_eq!(native_retry.report().successful_invocation(), 3);
+
+    let mut partial = plan.prepare(&cpu_target).unwrap();
+    partial
+        .step(zero_token_masked_inputs(1), learning_rate())
+        .unwrap();
+    let partial_before = partial.checkpoint().unwrap();
+    let error = match partial.flush_partial_window(learning_rate()) {
+        Ok(_) => panic!("an all-empty partial window committed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("partial token window"));
+    assert_eq!(partial.checkpoint().unwrap(), partial_before);
+    assert_eq!(partial.zero_grad().unwrap().discarded_microbatches(), 1);
+}
+
+#[test]
+fn compiled_transformer_zero_token_microbatches_match_backend_local_valid_reference() {
+    let model = TinyCausalTransformer::new(7).unwrap();
+    let policy = masked_config()
+        .with_zero_valid_token_microbatches()
+        .unwrap()
+        .with_window_loss_report();
+    let plan = CompiledAdamWPlan::compile_module_graph(policy, &model, |model, graph, inputs| {
+        let logits = model.forward_eval(graph, inputs["tokens"])?;
+        let losses = sparse_causal_losses(graph, logits, inputs["targets"])?;
+        Ok(CompiledAdamWGraph::token_mean(losses, BTreeMap::new()))
+    })
+    .unwrap();
+    let valid = masked_batch(2).into_compiled_inputs().unwrap();
+    let mixed_batches = [
+        zero_token_masked_inputs(1),
+        valid.clone(),
+        zero_token_masked_inputs(3),
+    ];
+    let reference_batches = [
+        valid,
+        zero_token_masked_inputs(1),
+        zero_token_masked_inputs(3),
+    ];
+    let cpu_target =
+        CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut interpreted_mixed = plan.prepare(&cpu_target).unwrap();
+    let mut interpreted_reference = plan.prepare(&cpu_target).unwrap();
+    for (index, (mixed, reference)) in mixed_batches
+        .iter()
+        .cloned()
+        .zip(reference_batches.iter().cloned())
+        .enumerate()
+    {
+        let mixed = interpreted_mixed.step(mixed, learning_rate()).unwrap();
+        let reference = interpreted_reference
+            .step(reference, learning_rate())
+            .unwrap();
+        assert_eq!(mixed.did_update(), index == 2);
+        assert_eq!(reference.did_update(), index == 2);
+    }
+    assert_eq!(
+        interpreted_mixed.checkpoint().unwrap(),
+        interpreted_reference.checkpoint().unwrap()
+    );
+
+    let executor = CapturedReplayExecutor::default();
+    let native_target = NativeCpuSessionTarget::new(&executor)
+        .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut native_mixed = plan.prepare_native_cpu(&native_target).unwrap();
+    let mut native_reference = plan.prepare_native_cpu(&native_target).unwrap();
+    for (index, (mixed, reference)) in mixed_batches.into_iter().zip(reference_batches).enumerate()
+    {
+        let mixed = native_mixed.step(mixed, learning_rate()).unwrap();
+        let reference = native_reference.step(reference, learning_rate()).unwrap();
+        assert_eq!(mixed.did_update(), index == 2);
+        assert_eq!(reference.did_update(), index == 2);
+        assert_eq!(mixed.report().fallback_count(), 0);
+        assert_eq!(reference.report().fallback_count(), 0);
+    }
+    assert_eq!(
+        native_mixed.checkpoint().unwrap(),
+        native_reference.checkpoint().unwrap()
+    );
+}
+
+#[test]
 fn compiled_transformer_native_cpu_target_is_strict_precompiled_and_resumes_exactly() {
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
@@ -4769,6 +5124,31 @@ fn assert_two_block_tensor_maps_close(
             assert!(
                 actual.is_finite() && expected.is_finite() && error <= tolerance,
                 "{label} {name}[{coordinate}] mismatch: actual={actual}, expected={expected}, error={error}, tolerance={tolerance}"
+            );
+        }
+    }
+}
+
+fn assert_f32_tensor_maps_bitwise_equal(
+    label: &str,
+    before: &BTreeMap<String, TensorData>,
+    after: &BTreeMap<String, TensorData>,
+) {
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        before.keys().collect::<Vec<_>>()
+    );
+    for (name, before) in before {
+        let after = &after[name];
+        assert_eq!(after.shape(), before.shape(), "{label} {name} shape");
+        assert_eq!(after.dtype(), DType::F32, "{label} {name} dtype");
+        assert_eq!(before.dtype(), DType::F32, "{label} {name} prior dtype");
+        for (coordinate, (before, after)) in before.values().iter().zip(after.values()).enumerate()
+        {
+            assert_eq!(
+                after.to_bits(),
+                before.to_bits(),
+                "{label} {name}[{coordinate}] raw bits"
             );
         }
     }

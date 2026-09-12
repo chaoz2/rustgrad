@@ -958,6 +958,7 @@ interpreter and strict-native CPU refrontier the sibling's atomic commit into
 the authoritative main cursor; checkpoint v9 authenticates both capture
 identities. The strict-Metal program and execution path remain the existing
 single main capture.
+
 AdamW accumulation also produces a separate authenticated state-only partial
 flush transition over the exact parameter, moment, accumulator,
 optimizer-step, and accumulation-index schema. The
@@ -977,6 +978,20 @@ source frontier retryable. Flush count and flushed-microbatch count authenticate
 progress and reconstruct the distinct optimizer/workload logical versions on
 checkpoint restore. No live Apple-hardware flush result is claimed by this
 semantic implementation.
+
+#### Empty token microbatches
+
+Token-mean training rejects a zero-valid-token mask by default. The explicit
+`CompiledAdamWConfig::with_zero_valid_token_microbatches` policy instead masks
+invalid loss lanes with exact graph zeros and divides by `count > 0 ? count :
+1`. An empty fixed-shape replay therefore contributes zero loss numerator,
+token weight, and gradient while still advancing authenticated replay and
+dropout state. Mixed windows retain the ordinary token-weighted mean. A full
+window or nonempty partial flush whose accumulated token count remains zero is
+rejected before recurrent replay, progress, report, or checkpoint publication;
+the same frontier may be retried with a nonempty mask or discarded with
+`zero_grad`. CPU interpreter and strict-native replay share this admission;
+token-weighted Metal remains fail-closed.
 
 #### Captured training and native replay
 

@@ -926,6 +926,7 @@ pub struct CompiledAdamWConfig {
     weight_decay: f32,
     gradient_accumulation_steps: u64,
     token_weight_mask_input: Option<String>,
+    allow_zero_valid_token_microbatches: bool,
     max_gradient_norm: Option<f32>,
     clip_report: bool,
     window_loss_report: bool,
@@ -957,6 +958,7 @@ impl CompiledAdamWConfig {
             weight_decay,
             gradient_accumulation_steps: 1,
             token_weight_mask_input: None,
+            allow_zero_valid_token_microbatches: false,
             max_gradient_norm: None,
             clip_report: false,
             window_loss_report: false,
@@ -1013,6 +1015,25 @@ impl CompiledAdamWConfig {
             self.gradient_accumulation_steps,
         )?;
         self.token_weight_mask_input = Some(mask_input_name);
+        Ok(self)
+    }
+
+    /// Allows a fixed-shape token-mean microbatch whose validated binary mask
+    /// contains no valid tokens. Its public loss, token weight, and gradient
+    /// contribution are exact zero while replay and dropout progress advance
+    /// normally. A completed or explicitly flushed window whose total token
+    /// weight is still zero rejects atomically.
+    ///
+    /// This opt-in requires token-weighted gradient accumulation and changes
+    /// the compiled capture identity. The default continues to reject empty
+    /// token masks before replay.
+    pub fn with_zero_valid_token_microbatches(mut self) -> Result<Self> {
+        if self.token_weight_mask_input.is_none() {
+            return Err(training(
+                "compiled AdamW zero-token microbatches require token-weighted accumulation",
+            ));
+        }
+        self.allow_zero_valid_token_microbatches = true;
         Ok(self)
     }
 
@@ -1213,6 +1234,12 @@ impl CompiledAdamWConfig {
     /// Existing F32 input whose valid-token count weights each microbatch.
     pub fn token_weighted_gradient_accumulation_mask(&self) -> Option<&str> {
         self.token_weight_mask_input.as_deref()
+    }
+
+    /// Whether zero-valid-token masks are admitted as zero-contribution
+    /// microbatches.
+    pub fn zero_valid_token_microbatches_enabled(&self) -> bool {
+        self.allow_zero_valid_token_microbatches
     }
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
@@ -3096,6 +3123,11 @@ impl CompiledOptimizerProgram for AdamWProgram {
             Some((_, _, _, divisor)) => *divisor,
             None => scalar_f32(graph, self.config.gradient_accumulation_steps as f32)?,
         };
+        let divisor = safe_token_count_divisor(
+            graph,
+            divisor,
+            self.config.allow_zero_valid_token_microbatches,
+        )?;
         let window_loss = if self.config.window_loss_report {
             let numerator_key =
                 RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedLossNumerator);
@@ -3428,6 +3460,7 @@ pub struct CompiledAdamWPlan {
     program_identity: u64,
     gradient_accumulation_steps: u64,
     token_weight_mask_input: Option<String>,
+    allow_zero_valid_token_microbatches: bool,
     max_gradient_norm: Option<f32>,
     clip_report: bool,
     window_loss_report: bool,
@@ -3786,6 +3819,7 @@ pub struct CpuCompiledAdamW {
     zero_grad: Option<CompiledAdamWAuxiliaryPlan>,
     gradient_accumulation_steps: u64,
     token_weight_mask_input: Option<String>,
+    allow_zero_valid_token_microbatches: bool,
     max_gradient_norm: Option<f32>,
     clip_report: bool,
     window_loss_report: bool,
@@ -4243,6 +4277,7 @@ struct CompiledEvaluationPlan {
     output_names: Vec<String>,
     parameter_inputs: BTreeMap<String, String>,
     loss_weight_mask_input: Option<String>,
+    allow_zero_valid_token_microbatches: bool,
     capture_identity: u64,
 }
 
@@ -5183,6 +5218,11 @@ impl CompiledAdamWAuxiliaryPlan {
             }
             None => graph.cast(index, DType::F32)?,
         };
+        let divisor = safe_token_count_divisor(
+            &mut graph,
+            divisor,
+            config.allow_zero_valid_token_microbatches,
+        )?;
         let window_loss_report = if config.window_loss_report {
             let numerator_key =
                 RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedLossNumerator);
@@ -5595,6 +5635,7 @@ impl CompiledEvaluationPlan {
                     objective,
                     training_plan.token_weight_mask_input.as_deref(),
                     &training_plan.inner.inputs,
+                    training_plan.allow_zero_valid_token_microbatches,
                 )?;
                 Ok((loss, outputs, loss_weight_mask_input))
             },
@@ -5701,6 +5742,7 @@ impl CompiledEvaluationPlan {
             output_names: outputs.keys().cloned().collect(),
             parameter_inputs,
             loss_weight_mask_input,
+            allow_zero_valid_token_microbatches: training_plan.allow_zero_valid_token_microbatches,
             capture_identity,
         })
     }
@@ -5726,7 +5768,11 @@ impl CompiledEvaluationPlan {
 
     fn validate_loss_weight(&self, inputs: &BTreeMap<String, TensorData>) -> Result<u64> {
         validate_evaluation_inputs(&self.inputs, inputs)?;
-        validate_token_weight_mask(inputs, self.loss_weight_mask_input.as_deref())
+        validate_token_weight_mask(
+            inputs,
+            self.loss_weight_mask_input.as_deref(),
+            self.allow_zero_valid_token_microbatches,
+        )
     }
 
     fn evaluate(
@@ -7165,6 +7211,7 @@ impl CompiledAdamWPlan {
         )?;
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let token_weight_mask_input = config.token_weight_mask_input.clone();
+        let allow_zero_valid_token_microbatches = config.allow_zero_valid_token_microbatches;
         let max_gradient_norm = config.max_gradient_norm;
         let clip_report = config.clip_report;
         let window_loss_report = config.window_loss_report;
@@ -7193,6 +7240,7 @@ impl CompiledAdamWPlan {
             program_identity,
             gradient_accumulation_steps,
             token_weight_mask_input,
+            allow_zero_valid_token_microbatches,
             max_gradient_norm,
             clip_report,
             window_loss_report,
@@ -7382,6 +7430,7 @@ impl CompiledAdamWPlan {
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
         let (mask_input, mask_shape) = token_mean_loss_descriptor(&config)?;
+        let allow_zero_valid_token_microbatches = config.allow_zero_valid_token_microbatches;
         let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
         let parameters = parameter_plan.initial_parameters()?;
         Self::compile_module_with_dropout_parameters(
@@ -7392,8 +7441,13 @@ impl CompiledAdamWPlan {
             parameters,
             |module, graph, inputs, dropout| {
                 let (losses, outputs) = build(module, graph, inputs, dropout)?;
-                let loss =
-                    lower_token_mean_loss(graph, losses, inputs[mask_input.as_str()], &mask_shape)?;
+                let loss = lower_token_mean_loss(
+                    graph,
+                    losses,
+                    inputs[mask_input.as_str()],
+                    &mask_shape,
+                    allow_zero_valid_token_microbatches,
+                )?;
                 Ok((loss, outputs))
             },
         )
@@ -7419,6 +7473,7 @@ impl CompiledAdamWPlan {
         parameter_plan.validate_weight_decay_exclusions(&config)?;
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let token_weight_mask_input = config.token_weight_mask_input.clone();
+        let allow_zero_valid_token_microbatches = config.allow_zero_valid_token_microbatches;
         let max_gradient_norm = config.max_gradient_norm;
         let clip_report = config.clip_report;
         let window_loss_report = config.window_loss_report;
@@ -7467,6 +7522,7 @@ impl CompiledAdamWPlan {
             program_identity,
             gradient_accumulation_steps,
             token_weight_mask_input,
+            allow_zero_valid_token_microbatches,
             max_gradient_norm,
             clip_report,
             window_loss_report,
@@ -7511,6 +7567,7 @@ impl CompiledAdamWPlan {
                 mask_input,
                 decoded.accumulation_index,
                 count,
+                self.allow_zero_valid_token_microbatches,
             )?,
             (None, None) => {}
             _ => {
@@ -7788,6 +7845,7 @@ impl CompiledAdamWPlan {
             zero_grad: self.zero_grad.clone(),
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             token_weight_mask_input: self.token_weight_mask_input.clone(),
+            allow_zero_valid_token_microbatches: self.allow_zero_valid_token_microbatches,
             max_gradient_norm: self.max_gradient_norm,
             clip_report: self.clip_report,
             window_loss_report: self.window_loss_report,
@@ -7904,6 +7962,10 @@ impl CompiledAdamWPlan {
 
     pub fn token_weighted_gradient_accumulation_mask(&self) -> Option<&str> {
         self.token_weight_mask_input.as_deref()
+    }
+
+    pub fn zero_valid_token_microbatches_enabled(&self) -> bool {
+        self.allow_zero_valid_token_microbatches
     }
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
@@ -8385,11 +8447,12 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
     /// Attaches a read-only evaluator using the training plan's authenticated
     /// scalar or compiler-owned token-mean objective policy.
     ///
-    /// Token-mean evaluation reuses the configured F32 mask input, lowers
-    /// `sum(mask * losses) / sum(mask)` inside the captured graph, and reports
-    /// the exact validated token count for weighted aggregation. Invalid masks
-    /// fail before replay. The legacy [`Self::with_evaluation`] scalar surface
-    /// remains behavior-compatible, including on token-weighted training plans.
+    /// Token-mean evaluation reuses the configured F32 mask input, owns masked
+    /// normalization inside the captured graph, and reports the exact validated
+    /// token count for weighted aggregation. The zero-token training opt-in also
+    /// admits an empty evaluation batch with exact-zero loss and weight. Invalid
+    /// masks fail before replay. The legacy [`Self::with_evaluation`] scalar
+    /// surface remains behavior-compatible, including on token-weighted plans.
     /// A v2-authenticated fresh-module restore accepts only the saved evaluator
     /// identity and retains the plan for retry on mismatch.
     pub fn with_evaluation_graph<F>(
@@ -8755,6 +8818,46 @@ impl<M: Module> CompiledModuleAdamWSession<M, MetalCompiledAdamW> {
 }
 
 impl CpuCompiledAdamW {
+    fn validate_completed_token_window(&self, next: AdamWProgress, loss_weight: u64) -> Result<()> {
+        if !self.allow_zero_valid_token_microbatches
+            || self.token_weight_mask_input.is_none()
+            || next.accumulation_index != 0
+        {
+            return Ok(());
+        }
+        let retained = self
+            .inner
+            .global_snapshot(AdamWGlobalState::AccumulatedTokenCount)?
+            .scalar_at(0)
+            .as_u64();
+        let total = retained
+            .checked_add(loss_weight)
+            .ok_or_else(|| training("compiled AdamW completed token count overflows"))?;
+        if total == 0 {
+            return Err(training(
+                "compiled AdamW completed token window must contain at least one valid token",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_partial_token_window(&self) -> Result<()> {
+        if !self.allow_zero_valid_token_microbatches || self.token_weight_mask_input.is_none() {
+            return Ok(());
+        }
+        let retained = self
+            .inner
+            .global_snapshot(AdamWGlobalState::AccumulatedTokenCount)?
+            .scalar_at(0)
+            .as_u64();
+        if retained == 0 {
+            return Err(training(
+                "compiled AdamW partial token window must contain at least one valid token",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn compile<F>(
         config: CompiledAdamWConfig,
         parameters: impl IntoIterator<Item = TrainingParameterInit>,
@@ -8858,11 +8961,15 @@ impl CpuCompiledAdamW {
         injected_failure: Option<u64>,
     ) -> Result<CompiledAdamWStepResult> {
         validate_training_inputs(&self.inner.inputs, &inputs)?;
-        let loss_weight =
-            validate_token_weight_mask(&inputs, self.token_weight_mask_input.as_deref())?;
+        let loss_weight = validate_token_weight_mask(
+            &inputs,
+            self.token_weight_mask_input.as_deref(),
+            self.allow_zero_valid_token_microbatches,
+        )?;
         let next = self
             .progress
             .advance_replay(self.gradient_accumulation_steps)?;
+        self.validate_completed_token_window(next, loss_weight)?;
         if let Some(dropout) = self.dropout {
             expected_dropout_counter(dropout, next.replay_step)?;
         }
@@ -8934,6 +9041,10 @@ impl CpuCompiledAdamW {
 
     pub fn token_weighted_gradient_accumulation_mask(&self) -> Option<&str> {
         self.token_weight_mask_input.as_deref()
+    }
+
+    pub fn zero_valid_token_microbatches_enabled(&self) -> bool {
+        self.allow_zero_valid_token_microbatches
     }
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
@@ -9081,6 +9192,7 @@ impl CpuCompiledAdamW {
         if !result.did_update() {
             return Ok(result);
         }
+        self.validate_partial_token_window()?;
         if let Some(learning_rate) = &learning_rate {
             validate_learning_rate_for_policy(learning_rate, self.non_finite_policy)?;
         }
@@ -9152,6 +9264,7 @@ impl CpuCompiledAdamW {
             program_identity: self.capture_identity(),
             gradient_accumulation_steps: self.gradient_accumulation_steps,
             token_weight_mask_input: self.token_weight_mask_input.clone(),
+            allow_zero_valid_token_microbatches: self.allow_zero_valid_token_microbatches,
             max_gradient_norm: self.max_gradient_norm,
             clip_report: self.clip_report,
             window_loss_report: self.window_loss_report,
@@ -9210,6 +9323,7 @@ impl CpuCompiledAdamW {
                 mask_input,
                 self.progress.accumulation_index,
                 count,
+                self.allow_zero_valid_token_microbatches,
             )?;
         }
         let accumulated_loss_numerator = self
@@ -9596,12 +9710,17 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         injected_failure: Option<u64>,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
         validate_training_inputs(&self.inner.inner.inputs, &inputs)?;
-        let loss_weight =
-            validate_token_weight_mask(&inputs, self.inner.token_weight_mask_input.as_deref())?;
+        let loss_weight = validate_token_weight_mask(
+            &inputs,
+            self.inner.token_weight_mask_input.as_deref(),
+            self.inner.allow_zero_valid_token_microbatches,
+        )?;
         let next = self
             .inner
             .progress
             .advance_replay(self.inner.gradient_accumulation_steps)?;
+        self.inner
+            .validate_completed_token_window(next, loss_weight)?;
         if let Some(dropout) = self.inner.dropout {
             expected_dropout_counter(dropout, next.replay_step)?;
         }
@@ -9754,6 +9873,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 report: None,
             });
         }
+        self.inner.validate_partial_token_window()?;
         if let Some(learning_rate) = &learning_rate {
             validate_learning_rate_for_policy(learning_rate, self.inner.non_finite_policy)?;
         }
@@ -11648,6 +11768,7 @@ fn lower_compiled_adamw_objective(
         objective,
         config.token_weight_mask_input.as_deref(),
         &config.inputs,
+        config.allow_zero_valid_token_microbatches,
     )
 }
 
@@ -11657,6 +11778,7 @@ fn lower_compiled_adamw_objective_for_policy(
     objective: CompiledAdamWObjective,
     token_weight_mask_input: Option<&str>,
     input_descriptors: &BTreeMap<String, (Shape, DType)>,
+    allow_zero_valid_token_microbatches: bool,
 ) -> Result<NodeId> {
     match objective {
         CompiledAdamWObjective::Scalar(loss) => {
@@ -11682,7 +11804,13 @@ fn lower_compiled_adamw_objective_for_policy(
             let mask = inputs.get(mask_input).copied().ok_or_else(|| {
                 training("compiled AdamW token-weight mask input is absent during compilation")
             })?;
-            lower_token_mean_loss(graph, losses, mask, mask_shape)
+            lower_token_mean_loss(
+                graph,
+                losses,
+                mask,
+                mask_shape,
+                allow_zero_valid_token_microbatches,
+            )
         }
     }
 }
@@ -11708,6 +11836,7 @@ fn lower_token_mean_loss(
     losses: NodeId,
     mask: NodeId,
     expected_shape: &Shape,
+    allow_zero_valid_token_microbatches: bool,
 ) -> Result<NodeId> {
     if graph.dtype(losses)? != DType::F32 || graph.shape(losses)? != expected_shape {
         return Err(training(
@@ -11719,15 +11848,38 @@ fn lower_token_mean_loss(
             "compiled AdamW token-weight mask descriptor changed during compilation",
         ));
     }
-    let weighted = graph.mul(losses, mask)?;
+    let weighted = if allow_zero_valid_token_microbatches {
+        let zero = scalar_f32(graph, 0.0)?;
+        let keep = graph.compare(CompareOp::Gt, mask, zero)?;
+        graph.select(keep, losses, zero)?
+    } else {
+        graph.mul(losses, mask)?
+    };
     let numerator = graph.sum_all(weighted)?;
     let denominator = graph.sum_all(mask)?;
+    let denominator =
+        safe_token_count_divisor(graph, denominator, allow_zero_valid_token_microbatches)?;
     graph.div(numerator, denominator)
+}
+
+fn safe_token_count_divisor(
+    graph: &mut Graph,
+    count: NodeId,
+    allow_zero_valid_token_microbatches: bool,
+) -> Result<NodeId> {
+    if !allow_zero_valid_token_microbatches {
+        return Ok(count);
+    }
+    let zero = scalar_f32(graph, 0.0)?;
+    let one = scalar_f32(graph, 1.0)?;
+    let positive = graph.compare(CompareOp::Gt, count, zero)?;
+    graph.select(positive, count, one)
 }
 
 fn validate_token_weight_mask(
     inputs: &BTreeMap<String, TensorData>,
     mask_input: Option<&str>,
+    allow_zero_valid_token_microbatches: bool,
 ) -> Result<u64> {
     let Some(mask_input) = mask_input else {
         return Ok(1);
@@ -11747,7 +11899,7 @@ fn validate_token_weight_mask(
             .checked_add(u64::from(value == 1.0))
             .ok_or_else(|| training("compiled AdamW token-weight count overflows"))?;
     }
-    if valid_tokens == 0 {
+    if valid_tokens == 0 && !allow_zero_valid_token_microbatches {
         return Err(training(
             "compiled AdamW token-weight mask must contain at least one valid token",
         ));
@@ -11760,6 +11912,7 @@ fn validate_retained_token_count(
     mask_input: &str,
     accumulation_index: u64,
     count: u64,
+    allow_zero_valid_token_microbatches: bool,
 ) -> Result<()> {
     let (shape, _) = inputs
         .get(mask_input)
@@ -11769,7 +11922,8 @@ fn validate_retained_token_count(
     let maximum_count = mask_elements
         .checked_mul(accumulation_index)
         .ok_or_else(|| training("compiled AdamW retained token count bound overflows"))?;
-    if count < accumulation_index || count > maximum_count {
+    if (!allow_zero_valid_token_microbatches && count < accumulation_index) || count > maximum_count
+    {
         return Err(training(
             "compiled AdamW retained token count is inconsistent with progress",
         ));
@@ -15816,6 +15970,7 @@ mod tests {
     #[test]
     fn token_weighted_accumulation_validates_static_policy_before_compilation() {
         let base = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0).unwrap();
+        assert!(base.clone().with_zero_valid_token_microbatches().is_err());
         assert!(
             base.clone()
                 .with_token_weighted_gradient_accumulation("mask")
@@ -15927,11 +16082,25 @@ mod tests {
         .unwrap()
     }
 
+    fn compile_zero_token_weighted_plan(steps: u64) -> CompiledAdamWPlan {
+        CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+            token_weighted_config(steps)
+                .with_zero_valid_token_microbatches()
+                .unwrap()
+                .with_window_loss_report(),
+            token_mean_dropout(),
+            &TokenMeanModule::new(),
+            build_token_losses,
+        )
+        .unwrap()
+    }
+
     fn compile_direct_token_mean_without_dropout(
         config: CompiledAdamWConfig,
         module: &TokenMeanModule,
     ) -> CompiledAdamWPlan {
         let (mask_input, mask_shape) = token_mean_loss_descriptor(&config).unwrap();
+        let allow_zero_valid_token_microbatches = config.allow_zero_valid_token_microbatches;
         let parameter =
             TrainingParameterInit::new("weight", module.weight.value().unwrap()).unwrap();
         CompiledAdamWPlan::compile_parameters_with_lowered_loss(
@@ -15939,8 +16108,13 @@ mod tests {
             [parameter],
             |graph, inputs, parameters| {
                 let losses = graph.mul(parameters["weight"], inputs["features"])?;
-                let loss =
-                    lower_token_mean_loss(graph, losses, inputs[mask_input.as_str()], &mask_shape)?;
+                let loss = lower_token_mean_loss(
+                    graph,
+                    losses,
+                    inputs[mask_input.as_str()],
+                    &mask_shape,
+                    allow_zero_valid_token_microbatches,
+                )?;
                 Ok((loss, BTreeMap::new()))
             },
         )
@@ -16623,10 +16797,10 @@ mod tests {
             "accumulated_token_count".into(),
             TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(0)]).unwrap(),
         );
-        assert!(
+        let empty_count =
             CompiledAdamWCheckpoint::from_bytes(save_safetensors(&tensors, &metadata).unwrap())
-                .is_err()
-        );
+                .unwrap();
+        assert!(plan.restore_checkpoint(&empty_count).is_err());
         let (mut tensors, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
         tensors.insert(
             "accumulated_token_count".into(),
@@ -16683,6 +16857,150 @@ mod tests {
                 .accumulated_token_count(),
             Some(0)
         );
+    }
+
+    #[test]
+    fn zero_token_microbatches_are_unbiased_checkpointed_and_reject_empty_windows() {
+        let plan = compile_zero_token_weighted_plan(3);
+        assert!(plan.zero_valid_token_microbatches_enabled());
+        assert_ne!(
+            plan.capture_identity(),
+            compile_token_weighted_plan(3).capture_identity()
+        );
+        let empty = || token_weighted_batch([17.0, -7.0, 13.0], [0.0, 0.0, 0.0]);
+        let valid = || token_weighted_batch([3.0, 3.0, 3.0], [1.0, 1.0, 1.0]);
+        let learning_rate = || TensorData::scalar(0.1);
+
+        let mut mixed = plan.prepare_cpu().unwrap();
+        let first = mixed.step(empty(), learning_rate()).unwrap();
+        assert!(!first.did_update());
+        assert_eq!(first.loss_weight(), 0);
+        assert_eq!(
+            first.loss().scalar_at(0).as_f64().to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert!(first.window_loss_report().is_none());
+        let first_checkpoint = mixed.checkpoint().unwrap();
+        assert_eq!(first_checkpoint.info().accumulated_token_count(), Some(0));
+        let mut restored = plan
+            .restore_checkpoint(&first_checkpoint)
+            .unwrap()
+            .prepare_cpu()
+            .unwrap();
+        assert_eq!(restored.checkpoint().unwrap(), first_checkpoint);
+
+        for runtime in [&mut mixed, &mut restored] {
+            assert!(!runtime.step(valid(), learning_rate()).unwrap().did_update());
+            let committed = runtime.step(empty(), learning_rate()).unwrap();
+            assert!(committed.did_update());
+            let report = committed.window_loss_report().unwrap();
+            assert_eq!(report.mean_loss(), 6.0);
+            assert_eq!(report.loss_weight(), 3);
+            assert_eq!(report.microbatch_count(), 3);
+        }
+        assert_eq!(restored.checkpoint().unwrap(), mixed.checkpoint().unwrap());
+
+        let mut reordered = plan.prepare_cpu().unwrap();
+        reordered.step(valid(), learning_rate()).unwrap();
+        reordered.step(empty(), learning_rate()).unwrap();
+        reordered.step(empty(), learning_rate()).unwrap();
+        assert_eq!(reordered.checkpoint().unwrap(), mixed.checkpoint().unwrap());
+
+        let executor = CapturedReplayExecutor::default();
+        let mut native = plan
+            .prepare_native_cpu(&NativeCpuSessionTarget::new(&executor))
+            .unwrap();
+        for batch in [empty(), valid(), empty()] {
+            let result = native.step(batch, learning_rate()).unwrap();
+            assert_eq!(result.report().fallback_count(), 0);
+        }
+        assert_native_adamw_state_close(&native, &mixed);
+
+        let mut all_empty = plan.prepare_cpu().unwrap();
+        let mut native_all_empty = plan
+            .prepare_native_cpu(&NativeCpuSessionTarget::new(&executor))
+            .unwrap();
+        for _ in 0..2 {
+            assert!(
+                !all_empty
+                    .step(empty(), learning_rate())
+                    .unwrap()
+                    .did_update()
+            );
+            let result = native_all_empty.step(empty(), learning_rate()).unwrap();
+            assert!(!result.did_update());
+            assert_eq!(result.report().fallback_count(), 0);
+        }
+        let before = all_empty.checkpoint().unwrap();
+        let native_before = native_all_empty.checkpoint().unwrap();
+        assert!(all_empty.step(empty(), learning_rate()).is_err());
+        assert!(native_all_empty.step(empty(), learning_rate()).is_err());
+        assert_eq!(all_empty.checkpoint().unwrap(), before);
+        assert_eq!(native_all_empty.checkpoint().unwrap(), native_before);
+        let retry = all_empty.step(valid(), learning_rate()).unwrap();
+        let native_retry = native_all_empty.step(valid(), learning_rate()).unwrap();
+        assert!(retry.did_update());
+        assert!(native_retry.did_update());
+        assert_eq!(native_retry.report().fallback_count(), 0);
+        assert_native_adamw_state_close(&native_all_empty, &all_empty);
+
+        let mut partial = plan.prepare_cpu().unwrap();
+        let mut native_partial = plan
+            .prepare_native_cpu(&NativeCpuSessionTarget::new(&executor))
+            .unwrap();
+        partial.step(empty(), learning_rate()).unwrap();
+        native_partial.step(empty(), learning_rate()).unwrap();
+        let partial_before = partial.checkpoint().unwrap();
+        let native_partial_before = native_partial.checkpoint().unwrap();
+        assert!(partial.flush_partial_window(learning_rate()).is_err());
+        assert!(
+            native_partial
+                .flush_partial_window(learning_rate())
+                .is_err()
+        );
+        assert_eq!(partial.checkpoint().unwrap(), partial_before);
+        assert_eq!(native_partial.checkpoint().unwrap(), native_partial_before);
+        assert_eq!(partial.zero_grad().unwrap().discarded_microbatches(), 1);
+        assert_eq!(
+            native_partial.zero_grad().unwrap().discarded_microbatches(),
+            1
+        );
+        assert_eq!(
+            partial
+                .checkpoint()
+                .unwrap()
+                .info()
+                .accumulated_token_count(),
+            Some(0)
+        );
+
+        let mut evaluation = CompiledModuleAdamWPlan::compile_graph(
+            token_evaluation_config()
+                .with_zero_valid_token_microbatches()
+                .unwrap(),
+            TokenMeanModule::new(),
+            |module, graph, inputs| {
+                let weight = module.weight.bind(graph)?;
+                let losses = graph.mul(weight, inputs["features"])?;
+                Ok(CompiledAdamWGraph::token_mean(losses, BTreeMap::new()))
+            },
+        )
+        .unwrap()
+        .with_evaluation_graph(|module, graph, inputs| {
+            let weight = module.weight.bind(graph)?;
+            let losses = graph.mul(weight, inputs["features"])?;
+            Ok(CompiledAdamWGraph::token_mean(losses, BTreeMap::new()))
+        })
+        .unwrap()
+        .prepare(&CpuSessionTarget::new())
+        .unwrap();
+        let evaluation_before = evaluation.checkpoint().unwrap();
+        let evaluated = evaluation
+            .evaluate(token_evaluation_batch([0.0; 6]))
+            .unwrap();
+        assert_eq!(evaluated.loss_weight(), 0);
+        assert_eq!(evaluated.loss().scalar_at(0).as_f64(), 0.0);
+        assert_eq!(evaluation.checkpoint().unwrap(), evaluation_before);
     }
 
     #[test]
