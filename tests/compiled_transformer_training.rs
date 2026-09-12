@@ -1562,7 +1562,7 @@ impl TrainingDropoutProvider for FixedResidualDropout {
     }
 }
 
-fn module_parameter_state(model: &TinyCausalTransformer) -> BTreeMap<String, (TensorData, u64)> {
+fn module_parameter_state(model: &impl Module) -> BTreeMap<String, (TensorData, u64)> {
     let mut state = BTreeMap::new();
     let mut error = None;
     model.visit("", &mut |name, parameter, _| match parameter.snapshot() {
@@ -3200,24 +3200,25 @@ fn two_block_gradient_family(name: &str) -> usize {
     }
 }
 
+const TWO_BLOCK_GRADIENT_FAMILIES: [(&str, usize); 9] = [
+    ("tied token embedding", 20),
+    ("positional embedding", 12),
+    ("first-block attention", 80),
+    ("first-block LayerNorm", 16),
+    ("first-block feed-forward", 76),
+    ("second-block attention", 80),
+    ("second-block LayerNorm", 16),
+    ("second-block feed-forward", 76),
+    ("final LayerNorm", 8),
+];
+
 fn assert_two_block_gradient_frontier_coverage(
     gradients: &BTreeMap<String, TensorData>,
     direction: &BTreeMap<String, TensorData>,
 ) {
-    const FAMILIES: [(&str, usize); 9] = [
-        ("tied token embedding", 20),
-        ("positional embedding", 12),
-        ("first-block attention", 80),
-        ("first-block LayerNorm", 16),
-        ("first-block feed-forward", 76),
-        ("second-block attention", 80),
-        ("second-block LayerNorm", 16),
-        ("second-block feed-forward", 76),
-        ("final LayerNorm", 8),
-    ];
     assert!(gradients.keys().eq(direction.keys()));
-    let mut coordinates = [0; FAMILIES.len()];
-    let mut has_nonzero_gradient = [false; FAMILIES.len()];
+    let mut coordinates = [0; TWO_BLOCK_GRADIENT_FAMILIES.len()];
+    let mut has_nonzero_gradient = [false; TWO_BLOCK_GRADIENT_FAMILIES.len()];
     for (name, gradient) in gradients {
         let family = two_block_gradient_family(name);
         let direction = &direction[name];
@@ -3236,7 +3237,11 @@ fn assert_two_block_gradient_frontier_coverage(
             has_nonzero_gradient[family] |= gradient != 0.0;
         }
     }
-    for (family, ((label, expected), actual)) in FAMILIES.into_iter().zip(coordinates).enumerate() {
+    for (family, ((label, expected), actual)) in TWO_BLOCK_GRADIENT_FAMILIES
+        .into_iter()
+        .zip(coordinates)
+        .enumerate()
+    {
         assert_eq!(
             actual, expected,
             "{label} canonical coordinate inventory changed"
@@ -3247,6 +3252,278 @@ fn assert_two_block_gradient_frontier_coverage(
         );
     }
     assert_eq!(coordinates.into_iter().sum::<usize>(), 384);
+}
+
+struct TwoBlockHvpEvaluation {
+    analytic: BTreeMap<String, TensorData>,
+    numerical: BTreeMap<String, TensorData>,
+    epsilon: f64,
+    valid_token_count: u64,
+}
+
+fn two_block_attention_mask_hvp_frontier(
+    model: &TwoBlockPositionalGpt,
+    inputs: BTreeMap<String, TensorData>,
+    masks: [TensorData; 6],
+    direction: &BTreeMap<String, TensorData>,
+) -> TwoBlockHvpEvaluation {
+    const EPSILONS: [f64; 4] = [1e-2, 5e-3, 2.5e-3, 1e-3];
+    const RELU_MARGIN: f64 = 0.25;
+
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let attention_mask =
+        graph.input_dtype(ATTENTION_KEEP_MASK, ATTENTION_KEEP_MASK_SHAPE, DType::Bool);
+    let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
+    let guard = graph.input_dtype(ATTENTION_DROPOUT_TRANSITION_GUARD, [], DType::F32);
+    let mut dropout = FixedResidualDropout::from_masks(masks);
+    let logits = model
+        .forward_with_attention_mask(&mut graph, tokens, attention_mask, &mut dropout)
+        .unwrap();
+    assert_eq!(dropout.next, 6);
+    let losses = multi_head_sparse_causal_losses(&mut graph, logits, targets).unwrap();
+    let guard_value = graph.reciprocal(guard).unwrap();
+    let losses = graph.add(losses, guard_value).unwrap();
+    let weighted_losses = graph.mul(losses, loss_mask).unwrap();
+    let numerator = graph.sum_all(weighted_losses).unwrap();
+    let valid_token_count = graph.sum_all(loss_mask).unwrap();
+    let loss = graph.div(numerator, valid_token_count).unwrap();
+    let relu_inputs = relu_inputs(&graph, loss);
+    assert_eq!(relu_inputs.len(), 2);
+
+    let trainable = model.trainable_parameters().unwrap();
+    assert_eq!(trainable.len(), 36);
+    assert!(trainable.iter().any(|(name, _)| name == "tokens.weight"));
+    assert!(trainable.iter().all(|(name, _)| name != "lm_head.weight"));
+    assert!(
+        trainable
+            .iter()
+            .map(|(_, parameter)| parameter.id())
+            .all(|id| {
+                trainable
+                    .iter()
+                    .filter(|(_, parameter)| parameter.id() == id)
+                    .count()
+                    == 1
+            })
+    );
+    let parameter_names = trainable
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parameter_names.iter().cloned().collect::<BTreeSet<_>>(),
+        direction.keys().cloned().collect::<BTreeSet<_>>(),
+        "the dense direction must cover the canonical trainable frontier"
+    );
+    let parameter_targets = trainable
+        .iter()
+        .map(|(_, parameter)| parameter.node(&graph).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parameter_targets
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        parameter_targets.len(),
+        "canonical trainable parameters must map to distinct graph leaves"
+    );
+    assert!(
+        parameter_targets
+            .iter()
+            .all(|target| graph.dtype(*target).unwrap() == DType::F32)
+    );
+    let excluded_inputs = [tokens, targets, attention_mask, loss_mask, guard];
+    assert!(
+        excluded_inputs
+            .iter()
+            .all(|input| !parameter_targets.contains(input))
+    );
+
+    let parameter_input_names = parameter_targets
+        .iter()
+        .map(|target| match graph.op(*target).unwrap() {
+            Op::Input { name } => name.clone(),
+            op => panic!("HVP target %{target} must be a parameter input, got {op:?}"),
+        })
+        .collect::<Vec<_>>();
+    let directions = parameter_names
+        .iter()
+        .map(|name| direction[name].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(directions.iter().map(TensorData::len).sum::<usize>(), 384);
+    assert!(directions.iter().all(|direction| {
+        direction.dtype() == DType::F32
+            && direction
+                .to_vec_f64()
+                .into_iter()
+                .all(|value| value.is_finite() && value != 0.0)
+    }));
+
+    // Compiled token-mean accumulation stores the numerator gradient: the
+    // first reverse pass is therefore weighted by the graph-computed count
+    // before the dense contraction and second batched reverse pass.
+    let first_gradients = graph.gradient_default(loss, &parameter_targets).unwrap();
+    assert_eq!(first_gradients.len(), parameter_targets.len());
+    let weighted_first_gradients = first_gradients
+        .iter()
+        .map(|gradient| graph.mul(*gradient, valid_token_count).unwrap())
+        .collect::<Vec<_>>();
+    let directional_terms = weighted_first_gradients
+        .iter()
+        .zip(&directions)
+        .map(|(gradient, direction)| {
+            let direction = graph.constant(direction.clone());
+            let product = graph.mul(*gradient, direction).unwrap();
+            graph.sum_all(product).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let directional_first_gradient = directional_terms
+        .into_iter()
+        .reduce(|total, term| graph.add(total, term).unwrap())
+        .expect("the canonical Transformer frontier is nonempty");
+    let hvps = graph
+        .gradient_default(directional_first_gradient, &parameter_targets)
+        .unwrap();
+    assert_eq!(hvps.len(), parameter_targets.len());
+
+    let mut bindings = model.input_bindings(&graph).unwrap();
+    for ((name, input_name), direction) in parameter_names
+        .iter()
+        .zip(&parameter_input_names)
+        .zip(&directions)
+    {
+        let parameter = bindings
+            .get(input_name)
+            .unwrap_or_else(|| panic!("parameter input for {name} must be bound"));
+        assert_eq!(parameter.shape(), direction.shape());
+        assert_eq!(parameter.dtype(), direction.dtype());
+    }
+    bindings.extend(inputs);
+
+    let mut base_outputs =
+        Vec::with_capacity(hvps.len() + weighted_first_gradients.len() + relu_inputs.len() + 1);
+    base_outputs.extend(hvps.iter().copied());
+    base_outputs.extend(weighted_first_gradients.iter().copied());
+    base_outputs.extend(relu_inputs.iter().copied());
+    base_outputs.push(valid_token_count);
+    let base = CpuBackend
+        .execute_many(&graph, &base_outputs, &bindings)
+        .unwrap();
+    let relu_start = hvps.len() + weighted_first_gradients.len();
+    let base_relu = &base.outputs[relu_start..relu_start + relu_inputs.len()];
+    assert!(base_relu.iter().all(|relu| {
+        relu.to_vec_f64()
+            .into_iter()
+            .all(|value| value.abs() >= RELU_MARGIN)
+    }));
+    let observed_token_count = base.outputs.last().unwrap().scalar_at(0).as_f64();
+    assert!(observed_token_count.is_finite() && observed_token_count > 0.0);
+    let observed_token_count = observed_token_count as u64;
+    assert_eq!(
+        observed_token_count as f64,
+        base.outputs.last().unwrap().scalar_at(0).as_f64(),
+        "the graph-computed valid-token count must remain integral"
+    );
+
+    let mut finite_difference_outputs = weighted_first_gradients.clone();
+    finite_difference_outputs.extend(relu_inputs.iter().copied());
+    finite_difference_outputs.push(valid_token_count);
+    let evaluate = |epsilon| {
+        CpuBackend
+            .execute_many(
+                &graph,
+                &finite_difference_outputs,
+                &directionally_perturbed_parameter_bindings(
+                    &bindings,
+                    &parameter_input_names,
+                    &directions,
+                    epsilon,
+                ),
+            )
+            .unwrap()
+    };
+    let stable_and_finite = |perturbed: &[TensorData]| {
+        let relu_start = weighted_first_gradients.len();
+        base_relu
+            .iter()
+            .zip(&perturbed[relu_start..relu_start + relu_inputs.len()])
+            .all(|(base, perturbed)| relu_region_unchanged(base, perturbed))
+            && perturbed[..weighted_first_gradients.len()]
+                .iter()
+                .all(|gradient| gradient.to_vec_f64().into_iter().all(f64::is_finite))
+    };
+    let (coarse_plus, coarse_minus, fine_plus, fine_minus, epsilon) = EPSILONS
+        .into_iter()
+        .find_map(|epsilon| {
+            let fine_epsilon = epsilon / 2.0;
+            let coarse_plus = evaluate(epsilon);
+            let coarse_minus = evaluate(-epsilon);
+            let fine_plus = evaluate(fine_epsilon);
+            let fine_minus = evaluate(-fine_epsilon);
+            let stable = {
+                let outputs = [
+                    &coarse_plus.outputs,
+                    &coarse_minus.outputs,
+                    &fine_plus.outputs,
+                    &fine_minus.outputs,
+                ];
+                outputs
+                    .into_iter()
+                    .all(|outputs| stable_and_finite(outputs.as_slice()))
+            };
+            stable.then_some((coarse_plus, coarse_minus, fine_plus, fine_minus, epsilon))
+        })
+        .expect("bounded paired HVP differences must preserve both ReLU regions");
+    for perturbed in [&coarse_plus, &coarse_minus, &fine_plus, &fine_minus] {
+        assert_eq!(
+            perturbed.outputs.last().unwrap().scalar_at(0).as_f64(),
+            observed_token_count as f64
+        );
+    }
+
+    let analytic = parameter_names
+        .iter()
+        .cloned()
+        .zip(base.outputs[..hvps.len()].iter().cloned())
+        .collect::<BTreeMap<_, _>>();
+    // The paired central estimates share the same smooth ReLU region, so
+    // Richardson extrapolation removes their leading O(h^2) truncation term.
+    let numerical = parameter_names
+        .iter()
+        .cloned()
+        .zip((0..weighted_first_gradients.len()).map(|gradient| {
+            let coarse_plus = &coarse_plus.outputs[gradient];
+            let coarse_minus = &coarse_minus.outputs[gradient];
+            let fine_plus = &fine_plus.outputs[gradient];
+            let fine_minus = &fine_minus.outputs[gradient];
+            assert_eq!(coarse_plus.shape(), coarse_minus.shape());
+            assert_eq!(coarse_plus.shape(), fine_plus.shape());
+            assert_eq!(coarse_plus.shape(), fine_minus.shape());
+            TensorData::from_scalars(
+                coarse_plus.shape().clone(),
+                DType::F32,
+                (0..coarse_plus.len()).map(|coordinate| {
+                    let coarse = (coarse_plus.scalar_at(coordinate).as_f64()
+                        - coarse_minus.scalar_at(coordinate).as_f64())
+                        / (2.0 * epsilon);
+                    let fine = (fine_plus.scalar_at(coordinate).as_f64()
+                        - fine_minus.scalar_at(coordinate).as_f64())
+                        / epsilon;
+                    Scalar::F((4.0 * fine - coarse) / 3.0)
+                }),
+            )
+            .unwrap()
+        }))
+        .collect::<BTreeMap<_, _>>();
+    TwoBlockHvpEvaluation {
+        analytic,
+        numerical,
+        epsilon,
+        valid_token_count: observed_token_count,
+    }
 }
 
 fn numerical_two_block_gradient_lanes_from_forward(
@@ -6160,6 +6437,121 @@ fn compiled_two_block_attention_mask_whole_gradient_frontier_matches_directional
             numerical.epsilon,
             numerical.derivative
         );
+    }
+    assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_attention_mask_whole_hvp_frontier_matches_central_differences() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+    const SCALE_AWARE_F32_TOLERANCE: f64 = 2e-2;
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    let mut visited = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        visited.insert(name, (parameter.id(), parameter.is_trainable()));
+    });
+    assert_eq!(visited.len(), 37);
+    assert_eq!(visited["tokens.weight"].0, visited["lm_head.weight"].0);
+    assert!(visited["tokens.weight"].1 && visited["lm_head.weight"].1);
+
+    let parameters = model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.value().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(parameters.len(), 36);
+    assert!(parameters.contains_key("tokens.weight"));
+    assert!(!parameters.contains_key("lm_head.weight"));
+    assert_eq!(parameters.values().map(TensorData::len).sum::<usize>(), 384);
+    let mut expected_traversal = parameters.keys().cloned().collect::<BTreeSet<_>>();
+    assert!(expected_traversal.insert("lm_head.weight".into()));
+    assert_eq!(
+        visited.keys().cloned().collect::<BTreeSet<_>>(),
+        expected_traversal,
+        "the traversal must expose exactly the canonical frontier plus its tied LM-head alias"
+    );
+    let directions = two_block_dense_parameter_directions(&parameters);
+    assert_ne!(directions[0], directions[1]);
+
+    let compile_count = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+        two_block_attention_mask_config(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_with_attention_mask(model, graph, inputs, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_ne!(attention_keep_mask(1), attention_keep_mask(2));
+    assert_ne!(attention_loss_mask(1), attention_loss_mask(2));
+
+    let mut fixed_dropout_masks = None;
+    for (index, direction) in directions.iter().enumerate() {
+        let replay = index as u64 + 1;
+        let inputs = attention_masked_dropout_batch(replay, 1.0);
+        let expected_token_count = attention_masked_loss_weight(replay);
+        let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
+        let step = runtime
+            .step(inputs.clone(), TensorData::scalar(1e-3))
+            .unwrap();
+        assert!(!step.did_update());
+        assert_eq!(step.loss_weight(), expected_token_count);
+        assert_eq!(runtime.optimizer_step().unwrap(), 0);
+        assert_eq!(runtime.accumulation_index().unwrap(), 1);
+        assert_attention_keep_mask_is_observed(
+            step.outputs(),
+            &attention_keep_mask(replay),
+            &attention_loss_mask(replay),
+        );
+
+        let masks = observed_two_block_dropout_masks(step.outputs());
+        if let Some(expected) = &fixed_dropout_masks {
+            assert_eq!(
+                &masks, expected,
+                "fresh runtimes must replay the same six fixed dropout masks"
+            );
+        } else {
+            fixed_dropout_masks = Some(masks.clone());
+        }
+        let evaluation = two_block_attention_mask_hvp_frontier(&model, inputs, masks, direction);
+        assert_eq!(evaluation.valid_token_count, expected_token_count);
+        assert!(evaluation.epsilon.is_finite() && evaluation.epsilon > 0.0);
+        assert_two_block_gradient_frontier_coverage(&evaluation.analytic, direction);
+        assert_two_block_gradient_frontier_coverage(&evaluation.numerical, direction);
+
+        let mut coordinates_checked = 0;
+        for (name, analytic) in &evaluation.analytic {
+            let numerical = &evaluation.numerical[name];
+            assert_eq!(analytic.shape(), numerical.shape());
+            assert_eq!(analytic.dtype(), DType::F32);
+            assert_eq!(numerical.dtype(), DType::F32);
+            for coordinate in 0..analytic.len() {
+                let analytic = analytic.scalar_at(coordinate).as_f64();
+                let numerical = numerical.scalar_at(coordinate).as_f64();
+                assert!(analytic.is_finite() && numerical.is_finite());
+                let error = (analytic - numerical).abs();
+                let scale = 1.0_f64.max(analytic.abs()).max(numerical.abs());
+                let tolerance = SCALE_AWARE_F32_TOLERANCE * scale;
+                assert!(
+                    error <= tolerance,
+                    "direction {index} {name}[{coordinate}] Richardson HVP mismatch at coarse epsilon {}: analytic={analytic}, numerical={numerical}, error={error}, tolerance={tolerance}",
+                    evaluation.epsilon
+                );
+                coordinates_checked += 1;
+            }
+        }
+        assert_eq!(coordinates_checked, 384);
+        assert_eq!(model.state_dict().unwrap(), state_before);
+        assert_eq!(module_parameter_state(&model), parameter_state_before);
     }
     assert_eq!(compile_count.get(), 1);
 }
