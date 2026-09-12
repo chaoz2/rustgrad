@@ -84,35 +84,22 @@ layers:
 
 ### Repeated compiled training
 
-RustGrad captures
-`forward → loss → backward → optimizer update` once, then replays it with
-persistent model and optimizer state behind an atomic commit boundary. The
+RustGrad can compile a fixed-shape
+`forward → loss → backward → optimizer update` program once and replay new
+batches against persistent model and optimizer state. The maintained
 [`compiled_transformer_train_resume`](examples/compiled_transformer_train_resume.rs)
-example covers masked Transformer training, dropout, token-weighted
-accumulation, clipping, freezing, tied weights, and checkpoint continuation.
+example demonstrates the complete masked Transformer training lifecycle.
 
-- **Backends:** `cpu` and `native-cpu` run the maintained CPU training path;
-  `metal` selects the corresponding device path.
-- **Reuse and resume:** `cpu-reuse` restores a plan in the same process, while
-  `cpu-file-resume` and `native-cpu-file-resume` rebuild and authenticate a
-  portable checkpoint before continuing.
-- **Evidence:** `native-cpu-scoreboard` emits versioned strict-native CPU
-  results for the maintained workload.
+- Compile once and replay new batches while state stays persistent and each
+  transition commits atomically.
+- Resume exactly from an in-process plan or a portable checkpoint rebuilt into
+  the same model topology.
+- Inspect execution plans and versioned evidence without treating
+  observational timings as performance thresholds.
 
-Guarantees and boundaries:
-
-- Failed replay or restore does not publish a partial parameter or optimizer
-  transition.
-- File resume authenticates rebuilt topology before mutating the destination.
-- Scoreboard timings are observational, not speedup claims or CI performance
-  thresholds.
-
-Metal training shares the checkpoint boundary but is separate from the CPU
-scoreboard contract.
-
-The detailed runtime, compatibility, and reporting contracts live in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
-[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
+See [Compiled recurrent training](docs/ARCHITECTURE.md#compiled-recurrent-training)
+for runtime ownership, resume modes, evidence, and backend boundaries. The
+[compatibility ledger](docs/COMPATIBILITY.md) records the supported surface.
 
 ## Run ResNet on a persistent Metal session
 
