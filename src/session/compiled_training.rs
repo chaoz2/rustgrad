@@ -1713,8 +1713,9 @@ impl PreparedNativeCpuEvaluation {
 /// External imports count only fallback owned copies into retained workspace
 /// storage; supported dense F32/I32 inputs bind caller storage read-only for
 /// the invocation instead. Recurrent bytes are borrowed directly from the
-/// authoritative active and inactive host banks. None are host/device
-/// transfers.
+/// authoritative host banks. Exact unchanged recurrent successors may retain
+/// the active bank; all other successors borrow the inactive bank. None are
+/// host/device transfers.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeCpuReplayTraffic {
@@ -1722,6 +1723,18 @@ pub struct NativeCpuReplayTraffic {
     external_input_import_bytes: u64,
     borrowed_recurrent_input_bytes: u64,
     borrowed_recurrent_output_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    retained_recurrent_state_count: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    retained_recurrent_state_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    replaced_recurrent_state_count: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    replaced_recurrent_state_bytes: u64,
+}
+
+const fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 impl NativeCpuReplayTraffic {
@@ -1736,7 +1749,25 @@ impl NativeCpuReplayTraffic {
             external_input_import_bytes,
             borrowed_recurrent_input_bytes,
             borrowed_recurrent_output_bytes,
+            retained_recurrent_state_count: 0,
+            retained_recurrent_state_bytes: 0,
+            replaced_recurrent_state_count: 0,
+            replaced_recurrent_state_bytes: 0,
         }
+    }
+
+    pub(crate) const fn with_recurrent_inventory(
+        mut self,
+        retained_count: u64,
+        retained_bytes: u64,
+        replaced_count: u64,
+        replaced_bytes: u64,
+    ) -> Self {
+        self.retained_recurrent_state_count = retained_count;
+        self.retained_recurrent_state_bytes = retained_bytes;
+        self.replaced_recurrent_state_count = replaced_count;
+        self.replaced_recurrent_state_bytes = replaced_bytes;
+        self
     }
 
     pub const fn external_input_import_count(&self) -> u64 {
@@ -1753,6 +1784,27 @@ impl NativeCpuReplayTraffic {
 
     pub const fn borrowed_recurrent_output_bytes(&self) -> u64 {
         self.borrowed_recurrent_output_bytes
+    }
+
+    /// Logical recurrent states whose authenticated successor retains the
+    /// active bank instead of writing and flipping an identical inactive bank.
+    pub const fn retained_recurrent_state_count(&self) -> u64 {
+        self.retained_recurrent_state_count
+    }
+
+    /// Logical bytes served from authenticated active recurrent-state banks.
+    pub const fn retained_recurrent_state_bytes(&self) -> u64 {
+        self.retained_recurrent_state_bytes
+    }
+
+    /// Logical recurrent states physically written into inactive banks.
+    pub const fn replaced_recurrent_state_count(&self) -> u64 {
+        self.replaced_recurrent_state_count
+    }
+
+    /// Recurrent successor bytes physically written into inactive banks.
+    pub const fn replaced_recurrent_state_bytes(&self) -> u64 {
+        self.replaced_recurrent_state_bytes
     }
 }
 
@@ -4169,7 +4221,6 @@ struct CompiledAdamWAccumulationPlan {
     capture: CapturedMixedSchedule,
     recurrent_capture: CapturedStatefulInference,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
-    adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
     capture_identity: u64,
 }
 
@@ -4792,7 +4843,6 @@ impl CompiledTrainingPlan {
                     capture: phase.capture,
                     recurrent_capture: phase.recurrent_capture,
                     state_buffers: phase.state_buffers,
-                    adamw_native_updates: phase.adamw_native_updates,
                     capture_identity,
                 })
             })
@@ -5981,6 +6031,12 @@ const fn native_cpu_replay_traffic(traffic: NativeReplayTraffic) -> NativeCpuRep
         traffic.borrowed_recurrent_input_bytes,
         traffic.borrowed_recurrent_output_bytes,
     )
+    .with_recurrent_inventory(
+        traffic.retained_recurrent_state_count,
+        traffic.retained_recurrent_state_bytes,
+        traffic.replaced_recurrent_state_count,
+        traffic.replaced_recurrent_state_bytes,
+    )
 }
 
 fn evaluation_result(
@@ -6794,7 +6850,7 @@ impl CpuCompiledTrainingProgram {
         )?;
         let preparation = transition
             .capture
-            .preflight_recurrent_native(
+            .preflight_recurrent_native_retaining_unchanged(
                 &self.runtime,
                 &prepared.cursor,
                 &prepared.provided,
@@ -9257,10 +9313,10 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     let (pure, inputs) = preparation.pure_and_inputs();
                     drafts.push(
                         executor
-                            .preflight_native_items_with_adamw_updates(
+                            .preflight_native_items_with_recurrent_retention(
                                 pure,
                                 inputs,
-                                &transition.adamw_native_updates,
+                                preparation.retained_recurrent_states(),
                             )
                             .map_err(replay_error)?,
                     );
@@ -14234,6 +14290,33 @@ mod tests {
             .as_ref()
             .unwrap()
             .workspace_stats();
+        let expected_retained_buffers = accumulation_transition
+            .state_buffers
+            .iter()
+            .filter(|(key, _)| !key.is_accumulation_reset_state())
+            .map(|(_, buffer)| *buffer)
+            .collect::<BTreeSet<_>>();
+        assert!(!expected_retained_buffers.is_empty());
+        assert_eq!(
+            expected_retained_buffers.len(),
+            initial_parameters().len() * 3 + 1
+        );
+        assert_eq!(
+            native
+                .accumulation_replay
+                .as_ref()
+                .unwrap()
+                .retained_recurrent_state_count(),
+            expected_retained_buffers.len()
+        );
+        assert_eq!(
+            native
+                .accumulation_replay
+                .as_ref()
+                .unwrap()
+                .retained_recurrent_state_buffers(),
+            expected_retained_buffers
+        );
         let flush_workspace = native
             .partial_flush_replay
             .as_ref()
@@ -14346,6 +14429,20 @@ mod tests {
         assert!(!actual.did_update());
         assert_eq!(actual.capture_identity(), plan.capture_identity());
         assert!(actual.clip_report().is_none());
+        let traffic = actual.report().traffic();
+        assert_eq!(traffic.retained_recurrent_state_count(), 7);
+        assert_eq!(traffic.replaced_recurrent_state_count(), 3);
+        assert_eq!(
+            traffic
+                .retained_recurrent_state_bytes()
+                .checked_add(traffic.replaced_recurrent_state_bytes()),
+            Some(traffic.borrowed_recurrent_input_bytes())
+        );
+        assert_eq!(
+            traffic.replaced_recurrent_state_bytes(),
+            traffic.borrowed_recurrent_output_bytes()
+        );
+        assert!(actual.report().executed_native_item_count() < actual.report().native_item_count());
         assert_eq!(
             actual.report().capture_identity(),
             plan.accumulation_capture_identity().unwrap()

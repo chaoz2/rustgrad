@@ -259,9 +259,10 @@ impl HostSlotPool {
                 ));
             }
             let inactive = 1 - slot.active;
-            if slot.values[inactive]
-                .as_ref()
-                .is_none_or(|value| !tensor_matches_descriptor(value, &request.descriptor))
+            if !request.retain_active
+                && slot.values[inactive]
+                    .as_ref()
+                    .is_none_or(|value| !tensor_matches_descriptor(value, &request.descriptor))
             {
                 slot.values[inactive] = Some(
                     TensorData::zeros_with_dtype(
@@ -284,10 +285,20 @@ impl HostSlotPool {
             };
             let (active, inactive) = if slot.active == 0 {
                 let (active, inactive) = slot.values.split_at_mut(1);
-                (active[0].as_ref(), inactive[0].as_mut())
+                (
+                    active[0].as_ref(),
+                    (!requests[ordinal].retain_active)
+                        .then(|| inactive[0].as_mut())
+                        .flatten(),
+                )
             } else {
                 let (inactive, active) = slot.values.split_at_mut(1);
-                (active[0].as_ref(), inactive[0].as_mut())
+                (
+                    active[0].as_ref(),
+                    (!requests[ordinal].retain_active)
+                        .then(|| inactive[0].as_mut())
+                        .flatten(),
+                )
             };
             banks.push(HostBufferBank {
                 ordinal,
@@ -297,7 +308,7 @@ impl HostSlotPool {
                         requests[ordinal].descriptor.buffer_id,
                     ))
                 })?,
-                inactive: inactive.expect("inactive persistent bank was initialized"),
+                inactive,
             });
         }
         if banks.len() != requests.len() {
@@ -308,14 +319,14 @@ impl HostSlotPool {
         banks.sort_by_key(|bank| bank.ordinal);
         let value = stage(&mut banks).map_err(HostBufferBankTransactionError::Stage)?;
         if banks.iter().any(|bank| {
-            !tensor_matches_descriptor(bank.inactive(), &requests[bank.ordinal].descriptor)
+            !tensor_matches_descriptor(bank.successor(), &requests[bank.ordinal].descriptor)
         }) {
             return Err(HostBufferBankTransactionError::Host(
                 HostBufferError::IncompatibleDescriptor,
             ));
         }
         drop(banks);
-        for request in requests {
+        for request in requests.iter().filter(|request| !request.retain_active) {
             let slot = state
                 .slots
                 .get_mut(&request.slot)
@@ -448,13 +459,14 @@ pub(crate) struct HostBufferBankRequest {
     slot: u64,
     generation: u64,
     descriptor: HostBufferDesc,
+    retain_active: bool,
 }
 
 pub(crate) struct HostBufferBank<'a> {
     ordinal: usize,
     buffer_id: u64,
     active: &'a TensorData,
-    inactive: &'a mut TensorData,
+    inactive: Option<&'a mut TensorData>,
 }
 
 impl HostBufferBank<'_> {
@@ -463,11 +475,21 @@ impl HostBufferBank<'_> {
     }
 
     pub(crate) fn tensors(&mut self) -> (&TensorData, &mut TensorData) {
-        (self.active, &mut *self.inactive)
+        (
+            self.active,
+            &mut *self
+                .inactive
+                .as_deref_mut()
+                .expect("replaced host bank has an inactive successor"),
+        )
     }
 
-    pub(crate) fn inactive(&self) -> &TensorData {
-        &*self.inactive
+    pub(crate) fn successor(&self) -> &TensorData {
+        self.inactive.as_deref().unwrap_or(self.active)
+    }
+
+    pub(crate) const fn is_retained(&self) -> bool {
+        self.inactive.is_none()
     }
 }
 
@@ -533,6 +555,17 @@ impl HostBufferLease {
             slot: self.slot,
             generation: self.generation,
             descriptor: self.descriptor.clone(),
+            retain_active: false,
+        }
+    }
+
+    pub(crate) fn retained_bank_request(&self) -> HostBufferBankRequest {
+        HostBufferBankRequest {
+            inner: self.inner.clone(),
+            slot: self.slot,
+            generation: self.generation,
+            descriptor: self.descriptor.clone(),
+            retain_active: true,
         }
     }
 

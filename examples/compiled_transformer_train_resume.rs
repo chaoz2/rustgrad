@@ -1718,11 +1718,38 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     // The module exposes 37 parameter traversal entries. The tied LM head
     // deduplicates with tokens.weight, and positions.weight is policy-frozen.
     const EXPECTED_ADAMW_UPDATE_GROUPS: usize = 35;
+    // Parameter/m1/m2 plus optimizer step are definitionally unchanged.
+    // Prepared schedule simplification may prove additional accumulator
+    // pass-throughs; index/token/loss/dropout must still receive new banks.
+    const GUARANTEED_RETAINED_RECURRENT_STATES: u64 = (EXPECTED_ADAMW_UPDATE_GROUPS * 3 + 1) as u64;
+    const REMAINING_RECURRENT_STATES: u64 = (EXPECTED_ADAMW_UPDATE_GROUPS + 4) as u64;
+    const MANDATORY_REPLACED_RECURRENT_STATES: u64 = 4;
     const EXPECTED_MAIN_RENDERED_ENTRIES: usize = 787 - EXPECTED_ADAMW_UPDATE_GROUPS * 3;
     // One accumulator per update group, plus loss numerator, index, and token count.
     const EXPECTED_ZERO_GRAD_ENTRIES: usize = EXPECTED_ADAMW_UPDATE_GROUPS + 3;
 
     let source = FileResumeTransformer::new(7)?;
+    let optimized_parameters = source
+        .trainable_parameters()?
+        .into_iter()
+        .filter(|(name, _)| name != FILE_RESUME_POLICY_FROZEN)
+        .collect::<Vec<_>>();
+    assert_eq!(optimized_parameters.len(), EXPECTED_ADAMW_UPDATE_GROUPS);
+    let optimized_parameter_bytes = optimized_parameters
+        .iter()
+        .map(|(_, parameter)| {
+            parameter
+                .value()
+                .map(|value| value.len() * value.dtype().itemsize())
+        })
+        .sum::<Result<usize>>()?;
+    let guaranteed_retained_recurrent_bytes =
+        u64::try_from(optimized_parameter_bytes * 3 + DType::U64.itemsize())?;
+    let remaining_recurrent_bytes = u64::try_from(
+        optimized_parameter_bytes + DType::U64.itemsize() * 3 + DType::F32.itemsize(),
+    )?;
+    let mandatory_replaced_recurrent_bytes =
+        u64::try_from(DType::U64.itemsize() * 3 + DType::F32.itemsize())?;
     let schedule = CompiledMultiStepLr::new(0.05, 0.5, [1])?;
     let builds = Cell::new(0);
     let compile_started = Instant::now();
@@ -1738,6 +1765,10 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let compile_wall_time = compile_started.elapsed();
     assert_eq!(builds.get(), 1, "the training graph must compile once");
     let inspection = plan.inspection()?;
+    assert_eq!(
+        u64::try_from(inspection.recurrent_state_count())?,
+        GUARANTEED_RETAINED_RECURRENT_STATES + REMAINING_RECURRENT_STATES
+    );
 
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor)
@@ -1830,6 +1861,10 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         prepare_wall_time,
     )?;
     let recurrent_state_bytes = u64::try_from(inspection.recurrent_state_bytes())?;
+    assert_eq!(
+        recurrent_state_bytes,
+        guaranteed_retained_recurrent_bytes + remaining_recurrent_bytes
+    );
     let mut stable_accumulation_executed_native_items = None;
     let mut committed_executed_native_items = None;
     for replay in 1..=SAMPLES {
@@ -2025,9 +2060,41 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         recurrent_state_bytes
     );
     assert_eq!(
-        accumulation_traffic.borrowed_recurrent_output_bytes(),
+        accumulation_traffic.borrowed_recurrent_output_bytes()
+            + accumulation_traffic.retained_recurrent_state_bytes(),
         recurrent_state_bytes
     );
+    assert_eq!(
+        accumulation_traffic.replaced_recurrent_state_bytes(),
+        accumulation_traffic.borrowed_recurrent_output_bytes()
+    );
+    assert_eq!(
+        accumulation_traffic.retained_recurrent_state_count()
+            + accumulation_traffic.replaced_recurrent_state_count(),
+        u64::try_from(inspection.recurrent_state_count())?
+    );
+    assert!(
+        accumulation_traffic.retained_recurrent_state_count()
+            >= GUARANTEED_RETAINED_RECURRENT_STATES
+    );
+    assert!(accumulation_traffic.replaced_recurrent_state_count() <= REMAINING_RECURRENT_STATES);
+    assert!(
+        accumulation_traffic.replaced_recurrent_state_count()
+            >= MANDATORY_REPLACED_RECURRENT_STATES
+    );
+    assert!(
+        accumulation_traffic.retained_recurrent_state_bytes()
+            >= guaranteed_retained_recurrent_bytes
+    );
+    assert!(accumulation_traffic.replaced_recurrent_state_bytes() <= remaining_recurrent_bytes);
+    assert!(
+        accumulation_traffic.replaced_recurrent_state_bytes() >= mandatory_replaced_recurrent_bytes
+    );
+
+    let prepared_retained_recurrent_states = accumulation_traffic.retained_recurrent_state_count();
+    let prepared_replaced_recurrent_states = accumulation_traffic.replaced_recurrent_state_count();
+    let prepared_retained_recurrent_bytes = accumulation_traffic.retained_recurrent_state_bytes();
+    let prepared_replaced_recurrent_bytes = accumulation_traffic.replaced_recurrent_state_bytes();
 
     let restored = plan.restore_checkpoint(&checkpoint)?;
     let restored_inspection = restored.inspection()?;
@@ -2096,8 +2163,34 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         recurrent_state_bytes
     );
     assert_eq!(
-        restored_report.traffic().borrowed_recurrent_output_bytes(),
+        restored_report.traffic().borrowed_recurrent_output_bytes()
+            + restored_report.traffic().retained_recurrent_state_bytes(),
         recurrent_state_bytes
+    );
+    assert_eq!(
+        restored_report.traffic().replaced_recurrent_state_bytes(),
+        restored_report.traffic().borrowed_recurrent_output_bytes()
+    );
+    assert_eq!(
+        restored_report.traffic().retained_recurrent_state_count()
+            + restored_report.traffic().replaced_recurrent_state_count(),
+        u64::try_from(restored_inspection.recurrent_state_count())?
+    );
+    assert_eq!(
+        restored_report.traffic().retained_recurrent_state_count(),
+        prepared_retained_recurrent_states
+    );
+    assert_eq!(
+        restored_report.traffic().replaced_recurrent_state_count(),
+        prepared_replaced_recurrent_states
+    );
+    assert_eq!(
+        restored_report.traffic().retained_recurrent_state_bytes(),
+        prepared_retained_recurrent_bytes
+    );
+    assert_eq!(
+        restored_report.traffic().replaced_recurrent_state_bytes(),
+        prepared_replaced_recurrent_bytes
     );
     assert_eq!(
         restored_report.executed_native_item_count(),

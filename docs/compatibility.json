@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:a2bbd75cd7fbb681",
+  "source_fingerprint": "fnv1a64:1520117ebff85b63",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -450,7 +450,7 @@
       "subject": "Strict-native CPU compiled AdamW replay",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`NativeCpuSessionTarget` prepares strict-native main, private accumulation-only, partial-flush, zero-grad, and evaluation programs with fallback disabled. For windows greater than one, non-commit CPU steps use an authenticated sibling that preserves the complete recurrent frontier while pruning averaged-gradient, clipping, learning-rate schedule, and AdamW candidate work; commit, flush, reset, and strict-Metal paths retain their established behavior. Checkpoint v9 authenticates the sibling identity while v1--v8 remain readable. `NativeTrainingScoreboard` v11 records distinct accumulation-only and optimizer-commit program, cache, traffic, and execution inventories while v1--v10 remain readable. Failed or rejected attempts publish no state, progress, or report. See the **Compiled recurrent training** section of `ARCHITECTURE.md` for ownership, atomicity, preparation, cache, traffic, and protected-CI evidence."
+        "Acceptance requirement": "`NativeCpuSessionTarget` prepares strict-native main, private accumulation-only, partial-flush, zero-grad, and evaluation programs with fallback disabled. Non-commit accumulation prunes optimizer work and retains exactly authenticated unchanged host-state banks while advancing the complete logical frontier; mismatches use full replacement. Checkpoint v9 preserves both capture identities. `NativeTrainingScoreboard` v12 authenticates phase-specific programs and retained/replaced traffic while v1--v11 remain readable. Failed attempts publish no state, progress, or report. See **Compiled recurrent training** in `ARCHITECTURE.md` for detailed ownership and acceptance boundaries."
       }
     },
     {
