@@ -341,8 +341,7 @@ pub(super) fn encode_adamw_checkpoint(
     if let Some(count) = accumulated_token_count {
         if accumulation_steps <= 1
             || count > MAX_EXACT_F32_INTEGER_COUNT
-            || count < accumulation_index
-            || (count == 0) != (accumulation_index == 0)
+            || (accumulation_index == 0 && count != 0)
         {
             return Err(training(
                 "compiled AdamW checkpoint accumulated token count is invalid",
@@ -1097,8 +1096,7 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
         let count = count.scalar_at(0).as_u64();
         if accumulation_steps <= 1
             || count > MAX_EXACT_F32_INTEGER_COUNT
-            || count < accumulation_index
-            || (count == 0) != (accumulation_index == 0)
+            || (accumulation_index == 0 && count != 0)
         {
             return Err(training(
                 "compiled AdamW checkpoint accumulated token count is invalid",
