@@ -150,6 +150,23 @@ pub(crate) struct PreparedScheduleDispatch {
     quantized: Vec<(u64, crate::QuantizedTensorData)>,
 }
 
+struct PreparedScheduleSegmentEntry {
+    kernel: Arc<JitKernel>,
+    slots: Vec<usize>,
+    quantized_ids: Vec<u64>,
+    quantized: Vec<crate::QuantizedTensorData>,
+    pointer_offset: usize,
+}
+
+/// One immutable authenticated schedule-module segment. Entry ordering, slot
+/// bindings, packed resources, dispatcher ownership, and pointer cardinality
+/// are sealed once; replay supplies only call-local pointers.
+pub(crate) struct PreparedScheduleSegment {
+    dispatcher: Arc<JitScheduleDispatcher>,
+    entries: Vec<PreparedScheduleSegmentEntry>,
+    pointer_count: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeScheduleModulePreparation {
     pub(crate) rendered_entry_count: usize,
@@ -492,26 +509,70 @@ impl PreparedNativeDispatch {
 }
 
 impl PreparedScheduleDispatch {
-    pub(crate) fn authenticate_segment(
+    pub(crate) fn seal_segment(
         entries: &[&Self],
-        quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
-    ) -> Result<(), PreparedScheduleDispatchFailure> {
+    ) -> Result<PreparedScheduleSegment, JitBackendError> {
         let Some(first) = entries.first() else {
-            return Ok(());
+            return Err(JitBackendError::Binding(
+                "native schedule segment is empty".into(),
+            ));
         };
         if entries
             .iter()
             .any(|entry| !Arc::ptr_eq(&entry.dispatcher, &first.dispatcher))
         {
-            return Err(PreparedScheduleDispatchFailure {
-                entry: 0,
-                error: JitBackendError::Binding(
-                    "native schedule segment spans multiple modules".into(),
-                ),
-            });
+            return Err(JitBackendError::Binding(
+                "native schedule segment spans multiple modules".into(),
+            ));
         }
-        for (entry, prepared) in entries.iter().enumerate() {
-            for (id, expected) in &prepared.quantized {
+        let mut pointer_count = 0_usize;
+        let entries = entries
+            .iter()
+            .map(|prepared| {
+                let pointer_offset = pointer_count;
+                pointer_count = pointer_count
+                    .checked_add(prepared.kernel.abi().pointer_order.len())
+                    .ok_or_else(|| {
+                        JitBackendError::Binding(
+                            "native schedule segment pointer count overflows".into(),
+                        )
+                    })?;
+                Ok(PreparedScheduleSegmentEntry {
+                    kernel: prepared.kernel.clone(),
+                    slots: prepared.slots.clone(),
+                    quantized_ids: prepared.quantized.iter().map(|(id, _)| *id).collect(),
+                    quantized: prepared
+                        .quantized
+                        .iter()
+                        .map(|(_, value)| value.clone())
+                        .collect(),
+                    pointer_offset,
+                })
+            })
+            .collect::<Result<Vec<_>, JitBackendError>>()?;
+        Ok(PreparedScheduleSegment {
+            dispatcher: first.dispatcher.clone(),
+            entries,
+            pointer_count,
+        })
+    }
+}
+
+impl PreparedScheduleSegment {
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) const fn pointer_count(&self) -> usize {
+        self.pointer_count
+    }
+
+    pub(crate) fn authenticate(
+        &self,
+        quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
+    ) -> Result<(), PreparedScheduleDispatchFailure> {
+        for (entry, prepared) in self.entries.iter().enumerate() {
+            for (id, expected) in prepared.quantized_ids.iter().zip(&prepared.quantized) {
                 let actual = quantized
                     .get(id)
                     .ok_or_else(|| PreparedScheduleDispatchFailure {
@@ -533,39 +594,29 @@ impl PreparedScheduleDispatch {
         Ok(())
     }
 
-    pub(crate) fn execute_segment(
-        entries: &[&Self],
+    pub(crate) fn execute_authenticated(
+        &self,
         buffers: &mut [JitBuffer],
         borrowed: Option<&mut BTreeMap<usize, crate::cpu_jit::BorrowedJitBuffer<'_>>>,
-        quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
+        scratch: &mut crate::cpu_jit::JitScheduleDispatchScratch,
     ) -> Result<(), PreparedScheduleDispatchFailure> {
-        let Some(first) = entries.first() else {
-            return Ok(());
-        };
-        Self::authenticate_segment(entries, quantized)?;
-        let mut resolved = Vec::with_capacity(entries.len());
-        for (entry, prepared) in entries.iter().enumerate() {
-            let resources = prepared
-                .quantized
-                .iter()
-                .map(|(id, expected)| {
-                    let actual = quantized.get(id).ok_or_else(|| {
-                        JitBackendError::Binding(format!("missing packed captured buffer {id}"))
-                    })?;
-                    if actual != expected {
-                        return Err(JitBackendError::Binding(format!(
-                            "packed captured buffer {id} changed after preparation"
-                        )));
-                    }
-                    Ok(expected)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| PreparedScheduleDispatchFailure { entry, error })?;
-            resolved.push((&*prepared.kernel, prepared.slots.as_slice(), resources));
-        }
-        first
-            .dispatcher
-            .call(&resolved, buffers, borrowed)
+        self.dispatcher
+            .call_prepared(
+                self.entries.len(),
+                self.pointer_count,
+                buffers,
+                borrowed,
+                scratch,
+                |index| {
+                    let entry = &self.entries[index];
+                    (
+                        &*entry.kernel,
+                        entry.slots.as_slice(),
+                        entry.quantized.as_slice(),
+                        entry.pointer_offset,
+                    )
+                },
+            )
             .map_err(|(entry, error)| PreparedScheduleDispatchFailure {
                 entry,
                 error: jit_error(error),

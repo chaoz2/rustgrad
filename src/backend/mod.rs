@@ -11,8 +11,9 @@ pub use jit::{CpuJitBackend, JitBackendError, JitExecution, JitFallback};
 pub(crate) use jit::{
     NativeScheduleCompilationBatch, NativeScheduleLayout, NativeScheduleModulePreparation,
     NativeStoreGroup, NativeStoreGroupMember, PreparedNativeDispatch, PreparedNativeStoreGroup,
-    PreparedScheduleDispatch, PreparedScheduleItem, TensorValueStore, canonical_dense_copy,
-    canonical_transpose_copy, is_canonical_rank2_transpose, schedule_native_layout,
+    PreparedScheduleDispatch, PreparedScheduleDispatchFailure, PreparedScheduleItem,
+    PreparedScheduleSegment, TensorValueStore, canonical_dense_copy, canonical_transpose_copy,
+    is_canonical_rank2_transpose, schedule_native_layout,
 };
 
 /// A deliberately thin execution boundary. CUDA-specific capabilities will

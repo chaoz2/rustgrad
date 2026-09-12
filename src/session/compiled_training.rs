@@ -13816,6 +13816,11 @@ mod tests {
         assert_eq!(workspace.intermediate_materialization_count, 0);
         assert_eq!(workspace.borrowed_recurrent_input_bytes, 0);
         assert_eq!(workspace.borrowed_recurrent_output_bytes, 0);
+        assert!(workspace.sealed_dispatch_step_count > 0);
+        assert!(workspace.sealed_dispatch_segment_count > 0);
+        assert_eq!(workspace.dispatch_metadata_build_count, 1);
+        assert_eq!(workspace.dispatch_scratch_capacity_growth_count, 0);
+        assert!(workspace.dispatch_scratch_is_empty);
         let preparation = native.preparation_report();
         assert_eq!(
             preparation.main().capture_identity(),
@@ -14049,6 +14054,9 @@ mod tests {
             failed_workspace.borrowed_recurrent_output_bytes + recurrent_state_bytes
         );
         assert_eq!(native.main_replay.structure_validation_count(), 1);
+        assert_eq!(retried_workspace.dispatch_metadata_build_count, 1);
+        assert_eq!(retried_workspace.dispatch_scratch_capacity_growth_count, 0);
+        assert!(retried_workspace.dispatch_scratch_is_empty);
     }
 
     #[test]
@@ -14067,6 +14075,10 @@ mod tests {
 
         for index in [0, item_count / 2, item_count - 1] {
             let mut native = plan.prepare(&target).unwrap();
+            let prepared_workspace = native.main_replay.workspace_stats();
+            assert_eq!(prepared_workspace.dispatch_metadata_build_count, 1);
+            assert_eq!(prepared_workspace.dispatch_scratch_capacity_growth_count, 0);
+            assert!(prepared_workspace.dispatch_scratch_is_empty);
             let checkpoint = native.checkpoint().unwrap();
             let cursor = native.inner.inner.cursor.clone();
             let counts = native_recurrent_test_counts(&native);
@@ -14084,6 +14096,10 @@ mod tests {
             assert_eq!(native.inner.inner.cursor, cursor);
             assert_eq!(native_recurrent_test_counts(&native), counts);
             assert_eq!(native.checkpoint().unwrap(), checkpoint);
+            let rejected_workspace = native.main_replay.workspace_stats();
+            assert_eq!(rejected_workspace.dispatch_metadata_build_count, 1);
+            assert_eq!(rejected_workspace.dispatch_scratch_capacity_growth_count, 0);
+            assert!(rejected_workspace.dispatch_scratch_is_empty);
 
             let replay = native.step(batch(), lr()).unwrap();
             assert!(replay.report().module_dispatch_count() > 0);
@@ -14091,6 +14107,10 @@ mod tests {
                 replay.report().module_dispatched_native_item_count(),
                 replay.report().executed_native_item_count()
             );
+            let retried_workspace = native.main_replay.workspace_stats();
+            assert_eq!(retried_workspace.dispatch_metadata_build_count, 1);
+            assert_eq!(retried_workspace.dispatch_scratch_capacity_growth_count, 0);
+            assert!(retried_workspace.dispatch_scratch_is_empty);
         }
     }
 
@@ -14477,6 +14497,18 @@ mod tests {
             .unwrap()
             .workspace_stats();
         let reset_workspace = native.zero_grad_replay.as_ref().unwrap().workspace_stats();
+        for workspace in [
+            native.main_replay.workspace_stats(),
+            accumulation_workspace,
+            flush_workspace,
+            reset_workspace,
+        ] {
+            assert!(workspace.sealed_dispatch_step_count > 0);
+            assert!(workspace.sealed_dispatch_segment_count > 0);
+            assert_eq!(workspace.dispatch_metadata_build_count, 1);
+            assert_eq!(workspace.dispatch_scratch_capacity_growth_count, 0);
+            assert!(workspace.dispatch_scratch_is_empty);
+        }
         assert_eq!(native.main_replay.structure_validation_count(), 1);
         assert_eq!(
             native
@@ -14879,6 +14911,11 @@ mod tests {
             .workspace_stats();
         assert!(workspace.allocation_count > 0);
         assert_eq!(workspace.input_import_count, 0);
+        assert!(workspace.sealed_dispatch_step_count > 0);
+        assert!(workspace.sealed_dispatch_segment_count > 0);
+        assert_eq!(workspace.dispatch_metadata_build_count, 1);
+        assert_eq!(workspace.dispatch_scratch_capacity_growth_count, 0);
+        assert!(workspace.dispatch_scratch_is_empty);
         let before_invalid_counts = native_recurrent_test_counts(&session.runtime);
 
         assert!(session.evaluate(BTreeMap::new()).is_err());
@@ -15008,6 +15045,12 @@ mod tests {
         assert_eq!(evaluated_workspace.borrowed_recurrent_input_bytes, 8);
         assert_eq!(evaluated_workspace.borrowed_recurrent_output_bytes, 0);
         assert_eq!(evaluated_workspace.intermediate_materialization_count, 0);
+        assert_eq!(evaluated_workspace.dispatch_metadata_build_count, 1);
+        assert_eq!(
+            evaluated_workspace.dispatch_scratch_capacity_growth_count,
+            0
+        );
+        assert!(evaluated_workspace.dispatch_scratch_is_empty);
 
         session
             .step(
@@ -15044,6 +15087,9 @@ mod tests {
         assert_eq!(updated_workspace.borrowed_external_input_bytes, 16);
         assert_eq!(updated_workspace.borrowed_recurrent_input_bytes, 16);
         assert_eq!(updated_workspace.borrowed_recurrent_output_bytes, 0);
+        assert_eq!(updated_workspace.dispatch_metadata_build_count, 1);
+        assert_eq!(updated_workspace.dispatch_scratch_capacity_growth_count, 0);
+        assert!(updated_workspace.dispatch_scratch_is_empty);
     }
 
     #[test]
