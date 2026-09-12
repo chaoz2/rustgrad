@@ -735,6 +735,29 @@ pub(crate) fn canonical_transpose_copy(
     canonical_scalar_transpose_copy(item)
 }
 
+pub(crate) fn canonical_dense_copy(item: &ScheduleItem) -> Option<(u64, u64)> {
+    let [binding] = item.ordered_inputs() else {
+        return None;
+    };
+    let crate::Operation::Movement(crate::MovementValue::Plan(plan)) = item.kernel.operation()
+    else {
+        return None;
+    };
+    let crate::MovementKernelKind::Contiguous { input } = &plan.kind else {
+        return None;
+    };
+    let output = item.primary_output();
+    (plan.validate().is_ok()
+        && input.node == binding.input_node
+        && binding.desc.view.is_none()
+        && input.shape == plan.output_shape
+        && input.dtype == plan.dtype
+        && input.shape == output.shape
+        && input.dtype == output.dtype
+        && plan.output.index() as u64 == output.id)
+        .then_some((binding.desc.id, output.id))
+}
+
 fn schedule_matmul_layouts(
     item: &ScheduleItem,
 ) -> Result<Option<crate::cpu_jit::NativeMatmulLayouts>, JitBackendError> {
@@ -805,8 +828,11 @@ fn validate_native_layout(
         }
     }
     if let Some(source) = layout.elided_output_source {
-        let candidate = canonical_transpose_copy(item)?;
-        if candidate.as_ref().map(|candidate| candidate.0) != Some(source) {
+        let transpose = canonical_transpose_copy(item)?;
+        let dense = canonical_dense_copy(item);
+        if transpose.as_ref().map(|candidate| candidate.0) != Some(source)
+            && dense.map(|candidate| candidate.0) != Some(source)
+        {
             return Err(JitBackendError::Binding(
                 "native elided output source mismatch".into(),
             ));

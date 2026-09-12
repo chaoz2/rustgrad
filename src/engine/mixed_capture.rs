@@ -213,115 +213,164 @@ impl<'a> NativeReplayContext<'a> {
             requested,
             replacements,
         } = prepared;
+        let retained = plan
+            .retained_recurrent_states()
+            .iter()
+            .map(|state| state.state_buffer)
+            .collect::<BTreeSet<_>>();
         replacements.validate_external_inputs(provided)?;
         let public = requested.iter().copied().collect::<BTreeSet<_>>();
-        let staged = runtime.transact_recurrent_native_banks(&current, &next, |banks| {
-            let (mut values, traffic, executor_wall_time) = {
-                let mut active = BTreeMap::new();
-                let mut inactive = BTreeMap::new();
-                for bank in banks.iter_mut() {
-                    let buffer = bank.buffer_id();
-                    let (current, successor) = bank.tensors();
-                    active.insert(buffer, current);
-                    inactive.insert(buffer, successor);
-                }
-                let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
-                let executor_started = Instant::now();
-                let executed = executor.execute_sealed_planned_native_items_resolved(
-                    pure,
-                    plan,
-                    &mut borrowed,
-                    Some(&public),
-                    |workspace, borrowed| {
-                        for replacement in &replacements.replacements {
-                            let successor =
-                                inactive.remove(&replacement.buffer).ok_or_else(|| {
-                                    ReplayError::Missing(format!(
-                                        "recurrent successor state {}",
-                                        replacement.buffer
-                                    ))
-                                })?;
-                            workspace.borrow_recurrent_output(
-                                replacement.producer,
-                                successor,
-                                borrowed,
-                            )?;
-                        }
-                        if !inactive.is_empty() {
-                            return Err(ReplayError::Corrupt(
-                                "recurrent successor binding set mismatch".into(),
-                            ));
-                        }
-                        Ok(())
-                    },
-                    |input, workspace, borrowed| {
-                        if let Some(buffer) = replacements.state_inputs.get(&input.name) {
-                            let value = active.get(buffer).copied().ok_or_else(|| {
-                                ReplayError::Missing(format!("recurrent input state {buffer}"))
-                            })?;
-                            super::captured_replay::validate_input_value(pure, input, value)?;
-                            workspace.borrow_recurrent_input(&input.name, value, borrowed)?;
+        let staged = runtime.transact_recurrent_native_banks_retaining(
+            &current,
+            &next,
+            &retained,
+            |banks| {
+                let (mut values, traffic, executor_wall_time) = {
+                    let mut active = BTreeMap::new();
+                    let mut inactive = BTreeMap::new();
+                    for bank in banks.iter_mut() {
+                        let buffer = bank.buffer_id();
+                        if bank.is_retained() {
+                            active.insert(buffer, bank.successor());
                         } else {
-                            let value = provided
-                                .get(&input.name)
-                                .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
-                            super::captured_replay::validate_input_value(pure, input, value)?;
-                            workspace.bind_external_input(&input.name, value, borrowed)?;
+                            let (current, successor) = bank.tensors();
+                            active.insert(buffer, current);
+                            inactive.insert(buffer, successor);
                         }
-                        Ok(())
-                    },
-                );
-                let executor_wall_time = executor_started.elapsed();
-                let (values, traffic) = executed?;
-                (values, traffic, executor_wall_time)
-            };
-            let outputs = requested
-                .iter()
-                .map(|id| {
-                    if replacements
-                        .replacements
-                        .iter()
-                        .any(|replacement| replacement.producer == *id)
-                    {
-                        // A public state successor was materialized as an
-                        // independent snapshot; preserve it while the inactive
-                        // recurrent bank becomes authoritative.
-                        values.tensor(*id, "requested mixed output").cloned()
-                    } else {
-                        values.take_tensor(*id, "requested mixed output")
                     }
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let successor_values = replacements
-                .replacements
-                .iter()
-                .map(|replacement| {
-                    banks
-                        .iter()
-                        .find(|bank| bank.buffer_id() == replacement.buffer)
-                        .map(|bank| bank.inactive())
-                        .ok_or_else(|| {
-                            ReplayError::Missing(format!(
-                                "recurrent successor state {}",
-                                replacement.buffer
-                            ))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            validate_transition(&outputs, &successor_values).map_err(ReplayError::Execute)?;
-            if let Some(step) = injected_failure
-                && replacements
+                    let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
+                    let executor_started = Instant::now();
+                    let executed = executor.execute_sealed_planned_native_items_resolved(
+                        pure,
+                        plan,
+                        &mut borrowed,
+                        Some(&public),
+                        |workspace, borrowed| {
+                            for replacement in &replacements.replacements {
+                                if retained.contains(&replacement.buffer) {
+                                    continue;
+                                }
+                                let successor =
+                                    inactive.remove(&replacement.buffer).ok_or_else(|| {
+                                        ReplayError::Missing(format!(
+                                            "recurrent successor state {}",
+                                            replacement.buffer
+                                        ))
+                                    })?;
+                                workspace.borrow_recurrent_output(
+                                    replacement.producer,
+                                    successor,
+                                    borrowed,
+                                )?;
+                            }
+                            if !inactive.is_empty() {
+                                return Err(ReplayError::Corrupt(
+                                    "recurrent successor binding set mismatch".into(),
+                                ));
+                            }
+                            Ok(())
+                        },
+                        |input, workspace, borrowed| {
+                            if let Some(buffer) = replacements.state_inputs.get(&input.name) {
+                                let value = active.get(buffer).copied().ok_or_else(|| {
+                                    ReplayError::Missing(format!("recurrent input state {buffer}"))
+                                })?;
+                                super::captured_replay::validate_input_value(pure, input, value)?;
+                                workspace.borrow_recurrent_input(&input.name, value, borrowed)?;
+                            } else {
+                                let value = provided
+                                    .get(&input.name)
+                                    .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
+                                super::captured_replay::validate_input_value(pure, input, value)?;
+                                workspace.bind_external_input(&input.name, value, borrowed)?;
+                            }
+                            Ok(())
+                        },
+                    );
+                    let executor_wall_time = executor_started.elapsed();
+                    let (values, traffic) = executed?;
+                    (values, traffic, executor_wall_time)
+                };
+                let outputs = requested
+                    .iter()
+                    .map(|id| {
+                        if replacements
+                            .replacements
+                            .iter()
+                            .any(|replacement| replacement.producer == *id)
+                        {
+                            // A public state successor was materialized as an
+                            // independent snapshot; preserve it while the inactive
+                            // recurrent bank becomes authoritative.
+                            values.tensor(*id, "requested mixed output").cloned()
+                        } else {
+                            values.take_tensor(*id, "requested mixed output")
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let successor_values = replacements
                     .replacements
                     .iter()
-                    .any(|replacement| replacement.step == step)
-            {
-                return Err(ReplayError::Execute(format!(
-                    "recurrent commit: {:?}",
-                    crate::RuntimeError::InjectedFailure(step)
-                )));
-            }
-            Ok((outputs, traffic, executor_wall_time))
-        });
+                    .map(|replacement| {
+                        banks
+                            .iter()
+                            .find(|bank| bank.buffer_id() == replacement.buffer)
+                            .map(|bank| bank.successor())
+                            .ok_or_else(|| {
+                                ReplayError::Missing(format!(
+                                    "recurrent successor state {}",
+                                    replacement.buffer
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                validate_transition(&outputs, &successor_values).map_err(ReplayError::Execute)?;
+                if let Some(step) = injected_failure
+                    && replacements
+                        .replacements
+                        .iter()
+                        .any(|replacement| replacement.step == step)
+                {
+                    return Err(ReplayError::Execute(format!(
+                        "recurrent commit: {:?}",
+                        crate::RuntimeError::InjectedFailure(step)
+                    )));
+                }
+                let retained_state_count = u64::try_from(retained.len()).map_err(|_| {
+                    ReplayError::Corrupt("retained recurrent state count exceeds u64".into())
+                })?;
+                let retained_state_bytes = current
+                    .iter()
+                    .filter(|state| retained.contains(&state.buffer))
+                    .try_fold(0u64, |total, state| {
+                        total
+                            .checked_add(u64::try_from(state.bytes).map_err(|_| {
+                                ReplayError::Corrupt(
+                                    "retained recurrent state bytes exceed u64".into(),
+                                )
+                            })?)
+                            .ok_or_else(|| {
+                                ReplayError::Corrupt(
+                                    "retained recurrent state bytes overflow".into(),
+                                )
+                            })
+                    })?;
+                let mut traffic = traffic;
+                if !retained.is_empty() {
+                    traffic.retained_recurrent_state_count = retained_state_count;
+                    traffic.retained_recurrent_state_bytes = retained_state_bytes;
+                    traffic.replaced_recurrent_state_count = u64::try_from(
+                        current.len().saturating_sub(retained.len()),
+                    )
+                    .map_err(|_| {
+                        ReplayError::Corrupt("replaced recurrent state count exceeds u64".into())
+                    })?;
+                    traffic.replaced_recurrent_state_bytes =
+                        traffic.borrowed_recurrent_output_bytes;
+                }
+                Ok((outputs, traffic, executor_wall_time))
+            },
+        );
         let (outputs, traffic, executor_wall_time) = match staged {
             Ok(staged) => staged,
             Err(crate::effects::runtime::RecurrentTransactionError::Stage(error)) => {
@@ -389,6 +438,7 @@ pub(crate) struct RecurrentNativePreparation {
     requested: Vec<u64>,
     replacements: PreparedRecurrentReplacementPlan,
     replay: NativeMixedReplayTrace,
+    retained_recurrent_states: Vec<super::captured_replay::NativeRecurrentStateRetention>,
 }
 
 impl RecurrentNativePreparation {
@@ -409,6 +459,12 @@ impl RecurrentNativePreparation {
 
     pub(crate) fn release_input_witnesses(&mut self) {
         self.inputs = None;
+    }
+
+    pub(crate) fn retained_recurrent_states(
+        &self,
+    ) -> &[super::captured_replay::NativeRecurrentStateRetention] {
+        &self.retained_recurrent_states
     }
 
     pub(crate) fn finish(
@@ -456,6 +512,8 @@ impl PreparedRecurrentNativeReplay {
         replacements: PreparedRecurrentReplacementPlan,
     ) -> Result<Self, ReplayError> {
         replacements.authenticate_adamw_native_updates(plan.adamw_native_updates())?;
+        replacements
+            .authenticate_retained_recurrent_states(&pure, plan.retained_recurrent_states())?;
         let plan = plan.seal(&pure)?;
         if trace.item_count != plan.item_count()
             || trace.cache_hit_count != plan.cache_hit_count()
@@ -492,6 +550,20 @@ impl PreparedRecurrentNativeReplay {
     #[cfg(test)]
     pub(crate) fn last_executed_native_item_count(&self) -> usize {
         self.plan.last_executed_native_item_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_recurrent_state_count(&self) -> usize {
+        self.plan.retained_recurrent_states().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_recurrent_state_buffers(&self) -> BTreeSet<u64> {
+        self.plan
+            .retained_recurrent_states()
+            .iter()
+            .map(|state| state.state_buffer)
+            .collect()
     }
 
     #[cfg(test)]
@@ -572,6 +644,90 @@ impl PreparedRecurrentNativeReplay {
 }
 
 impl PreparedRecurrentReplacementPlan {
+    fn authenticate_retained_recurrent_states(
+        &self,
+        pure: &CapturedSchedule,
+        retained: &[super::captured_replay::NativeRecurrentStateRetention],
+    ) -> Result<(), ReplayError> {
+        let replacements = self
+            .replacements
+            .iter()
+            .map(|replacement| ((replacement.producer, replacement.buffer), replacement))
+            .collect::<BTreeMap<_, _>>();
+        let mut buffers = BTreeSet::new();
+        let state_inputs = pure
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                self.state_inputs
+                    .get(&input.name)
+                    .map(|buffer| (input.desc.id, *buffer))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for state in retained {
+            if !buffers.insert(state.state_buffer)
+                || !replacements.contains_key(&(state.output, state.state_buffer))
+                || state_inputs.get(&state.input) != Some(&state.state_buffer)
+            {
+                return Err(ReplayError::Corrupt(
+                    "prepared retained recurrent replacement mismatch".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn exact_dense_passthroughs(
+        &self,
+        pure: &CapturedSchedule,
+        requested: &[u64],
+    ) -> Result<Vec<super::captured_replay::NativeRecurrentStateRetention>, ReplayError> {
+        let state_inputs = pure
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                self.state_inputs
+                    .get(&input.name)
+                    .map(|buffer| (input.desc.id, *buffer))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut retained: Vec<super::captured_replay::NativeRecurrentStateRetention> = Vec::new();
+        for replacement in &self.replacements {
+            if requested.contains(&replacement.producer) {
+                continue;
+            }
+            let Some((logical_index, item)) = pure
+                .items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.primary_output().id == replacement.producer)
+            else {
+                continue;
+            };
+            let Some((input, output)) = crate::backend::canonical_dense_copy(item) else {
+                continue;
+            };
+            if state_inputs.get(&input) != Some(&replacement.buffer)
+                || item
+                    .consumers
+                    .iter()
+                    .any(|consumer| pure.items.iter().any(|candidate| candidate.id == *consumer))
+                || retained
+                    .iter()
+                    .any(|state| state.input == input || state.output == output)
+            {
+                continue;
+            }
+            retained.push(super::captured_replay::NativeRecurrentStateRetention {
+                logical_index,
+                input,
+                output,
+                state_buffer: replacement.buffer,
+            });
+        }
+        Ok(retained)
+    }
+
     fn authenticate_adamw_native_updates(
         &self,
         updates: &[super::captured_replay::AdamWNativeUpdateManifest],
@@ -1108,6 +1264,27 @@ impl CapturedMixedSchedule {
         provided: &BTreeMap<String, crate::TensorData>,
         vectorized: bool,
     ) -> Result<RecurrentNativePreparation, ReplayError> {
+        self.preflight_recurrent_native_impl(runtime, cursor, provided, vectorized, false)
+    }
+
+    pub(crate) fn preflight_recurrent_native_retaining_unchanged(
+        &self,
+        runtime: &crate::EffectRuntime,
+        cursor: &MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        vectorized: bool,
+    ) -> Result<RecurrentNativePreparation, ReplayError> {
+        self.preflight_recurrent_native_impl(runtime, cursor, provided, vectorized, true)
+    }
+
+    fn preflight_recurrent_native_impl(
+        &self,
+        runtime: &crate::EffectRuntime,
+        cursor: &MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        vectorized: bool,
+        retain_unchanged: bool,
+    ) -> Result<RecurrentNativePreparation, ReplayError> {
         validate(self, true)?;
         validate_recurrent_cursor(self, cursor)?;
         let starts = recurrent_rebase_starts(self, cursor)?;
@@ -1141,12 +1318,18 @@ impl CapturedMixedSchedule {
             }
         }
         pure.identity = 0;
+        let retained_recurrent_states = if retain_unchanged {
+            replacements.exact_dense_passthroughs(&pure, &self.schedule.requested)?
+        } else {
+            Vec::new()
+        };
         Ok(RecurrentNativePreparation {
             pure,
             inputs: Some(inputs),
             requested: self.schedule.requested.clone(),
             replacements,
             replay: self.native_replay_trace(vectorized)?,
+            retained_recurrent_states,
         })
     }
 

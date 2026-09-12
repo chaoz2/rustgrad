@@ -32,7 +32,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V7: u32 = 7;
 const NATIVE_TRAINING_REPORT_FORMAT_V8: u32 = 8;
 const NATIVE_TRAINING_REPORT_FORMAT_V9: u32 = 9;
 const NATIVE_TRAINING_REPORT_FORMAT_V10: u32 = 10;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 11;
+const NATIVE_TRAINING_REPORT_FORMAT_V11: u32 = 11;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 12;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -335,6 +336,7 @@ impl NativeTrainingProgramReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
                 | NATIVE_TRAINING_REPORT_FORMAT_V10
+                | NATIVE_TRAINING_REPORT_FORMAT_V11
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self)?,
@@ -719,6 +721,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
                 | NATIVE_TRAINING_REPORT_FORMAT_V10
+                | NATIVE_TRAINING_REPORT_FORMAT_V11
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -757,14 +760,45 @@ impl NativeTrainingReport {
             self.accumulation_replay_executed_native_item_count,
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V10, None, None, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_V11, Some(program), Some(traffic), Some(executed))
+                if traffic.borrowed_recurrent_input_bytes()
+                    == self.recurrent_logical_state_bytes
+                    && traffic.borrowed_recurrent_output_bytes()
+                        == self.recurrent_logical_state_bytes
+                    && traffic.retained_recurrent_state_count() == 0
+                    && traffic.retained_recurrent_state_bytes() == 0
+                    && traffic.replaced_recurrent_state_count() == 0
+                    && traffic.replaced_recurrent_state_bytes() == 0
+                    && executed <= program.rendered_entry_count
+                    && program.capture_identity != self.main.capture_identity =>
+            {
+                program.validate(self.format_version)?;
+                if program.vectorized != self.main.vectorized {
+                    return Err(invalid("native program vectorization policy differs"));
+                }
+            }
             (
                 NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(program),
                 Some(traffic),
                 Some(executed),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
-                && traffic.borrowed_recurrent_output_bytes()
-                    == self.recurrent_logical_state_bytes
+                && traffic
+                    .borrowed_recurrent_output_bytes()
+                    .checked_add(traffic.retained_recurrent_state_bytes())
+                    == Some(self.recurrent_logical_state_bytes)
+                && traffic.retained_recurrent_state_count()
+                    <= self.recurrent_logical_state_count
+                && ((traffic.retained_recurrent_state_count() == 0
+                    && traffic.retained_recurrent_state_bytes() == 0
+                    && traffic.replaced_recurrent_state_count() == 0
+                    && traffic.replaced_recurrent_state_bytes() == 0)
+                    || (traffic
+                        .retained_recurrent_state_count()
+                        .checked_add(traffic.replaced_recurrent_state_count())
+                        == Some(self.recurrent_logical_state_count)
+                        && traffic.replaced_recurrent_state_bytes()
+                            == traffic.borrowed_recurrent_output_bytes()))
                 && executed <= program.rendered_entry_count
                 && program.capture_identity != self.main.capture_identity =>
             {
@@ -786,11 +820,24 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
                 | NATIVE_TRAINING_REPORT_FORMAT_V10
-                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                | NATIVE_TRAINING_REPORT_FORMAT_V11,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
                 && traffic.borrowed_recurrent_output_bytes()
-                    == self.recurrent_logical_state_bytes => {}
+                    == self.recurrent_logical_state_bytes
+                && traffic.retained_recurrent_state_count() == 0
+                && traffic.retained_recurrent_state_bytes() == 0
+                && traffic.replaced_recurrent_state_count() == 0
+                && traffic.replaced_recurrent_state_bytes() == 0 => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(traffic))
+                if traffic.borrowed_recurrent_input_bytes()
+                    == self.recurrent_logical_state_bytes
+                    && traffic.borrowed_recurrent_output_bytes()
+                        == self.recurrent_logical_state_bytes
+                    && traffic.retained_recurrent_state_count() == 0
+                    && traffic.retained_recurrent_state_bytes() == 0
+                    && traffic.replaced_recurrent_state_count() == 0
+                    && traffic.replaced_recurrent_state_bytes() == 0 => {}
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2, Some(_)) => {
                 return Err(invalid("legacy native training report has replay traffic"));
             }
@@ -809,7 +856,8 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V7
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
-                | NATIVE_TRAINING_REPORT_FORMAT_V10,
+                | NATIVE_TRAINING_REPORT_FORMAT_V10
+                | NATIVE_TRAINING_REPORT_FORMAT_V11,
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
             (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(executed))
@@ -846,6 +894,7 @@ impl NativeTrainingReport {
             NATIVE_TRAINING_REPORT_FORMAT_V8
             | NATIVE_TRAINING_REPORT_FORMAT_V9
             | NATIVE_TRAINING_REPORT_FORMAT_V10
+            | NATIVE_TRAINING_REPORT_FORMAT_V11
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
@@ -929,6 +978,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
                 | NATIVE_TRAINING_REPORT_FORMAT_V10
+                | NATIVE_TRAINING_REPORT_FORMAT_V11
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
@@ -939,6 +989,7 @@ impl NativeTrainingReport {
                         NATIVE_TRAINING_REPORT_FORMAT_V8
                         | NATIVE_TRAINING_REPORT_FORMAT_V9
                         | NATIVE_TRAINING_REPORT_FORMAT_V10
+                        | NATIVE_TRAINING_REPORT_FORMAT_V11
                         | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                         Some(overlap),
                     ) => overlap
@@ -1023,6 +1074,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V8
                 | NATIVE_TRAINING_REPORT_FORMAT_V9
                 | NATIVE_TRAINING_REPORT_FORMAT_V10
+                | NATIVE_TRAINING_REPORT_FORMAT_V11
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -1051,7 +1103,9 @@ impl NativeTrainingReport {
         match (self.format_version, &self.step_phases) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V9, None) => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V10 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V10
+                | NATIVE_TRAINING_REPORT_FORMAT_V11
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(phases),
             ) => phases.validate(
                 self.successful_replay_count,
@@ -1324,8 +1378,29 @@ impl NativeTrainingScoreboard {
             self.inspection.recurrent_state_bytes,
             "recurrent state byte",
         )?;
+        let has_recurrent_inventory = report.traffic().retained_recurrent_state_count() != 0
+            || report.traffic().retained_recurrent_state_bytes() != 0
+            || report.traffic().replaced_recurrent_state_count() != 0
+            || report.traffic().replaced_recurrent_state_bytes() != 0;
         if report.traffic().borrowed_recurrent_input_bytes() != recurrent_state_bytes
-            || report.traffic().borrowed_recurrent_output_bytes() != recurrent_state_bytes
+            || report
+                .traffic()
+                .borrowed_recurrent_output_bytes()
+                .checked_add(report.traffic().retained_recurrent_state_bytes())
+                != Some(recurrent_state_bytes)
+            || report.traffic().retained_recurrent_state_count()
+                > count(self.inspection.recurrent_state_count, "recurrent state")?
+            || (has_recurrent_inventory
+                && (report
+                    .traffic()
+                    .retained_recurrent_state_count()
+                    .checked_add(report.traffic().replaced_recurrent_state_count())
+                    != Some(count(
+                        self.inspection.recurrent_state_count,
+                        "recurrent state",
+                    )?)
+                    || report.traffic().replaced_recurrent_state_bytes()
+                        != report.traffic().borrowed_recurrent_output_bytes()))
         {
             return Err(invalid(
                 "native replay traffic does not match recurrent state",
@@ -1868,7 +1943,8 @@ mod tests {
         accumulation.native_identity = 12;
         accumulation.execution_plan_identity = 14;
         report.accumulation = Some(accumulation);
-        report.accumulation_replay_traffic = report.main_replay_traffic;
+        report.accumulation_replay_traffic =
+            Some(NativeCpuReplayTraffic::new(2, 12, 16, 8).with_recurrent_inventory(2, 8, 2, 8));
         report.accumulation_replay_executed_native_item_count =
             report.main_replay_executed_native_item_count;
         report.accumulation_schedule_cache_keys = vec![23, 29];
@@ -1913,6 +1989,39 @@ mod tests {
             serde_json::json!(15);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["accumulation_replay_traffic"]["retained_recurrent_state_count"] =
+            serde_json::json!(1);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+    }
+
+    #[test]
+    fn phase_specialized_v11_report_decodes_without_recurrent_retention_inventory() {
+        let report = phase_specialized_report();
+        let mut json = serde_json::to_value(report).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V11);
+        for phase in ["main_replay_traffic", "accumulation_replay_traffic"] {
+            let traffic = json[phase].as_object_mut().unwrap();
+            traffic.remove("retained_recurrent_state_count");
+            traffic.remove("retained_recurrent_state_bytes");
+            traffic.remove("replaced_recurrent_state_count");
+            traffic.remove("replaced_recurrent_state_bytes");
+        }
+        json["accumulation_replay_traffic"]["borrowed_recurrent_output_bytes"] =
+            serde_json::json!(16);
+        let decoded =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V11);
+        assert_eq!(
+            decoded
+                .accumulation_replay_traffic()
+                .unwrap()
+                .retained_recurrent_state_count(),
+            0
         );
     }
 

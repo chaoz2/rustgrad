@@ -817,6 +817,7 @@ pub(crate) struct PlannedNativeItems {
     input_schema: Vec<crate::ReplayInput>,
     schedule_cache_keys: Vec<u64>,
     adamw_native_updates: Vec<AdamWNativeUpdateManifest>,
+    retained_recurrent_states: Vec<NativeRecurrentStateRetention>,
     #[cfg(test)]
     adamw_native_update_admissions: Vec<AdamWNativeUpdateAdmissionDiagnostic>,
     #[cfg(test)]
@@ -828,6 +829,7 @@ pub(crate) struct NativeItemPlanDraft {
     layout_wall_time: Duration,
     adamw_native_updates: Vec<crate::backend::NativeStoreGroup>,
     admitted_adamw_updates: Vec<AdamWNativeUpdateManifest>,
+    retained_recurrent_states: Vec<NativeRecurrentStateRetention>,
     #[cfg(test)]
     adamw_native_update_admissions: Vec<AdamWNativeUpdateAdmissionDiagnostic>,
 }
@@ -850,6 +852,14 @@ pub(crate) struct AdamWNativeUpdateSuccessor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AdamWNativeUpdateManifest {
     pub(crate) members: [AdamWNativeUpdateSuccessor; 4],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeRecurrentStateRetention {
+    pub(crate) logical_index: usize,
+    pub(crate) input: u64,
+    pub(crate) output: u64,
+    pub(crate) state_buffer: u64,
 }
 
 #[cfg(test)]
@@ -1016,6 +1026,10 @@ impl PlannedNativeItems {
         &self.adamw_native_updates
     }
 
+    pub(crate) fn retained_recurrent_states(&self) -> &[NativeRecurrentStateRetention] {
+        &self.retained_recurrent_states
+    }
+
     #[cfg(test)]
     pub(crate) fn adamw_native_update_admissions(&self) -> &[AdamWNativeUpdateAdmissionDiagnostic] {
         &self.adamw_native_update_admissions
@@ -1108,7 +1122,8 @@ impl PlannedNativeItems {
                 "prepared native schedule cache keys mismatch".into(),
             ));
         }
-        let layouts = native_schedule_layouts(capture)?;
+        let layouts =
+            native_schedule_layouts_with_retained(capture, &self.retained_recurrent_states)?;
         let mut covered = vec![false; capture.items.len()];
         for prepared in &self.items {
             match prepared {
@@ -1204,6 +1219,10 @@ impl SealedPlannedNativeItems {
         self.plan.schedule_cache_keys()
     }
 
+    pub(super) fn retained_recurrent_states(&self) -> &[NativeRecurrentStateRetention] {
+        self.plan.retained_recurrent_states()
+    }
+
     pub(super) fn module_preparation(&self) -> crate::backend::NativeScheduleModulePreparation {
         self.plan.module_preparation()
     }
@@ -1267,8 +1286,9 @@ impl SealedPlannedNativeItems {
     }
 }
 
-fn native_schedule_layouts(
+fn native_schedule_layouts_with_retained(
     capture: &CapturedSchedule,
+    retained: &[NativeRecurrentStateRetention],
 ) -> Result<Vec<NativeScheduleLayout>, ReplayError> {
     let mut layouts = capture
         .items
@@ -1446,7 +1466,46 @@ fn native_schedule_layouts(
             }
         }
     }
+    let mut retained_inputs = BTreeSet::new();
+    let mut retained_outputs = BTreeSet::new();
+    for state in retained {
+        let Some(item) = capture.items.get(state.logical_index) else {
+            return Err(ReplayError::Corrupt(
+                "retained recurrent logical item is out of range".into(),
+            ));
+        };
+        if item.primary_output().id != state.output
+            || crate::backend::canonical_dense_copy(item) != Some((state.input, state.output))
+            || !retained_inputs.insert(state.input)
+            || !retained_outputs.insert(state.output)
+            || item.consumers.iter().any(|consumer| {
+                capture
+                    .items
+                    .iter()
+                    .any(|candidate| candidate.id == *consumer)
+            })
+        {
+            return Err(ReplayError::Corrupt(
+                "retained recurrent state is not an exact private dense pass-through".into(),
+            ));
+        }
+        if layouts[state.logical_index]
+            .elided_output_source
+            .replace(state.input)
+            .is_some()
+        {
+            return Err(ReplayError::Corrupt(
+                "retained recurrent state overlaps another native elision".into(),
+            ));
+        }
+    }
     Ok(layouts)
+}
+
+fn native_schedule_layouts(
+    capture: &CapturedSchedule,
+) -> Result<Vec<NativeScheduleLayout>, ReplayError> {
+    native_schedule_layouts_with_retained(capture, &[])
 }
 
 fn plan_adamw_native_update(
@@ -1782,9 +1841,27 @@ impl CapturedReplayExecutor {
             layout_wall_time: started.elapsed(),
             adamw_native_updates,
             admitted_adamw_updates,
+            retained_recurrent_states: Vec::new(),
             #[cfg(test)]
             adamw_native_update_admissions: admitted.diagnostics,
         })
+    }
+
+    pub(crate) fn preflight_native_items_with_recurrent_retention(
+        &self,
+        capture: &CapturedSchedule,
+        provided: &BTreeMap<String, TensorData>,
+        retained: &[NativeRecurrentStateRetention],
+    ) -> Result<NativeItemPlanDraft, ReplayError> {
+        let mut draft = self.preflight_native_items(capture, provided)?;
+        let started = Instant::now();
+        draft.layouts = native_schedule_layouts_with_retained(capture, retained)?;
+        draft.layout_wall_time = draft
+            .layout_wall_time
+            .checked_add(started.elapsed())
+            .ok_or_else(|| ReplayError::Corrupt("native layout duration overflow".into()))?;
+        draft.retained_recurrent_states = retained.to_vec();
+        Ok(draft)
     }
 
     pub(crate) fn plan_native_items(
@@ -1865,6 +1942,7 @@ impl CapturedReplayExecutor {
                     input_schema: capture.inputs.clone(),
                     schedule_cache_keys: capture.items.iter().map(|item| item.cache_key).collect(),
                     adamw_native_updates: draft.admitted_adamw_updates,
+                    retained_recurrent_states: draft.retained_recurrent_states,
                     #[cfg(test)]
                     adamw_native_update_admissions: draft.adamw_native_update_admissions,
                     #[cfg(test)]

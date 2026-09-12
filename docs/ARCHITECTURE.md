@@ -944,8 +944,16 @@ totals, and source-ordered dropout advancement; parameters, moments, and
 optimizer step are complete authenticated pass-through successors. Host
 progress selects it only before the window-closing replay, while every
 successful transition still replaces the full frontier and advances every
-logical version once. Learning-rate values are validated even though neither
-external nor scheduled learning-rate/AdamW candidate work is reachable. The
+logical version once. On strict-native CPU, exact private dense pass-through
+successors retain their authenticated active host bank: only accumulator,
+index, token/loss-total, and dropout successors borrow inactive destinations
+and flip. The prepared plan proves each retained output is a private
+same-descriptor `Contiguous` copy of the matching state input; any candidate
+that fails that proof follows the historical full-replacement path. Validation,
+injected failure, and all successor admission precede the single selective bank
+commit, so retained bytes cannot weaken retry atomicity. Learning-rate values
+are validated even though neither external nor scheduled learning-rate/AdamW
+candidate work is reachable. The
 interpreter and strict-native CPU refrontier the sibling's atomic commit into
 the authoritative main cursor; checkpoint v9 authenticates both capture
 identities. The strict-Metal program and execution path remain the existing
@@ -1024,7 +1032,7 @@ interpreter and strict-Metal targets.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional accumulation/flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v11 validates those facts against strict-native
+separate `NativeTrainingScoreboard` v12 validates those facts against strict-native
 preparation and successful training-step reports, then aggregates caller-observed
 compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
 sample set into versioned JSON. Every attached native program partitions its
@@ -1036,12 +1044,14 @@ complete-job overlap from summed program totals. V9 separately authenticates
 logical schedule/cache coverage and grouped physical rendered/executed entry
 counts; v5-v8 retain their original one-rendered-entry-per-logical-item wire
 invariant. Raw report recording continues to emit v9. Without a sibling,
-`record_step` emits v10; phase-specialized accumulation emits v11 and
+`record_step` emits v10; phase-specialized accumulation with full physical
+replacement emits v11, while retained-state accumulation emits v12 and
 authenticates distinct program, cache, traffic, and executed-entry inventories
-for accumulation-only versus optimizer-commit replay. Both classify successful
+plus an exact retained/physically-replaced recurrent-state count and byte
+partition for accumulation-only versus optimizer-commit replay. Both classify successful
 steps solely from `did_update`:
 the first replay remains separate and warm accumulation-only and optimizer-commit
-samples have disjoint, exact timing partitions. V1-v10 JSON remains readable,
+samples have disjoint, exact timing partitions. V1-v11 JSON remains readable,
 and one scoreboard rejects mixed raw/classified recording without consuming a
 sample. Partial flush is not a main-step sample. Main replay wall time is partitioned exactly
 between the sealed native executor and the checked recurrent

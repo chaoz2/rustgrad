@@ -288,14 +288,14 @@ impl EffectRuntime {
         }
     }
 
-    /// Runs one native recurrent transition with direct, call-scoped borrows
-    /// of each active tensor and its inactive successor bank. The pool lock and
-    /// every borrow remain live until staging and validation finish; only then
-    /// are all banks flipped together.
-    pub(crate) fn transact_recurrent_native_banks<T, E>(
+    /// Runs one native recurrent transition with direct, call-scoped borrows.
+    /// Retained states expose only their active successor; every other state
+    /// exposes an inactive destination. Validation precedes one atomic commit.
+    pub(crate) fn transact_recurrent_native_banks_retaining<T, E>(
         &mut self,
         current: &[BufferState],
         next: &[BufferState],
+        retain_active: &BTreeSet<u64>,
         stage: impl FnOnce(&mut [HostBufferBank<'_>]) -> Result<T, E>,
     ) -> Result<T, RecurrentTransactionError<E>> {
         if current.is_empty() || current.len() != next.len() {
@@ -336,7 +336,16 @@ impl EffectRuntime {
                     },
                 ));
             }
-            requests.push(slot.lease.bank_request());
+            requests.push(if retain_active.contains(&current.buffer) {
+                slot.lease.retained_bank_request()
+            } else {
+                slot.lease.bank_request()
+            });
+        }
+        if retain_active.iter().any(|buffer| !seen.contains(buffer)) {
+            return Err(RecurrentTransactionError::Contract(
+                "retained recurrent state is absent from the frontier",
+            ));
         }
 
         let staged = self.pool.transact_inactive_banks(&requests, stage);
@@ -1017,27 +1026,37 @@ mod tests {
         skipped[0].version += 1;
         let staged = std::cell::Cell::new(false);
         assert!(matches!(
-            runtime.transact_recurrent_native_banks(&current, &skipped, |_banks| {
-                staged.set(true);
-                Ok::<_, ()>(())
-            }),
+            runtime.transact_recurrent_native_banks_retaining(
+                &current,
+                &skipped,
+                &BTreeSet::new(),
+                |_banks| {
+                    staged.set(true);
+                    Ok::<_, ()>(())
+                },
+            ),
             Err(RecurrentTransactionError::Contract(
                 "recurrent replacement state mismatch"
             ))
         ));
         assert!(!staged.get());
         assert!(matches!(
-            runtime.transact_recurrent_native_banks(&current, &next[..1], |_banks| {
-                staged.set(true);
-                Ok::<_, ()>(())
-            }),
+            runtime.transact_recurrent_native_banks_retaining(
+                &current,
+                &next[..1],
+                &BTreeSet::new(),
+                |_banks| {
+                    staged.set(true);
+                    Ok::<_, ()>(())
+                },
+            ),
             Err(RecurrentTransactionError::Contract(
                 "recurrent replacement frontier cardinality mismatch"
             ))
         ));
         assert!(!staged.get());
         let observed = runtime
-            .transact_recurrent_native_banks(&current, &next, |banks| {
+            .transact_recurrent_native_banks_retaining(&current, &next, &BTreeSet::new(), |banks| {
                 assert_eq!(banks.len(), 2);
                 for bank in banks {
                     let buffer = bank.buffer_id();
@@ -1080,11 +1099,16 @@ mod tests {
             runtime.snapshot(&next[1]).unwrap(),
         ];
         assert!(matches!(
-            runtime.transact_recurrent_native_banks(&next, &second, |banks| {
-                let (_, inactive) = banks[0].tensors();
-                *inactive = data([2], Storage::F32(vec![90.0, 100.0]));
-                Err::<(), _>("rejected")
-            }),
+            runtime.transact_recurrent_native_banks_retaining(
+                &next,
+                &second,
+                &BTreeSet::new(),
+                |banks| {
+                    let (_, inactive) = banks[0].tensors();
+                    *inactive = data([2], Storage::F32(vec![90.0, 100.0]));
+                    Err::<(), _>("rejected")
+                },
+            ),
             Err(RecurrentTransactionError::Stage("rejected"))
         ));
         assert_eq!(
@@ -1096,7 +1120,7 @@ mod tests {
             before[1].tensor()
         );
         runtime
-            .transact_recurrent_native_banks(&next, &second, |banks| {
+            .transact_recurrent_native_banks_retaining(&next, &second, &BTreeSet::new(), |banks| {
                 assert_eq!(banks.len(), 2);
                 for bank in banks {
                     let buffer = bank.buffer_id();
@@ -1118,6 +1142,39 @@ mod tests {
         );
         assert_eq!(
             runtime.snapshot(&second[1]).unwrap().tensor(),
+            &data([], Storage::U64(vec![11]))
+        );
+
+        let third = second
+            .iter()
+            .cloned()
+            .map(|mut state| {
+                state.version += 1;
+                state
+            })
+            .collect::<Vec<_>>();
+        runtime
+            .transact_recurrent_native_banks_retaining(
+                &second,
+                &third,
+                &BTreeSet::from([42]),
+                |banks| {
+                    assert_eq!(banks.len(), 2);
+                    assert!(!banks[0].is_retained());
+                    assert!(banks[1].is_retained());
+                    assert_eq!(banks[1].successor(), &data([], Storage::U64(vec![11])));
+                    let (_, inactive) = banks[0].tensors();
+                    *inactive = data([2], Storage::F32(vec![12.0, 13.0]));
+                    Ok::<_, ()>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.snapshot(&third[0]).unwrap().tensor(),
+            &data([2], Storage::F32(vec![12.0, 13.0]))
+        );
+        assert_eq!(
+            runtime.snapshot(&third[1]).unwrap().tensor(),
             &data([], Storage::U64(vec![11]))
         );
     }
@@ -1229,9 +1286,10 @@ mod tests {
         let before = runtime.recurrent_test_counts();
 
         assert!(matches!(
-            runtime.transact_recurrent_native_banks(
+            runtime.transact_recurrent_native_banks_retaining(
                 std::slice::from_ref(&current),
                 std::slice::from_ref(&next),
+                &BTreeSet::new(),
                 |banks| {
                     let (_, inactive) = banks[0].tensors();
                     *inactive = data([1], Storage::F32(vec![9.0]));
@@ -1253,9 +1311,10 @@ mod tests {
         ));
 
         runtime
-            .transact_recurrent_native_banks(
+            .transact_recurrent_native_banks_retaining(
                 std::slice::from_ref(&current),
                 std::slice::from_ref(&next),
+                &BTreeSet::new(),
                 |banks| {
                     let (active, inactive) = banks[0].tensors();
                     assert_eq!(active, &data([2], Storage::F32(vec![1.0, 2.0])));

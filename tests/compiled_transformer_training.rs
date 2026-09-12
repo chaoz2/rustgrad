@@ -4043,6 +4043,16 @@ fn compiled_transformer_native_cpu_target_is_strict_precompiled_and_resumes_exac
 #[test]
 fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let model = TinyCausalTransformer::new(7).unwrap();
+    let canonical_trainable_parameters = model.trainable_parameters().unwrap();
+    let canonical_trainable_parameter_count = canonical_trainable_parameters.len();
+    let canonical_trainable_parameter_bytes = canonical_trainable_parameters
+        .iter()
+        .map(|(_, parameter)| {
+            let value = parameter.value().unwrap();
+            value.len() * value.dtype().itemsize()
+        })
+        .sum::<usize>();
+    assert_eq!(canonical_trainable_parameter_count, 19);
     let plan =
         CompiledAdamWPlan::compile_module_with_dropout(config(), dropout_config(), &model, build)
             .unwrap();
@@ -4191,8 +4201,69 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         inspection.recurrent_state_bytes()
     );
     assert_eq!(
-        usize::try_from(accumulation_traffic.borrowed_recurrent_output_bytes()).unwrap(),
+        usize::try_from(
+            accumulation_traffic.borrowed_recurrent_output_bytes()
+                + accumulation_traffic.retained_recurrent_state_bytes()
+        )
+        .unwrap(),
         inspection.recurrent_state_bytes()
+    );
+    assert_eq!(
+        accumulation_traffic.replaced_recurrent_state_bytes(),
+        accumulation_traffic.borrowed_recurrent_output_bytes()
+    );
+    assert_eq!(
+        accumulation_traffic.retained_recurrent_state_count()
+            + accumulation_traffic.replaced_recurrent_state_count(),
+        u64::try_from(inspection.recurrent_state_count()).unwrap()
+    );
+    // Parameters, first/second moments, and the optimizer step are
+    // definitionally unchanged on an accumulation-only replay. Individual
+    // gradient accumulators may additionally simplify to exact pass-throughs,
+    // but that is a private prepared-schedule property, not a model contract.
+    let guaranteed_retained_state_count =
+        u64::try_from(canonical_trainable_parameter_count * 3 + 1).unwrap();
+    let remaining_state_count = u64::try_from(canonical_trainable_parameter_count + 2).unwrap();
+    let mandatory_replaced_state_count = 2_u64; // accumulation index and dropout cursor
+    let guaranteed_retained_state_bytes =
+        u64::try_from(canonical_trainable_parameter_bytes * 3 + DType::U64.itemsize()).unwrap();
+    let remaining_state_bytes =
+        u64::try_from(canonical_trainable_parameter_bytes + DType::U64.itemsize() * 2).unwrap();
+    let mandatory_replaced_state_bytes = u64::try_from(DType::U64.itemsize() * 2).unwrap();
+    assert_eq!(
+        inspection.recurrent_state_count(),
+        usize::try_from(guaranteed_retained_state_count + remaining_state_count).unwrap()
+    );
+    assert_eq!(
+        inspection.recurrent_state_bytes(),
+        usize::try_from(guaranteed_retained_state_bytes + remaining_state_bytes).unwrap()
+    );
+    assert!(
+        accumulation_traffic.retained_recurrent_state_count() >= guaranteed_retained_state_count
+    );
+    assert!(accumulation_traffic.replaced_recurrent_state_count() <= remaining_state_count);
+    assert!(
+        accumulation_traffic.replaced_recurrent_state_count() >= mandatory_replaced_state_count
+    );
+    assert!(
+        accumulation_traffic.retained_recurrent_state_bytes() >= guaranteed_retained_state_bytes
+    );
+    assert!(accumulation_traffic.replaced_recurrent_state_bytes() <= remaining_state_bytes);
+    assert!(
+        accumulation_traffic.replaced_recurrent_state_bytes() >= mandatory_replaced_state_bytes
+    );
+    // Every retained successor elides its authenticated dense-copy item, but
+    // the same prepared tape may legally elide other schedule items (for
+    // example, an affine transpose owner). Retention is therefore a lower
+    // bound on skipped logical items rather than their complete inventory.
+    let skipped_accumulation_items = accumulation
+        .native_item_count()
+        .checked_sub(accumulation_executed_native_item_count)
+        .unwrap();
+    assert!(skipped_accumulation_items >= accumulation_traffic.retained_recurrent_state_count());
+    assert!(
+        skipped_accumulation_items >= guaranteed_retained_state_count,
+        "the accumulation replay must elide every definitionally unchanged state"
     );
     assert_eq!(
         report.partial_flush().unwrap().capture_identity(),
@@ -4308,7 +4379,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     );
     assert!(json["main_replay_executor_wall_time"].is_object());
     assert!(json["main_replay_recurrent_overhead_wall_time"].is_object());
-    assert_eq!(json["format_version"], 11);
+    assert_eq!(json["format_version"], 12);
     assert_eq!(
         json["step_phases"]["warm_accumulation_only"]["wall_time"]["sample_count"],
         1
