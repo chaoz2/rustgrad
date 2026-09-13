@@ -2109,6 +2109,7 @@ enum PyTorchSuccessorOracle<'a> {
         parameter_names: &'a BTreeSet<&'a str>,
         optimizer: &'a CompiledAdamWConfig,
         learning_rate: f32,
+        recurrence_ulp_tolerance: u32,
     },
 }
 
@@ -2145,6 +2146,7 @@ fn assert_adamw_gauge_null_successors(
     parameter_names: &BTreeSet<&str>,
     optimizer: &CompiledAdamWConfig,
     learning_rate: f32,
+    recurrence_ulp_tolerance: u32,
 ) {
     const MAX_RMS_TO_EPSILON_RATIO: f64 = 0.01;
     const MAX_UPDATE_TO_LEARNING_RATE_RATIO: f64 = 0.01;
@@ -2177,18 +2179,37 @@ fn assert_adamw_gauge_null_successors(
         let expected = window.expected.parameter_successors[*name].tensor();
         let expected_initial = window.expected_initial[*name].tensor();
         let expected_second = window.expected.second_moments[*name].tensor();
-        assert_eq!(
-            actual, &reconstructed[*name],
-            "{label} analytic gauge-null successor {name} must match the backend-local AdamW recurrence"
-        );
+        let reconstructed = &reconstructed[*name];
         assert_eq!(actual.shape(), actual_initial.shape());
         assert_eq!(actual.shape(), expected.shape());
         assert_eq!(actual.shape(), expected_initial.shape());
         assert_eq!(actual.shape(), actual_second.shape());
         assert_eq!(actual.shape(), expected_second.shape());
+        assert_eq!(actual.shape(), reconstructed.shape());
         assert_eq!(actual.dtype(), DType::F32);
 
         for coordinate in 0..actual.len() {
+            let actual_value = actual.scalar_at(coordinate).as_f64() as f32;
+            let reconstructed_value = reconstructed.scalar_at(coordinate).as_f64() as f32;
+            let ordered_bits = |value: f32| {
+                let bits = value.to_bits() as i32;
+                if bits < 0 { i32::MIN - bits } else { bits }
+            };
+            let recurrence_ulp_distance =
+                ordered_bits(actual_value).abs_diff(ordered_bits(reconstructed_value));
+            // The interpreted recurrence remains raw-bit exact. Fused native
+            // execution uses backend-specific F32 instruction ordering, so its
+            // dedicated oracle admits a two-ULP rounding envelope only for these
+            // analytically softmax-null, epsilon-conditioned successor lanes.
+            let recurrence_matches = if recurrence_ulp_tolerance == 0 {
+                actual_value.to_bits() == reconstructed_value.to_bits()
+            } else {
+                recurrence_ulp_distance <= recurrence_ulp_tolerance
+            };
+            assert!(
+                recurrence_matches,
+                "{label} analytic gauge-null successor {name}[{coordinate}] must match the backend-local AdamW recurrence within {recurrence_ulp_tolerance} F32 ULPs: actual={actual_value}, reconstructed={reconstructed_value}, distance={recurrence_ulp_distance}"
+            );
             let actual_second = actual_second.scalar_at(coordinate).as_f64();
             let expected_second = expected_second.scalar_at(coordinate).as_f64();
             assert!(actual_second.is_finite() && actual_second >= 0.0);
@@ -2288,6 +2309,7 @@ fn assert_pytorch_adamw_window_for_frontier(
         parameter_names,
         optimizer,
         learning_rate,
+        recurrence_ulp_tolerance,
     } = successor_oracle
     {
         assert_adamw_gauge_null_successors(
@@ -2296,6 +2318,7 @@ fn assert_pytorch_adamw_window_for_frontier(
             parameter_names,
             optimizer,
             learning_rate,
+            recurrence_ulp_tolerance,
         );
     }
     assert_pytorch_parameter_successors_close(
@@ -2380,7 +2403,7 @@ fn policy_token_losses_from_logits(logits: &TensorData, targets: &[i32]) -> Tens
     .unwrap()
 }
 
-fn assert_policy_frontier_replay(step: &CompiledAdamWStepResult, expected: &PyTorchReplayFixture) {
+fn assert_policy_frontier_replay(step: &impl CompiledAdamWStep, expected: &PyTorchReplayFixture) {
     let replay = expected.replay;
     assert!((1..=7).contains(&replay));
     assert_eq!(step.loss_weight(), expected.valid_token_count);
@@ -2493,6 +2516,84 @@ fn assert_policy_frontier_replay(step: &CompiledAdamWStepResult, expected: &PyTo
             }
         }
     }
+}
+
+fn assert_native_policy_step(
+    step: &NativeCpuCompiledAdamWStepResult,
+    expected: &PyTorchReplayFixture,
+) {
+    assert_policy_frontier_replay(step, expected);
+    assert_eq!(step.report().fallback_count(), 0);
+    assert!(step.report().executed_native_item_count() > 0);
+    assert!(step.report().module_dispatch_count() > 0);
+    assert!(step.report().module_dispatched_native_item_count() > 0);
+}
+
+fn assert_native_policy_preparation(runtime: &NativeCpuCompiledAdamW<'_>) {
+    let preparation = runtime.preparation_report();
+    for (phase, program) in [
+        ("main", preparation.main()),
+        (
+            "accumulation",
+            preparation
+                .accumulation()
+                .expect("the N=3 policy must prepare an accumulation sibling"),
+        ),
+        (
+            "partial flush",
+            preparation
+                .partial_flush()
+                .expect("the N=3 policy must prepare a partial-flush transition"),
+        ),
+        (
+            "zero grad",
+            preparation
+                .zero_grad()
+                .expect("the N=3 policy must prepare an accumulation reset"),
+        ),
+    ] {
+        assert!(program.is_vectorized(), "{phase} must remain vectorized");
+        assert!(
+            program.native_item_count() > 0,
+            "{phase} must retain logical native work"
+        );
+        assert!(
+            program.work().rendered_entry_count() > 0,
+            "{phase} must retain physical native work"
+        );
+        assert_eq!(program.fallback_count(), 0, "{phase} fallback");
+    }
+    assert!(preparation.evaluation().is_none());
+}
+
+fn assert_native_policy_progress(
+    runtime: &NativeCpuCompiledAdamW<'_>,
+    replay_step: u64,
+    optimizer_step: u64,
+    accumulation_index: u64,
+    accumulated_token_count: u64,
+) {
+    let checkpoint = runtime.checkpoint().unwrap();
+    let info = checkpoint.info();
+    assert_eq!(info.replay_step(), replay_step);
+    assert_eq!(info.optimizer_step(), optimizer_step);
+    assert_eq!(info.accumulation_index(), accumulation_index);
+    assert_eq!(
+        info.accumulated_token_count(),
+        Some(accumulated_token_count)
+    );
+    assert_eq!(info.dropout_block_counter(), Some(replay_step * 84));
+}
+
+fn assert_policy_accumulators_are_positive_zero(runtime: &impl CompiledAdamWRuntime) {
+    let accumulators = runtime.gradient_accumulator_snapshots().unwrap();
+    assert!(!accumulators.is_empty());
+    assert!(
+        accumulators
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .all(|value| value.to_bits() == 0.0f64.to_bits())
+    );
 }
 
 fn assert_policy_window_report(
@@ -2643,8 +2744,8 @@ fn assert_policy_evaluation_frontier(
 
 fn assert_compiled_adamw_steps_exact(
     label: &str,
-    actual: &CompiledAdamWStepResult,
-    expected: &CompiledAdamWStepResult,
+    actual: &impl CompiledAdamWStep,
+    expected: &impl CompiledAdamWStep,
 ) {
     assert_eq!(actual.loss(), expected.loss(), "{label} loss");
     assert_eq!(actual.outputs(), expected.outputs(), "{label} outputs");
@@ -2674,6 +2775,38 @@ fn assert_compiled_adamw_steps_exact(
         actual.capture_identity(),
         expected.capture_identity(),
         "{label} capture identity"
+    );
+}
+
+fn assert_compiled_adamw_flushes_exact(
+    label: &str,
+    actual: &impl CompiledAdamWFlush,
+    expected: &impl CompiledAdamWFlush,
+) {
+    assert_eq!(
+        actual.flushed_microbatches(),
+        expected.flushed_microbatches(),
+        "{label} flushed microbatches"
+    );
+    assert_eq!(
+        actual.did_update(),
+        expected.did_update(),
+        "{label} update phase"
+    );
+    assert_eq!(
+        actual.optimizer_step(),
+        expected.optimizer_step(),
+        "{label} optimizer step"
+    );
+    assert_eq!(
+        actual.clip_report(),
+        expected.clip_report(),
+        "{label} clip report"
+    );
+    assert_eq!(
+        actual.window_loss_report(),
+        expected.window_loss_report(),
+        "{label} window loss report"
     );
 }
 
@@ -9029,6 +9162,7 @@ fn compiled_two_block_policy_frontier_matches_pytorch_across_resume_and_flush() 
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
             learning_rate: first_expected.learning_rate,
+            recurrence_ulp_tolerance: 0,
         },
     );
     assert_policy_window_report(
@@ -9133,6 +9267,7 @@ fn compiled_two_block_policy_frontier_matches_pytorch_across_resume_and_flush() 
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
             learning_rate: second_expected.learning_rate,
+            recurrence_ulp_tolerance: 0,
         },
     );
     assert_policy_window_report(
@@ -9191,6 +9326,7 @@ fn compiled_two_block_policy_frontier_matches_pytorch_across_resume_and_flush() 
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
             learning_rate: policy.partial_flush.learning_rate,
+            recurrence_ulp_tolerance: 0,
         },
     );
     assert_policy_window_report(
@@ -9213,6 +9349,371 @@ fn compiled_two_block_policy_frontier_matches_pytorch_across_resume_and_flush() 
             .flat_map(TensorData::to_vec_f64)
             .all(|value| value.to_bits() == 0.0f64.to_bits())
     );
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
+    assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_policy_frontier_matches_pytorch_on_strict_native_cpu() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+
+    let fixture = two_block_pytorch_fixture();
+    let policy = &fixture.policy_frontier;
+    assert_eq!(policy.replays.len(), 7);
+    assert_eq!(policy.commits.len(), 2);
+    assert_eq!(policy.active_parameter_count, 35);
+    assert_eq!(policy.active_coordinate_count, 372);
+    assert_eq!(
+        policy
+            .replays
+            .iter()
+            .map(|replay| replay.valid_token_count)
+            .collect::<Vec<_>>(),
+        [5, 3, 3, 5, 3, 3, 5]
+    );
+    let analytic_gauge_null_parameters = policy
+        .analytic_gauge_null_parameters
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(analytic_gauge_null_parameters.len(), 2);
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    assert_eq!(
+        &state_before.tensors()[POLICY_FROZEN_PARAMETER],
+        &policy.frozen_parameter.tensor()
+    );
+    let mut traversal = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        assert!(traversal.insert(name, parameter.id()).is_none());
+    });
+    assert_eq!(traversal.len(), 37);
+    assert_eq!(
+        traversal.values().copied().collect::<BTreeSet<_>>().len(),
+        36
+    );
+    assert_eq!(traversal["tokens.weight"], traversal["lm_head.weight"]);
+    assert_ne!(
+        traversal["tokens.weight"],
+        traversal[POLICY_FROZEN_PARAMETER]
+    );
+
+    let compile_count = Cell::new(0);
+    let optimizer = two_block_policy_frontier_config();
+    let plan = CompiledAdamWPlan::compile_module_graph_with_dropout_and_ignore_index(
+        optimizer.clone(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, ignore_index, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_policy_frontier(model, graph, inputs, ignore_index, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(plan.gradient_accumulation_steps(), 3);
+    assert_eq!(plan.loss_scale().to_bits(), 128.0f32.to_bits());
+    assert_eq!(plan.max_gradient_norm(), Some(0.25));
+    assert_eq!(
+        plan.token_weighted_ignore_index(),
+        Some(("targets", POLICY_IGNORE_INDEX))
+    );
+    assert_eq!(
+        plan.captured_multi_step_lr(),
+        Some(&CompiledMultiStepLr::new(1e-3, 0.5, [1]).unwrap())
+    );
+
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let mut uninterrupted = plan.prepare(&target).unwrap();
+    assert_native_policy_preparation(&uninterrupted);
+    let initial_parameters = uninterrupted.parameter_snapshots().unwrap();
+    assert_eq!(initial_parameters.len(), policy.active_parameter_count);
+    assert_eq!(
+        initial_parameters
+            .values()
+            .map(TensorData::len)
+            .sum::<usize>(),
+        policy.active_coordinate_count
+    );
+    assert!(!initial_parameters.contains_key(POLICY_FROZEN_PARAMETER));
+    assert!(initial_parameters.contains_key("tokens.weight"));
+    assert!(!initial_parameters.contains_key("lm_head.weight"));
+    assert_eq!(
+        initial_parameters,
+        fixture_tensor_map(&policy.initial_parameters)
+    );
+
+    let first = uninterrupted
+        .step_scheduled(policy_frontier_batch(1))
+        .unwrap();
+    assert!(!first.did_update());
+    assert_native_policy_step(&first, &policy.replays[0]);
+    assert_native_policy_progress(&uninterrupted, 1, 0, 1, 5);
+    let first_contribution = uninterrupted.gradient_accumulator_snapshots().unwrap();
+    assert_pytorch_tensor_map_close(
+        "strict-native policy replay 1 numerator gradient",
+        &first_contribution,
+        &policy.replays[0].numerator_gradients,
+    );
+    assert_eq!(first_contribution.len(), policy.active_parameter_count);
+    assert_eq!(
+        first_contribution
+            .values()
+            .map(TensorData::len)
+            .sum::<usize>(),
+        policy.active_coordinate_count
+    );
+
+    let second = uninterrupted
+        .step_scheduled(policy_frontier_batch(2))
+        .unwrap();
+    assert!(!second.did_update());
+    assert_native_policy_step(&second, &policy.replays[1]);
+    assert_native_policy_progress(&uninterrupted, 2, 0, 2, 8);
+    let third = uninterrupted
+        .step_scheduled(policy_frontier_batch(3))
+        .unwrap();
+    assert!(third.did_update());
+    assert_native_policy_step(&third, &policy.replays[2]);
+    assert_native_policy_progress(&uninterrupted, 3, 1, 0, 0);
+    assert_policy_accumulators_are_positive_zero(&uninterrupted);
+
+    let first_window_parameters = uninterrupted.parameter_snapshots().unwrap();
+    let first_window_first_moments = uninterrupted.first_moment_snapshots().unwrap();
+    let first_window_second_moments = uninterrupted.second_moment_snapshots().unwrap();
+    let first_expected = &policy.commits[0];
+    assert_pytorch_adamw_window_for_frontier(
+        "strict-native policy first window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 1,
+            clip_report: third.clip_report().unwrap(),
+            actual_initial: &initial_parameters,
+            actual_first_moments: &first_window_first_moments,
+            actual_second_moments: &first_window_second_moments,
+            actual_successors: &first_window_parameters,
+            expected_initial: &policy.initial_parameters,
+            expected: &first_expected.adamw,
+        },
+        first_expected.microbatch_count,
+        policy.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: first_expected.learning_rate,
+            recurrence_ulp_tolerance: 2,
+        },
+    );
+    assert_policy_window_report(
+        "strict-native policy first window",
+        third.window_loss_report().unwrap(),
+        first_expected,
+    );
+
+    let fourth = uninterrupted
+        .step_scheduled(policy_frontier_batch(4))
+        .unwrap();
+    assert!(!fourth.did_update());
+    assert_native_policy_step(&fourth, &policy.replays[3]);
+    assert_native_policy_progress(&uninterrupted, 4, 1, 1, 5);
+    let fourth_contribution = uninterrupted.gradient_accumulator_snapshots().unwrap();
+    assert_pytorch_tensor_map_close(
+        "strict-native policy replay 4 numerator gradient",
+        &fourth_contribution,
+        &policy.replays[3].numerator_gradients,
+    );
+    let pending_checkpoint = uninterrupted.checkpoint().unwrap();
+    let pending = &policy.pending_checkpoint;
+    assert_eq!(pending_checkpoint.info().replay_step(), pending.replay_step);
+    assert_eq!(
+        pending_checkpoint.info().optimizer_step(),
+        pending.optimizer_step
+    );
+    assert_eq!(
+        pending_checkpoint.info().accumulation_index(),
+        pending.accumulation_index
+    );
+    assert_eq!(
+        pending_checkpoint.info().accumulated_token_count(),
+        Some(pending.valid_token_count)
+    );
+    assert_eq!(
+        pending_checkpoint.info().dropout_block_counter(),
+        Some(pending.dropout_counter)
+    );
+    assert_pytorch_scalar_close(
+        "strict-native policy pending loss numerator",
+        f64::from(
+            pending_checkpoint
+                .info()
+                .accumulated_loss_numerator()
+                .unwrap(),
+        ),
+        f64::from(pending.loss_numerator),
+    );
+
+    let restored_plan = plan.restore_checkpoint(&pending_checkpoint).unwrap();
+    assert_eq!(restored_plan.capture_identity(), plan.capture_identity());
+    assert_eq!(compile_count.get(), 1);
+    let mut resumed = restored_plan.prepare(&target).unwrap();
+    assert_native_policy_preparation(&resumed);
+    assert_eq!(resumed.checkpoint().unwrap(), pending_checkpoint);
+
+    let fifth = uninterrupted
+        .step_scheduled(policy_frontier_batch(5))
+        .unwrap();
+    let resumed_fifth = resumed.step_scheduled(policy_frontier_batch(5)).unwrap();
+    assert!(!fifth.did_update());
+    assert_native_policy_step(&fifth, &policy.replays[4]);
+    assert_native_policy_step(&resumed_fifth, &policy.replays[4]);
+    assert_compiled_adamw_steps_exact(
+        "strict-native policy replay 5 resume",
+        &resumed_fifth,
+        &fifth,
+    );
+    assert_native_policy_progress(&uninterrupted, 5, 1, 2, 8);
+    assert_native_policy_progress(&resumed, 5, 1, 2, 8);
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+
+    let sixth = uninterrupted
+        .step_scheduled(policy_frontier_batch(6))
+        .unwrap();
+    let resumed_sixth = resumed.step_scheduled(policy_frontier_batch(6)).unwrap();
+    assert!(sixth.did_update());
+    assert_native_policy_step(&sixth, &policy.replays[5]);
+    assert_native_policy_step(&resumed_sixth, &policy.replays[5]);
+    assert_compiled_adamw_steps_exact(
+        "strict-native policy replay 6 resume",
+        &resumed_sixth,
+        &sixth,
+    );
+    assert_native_policy_progress(&uninterrupted, 6, 2, 0, 0);
+    assert_native_policy_progress(&resumed, 6, 2, 0, 0);
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+    assert_policy_accumulators_are_positive_zero(&uninterrupted);
+    assert_policy_accumulators_are_positive_zero(&resumed);
+
+    let second_window_parameters = uninterrupted.parameter_snapshots().unwrap();
+    let second_window_first_moments = uninterrupted.first_moment_snapshots().unwrap();
+    let second_window_second_moments = uninterrupted.second_moment_snapshots().unwrap();
+    let second_expected = &policy.commits[1];
+    assert_pytorch_adamw_window_for_frontier(
+        "strict-native policy second window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 2,
+            clip_report: sixth.clip_report().unwrap(),
+            actual_initial: &first_window_parameters,
+            actual_first_moments: &second_window_first_moments,
+            actual_second_moments: &second_window_second_moments,
+            actual_successors: &second_window_parameters,
+            expected_initial: &first_expected.adamw.parameter_successors,
+            expected: &second_expected.adamw,
+        },
+        second_expected.microbatch_count,
+        policy.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: second_expected.learning_rate,
+            recurrence_ulp_tolerance: 2,
+        },
+    );
+    assert_policy_window_report(
+        "strict-native policy second window",
+        sixth.window_loss_report().unwrap(),
+        second_expected,
+    );
+
+    let seventh = uninterrupted
+        .step_scheduled(policy_frontier_batch(7))
+        .unwrap();
+    let resumed_seventh = resumed.step_scheduled(policy_frontier_batch(7)).unwrap();
+    assert!(!seventh.did_update());
+    assert_native_policy_step(&seventh, &policy.replays[6]);
+    assert_native_policy_step(&resumed_seventh, &policy.replays[6]);
+    assert_compiled_adamw_steps_exact(
+        "strict-native policy replay 7 resume",
+        &resumed_seventh,
+        &seventh,
+    );
+    assert_native_policy_progress(&uninterrupted, 7, 2, 1, 5);
+    assert_native_policy_progress(&resumed, 7, 2, 1, 5);
+    let seventh_contribution = uninterrupted.gradient_accumulator_snapshots().unwrap();
+    assert_pytorch_tensor_map_close(
+        "strict-native policy replay 7 numerator gradient",
+        &seventh_contribution,
+        &policy.replays[6].numerator_gradients,
+    );
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+
+    let expected_flush = uninterrupted.flush_partial_window_scheduled().unwrap();
+    let resumed_flush = resumed.flush_partial_window_scheduled().unwrap();
+    assert_compiled_adamw_flushes_exact(
+        "strict-native policy partial flush resume",
+        &resumed_flush,
+        &expected_flush,
+    );
+    for flush in [&expected_flush, &resumed_flush] {
+        let report = flush
+            .report()
+            .expect("the nonempty strict-native partial flush must execute");
+        assert_eq!(report.fallback_count(), 0);
+        assert!(report.executed_native_item_count() > 0);
+        assert!(report.module_dispatch_count() > 0);
+        assert!(report.module_dispatched_native_item_count() > 0);
+    }
+    assert!(expected_flush.did_update());
+    assert_eq!(expected_flush.flushed_microbatches(), 1);
+    assert_eq!(expected_flush.optimizer_step(), 3);
+    assert_native_policy_progress(&uninterrupted, 7, 3, 0, 0);
+    assert_native_policy_progress(&resumed, 7, 3, 0, 0);
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+    assert_policy_accumulators_are_positive_zero(&uninterrupted);
+    assert_policy_accumulators_are_positive_zero(&resumed);
+    assert_pytorch_adamw_window_for_frontier(
+        "strict-native policy partial flush",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 3,
+            clip_report: expected_flush.clip_report().unwrap(),
+            actual_initial: &second_window_parameters,
+            actual_first_moments: &uninterrupted.first_moment_snapshots().unwrap(),
+            actual_second_moments: &uninterrupted.second_moment_snapshots().unwrap(),
+            actual_successors: &uninterrupted.parameter_snapshots().unwrap(),
+            expected_initial: &second_expected.adamw.parameter_successors,
+            expected: &policy.partial_flush.adamw,
+        },
+        policy.partial_flush.microbatch_count,
+        policy.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: policy.partial_flush.learning_rate,
+            recurrence_ulp_tolerance: 2,
+        },
+    );
+    assert_policy_window_report(
+        "strict-native policy partial flush",
+        expected_flush.window_loss_report().unwrap(),
+        &policy.partial_flush,
+    );
+
     assert_eq!(model.state_dict().unwrap(), state_before);
     assert_eq!(module_parameter_state(&model), parameter_state_before);
     assert_eq!(compile_count.get(), 1);
