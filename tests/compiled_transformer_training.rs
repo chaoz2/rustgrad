@@ -1624,6 +1624,7 @@ struct PyTorchReplayFixture {
 
 #[derive(Deserialize)]
 struct PyTorchAdamWWindowFixture {
+    optimizer_step: u64,
     valid_token_count: u64,
     pre_clip_norm: f32,
     clip_scale: f32,
@@ -1653,7 +1654,7 @@ struct TwoBlockPyTorchFixture {
     tied_names: [String; 2],
     initial_parameters: BTreeMap<String, PyTorchTensorFixture>,
     replays: Vec<PyTorchReplayFixture>,
-    window: PyTorchAdamWWindowFixture,
+    windows: Vec<PyTorchAdamWWindowFixture>,
 }
 
 fn two_block_pytorch_fixture() -> TwoBlockPyTorchFixture {
@@ -1851,6 +1852,58 @@ fn assert_pytorch_parameter_successors_close(
     assert_eq!(
         fixture_changed_coordinates, 312,
         "the checked fixture's changed-coordinate inventory drifted"
+    );
+}
+
+struct PyTorchAdamWWindowAssertion<'a> {
+    optimizer_step: u64,
+    commit: &'a CompiledAdamWStepResult,
+    actual_initial: &'a BTreeMap<String, TensorData>,
+    actual_first_moments: &'a BTreeMap<String, TensorData>,
+    actual_second_moments: &'a BTreeMap<String, TensorData>,
+    actual_successors: &'a BTreeMap<String, TensorData>,
+    expected_initial: &'a BTreeMap<String, PyTorchTensorFixture>,
+    expected: &'a PyTorchAdamWWindowFixture,
+}
+
+fn assert_pytorch_adamw_window(label: &str, window: PyTorchAdamWWindowAssertion<'_>) {
+    assert_eq!(window.expected.optimizer_step, window.optimizer_step);
+    assert_eq!(window.expected.valid_token_count, 9);
+    assert!(window.commit.did_update());
+    let clip = window
+        .commit
+        .clip_report()
+        .unwrap_or_else(|| panic!("{label} must commit a clipped update"));
+    assert_eq!(clip.did_clip(), Some(true));
+    assert_pytorch_scalar_close(
+        &format!("{label} pre-clip norm"),
+        f64::from(clip.pre_clip_global_norm()),
+        f64::from(window.expected.pre_clip_norm),
+    );
+    assert_pytorch_scalar_close(
+        &format!("{label} clip scale"),
+        f64::from(clip.applied_scale()),
+        f64::from(window.expected.clip_scale),
+    );
+    assert_pytorch_adamw_moments_close(
+        &format!("{label} first moment successor"),
+        window.actual_first_moments,
+        &window.expected.first_moments,
+        32.0,
+        2e-3,
+    );
+    assert_pytorch_adamw_moments_close(
+        &format!("{label} second moment successor"),
+        window.actual_second_moments,
+        &window.expected.second_moments,
+        64.0,
+        5e-3,
+    );
+    assert_pytorch_parameter_successors_close(
+        window.actual_successors,
+        window.actual_initial,
+        &window.expected.parameter_successors,
+        window.expected_initial,
     );
 }
 
@@ -7444,7 +7497,7 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
     );
     assert_eq!(
         fixture.provenance.rustgrad_base,
-        "73029785579153f9dfc444060b48f3bbb70d3091"
+        "90d41be5f2dab7d418f4800918a6544b3ef63710"
     );
     assert_eq!(fixture.provenance.python, "3.11.13");
     assert_eq!(fixture.provenance.torch, "2.1.2");
@@ -7462,7 +7515,8 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
         fixture.tied_names,
         ["tokens.weight".to_owned(), "lm_head.weight".to_owned()]
     );
-    assert_eq!(fixture.replays.len(), 2);
+    assert_eq!(fixture.replays.len(), 4);
+    assert_eq!(fixture.windows.len(), 2);
 
     let model =
         TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
@@ -7581,8 +7635,104 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
     assert!(second_step.did_update());
     assert_eq!(second_step.loss(), isolated_second_step.loss());
     assert_eq!(second_step.outputs(), isolated_second_step.outputs());
-    let observed_steps = [&first_step, &isolated_second_step];
-    let observed_gradients = [&first_gradients, &second_gradients];
+    let first_window_parameters = runtime.parameter_snapshots().unwrap();
+    let first_window_first_moments = runtime.first_moment_snapshots().unwrap();
+    let first_window_second_moments = runtime.second_moment_snapshots().unwrap();
+    assert_pytorch_adamw_window(
+        "first window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 1,
+            commit: &second_step,
+            actual_initial: &initial_parameters,
+            actual_first_moments: &first_window_first_moments,
+            actual_second_moments: &first_window_second_moments,
+            actual_successors: &first_window_parameters,
+            expected_initial: &fixture.initial_parameters,
+            expected: &fixture.windows[0],
+        },
+    );
+    assert!(
+        runtime
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .all(|value| value.to_bits() == 0.0f64.to_bits())
+    );
+
+    let third_step = runtime
+        .step(
+            attention_masked_dropout_batch(3, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    assert!(!third_step.did_update());
+    let third_gradients = runtime.gradient_accumulator_snapshots().unwrap();
+    let pending_checkpoint = runtime.checkpoint().unwrap();
+    assert_eq!(pending_checkpoint.info().replay_step(), 3);
+    assert_eq!(pending_checkpoint.info().optimizer_step(), 1);
+    assert_eq!(pending_checkpoint.info().accumulation_index(), 1);
+    assert_eq!(pending_checkpoint.info().accumulated_token_count(), Some(5));
+    assert_eq!(pending_checkpoint.info().dropout_block_counter(), Some(252));
+
+    let restored_plan = plan.restore_checkpoint(&pending_checkpoint).unwrap();
+    assert_eq!(restored_plan.capture_identity(), plan.capture_identity());
+    assert_eq!(compile_count.get(), 1);
+    let mut resumed = restored_plan.prepare(&CpuSessionTarget).unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), pending_checkpoint);
+    let mut isolated_fourth = plan
+        .restore_checkpoint(&pending_checkpoint)
+        .unwrap()
+        .prepare(&CpuSessionTarget)
+        .unwrap();
+    let discarded = isolated_fourth.zero_grad().unwrap();
+    assert!(discarded.did_discard());
+    assert_eq!(discarded.discarded_microbatches(), 1);
+    assert_eq!(isolated_fourth.optimizer_step().unwrap(), 1);
+    assert_eq!(isolated_fourth.accumulation_index().unwrap(), 0);
+    assert_eq!(isolated_fourth.dropout_block_counter().unwrap(), Some(252));
+    let isolated_fourth_step = isolated_fourth
+        .step(
+            attention_masked_dropout_batch(4, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    assert!(!isolated_fourth_step.did_update());
+    let fourth_gradients = isolated_fourth.gradient_accumulator_snapshots().unwrap();
+
+    let fourth_step = runtime
+        .step(
+            attention_masked_dropout_batch(4, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    let resumed_fourth_step = resumed
+        .step(
+            attention_masked_dropout_batch(4, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    assert!(fourth_step.did_update());
+    assert!(resumed_fourth_step.did_update());
+    assert_eq!(fourth_step.loss(), isolated_fourth_step.loss());
+    assert_eq!(fourth_step.outputs(), isolated_fourth_step.outputs());
+    assert_eq!(resumed_fourth_step.loss(), fourth_step.loss());
+    assert_eq!(resumed_fourth_step.outputs(), fourth_step.outputs());
+    assert_eq!(resumed.checkpoint().unwrap(), runtime.checkpoint().unwrap());
+    assert_eq!(compile_count.get(), 1);
+
+    let observed_steps = [
+        &first_step,
+        &isolated_second_step,
+        &third_step,
+        &isolated_fourth_step,
+    ];
+    let observed_gradients = [
+        &first_gradients,
+        &second_gradients,
+        &third_gradients,
+        &fourth_gradients,
+    ];
 
     for ((fixture_replay, step), gradients) in fixture
         .replays
@@ -7591,7 +7741,7 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
         .zip(observed_gradients)
     {
         let replay = fixture_replay.replay;
-        assert!(replay == 1 || replay == 2);
+        assert!((1..=4).contains(&replay));
         assert_eq!(fixture_replay.tokens, MULTI_HEAD_TOKENS);
         assert_eq!(fixture_replay.targets, MULTI_HEAD_TARGETS);
         assert_eq!(
@@ -7623,7 +7773,7 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
         assert_eq!(step.loss_weight(), fixture_replay.valid_token_count);
         assert_eq!(
             fixture_replay.valid_token_count,
-            if replay == 1 { 5 } else { 4 }
+            if replay % 2 == 1 { 5 } else { 4 }
         );
         assert_pytorch_scalar_close(
             &format!("replay {replay} token-mean loss"),
@@ -7681,43 +7831,21 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
         assert_pytorch_gradient_family_evidence(gradients, &fixture_replay.numerator_gradients);
     }
 
-    assert_eq!(fixture.window.valid_token_count, 9);
-    let clip = second_step
-        .clip_report()
-        .expect("the PyTorch reference window must commit a clipped update");
-    assert_eq!(clip.did_clip(), Some(true));
-    assert_pytorch_scalar_close(
-        "window pre-clip norm",
-        f64::from(clip.pre_clip_global_norm()),
-        f64::from(fixture.window.pre_clip_norm),
-    );
-    assert_pytorch_scalar_close(
-        "window clip scale",
-        f64::from(clip.applied_scale()),
-        f64::from(fixture.window.clip_scale),
-    );
-    let first_moments = runtime.first_moment_snapshots().unwrap();
-    assert_pytorch_adamw_moments_close(
-        "first moment successor",
-        &first_moments,
-        &fixture.window.first_moments,
-        32.0,
-        2e-3,
-    );
-    let second_moments = runtime.second_moment_snapshots().unwrap();
-    assert_pytorch_adamw_moments_close(
-        "second moment successor",
-        &second_moments,
-        &fixture.window.second_moments,
-        64.0,
-        5e-3,
-    );
-    let parameter_successors = runtime.parameter_snapshots().unwrap();
-    assert_pytorch_parameter_successors_close(
-        &parameter_successors,
-        &initial_parameters,
-        &fixture.window.parameter_successors,
-        &fixture.initial_parameters,
+    let second_window_first_moments = runtime.first_moment_snapshots().unwrap();
+    let second_window_second_moments = runtime.second_moment_snapshots().unwrap();
+    let second_window_parameters = runtime.parameter_snapshots().unwrap();
+    assert_pytorch_adamw_window(
+        "second window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 2,
+            commit: &fourth_step,
+            actual_initial: &first_window_parameters,
+            actual_first_moments: &second_window_first_moments,
+            actual_second_moments: &second_window_second_moments,
+            actual_successors: &second_window_parameters,
+            expected_initial: &fixture.windows[0].parameter_successors,
+            expected: &fixture.windows[1],
+        },
     );
     let accumulators = runtime.gradient_accumulator_snapshots().unwrap();
     assert_eq!(accumulators.len(), fixture.canonical_parameter_count);
@@ -7731,13 +7859,33 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
             .flat_map(TensorData::to_vec_f64)
             .all(|value| value.to_bits() == 0.0f64.to_bits())
     );
-    assert_eq!(runtime.optimizer_step().unwrap(), 1);
+    assert_eq!(runtime.optimizer_step().unwrap(), 2);
     assert_eq!(runtime.accumulation_index().unwrap(), 0);
-    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(168));
+    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(336));
+    assert_eq!(runtime.step_count(), 4);
+    assert_eq!(resumed.step_count(), 4);
+    assert_eq!(resumed.optimizer_step().unwrap(), 2);
+    assert_eq!(resumed.accumulation_index().unwrap(), 0);
+    assert_eq!(resumed.dropout_block_counter().unwrap(), Some(336));
     assert_eq!(
-        runtime.step_count() + isolated_second.step_count(),
-        4,
-        "the external frontier oracle must remain bounded to four compiled replays"
+        resumed.parameter_snapshots().unwrap(),
+        second_window_parameters
+    );
+    assert_eq!(
+        resumed.first_moment_snapshots().unwrap(),
+        second_window_first_moments
+    );
+    assert_eq!(
+        resumed.second_moment_snapshots().unwrap(),
+        second_window_second_moments
+    );
+    assert!(
+        resumed
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .all(|value| value.to_bits() == 0.0f64.to_bits())
     );
     assert_eq!(model.state_dict().unwrap(), state_before);
     assert_eq!(module_parameter_state(&model), parameter_state_before);

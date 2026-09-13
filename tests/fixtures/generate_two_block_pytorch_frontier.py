@@ -193,7 +193,9 @@ def linear(value: torch.Tensor, params: OrderedDict[str, torch.Tensor], prefix: 
 
 
 def combined_attention_mask(replay: int) -> tuple[torch.Tensor, torch.Tensor]:
-    caller = torch.tensor(MASKS[replay - 1], dtype=torch.bool).reshape(BATCH, 1, TIME, TIME)
+    caller = torch.tensor(MASKS[(replay - 1) % len(MASKS)], dtype=torch.bool).reshape(
+        BATCH, 1, TIME, TIME
+    )
     effective = caller.expand(BATCH, HEADS, TIME, TIME) & torch.tril(
         torch.ones(TIME, TIME, dtype=torch.bool)
     )
@@ -252,7 +254,9 @@ def forward(params: OrderedDict[str, torch.Tensor], replay: int) -> dict[str, to
     token_losses = -torch.log_softmax(logits.reshape(-1, VOCAB), dim=-1).gather(
         1, targets.reshape(-1, 1)
     ).reshape(BATCH, TIME) + 1.0
-    loss_mask = torch.tensor(LOSS_MASKS[replay - 1], dtype=torch.float32).reshape(BATCH, TIME)
+    loss_mask = torch.tensor(
+        LOSS_MASKS[(replay - 1) % len(LOSS_MASKS)], dtype=torch.float32
+    ).reshape(BATCH, TIME)
     numerator = (token_losses * loss_mask).sum()
     valid_token_count = loss_mask.sum()
     return {
@@ -281,47 +285,27 @@ def tensor_map(values: OrderedDict[str, torch.Tensor] | dict[str, torch.Tensor])
     return {name: tensor(value) for name, value in sorted(values.items())}
 
 
-def main(output: Path) -> None:
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-    params = make_parameters()
-    replays = []
-    numerator_gradients = []
-    for replay in (1, 2):
-        result = forward(params, replay)
-        gradients = torch.autograd.grad(result["numerator"], tuple(params.values()))
-        gradient_map = OrderedDict(zip(params.keys(), gradients))
-        numerator_gradients.append(gradient_map)
-        assert int(result["valid_token_count"].item()) == (5 if replay == 1 else 4)
-        assert all(torch.isfinite(gradient).all() for gradient in gradients)
-        assert all(
-            torch.count_nonzero(relu_input).item() > 0 for relu_input in result["relu_inputs"]
-        )
-        for probabilities in result["attention_probabilities"]:
-            assert torch.count_nonzero(probabilities[~result["row_valid"].expand_as(probabilities)]).item() == 0
-        replays.append(
-            {
-                "replay": replay,
-                "tokens": list(TOKENS),
-                "targets": list(TARGETS),
-                "attention_keep_mask": list(MASKS[replay - 1]),
-                "loss_mask": list(LOSS_MASKS[replay - 1]),
-                "effective_attention_mask": tensor(result["effective_attention_mask"]),
-                "row_valid": tensor(result["row_valid"]),
-                "dropout_masks": [tensor(mask) for mask in result["dropout_masks"]],
-                "attention_probabilities": [
-                    tensor(probabilities) for probabilities in result["attention_probabilities"]
-                ],
-                "logits": tensor(result["logits"]),
-                "token_losses": tensor(result["token_losses"]),
-                "token_mean_loss": float(result["loss"].item()),
-                "valid_token_count": int(result["valid_token_count"].item()),
-                "numerator_gradients": tensor_map(gradient_map),
-            }
-        )
-
+def adamw_window(
+    params: OrderedDict[str, torch.Tensor],
+    first_moments: OrderedDict[str, torch.Tensor],
+    second_moments: OrderedDict[str, torch.Tensor],
+    numerator_gradients: list[OrderedDict[str, torch.Tensor]],
+    optimizer_step: int,
+) -> tuple[
+    OrderedDict[str, torch.Tensor],
+    OrderedDict[str, torch.Tensor],
+    OrderedDict[str, torch.Tensor],
+    dict[str, object],
+]:
     averaged = OrderedDict(
-        (name, (numerator_gradients[0][name] + numerator_gradients[1][name]) / 9.0)
+        (
+            name,
+            sum(
+                (gradients[name] for gradients in numerator_gradients),
+                start=torch.zeros_like(params[name]),
+            )
+            / 9.0,
+        )
         for name in params
     )
     gradient_vector = torch.cat([gradient.reshape(-1) for gradient in averaged.values()])
@@ -330,22 +314,109 @@ def main(output: Path) -> None:
         pre_clip_norm, torch.tensor(MAX_GRADIENT_NORM, dtype=torch.float32)
     )
     clipped = OrderedDict((name, gradient * clip_scale) for name, gradient in averaged.items())
-    first_moments = OrderedDict(
-        (name, f32(1.0 - BETAS[0]) * gradient) for name, gradient in clipped.items()
+    next_first_moments = OrderedDict(
+        (
+            name,
+            f32(BETAS[0]) * first_moments[name] + f32(1.0 - BETAS[0]) * gradient,
+        )
+        for name, gradient in clipped.items()
     )
-    second_moments = OrderedDict(
-        (name, f32(1.0 - BETAS[1]) * gradient * gradient) for name, gradient in clipped.items()
+    next_second_moments = OrderedDict(
+        (
+            name,
+            f32(BETAS[1]) * second_moments[name]
+            + f32(1.0 - BETAS[1]) * gradient * gradient,
+        )
+        for name, gradient in clipped.items()
     )
+    first_correction = f32(1.0 - BETAS[0] ** optimizer_step)
+    second_correction = f32(1.0 - BETAS[1] ** optimizer_step)
     successors = OrderedDict()
     for name, parameter in params.items():
-        first = first_moments[name] / f32(1.0 - BETAS[0])
-        second = second_moments[name] / f32(1.0 - BETAS[1])
-        successors[name] = parameter - LEARNING_RATE * first / (torch.sqrt(second) + EPSILON)
+        first = next_first_moments[name] / first_correction
+        second = next_second_moments[name] / second_correction
+        successors[name] = (
+            parameter - LEARNING_RATE * first / (torch.sqrt(second) + EPSILON)
+        ).detach().requires_grad_()
+
+    fixture = {
+        "optimizer_step": optimizer_step,
+        "valid_token_count": 9,
+        "pre_clip_norm": float(pre_clip_norm.item()),
+        "clip_scale": float(clip_scale.item()),
+        "first_moments": tensor_map(next_first_moments),
+        "second_moments": tensor_map(next_second_moments),
+        "parameter_successors": tensor_map(successors),
+    }
+    return successors, next_first_moments, next_second_moments, fixture
+
+
+def main(output: Path) -> None:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    params = make_parameters()
+    initial_parameters = OrderedDict(
+        (name, parameter.detach().clone()) for name, parameter in params.items()
+    )
+    first_moments = OrderedDict(
+        (name, torch.zeros_like(parameter)) for name, parameter in params.items()
+    )
+    second_moments = OrderedDict(
+        (name, torch.zeros_like(parameter)) for name, parameter in params.items()
+    )
+    replays = []
+    windows = []
+    for optimizer_step in (1, 2):
+        numerator_gradients = []
+        for replay in (2 * optimizer_step - 1, 2 * optimizer_step):
+            result = forward(params, replay)
+            gradients = torch.autograd.grad(result["numerator"], tuple(params.values()))
+            gradient_map = OrderedDict(zip(params.keys(), gradients))
+            numerator_gradients.append(gradient_map)
+            assert int(result["valid_token_count"].item()) == (
+                5 if replay % 2 == 1 else 4
+            )
+            assert all(torch.isfinite(gradient).all() for gradient in gradients)
+            assert all(
+                torch.count_nonzero(relu_input).item() > 0 for relu_input in result["relu_inputs"]
+            )
+            for probabilities in result["attention_probabilities"]:
+                invalid_rows = ~result["row_valid"].expand_as(probabilities)
+                assert torch.count_nonzero(probabilities[invalid_rows]).item() == 0
+            mask_index = (replay - 1) % len(MASKS)
+            replays.append(
+                {
+                    "replay": replay,
+                    "tokens": list(TOKENS),
+                    "targets": list(TARGETS),
+                    "attention_keep_mask": list(MASKS[mask_index]),
+                    "loss_mask": list(LOSS_MASKS[mask_index]),
+                    "effective_attention_mask": tensor(result["effective_attention_mask"]),
+                    "row_valid": tensor(result["row_valid"]),
+                    "dropout_masks": [tensor(mask) for mask in result["dropout_masks"]],
+                    "attention_probabilities": [
+                        tensor(probabilities) for probabilities in result["attention_probabilities"]
+                    ],
+                    "logits": tensor(result["logits"]),
+                    "token_losses": tensor(result["token_losses"]),
+                    "token_mean_loss": float(result["loss"].item()),
+                    "valid_token_count": int(result["valid_token_count"].item()),
+                    "numerator_gradients": tensor_map(gradient_map),
+                }
+            )
+        params, first_moments, second_moments, window = adamw_window(
+            params,
+            first_moments,
+            second_moments,
+            numerator_gradients,
+            optimizer_step,
+        )
+        windows.append(window)
 
     fixture = {
         "provenance": {
             "generator": "tests/fixtures/generate_two_block_pytorch_frontier.py",
-            "rustgrad_base": "73029785579153f9dfc444060b48f3bbb70d3091",
+            "rustgrad_base": "90d41be5f2dab7d418f4800918a6544b3ef63710",
             "python": sys.version.split()[0],
             "torch": torch.__version__,
             "device": "cpu",
@@ -357,16 +428,9 @@ def main(output: Path) -> None:
         "canonical_parameter_count": 36,
         "canonical_coordinate_count": 384,
         "tied_names": ["tokens.weight", "lm_head.weight"],
-        "initial_parameters": tensor_map(params),
+        "initial_parameters": tensor_map(initial_parameters),
         "replays": replays,
-        "window": {
-            "valid_token_count": 9,
-            "pre_clip_norm": float(pre_clip_norm.item()),
-            "clip_scale": float(clip_scale.item()),
-            "first_moments": tensor_map(first_moments),
-            "second_moments": tensor_map(second_moments),
-            "parameter_successors": tensor_map(successors),
-        },
+        "windows": windows,
     }
     output.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
 
