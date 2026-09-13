@@ -1042,50 +1042,69 @@ parent directory has been durably synced.
 
 `CpuCompiledMomentumSgd` and `CpuCompiledAdamW` consume detached named F32
 parameter values, build one private Graph with one batched reverse traversal,
-and capture the pure loss/output/update prefix together with ordered parameter
-and optimizer-state stores. AdamW keeps first and second moments plus its U64
-step counter inside that same captured recurrent frontier.
+and capture the pure loss/output/update prefix plus ordered parameter and
+optimizer-state stores. AdamW keeps first and second moments and its U64 step
+counter in that recurrent frontier.
+
+##### Program inventory
+
+| Program | Captured role |
+|---|---|
+| Main | Forward, objective, reverse traversal, reports, and optimizer commit. |
+| Accumulation | Private sibling for non-commit microbatches when gradient accumulation is configured. |
+| Partial flush | Optional nonempty-window optimizer commit. |
+| `zero_grad` | Optional accumulator reset. |
+| Evaluation | Optional read-only objective over the current parameter frontier. |
+
 `NativeCpuSessionTarget` is a separate strict-native AdamW preparation target,
-not a mode on the interpreter session. It precompiles the main replay, private
-accumulation sibling, and every attached partial-flush/zero-grad/evaluation pure
-program through the existing
-`CapturedReplayExecutor` before returning mutable state, then reuses the same
-mixed staging and single `EffectRuntime` commit with interpreter fallback
-disabled. Capture/recurrent witnesses, layouts, rendering, ABI, and cache
-preflight remain sequential. Distinct durable cache misses then enter
-per-artifact compile/load gates through a process-wide two-permit compiler pool;
-complete jobs finalize in canonical main/accumulation/partial-flush/zero-grad/evaluation
-order. Identical keys cannot race loading or damaged-cache recovery, and
-optional programs do not perturb another program's artifact key. Each attached
-schedule renders its ordered native entries once and
-loads them as uniquely named functions in one content-addressed shared module;
-preparation also authenticates an immutable workspace tape for fixed ABI slots,
-derived affine reads, typed output-initialization coverage, and quantized
-resources. Proven dense full writers skip the retained output clear; reduction,
-scatter, prefix-scan, and unknown families keep the conservative zero-filled
-contract. Replay binds
-external and recurrent pointers only for the synchronous call, dispatches
-admitted contiguous tape segments through those existing module entries, and
-uses the conservative per-item path around any entry that cannot join a segment.
-Segments close before a physical output slot is reused or when a Rust-prepared
-affine input depends on an output inside the open segment; crossing either
-boundary would clear a live value or derive it before its producer executes.
-The reported segment count is therefore the actual Rust-to-C call count, while
-logical item order and exact failing-item attribution remain unchanged. Each
-prepared recurrent program seals its validated RGSM identity,
-pure cache/layout inventory, replacement map, and initial frontier descriptor
-once. Main, accumulation, partial-flush, and zero-grad hot replay therefore repeats only
+not an interpreter-session mode. It prepares the main replay and every attached
+sibling through `CapturedReplayExecutor` before returning mutable state. Replay
+then uses the existing mixed staging and one `EffectRuntime` commit with
+interpreter fallback disabled.
+
+##### Native preparation
+
+Capture and recurrent witnesses, layouts, rendering, ABI, and durable-cache
+preflight remain sequential. Distinct cache misses enter per-artifact
+compile/load gates through a process-wide two-permit compiler pool, then finish
+in canonical main, accumulation, partial-flush, `zero_grad`, evaluation order.
+Identical keys cannot race loading or damaged-cache recovery; optional programs
+do not change another program's artifact key.
+
+Each schedule renders its ordered native entries once and loads uniquely named
+functions into one content-addressed shared module. Preparation also
+authenticates an immutable workspace tape covering fixed ABI slots, derived
+affine reads, typed output initialization, and quantized resources.
+
+##### Replay execution
+
+| Concern | Contract |
+|---|---|
+| Bindings | External and recurrent pointers exist only for the synchronous call. |
+| Output initialization | Proven dense full writers skip the retained clear; reduction, scatter, prefix-scan, and unknown families retain conservative zero filling. |
+| Dispatch | Admitted contiguous tape segments call existing module entries; ineligible entries retain the conservative per-item path. |
+| Segment barriers | A segment closes before physical output-slot reuse or a Rust-prepared affine input that depends on an output inside the open segment. This prevents clearing a live value or deriving an input before its producer runs. |
+| Ordering and failures | The segment count is the actual Rust-to-C call count; logical order and exact failing-item attribution do not change. |
+
+Each prepared recurrent program seals its validated RGSM identity, pure
+cache/layout inventory, replacement map, and initial frontier descriptor once.
+Main, accumulation, partial-flush, and `zero_grad` hot replay repeats only
 call-dependent cursor, input, active-bank, quantized-index, successor, and
-transaction admission; generic artifact replay retains full per-call artifact
-validation. Its typed preparation/run reports expose only CPU facts: native item
-and cache counts, rendered entries, loaded modules, durable artifact hits/misses,
-actual compiler invocations, per-run module segment/entry dispatch counts,
+transaction admission. Generic artifact replay retains full per-call artifact
+validation.
+
+##### Publication, evidence, and portability
+
+Unsupported preparation and failed execution or commit publish neither state
+nor progress. Checkpoint bytes and capture identity remain shared with the
+interpreter and strict-Metal targets.
+
+Typed preparation and run reports expose CPU facts only: native-item and cache
+counts, rendered entries, loaded modules, durable artifact hits and misses,
+actual compiler invocations, per-run module segment and entry dispatch counts,
 successful full-writer clear-elision counts, static execution summaries,
 recurrent logical bytes, stable capture/native identities, and call-local wall
-times excluded from identity.
-Unsupported preparation and failed execution or commit publish neither state
-nor progress; checkpoint bytes and capture identity are shared with the
-interpreter and strict-Metal targets.
+times. Wall times do not participate in identity.
 
 #### Native CPU scoreboard evidence
 

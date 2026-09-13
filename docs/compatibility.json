@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:4499b676d2686e5d",
+  "source_fingerprint": "fnv1a64:24434f0dd0382680",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -459,7 +459,7 @@
       "subject": "Compiled persistent-state training runtime",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CompiledAdamWPlan` captures fixed-shape forward, objective, one reverse traversal, and optimizer state before selecting graph-free CPU, strict-native CPU, or the bounded strict-Metal target. Successful replay atomically advances the authenticated recurrent frontier; accumulation, partial flush, `zero_grad`, clipping, loss scaling, schedules, dropout, freezing, ties, publication, and portable restore retain that boundary. A separate bounded `CompiledAdamWProgramArtifact` can restore the complete resource-free CPU plan with an unchanged complete-module checkpoint, bypassing graph/autograd/schedule/capture reconstruction; artifact-restored Metal remains fail-closed. The maintained two-block Transformer covers exact in-process and different-initialization file continuation with decreasing loss. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership, artifacts, resume modes, evidence, backend limits, and version compatibility. Dynamic shapes, mixed-precision state, distributed or asynchronous training, broad optimizer construction, and unverified live-Metal performance remain outside this capability."
+        "Acceptance requirement": "`CompiledAdamWPlan` compiles fixed-shape forward, objective, one reverse traversal, and AdamW recurrent state once for graph-free CPU, strict-native CPU, or the bounded strict-Metal target. Replay atomically preserves accumulation, partial flush, `zero_grad`, clipping and loss scaling, schedules and dropout, freezing and ties, evaluation and publication, and portable checkpoint semantics. A bounded `CompiledAdamWProgramArtifact`, paired with unchanged complete-module checkpoint bytes, restores the resource-free CPU plan without graph, autograd, schedule, or capture reconstruction; the maintained two-block Transformer covers exact in-process and different-initialization file continuation with decreasing loss, while artifact-restored Metal remains fail-closed. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership, artifacts, evidence, versioning, and backend limits; dynamic shapes, mixed-precision state, distributed or asynchronous training, broad optimizer construction, and unverified live-Metal performance remain outside this capability."
       }
     },
     {
