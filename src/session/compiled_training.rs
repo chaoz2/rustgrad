@@ -2,6 +2,7 @@
 
 mod adamw_checkpoint;
 mod module_adamw_checkpoint;
+mod program_artifact;
 mod state_schema;
 
 #[cfg(test)]
@@ -18,6 +19,10 @@ pub use self::module_adamw_checkpoint::CompiledModuleAdamWCheckpoint;
 use self::module_adamw_checkpoint::{
     DecodedModuleAdamWCheckpoint, ModuleCheckpointState, ModuleCheckpointStateKind,
     ModuleCheckpointVisit, decode_module_adamw_checkpoint, encode_module_adamw_checkpoint,
+};
+pub use self::program_artifact::{
+    CompiledAdamWProgramArtifact, CompiledAdamWProgramArtifactInfo,
+    CompiledModuleAdamWArtifactRestoreError,
 };
 use self::state_schema::{
     AdamWGlobalState, AdamWParameterState, INTERNAL_PREFIX, RecurrentStateKey, StateSpec,
@@ -3567,6 +3572,28 @@ pub struct CompiledAdamWPlan {
     frozen_parameters: BTreeSet<String>,
     evaluation: Option<CompiledEvaluationPlan>,
     learning_rate: CompiledLearningRatePolicy,
+    adamw_policy: CompiledAdamWPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CompiledAdamWPolicy {
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    weight_decay_exclusions: BTreeSet<String>,
+}
+
+impl CompiledAdamWPolicy {
+    fn from_config(config: &CompiledAdamWConfig) -> Self {
+        Self {
+            beta1: config.beta1,
+            beta2: config.beta2,
+            eps: config.eps,
+            weight_decay: config.weight_decay,
+            weight_decay_exclusions: config.weight_decay_exclusions.clone(),
+        }
+    }
 }
 
 /// Explicit scalar or token-mean objective returned by a compiled module
@@ -3928,6 +3955,7 @@ pub struct CpuCompiledAdamW {
     evaluation: Option<CpuCompiledEvaluation>,
     learning_rate: CompiledLearningRatePolicy,
     non_finite_policy: CpuNonFinitePolicy,
+    adamw_policy: CompiledAdamWPolicy,
 }
 
 /// Strict-native CPU AdamW session prepared from the same authenticated plan
@@ -4372,7 +4400,7 @@ pub trait CompiledScheduledAdamWCommitOnlyRuntime:
 #[derive(Clone)]
 struct CompiledTrainingPlan {
     capture: CapturedMixedSchedule,
-    recurrent_capture: CapturedStatefulInference,
+    recurrent_capture: CompiledRecurrentCapture,
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
     clip_report: bool,
@@ -4393,7 +4421,7 @@ struct CompiledTrainingPlan {
 #[derive(Clone)]
 struct CompiledAdamWAccumulationPlan {
     capture: CapturedMixedSchedule,
-    recurrent_capture: CapturedStatefulInference,
+    recurrent_capture: CompiledRecurrentCapture,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
     capture_identity: u64,
 }
@@ -4401,7 +4429,7 @@ struct CompiledAdamWAccumulationPlan {
 #[derive(Clone)]
 struct CompiledAdamWAuxiliaryPlan {
     capture: CapturedMixedSchedule,
-    recurrent_capture: CapturedStatefulInference,
+    recurrent_capture: CompiledRecurrentCapture,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
     adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
@@ -4412,13 +4440,118 @@ struct CompiledAdamWAuxiliaryPlan {
 
 #[derive(Clone)]
 struct CompiledEvaluationPlan {
-    inference: crate::CapturedInference,
+    inference: CompiledEvaluationCapture,
     inputs: BTreeMap<String, (Shape, DType)>,
     output_names: Vec<String>,
     parameter_inputs: BTreeMap<String, String>,
     loss_weight_policy: Option<CompiledTokenWeightPolicy>,
     allow_zero_valid_token_microbatches: bool,
     capture_identity: u64,
+}
+
+#[derive(Clone)]
+struct CompiledRecurrentCapture {
+    stateful: Option<CapturedStatefulInference>,
+    execution_plan: ExecutionPlanSummary,
+}
+
+impl CompiledRecurrentCapture {
+    fn from_stateful(stateful: CapturedStatefulInference) -> Self {
+        Self {
+            execution_plan: stateful.execution_plan().clone(),
+            stateful: Some(stateful),
+        }
+    }
+
+    fn from_artifact(capture: &CapturedMixedSchedule) -> Result<Self> {
+        let execution_plan = artifact_recurrent_execution_plan(capture)?;
+        Ok(Self {
+            stateful: None,
+            execution_plan,
+        })
+    }
+
+    fn execution_plan(&self) -> &ExecutionPlanSummary {
+        &self.execution_plan
+    }
+
+    fn stateful(&self) -> Result<CapturedStatefulInference> {
+        self.stateful.clone().ok_or_else(|| {
+            training("compiled AdamW program artifacts currently prepare on CPU only")
+        })
+    }
+}
+
+fn artifact_recurrent_execution_plan(
+    capture: &CapturedMixedSchedule,
+) -> Result<ExecutionPlanSummary> {
+    let split = capture
+        .schedule
+        .items
+        .iter()
+        .position(crate::ScheduleItem::is_effect)
+        .ok_or_else(|| training("compiled artifact mixed capture has no effects"))?;
+    if capture.schedule.items[split..]
+        .iter()
+        .any(|item| !item.is_effect())
+    {
+        return Err(training(
+            "compiled artifact mixed capture does not have an ordered effect suffix",
+        ));
+    }
+    let mut pure = capture.schedule.clone();
+    pure.items.truncate(split);
+    pure.requested.extend(
+        capture
+            .value_bindings
+            .iter()
+            .map(|binding| binding.producer_output.id),
+    );
+    pure.identity = crate::schedule::artifact::identity(&pure)
+        .map_err(|error| training(format!("compiled artifact capture identity: {error}")))?;
+    ExecutionPlanSummary::from_capture(&pure, true)
+        .map_err(|error| training(format!("compiled artifact execution summary: {error}")))
+}
+
+#[derive(Clone)]
+struct CompiledEvaluationCapture {
+    inference: Option<crate::CapturedInference>,
+    capture: CapturedSchedule,
+    execution_plan: ExecutionPlanSummary,
+}
+
+impl CompiledEvaluationCapture {
+    fn from_inference(inference: crate::CapturedInference) -> Self {
+        Self {
+            capture: inference.capture().clone(),
+            execution_plan: inference.execution_plan().clone(),
+            inference: Some(inference),
+        }
+    }
+
+    fn from_artifact(capture: CapturedSchedule) -> Result<Self> {
+        let execution_plan = ExecutionPlanSummary::from_capture(&capture, true)
+            .map_err(|error| training(format!("compiled evaluation artifact summary: {error}")))?;
+        Ok(Self {
+            inference: None,
+            capture,
+            execution_plan,
+        })
+    }
+
+    fn capture(&self) -> &CapturedSchedule {
+        &self.capture
+    }
+
+    fn execution_plan(&self) -> &ExecutionPlanSummary {
+        &self.execution_plan
+    }
+
+    fn inference(&self) -> Result<crate::CapturedInference> {
+        self.inference.clone().ok_or_else(|| {
+            training("compiled AdamW program artifacts currently prepare on CPU only")
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -4460,7 +4593,7 @@ struct CompiledStepReplayRequest {
 /// One static CPU training program with runtime-owned recurrent state.
 struct CpuCompiledTrainingProgram {
     capture: CapturedMixedSchedule,
-    recurrent_capture: CapturedStatefulInference,
+    recurrent_capture: CompiledRecurrentCapture,
     runtime: EffectRuntime,
     cursor: MixedReplayCursor,
     inputs: BTreeMap<String, (Shape, DType)>,
@@ -5049,7 +5182,9 @@ impl CompiledTrainingPlan {
                     .capture_identity();
                 Ok::<_, Error>(CompiledAdamWAccumulationPlan {
                     capture: phase.capture,
-                    recurrent_capture: phase.recurrent_capture,
+                    recurrent_capture: CompiledRecurrentCapture::from_stateful(
+                        phase.recurrent_capture,
+                    ),
                     state_buffers: phase.state_buffers,
                     capture_identity,
                 })
@@ -5071,7 +5206,7 @@ impl CompiledTrainingPlan {
         let output_names = outputs.keys().cloned().collect();
         Ok(Self {
             capture: main.capture,
-            recurrent_capture: main.recurrent_capture,
+            recurrent_capture: CompiledRecurrentCapture::from_stateful(main.recurrent_capture),
             inputs: optimizer.inputs().clone(),
             output_names,
             clip_report: clip_report_enabled,
@@ -5115,7 +5250,7 @@ impl CompiledTrainingPlan {
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
         self.recurrent_capture
-            .clone()
+            .stateful()?
             .with_initial_state(initial_state)
             .map_err(captured_inference_error)
     }
@@ -5165,7 +5300,7 @@ impl CompiledTrainingPlan {
                     .cloned()
                     .collect::<BTreeSet<_>>();
                 MetalFixedStateReadPlan::new(
-                    evaluation.inference,
+                    evaluation.inference.inference()?,
                     renderer,
                     &inner,
                     &parameter_names,
@@ -5575,7 +5710,7 @@ impl CompiledAdamWAuxiliaryPlan {
             adamw_native_update_manifests(parameters.keys().cloned(), &updates, &state_buffers)?;
         Ok(Self {
             capture,
-            recurrent_capture,
+            recurrent_capture: CompiledRecurrentCapture::from_stateful(recurrent_capture),
             state_buffers,
             state_input_keys: specs
                 .into_iter()
@@ -5715,7 +5850,7 @@ impl CompiledAdamWAuxiliaryPlan {
             .capture_identity();
         Ok(Self {
             capture,
-            recurrent_capture,
+            recurrent_capture: CompiledRecurrentCapture::from_stateful(recurrent_capture),
             state_buffers,
             state_input_keys: specs
                 .into_iter()
@@ -5746,10 +5881,13 @@ impl CompiledAdamWAuxiliaryPlan {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        self.recurrent_capture = self
-            .recurrent_capture
-            .with_initial_state(initial_state)
-            .map_err(captured_inference_error)?;
+        if let Some(stateful) = self.recurrent_capture.stateful.take() {
+            self.recurrent_capture.stateful = Some(
+                stateful
+                    .with_initial_state(initial_state)
+                    .map_err(captured_inference_error)?,
+            );
+        }
         Ok(self)
     }
 }
@@ -5914,7 +6052,7 @@ impl CompiledEvaluationPlan {
         }
         let capture_identity = inference.capture().identity;
         Ok(Self {
-            inference,
+            inference: CompiledEvaluationCapture::from_inference(inference),
             inputs: training_plan.inner.inputs.clone(),
             output_names: outputs.keys().cloned().collect(),
             parameter_inputs,
@@ -7453,6 +7591,7 @@ impl CompiledAdamWPlan {
         let host_token_inputs = config.host_token_inputs.clone();
         let frozen_parameters = config.frozen_parameters.clone();
         let learning_rate = config.learning_rate.clone();
+        let adamw_policy = CompiledAdamWPolicy::from_config(&config);
         let inner = CompiledTrainingPlan::compile(
             AdamWProgram {
                 config: config.clone(),
@@ -7485,6 +7624,7 @@ impl CompiledAdamWPlan {
             frozen_parameters,
             evaluation: None,
             learning_rate,
+            adamw_policy,
         })
     }
 
@@ -7715,6 +7855,7 @@ impl CompiledAdamWPlan {
         let host_token_inputs = config.host_token_inputs.clone();
         let frozen_parameters = config.frozen_parameters.clone();
         let learning_rate = config.learning_rate.clone();
+        let adamw_policy = CompiledAdamWPolicy::from_config(&config);
         let workload = StateSpec::dropout_counter()?;
         let mut dropout_state = None;
         let mut frozen_parameter_nodes = BTreeSet::new();
@@ -7767,6 +7908,7 @@ impl CompiledAdamWPlan {
             frozen_parameters,
             evaluation: None,
             learning_rate,
+            adamw_policy,
         })
     }
 
@@ -8093,6 +8235,7 @@ impl CompiledAdamWPlan {
                 .clone()
                 .map(|plan| CpuCompiledEvaluation { plan }),
             learning_rate: self.learning_rate.clone(),
+            adamw_policy: self.adamw_policy.clone(),
             non_finite_policy,
         })
     }
@@ -8161,7 +8304,7 @@ impl CompiledAdamWPlan {
             .as_ref()
             .map(|transition| {
                 MetalFixedStateTransitionPlan::new(
-                    transition.recurrent_capture.clone(),
+                    transition.recurrent_capture.stateful()?,
                     renderer,
                     &inner.inner,
                 )
@@ -9627,6 +9770,7 @@ impl CpuCompiledAdamW {
                 .as_ref()
                 .map(|evaluation| evaluation.plan.clone()),
             learning_rate: self.learning_rate.clone(),
+            adamw_policy: self.adamw_policy.clone(),
         }
         .metal_plan(renderer)
     }
@@ -19560,6 +19704,12 @@ mod tests {
         )
         .unwrap();
         let capture_identity = source_plan.capture_identity();
+        let program_artifact = source_plan.program_artifact().unwrap();
+        assert_eq!(source_plan.program_artifact().unwrap(), program_artifact);
+        assert_eq!(
+            CompiledAdamWProgramArtifact::from_bytes(program_artifact.as_bytes().to_vec()).unwrap(),
+            program_artifact
+        );
         let mut source = source_plan.prepare(&CpuSessionTarget::new()).unwrap();
         let batch =
             || BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]);
@@ -19570,6 +19720,53 @@ mod tests {
             &source.checkpoint().unwrap()
         );
         assert_eq!(checkpoint.evaluation_capture_identity(), None);
+        assert_eq!(
+            program_artifact.info().capture_identity(),
+            checkpoint.optimizer_checkpoint().info().capture_identity()
+        );
+        let artifact_destination = TiedFrozenModule::new([9.0, 10.0]);
+        let artifact_destination_before = artifact_destination.shared.snapshot().unwrap();
+        let restored = CompiledModuleAdamWPlan::restore_from_program_artifact(
+            artifact_destination,
+            &program_artifact,
+            &checkpoint,
+        )
+        .unwrap();
+        assert_parameter_snapshot_eq(
+            &restored.module.shared.snapshot().unwrap(),
+            &artifact_destination_before,
+        );
+        let restored = restored.prepare(&CpuSessionTarget::new()).unwrap();
+        assert_eq!(
+            restored.checkpoint().unwrap(),
+            *checkpoint.optimizer_checkpoint()
+        );
+        let mut corrupt_artifact = program_artifact.as_bytes().to_vec();
+        let last = corrupt_artifact.len() - 1;
+        corrupt_artifact[last] ^= 1;
+        assert!(CompiledAdamWProgramArtifact::from_bytes(corrupt_artifact).is_err());
+        let foreign_artifact = CompiledModuleAdamWPlan::compile_graph(
+            module_config().with_gradient_accumulation(3).unwrap(),
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap()
+        .program_artifact()
+        .unwrap();
+        let mismatch_destination = TiedFrozenModule::new([11.0, 12.0]);
+        let mismatch_before = mismatch_destination.shared.snapshot().unwrap();
+        let mismatch = match CompiledModuleAdamWPlan::restore_from_program_artifact(
+            mismatch_destination,
+            &foreign_artifact,
+            &checkpoint,
+        ) {
+            Ok(_) => panic!("foreign program artifact restored"),
+            Err(error) => error.into_module(),
+        };
+        assert_parameter_snapshot_eq(&mismatch.shared.snapshot().unwrap(), &mismatch_before);
         assert_eq!(
             CompiledModuleAdamWCheckpoint::from_bytes(checkpoint.as_bytes().to_vec()).unwrap(),
             checkpoint

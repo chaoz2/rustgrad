@@ -939,6 +939,7 @@ facade adds only its progress/policy interpretation and portable checkpoint.
 | [Compile and replay](#compile-and-replay-contract) | One fixed graph, reverse traversal, optimizer program, and authenticated capture are prepared before repeated execution. |
 | [State ownership](#state-ownership-and-atomicity) | CPU `EffectRuntime` owns host recurrent bytes, while Metal owns epoch-swapped device banks; each cursor authenticates its frontier before atomic publication. |
 | [Resume](#resume-modes-and-module-ownership) | In-process plan restore, optimizer checkpoints, complete-module checkpoints, and bounded files remain distinct modes. |
+| [Program artifacts](#compiled-adamw-program-artifacts) | CPU executable captures and policy schemas persist separately from checkpoint tensors and native resources. |
 | [Evidence](#native-cpu-scoreboard-evidence) | Reports describe successful CPU preparation and replay without changing execution identities or imposing timing thresholds. |
 | [Backends](#compiled-training-backend-boundaries) | CPU interpreter, strict-native CPU, and the bounded strict-Metal path share capture/state contracts without hidden fallback. |
 
@@ -1010,6 +1011,28 @@ the same frontier may be retried with a nonempty mask or discarded with
 `zero_grad`. CPU interpreter and strict-native replay share this admission;
 token-weighted Metal remains fail-closed. Dynamic shapes, non-token objective
 weighting, and an inference ignore-index surface remain outside this policy.
+
+#### Compiled AdamW program artifacts
+
+`CompiledAdamWProgramArtifact` is a separate bounded, checksummed envelope for
+the resource-free CPU training program. It owns deterministic RGSM/RGSA bytes
+for the main capture and every present accumulation, partial-flush,
+`zero_grad`, and evaluation sibling, plus their input/output, recurrent-buffer,
+optimizer, dropout, learning-rate, token-weight, freeze/tie, and native-update
+schemas. It never contains checkpoint tensors, live `Parameter` handles,
+runtime banks, native pointers, loaded libraries, or machine code.
+
+| Boundary | Contract |
+|---|---|
+| Save | An owned module plan emits deterministic artifact bytes; AdamW and complete-module checkpoint bytes remain unchanged. |
+| Restore | `restore_from_program_artifact` consumes a differently initialized compatible module together with its complete-module checkpoint and rebuilds the resource-free CPU plan without invoking the workload builder, autograd, scheduling, capture, or evaluator construction. |
+| Admission | Envelope version, byte bound, checksum, every embedded capture, sibling cardinality/identity, state maps, module topology, evaluator identity, policy, and checkpoint capture identities authenticate before runtime preparation or module publication. |
+| Execution | Interpreter and strict-native CPU use the existing replay, commit-only egress, failure atomicity, checkpoint, and durable native-cache paths. Artifact-restored plans reject strict-Metal rendering because the graph-origin stateful wrapper is intentionally not serialized. |
+
+The artifact and checkpoint are an explicit pair: the artifact supplies
+immutable executable structure, while the unchanged checkpoint supplies the
+current parameter, optimizer, accumulation, loss/token, and dropout frontier.
+Neither can substitute for the other.
 
 #### Compile and replay contract
 
