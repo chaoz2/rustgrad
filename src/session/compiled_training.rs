@@ -4975,6 +4975,12 @@ struct CompiledStepReplayRequest {
     injected_failure: Option<u64>,
 }
 
+struct PendingAdamWStep {
+    request: CompiledStepReplayRequest,
+    next_progress: AdamWProgress,
+    loss_weight: u64,
+}
+
 /// One static CPU training program with runtime-owned recurrent state.
 struct CpuCompiledTrainingProgram {
     capture: CapturedMixedSchedule,
@@ -9513,6 +9519,57 @@ impl<M: Module> CompiledModuleAdamWSession<M, MetalCompiledAdamW> {
 }
 
 impl CpuCompiledAdamW {
+    fn admit_step(
+        &self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: Option<TensorData>,
+        selection: CompiledStepOutputSelection,
+        injected_failure: Option<u64>,
+    ) -> Result<PendingAdamWStep> {
+        validate_training_inputs(&self.inner.inputs, &inputs)?;
+        let loss_weight = validate_token_weight(
+            &inputs,
+            self.token_weight_policy.as_ref(),
+            self.allow_zero_valid_token_microbatches,
+        )?;
+        let next_progress = self
+            .progress
+            .advance_replay(self.gradient_accumulation_steps)?;
+        self.validate_completed_token_window(next_progress, loss_weight)?;
+        if let Some(dropout) = self.dropout {
+            expected_dropout_counter(dropout, next_progress.replay_step)?;
+        }
+        Ok(PendingAdamWStep {
+            request: CompiledStepReplayRequest {
+                inputs,
+                learning_rate,
+                non_finite_policy: self.non_finite_policy,
+                output_selection: selection,
+                injected_failure,
+            },
+            next_progress,
+            loss_weight,
+        })
+    }
+
+    fn publish_step(
+        &mut self,
+        next_progress: AdamWProgress,
+        loss_weight: u64,
+        mut result: CompiledTrainingStepResult,
+    ) -> CompiledAdamWStepResult {
+        result.step = next_progress.replay_step;
+        self.progress = next_progress;
+        adamw_step_result(
+            result,
+            next_progress,
+            loss_weight,
+            self.gradient_accumulation_steps,
+            self.clip_report,
+            self.window_loss_report,
+        )
+    }
+
     fn validate_completed_token_window(&self, next: AdamWProgress, loss_weight: u64) -> Result<()> {
         if !self.allow_zero_valid_token_microbatches
             || self.token_weight_policy.is_none()
@@ -9689,27 +9746,12 @@ impl CpuCompiledAdamW {
         selection: CompiledStepOutputSelection,
         injected_failure: Option<u64>,
     ) -> Result<CompiledAdamWStepResult> {
-        validate_training_inputs(&self.inner.inputs, &inputs)?;
-        let loss_weight = validate_token_weight(
-            &inputs,
-            self.token_weight_policy.as_ref(),
-            self.allow_zero_valid_token_microbatches,
-        )?;
-        let next = self
-            .progress
-            .advance_replay(self.gradient_accumulation_steps)?;
-        self.validate_completed_token_window(next, loss_weight)?;
-        if let Some(dropout) = self.dropout {
-            expected_dropout_counter(dropout, next.replay_step)?;
-        }
-        let request = CompiledStepReplayRequest {
-            inputs,
-            learning_rate,
-            non_finite_policy: self.non_finite_policy,
-            output_selection: selection,
-            injected_failure,
-        };
-        let mut result = if next.accumulation_index == 0 {
+        let PendingAdamWStep {
+            request,
+            next_progress,
+            loss_weight,
+        } = self.admit_step(inputs, learning_rate, selection, injected_failure)?;
+        let result = if next_progress.accumulation_index == 0 {
             self.inner.step_inner_with_learning_rate(request, true)?
         } else {
             let transition = self
@@ -9720,16 +9762,7 @@ impl CpuCompiledAdamW {
             self.inner
                 .step_accumulation_inner_with_learning_rate(&transition, request)?
         };
-        result.step = next.replay_step;
-        self.progress = next;
-        Ok(adamw_step_result(
-            result,
-            next,
-            loss_weight,
-            self.gradient_accumulation_steps,
-            self.clip_report,
-            self.window_loss_report,
-        ))
+        Ok(self.publish_step(next_progress, loss_weight, result))
     }
 
     pub fn step_batch_scheduled<B>(&mut self, batch: B) -> Result<CompiledAdamWStepResult>
@@ -10525,33 +10558,18 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         selection: CompiledStepOutputSelection,
         injected_failure: Option<u64>,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
-        validate_training_inputs(&self.inner.inner.inputs, &inputs)?;
-        let loss_weight = validate_token_weight(
-            &inputs,
-            self.inner.token_weight_policy.as_ref(),
-            self.inner.allow_zero_valid_token_microbatches,
-        )?;
-        let next = self
+        let PendingAdamWStep {
+            request,
+            next_progress,
+            loss_weight,
+        } = self
             .inner
-            .progress
-            .advance_replay(self.inner.gradient_accumulation_steps)?;
-        self.inner
-            .validate_completed_token_window(next, loss_weight)?;
-        if let Some(dropout) = self.inner.dropout {
-            expected_dropout_counter(dropout, next.replay_step)?;
-        }
+            .admit_step(inputs, learning_rate, selection, injected_failure)?;
         let successful_invocation = self
             .successful_steps
             .checked_add(1)
             .ok_or_else(|| training("compiled native CPU run count overflow"))?;
-        let request = CompiledStepReplayRequest {
-            inputs,
-            learning_rate,
-            non_finite_policy: self.inner.non_finite_policy,
-            output_selection: selection,
-            injected_failure,
-        };
-        let (mut result, mut report) = if next.accumulation_index == 0 {
+        let (result, mut report) = if next_progress.accumulation_index == 0 {
             self.inner.inner.step_native_inner_with_learning_rate(
                 request,
                 true,
@@ -10576,21 +10594,10 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     NativeReplayContext::new(self.executor, replay),
                 )?
         };
-        result.step = next.replay_step;
         report.successful_invocation = successful_invocation;
-        self.inner.progress = next;
+        let inner = self.inner.publish_step(next_progress, loss_weight, result);
         self.successful_steps = successful_invocation;
-        Ok(NativeCpuCompiledAdamWStepResult {
-            inner: adamw_step_result(
-                result,
-                next,
-                loss_weight,
-                self.inner.gradient_accumulation_steps,
-                self.inner.clip_report,
-                self.inner.window_loss_report,
-            ),
-            report,
-        })
+        Ok(NativeCpuCompiledAdamWStepResult { inner, report })
     }
 
     pub fn step_batch_scheduled<B>(&mut self, batch: B) -> Result<NativeCpuCompiledAdamWStepResult>
@@ -16488,6 +16495,97 @@ mod tests {
         plan.zero_grad.as_mut().unwrap().outputs =
             CompiledAdamWAuxiliaryOutputSchema::from_report_flags(true, false);
         assert!(plan.prepare_cpu().is_err());
+    }
+
+    #[test]
+    fn pending_adamw_step_admission_is_owned_and_publication_metadata_matches_native() {
+        let plan = non_finite_flush_plan();
+        let mut interpreted = plan.prepare_cpu().unwrap();
+        let before_progress = interpreted.progress;
+        let before_checkpoint = interpreted.checkpoint().unwrap();
+        let pending = interpreted
+            .admit_step(
+                scalar_batch(1.0),
+                Some(TensorData::scalar(0.01)),
+                CompiledStepOutputSelection::All,
+                None,
+            )
+            .unwrap();
+        assert_eq!(interpreted.progress, before_progress);
+        assert_eq!(interpreted.checkpoint().unwrap(), before_checkpoint);
+        assert_eq!(pending.next_progress.replay_step, 1);
+        assert_eq!(pending.next_progress.optimizer_step, 0);
+        assert_eq!(pending.next_progress.accumulation_index, 1);
+        assert_eq!(pending.loss_weight, 1);
+        assert_eq!(pending.request.inputs, scalar_batch(1.0));
+        assert!(pending.request.learning_rate.is_some());
+        assert!(matches!(
+            pending.request.output_selection,
+            CompiledStepOutputSelection::All
+        ));
+        assert_eq!(
+            pending.request.non_finite_policy,
+            CpuNonFinitePolicy::Propagate
+        );
+        assert!(pending.request.injected_failure.is_none());
+
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut native = target.prepare(&plan).unwrap();
+        let interpreted_accumulation = interpreted
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        let native_accumulation = native
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(
+            (
+                native_accumulation.step(),
+                native_accumulation.optimizer_step(),
+                native_accumulation.accumulation_index(),
+                native_accumulation.loss_weight(),
+                native_accumulation.did_update(),
+                native_accumulation.clip_report(),
+                native_accumulation.window_loss_report(),
+            ),
+            (
+                interpreted_accumulation.step(),
+                interpreted_accumulation.optimizer_step(),
+                interpreted_accumulation.accumulation_index(),
+                interpreted_accumulation.loss_weight(),
+                interpreted_accumulation.did_update(),
+                interpreted_accumulation.clip_report(),
+                interpreted_accumulation.window_loss_report(),
+            )
+        );
+
+        let interpreted_commit = interpreted
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        let native_commit = native
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(
+            (
+                native_commit.step(),
+                native_commit.optimizer_step(),
+                native_commit.accumulation_index(),
+                native_commit.loss_weight(),
+                native_commit.did_update(),
+                native_commit.clip_report(),
+                native_commit.window_loss_report(),
+            ),
+            (
+                interpreted_commit.step(),
+                interpreted_commit.optimizer_step(),
+                interpreted_commit.accumulation_index(),
+                interpreted_commit.loss_weight(),
+                interpreted_commit.did_update(),
+                interpreted_commit.clip_report(),
+                interpreted_commit.window_loss_report(),
+            )
+        );
+        assert_eq!(native.successful_steps, 2);
     }
 
     #[test]
