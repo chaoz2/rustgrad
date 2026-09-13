@@ -674,6 +674,11 @@ impl ProgramWire {
             validate_native_manifests(phase, &capture, &BTreeMap::new(), &BTreeMap::new())?;
         }
         if let Some(phase) = &self.zero_grad {
+            let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
+                phase.clip_report,
+                phase.window_loss_report,
+            );
+            outputs.validate_report_flags(false, false)?;
             if phase.clip_report
                 || phase.window_loss_report
                 || !phase.adamw_native_updates.is_empty()
@@ -692,14 +697,13 @@ impl ProgramWire {
             validate_native_manifests(phase, &capture, &BTreeMap::new(), &BTreeMap::new())?;
         }
         if let Some(phase) = &self.partial_flush {
-            if phase.clip_report != self.clip_report
-                || phase.window_loss_report != self.window_loss_report
-            {
-                return Err(training("compiled flush artifact report policy differs"));
-            }
+            let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
+                phase.clip_report,
+                phase.window_loss_report,
+            );
+            outputs.validate_report_flags(self.clip_report, self.window_loss_report)?;
             let (capture, states) = decode_phase(phase)?;
-            let expected_outputs =
-                usize::from(self.clip_report) * 2 + usize::from(self.window_loss_report) * 2;
+            let expected_outputs = outputs.observations.len();
             let has_learning_rate = capture
                 .schedule
                 .inputs
@@ -1099,13 +1103,17 @@ fn phase_wire(
 }
 
 fn auxiliary_wire(plan: &CompiledAdamWAuxiliaryPlan) -> Result<PhaseWire> {
+    let (clip_report, window_loss_report) = plan
+        .outputs
+        .report_flags()
+        .ok_or_else(|| training("compiled AdamW auxiliary observation schema is not canonical"))?;
     phase_wire(
         &plan.capture,
         &plan.state_buffers,
         &plan.state_input_keys,
         &plan.recurrent_store_groups,
-        plan.clip_report,
-        plan.window_loss_report,
+        clip_report,
+        window_loss_report,
     )
 }
 
@@ -1345,6 +1353,11 @@ fn decode_phase(
 
 fn decode_auxiliary(wire: &PhaseWire) -> Result<CompiledAdamWAuxiliaryPlan> {
     let (capture, state_buffers) = decode_phase(wire)?;
+    let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
+        wire.clip_report,
+        wire.window_loss_report,
+    );
+    outputs.validate_report_flags(wire.clip_report, wire.window_loss_report)?;
     let capture_identity = capture
         .initial_recurrent_cursor()
         .map_err(replay_error)?
@@ -1361,8 +1374,7 @@ fn decode_auxiliary(wire: &PhaseWire) -> Result<CompiledAdamWAuxiliaryPlan> {
             .map(decode_manifest)
             .collect::<Result<_>>()?,
         capture_identity,
-        clip_report: wire.clip_report,
-        window_loss_report: wire.window_loss_report,
+        outputs,
     })
 }
 

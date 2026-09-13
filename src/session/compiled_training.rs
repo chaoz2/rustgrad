@@ -3138,7 +3138,7 @@ struct CompiledOptimizerLowering {
     observations: Vec<CompiledTrainingObservationNode>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdamWObservation {
     ClipNorm,
     ClipScale,
@@ -3251,6 +3251,115 @@ fn validate_adamw_observation_schema(
         return Err(training("compiled AdamW observation schema differs"));
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompiledAdamWAuxiliaryOutputSchema {
+    observations: CompiledTrainingObservationSchema,
+}
+
+impl CompiledAdamWAuxiliaryOutputSchema {
+    fn from_nodes(graph: &Graph, nodes: &[CompiledTrainingObservationNode]) -> Result<Self> {
+        let schema = Self {
+            observations: CompiledTrainingObservationSchema::from_nodes(graph, nodes)?,
+        };
+        schema.report_flags().ok_or_else(|| {
+            training("compiled AdamW auxiliary observation schema is not canonical")
+        })?;
+        Ok(schema)
+    }
+
+    fn from_report_flags(clip_report: bool, window_loss_report: bool) -> Self {
+        Self {
+            observations: adamw_observation_schema(clip_report, window_loss_report),
+        }
+    }
+
+    fn validate_report_flags(&self, clip_report: bool, window_loss_report: bool) -> Result<()> {
+        if self != &Self::from_report_flags(clip_report, window_loss_report) {
+            return Err(training(
+                "compiled AdamW auxiliary observation flags differ from its schema",
+            ));
+        }
+        Ok(())
+    }
+
+    fn report_flags(&self) -> Option<(bool, bool)> {
+        [(false, false), (true, false), (false, true), (true, true)]
+            .into_iter()
+            .find(|(clip_report, window_loss_report)| {
+                self.observations == adamw_observation_schema(*clip_report, *window_loss_report)
+            })
+    }
+
+    #[cfg(test)]
+    fn clip_report_enabled(&self) -> bool {
+        self.report_flags()
+            .expect("compiled auxiliary output schema was authenticated")
+            .0
+    }
+
+    #[cfg(test)]
+    fn window_loss_report_enabled(&self) -> bool {
+        self.report_flags()
+            .expect("compiled auxiliary output schema was authenticated")
+            .1
+    }
+
+    fn node_ids(&self, nodes: &[CompiledTrainingObservationNode]) -> Result<Vec<NodeId>> {
+        if nodes.iter().map(|observation| observation.spec).ne(self
+            .observations
+            .entries
+            .iter()
+            .copied())
+        {
+            return Err(training(
+                "compiled AdamW auxiliary observation nodes differ from its schema",
+            ));
+        }
+        Ok(nodes.iter().map(|observation| observation.node).collect())
+    }
+
+    fn validate_and_decode(
+        &self,
+        outputs: &[TensorData],
+        policy: CpuNonFinitePolicy,
+    ) -> std::result::Result<CompiledAdamWAuxiliaryReports, String> {
+        let (clip_report, window_loss_report) = self.report_flags().ok_or_else(|| {
+            "compiled AdamW auxiliary observation schema is not canonical".to_owned()
+        })?;
+        if outputs.len() != self.observations.len() {
+            return Err("compiled CPU auxiliary output inventory differs".to_owned());
+        }
+        validate_staged_observations(outputs, 0, &self.observations, true, policy)?;
+        let mut values = outputs.iter();
+        let clip_report = clip_report.then(|| {
+            let norm = values
+                .next()
+                .expect("compiled clip-report norm cardinality was authenticated");
+            let scale = values
+                .next()
+                .expect("compiled clip-report scale cardinality was authenticated");
+            CompiledAdamWClipReport::new(norm.values()[0], scale.values()[0])
+        });
+        let window_loss = window_loss_report.then(|| {
+            let mean_loss = values
+                .next()
+                .expect("compiled window-loss mean cardinality was authenticated");
+            let loss_weight = values
+                .next()
+                .expect("compiled window-loss weight cardinality was authenticated");
+            CompiledAdamWWindowLossValue {
+                mean_loss_bits: mean_loss.values()[0].to_bits(),
+                loss_weight: loss_weight.scalar_at(0).as_u64(),
+            }
+        });
+        debug_assert!(values.next().is_none());
+        Ok(CompiledAdamWAuxiliaryReports {
+            clip_report,
+            window_loss,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4710,8 +4819,7 @@ struct CompiledAdamWAuxiliaryPlan {
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
     recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
     capture_identity: u64,
-    clip_report: bool,
-    window_loss_report: bool,
+    outputs: CompiledAdamWAuxiliaryOutputSchema,
 }
 
 #[derive(Clone)]
@@ -5867,16 +5975,12 @@ impl CompiledAdamWAuxiliaryPlan {
             .iter()
             .map(|(input, _, value, _, _)| (input.clone(), value.clone()))
             .collect();
-        let clip_requested = clipped
-            .report
-            .into_iter()
-            .flat_map(|report| [report.pre_clip_global_norm, report.applied_scale]);
-        let window_loss_requested = window_loss_report
-            .iter()
-            .flat_map(|(_, report)| [report.mean_loss, report.loss_weight]);
-        let public_requested = clip_requested
-            .chain(window_loss_requested)
-            .collect::<Vec<_>>();
+        let observations = adamw_observation_nodes(
+            clipped.report,
+            window_loss_report.as_ref().map(|(_, report)| *report),
+        );
+        let outputs = CompiledAdamWAuxiliaryOutputSchema::from_nodes(&graph, &observations)?;
+        let public_requested = outputs.node_ids(&observations)?;
         let public_requested = materialize_compiled_recurrent_public_aliases(
             &mut graph,
             &public_requested,
@@ -5964,8 +6068,7 @@ impl CompiledAdamWAuxiliaryPlan {
                 .collect(),
             recurrent_store_groups,
             capture_identity,
-            clip_report: clipped.report.is_some(),
-            window_loss_report: window_loss_report.is_some(),
+            outputs,
         })
     }
 
@@ -6104,8 +6207,7 @@ impl CompiledAdamWAuxiliaryPlan {
                 .collect(),
             recurrent_store_groups: Vec::new(),
             capture_identity,
-            clip_report: false,
-            window_loss_report: false,
+            outputs: CompiledAdamWAuxiliaryOutputSchema::from_report_flags(false, false),
         })
     }
 
@@ -7382,9 +7484,8 @@ impl CpuCompiledTrainingProgram {
         injected_failure: Option<u64>,
     ) -> Result<CompiledAdamWAuxiliaryReports> {
         let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
-        let clip_report = transition.clip_report;
-        let window_loss_report = transition.window_loss_report;
-        let window_loss_report_start = usize::from(clip_report) * 2;
+        let output_schema = transition.outputs.clone();
+        let mut reports = None;
         let replay = transition
             .capture
             .replay_recurrent_checked(
@@ -7394,26 +7495,12 @@ impl CpuCompiledTrainingProgram {
                 injected_failure,
                 |outputs, successors| {
                     validate_staged_transition(outputs, successors, non_finite_policy, false)?;
-                    validate_staged_clip_report(outputs, 0, clip_report, non_finite_policy)?;
-                    validate_staged_window_loss_report(
-                        outputs,
-                        window_loss_report_start,
-                        window_loss_report,
-                        non_finite_policy,
-                    )
+                    reports = Some(output_schema.validate_and_decode(outputs, non_finite_policy)?);
+                    Ok(())
                 },
             )
             .map_err(replay_error)?;
-        debug_assert_eq!(
-            replay.outputs.len(),
-            usize::from(transition.clip_report) * 2
-                + usize::from(transition.window_loss_report) * 2
-        );
-        let mut outputs = replay.outputs.into_iter();
-        let clip_report = take_compiled_clip_report(&mut outputs, transition.clip_report);
-        let window_loss =
-            take_compiled_window_loss_value(&mut outputs, transition.window_loss_report);
-        debug_assert!(outputs.next().is_none());
+        let reports = reports.expect("compiled auxiliary outputs were authenticated before commit");
         #[cfg(debug_assertions)]
         {
             let mut committed = replay.committed.clone();
@@ -7421,10 +7508,7 @@ impl CpuCompiledTrainingProgram {
             debug_assert_eq!(committed, prepared.cursor.frontier());
         }
         self.cursor = prepared.next_main_cursor;
-        Ok(CompiledAdamWAuxiliaryReports {
-            clip_report,
-            window_loss,
-        })
+        Ok(reports)
     }
 
     fn preflight_native_auxiliary_transition(
@@ -7536,9 +7620,8 @@ impl CpuCompiledTrainingProgram {
     ) -> Result<(CompiledAdamWAuxiliaryReports, NativeCpuRunReport)> {
         let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
         let started = Instant::now();
-        let clip_report = transition.clip_report;
-        let window_loss_report = transition.window_loss_report;
-        let window_loss_report_start = usize::from(clip_report) * 2;
+        let output_schema = transition.outputs.clone();
+        let mut reports = None;
         let replay = native
             .replay_recurrent_checked(
                 &mut self.runtime,
@@ -7552,29 +7635,15 @@ impl CpuCompiledTrainingProgram {
                         non_finite_policy,
                         false,
                     )?;
-                    validate_staged_clip_report(outputs, 0, clip_report, non_finite_policy)?;
-                    validate_staged_window_loss_report(
-                        outputs,
-                        window_loss_report_start,
-                        window_loss_report,
-                        non_finite_policy,
-                    )
+                    reports = Some(output_schema.validate_and_decode(outputs, non_finite_policy)?);
+                    Ok(())
                 },
             )
             .map_err(replay_error)?;
         let traffic = replay.traffic;
         let executor_wall_time = replay.executor_wall_time;
         let replay = replay.replay;
-        debug_assert_eq!(
-            replay.outputs.len(),
-            usize::from(transition.clip_report) * 2
-                + usize::from(transition.window_loss_report) * 2
-        );
-        let mut outputs = replay.outputs.into_iter();
-        let clip_report = take_compiled_clip_report(&mut outputs, transition.clip_report);
-        let window_loss =
-            take_compiled_window_loss_value(&mut outputs, transition.window_loss_report);
-        debug_assert!(outputs.next().is_none());
+        let reports = reports.expect("compiled auxiliary outputs were authenticated before commit");
         let native = replay
             .native_trace
             .as_ref()
@@ -7594,13 +7663,7 @@ impl CpuCompiledTrainingProgram {
             debug_assert_eq!(committed, prepared.cursor.frontier());
         }
         self.cursor = prepared.next_main_cursor;
-        Ok((
-            CompiledAdamWAuxiliaryReports {
-                clip_report,
-                window_loss,
-            },
-            report,
-        ))
+        Ok((reports, report))
     }
 
     fn snapshots(&self, buffers: &BTreeMap<String, u64>) -> Result<BTreeMap<String, TensorData>> {
@@ -8413,6 +8476,14 @@ impl CompiledAdamWPlan {
             self.clip_report,
             self.window_loss_report,
         )?;
+        if let Some(partial_flush) = &self.partial_flush {
+            partial_flush
+                .outputs
+                .validate_report_flags(self.clip_report, self.window_loss_report)?;
+        }
+        if let Some(zero_grad) = &self.zero_grad {
+            zero_grad.outputs.validate_report_flags(false, false)?;
+        }
         Ok(CpuCompiledAdamW {
             inner: self
                 .inner
@@ -12976,64 +13047,11 @@ fn validate_staged_observations(
                 if value.shape() != &Shape::from([]) || value.dtype() != DType::U64 {
                     return Err(spec.descriptor_error.to_owned());
                 }
-                if policy == CpuNonFinitePolicy::RejectTransition
-                    && value.scalar_at(0).as_u64() == 0
-                {
+                if value.scalar_at(0).as_u64() == 0 {
                     return Err(spec.invalid_value_error.to_owned());
                 }
             }
         }
-    }
-    Ok(())
-}
-
-fn validate_staged_clip_report(
-    outputs: &[TensorData],
-    start: usize,
-    enabled: bool,
-    policy: CpuNonFinitePolicy,
-) -> std::result::Result<(), String> {
-    if !enabled || policy == CpuNonFinitePolicy::Propagate {
-        return Ok(());
-    }
-    let report = outputs
-        .get(start..start + 2)
-        .ok_or_else(|| "compiled CPU clip-report output inventory differs".to_owned())?;
-    if report
-        .iter()
-        .any(|value| value.shape() != &Shape::from([]) || value.dtype() != DType::F32)
-    {
-        return Err("compiled CPU clip report must contain rank-zero F32 values".to_owned());
-    }
-    if has_non_finite_f32(report.iter()) {
-        return Err("compiled CPU transition has a non-finite clip report".to_owned());
-    }
-    Ok(())
-}
-
-fn validate_staged_window_loss_report(
-    outputs: &[TensorData],
-    start: usize,
-    enabled: bool,
-    policy: CpuNonFinitePolicy,
-) -> std::result::Result<(), String> {
-    if !enabled || policy == CpuNonFinitePolicy::Propagate {
-        return Ok(());
-    }
-    let report = outputs
-        .get(start..start + 2)
-        .ok_or_else(|| "compiled CPU window-loss output inventory differs".to_owned())?;
-    if report[0].shape() != &Shape::from([]) || report[0].dtype() != DType::F32 {
-        return Err("compiled CPU window loss must be rank-zero F32".to_owned());
-    }
-    if report[1].shape() != &Shape::from([]) || report[1].dtype() != DType::U64 {
-        return Err("compiled CPU window-loss weight must be rank-zero U64".to_owned());
-    }
-    if has_non_finite_f32(std::iter::once(&report[0])) {
-        return Err("compiled CPU transition has a non-finite window loss".to_owned());
-    }
-    if report[1].scalar_at(0).as_u64() == 0 {
-        return Err("compiled CPU window-loss weight must be positive".to_owned());
     }
     Ok(())
 }
@@ -16342,6 +16360,134 @@ mod tests {
         let pending = adamw_step_result(inner(Vec::new()), pending, 1, 3, true, true);
         assert!(pending.clip_report().is_none());
         assert!(pending.window_loss_report().is_none());
+    }
+
+    #[test]
+    fn adamw_auxiliary_output_schema_authenticates_every_report_shape() {
+        let values = |clip_report, window_loss_report| {
+            let mut values = Vec::new();
+            if clip_report {
+                values.extend([TensorData::scalar(2.0), TensorData::scalar(0.5)]);
+            }
+            if window_loss_report {
+                values.extend([
+                    TensorData::scalar(1.25),
+                    TensorData::scalar_with_dtype(Scalar::U(3), DType::U64),
+                ]);
+            }
+            values
+        };
+        for (clip_report, window_loss_report) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let schema = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
+                clip_report,
+                window_loss_report,
+            );
+            assert_eq!(
+                schema.report_flags(),
+                Some((clip_report, window_loss_report))
+            );
+            assert_eq!(schema.clip_report_enabled(), clip_report);
+            assert_eq!(schema.window_loss_report_enabled(), window_loss_report);
+            for policy in [
+                CpuNonFinitePolicy::Propagate,
+                CpuNonFinitePolicy::RejectTransition,
+            ] {
+                let decoded = schema
+                    .validate_and_decode(&values(clip_report, window_loss_report), policy)
+                    .unwrap();
+                assert_eq!(decoded.clip_report.is_some(), clip_report);
+                assert_eq!(decoded.window_loss.is_some(), window_loss_report);
+                if let Some(report) = decoded.clip_report {
+                    assert_eq!(report.pre_clip_global_norm(), 2.0);
+                    assert_eq!(report.applied_scale(), 0.5);
+                }
+                if let Some(report) = decoded.window_loss {
+                    assert_eq!(f32::from_bits(report.mean_loss_bits), 1.25);
+                    assert_eq!(report.loss_weight, 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adamw_auxiliary_output_schema_rejects_malformed_outputs_before_commit() {
+        let clip = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(true, false);
+        let malformed = [
+            TensorData::scalar(2.0),
+            TensorData::scalar_with_dtype(Scalar::U(1), DType::U64),
+        ];
+        for policy in [
+            CpuNonFinitePolicy::Propagate,
+            CpuNonFinitePolicy::RejectTransition,
+        ] {
+            assert!(clip.validate_and_decode(&malformed, policy).is_err());
+            assert!(clip.validate_and_decode(&malformed[..1], policy).is_err());
+            assert!(
+                CompiledAdamWAuxiliaryOutputSchema::from_report_flags(false, false)
+                    .validate_and_decode(&[TensorData::scalar(1.0)], policy)
+                    .is_err()
+            );
+        }
+
+        let non_finite = [TensorData::scalar(f32::NAN), TensorData::scalar(1.0)];
+        assert!(
+            clip.validate_and_decode(&non_finite, CpuNonFinitePolicy::Propagate)
+                .is_ok()
+        );
+        assert!(
+            clip.validate_and_decode(&non_finite, CpuNonFinitePolicy::RejectTransition)
+                .is_err()
+        );
+
+        let window = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(false, true);
+        let zero_weight = [
+            TensorData::scalar(1.0),
+            TensorData::scalar_with_dtype(Scalar::U(0), DType::U64),
+        ];
+        assert!(
+            window
+                .validate_and_decode(&zero_weight, CpuNonFinitePolicy::Propagate)
+                .is_err()
+        );
+        assert!(
+            window
+                .validate_and_decode(&zero_weight, CpuNonFinitePolicy::RejectTransition)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn adamw_auxiliary_output_schema_rejects_reordered_nodes_and_flag_mismatch() {
+        let mut graph = Graph::new();
+        let clip_norm = graph
+            .full_with_dtype(Shape::from([]), Scalar::F(2.0), DType::F32)
+            .unwrap();
+        let clip_scale = graph
+            .full_with_dtype(Shape::from([]), Scalar::F(0.5), DType::F32)
+            .unwrap();
+        let reordered = [
+            CompiledTrainingObservationNode {
+                spec: AdamWObservation::ClipScale.spec(),
+                node: clip_scale,
+            },
+            CompiledTrainingObservationNode {
+                spec: AdamWObservation::ClipNorm.spec(),
+                node: clip_norm,
+            },
+        ];
+        assert!(CompiledAdamWAuxiliaryOutputSchema::from_nodes(&graph, &reordered).is_err());
+
+        let mut plan = non_finite_flush_plan();
+        plan.partial_flush.as_mut().unwrap().outputs =
+            CompiledAdamWAuxiliaryOutputSchema::from_report_flags(false, false);
+        assert!(plan.prepare_cpu().is_err());
+
+        let mut plan = non_finite_flush_plan();
+        plan.zero_grad.as_mut().unwrap().outputs =
+            CompiledAdamWAuxiliaryOutputSchema::from_report_flags(true, false);
+        assert!(plan.prepare_cpu().is_err());
     }
 
     #[test]
@@ -20274,6 +20420,56 @@ mod tests {
         };
         assert_parameter_snapshot_eq(&destination.weight.snapshot().unwrap(), &destination_before);
         assert_eq!(destination.weight.id(), destination_identity);
+    }
+
+    #[test]
+    fn program_artifact_rejects_auxiliary_output_flag_mismatch_before_restore() {
+        let config = module_config()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_max_gradient_norm(1.0)
+            .unwrap()
+            .with_clip_report();
+        let plan = CompiledModuleAdamWPlan::compile_graph(
+            config,
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap();
+        let artifact = plan.program_artifact().unwrap();
+        let checkpoint = plan
+            .prepare(&CpuSessionTarget::new())
+            .unwrap()
+            .module_checkpoint()
+            .unwrap();
+
+        for (phase, clip_report) in [("partial_flush", false), ("zero_grad", true)] {
+            let (bytes, unchecked) = program_artifact::rewrite_json_for_test(&artifact, |json| {
+                json[phase]["clip_report"] = serde_json::Value::Bool(clip_report);
+            });
+            let error = CompiledAdamWProgramArtifact::from_bytes(bytes).unwrap_err();
+            assert!(error.to_string().contains("auxiliary observation"));
+
+            let destination = TiedFrozenModule::new([9.0, 10.0]);
+            let destination_identity = destination.shared.id();
+            let destination_before = destination.shared.snapshot().unwrap();
+            let destination = match CompiledModuleAdamWPlan::restore_from_program_artifact(
+                destination,
+                &unchecked,
+                &checkpoint,
+            ) {
+                Ok(_) => panic!("mismatched auxiliary output flags restored"),
+                Err(error) => error.into_module(),
+            };
+            assert_parameter_snapshot_eq(
+                &destination.shared.snapshot().unwrap(),
+                &destination_before,
+            );
+            assert_eq!(destination.shared.id(), destination_identity);
+        }
     }
 
     #[test]
