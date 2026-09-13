@@ -112,22 +112,23 @@ capture-owned policy-frozen constant, while preserving its tied identity,
 policy-frozen state, inherent frozen state, and buffer. Portable resume into a
 fresh owned module continues to recompile and authenticate the topology because
 executable captures are intentionally absent from checkpoint bytes.
-That CPU-only borrowed-plan workload now binds an exact `[B,T]` F32 loss mask
-beside fixed-capacity I32 tokens and legal dummy targets. Batch conversion
-rejects non-finite or non-binary masks, non-right padding, out-of-vocabulary
-tokens or dummy targets, and an all-padding batch before recurrent mutation.
-The token-mean compile surface accepts fixed-shape per-token F32 losses whose
-descriptor must exactly match the configured mask, and the compiler makes
-`sum(mask * losses) / sum(mask)` the sole public and differentiation scalar.
+That CPU-only borrowed-plan workload now binds fixed-capacity I32 tokens and
+sentinel targets. Compiler-owned ignore-index weighting derives the token keep
+tensor and exact count from those targets; the same validity source produces
+the compact broadcast attention mask. The token-mean compile surface accepts
+fixed-shape per-token F32 losses whose descriptor must exactly match the target,
+and the compiler makes the weighted mean the sole public and differentiation
+scalar. The older explicit F32 mask path remains compatibility-covered.
 Token-weighted configurations fail closed on the older arbitrary scalar-loss
 constructors. Across distinct valid lengths, including one padded final partial
-row, the CPU-only policy re-sums that mask inside the captured graph, retains a
-checked exact U64 valid-token count, and weights each normalized microbatch
-gradient before the whole-window divide, clipping, and AdamW update. Interpreter
+row, the CPU-only policy re-sums the derived keep tensor inside the captured
+graph, retains a checked exact U64 valid-token count, and weights each normalized
+microbatch gradient before the whole-window divide, clipping, and AdamW update. Interpreter
 and strict-native CPU results expose that same exact valid-token count as the
-normalized loss aggregation weight. They reject malformed masks before staging
-and retain zero fallback; Metal fails closed while the default scalar-loss
-CPU/native/Metal workload reports weight one and remains otherwise unchanged.
+normalized loss aggregation weight. They reject malformed weighting inputs
+before staging and retain zero fallback; Metal fails closed while the default
+scalar-loss CPU/native/Metal workload reports weight one and remains otherwise
+unchanged.
 Evaluation is stateless with respect to replay, optimizer, dropout,
 accumulation, checkpoint, and scoreboard state, including after a `zero_grad`
 bank flip. Compiled
@@ -213,8 +214,9 @@ before selecting private status-free renderers. Host validation
 checks every lane before driver work, leaving no transactional/indexed owner in
 that workload and reducing each prepared replay to one submission and one wait.
 Ordinary untrusted indexed movement remains guarded, and this transient policy
-does not alter recurrent state or checkpoint format. Weighted, ignored, and
-label-smoothed causal loss remain outside this workload-specific composition.
+does not alter recurrent state or checkpoint format. Target-derived ignored
+weighting is CPU-only; label-smoothed causal loss remains outside this
+workload-specific composition.
 
 ### 3. P1 — lower the identical training capture to Metal
 
