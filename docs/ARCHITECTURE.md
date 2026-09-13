@@ -1114,35 +1114,45 @@ successful full-writer clear-elision counts, static execution summaries,
 recurrent logical bytes, stable capture/native identities, and call-local wall
 times. Wall times do not participate in identity.
 
+An oversized unique schedule suffix is deterministically divided into two
+contiguous source-balanced translation units. Both compile to ephemeral PIC
+objects under the process-wide two-compiler limit; one ordered final link still
+publishes and loads exactly one content-addressed schedule library. Smaller
+suffixes retain the single combined compile/link command. Chunk sources and
+objects are cleaned on every result, and neither chunk boundaries nor process
+observations enter capture, cache, checkpoint, or replay identity.
+
 #### Native CPU scoreboard evidence
 
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional accumulation/flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v14 authenticates strict-native preparation
+separate `NativeTrainingScoreboard` v15 authenticates strict-native preparation
 and successful training-step reports, then emits bounded versioned JSON.
 
 | Evidence | Meaning |
 |---|---|
-| Preparation | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions, plus referenced modules and the unique/shared-prefix entry partition for every attached program. |
+| Preparation | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions; combined/object/link process inventories and cumulative versus effective compiler wall; plus referenced modules and the unique/shared-prefix entry partition for every attached program. |
 | Execution | Logical schedule/cache inventory, physical rendered/executed entries, and actual module-dispatch calls. |
 | Replay traffic | Owned external imports, borrowed/retained/replaced recurrent bytes, and logical CPU egress materialization count/bytes. CPU egress is not a device transfer. |
 | Timing | Caller-observed compile/prepare/checkpoint time plus bounded first/steady replay and executor/recurrent-overhead partitions. No threshold or speedup is claimed. |
 
 ##### Replay phases and wire versions
 
-V14 is emitted for both raw and classified recording. Classified steps use only
+V15 is emitted for both raw and classified recording. Classified steps use only
 `did_update`; the first replay remains separate, and warm accumulation-only and
 optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
 classification. One scoreboard rejects mixed recording modes without consuming
 a sample, and partial flush remains outside the main-step sample set.
 
-V1-v13 JSON remains readable. V1-v12 has CPU egress evidence absent; V13
+V1-v14 JSON remains readable. V1-v12 has CPU egress evidence absent; V13
 requires its successful main and, when present, accumulation replay inventories to include
 the workspace-backed tensors detached for the caller. Commit-only replay omits
 caller-named outputs while retaining loss and enabled validation/report scalars.
 Native preparation admits prefix reuse through four fail-closed contracts; v14
-records the resulting evidence without serializing entry metadata:
+records the resulting evidence without serializing entry metadata, and v15
+adds the compiler process-mode and cumulative-wall evidence without changing
+that prefix contract:
 
 - **Inventory.** Referenced modules and the exact unique-rendered/shared-prefix
   entry partition are authenticated per program.

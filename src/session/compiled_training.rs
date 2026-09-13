@@ -1395,6 +1395,9 @@ pub struct NativeCpuPreparationWork {
     shared_prefix_source_program: Option<usize>,
     durable_artifact_cache_hit_count: usize,
     durable_artifact_cache_miss_count: usize,
+    combined_compile_link_count: usize,
+    object_compile_count: usize,
+    linker_invocation_count: usize,
     compiler_invocation_count: usize,
 }
 
@@ -1409,6 +1412,9 @@ impl NativeCpuPreparationWork {
             shared_prefix_source_program: module.shared_prefix_source_program,
             durable_artifact_cache_hit_count: module.durable_artifact_cache_hit_count,
             durable_artifact_cache_miss_count: module.durable_artifact_cache_miss_count,
+            combined_compile_link_count: module.combined_compile_link_count,
+            object_compile_count: module.object_compile_count,
+            linker_invocation_count: module.linker_invocation_count,
             compiler_invocation_count: module.compiler_invocation_count,
         }
     }
@@ -1453,11 +1459,49 @@ impl NativeCpuPreparationWork {
         self.compiler_invocation_count
     }
 
+    /// Single-process translation-unit compilation plus shared-library link.
+    pub const fn combined_compile_link_count(&self) -> usize {
+        self.combined_compile_link_count
+    }
+
+    /// PIC object translation units compiled before a separate final link.
+    pub const fn object_compile_count(&self) -> usize {
+        self.object_compile_count
+    }
+
+    /// Separate shared-library linker processes.
+    pub const fn linker_invocation_count(&self) -> usize {
+        self.linker_invocation_count
+    }
+
     fn validate(&self, native_item_count: usize) -> Result<()> {
         let durable_access_count = self
             .durable_artifact_cache_hit_count
             .checked_add(self.durable_artifact_cache_miss_count)
             .ok_or_else(|| training("compiled native CPU durable cache count overflows"))?;
+        let observed_compiler_invocation_count = self
+            .combined_compile_link_count
+            .checked_add(self.object_compile_count)
+            .and_then(|count| count.checked_add(self.linker_invocation_count))
+            .ok_or_else(|| training("compiled native CPU compiler count overflows"))?;
+        let unique_rendered_entry_count = u64::try_from(self.unique_rendered_entry_count)
+            .map_err(|_| training("compiled native CPU unique entry count overflows"))?;
+        let compiler_process_inventory = (
+            u64::try_from(self.combined_compile_link_count)
+                .map_err(|_| training("compiled native CPU compiler count overflows"))?,
+            u64::try_from(self.object_compile_count)
+                .map_err(|_| training("compiled native CPU compiler count overflows"))?,
+            u64::try_from(self.linker_invocation_count)
+                .map_err(|_| training("compiled native CPU compiler count overflows"))?,
+        );
+        let compiler_mode_is_valid = if self.durable_artifact_cache_miss_count == 0 {
+            observed_compiler_invocation_count == 0
+        } else {
+            crate::cpu_jit::NativeScheduleModuleBuildMode::for_unique_rendered_entry_count(
+                unique_rendered_entry_count,
+            )
+            .is_some_and(|mode| mode.process_inventory() == compiler_process_inventory)
+        };
         if self.rendered_entry_count > native_item_count
             || (self.rendered_entry_count == 0) != (native_item_count == 0)
             || self
@@ -1472,7 +1516,9 @@ impl NativeCpuPreparationWork {
                 .checked_add(usize::from(self.shared_prefix_entry_count != 0))
                 != Some(self.referenced_module_count)
             || durable_access_count > self.loaded_module_count
-            || self.compiler_invocation_count != self.durable_artifact_cache_miss_count
+            || self.object_compile_count > self.unique_rendered_entry_count
+            || self.compiler_invocation_count != observed_compiler_invocation_count
+            || !compiler_mode_is_valid
         {
             return Err(training(
                 "compiled native CPU module preparation evidence mismatch",
@@ -1491,6 +1537,8 @@ pub struct NativeCpuPreparationPhases {
     layout_wall_time: Duration,
     render_wall_time: Duration,
     compiler_process_wall_time: Duration,
+    compiler_process_total_wall_time: Duration,
+    linker_process_wall_time: Duration,
     module_load_wall_time: Duration,
     residual_wall_time: Duration,
 }
@@ -1519,6 +1567,8 @@ impl NativeCpuPreparationPhases {
             layout_wall_time: module.layout_wall_time,
             render_wall_time: module.render_wall_time,
             compiler_process_wall_time: module.compiler_process_wall_time,
+            compiler_process_total_wall_time: module.compiler_process_total_wall_time,
+            linker_process_wall_time: module.linker_process_wall_time,
             module_load_wall_time: module.module_load_wall_time,
             residual_wall_time,
         })
@@ -1541,6 +1591,14 @@ impl NativeCpuPreparationPhases {
         if total != total_wall_time
             || (work.compiler_invocation_count == 0
                 && self.compiler_process_wall_time != Duration::ZERO)
+            || self.compiler_process_total_wall_time < self.compiler_process_wall_time
+            || (work.compiler_invocation_count <= 1
+                && self.compiler_process_total_wall_time != self.compiler_process_wall_time)
+            || self.linker_process_wall_time > self.compiler_process_wall_time
+            || (work.compiler_invocation_count == 0
+                && self.compiler_process_total_wall_time != Duration::ZERO)
+            || (work.linker_invocation_count == 0
+                && self.linker_process_wall_time != Duration::ZERO)
             || (work.loaded_module_count == 0 && self.module_load_wall_time != Duration::ZERO)
         {
             return Err(training(
@@ -1560,6 +1618,16 @@ impl NativeCpuPreparationPhases {
 
     pub const fn compiler_process_wall_time(&self) -> Duration {
         self.compiler_process_wall_time
+    }
+
+    /// Sum of all compiler subprocess durations, including overlapped work.
+    pub const fn compiler_process_total_wall_time(&self) -> Duration {
+        self.compiler_process_total_wall_time
+    }
+
+    /// Wall time of the separate final link, zero for combined compilation.
+    pub const fn linker_process_wall_time(&self) -> Duration {
+        self.linker_process_wall_time
     }
 
     pub const fn module_load_wall_time(&self) -> Duration {
@@ -13811,6 +13879,46 @@ mod tests {
     }
 
     #[test]
+    fn native_preparation_work_authenticates_exact_module_build_mode() {
+        let direct = NativeCpuPreparationWork {
+            rendered_entry_count: 512,
+            loaded_module_count: 1,
+            referenced_module_count: 1,
+            unique_rendered_entry_count: 512,
+            shared_prefix_entry_count: 0,
+            shared_prefix_source_program: None,
+            durable_artifact_cache_hit_count: 0,
+            durable_artifact_cache_miss_count: 1,
+            combined_compile_link_count: 1,
+            object_compile_count: 0,
+            linker_invocation_count: 0,
+            compiler_invocation_count: 1,
+        };
+        assert!(direct.validate(512).is_ok());
+        let oversized_direct = NativeCpuPreparationWork {
+            rendered_entry_count: 682,
+            unique_rendered_entry_count: 682,
+            ..direct
+        };
+        assert!(oversized_direct.validate(682).is_err());
+
+        let chunked = NativeCpuPreparationWork {
+            combined_compile_link_count: 0,
+            object_compile_count: 2,
+            linker_invocation_count: 1,
+            compiler_invocation_count: 3,
+            ..oversized_direct
+        };
+        assert!(chunked.validate(682).is_ok());
+        let bounded_chunked = NativeCpuPreparationWork {
+            rendered_entry_count: 512,
+            unique_rendered_entry_count: 512,
+            ..chunked
+        };
+        assert!(bounded_chunked.validate(512).is_err());
+    }
+
+    #[test]
     fn compiled_state_aliases_receive_explicit_capture_owners() {
         let mut graph = Graph::new();
         let input = graph.input_dtype_requires_grad("state", [], DType::F32, false);
@@ -16315,7 +16423,7 @@ mod tests {
             accumulation_preparation.native_item_count()
                 < native.preparation_report().main().native_item_count()
         );
-        assert!(native.preparation_report().compiler_process_count() <= 4);
+        assert!(native.preparation_report().compiler_process_count() <= 6);
         assert!(
             native
                 .preparation_report()
@@ -16336,7 +16444,7 @@ mod tests {
                 program.work().loaded_module_count(),
                 usize::from(program.work().unique_rendered_entry_count() != 0)
             );
-            assert!(program.work().compiler_invocation_count() <= 1);
+            assert!(program.work().compiler_invocation_count() <= 3);
         }
 
         let initial_checkpoint = native.checkpoint().unwrap();
