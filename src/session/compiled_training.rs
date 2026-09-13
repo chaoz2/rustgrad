@@ -1366,8 +1366,7 @@ pub struct CompiledTrainingStepResult {
     outputs: BTreeMap<String, TensorData>,
     step: u64,
     capture_identity: u64,
-    clip_report: Option<CompiledAdamWClipReport>,
-    window_loss: Option<CompiledAdamWWindowLossValue>,
+    observations: Vec<CompiledTrainingObservationValue>,
 }
 
 /// Detached outputs from one read-only evaluation of the live compiled
@@ -2365,6 +2364,7 @@ pub struct CompiledAdamWStepResult {
     optimizer_step: u64,
     accumulation_index: u64,
     loss_weight: u64,
+    clip_report: Option<CompiledAdamWClipReport>,
     window_loss_report: Option<CompiledAdamWWindowLossReport>,
 }
 
@@ -2493,7 +2493,7 @@ impl CompiledAdamWStepResult {
 
     /// Completed-window clipping evidence when reporting was requested.
     pub fn clip_report(&self) -> Option<&CompiledAdamWClipReport> {
-        self.inner.clip_report.as_ref()
+        self.clip_report.as_ref()
     }
 
     /// Aggregate loss for the full window committed by this replay.
@@ -2997,12 +2997,260 @@ struct CompiledAdamWWindowLossNodes {
     loss_weight: NodeId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CompiledTrainingObservationKey(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompiledTrainingObservationConstraint {
+    ScalarF32,
+    ScalarU64Positive,
+}
+
+#[derive(Clone, Copy)]
+struct CompiledTrainingObservationNode {
+    spec: CompiledTrainingObservationSpec,
+    node: NodeId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompiledTrainingObservationSpec {
+    key: CompiledTrainingObservationKey,
+    constraint: CompiledTrainingObservationConstraint,
+    descriptor_error: &'static str,
+    invalid_value_error: &'static str,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CompiledTrainingObservationSchema {
+    entries: Vec<CompiledTrainingObservationSpec>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompiledTrainingLossOutput {
+    ScalarF32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompiledTrainingPhaseOutputSchema {
+    loss: CompiledTrainingLossOutput,
+    named_outputs: Vec<String>,
+    observations: CompiledTrainingObservationSchema,
+}
+
+struct CompiledTrainingPhaseOutputs {
+    loss: TensorData,
+    named_outputs: BTreeMap<String, TensorData>,
+    observations: Vec<CompiledTrainingObservationValue>,
+}
+
+impl CompiledTrainingPhaseOutputSchema {
+    fn selected_len(
+        &self,
+        include_named_outputs: bool,
+        include_observations: bool,
+    ) -> Result<usize> {
+        let loss_count: usize = match self.loss {
+            CompiledTrainingLossOutput::ScalarF32 => 1,
+        };
+        loss_count
+            .checked_add(usize::from(include_named_outputs) * self.named_outputs.len())
+            .and_then(|count| {
+                count.checked_add(usize::from(include_observations) * self.observations.len())
+            })
+            .ok_or_else(|| training("compiled requested output count overflows"))
+    }
+
+    fn take(
+        &self,
+        values: Vec<TensorData>,
+        selection: CompiledStepOutputSelection,
+        include_observations: bool,
+    ) -> CompiledTrainingPhaseOutputs {
+        let expected = self
+            .selected_len(selection.includes_named_outputs(), include_observations)
+            .expect("compiled output schema was authenticated before replay");
+        debug_assert_eq!(values.len(), expected);
+        let mut values = values.into_iter();
+        let loss = values
+            .next()
+            .expect("compiled loss cardinality was authenticated");
+        let named_outputs = if selection.includes_named_outputs() {
+            self.named_outputs
+                .iter()
+                .cloned()
+                .zip(&mut values)
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let observations = if include_observations {
+            self.observations
+                .entries
+                .iter()
+                .map(|spec| CompiledTrainingObservationValue {
+                    key: spec.key,
+                    value: values
+                        .next()
+                        .expect("compiled observation cardinality was authenticated"),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        debug_assert!(values.next().is_none());
+        CompiledTrainingPhaseOutputs {
+            loss,
+            named_outputs,
+            observations,
+        }
+    }
+}
+
+impl CompiledTrainingObservationSchema {
+    fn from_nodes(graph: &Graph, nodes: &[CompiledTrainingObservationNode]) -> Result<Self> {
+        let mut keys = BTreeSet::new();
+        for observation in nodes {
+            if !keys.insert(observation.spec.key) {
+                return Err(training("compiled training observation key repeats"));
+            }
+            validate_observation_descriptor(graph, observation.node, observation.spec.constraint)?;
+        }
+        Ok(Self {
+            entries: nodes.iter().map(|observation| observation.spec).collect(),
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompiledTrainingObservationValue {
+    key: CompiledTrainingObservationKey,
+    value: TensorData,
+}
+
 struct CompiledOptimizerLowering {
     updates: BTreeMap<RecurrentStateKey, NodeId>,
-    accumulation_updates: Option<BTreeMap<RecurrentStateKey, NodeId>>,
+    sibling_updates: Option<BTreeMap<RecurrentStateKey, NodeId>>,
     recurrent_store_groups: Vec<RecurrentStoreGroupSpec>,
-    clip_report: Option<CompiledAdamWClipNodes>,
-    window_loss_report: Option<CompiledAdamWWindowLossNodes>,
+    observations: Vec<CompiledTrainingObservationNode>,
+}
+
+#[derive(Clone, Copy)]
+enum AdamWObservation {
+    ClipNorm,
+    ClipScale,
+    WindowMean,
+    WindowWeight,
+}
+
+impl AdamWObservation {
+    const fn spec(self) -> CompiledTrainingObservationSpec {
+        let (key, constraint, descriptor_error, invalid_value_error) = match self {
+            Self::ClipNorm => (
+                0,
+                CompiledTrainingObservationConstraint::ScalarF32,
+                "compiled CPU clip report must contain rank-zero F32 values",
+                "compiled CPU transition has a non-finite clip report",
+            ),
+            Self::ClipScale => (
+                1,
+                CompiledTrainingObservationConstraint::ScalarF32,
+                "compiled CPU clip report must contain rank-zero F32 values",
+                "compiled CPU transition has a non-finite clip report",
+            ),
+            Self::WindowMean => (
+                2,
+                CompiledTrainingObservationConstraint::ScalarF32,
+                "compiled CPU window loss must be rank-zero F32",
+                "compiled CPU transition has a non-finite window loss",
+            ),
+            Self::WindowWeight => (
+                3,
+                CompiledTrainingObservationConstraint::ScalarU64Positive,
+                "compiled CPU window-loss weight must be rank-zero U64",
+                "compiled CPU window-loss weight must be positive",
+            ),
+        };
+        CompiledTrainingObservationSpec {
+            key: CompiledTrainingObservationKey(key),
+            constraint,
+            descriptor_error,
+            invalid_value_error,
+        }
+    }
+}
+
+fn adamw_observation_order(clip_report: bool, window_loss_report: bool) -> Vec<AdamWObservation> {
+    let mut observations =
+        Vec::with_capacity(usize::from(clip_report) * 2 + usize::from(window_loss_report) * 2);
+    if clip_report {
+        observations.extend([AdamWObservation::ClipNorm, AdamWObservation::ClipScale]);
+    }
+    if window_loss_report {
+        observations.extend([AdamWObservation::WindowMean, AdamWObservation::WindowWeight]);
+    }
+    observations
+}
+
+fn adamw_observation_nodes(
+    clip: Option<CompiledAdamWClipNodes>,
+    window_loss: Option<CompiledAdamWWindowLossNodes>,
+) -> Vec<CompiledTrainingObservationNode> {
+    adamw_observation_order(clip.is_some(), window_loss.is_some())
+        .into_iter()
+        .map(|observation| {
+            let node = match observation {
+                AdamWObservation::ClipNorm => {
+                    clip.expect("clip observations require clip nodes")
+                        .pre_clip_global_norm
+                }
+                AdamWObservation::ClipScale => {
+                    clip.expect("clip observations require clip nodes")
+                        .applied_scale
+                }
+                AdamWObservation::WindowMean => {
+                    window_loss
+                        .expect("window observations require window nodes")
+                        .mean_loss
+                }
+                AdamWObservation::WindowWeight => {
+                    window_loss
+                        .expect("window observations require window nodes")
+                        .loss_weight
+                }
+            };
+            CompiledTrainingObservationNode {
+                spec: observation.spec(),
+                node,
+            }
+        })
+        .collect()
+}
+
+fn adamw_observation_schema(
+    clip_report: bool,
+    window_loss_report: bool,
+) -> CompiledTrainingObservationSchema {
+    CompiledTrainingObservationSchema {
+        entries: adamw_observation_order(clip_report, window_loss_report)
+            .into_iter()
+            .map(AdamWObservation::spec)
+            .collect(),
+    }
+}
+
+fn validate_adamw_observation_schema(
+    actual: &CompiledTrainingObservationSchema,
+    clip_report: bool,
+    window_loss_report: bool,
+) -> Result<()> {
+    if actual != &adamw_observation_schema(clip_report, window_loss_report) {
+        return Err(training("compiled AdamW observation schema differs"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3088,10 +3336,9 @@ impl CompiledOptimizerProgram for MomentumProgram {
         }
         Ok(CompiledOptimizerLowering {
             updates,
-            accumulation_updates: None,
+            sibling_updates: None,
             recurrent_store_groups: Vec::new(),
-            clip_report: None,
-            window_loss_report: None,
+            observations: Vec::new(),
         })
     }
 }
@@ -3210,12 +3457,12 @@ impl CompiledOptimizerProgram for AdamWProgram {
             } else {
                 None
             };
+            let observations = adamw_observation_nodes(clipped.report, window_loss_report);
             return Ok(CompiledOptimizerLowering {
                 updates,
-                accumulation_updates: None,
+                sibling_updates: None,
                 recurrent_store_groups: Vec::new(),
-                clip_report: clipped.report,
-                window_loss_report,
+                observations,
             });
         }
 
@@ -3355,17 +3602,20 @@ impl CompiledOptimizerProgram for AdamWProgram {
             updates.insert(second_key, next_second);
             updates.insert(RecurrentStateKey::parameter(name), next_parameter);
         }
-        Ok(CompiledOptimizerLowering {
-            updates,
-            accumulation_updates: Some(accumulation_updates),
-            recurrent_store_groups: adamw_recurrent_store_group_specs(parameters.keys(), true),
-            clip_report: clipped.report,
-            window_loss_report: window_loss.map(|(_, _, mean_loss, loss_weight)| {
-                CompiledAdamWWindowLossNodes {
+        let observations = adamw_observation_nodes(
+            clipped.report,
+            window_loss.map(
+                |(_, _, mean_loss, loss_weight)| CompiledAdamWWindowLossNodes {
                     mean_loss,
                     loss_weight,
-                }
-            }),
+                },
+            ),
+        );
+        Ok(CompiledOptimizerLowering {
+            updates,
+            sibling_updates: Some(accumulation_updates),
+            recurrent_store_groups: adamw_recurrent_store_group_specs(parameters.keys(), true),
+            observations,
         })
     }
 }
@@ -4430,9 +4680,7 @@ struct CompiledTrainingPlan {
     capture: CapturedMixedSchedule,
     recurrent_capture: CompiledRecurrentCapture,
     inputs: BTreeMap<String, (Shape, DType)>,
-    output_names: Vec<String>,
-    clip_report: bool,
-    window_loss_report: bool,
+    phase_outputs: CompiledTrainingPhaseOutputSchema,
     parameter_buffers: BTreeMap<String, u64>,
     optimizer_buffers: BTreeMap<RecurrentStateKey, u64>,
     workload_buffers: BTreeMap<RecurrentStateKey, u64>,
@@ -4443,11 +4691,11 @@ struct CompiledTrainingPlan {
     recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
     frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
-    accumulation: Option<CompiledAdamWAccumulationPlan>,
+    accumulation: Option<CompiledTrainingSiblingPlan>,
 }
 
 #[derive(Clone)]
-struct CompiledAdamWAccumulationPlan {
+struct CompiledTrainingSiblingPlan {
     capture: CapturedMixedSchedule,
     recurrent_capture: CompiledRecurrentCapture,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
@@ -4609,17 +4857,6 @@ impl CompiledStepOutputSelection {
     const fn includes_named_outputs(self) -> bool {
         matches!(self, Self::All)
     }
-
-    fn take_named_outputs(
-        self,
-        output_names: &[String],
-        outputs: &mut impl Iterator<Item = TensorData>,
-    ) -> BTreeMap<String, TensorData> {
-        if !self.includes_named_outputs() {
-            return BTreeMap::new();
-        }
-        output_names.iter().cloned().zip(outputs).collect()
-    }
 }
 
 struct CompiledStepReplayRequest {
@@ -4637,9 +4874,7 @@ struct CpuCompiledTrainingProgram {
     runtime: EffectRuntime,
     cursor: MixedReplayCursor,
     inputs: BTreeMap<String, (Shape, DType)>,
-    output_names: Vec<String>,
-    clip_report: bool,
-    window_loss_report: bool,
+    phase_outputs: CompiledTrainingPhaseOutputSchema,
     parameter_buffers: BTreeMap<String, u64>,
     optimizer_buffers: BTreeMap<RecurrentStateKey, u64>,
     workload_buffers: BTreeMap<RecurrentStateKey, u64>,
@@ -4648,7 +4883,7 @@ struct CpuCompiledTrainingProgram {
     recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
     frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
-    accumulation: Option<CompiledAdamWAccumulationPlan>,
+    accumulation: Option<CompiledTrainingSiblingPlan>,
 }
 
 struct CpuAuxiliaryReplay {
@@ -5119,10 +5354,9 @@ impl CompiledTrainingPlan {
             .collect::<BTreeMap<_, _>>();
         let CompiledOptimizerLowering {
             mut updates,
-            mut accumulation_updates,
+            mut sibling_updates,
             recurrent_store_groups,
-            clip_report,
-            window_loss_report,
+            observations,
         } = optimizer.lower_updates(
             &mut graph,
             CompiledOptimizerLoweringContext {
@@ -5137,25 +5371,18 @@ impl CompiledTrainingPlan {
         match (specs.get(optimizer_spec_count), workload_successor) {
             (Some(spec), Some(successor)) => {
                 updates.insert(spec.key.clone(), successor);
-                if let Some(accumulation_updates) = &mut accumulation_updates {
-                    accumulation_updates.insert(spec.key.clone(), successor);
+                if let Some(sibling_updates) = &mut sibling_updates {
+                    sibling_updates.insert(spec.key.clone(), successor);
                 }
             }
             (None, None) => {}
             _ => return Err(training("compiled workload successor set mismatch")),
         }
-        let clip_report_enabled = clip_report.is_some();
-        let window_loss_report_enabled = window_loss_report.is_some();
-        let clip_requested = clip_report
-            .into_iter()
-            .flat_map(|report| [report.pre_clip_global_norm, report.applied_scale]);
-        let window_loss_requested = window_loss_report
-            .into_iter()
-            .flat_map(|report| [report.mean_loss, report.loss_weight]);
+        let observation_schema =
+            CompiledTrainingObservationSchema::from_nodes(&graph, &observations)?;
         let main_public_requested = std::iter::once(loss)
             .chain(outputs.values().copied())
-            .chain(clip_requested)
-            .chain(window_loss_requested)
+            .chain(observations.iter().map(|observation| observation.node))
             .collect::<Vec<_>>();
         let external_input_names = optimizer.inputs().keys().cloned().collect::<Vec<_>>();
         let main = capture_training_phase(
@@ -5172,7 +5399,7 @@ impl CompiledTrainingPlan {
                 materialize_state_passthroughs: false,
             },
         )?;
-        let accumulation = accumulation_updates
+        let accumulation = sibling_updates
             .map(|updates| {
                 let public_requested = std::iter::once(loss)
                     .chain(outputs.values().copied())
@@ -5196,7 +5423,7 @@ impl CompiledTrainingPlan {
                     .initial_recurrent_cursor()
                     .map_err(replay_error)?
                     .capture_identity();
-                Ok::<_, Error>(CompiledAdamWAccumulationPlan {
+                Ok::<_, Error>(CompiledTrainingSiblingPlan {
                     capture: phase.capture,
                     recurrent_capture: CompiledRecurrentCapture::from_stateful(
                         phase.recurrent_capture,
@@ -5219,14 +5446,16 @@ impl CompiledTrainingPlan {
             }
         }
 
-        let output_names = outputs.keys().cloned().collect();
+        let phase_outputs = CompiledTrainingPhaseOutputSchema {
+            loss: CompiledTrainingLossOutput::ScalarF32,
+            named_outputs: outputs.keys().cloned().collect(),
+            observations: observation_schema,
+        };
         Ok(Self {
             capture: main.capture,
             recurrent_capture: CompiledRecurrentCapture::from_stateful(main.recurrent_capture),
             inputs: optimizer.inputs().clone(),
-            output_names,
-            clip_report: clip_report_enabled,
-            window_loss_report: window_loss_report_enabled,
+            phase_outputs,
             parameter_buffers,
             optimizer_buffers,
             workload_buffers,
@@ -5328,7 +5557,7 @@ impl CompiledTrainingPlan {
         Ok(MetalCompiledTrainingPlan {
             inner,
             inputs: self.inputs.clone(),
-            output_names: self.output_names.clone(),
+            output_names: self.phase_outputs.named_outputs.clone(),
             state_input_keys: self.state_input_keys.clone(),
             program_identity: self.capture_identity()?,
             evaluation,
@@ -5441,9 +5670,7 @@ impl CompiledTrainingPlan {
             runtime,
             cursor,
             inputs: self.inputs.clone(),
-            output_names: self.output_names.clone(),
-            clip_report: self.clip_report,
-            window_loss_report: self.window_loss_report,
+            phase_outputs: self.phase_outputs.clone(),
             parameter_buffers: self.parameter_buffers.clone(),
             optimizer_buffers: self.optimizer_buffers.clone(),
             workload_buffers: self.workload_buffers.clone(),
@@ -6535,33 +6762,30 @@ impl CpuCompiledTrainingProgram {
         &self,
         capture: &CapturedMixedSchedule,
         selection: CompiledStepOutputSelection,
-        include_reports: bool,
+        include_observations: bool,
     ) -> Result<Option<Vec<u64>>> {
         if selection.includes_named_outputs() {
             return Ok(None);
         }
-        let report_count = if include_reports {
-            usize::from(self.clip_report) * 2 + usize::from(self.window_loss_report) * 2
-        } else {
-            0
-        };
-        let expected = 1usize
-            .checked_add(self.output_names.len())
-            .and_then(|count| count.checked_add(report_count))
-            .ok_or_else(|| training("compiled requested output count overflows"))?;
+        let expected = self
+            .phase_outputs
+            .selected_len(true, include_observations)?;
         if capture.schedule.requested.len() != expected {
             return Err(training(
                 "compiled requested output layout does not match its authenticated capture",
             ));
         }
-        let mut selected = Vec::with_capacity(1 + report_count);
+        let mut selected = Vec::with_capacity(
+            self.phase_outputs
+                .selected_len(false, include_observations)?,
+        );
         selected.push(capture.schedule.requested[0]);
         selected.extend(
             capture
                 .schedule
                 .requested
                 .iter()
-                .skip(1 + self.output_names.len())
+                .skip(1 + self.phase_outputs.named_outputs.len())
                 .copied(),
         );
         Ok(Some(selected))
@@ -6598,7 +6822,7 @@ impl CpuCompiledTrainingProgram {
     fn step_inner_with_learning_rate(
         &mut self,
         request: CompiledStepReplayRequest,
-        validate_commit_reports: bool,
+        validate_commit_observations: bool,
     ) -> Result<CompiledTrainingStepResult> {
         let CompiledStepReplayRequest {
             inputs,
@@ -6619,13 +6843,11 @@ impl CpuCompiledTrainingProgram {
         if let Some(learning_rate) = learning_rate {
             provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
         }
-        let clip_report = self.clip_report;
         let selected_requested = self.selected_step_outputs(&self.capture, selection, true)?;
-        let named_output_count =
-            usize::from(selection.includes_named_outputs()) * self.output_names.len();
-        let clip_report_start = 1 + named_output_count;
-        let window_loss_report = self.window_loss_report;
-        let window_loss_report_start = clip_report_start + usize::from(clip_report) * 2;
+        let named_output_count = usize::from(selection.includes_named_outputs())
+            * self.phase_outputs.named_outputs.len();
+        let observation_start = 1 + named_output_count;
+        let observations = self.phase_outputs.observations.clone();
         let replay = self
             .capture
             .replay_recurrent_selected_checked(
@@ -6636,16 +6858,11 @@ impl CpuCompiledTrainingProgram {
                 injected_failure,
                 |outputs, successors| {
                     validate_staged_transition(outputs, successors, non_finite_policy, true)?;
-                    validate_staged_clip_report(
+                    validate_staged_observations(
                         outputs,
-                        clip_report_start,
-                        clip_report && validate_commit_reports,
-                        non_finite_policy,
-                    )?;
-                    validate_staged_window_loss_report(
-                        outputs,
-                        window_loss_report_start,
-                        window_loss_report && validate_commit_reports,
+                        observation_start,
+                        &observations,
+                        validate_commit_observations,
                         non_finite_policy,
                     )
                 },
@@ -6653,33 +6870,23 @@ impl CpuCompiledTrainingProgram {
             .map_err(replay_error)?;
         debug_assert_eq!(
             replay.outputs.len(),
-            1 + named_output_count
-                + usize::from(self.clip_report) * 2
-                + usize::from(self.window_loss_report) * 2
+            1 + named_output_count + self.phase_outputs.observations.len()
         );
-        let mut outputs = replay.outputs.into_iter();
-        let loss = outputs
-            .next()
-            .expect("compiled output cardinality was validated before publication");
-        let named_outputs = selection.take_named_outputs(&self.output_names, &mut outputs);
-        let clip_report = take_compiled_clip_report(&mut outputs, self.clip_report);
-        let window_loss = take_compiled_window_loss_value(&mut outputs, self.window_loss_report);
-        debug_assert!(outputs.next().is_none());
+        let outputs = self.phase_outputs.take(replay.outputs, selection, true);
         self.step = next_step;
         Ok(CompiledTrainingStepResult {
-            loss,
-            outputs: named_outputs,
+            loss: outputs.loss,
+            outputs: outputs.named_outputs,
             step: self.step,
             capture_identity: self.cursor.capture_identity(),
-            clip_report,
-            window_loss,
+            observations: outputs.observations,
         })
     }
 
     fn step_native_inner_with_learning_rate(
         &mut self,
         request: CompiledStepReplayRequest,
-        validate_commit_reports: bool,
+        validate_commit_observations: bool,
         native: NativeReplayContext<'_>,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
         let CompiledStepReplayRequest {
@@ -6702,13 +6909,11 @@ impl CpuCompiledTrainingProgram {
             provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
         }
         let started = Instant::now();
-        let clip_report = self.clip_report;
         let selected_requested = self.selected_step_outputs(&self.capture, selection, true)?;
-        let named_output_count =
-            usize::from(selection.includes_named_outputs()) * self.output_names.len();
-        let clip_report_start = 1 + named_output_count;
-        let window_loss_report = self.window_loss_report;
-        let window_loss_report_start = clip_report_start + usize::from(clip_report) * 2;
+        let named_output_count = usize::from(selection.includes_named_outputs())
+            * self.phase_outputs.named_outputs.len();
+        let observation_start = 1 + named_output_count;
+        let observations = self.phase_outputs.observations.clone();
         let replay = native
             .replay_recurrent_selected_checked(
                 &mut self.runtime,
@@ -6723,16 +6928,11 @@ impl CpuCompiledTrainingProgram {
                         non_finite_policy,
                         true,
                     )?;
-                    validate_staged_clip_report(
+                    validate_staged_observations(
                         outputs,
-                        clip_report_start,
-                        clip_report && validate_commit_reports,
-                        non_finite_policy,
-                    )?;
-                    validate_staged_window_loss_report(
-                        outputs,
-                        window_loss_report_start,
-                        window_loss_report && validate_commit_reports,
+                        observation_start,
+                        &observations,
+                        validate_commit_observations,
                         non_finite_policy,
                     )
                 },
@@ -6755,27 +6955,17 @@ impl CpuCompiledTrainingProgram {
         );
         debug_assert_eq!(
             replay.outputs.len(),
-            1 + named_output_count
-                + usize::from(self.clip_report) * 2
-                + usize::from(self.window_loss_report) * 2
+            1 + named_output_count + self.phase_outputs.observations.len()
         );
-        let mut outputs = replay.outputs.into_iter();
-        let loss = outputs
-            .next()
-            .expect("compiled output cardinality was validated before publication");
-        let named_outputs = selection.take_named_outputs(&self.output_names, &mut outputs);
-        let clip_report = take_compiled_clip_report(&mut outputs, self.clip_report);
-        let window_loss = take_compiled_window_loss_value(&mut outputs, self.window_loss_report);
-        debug_assert!(outputs.next().is_none());
+        let outputs = self.phase_outputs.take(replay.outputs, selection, true);
         self.step = next_step;
         Ok((
             CompiledTrainingStepResult {
-                loss,
-                outputs: named_outputs,
+                loss: outputs.loss,
+                outputs: outputs.named_outputs,
                 step: self.step,
                 capture_identity: self.cursor.capture_identity(),
-                clip_report,
-                window_loss,
+                observations: outputs.observations,
             },
             report,
         ))
@@ -6783,7 +6973,7 @@ impl CpuCompiledTrainingProgram {
 
     fn step_accumulation_inner_with_learning_rate(
         &mut self,
-        transition: &CompiledAdamWAccumulationPlan,
+        transition: &CompiledTrainingSiblingPlan,
         request: CompiledStepReplayRequest,
     ) -> Result<CompiledTrainingStepResult> {
         let CompiledStepReplayRequest {
@@ -6818,30 +7008,24 @@ impl CpuCompiledTrainingProgram {
                 },
             )
             .map_err(replay_error)?;
-        let named_output_count =
-            usize::from(selection.includes_named_outputs()) * self.output_names.len();
+        let named_output_count = usize::from(selection.includes_named_outputs())
+            * self.phase_outputs.named_outputs.len();
         debug_assert_eq!(replay.outputs.len(), 1 + named_output_count);
-        let mut outputs = replay.outputs.into_iter();
-        let loss = outputs
-            .next()
-            .expect("compiled accumulation output cardinality was validated");
-        let named_outputs = selection.take_named_outputs(&self.output_names, &mut outputs);
-        debug_assert!(outputs.next().is_none());
+        let outputs = self.phase_outputs.take(replay.outputs, selection, false);
         self.cursor = prepared.next_main_cursor;
         self.step = next_step;
         Ok(CompiledTrainingStepResult {
-            loss,
-            outputs: named_outputs,
+            loss: outputs.loss,
+            outputs: outputs.named_outputs,
             step: self.step,
             capture_identity: self.capture_identity(),
-            clip_report: None,
-            window_loss: None,
+            observations: outputs.observations,
         })
     }
 
     fn step_accumulation_native_inner_with_learning_rate(
         &mut self,
-        transition: &CompiledAdamWAccumulationPlan,
+        transition: &CompiledTrainingSiblingPlan,
         request: CompiledStepReplayRequest,
         native: NativeReplayContext<'_>,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
@@ -6885,15 +7069,10 @@ impl CpuCompiledTrainingProgram {
         let traffic = replay.traffic;
         let executor_wall_time = replay.executor_wall_time;
         let replay = replay.replay;
-        let named_output_count =
-            usize::from(selection.includes_named_outputs()) * self.output_names.len();
+        let named_output_count = usize::from(selection.includes_named_outputs())
+            * self.phase_outputs.named_outputs.len();
         debug_assert_eq!(replay.outputs.len(), 1 + named_output_count);
-        let mut outputs = replay.outputs.into_iter();
-        let loss = outputs
-            .next()
-            .expect("compiled accumulation output cardinality was validated");
-        let named_outputs = selection.take_named_outputs(&self.output_names, &mut outputs);
-        debug_assert!(outputs.next().is_none());
+        let outputs = self.phase_outputs.take(replay.outputs, selection, false);
         let native = replay
             .native_trace
             .as_ref()
@@ -6910,12 +7089,11 @@ impl CpuCompiledTrainingProgram {
         self.step = next_step;
         Ok((
             CompiledTrainingStepResult {
-                loss,
-                outputs: named_outputs,
+                loss: outputs.loss,
+                outputs: outputs.named_outputs,
                 step: self.step,
                 capture_identity: self.capture_identity(),
-                clip_report: None,
-                window_loss: None,
+                observations: outputs.observations,
             },
             report,
         ))
@@ -6952,9 +7130,7 @@ impl CpuCompiledTrainingProgram {
             capture: self.capture.clone(),
             recurrent_capture: self.recurrent_capture.clone(),
             inputs: self.inputs.clone(),
-            output_names: self.output_names.clone(),
-            clip_report: self.clip_report,
-            window_loss_report: self.window_loss_report,
+            phase_outputs: self.phase_outputs.clone(),
             parameter_buffers: self.parameter_buffers.clone(),
             optimizer_buffers: self.optimizer_buffers.clone(),
             workload_buffers: self.workload_buffers.clone(),
@@ -7276,7 +7452,7 @@ impl CpuCompiledTrainingProgram {
 
     fn preflight_native_accumulation(
         &self,
-        transition: &CompiledAdamWAccumulationPlan,
+        transition: &CompiledTrainingSiblingPlan,
         vectorized: bool,
     ) -> Result<(RecurrentNativePreparation, Duration)> {
         let started = Instant::now();
@@ -7325,7 +7501,7 @@ impl CpuCompiledTrainingProgram {
 
     fn finish_native_accumulation(
         &self,
-        transition: &CompiledAdamWAccumulationPlan,
+        transition: &CompiledTrainingSiblingPlan,
         preparation: RecurrentNativePreparation,
         plan: PlannedNativeItems,
         residual_wall_time: Duration,
@@ -8232,6 +8408,11 @@ impl CompiledAdamWPlan {
         &self,
         non_finite_policy: CpuNonFinitePolicy,
     ) -> Result<CpuCompiledAdamW> {
+        validate_adamw_observation_schema(
+            &self.inner.phase_outputs.observations,
+            self.clip_report,
+            self.window_loss_report,
+        )?;
         Ok(CpuCompiledAdamW {
             inner: self
                 .inner
@@ -9475,6 +9656,8 @@ impl CpuCompiledAdamW {
             next,
             loss_weight,
             self.gradient_accumulation_steps,
+            self.clip_report,
+            self.window_loss_report,
         ))
     }
 
@@ -10332,6 +10515,8 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 next,
                 loss_weight,
                 self.inner.gradient_accumulation_steps,
+                self.inner.clip_report,
+                self.inner.window_loss_report,
             ),
             report,
         })
@@ -11084,19 +11269,47 @@ fn adamw_step_result(
     progress: AdamWProgress,
     loss_weight: u64,
     gradient_accumulation_steps: u64,
+    clip_report_enabled: bool,
+    window_loss_report_enabled: bool,
 ) -> CompiledAdamWStepResult {
-    if progress.accumulation_index != 0 {
-        inner.clip_report = None;
-        inner.window_loss = None;
+    let expected = if progress.accumulation_index == 0 {
+        adamw_observation_schema(clip_report_enabled, window_loss_report_enabled)
+    } else {
+        CompiledTrainingObservationSchema::default()
+    };
+    debug_assert_eq!(inner.observations.len(), expected.len());
+    debug_assert!(
+        inner
+            .observations
+            .iter()
+            .map(|observation| observation.key)
+            .eq(expected.entries.iter().map(|spec| spec.key))
+    );
+    for (observation, spec) in inner.observations.iter().zip(&expected.entries) {
+        debug_assert!(
+            validate_observation_value_descriptor(&observation.value, spec.constraint).is_ok()
+        );
     }
-    let window_loss_report = inner
-        .window_loss
+    let mut observations = std::mem::take(&mut inner.observations)
+        .into_iter()
+        .map(|observation| observation.value);
+    let clip_report = take_compiled_clip_report(
+        &mut observations,
+        clip_report_enabled && progress.accumulation_index == 0,
+    );
+    let window_loss = take_compiled_window_loss_value(
+        &mut observations,
+        window_loss_report_enabled && progress.accumulation_index == 0,
+    );
+    debug_assert!(observations.next().is_none());
+    let window_loss_report = window_loss
         .map(|value| CompiledAdamWWindowLossReport::new(value, gradient_accumulation_steps));
     CompiledAdamWStepResult {
         inner,
         optimizer_step: progress.optimizer_step,
         accumulation_index: progress.accumulation_index,
         loss_weight,
+        clip_report,
         window_loss_report,
     }
 }
@@ -11586,12 +11799,13 @@ impl MetalCompiledAdamW {
                 outputs,
                 step: self.progress.replay_step,
                 capture_identity: self.inner.program_identity,
-                clip_report: None,
-                window_loss: None,
+                observations: Vec::new(),
             },
             self.progress,
             1,
             self.gradient_accumulation_steps,
+            false,
+            false,
         );
         Ok(MetalCompiledAdamWStepResult { inner, report })
     }
@@ -12224,6 +12438,39 @@ fn validate_loss(graph: &Graph, loss: NodeId) -> Result<()> {
     Ok(())
 }
 
+fn validate_observation_descriptor(
+    graph: &Graph,
+    node: NodeId,
+    constraint: CompiledTrainingObservationConstraint,
+) -> Result<()> {
+    let expected_dtype = match constraint {
+        CompiledTrainingObservationConstraint::ScalarF32 => DType::F32,
+        CompiledTrainingObservationConstraint::ScalarU64Positive => DType::U64,
+    };
+    if graph.dtype(node)? != expected_dtype || graph.shape(node)? != &Shape::from([]) {
+        return Err(training(
+            "compiled training observation descriptor mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_observation_value_descriptor(
+    value: &TensorData,
+    constraint: CompiledTrainingObservationConstraint,
+) -> Result<()> {
+    let expected_dtype = match constraint {
+        CompiledTrainingObservationConstraint::ScalarF32 => DType::F32,
+        CompiledTrainingObservationConstraint::ScalarU64Positive => DType::U64,
+    };
+    if value.dtype() != expected_dtype || value.shape() != &Shape::from([]) {
+        return Err(training(
+            "compiled training observation descriptor mismatch",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_evaluation_inputs(
     expected: &BTreeMap<String, (Shape, DType)>,
     provided: &BTreeMap<String, TensorData>,
@@ -12693,6 +12940,49 @@ fn validate_staged_transition<'a>(
     }
     if has_non_finite_f32(successors) {
         return Err("compiled CPU transition has a non-finite recurrent successor".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_staged_observations(
+    outputs: &[TensorData],
+    start: usize,
+    schema: &CompiledTrainingObservationSchema,
+    enabled: bool,
+    policy: CpuNonFinitePolicy,
+) -> std::result::Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    let end = start
+        .checked_add(schema.len())
+        .ok_or_else(|| "compiled CPU observation output inventory overflows".to_owned())?;
+    let observations = outputs
+        .get(start..end)
+        .ok_or_else(|| "compiled CPU observation output inventory differs".to_owned())?;
+    for (value, spec) in observations.iter().zip(&schema.entries) {
+        match spec.constraint {
+            CompiledTrainingObservationConstraint::ScalarF32 => {
+                if value.shape() != &Shape::from([]) || value.dtype() != DType::F32 {
+                    return Err(spec.descriptor_error.to_owned());
+                }
+                if policy == CpuNonFinitePolicy::RejectTransition
+                    && has_non_finite_f32(std::iter::once(value))
+                {
+                    return Err(spec.invalid_value_error.to_owned());
+                }
+            }
+            CompiledTrainingObservationConstraint::ScalarU64Positive => {
+                if value.shape() != &Shape::from([]) || value.dtype() != DType::U64 {
+                    return Err(spec.descriptor_error.to_owned());
+                }
+                if policy == CpuNonFinitePolicy::RejectTransition
+                    && value.scalar_at(0).as_u64() == 0
+                {
+                    return Err(spec.invalid_value_error.to_owned());
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -15983,6 +16273,8 @@ mod tests {
         let mut momentum = compiled();
         let mut adamw = compiled_adamw();
         assert!(momentum.inner.recurrent_store_groups.is_empty());
+        assert!(momentum.inner.phase_outputs.observations.entries.is_empty());
+        assert!(momentum.inner.accumulation.is_none());
 
         let (momentum_loss, momentum_outputs) = run_core_training_step(&mut momentum);
         let (adamw_loss, adamw_outputs) = run_core_training_step(&mut adamw);
@@ -15997,6 +16289,117 @@ mod tests {
                 .unwrap()
                 .capture_identity,
             adamw.capture_identity()
+        );
+    }
+
+    #[test]
+    fn adamw_observation_adapter_maps_every_ordered_report_shape() {
+        assert_eq!(adamw_observation_schema(false, false).len(), 0);
+        assert_eq!(adamw_observation_schema(true, false).len(), 2);
+        assert_eq!(adamw_observation_schema(false, true).len(), 2);
+        assert_eq!(adamw_observation_schema(true, true).len(), 4);
+        let value = |key, value| CompiledTrainingObservationValue { key, value };
+        let inner = |observations| CompiledTrainingStepResult {
+            loss: TensorData::scalar(1.0),
+            outputs: BTreeMap::new(),
+            step: 1,
+            capture_identity: 7,
+            observations,
+        };
+        let committed = AdamWProgress {
+            replay_step: 1,
+            optimizer_step: 1,
+            ..AdamWProgress::INITIAL
+        };
+        let window_weight =
+            TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(3)]).unwrap();
+        let observations = vec![
+            value(
+                AdamWObservation::ClipNorm.spec().key,
+                TensorData::scalar(2.0),
+            ),
+            value(
+                AdamWObservation::ClipScale.spec().key,
+                TensorData::scalar(0.5),
+            ),
+            value(
+                AdamWObservation::WindowMean.spec().key,
+                TensorData::scalar(1.25),
+            ),
+            value(AdamWObservation::WindowWeight.spec().key, window_weight),
+        ];
+        let adapted = adamw_step_result(inner(observations), committed, 1, 3, true, true);
+        assert_eq!(adapted.clip_report().unwrap().pre_clip_global_norm(), 2.0);
+        assert_eq!(adapted.window_loss_report().unwrap().loss_weight(), 3);
+        let no_report = adamw_step_result(inner(Vec::new()), committed, 1, 1, false, false);
+        assert!(no_report.clip_report().is_none());
+        assert!(no_report.window_loss_report().is_none());
+        let pending = AdamWProgress {
+            replay_step: 1,
+            accumulation_index: 1,
+            ..AdamWProgress::INITIAL
+        };
+        let pending = adamw_step_result(inner(Vec::new()), pending, 1, 3, true, true);
+        assert!(pending.clip_report().is_none());
+        assert!(pending.window_loss_report().is_none());
+    }
+
+    #[test]
+    fn compiled_observation_schema_rejects_duplicate_keys_and_wrong_nodes() {
+        let mut graph = Graph::new();
+        let f32_value = graph
+            .full_with_dtype(Shape::from([]), Scalar::F(1.0), DType::F32)
+            .unwrap();
+        let u64_value = graph
+            .full_with_dtype(Shape::from([]), Scalar::U(1), DType::U64)
+            .unwrap();
+        let duplicate = [
+            CompiledTrainingObservationNode {
+                spec: AdamWObservation::ClipNorm.spec(),
+                node: f32_value,
+            },
+            CompiledTrainingObservationNode {
+                spec: AdamWObservation::ClipNorm.spec(),
+                node: f32_value,
+            },
+        ];
+        assert!(CompiledTrainingObservationSchema::from_nodes(&graph, &duplicate).is_err());
+        assert!(
+            CompiledTrainingObservationSchema::from_nodes(
+                &graph,
+                &[CompiledTrainingObservationNode {
+                    spec: AdamWObservation::ClipNorm.spec(),
+                    node: u64_value,
+                }],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn adamw_observation_schema_mismatch_fails_before_runtime_preparation() {
+        let mut plan = non_finite_flush_plan();
+        plan.inner.phase_outputs.observations.entries.swap(0, 1);
+        assert!(plan.prepare_cpu().is_err());
+    }
+
+    #[test]
+    fn malformed_observation_value_rejects_during_staged_validation() {
+        let schema = adamw_observation_schema(true, false);
+        let outputs = [
+            TensorData::scalar(1.0),
+            TensorData::scalar_with_dtype(Scalar::U(2), DType::U64),
+            TensorData::scalar(0.5),
+        ];
+        assert!(
+            validate_staged_observations(
+                &outputs,
+                1,
+                &schema,
+                true,
+                CpuNonFinitePolicy::RejectTransition,
+            )
+            .is_err()
         );
     }
 
@@ -18477,7 +18880,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan.inner.output_names,
+            plan.inner.phase_outputs.named_outputs,
             vec!["direct".to_owned(), "empty".to_owned(), "shrunk".to_owned()]
         );
         assert!(
