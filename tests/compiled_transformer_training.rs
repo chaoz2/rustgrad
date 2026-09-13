@@ -8,14 +8,15 @@ use rustgrad::runtime::metal::{
 };
 use rustgrad::{
     Backend, BinaryOp, CapturedReplayExecutor, CapturedReplayOptions, CapturedSchedule, CompareOp,
-    CompiledAdamWCheckpoint, CompiledAdamWConfig, CompiledAdamWFlush, CompiledAdamWFlushRuntime,
-    CompiledAdamWGraph, CompiledAdamWObjective, CompiledAdamWPlan, CompiledAdamWRuntime,
-    CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWWindowLossReport,
-    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
-    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan,
-    CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
-    CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions,
-    MetalCompiledAdamWPlan, Module, NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeCpuCompiledAdamW,
+    CompiledAdamWCheckpoint, CompiledAdamWClipReport, CompiledAdamWConfig, CompiledAdamWFlush,
+    CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWObjective, CompiledAdamWPlan,
+    CompiledAdamWRuntime, CompiledAdamWStep, CompiledAdamWStepResult,
+    CompiledAdamWWindowLossReport, CompiledCheckpointRuntime, CompiledDropoutConfig,
+    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
+    CompiledInputSpec, CompiledModuleAdamWPlan, CompiledMultiStepLr, CompiledTrainingRuntime,
+    CompiledTrainingStep, CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget,
+    DType, Error, Graph, LossOptions, MetalCompiledAdamWPlan, Module,
+    NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeCpuCompiledAdamW,
     NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget, NativeTrainingReport,
     NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
     TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy, load_safetensors,
@@ -1655,6 +1656,7 @@ struct TwoBlockPyTorchFixture {
     initial_parameters: BTreeMap<String, PyTorchTensorFixture>,
     replays: Vec<PyTorchReplayFixture>,
     windows: Vec<PyTorchAdamWWindowFixture>,
+    partial_flush: PyTorchAdamWWindowFixture,
 }
 
 fn two_block_pytorch_fixture() -> TwoBlockPyTorchFixture {
@@ -1857,7 +1859,7 @@ fn assert_pytorch_parameter_successors_close(
 
 struct PyTorchAdamWWindowAssertion<'a> {
     optimizer_step: u64,
-    commit: &'a CompiledAdamWStepResult,
+    clip_report: &'a CompiledAdamWClipReport,
     actual_initial: &'a BTreeMap<String, TensorData>,
     actual_first_moments: &'a BTreeMap<String, TensorData>,
     actual_second_moments: &'a BTreeMap<String, TensorData>,
@@ -1868,12 +1870,8 @@ struct PyTorchAdamWWindowAssertion<'a> {
 
 fn assert_pytorch_adamw_window(label: &str, window: PyTorchAdamWWindowAssertion<'_>) {
     assert_eq!(window.expected.optimizer_step, window.optimizer_step);
-    assert_eq!(window.expected.valid_token_count, 9);
-    assert!(window.commit.did_update());
-    let clip = window
-        .commit
-        .clip_report()
-        .unwrap_or_else(|| panic!("{label} must commit a clipped update"));
+    assert!(window.expected.valid_token_count > 0);
+    let clip = window.clip_report;
     assert_eq!(clip.did_clip(), Some(true));
     assert_pytorch_scalar_close(
         &format!("{label} pre-clip norm"),
@@ -7497,7 +7495,7 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
     );
     assert_eq!(
         fixture.provenance.rustgrad_base,
-        "90d41be5f2dab7d418f4800918a6544b3ef63710"
+        "dcba9ad2a311746caa340708054f32efea11e444"
     );
     assert_eq!(fixture.provenance.python, "3.11.13");
     assert_eq!(fixture.provenance.torch, "2.1.2");
@@ -7515,8 +7513,18 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
         fixture.tied_names,
         ["tokens.weight".to_owned(), "lm_head.weight".to_owned()]
     );
-    assert_eq!(fixture.replays.len(), 4);
+    assert_eq!(fixture.replays.len(), 5);
     assert_eq!(fixture.windows.len(), 2);
+    assert_eq!(
+        fixture
+            .windows
+            .iter()
+            .map(|window| (window.optimizer_step, window.valid_token_count))
+            .collect::<Vec<_>>(),
+        [(1, 9), (2, 9)]
+    );
+    assert_eq!(fixture.partial_flush.optimizer_step, 3);
+    assert_eq!(fixture.partial_flush.valid_token_count, 5);
 
     let model =
         TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
@@ -7642,7 +7650,9 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
         "first window",
         PyTorchAdamWWindowAssertion {
             optimizer_step: 1,
-            commit: &second_step,
+            clip_report: second_step
+                .clip_report()
+                .expect("the first PyTorch window must report clipping"),
             actual_initial: &initial_parameters,
             actual_first_moments: &first_window_first_moments,
             actual_second_moments: &first_window_second_moments,
@@ -7721,17 +7731,48 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
     assert_eq!(resumed.checkpoint().unwrap(), runtime.checkpoint().unwrap());
     assert_eq!(compile_count.get(), 1);
 
+    let fifth_step = runtime
+        .step(
+            attention_masked_dropout_batch(5, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    let resumed_fifth_step = resumed
+        .step(
+            attention_masked_dropout_batch(5, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    assert!(!fifth_step.did_update());
+    assert!(!resumed_fifth_step.did_update());
+    assert_eq!(resumed_fifth_step.loss(), fifth_step.loss());
+    assert_eq!(resumed_fifth_step.outputs(), fifth_step.outputs());
+    let fifth_gradients = runtime.gradient_accumulator_snapshots().unwrap();
+    assert_eq!(
+        resumed.gradient_accumulator_snapshots().unwrap(),
+        fifth_gradients
+    );
+    let partial_checkpoint = runtime.checkpoint().unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), partial_checkpoint);
+    assert_eq!(partial_checkpoint.info().replay_step(), 5);
+    assert_eq!(partial_checkpoint.info().optimizer_step(), 2);
+    assert_eq!(partial_checkpoint.info().accumulation_index(), 1);
+    assert_eq!(partial_checkpoint.info().accumulated_token_count(), Some(5));
+    assert_eq!(partial_checkpoint.info().dropout_block_counter(), Some(420));
+
     let observed_steps = [
         &first_step,
         &isolated_second_step,
         &third_step,
         &isolated_fourth_step,
+        &fifth_step,
     ];
     let observed_gradients = [
         &first_gradients,
         &second_gradients,
         &third_gradients,
         &fourth_gradients,
+        &fifth_gradients,
     ];
 
     for ((fixture_replay, step), gradients) in fixture
@@ -7741,7 +7782,7 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
         .zip(observed_gradients)
     {
         let replay = fixture_replay.replay;
-        assert!((1..=4).contains(&replay));
+        assert!((1..=5).contains(&replay));
         assert_eq!(fixture_replay.tokens, MULTI_HEAD_TOKENS);
         assert_eq!(fixture_replay.targets, MULTI_HEAD_TARGETS);
         assert_eq!(
@@ -7838,7 +7879,9 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
         "second window",
         PyTorchAdamWWindowAssertion {
             optimizer_step: 2,
-            commit: &fourth_step,
+            clip_report: fourth_step
+                .clip_report()
+                .expect("the second PyTorch window must report clipping"),
             actual_initial: &first_window_parameters,
             actual_first_moments: &second_window_first_moments,
             actual_second_moments: &second_window_second_moments,
@@ -7847,26 +7890,19 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
             expected: &fixture.windows[1],
         },
     );
-    let accumulators = runtime.gradient_accumulator_snapshots().unwrap();
-    assert_eq!(accumulators.len(), fixture.canonical_parameter_count);
+    assert_eq!(fifth_gradients.len(), fixture.canonical_parameter_count);
     assert_eq!(
-        accumulators.values().map(TensorData::len).sum::<usize>(),
-        384
-    );
-    assert!(
-        accumulators
-            .values()
-            .flat_map(TensorData::to_vec_f64)
-            .all(|value| value.to_bits() == 0.0f64.to_bits())
+        fifth_gradients.values().map(TensorData::len).sum::<usize>(),
+        fixture.canonical_coordinate_count
     );
     assert_eq!(runtime.optimizer_step().unwrap(), 2);
-    assert_eq!(runtime.accumulation_index().unwrap(), 0);
-    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(336));
-    assert_eq!(runtime.step_count(), 4);
-    assert_eq!(resumed.step_count(), 4);
+    assert_eq!(runtime.accumulation_index().unwrap(), 1);
+    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(420));
+    assert_eq!(runtime.step_count(), 5);
+    assert_eq!(resumed.step_count(), 5);
     assert_eq!(resumed.optimizer_step().unwrap(), 2);
-    assert_eq!(resumed.accumulation_index().unwrap(), 0);
-    assert_eq!(resumed.dropout_block_counter().unwrap(), Some(336));
+    assert_eq!(resumed.accumulation_index().unwrap(), 1);
+    assert_eq!(resumed.dropout_block_counter().unwrap(), Some(420));
     assert_eq!(
         resumed.parameter_snapshots().unwrap(),
         second_window_parameters
@@ -7879,13 +7915,132 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
         resumed.second_moment_snapshots().unwrap(),
         second_window_second_moments
     );
+
+    let mut restored_flush = plan
+        .restore_checkpoint(&partial_checkpoint)
+        .unwrap()
+        .prepare(&CpuSessionTarget)
+        .unwrap();
+    let mut zeroed = plan
+        .restore_checkpoint(&partial_checkpoint)
+        .unwrap()
+        .prepare(&CpuSessionTarget)
+        .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(restored_flush.checkpoint().unwrap(), partial_checkpoint);
+    assert_eq!(zeroed.checkpoint().unwrap(), partial_checkpoint);
+    let expected_flush = runtime
+        .flush_partial_window(TensorData::scalar(LEARNING_RATE))
+        .unwrap();
+    let restored_flush_result = restored_flush
+        .flush_partial_window(TensorData::scalar(LEARNING_RATE))
+        .unwrap();
+    assert_eq!(restored_flush_result, expected_flush);
+    assert!(expected_flush.did_update());
+    assert_eq!(expected_flush.flushed_microbatches(), 1);
+    assert_eq!(expected_flush.optimizer_step(), 3);
+    let flushed_checkpoint = runtime.checkpoint().unwrap();
+    assert_eq!(restored_flush.checkpoint().unwrap(), flushed_checkpoint);
+    assert_eq!(flushed_checkpoint.info().replay_step(), 5);
+    assert_eq!(flushed_checkpoint.info().optimizer_step(), 3);
+    assert_eq!(flushed_checkpoint.info().accumulation_index(), 0);
+    assert_eq!(flushed_checkpoint.info().accumulated_token_count(), Some(0));
+    assert_eq!(flushed_checkpoint.info().dropout_block_counter(), Some(420));
+    let partial_first_moments = runtime.first_moment_snapshots().unwrap();
+    let partial_second_moments = runtime.second_moment_snapshots().unwrap();
+    let partial_parameters = runtime.parameter_snapshots().unwrap();
+    assert_pytorch_adamw_window(
+        "partial flush",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 3,
+            clip_report: expected_flush
+                .clip_report()
+                .expect("the PyTorch partial flush must report clipping"),
+            actual_initial: &second_window_parameters,
+            actual_first_moments: &partial_first_moments,
+            actual_second_moments: &partial_second_moments,
+            actual_successors: &partial_parameters,
+            expected_initial: &fixture.windows[1].parameter_successors,
+            expected: &fixture.partial_flush,
+        },
+    );
     assert!(
-        resumed
+        runtime
             .gradient_accumulator_snapshots()
             .unwrap()
             .values()
             .flat_map(TensorData::to_vec_f64)
             .all(|value| value.to_bits() == 0.0f64.to_bits())
+    );
+
+    assert_eq!(
+        zeroed.parameter_snapshots().unwrap(),
+        second_window_parameters
+    );
+    assert_eq!(
+        zeroed.first_moment_snapshots().unwrap(),
+        second_window_first_moments
+    );
+    assert_eq!(
+        zeroed.second_moment_snapshots().unwrap(),
+        second_window_second_moments
+    );
+    assert_eq!(
+        zeroed.gradient_accumulator_snapshots().unwrap(),
+        fifth_gradients
+    );
+    let discarded = zeroed.zero_grad().unwrap();
+    assert!(discarded.did_discard());
+    assert_eq!(discarded.discarded_microbatches(), 1);
+    assert_eq!(
+        zeroed.parameter_snapshots().unwrap(),
+        second_window_parameters
+    );
+    assert_eq!(
+        zeroed.first_moment_snapshots().unwrap(),
+        second_window_first_moments
+    );
+    assert_eq!(
+        zeroed.second_moment_snapshots().unwrap(),
+        second_window_second_moments
+    );
+    assert!(
+        zeroed
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .all(|value| value.to_bits() == 0.0f64.to_bits())
+    );
+    let zero_checkpoint = zeroed.checkpoint().unwrap();
+    assert_eq!(zero_checkpoint.info().replay_step(), 5);
+    assert_eq!(zero_checkpoint.info().optimizer_step(), 2);
+    assert_eq!(zero_checkpoint.info().accumulation_index(), 0);
+    assert_eq!(zero_checkpoint.info().accumulated_token_count(), Some(0));
+    assert_eq!(zero_checkpoint.info().dropout_block_counter(), Some(420));
+    let mut zero_retry = plan
+        .restore_checkpoint(&zero_checkpoint)
+        .unwrap()
+        .prepare(&CpuSessionTarget)
+        .unwrap();
+    let expected_retry = zeroed
+        .step(
+            attention_masked_dropout_batch(6, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    let actual_retry = zero_retry
+        .step(
+            attention_masked_dropout_batch(6, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    assert_eq!(actual_retry.loss(), expected_retry.loss());
+    assert_eq!(actual_retry.outputs(), expected_retry.outputs());
+    assert_eq!(actual_retry.loss_weight(), expected_retry.loss_weight());
+    assert_eq!(
+        zero_retry.checkpoint().unwrap(),
+        zeroed.checkpoint().unwrap()
     );
     assert_eq!(model.state_dict().unwrap(), state_before);
     assert_eq!(module_parameter_state(&model), parameter_state_before);

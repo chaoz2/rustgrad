@@ -285,12 +285,50 @@ def tensor_map(values: OrderedDict[str, torch.Tensor] | dict[str, torch.Tensor])
     return {name: tensor(value) for name, value in sorted(values.items())}
 
 
+def replay_fixture(
+    params: OrderedDict[str, torch.Tensor], replay: int
+) -> tuple[OrderedDict[str, torch.Tensor], dict[str, object]]:
+    result = forward(params, replay)
+    gradients = torch.autograd.grad(result["numerator"], tuple(params.values()))
+    gradient_map = OrderedDict(zip(params.keys(), gradients))
+    expected_token_count = 5 if replay % 2 == 1 else 4
+    assert int(result["valid_token_count"].item()) == expected_token_count
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert all(
+        torch.count_nonzero(relu_input).item() > 0 for relu_input in result["relu_inputs"]
+    )
+    for probabilities in result["attention_probabilities"]:
+        invalid_rows = ~result["row_valid"].expand_as(probabilities)
+        assert torch.count_nonzero(probabilities[invalid_rows]).item() == 0
+    mask_index = (replay - 1) % len(MASKS)
+    fixture = {
+        "replay": replay,
+        "tokens": list(TOKENS),
+        "targets": list(TARGETS),
+        "attention_keep_mask": list(MASKS[mask_index]),
+        "loss_mask": list(LOSS_MASKS[mask_index]),
+        "effective_attention_mask": tensor(result["effective_attention_mask"]),
+        "row_valid": tensor(result["row_valid"]),
+        "dropout_masks": [tensor(mask) for mask in result["dropout_masks"]],
+        "attention_probabilities": [
+            tensor(probabilities) for probabilities in result["attention_probabilities"]
+        ],
+        "logits": tensor(result["logits"]),
+        "token_losses": tensor(result["token_losses"]),
+        "token_mean_loss": float(result["loss"].item()),
+        "valid_token_count": int(result["valid_token_count"].item()),
+        "numerator_gradients": tensor_map(gradient_map),
+    }
+    return gradient_map, fixture
+
+
 def adamw_window(
     params: OrderedDict[str, torch.Tensor],
     first_moments: OrderedDict[str, torch.Tensor],
     second_moments: OrderedDict[str, torch.Tensor],
     numerator_gradients: list[OrderedDict[str, torch.Tensor]],
     optimizer_step: int,
+    valid_token_count: int,
 ) -> tuple[
     OrderedDict[str, torch.Tensor],
     OrderedDict[str, torch.Tensor],
@@ -304,7 +342,7 @@ def adamw_window(
                 (gradients[name] for gradients in numerator_gradients),
                 start=torch.zeros_like(params[name]),
             )
-            / 9.0,
+            / f32(float(valid_token_count)),
         )
         for name in params
     )
@@ -341,7 +379,7 @@ def adamw_window(
 
     fixture = {
         "optimizer_step": optimizer_step,
-        "valid_token_count": 9,
+        "valid_token_count": valid_token_count,
         "pre_clip_norm": float(pre_clip_norm.item()),
         "clip_scale": float(clip_scale.item()),
         "first_moments": tensor_map(next_first_moments),
@@ -369,54 +407,34 @@ def main(output: Path) -> None:
     for optimizer_step in (1, 2):
         numerator_gradients = []
         for replay in (2 * optimizer_step - 1, 2 * optimizer_step):
-            result = forward(params, replay)
-            gradients = torch.autograd.grad(result["numerator"], tuple(params.values()))
-            gradient_map = OrderedDict(zip(params.keys(), gradients))
+            gradient_map, fixture = replay_fixture(params, replay)
             numerator_gradients.append(gradient_map)
-            assert int(result["valid_token_count"].item()) == (
-                5 if replay % 2 == 1 else 4
-            )
-            assert all(torch.isfinite(gradient).all() for gradient in gradients)
-            assert all(
-                torch.count_nonzero(relu_input).item() > 0 for relu_input in result["relu_inputs"]
-            )
-            for probabilities in result["attention_probabilities"]:
-                invalid_rows = ~result["row_valid"].expand_as(probabilities)
-                assert torch.count_nonzero(probabilities[invalid_rows]).item() == 0
-            mask_index = (replay - 1) % len(MASKS)
-            replays.append(
-                {
-                    "replay": replay,
-                    "tokens": list(TOKENS),
-                    "targets": list(TARGETS),
-                    "attention_keep_mask": list(MASKS[mask_index]),
-                    "loss_mask": list(LOSS_MASKS[mask_index]),
-                    "effective_attention_mask": tensor(result["effective_attention_mask"]),
-                    "row_valid": tensor(result["row_valid"]),
-                    "dropout_masks": [tensor(mask) for mask in result["dropout_masks"]],
-                    "attention_probabilities": [
-                        tensor(probabilities) for probabilities in result["attention_probabilities"]
-                    ],
-                    "logits": tensor(result["logits"]),
-                    "token_losses": tensor(result["token_losses"]),
-                    "token_mean_loss": float(result["loss"].item()),
-                    "valid_token_count": int(result["valid_token_count"].item()),
-                    "numerator_gradients": tensor_map(gradient_map),
-                }
-            )
+            replays.append(fixture)
         params, first_moments, second_moments, window = adamw_window(
             params,
             first_moments,
             second_moments,
             numerator_gradients,
             optimizer_step,
+            9,
         )
         windows.append(window)
+
+    replay_five_gradients, replay_five = replay_fixture(params, 5)
+    replays.append(replay_five)
+    _, _, _, partial_flush = adamw_window(
+        params,
+        first_moments,
+        second_moments,
+        [replay_five_gradients],
+        3,
+        5,
+    )
 
     fixture = {
         "provenance": {
             "generator": "tests/fixtures/generate_two_block_pytorch_frontier.py",
-            "rustgrad_base": "90d41be5f2dab7d418f4800918a6544b3ef63710",
+            "rustgrad_base": "dcba9ad2a311746caa340708054f32efea11e444",
             "python": sys.version.split()[0],
             "torch": torch.__version__,
             "device": "cpu",
@@ -431,6 +449,7 @@ def main(output: Path) -> None:
         "initial_parameters": tensor_map(initial_parameters),
         "replays": replays,
         "windows": windows,
+        "partial_flush": partial_flush,
     }
     output.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
 
