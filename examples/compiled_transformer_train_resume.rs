@@ -1934,9 +1934,33 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             loss_mask_weight(&batch.loss_mask),
             EXPECTED_LOSS_WEIGHTS[(replay - 1) as usize]
         );
-        let step = session.step_batch_scheduled(batch)?;
+        let step = session.step_batch_commit_only_scheduled(batch)?;
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
+        assert!(step.outputs().is_empty());
+        assert!(step.loss().values()[0].is_finite());
+        assert_eq!(step.clip_report().is_some(), step.did_update());
+        assert_eq!(step.window_loss_report().is_some(), step.did_update());
+        if let Some(clip) = step.clip_report() {
+            assert!(clip.is_finite());
+            assert!(clip.did_clip().is_some());
+        }
+        if let Some(window) = step.window_loss_report() {
+            assert!(window.is_finite());
+            assert_eq!(window.microbatch_count(), ACCUMULATION_STEPS);
+            assert_eq!(
+                window.loss_weight(),
+                EXPECTED_LOSS_WEIGHTS.iter().copied().sum::<u64>()
+            );
+        }
         let report = step.report();
+        assert_eq!(
+            report.traffic().materialized_egress_count(),
+            if step.did_update() { 5 } else { 1 }
+        );
+        assert_eq!(
+            report.traffic().materialized_egress_bytes(),
+            if step.did_update() { 24 } else { 4 }
+        );
         let executed = report.executed_native_item_count();
         assert!(executed > 0);
         assert!(executed <= report.native_item_count());
@@ -2088,6 +2112,8 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         .expect("current native CPU scoreboard reports replay traffic");
     assert_eq!(replay_traffic.external_input_import_count(), 0);
     assert_eq!(replay_traffic.external_input_import_bytes(), 0);
+    assert_eq!(replay_traffic.materialized_egress_count(), 5);
+    assert_eq!(replay_traffic.materialized_egress_bytes(), 24);
     assert_eq!(
         replay_traffic.borrowed_recurrent_input_bytes(),
         recurrent_state_bytes
@@ -2116,6 +2142,8 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         .expect("phase-specialized scoreboard reports accumulation traffic");
     assert_eq!(accumulation_traffic.external_input_import_count(), 0);
     assert_eq!(accumulation_traffic.external_input_import_bytes(), 0);
+    assert_eq!(accumulation_traffic.materialized_egress_count(), 1);
+    assert_eq!(accumulation_traffic.materialized_egress_bytes(), 4);
     assert_eq!(
         accumulation_traffic.borrowed_recurrent_input_bytes(),
         recurrent_state_bytes

@@ -1065,45 +1065,33 @@ interpreter and strict-Metal targets.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional accumulation/flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v12 validates those facts against strict-native
-preparation and successful training-step reports, then aggregates caller-observed
-compile/prepare/checkpoint durations and a bounded runtime-reported first/steady
-sample set into versioned JSON. Every attached native program partitions its
-runtime-observed preparation total exactly into layout, rendering, compiler
-process, module load, and residual host work. V8 records exact overlap across
-complete parallel module jobs plus compiler-process-only overlap and concurrency;
-the caller-observed whole-prepare remainder is checked after subtracting the
-complete-job overlap from summed program totals. V9 separately authenticates
-logical schedule/cache coverage and grouped physical rendered/executed entry
-counts; v5-v8 retain their original one-rendered-entry-per-logical-item wire
-invariant.
+separate `NativeTrainingScoreboard` v13 authenticates strict-native preparation
+and successful training-step reports, then emits bounded versioned JSON.
+
+| Evidence | Meaning |
+|---|---|
+| Preparation | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions for every attached program. |
+| Execution | Logical schedule/cache inventory, physical rendered/executed entries, and actual module-dispatch calls. |
+| Replay traffic | Owned external imports, borrowed/retained/replaced recurrent bytes, and logical CPU egress materialization count/bytes. CPU egress is not a device transfer. |
+| Timing | Caller-observed compile/prepare/checkpoint time plus bounded first/steady replay and executor/recurrent-overhead partitions. No threshold or speedup is claimed. |
 
 ##### Replay phases and wire versions
 
-Raw report recording continues to emit v9. Without a sibling,
-`record_step` emits v10; phase-specialized accumulation with full physical
-replacement emits v11, while retained-state accumulation emits v12 and
-authenticates distinct program, cache, traffic, and executed-entry inventories
-plus an exact retained/physically-replaced recurrent-state count and byte
-partition for accumulation-only versus optimizer-commit replay. Both classify successful
-steps solely from `did_update`:
-the first replay remains separate and warm accumulation-only and optimizer-commit
-samples have disjoint, exact timing partitions. V1-v11 JSON remains readable,
-and one scoreboard rejects mixed raw/classified recording without consuming a
-sample. Partial flush is not a main-step sample. Main replay wall time is partitioned exactly
-between the sealed native executor and the checked recurrent
-staging/validation/commit remainder; failed calls publish neither phase. It
-reports deterministic
-schedule/native-item/cache inventories, stable phase-specific successful CPU
-JIT item-execution counts, logical temporary/state peaks, and per-step
-fallback external-input import count/bytes plus borrowed recurrent input/output
-bytes. Dense F32/I32 inputs bind caller-owned storage
-read-only for exactly one replay call, so their successful import counts are
-zero; unsupported storage retains the owned-copy fallback. Rejected attempts
-expose no report sample. CPU device kernel launches, host/device transfers, and
-measured physical peak host memory remain unavailable (`null`). Durations
-do not change any plan, capture, checkpoint, or native identity, and the report
-makes no threshold or speedup claim.
+V13 is emitted for both raw and classified recording. Classified steps use only
+`did_update`; the first replay remains separate, and warm accumulation-only and
+optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
+classification. One scoreboard rejects mixed recording modes without consuming
+a sample, and partial flush remains outside the main-step sample set.
+
+V1-v12 JSON remains readable with CPU egress evidence absent. V13 requires the
+successful main and, when present, accumulation replay inventories to include
+the workspace-backed tensors detached for the caller. Commit-only replay omits
+caller-named outputs while retaining loss and enabled validation/report scalars.
+Dense F32/I32 inputs bind caller storage read-only for one call; unsupported
+storage retains the owned-import fallback. Failed calls publish no report or
+sample. Kernel launches, host/device transfers, and measured physical peak host
+memory remain unavailable (`null`), and observations change no execution or
+checkpoint identity.
 
 ##### Protected evidence
 

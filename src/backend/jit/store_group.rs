@@ -91,7 +91,26 @@ pub(crate) fn render_schedule_module_entries(
         }
     }
     let mut entries = Vec::with_capacity(items.len());
+    let mut zero_domains = Vec::new();
     for (index, (item, layout)) in items.iter().zip(layouts).enumerate() {
+        let elements = item
+            .primary_output()
+            .shape
+            .numel()
+            .map_err(|error| JitBackendError::Binding(error.to_string()))?;
+        if elements == 0 {
+            if grouped_members.contains(&index) {
+                return Err(JitBackendError::Binding(
+                    "zero-domain item belongs to a native store group".into(),
+                ));
+            }
+            super::validate_native_layout(item, &layout)?;
+            backend.validate_zero_domain_schedule_item(item)?;
+            zero_domains.push(super::PreparedZeroDomainEntry {
+                logical_index: index,
+            });
+            continue;
+        }
         if grouped_members.contains(&index) {
             let Some(group) = groups_by_anchor.get(&index) else {
                 continue;
@@ -151,6 +170,7 @@ pub(crate) fn render_schedule_module_entries(
     }
     Ok(RenderedScheduleModule {
         entries,
+        zero_domains,
         render_wall_time: started.elapsed(),
     })
 }

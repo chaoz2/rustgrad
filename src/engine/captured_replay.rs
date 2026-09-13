@@ -1107,7 +1107,13 @@ impl PlannedNativeItems {
                 "prepared native item count mismatch".into(),
             ));
         }
-        if self.module_preparation.rendered_entry_count != self.items.len() {
+        if self.module_preparation.rendered_entry_count
+            != self
+                .items
+                .iter()
+                .filter(|item| item.renders_entry())
+                .count()
+        {
             return Err(ReplayError::Corrupt(
                 "prepared native physical entry count mismatch".into(),
             ));
@@ -1142,6 +1148,25 @@ impl PlannedNativeItems {
                     if *slot || !prepared.authenticates_layout(*logical_index, item, layout) {
                         return Err(ReplayError::Corrupt(
                             "prepared native operand layout mismatch".into(),
+                        ));
+                    }
+                    *slot = true;
+                }
+                PreparedNativeDispatch::ZeroDomain { logical_index, .. } => {
+                    let Some((item, layout, slot)) = capture
+                        .items
+                        .get(*logical_index)
+                        .zip(layouts.get(*logical_index))
+                        .zip(covered.get_mut(*logical_index))
+                        .map(|((item, layout), slot)| (item, layout, slot))
+                    else {
+                        return Err(ReplayError::Corrupt(
+                            "prepared zero-domain logical item is out of range".into(),
+                        ));
+                    };
+                    if *slot || !prepared.authenticates_layout(*logical_index, item, layout) {
+                        return Err(ReplayError::Corrupt(
+                            "prepared zero-domain item mismatch".into(),
                         ));
                     }
                     *slot = true;
@@ -1248,7 +1273,8 @@ impl SealedPlannedNativeItems {
                                 .iter()
                                 .find(|member| member.output_buffer == successor.output)
                                 .map(|member| member.logical_index),
-                            PreparedNativeDispatch::Item { .. } => None,
+                            PreparedNativeDispatch::Item { .. }
+                            | PreparedNativeDispatch::ZeroDomain { .. } => None,
                         })
                         .expect("sealed AdamW native update has a physical store-group member")
                 })
@@ -1261,6 +1287,15 @@ impl SealedPlannedNativeItems {
         &self,
     ) -> super::native_replay_workspace::NativeReplayWorkspaceStats {
         self.plan.workspace_stats()
+    }
+
+    #[cfg(test)]
+    pub(super) fn zero_domain_item_count(&self) -> usize {
+        self.plan
+            .items
+            .iter()
+            .filter(|item| matches!(item, PreparedNativeDispatch::ZeroDomain { .. }))
+            .count()
     }
 
     #[cfg(test)]
@@ -1819,18 +1854,6 @@ impl CapturedReplayExecutor {
             return Err(ReplayError::Unsupported(
                 "ordinary captured native replay cannot execute effect items".into(),
             ));
-        }
-        for item in &capture.items {
-            let elements = item
-                .primary_output()
-                .shape
-                .numel()
-                .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
-            if elements == 0 {
-                return Err(ReplayError::Unsupported(
-                    "strict native plan selected non-native item".into(),
-                ));
-            }
         }
         let started = Instant::now();
         let layouts = native_schedule_layouts(capture)?;
@@ -2795,6 +2818,72 @@ mod tests {
                 if message == "prepared native physical entry count mismatch"
         ));
         assert_eq!(executor.native_item_plan_count(), 1);
+    }
+
+    #[test]
+    fn native_egress_counts_final_logical_requested_aliases() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], DType::F32);
+        let source = graph.square(input).unwrap();
+        let shrunk = graph.shrink(source, [(1, 3)]).unwrap();
+        let empty = graph.shrink(source, [(0, 0)]).unwrap();
+        let capture = captured(&graph, &[source, shrunk, empty]);
+        assert_eq!(capture.requested_passthroughs.len(), 2);
+        assert!(
+            capture
+                .requested_passthroughs
+                .iter()
+                .all(|alias| alias.source == source)
+        );
+        let bindings = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([4], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+
+        let (values, traffic) = executor
+            .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(
+            values
+                .tensor(source.index() as u64, "source")
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            values
+                .tensor(shrunk.index() as u64, "shrunk")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            values.tensor(empty.index() as u64, "empty").unwrap().len(),
+            0
+        );
+        assert_eq!(traffic.materialized_egress_count, 3);
+        assert_eq!(traffic.materialized_egress_bytes, 24);
+
+        let selected = BTreeSet::from([source.index() as u64]);
+        let mut borrowed = super::super::native_replay_workspace::NativeReplayBindings::new();
+        let (_, selected_traffic) = executor
+            .execute_planned_native_items_resolved(
+                &capture,
+                &mut plan,
+                &mut borrowed,
+                Some(&selected),
+                |_workspace, _borrowed| Ok(()),
+                |input, workspace, borrowed| {
+                    workspace.bind_external_input(&input.name, &bindings[&input.name], borrowed)
+                },
+            )
+            .unwrap();
+        assert_eq!(selected_traffic.materialized_egress_count, 1);
+        assert_eq!(selected_traffic.materialized_egress_bytes, 16);
     }
 
     #[test]

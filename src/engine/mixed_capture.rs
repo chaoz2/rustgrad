@@ -597,6 +597,11 @@ impl PreparedRecurrentNativeReplay {
     }
 
     #[cfg(test)]
+    pub(crate) fn zero_domain_item_count(&self) -> usize {
+        self.plan.zero_domain_item_count()
+    }
+
+    #[cfg(test)]
     pub(crate) fn last_executed_native_item_count(&self) -> usize {
         self.plan.last_executed_native_item_count()
     }
