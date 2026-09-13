@@ -7599,7 +7599,7 @@ impl CpuCompiledTrainingProgram {
         let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
         let output_schema = transition.outputs.clone();
         let mut reports = None;
-        let replay = transition
+        let _replay = transition
             .capture
             .replay_recurrent_checked(
                 &mut self.runtime,
@@ -7616,7 +7616,7 @@ impl CpuCompiledTrainingProgram {
         let reports = reports.expect("compiled auxiliary outputs were authenticated before commit");
         #[cfg(debug_assertions)]
         {
-            let mut committed = replay.committed.clone();
+            let mut committed = _replay.committed.clone();
             committed.sort_by_key(|state| state.buffer);
             debug_assert_eq!(committed, prepared.cursor.frontier());
         }
