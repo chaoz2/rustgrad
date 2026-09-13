@@ -249,6 +249,33 @@ def block_forward(
     return residual + apply_dropout(ff_output, masks[2]), probabilities, ff_input
 
 
+def block_evaluation_forward(
+    value: torch.Tensor,
+    params: OrderedDict[str, torch.Tensor],
+    prefix: str,
+    effective_mask: torch.Tensor,
+    row_valid: torch.Tensor,
+) -> torch.Tensor:
+    normalized = layer_norm(value, params, f"{prefix}.ln1")
+    heads = []
+    for projection_name in ("query", "key", "value"):
+        projected = linear(normalized, params, f"{prefix}.{projection_name}")
+        heads.append(projected.reshape(BATCH, TIME, HEADS, HEAD_SIZE).permute(0, 2, 1, 3))
+    query, key, projected_value = heads
+    scores = (query @ key.transpose(-1, -2)) / f32(math.sqrt(float(HEAD_SIZE)))
+    safe_mask = effective_mask | (~row_valid & torch.nn.functional.one_hot(
+        torch.zeros(BATCH, HEADS, TIME, dtype=torch.int64), TIME
+    ).to(torch.bool))
+    probabilities = torch.softmax(scores.masked_fill(~safe_mask, -math.inf), dim=-1)
+    probabilities = torch.where(row_valid, probabilities, torch.zeros((), dtype=torch.float32))
+    attended = probabilities @ projected_value
+    attended = attended.permute(0, 2, 1, 3).contiguous().reshape(BATCH, TIME, EMBEDDING)
+    residual = value + linear(attended, params, f"{prefix}.out")
+    ff_input = linear(layer_norm(residual, params, f"{prefix}.ln2"), params, f"{prefix}.ff1")
+    ff_output = linear(torch.relu(ff_input), params, f"{prefix}.ff2")
+    return residual + ff_output
+
+
 def forward_inputs(
     params: OrderedDict[str, torch.Tensor],
     replay: int,
@@ -353,6 +380,54 @@ def policy_forward(
         row_valid,
         POLICY_IGNORE_INDEX,
     )
+
+
+def policy_evaluation_forward(
+    params: OrderedDict[str, torch.Tensor], replay: int
+) -> dict[str, torch.Tensor]:
+    tokens, targets, loss_mask, caller = policy_batch(replay)
+    effective_mask, row_valid = apply_causal_attention_mask(caller)
+    positions = torch.tensor(POSITIONS, dtype=torch.int64).reshape(BATCH, TIME)
+    value = params["tokens.weight"][tokens] + params["positions.weight"][positions]
+    value = block_evaluation_forward(value, params, "first", effective_mask, row_valid)
+    value = block_evaluation_forward(value, params, "second", effective_mask, row_valid)
+    value = layer_norm(value, params, "norm")
+    logits = value @ params["tokens.weight"].transpose(0, 1)
+    gather_targets = torch.where(targets == POLICY_IGNORE_INDEX, 0, targets)
+    token_losses = -torch.log_softmax(logits.reshape(-1, VOCAB), dim=-1).gather(
+        1, gather_targets.reshape(-1, 1)
+    ).reshape(BATCH, TIME) + 1.0
+    token_losses = torch.where(
+        targets == POLICY_IGNORE_INDEX,
+        torch.zeros((), dtype=torch.float32),
+        token_losses,
+    )
+    numerator = (token_losses * loss_mask).sum()
+    valid_token_count = loss_mask.sum()
+    return {
+        "logits": logits,
+        "loss": numerator / valid_token_count,
+        "valid_token_count": valid_token_count,
+    }
+
+
+def policy_evaluation_fixture(
+    params: OrderedDict[str, torch.Tensor], replay_step: int, optimizer_step: int
+) -> dict[str, object]:
+    results = [policy_evaluation_forward(params, replay) for replay in (1, 2, 3)]
+    valid_token_counts = [int(result["valid_token_count"].item()) for result in results]
+    assert valid_token_counts == [5, 3, 3]
+    batch_losses = [float(result["loss"].item()) for result in results]
+    token_mean_loss = sum(
+        loss * valid_token_count
+        for loss, valid_token_count in zip(batch_losses, valid_token_counts)
+    ) / sum(valid_token_counts)
+    return {
+        "replay_step": replay_step,
+        "optimizer_step": optimizer_step,
+        "batch_losses": batch_losses,
+        "token_mean_loss": token_mean_loss,
+    }
 
 
 def tensor(value: torch.Tensor) -> dict[str, object]:
@@ -559,6 +634,7 @@ def generate_policy_frontier() -> dict[str, object]:
     replays = []
     gradients_by_replay = []
     numerators = []
+    evaluation_points = [policy_evaluation_fixture(params, 0, 0)]
 
     def record_replay(replay: int) -> None:
         gradients, fixture, numerator = policy_replay_fixture(params, replay)
@@ -617,6 +693,7 @@ def generate_policy_frontier() -> dict[str, object]:
     for replay in range(1, 4):
         record_replay(replay)
     first_commit = commit_window(1, 3, 1, 11, 1.0e-3)
+    evaluation_points.append(policy_evaluation_fixture(params, 3, 1))
 
     record_replay(4)
     pending_checkpoint = {
@@ -630,9 +707,10 @@ def generate_policy_frontier() -> dict[str, object]:
     for replay in (5, 6):
         record_replay(replay)
     second_commit = commit_window(4, 6, 2, 11, 5.0e-4)
+    evaluation_points.append(policy_evaluation_fixture(params, 6, 2))
 
     record_replay(7)
-    _, _, _, partial_flush = adamw_window(
+    next_active, first_moments, second_moments, partial_flush = adamw_window(
         active_params,
         first_moments,
         second_moments,
@@ -643,6 +721,20 @@ def generate_policy_frontier() -> dict[str, object]:
         learning_rate=5.0e-4,
         weight_decay=POLICY_WEIGHT_DECAY,
     )
+    params = OrderedDict(
+        (
+            name,
+            frozen_parameter.detach().clone().requires_grad_()
+            if name == POLICY_FROZEN_PARAMETER
+            else next_active[name],
+        )
+        for name in params
+    )
+    active_params = OrderedDict(
+        (name, parameter)
+        for name, parameter in params.items()
+        if name != POLICY_FROZEN_PARAMETER
+    )
     partial_flush.update(
         {
             "learning_rate": 5.0e-4,
@@ -650,6 +742,7 @@ def generate_policy_frontier() -> dict[str, object]:
             "microbatch_count": 1,
         }
     )
+    evaluation_points.append(policy_evaluation_fixture(params, 7, 3))
     assert torch.equal(params[POLICY_FROZEN_PARAMETER], frozen_parameter)
     return {
         "rustgrad_base": "0b9bae3c69e072e050e7f9c08daf8184c0630133",
@@ -669,6 +762,12 @@ def generate_policy_frontier() -> dict[str, object]:
         "commits": [first_commit, second_commit],
         "pending_checkpoint": pending_checkpoint,
         "partial_flush": partial_flush,
+        "evaluation": {
+            "batch_replays": [1, 2, 3],
+            "valid_token_counts": [5, 3, 3],
+            "total_valid_token_count": 11,
+            "points": evaluation_points,
+        },
     }
 
 
