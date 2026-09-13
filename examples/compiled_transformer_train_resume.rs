@@ -1504,9 +1504,8 @@ where
         .expect("the compiler-owned token-mean evaluator is attached");
     let program_artifact = source_plan.program_artifact()?;
     let artifact_file = TemporaryCheckpointFile::new()?;
-    fs::write(artifact_file.path(), program_artifact.as_bytes())?;
-    let program_artifact =
-        CompiledAdamWProgramArtifact::from_bytes(fs::read(artifact_file.path())?)?;
+    program_artifact.save_file(artifact_file.path())?;
+    let program_artifact = CompiledAdamWProgramArtifact::load_file(artifact_file.path())?;
     assert_eq!(source_plan.captured_multi_step_lr(), Some(&schedule));
     let mut uninterrupted = prepare(source_plan)?;
     validate_preparation(&uninterrupted);
