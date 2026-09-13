@@ -36,7 +36,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V11: u32 = 11;
 const NATIVE_TRAINING_REPORT_FORMAT_V12: u32 = 12;
 const NATIVE_TRAINING_REPORT_FORMAT_V13: u32 = 13;
 const NATIVE_TRAINING_REPORT_FORMAT_V14: u32 = 14;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 15;
+const NATIVE_TRAINING_REPORT_FORMAT_V15: u32 = 15;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 16;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,7 +117,11 @@ impl NativeTrainingPreparationTiming {
             self.compiler_process_total,
             self.linker_process,
         ) {
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(total), Some(linker)) => {
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V15 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(total),
+                Some(linker),
+            ) => {
                 let total = total
                     .as_nanos()
                     .map_err(|_| invalid("invalid native cumulative compiler duration"))?;
@@ -132,7 +137,7 @@ impl NativeTrainingPreparationTiming {
                 }
                 total
             }
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, _, _) => {
+            (NATIVE_TRAINING_REPORT_FORMAT_V15 | NATIVE_TRAINING_REPORT_FORMAT_VERSION, _, _) => {
                 return Err(invalid("native chunk compiler timing is absent"));
             }
             (_, None, None) => compiler_process,
@@ -546,6 +551,7 @@ impl NativeTrainingProgramReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V12
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self, format_version)?,
@@ -687,6 +693,42 @@ struct NativeCompilerAggregate {
     cumulative_wall_sum: u128,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativeRenderAggregate {
+    job_count: u64,
+    wall_sum: u128,
+    wall_max: u128,
+}
+
+impl NativeRenderAggregate {
+    fn from_programs<'a>(
+        programs: impl IntoIterator<Item = &'a NativeTrainingProgramReport>,
+    ) -> Result<Self> {
+        programs
+            .into_iter()
+            .try_fold(Self::default(), |aggregate, program| {
+                let render = program
+                    .preparation_timing
+                    .as_ref()
+                    .ok_or_else(|| invalid("native program preparation timing is absent"))?
+                    .render
+                    .as_nanos()
+                    .map_err(|_| invalid("invalid native render duration"))?;
+                Ok(Self {
+                    job_count: aggregate
+                        .job_count
+                        .checked_add(1)
+                        .ok_or_else(|| invalid("native render job count overflows"))?,
+                    wall_sum: aggregate
+                        .wall_sum
+                        .checked_add(render)
+                        .ok_or_else(|| invalid("native render duration overflows"))?,
+                    wall_max: aggregate.wall_max.max(render),
+                })
+            })
+    }
+}
+
 impl NativeCompilerAggregate {
     fn from_programs<'a>(
         programs: impl IntoIterator<Item = &'a NativeTrainingProgramReport>,
@@ -715,7 +757,7 @@ impl NativeCompilerAggregate {
                     .compiler_process
                     .as_nanos()
                     .map_err(|_| invalid("invalid native compiler process duration"))?;
-                let cumulative = if format_version == NATIVE_TRAINING_REPORT_FORMAT_VERSION {
+                let cumulative = if format_version >= NATIVE_TRAINING_REPORT_FORMAT_V15 {
                     timing
                         .compiler_process_total
                         .ok_or_else(|| invalid("native cumulative compiler timing is absent"))?
@@ -840,6 +882,10 @@ pub struct NativeTrainingReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepare_parallel_module_overlap_wall_time: Option<BenchmarkDuration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_parallel_render_overlap_wall_time: Option<BenchmarkDuration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_max_parallel_render_job_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     prepare_compiler_process_overlap_wall_time: Option<BenchmarkDuration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepare_compiler_process_count: Option<u64>,
@@ -902,6 +948,16 @@ impl NativeTrainingReport {
     /// Exact overlap among complete native module compiler/loader jobs.
     pub const fn prepare_parallel_module_overlap_wall_time(&self) -> Option<BenchmarkDuration> {
         self.prepare_parallel_module_overlap_wall_time
+    }
+
+    /// Exact overlap among immutable per-program native render jobs.
+    pub const fn prepare_parallel_render_overlap_wall_time(&self) -> Option<BenchmarkDuration> {
+        self.prepare_parallel_render_overlap_wall_time
+    }
+
+    /// Observed maximum concurrency of immutable per-program native renders.
+    pub const fn prepare_max_parallel_render_job_count(&self) -> Option<u64> {
+        self.prepare_max_parallel_render_job_count
     }
 
     pub const fn prepare_compiler_process_overlap_wall_time(&self) -> Option<BenchmarkDuration> {
@@ -1053,6 +1109,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V12
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -1103,6 +1160,7 @@ impl NativeTrainingReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 None,
                 None,
@@ -1129,6 +1187,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V12
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(program),
                 Some(traffic),
@@ -1184,6 +1243,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V12
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -1209,6 +1269,7 @@ impl NativeTrainingReport {
                         && traffic.materialized_egress_bytes() == 0 => {}
                 NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
                     if traffic.materialized_egress_count() != 0
                         && traffic.materialized_egress_bytes() != 0 => {}
@@ -1217,6 +1278,7 @@ impl NativeTrainingReport {
                 }
                 NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                     return Err(invalid("native CPU egress evidence is absent"));
                 }
@@ -1244,6 +1306,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V12
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
@@ -1305,6 +1368,7 @@ impl NativeTrainingReport {
             | NATIVE_TRAINING_REPORT_FORMAT_V12
             | NATIVE_TRAINING_REPORT_FORMAT_V13
             | NATIVE_TRAINING_REPORT_FORMAT_V14
+            | NATIVE_TRAINING_REPORT_FORMAT_V15
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
@@ -1326,25 +1390,24 @@ impl NativeTrainingReport {
                     self.format_version,
                 )?;
                 let internal_compiler_overlap = aggregate.internal_overlap()?;
-                let overlap_is_valid =
-                    if self.format_version == NATIVE_TRAINING_REPORT_FORMAT_VERSION {
-                        let active_union = aggregate
-                            .cumulative_wall_sum
-                            .checked_sub(compiler_overlap)
-                            .ok_or_else(|| {
-                                invalid("native compiler overlap exceeds cumulative work")
-                            })?;
-                        compiler_overlap >= internal_compiler_overlap
-                            && aggregate.effective_wall_max <= active_union
-                            && active_union <= aggregate.effective_wall_sum
-                            && compiler_overlap <= active_union
-                    } else {
-                        let maximum_compiler_overlap = aggregate
-                            .effective_wall_sum
-                            .checked_sub(aggregate.effective_wall_max)
-                            .ok_or_else(|| invalid("native compiler process overlap underflows"))?;
-                        compiler_overlap <= maximum_compiler_overlap
-                    };
+                let overlap_is_valid = if self.format_version >= NATIVE_TRAINING_REPORT_FORMAT_V15 {
+                    let active_union = aggregate
+                        .cumulative_wall_sum
+                        .checked_sub(compiler_overlap)
+                        .ok_or_else(|| {
+                            invalid("native compiler overlap exceeds cumulative work")
+                        })?;
+                    compiler_overlap >= internal_compiler_overlap
+                        && aggregate.effective_wall_max <= active_union
+                        && active_union <= aggregate.effective_wall_sum
+                        && compiler_overlap <= active_union
+                } else {
+                    let maximum_compiler_overlap = aggregate
+                        .effective_wall_sum
+                        .checked_sub(aggregate.effective_wall_max)
+                        .ok_or_else(|| invalid("native compiler process overlap underflows"))?;
+                    compiler_overlap <= maximum_compiler_overlap
+                };
                 if compiler_count != aggregate.process_count
                     || max_parallel > 2
                     || max_parallel > compiler_count
@@ -1362,6 +1425,42 @@ impl NativeTrainingReport {
             }
             _ => unreachable!("format version was validated"),
         };
+        let render_overlap = match (
+            self.format_version,
+            self.prepare_parallel_render_overlap_wall_time,
+            self.prepare_max_parallel_render_job_count,
+        ) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V15, None, None) => 0,
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(overlap), Some(max_parallel)) => {
+                let overlap = overlap
+                    .as_nanos()
+                    .map_err(|_| invalid("invalid native render overlap duration"))?;
+                let aggregate = NativeRenderAggregate::from_programs(
+                    std::iter::once(&self.main)
+                        .chain(self.accumulation.iter())
+                        .chain(self.partial_flush.iter())
+                        .chain(&self.zero_grad)
+                        .chain(&self.evaluation),
+                )?;
+                let maximum_overlap = aggregate
+                    .wall_sum
+                    .checked_sub(aggregate.wall_max)
+                    .ok_or_else(|| invalid("native render overlap underflows"))?;
+                if max_parallel == 0
+                    || max_parallel > 2
+                    || max_parallel > aggregate.job_count
+                    || overlap > maximum_overlap
+                    || (overlap == 0) != (max_parallel == 1)
+                {
+                    return Err(invalid("native parallel render evidence differs"));
+                }
+                overlap
+            }
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V15, _, _) => {
+                return Err(invalid("legacy native report has parallel render evidence"));
+            }
+            _ => return Err(invalid("native parallel render evidence is absent")),
+        };
         match (
             self.format_version,
             self.prepare_runtime_overhead_wall_time,
@@ -1377,6 +1476,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V12
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
@@ -1391,6 +1491,7 @@ impl NativeTrainingReport {
                         | NATIVE_TRAINING_REPORT_FORMAT_V12
                         | NATIVE_TRAINING_REPORT_FORMAT_V13
                         | NATIVE_TRAINING_REPORT_FORMAT_V14
+                        | NATIVE_TRAINING_REPORT_FORMAT_V15
                         | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                         Some(overlap),
                     ) => overlap
@@ -1438,6 +1539,7 @@ impl NativeTrainingReport {
                 })?;
                 let effective_program_total = program_total
                     .checked_sub(overlap)
+                    .and_then(|total| total.checked_sub(render_overlap))
                     .ok_or_else(|| invalid("native prepare overlap exceeds program duration"))?;
                 let partitioned = overhead
                     .as_nanos()
@@ -1484,6 +1586,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V12
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -1532,7 +1635,10 @@ impl NativeTrainingReport {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V9, Some(_)) => {
                 return Err(invalid("legacy native training report has step phases"));
             }
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(phases)) => phases.validate(
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V15 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(phases),
+            ) => phases.validate(
                 self.successful_replay_count,
                 self.first_replay_wall_time,
                 self.steady_replay_total_wall_time,
@@ -1543,7 +1649,8 @@ impl NativeTrainingReport {
                     .as_ref()
                     .ok_or_else(|| invalid("classified replay overhead timing is absent"))?,
             )?,
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, None) if self.accumulation.is_none() => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_V15 | NATIVE_TRAINING_REPORT_FORMAT_VERSION, None)
+                if self.accumulation.is_none() => {}
             _ => return Err(invalid("native training step phases differ")),
         }
         let expected_rate = rate_from_total(
@@ -1600,6 +1707,8 @@ pub struct NativeTrainingScoreboard {
     prepare_wall_time: Duration,
     prepare_runtime_overhead_wall_time: Duration,
     prepare_parallel_module_overlap_wall_time: Duration,
+    prepare_parallel_render_overlap_wall_time: Duration,
+    prepare_max_parallel_render_job_count: u64,
     prepare_compiler_process_overlap_wall_time: Duration,
     prepare_compiler_process_count: u64,
     prepare_max_parallel_compiler_process_count: u64,
@@ -1689,6 +1798,12 @@ impl NativeTrainingScoreboard {
             })?;
         let prepare_parallel_module_overlap_wall_time =
             preparation.parallel_module_overlap_wall_time();
+        let prepare_parallel_render_overlap_wall_time =
+            preparation.parallel_render_overlap_wall_time();
+        let prepare_max_parallel_render_job_count = count(
+            preparation.max_parallel_render_job_count(),
+            "parallel native render job",
+        )?;
         let prepare_compiler_process_count = count(
             preparation.compiler_process_count(),
             "native compiler process",
@@ -1699,7 +1814,8 @@ impl NativeTrainingScoreboard {
         )?;
         let effective_program_prepare_wall_time = program_prepare_wall_time
             .checked_sub(prepare_parallel_module_overlap_wall_time)
-            .ok_or_else(|| invalid("native parallel module overlap exceeds program time"))?;
+            .and_then(|time| time.checked_sub(prepare_parallel_render_overlap_wall_time))
+            .ok_or_else(|| invalid("native parallel work overlap exceeds program time"))?;
         let prepare_runtime_overhead_wall_time = prepare_wall_time
             .checked_sub(effective_program_prepare_wall_time)
             .ok_or_else(|| invalid("native program preparation exceeds whole prepare time"))?;
@@ -1708,6 +1824,8 @@ impl NativeTrainingScoreboard {
             prepare_wall_time,
             prepare_runtime_overhead_wall_time,
             prepare_parallel_module_overlap_wall_time,
+            prepare_parallel_render_overlap_wall_time,
+            prepare_max_parallel_render_job_count,
             prepare_compiler_process_overlap_wall_time: preparation
                 .compiler_process_overlap_wall_time(),
             prepare_compiler_process_count,
@@ -1973,6 +2091,10 @@ impl NativeTrainingScoreboard {
             prepare_parallel_module_overlap_wall_time: Some(BenchmarkDuration::from_duration(
                 self.prepare_parallel_module_overlap_wall_time,
             )),
+            prepare_parallel_render_overlap_wall_time: Some(BenchmarkDuration::from_duration(
+                self.prepare_parallel_render_overlap_wall_time,
+            )),
+            prepare_max_parallel_render_job_count: Some(self.prepare_max_parallel_render_job_count),
             prepare_compiler_process_overlap_wall_time: Some(BenchmarkDuration::from_duration(
                 self.prepare_compiler_process_overlap_wall_time,
             )),
@@ -2318,6 +2440,15 @@ mod tests {
         }
     }
 
+    fn remove_parallel_render_evidence(json: &mut serde_json::Value) {
+        json.as_object_mut()
+            .unwrap()
+            .remove("prepare_parallel_render_overlap_wall_time");
+        json.as_object_mut()
+            .unwrap()
+            .remove("prepare_max_parallel_render_job_count");
+    }
+
     fn zero_report() -> NativeTrainingReport {
         NativeTrainingReport {
             format_version: NATIVE_TRAINING_REPORT_FORMAT_V10,
@@ -2325,6 +2456,8 @@ mod tests {
             prepare_wall_time: zero_duration(),
             prepare_runtime_overhead_wall_time: Some(zero_duration()),
             prepare_parallel_module_overlap_wall_time: Some(zero_duration()),
+            prepare_parallel_render_overlap_wall_time: None,
+            prepare_max_parallel_render_job_count: None,
             prepare_compiler_process_overlap_wall_time: Some(zero_duration()),
             prepare_compiler_process_count: Some(1),
             prepare_max_parallel_compiler_process_count: Some(1),
@@ -2433,6 +2566,8 @@ mod tests {
     fn phase_specialized_report() -> NativeTrainingReport {
         let mut report = zero_report();
         report.format_version = NATIVE_TRAINING_REPORT_FORMAT_VERSION;
+        report.prepare_parallel_render_overlap_wall_time = Some(zero_duration());
+        report.prepare_max_parallel_render_job_count = Some(1);
         report.main_replay_traffic = report
             .main_replay_traffic
             .map(|traffic| traffic.with_materialized_egress(5, 24));
@@ -2559,6 +2694,7 @@ mod tests {
         let report = phase_specialized_report();
         let mut json = serde_json::to_value(report).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V11);
+        remove_parallel_render_evidence(&mut json);
         remove_prefix_module_evidence(&mut json);
         remove_chunk_compiler_evidence(&mut json);
         for phase in ["main_replay_traffic", "accumulation_replay_traffic"] {
@@ -2588,6 +2724,7 @@ mod tests {
     fn phase_specialized_v12_report_decodes_without_egress_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V12);
+        remove_parallel_render_evidence(&mut json);
         remove_prefix_module_evidence(&mut json);
         remove_chunk_compiler_evidence(&mut json);
         for phase in ["main_replay_traffic", "accumulation_replay_traffic"] {
@@ -2618,6 +2755,7 @@ mod tests {
     fn version_thirteen_report_decodes_without_prefix_module_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V13);
+        remove_parallel_render_evidence(&mut json);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
             "v13 cannot claim v14 prefix-module evidence"
@@ -2658,6 +2796,7 @@ mod tests {
     fn version_fourteen_preserves_prefix_evidence_and_rejects_v15_compiler_fields() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V14);
+        remove_parallel_render_evidence(&mut json);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
             "v14 cannot claim v15 chunk compiler evidence"
@@ -2756,6 +2895,65 @@ mod tests {
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
             "v15 requires complete chunk compiler evidence"
         );
+    }
+
+    #[test]
+    fn version_fifteen_decodes_without_parallel_render_evidence() {
+        let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V15);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "v15 cannot claim v16 parallel render evidence"
+        );
+        remove_parallel_render_evidence(&mut json);
+        let decoded =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V15);
+        assert!(
+            decoded
+                .prepare_parallel_render_overlap_wall_time()
+                .is_none()
+        );
+        assert!(decoded.prepare_max_parallel_render_job_count().is_none());
+    }
+
+    #[test]
+    fn current_report_authenticates_parallel_render_overlap_and_bound() {
+        let mut report = phase_specialized_report();
+        {
+            let timing = report.main.preparation_timing.as_mut().unwrap();
+            timing.total = BenchmarkDuration::from_duration(Duration::from_nanos(2));
+            timing.render = BenchmarkDuration::from_duration(Duration::from_nanos(2));
+        }
+        {
+            let timing = report
+                .accumulation
+                .as_mut()
+                .unwrap()
+                .preparation_timing
+                .as_mut()
+                .unwrap();
+            timing.total = BenchmarkDuration::from_duration(Duration::from_nanos(2));
+            timing.render = BenchmarkDuration::from_duration(Duration::from_nanos(2));
+        }
+        report.prepare_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(3));
+        report.prepare_parallel_render_overlap_wall_time =
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(1)));
+        report.prepare_max_parallel_render_job_count = Some(2);
+        assert!(report.validate().is_ok());
+
+        let valid = report.clone();
+        report.prepare_max_parallel_render_job_count = Some(3);
+        assert!(report.validate().is_err());
+
+        let mut report = valid.clone();
+        report.prepare_parallel_render_overlap_wall_time =
+            Some(BenchmarkDuration::from_duration(Duration::from_nanos(3)));
+        assert!(report.validate().is_err());
+
+        let mut report = valid;
+        report.prepare_parallel_render_overlap_wall_time = None;
+        assert!(report.validate().is_err());
     }
 
     #[test]

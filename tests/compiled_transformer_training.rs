@@ -6132,6 +6132,8 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let mut session = plan.prepare(&target).unwrap();
     let preparation = session.preparation_report();
     let preparation_parallel_module_overlap = preparation.parallel_module_overlap_wall_time();
+    let preparation_parallel_render_overlap = preparation.parallel_render_overlap_wall_time();
+    assert!((1..=2).contains(&preparation.max_parallel_render_job_count()));
     let prepare_wall_time = std::iter::once(preparation.main())
         .chain(preparation.accumulation())
         .chain(preparation.partial_flush())
@@ -6379,10 +6381,23 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         .to_duration()
         .unwrap();
     assert_eq!(parallel_module_overlap, preparation_parallel_module_overlap);
+    let parallel_render_overlap = report
+        .prepare_parallel_render_overlap_wall_time()
+        .expect("current scoreboard reports parallel render overlap")
+        .to_duration()
+        .unwrap();
+    assert_eq!(parallel_render_overlap, preparation_parallel_render_overlap);
+    assert!(
+        report
+            .prepare_max_parallel_render_job_count()
+            .is_some_and(|count| (1..=2).contains(&count))
+    );
     assert_eq!(
         program_prepare_total
             .checked_sub(parallel_module_overlap)
             .expect("parallel module overlap fits program preparation")
+            .checked_sub(parallel_render_overlap)
+            .expect("parallel render overlap fits program preparation")
             .checked_add(
                 report
                     .prepare_runtime_overhead_wall_time()
@@ -6467,6 +6482,12 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     assert_eq!(
         json["format_version"],
         NATIVE_TRAINING_REPORT_FORMAT_VERSION
+    );
+    assert!(json["prepare_parallel_render_overlap_wall_time"].is_object());
+    assert!(
+        json["prepare_max_parallel_render_job_count"]
+            .as_u64()
+            .is_some_and(|count| (1..=2).contains(&count))
     );
     assert_eq!(
         json["main_replay_traffic"]["materialized_egress_count"],

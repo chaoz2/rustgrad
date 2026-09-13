@@ -283,10 +283,33 @@ pub(crate) struct NativeScheduleModulePreparation {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeScheduleCompilationBatch {
+    pub(crate) parallel_render_overlap_wall_time: Duration,
+    pub(crate) max_parallel_render_job_count: usize,
     pub(crate) parallel_work_overlap_wall_time: Duration,
     pub(crate) compiler_process_overlap_wall_time: Duration,
     pub(crate) compiler_process_count: usize,
     pub(crate) max_parallel_compiler_process_count: usize,
+}
+
+const MAX_PARALLEL_NATIVE_RENDER_JOB_COUNT: usize = 2;
+
+struct NativeScheduleRenderJob<'a> {
+    ordinal: usize,
+    items: &'a [ScheduleItem],
+    layouts: &'a [NativeScheduleLayout],
+    store_groups: &'a [NativeStoreGroup],
+}
+
+struct NativeScheduleRenderResult {
+    ordinal: usize,
+    rendered: Result<RenderedScheduleModule, JitBackendError>,
+    interval: (Instant, Instant),
+}
+
+struct NativeScheduleRenderBatch {
+    rendered: Vec<RenderedScheduleModule>,
+    parallel_overlap_wall_time: Duration,
+    max_parallel_job_count: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -298,6 +321,7 @@ pub(crate) struct NativeScheduleLayout {
 
 fn overlapping_wall_time(
     intervals: &[(Instant, Instant)],
+    work: &str,
 ) -> Result<(Duration, usize), JitBackendError> {
     let mut intervals = intervals.to_vec();
     intervals.sort_by_key(|(start, _)| *start);
@@ -306,7 +330,7 @@ fn overlapping_wall_time(
         .try_fold(Duration::ZERO, |total, (start, end)| {
             total
                 .checked_add(end.duration_since(*start))
-                .ok_or_else(|| JitBackendError::Native("compiler-process duration overflow".into()))
+                .ok_or_else(|| JitBackendError::Native(format!("{work} duration overflow")))
         })?;
     let mut union = Duration::ZERO;
     let mut current: Option<(Instant, Instant)> = None;
@@ -318,9 +342,7 @@ fn overlapping_wall_time(
             Some((range_start, range_end)) => {
                 union = union
                     .checked_add(range_end.duration_since(range_start))
-                    .ok_or_else(|| {
-                        JitBackendError::Native("compiler-process union overflow".into())
-                    })?;
+                    .ok_or_else(|| JitBackendError::Native(format!("{work} union overflow")))?;
                 current = Some((*start, *end));
             }
             None => current = Some((*start, *end)),
@@ -329,7 +351,7 @@ fn overlapping_wall_time(
     if let Some((start, end)) = current {
         union = union
             .checked_add(end.duration_since(start))
-            .ok_or_else(|| JitBackendError::Native("compiler-process union overflow".into()))?;
+            .ok_or_else(|| JitBackendError::Native(format!("{work} union overflow")))?;
     }
     let max_parallel = intervals
         .iter()
@@ -342,11 +364,118 @@ fn overlapping_wall_time(
         .max()
         .unwrap_or(0);
     Ok((
-        individual.checked_sub(union).ok_or_else(|| {
-            JitBackendError::Native("compiler-process overlap exceeds duration".into())
-        })?,
+        individual
+            .checked_sub(union)
+            .ok_or_else(|| JitBackendError::Native(format!("{work} overlap exceeds duration")))?,
         max_parallel,
     ))
+}
+
+fn render_schedule_module_job(
+    backend: &CpuJitBackend,
+    job: NativeScheduleRenderJob<'_>,
+) -> NativeScheduleRenderResult {
+    let started = Instant::now();
+    let mut rendered =
+        render_schedule_module_entries(backend, job.items, job.layouts, job.store_groups);
+    let finished = Instant::now();
+    if let Ok(rendered) = &mut rendered {
+        rendered.render_wall_time = finished.duration_since(started);
+    }
+    NativeScheduleRenderResult {
+        ordinal: job.ordinal,
+        rendered,
+        interval: (started, finished),
+    }
+}
+
+fn native_render_worker_count(job_count: usize) -> usize {
+    job_count.min(MAX_PARALLEL_NATIVE_RENDER_JOB_COUNT)
+}
+
+fn render_schedule_modules(
+    backend: &CpuJitBackend,
+    programs: &[(
+        &[ScheduleItem],
+        Vec<NativeScheduleLayout>,
+        Vec<NativeStoreGroup>,
+    )],
+) -> Result<NativeScheduleRenderBatch, JitBackendError> {
+    let jobs = programs
+        .iter()
+        .enumerate()
+        .map(
+            |(ordinal, (items, layouts, store_groups))| NativeScheduleRenderJob {
+                ordinal,
+                items,
+                layouts,
+                store_groups,
+            },
+        )
+        .collect::<VecDeque<_>>();
+    let worker_count = native_render_worker_count(jobs.len());
+    let queue = Arc::new(Mutex::new(jobs));
+    let mut results = thread::scope(|scope| -> Result<Vec<_>, JitBackendError> {
+        let handles = (0..worker_count)
+            .map(|worker| {
+                let queue = queue.clone();
+                thread::Builder::new()
+                    .name(format!("rustgrad-native-render-{worker}"))
+                    .spawn_scoped(scope, move || {
+                        let mut results = Vec::new();
+                        loop {
+                            let job = queue
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .pop_front();
+                            let Some(job) = job else {
+                                break;
+                            };
+                            results.push(render_schedule_module_job(backend, job));
+                        }
+                        results
+                    })
+                    .map_err(|error| {
+                        JitBackendError::Native(format!(
+                            "native schedule render worker spawn failed: {error}"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut results = Vec::new();
+        for handle in handles {
+            results.extend(handle.join().map_err(|_| {
+                JitBackendError::Native("native schedule render worker panicked".into())
+            })?);
+        }
+        Ok(results)
+    })?;
+    results.sort_by_key(|result| result.ordinal);
+    if results.len() != programs.len()
+        || results
+            .iter()
+            .enumerate()
+            .any(|(ordinal, result)| result.ordinal != ordinal)
+    {
+        return Err(JitBackendError::Native(
+            "native schedule render result inventory mismatch".into(),
+        ));
+    }
+    let intervals = results
+        .iter()
+        .map(|result| result.interval)
+        .collect::<Vec<_>>();
+    let (parallel_overlap_wall_time, max_parallel_job_count) =
+        overlapping_wall_time(&intervals, "native schedule render")?;
+    let rendered = results
+        .into_iter()
+        .map(|result| result.rendered)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(NativeScheduleRenderBatch {
+        rendered,
+        parallel_overlap_wall_time,
+        max_parallel_job_count,
+    })
 }
 
 impl PreparedScheduleItem {
@@ -1296,12 +1425,11 @@ impl CpuJitBackend {
             Vec<NativeStoreGroup>,
         )>,
     ) -> Result<PreparedNativeScheduleModules, JitBackendError> {
-        let rendered = programs
-            .iter()
-            .map(|(items, layouts, store_groups)| {
-                render_schedule_module_entries(self, items, layouts.clone(), store_groups)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let NativeScheduleRenderBatch {
+            rendered,
+            parallel_overlap_wall_time: parallel_render_overlap_wall_time,
+            max_parallel_job_count: max_parallel_render_job_count,
+        } = render_schedule_modules(self, &programs)?;
         let mut prefix_reuses = Vec::with_capacity(rendered.len());
         for program in 0..rendered.len() {
             let standalone_sources = prefix_reuses
@@ -1409,9 +1537,12 @@ impl CpuJitBackend {
             .map(|(_, interval)| *interval)
             .collect::<Vec<_>>();
         let (compiler_process_overlap_wall_time, max_parallel_compiler_process_count) =
-            overlapping_wall_time(&compiler_intervals)?;
-        let (parallel_work_overlap_wall_time, _) = overlapping_wall_time(&work_intervals)?;
+            overlapping_wall_time(&compiler_intervals, "compiler process")?;
+        let (parallel_work_overlap_wall_time, _) =
+            overlapping_wall_time(&work_intervals, "native schedule module")?;
         let compilation = NativeScheduleCompilationBatch {
+            parallel_render_overlap_wall_time,
+            max_parallel_render_job_count,
             parallel_work_overlap_wall_time,
             compiler_process_overlap_wall_time,
             compiler_process_count: compiler_intervals.len(),
@@ -2187,6 +2318,14 @@ mod tests {
     }
 
     #[test]
+    fn native_render_worker_count_is_bounded_to_two() {
+        assert_eq!(native_render_worker_count(0), 0);
+        assert_eq!(native_render_worker_count(1), 1);
+        assert_eq!(native_render_worker_count(2), 2);
+        assert_eq!(native_render_worker_count(5), 2);
+    }
+
+    #[test]
     fn native_module_preparation_reuses_prefix_and_compiles_only_suffix() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [4], DType::F32);
@@ -2209,6 +2348,8 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(programs.len(), 3);
+        assert!(compilation.max_parallel_render_job_count > 0);
+        assert!(compilation.max_parallel_render_job_count <= 2);
         assert!(compilation.compiler_process_count <= 2);
         let (prefix, prefix_work) = &programs[0];
         let (extended, extended_work) = &programs[1];
@@ -2253,6 +2394,18 @@ mod tests {
             .and_then(|item| item.dispatcher.as_ref())
             .unwrap();
         assert!(Arc::ptr_eq(prefix_dispatcher, fully_reused_dispatcher));
+
+        let (warm_programs, warm_compilation) = backend
+            .prepare_schedule_modules(vec![
+                (&schedule.items[..1], layouts[..1].to_vec(), Vec::new()),
+                (&schedule.items, layouts.clone(), Vec::new()),
+                (&schedule.items[..1], layouts[..1].to_vec(), Vec::new()),
+            ])
+            .unwrap();
+        assert_eq!(warm_programs.len(), programs.len());
+        assert_eq!(warm_compilation.compiler_process_count, 0);
+        assert!(warm_compilation.max_parallel_render_job_count > 0);
+        assert!(warm_compilation.max_parallel_render_job_count <= 2);
     }
 
     #[test]
@@ -2322,6 +2475,79 @@ mod tests {
     }
 
     #[test]
+    fn parallel_native_render_selects_errors_in_program_order_and_retries_cleanly() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], DType::F32);
+        let left = graph.relu(input).unwrap();
+        let right = graph.square(input).unwrap();
+        let schedule = crate::schedule_many(&graph, &[left, right]).unwrap();
+        let layouts = schedule
+            .items
+            .iter()
+            .map(schedule_native_layout)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let kernels = schedule
+            .items
+            .iter()
+            .map(|item| &item.kernel)
+            .collect::<Vec<_>>();
+        let kernel = crate::kernel::fuse_native_store_group(&kernels).unwrap();
+        let output_initialization = crate::cpu_jit::render_native_store_group(&kernel)
+            .unwrap()
+            .1;
+        let malformed_group = NativeStoreGroup {
+            members: vec![NativeStoreGroupMember {
+                logical_index: 0,
+                output_buffer: schedule.items[0].primary_output().id,
+            }],
+            kernel,
+            output_initialization,
+        };
+        let backend = CpuJitBackend::new(JitFallback::Error);
+        let programs = vec![
+            (
+                schedule.items.as_slice(),
+                layouts.clone(),
+                vec![malformed_group.clone()],
+            ),
+            (schedule.items.as_slice(), Vec::new(), Vec::new()),
+        ];
+        let error = match render_schedule_modules(&backend, &programs) {
+            Ok(_) => panic!("parallel native render must reject malformed programs"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("multiple members"));
+        assert!(backend.schedule_modules.lock().unwrap().is_empty());
+        assert!(backend.cache.lock().unwrap().is_empty());
+        assert!(backend.zero_domain_cache.lock().unwrap().is_empty());
+
+        let reversed = vec![
+            (schedule.items.as_slice(), Vec::new(), Vec::new()),
+            (
+                schedule.items.as_slice(),
+                layouts.clone(),
+                vec![malformed_group],
+            ),
+        ];
+        let error = match render_schedule_modules(&backend, &reversed) {
+            Ok(_) => panic!("parallel native render must preserve program error order"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("layout count mismatch"));
+
+        let valid = vec![
+            (&schedule.items[..1], layouts[..1].to_vec(), Vec::new()),
+            (schedule.items.as_slice(), layouts, Vec::new()),
+        ];
+        let rendered = render_schedule_modules(&backend, &valid).unwrap();
+        assert_eq!(rendered.rendered.len(), 2);
+        assert_eq!(rendered.rendered[0].entries.len(), 1);
+        assert_eq!(rendered.rendered[1].entries.len(), schedule.items.len());
+        assert!(rendered.max_parallel_job_count <= 2);
+    }
+
+    #[test]
     fn native_store_group_preserves_an_independent_intervening_item() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [4], DType::F32);
@@ -2358,7 +2584,7 @@ mod tests {
         let rendered = render_schedule_module_entries(
             &CpuJitBackend::new(JitFallback::Error),
             &schedule.items,
-            layouts.clone(),
+            &layouts,
             std::slice::from_ref(&group),
         )
         .unwrap();
@@ -2378,7 +2604,7 @@ mod tests {
             let error = match render_schedule_module_entries(
                 &CpuJitBackend::new(JitFallback::Error),
                 &schedule.items,
-                layouts.clone(),
+                &layouts,
                 &[malformed],
             ) {
                 Ok(_) => panic!("duplicate or descending store-group members must reject"),

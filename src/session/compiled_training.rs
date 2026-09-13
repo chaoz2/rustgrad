@@ -1741,6 +1741,8 @@ pub struct NativeCpuCompiledAdamWPreparationReport {
     evaluation: Option<NativeCpuProgramPreparationReport>,
     recurrent_state_count: usize,
     recurrent_state_bytes: usize,
+    parallel_render_overlap_wall_time: Duration,
+    max_parallel_render_job_count: usize,
     parallel_module_overlap_wall_time: Duration,
     compiler_process_overlap_wall_time: Duration,
     compiler_process_count: usize,
@@ -1776,6 +1778,17 @@ impl NativeCpuCompiledAdamWPreparationReport {
 
     pub const fn recurrent_state_bytes(&self) -> usize {
         self.recurrent_state_bytes
+    }
+
+    /// Exact overlap among the immutable per-program native render jobs.
+    pub const fn parallel_render_overlap_wall_time(&self) -> Duration {
+        self.parallel_render_overlap_wall_time
+    }
+
+    /// Maximum number of immutable per-program native render jobs observed
+    /// concurrently. The private worker pool is bounded to two.
+    pub const fn max_parallel_render_job_count(&self) -> usize {
+        self.max_parallel_render_job_count
     }
 
     /// Exact overlap among independently authenticated native module compiler
@@ -11052,6 +11065,8 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 evaluation: evaluation_report,
                 recurrent_state_count,
                 recurrent_state_bytes,
+                parallel_render_overlap_wall_time: compilation.parallel_render_overlap_wall_time,
+                max_parallel_render_job_count: compilation.max_parallel_render_job_count,
                 parallel_module_overlap_wall_time: compilation.parallel_work_overlap_wall_time,
                 compiler_process_overlap_wall_time: compilation.compiler_process_overlap_wall_time,
                 compiler_process_count: compilation.compiler_process_count,
@@ -15642,6 +15657,11 @@ mod tests {
         assert!(preparation.max_parallel_compiler_process_count() <= 1);
         assert_eq!(
             preparation.parallel_module_overlap_wall_time(),
+            Duration::ZERO
+        );
+        assert_eq!(preparation.max_parallel_render_job_count(), 1);
+        assert_eq!(
+            preparation.parallel_render_overlap_wall_time(),
             Duration::ZERO
         );
         let phases = preparation.main().phases();
