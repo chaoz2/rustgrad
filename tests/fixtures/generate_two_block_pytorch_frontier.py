@@ -38,6 +38,15 @@ MAX_GRADIENT_NORM = 1.0e-4
 LEARNING_RATE = 1.0e-3
 BETAS = (0.9, 0.999)
 EPSILON = 1.0e-8
+POLICY_MAX_GRADIENT_NORM = 0.25
+POLICY_WEIGHT_DECAY = 0.01
+POLICY_LOSS_SCALE = 128.0
+POLICY_IGNORE_INDEX = -100
+POLICY_FROZEN_PARAMETER = "positions.weight"
+# Key bias shifts every key score equally for one query/head and is therefore a
+# topology-derived softmax gauge direction, independent of observed values.
+POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS = ("first.key.1", "second.key.1")
+POLICY_VALID_LENGTHS = ((3, 2), (2, 1), (3, 0))
 MASKS = (
     (
         True, True, True, True, True, True, False, False, False,
@@ -192,14 +201,18 @@ def linear(value: torch.Tensor, params: OrderedDict[str, torch.Tensor], prefix: 
     return value @ params[f"{prefix}.0"] + params[f"{prefix}.1"]
 
 
-def combined_attention_mask(replay: int) -> tuple[torch.Tensor, torch.Tensor]:
-    caller = torch.tensor(MASKS[(replay - 1) % len(MASKS)], dtype=torch.bool).reshape(
-        BATCH, 1, TIME, TIME
-    )
+def apply_causal_attention_mask(caller: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     effective = caller.expand(BATCH, HEADS, TIME, TIME) & torch.tril(
         torch.ones(TIME, TIME, dtype=torch.bool)
     )
     return effective, effective.any(dim=-1, keepdim=True)
+
+
+def combined_attention_mask(replay: int) -> tuple[torch.Tensor, torch.Tensor]:
+    caller = torch.tensor(MASKS[(replay - 1) % len(MASKS)], dtype=torch.bool).reshape(
+        BATCH, 1, TIME, TIME
+    )
+    return apply_causal_attention_mask(caller)
 
 
 def apply_dropout(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -236,10 +249,17 @@ def block_forward(
     return residual + apply_dropout(ff_output, masks[2]), probabilities, ff_input
 
 
-def forward(params: OrderedDict[str, torch.Tensor], replay: int) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+def forward_inputs(
+    params: OrderedDict[str, torch.Tensor],
+    replay: int,
+    tokens: torch.Tensor,
+    targets: torch.Tensor,
+    loss_mask: torch.Tensor,
+    effective_mask: torch.Tensor,
+    row_valid: torch.Tensor,
+    ignore_index: int | None,
+) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     masks = replay_masks(replay)
-    effective_mask, row_valid = combined_attention_mask(replay)
-    tokens = torch.tensor(TOKENS, dtype=torch.int64).reshape(BATCH, TIME)
     positions = torch.tensor(POSITIONS, dtype=torch.int64).reshape(BATCH, TIME)
     value = params["tokens.weight"][tokens] + params["positions.weight"][positions]
     value, first_probabilities, first_relu_input = block_forward(
@@ -250,13 +270,19 @@ def forward(params: OrderedDict[str, torch.Tensor], replay: int) -> dict[str, to
     )
     value = layer_norm(value, params, "norm")
     logits = value @ params["tokens.weight"].transpose(0, 1)
-    targets = torch.tensor(TARGETS, dtype=torch.int64).reshape(BATCH, TIME)
+    if ignore_index is None:
+        gather_targets = targets
+    else:
+        gather_targets = torch.where(targets == ignore_index, 0, targets)
     token_losses = -torch.log_softmax(logits.reshape(-1, VOCAB), dim=-1).gather(
-        1, targets.reshape(-1, 1)
+        1, gather_targets.reshape(-1, 1)
     ).reshape(BATCH, TIME) + 1.0
-    loss_mask = torch.tensor(
-        LOSS_MASKS[(replay - 1) % len(LOSS_MASKS)], dtype=torch.float32
-    ).reshape(BATCH, TIME)
+    if ignore_index is not None:
+        token_losses = torch.where(
+            targets == ignore_index,
+            torch.zeros((), dtype=torch.float32),
+            token_losses,
+        )
     numerator = (token_losses * loss_mask).sum()
     valid_token_count = loss_mask.sum()
     return {
@@ -271,6 +297,62 @@ def forward(params: OrderedDict[str, torch.Tensor], replay: int) -> dict[str, to
         "effective_attention_mask": effective_mask,
         "row_valid": row_valid,
     }
+
+
+def forward(params: OrderedDict[str, torch.Tensor], replay: int) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+    effective_mask, row_valid = combined_attention_mask(replay)
+    return forward_inputs(
+        params,
+        replay,
+        torch.tensor(TOKENS, dtype=torch.int64).reshape(BATCH, TIME),
+        torch.tensor(TARGETS, dtype=torch.int64).reshape(BATCH, TIME),
+        torch.tensor(
+            LOSS_MASKS[(replay - 1) % len(LOSS_MASKS)], dtype=torch.float32
+        ).reshape(BATCH, TIME),
+        effective_mask,
+        row_valid,
+        None,
+    )
+
+
+def policy_batch(replay: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    valid_lengths = POLICY_VALID_LENGTHS[(replay - 1) % len(POLICY_VALID_LENGTHS)]
+    tokens = list(TOKENS)
+    targets = list(TARGETS)
+    loss_mask = []
+    for batch, valid_length in enumerate(valid_lengths):
+        for time in range(TIME):
+            keep = time < valid_length
+            loss_mask.append(1.0 if keep else 0.0)
+            if not keep:
+                lane = batch * TIME + time
+                tokens[lane] = 0
+                targets[lane] = POLICY_IGNORE_INDEX
+    target_tensor = torch.tensor(targets, dtype=torch.int64).reshape(BATCH, TIME)
+    caller = (target_tensor != POLICY_IGNORE_INDEX).reshape(BATCH, 1, 1, TIME)
+    return (
+        torch.tensor(tokens, dtype=torch.int64).reshape(BATCH, TIME),
+        target_tensor,
+        torch.tensor(loss_mask, dtype=torch.float32).reshape(BATCH, TIME),
+        caller,
+    )
+
+
+def policy_forward(
+    params: OrderedDict[str, torch.Tensor], replay: int
+) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+    tokens, targets, loss_mask, caller = policy_batch(replay)
+    effective_mask, row_valid = apply_causal_attention_mask(caller)
+    return forward_inputs(
+        params,
+        replay,
+        tokens,
+        targets,
+        loss_mask,
+        effective_mask,
+        row_valid,
+        POLICY_IGNORE_INDEX,
+    )
 
 
 def tensor(value: torch.Tensor) -> dict[str, object]:
@@ -322,6 +404,54 @@ def replay_fixture(
     return gradient_map, fixture
 
 
+def policy_replay_fixture(
+    params: OrderedDict[str, torch.Tensor], replay: int
+) -> tuple[OrderedDict[str, torch.Tensor], dict[str, object], float]:
+    result = policy_forward(params, replay)
+    active_params = OrderedDict(
+        (name, parameter)
+        for name, parameter in params.items()
+        if name != POLICY_FROZEN_PARAMETER
+    )
+    gradients = torch.autograd.grad(result["numerator"], tuple(active_params.values()))
+    gradient_map = OrderedDict(zip(active_params.keys(), gradients))
+    tokens, targets, loss_mask, caller = policy_batch(replay)
+    expected_token_count = sum(
+        POLICY_VALID_LENGTHS[(replay - 1) % len(POLICY_VALID_LENGTHS)]
+    )
+    assert int(result["valid_token_count"].item()) == expected_token_count
+    assert len(gradient_map) == 35
+    assert sum(gradient.numel() for gradient in gradient_map.values()) == 372
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert all(
+        torch.count_nonzero(relu_input).item() > 0 for relu_input in result["relu_inputs"]
+    )
+    for probabilities in result["attention_probabilities"]:
+        invalid_rows = ~result["row_valid"].expand_as(probabilities)
+        assert torch.count_nonzero(probabilities[invalid_rows]).item() == 0
+    if replay % len(POLICY_VALID_LENGTHS) == 0:
+        assert not bool(result["row_valid"][1].any())
+    fixture = {
+        "replay": replay,
+        "tokens": tokens.reshape(-1).tolist(),
+        "targets": targets.reshape(-1).tolist(),
+        "attention_keep_mask": caller.reshape(-1).tolist(),
+        "loss_mask": loss_mask.reshape(-1).tolist(),
+        "effective_attention_mask": tensor(result["effective_attention_mask"]),
+        "row_valid": tensor(result["row_valid"]),
+        "dropout_masks": [tensor(mask) for mask in result["dropout_masks"]],
+        "attention_probabilities": [
+            tensor(probabilities) for probabilities in result["attention_probabilities"]
+        ],
+        "logits": tensor(result["logits"]),
+        "token_losses": tensor(result["token_losses"]),
+        "token_mean_loss": float(result["loss"].item()),
+        "valid_token_count": int(result["valid_token_count"].item()),
+        "numerator_gradients": tensor_map(gradient_map),
+    }
+    return gradient_map, fixture, float(result["numerator"].item())
+
+
 def adamw_window(
     params: OrderedDict[str, torch.Tensor],
     first_moments: OrderedDict[str, torch.Tensor],
@@ -329,6 +459,10 @@ def adamw_window(
     numerator_gradients: list[OrderedDict[str, torch.Tensor]],
     optimizer_step: int,
     valid_token_count: int,
+    *,
+    max_gradient_norm: float = MAX_GRADIENT_NORM,
+    learning_rate: float = LEARNING_RATE,
+    weight_decay: float = 0.0,
 ) -> tuple[
     OrderedDict[str, torch.Tensor],
     OrderedDict[str, torch.Tensor],
@@ -348,8 +482,11 @@ def adamw_window(
     )
     gradient_vector = torch.cat([gradient.reshape(-1) for gradient in averaged.values()])
     pre_clip_norm = torch.sqrt((gradient_vector * gradient_vector).sum())
-    clip_scale = torch.tensor(MAX_GRADIENT_NORM, dtype=torch.float32) / torch.maximum(
-        pre_clip_norm, torch.tensor(MAX_GRADIENT_NORM, dtype=torch.float32)
+    max_gradient_norm = torch.tensor(f32(max_gradient_norm), dtype=torch.float32)
+    learning_rate = torch.tensor(f32(learning_rate), dtype=torch.float32)
+    weight_decay = torch.tensor(f32(weight_decay), dtype=torch.float32)
+    clip_scale = max_gradient_norm / torch.maximum(
+        pre_clip_norm, max_gradient_norm
     )
     clipped = OrderedDict((name, gradient * clip_scale) for name, gradient in averaged.items())
     next_first_moments = OrderedDict(
@@ -370,12 +507,16 @@ def adamw_window(
     first_correction = f32(1.0 - BETAS[0] ** optimizer_step)
     second_correction = f32(1.0 - BETAS[1] ** optimizer_step)
     successors = OrderedDict()
+    decay_factor = f32(1.0) - learning_rate * weight_decay
     for name, parameter in params.items():
         first = next_first_moments[name] / first_correction
         second = next_second_moments[name] / second_correction
-        successors[name] = (
-            parameter - LEARNING_RATE * first / (torch.sqrt(second) + EPSILON)
-        ).detach().requires_grad_()
+        if weight_decay.item() == 0.0:
+            successor = parameter - LEARNING_RATE * first / (torch.sqrt(second) + EPSILON)
+        else:
+            normalized = first / (torch.sqrt(second) + EPSILON)
+            successor = parameter * decay_factor - learning_rate * normalized
+        successors[name] = successor.detach().requires_grad_()
 
     fixture = {
         "optimizer_step": optimizer_step,
@@ -387,6 +528,148 @@ def adamw_window(
         "parameter_successors": tensor_map(successors),
     }
     return successors, next_first_moments, next_second_moments, fixture
+
+
+def generate_policy_frontier() -> dict[str, object]:
+    params = make_parameters()
+    frozen_parameter = params[POLICY_FROZEN_PARAMETER].detach().clone()
+    active_params = OrderedDict(
+        (name, parameter)
+        for name, parameter in params.items()
+        if name != POLICY_FROZEN_PARAMETER
+    )
+    initial_parameters = OrderedDict(
+        (name, parameter.detach().clone()) for name, parameter in active_params.items()
+    )
+    assert all(
+        name in active_params
+        and torch.count_nonzero(initial_parameters[name]).item() == 0
+        for name in POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS
+    )
+    assert (
+        sum(initial_parameters[name].numel() for name in POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS)
+        == 8
+    )
+    first_moments = OrderedDict(
+        (name, torch.zeros_like(parameter)) for name, parameter in active_params.items()
+    )
+    second_moments = OrderedDict(
+        (name, torch.zeros_like(parameter)) for name, parameter in active_params.items()
+    )
+    replays = []
+    gradients_by_replay = []
+    numerators = []
+
+    def record_replay(replay: int) -> None:
+        gradients, fixture, numerator = policy_replay_fixture(params, replay)
+        gradients_by_replay.append(gradients)
+        replays.append(fixture)
+        numerators.append(numerator)
+
+    def commit_window(
+        replay_start: int,
+        replay_end: int,
+        optimizer_step: int,
+        valid_token_count: int,
+        learning_rate: float,
+    ) -> dict[str, object]:
+        nonlocal params, active_params, first_moments, second_moments
+        prior_active = active_params
+        next_active, first_moments, second_moments, window = adamw_window(
+            active_params,
+            first_moments,
+            second_moments,
+            gradients_by_replay[replay_start - 1 : replay_end],
+            optimizer_step,
+            valid_token_count,
+            max_gradient_norm=POLICY_MAX_GRADIENT_NORM,
+            learning_rate=learning_rate,
+            weight_decay=POLICY_WEIGHT_DECAY,
+        )
+        assert prior_active.keys() == next_active.keys()
+        params = OrderedDict(
+            (
+                name,
+                frozen_parameter.detach().clone().requires_grad_()
+                if name == POLICY_FROZEN_PARAMETER
+                else next_active[name],
+            )
+            for name in params
+        )
+        active_params = OrderedDict(
+            (name, parameter)
+            for name, parameter in params.items()
+            if name != POLICY_FROZEN_PARAMETER
+        )
+        assert torch.equal(params[POLICY_FROZEN_PARAMETER], frozen_parameter)
+        window_numerator = f32(0.0)
+        for numerator in numerators[replay_start - 1 : replay_end]:
+            window_numerator = f32(window_numerator + numerator)
+        window.update(
+            {
+                "learning_rate": learning_rate,
+                "mean_loss": f32(window_numerator / f32(float(valid_token_count))),
+                "microbatch_count": replay_end - replay_start + 1,
+            }
+        )
+        return window
+
+    for replay in range(1, 4):
+        record_replay(replay)
+    first_commit = commit_window(1, 3, 1, 11, 1.0e-3)
+
+    record_replay(4)
+    pending_checkpoint = {
+        "replay_step": 4,
+        "optimizer_step": 1,
+        "accumulation_index": 1,
+        "valid_token_count": 5,
+        "dropout_counter": 4 * 84,
+        "loss_numerator": numerators[3],
+    }
+    for replay in (5, 6):
+        record_replay(replay)
+    second_commit = commit_window(4, 6, 2, 11, 5.0e-4)
+
+    record_replay(7)
+    _, _, _, partial_flush = adamw_window(
+        active_params,
+        first_moments,
+        second_moments,
+        [gradients_by_replay[6]],
+        3,
+        5,
+        max_gradient_norm=POLICY_MAX_GRADIENT_NORM,
+        learning_rate=5.0e-4,
+        weight_decay=POLICY_WEIGHT_DECAY,
+    )
+    partial_flush.update(
+        {
+            "learning_rate": 5.0e-4,
+            "mean_loss": f32(numerators[6] / f32(5.0)),
+            "microbatch_count": 1,
+        }
+    )
+    assert torch.equal(params[POLICY_FROZEN_PARAMETER], frozen_parameter)
+    return {
+        "rustgrad_base": "0b9bae3c69e072e050e7f9c08daf8184c0630133",
+        "weight_decay": POLICY_WEIGHT_DECAY,
+        "loss_scale": POLICY_LOSS_SCALE,
+        "accumulation_steps": 3,
+        "max_gradient_norm": POLICY_MAX_GRADIENT_NORM,
+        "ignore_index": POLICY_IGNORE_INDEX,
+        "learning_rates": [1.0e-3, 5.0e-4],
+        "active_parameter_count": len(active_params),
+        "active_coordinate_count": sum(parameter.numel() for parameter in active_params.values()),
+        "analytic_gauge_null_parameters": list(POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS),
+        "frozen_parameter_name": POLICY_FROZEN_PARAMETER,
+        "frozen_parameter": tensor(frozen_parameter),
+        "initial_parameters": tensor_map(initial_parameters),
+        "replays": replays,
+        "commits": [first_commit, second_commit],
+        "pending_checkpoint": pending_checkpoint,
+        "partial_flush": partial_flush,
+    }
 
 
 def main(output: Path) -> None:
@@ -450,6 +733,7 @@ def main(output: Path) -> None:
         "replays": replays,
         "windows": windows,
         "partial_flush": partial_flush,
+        "policy_frontier": generate_policy_frontier(),
     }
     output.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
 
