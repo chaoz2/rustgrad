@@ -4,15 +4,13 @@
 //! unaligned or lifetime-sensitive zero-copy casts.  The wire representation is
 //! canonical little-endian regardless of the host architecture.
 
-use crate::{DType, Error, Result, Shape, Storage, TensorData};
+use crate::{
+    DType, Error, Result, Shape, Storage, TensorData,
+    file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically},
+};
 use serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::Value;
-use std::{
-    collections::BTreeMap,
-    fmt, fs,
-    io::{self, Read, Write},
-    path::Path,
-};
+use std::{collections::BTreeMap, fmt, fs, io, path::Path};
 
 pub type StateDict = BTreeMap<String, TensorData>;
 /// Safetensors' reserved `__metadata__` object, whose values are strings.
@@ -607,86 +605,34 @@ pub(crate) fn read_safetensors_file_bytes_with_limits(
     path: impl AsRef<Path>,
     limits: SafetensorsReadLimits,
 ) -> std::result::Result<Vec<u8>, SafetensorsFileError> {
-    let path = path.as_ref();
-    let metadata = fs::metadata(path).map_err(|error| SafetensorsFileError::Io {
-        operation: "inspect",
-        kind: error.kind(),
-    })?;
-    if metadata.len() > u64::try_from(limits.max_file_bytes).unwrap_or(u64::MAX) {
-        return Err(SafetensorsFileError::Limit {
-            actual: metadata.len(),
-            maximum: limits.max_file_bytes,
-        });
-    }
-    let file = fs::File::open(path).map_err(|error| SafetensorsFileError::Io {
-        operation: "open",
-        kind: error.kind(),
-    })?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(limits.max_file_bytes.min(64 << 10))
-        .map_err(|_| SafetensorsFileError::Format(ser("file buffer allocation failed")))?;
-    file.take(
-        u64::try_from(limits.max_file_bytes)
-            .unwrap_or(u64::MAX)
-            .saturating_add(1),
-    )
-    .read_to_end(&mut bytes)
-    .map_err(|error| SafetensorsFileError::Io {
-        operation: "read",
-        kind: error.kind(),
-    })?;
-    if bytes.len() > limits.max_file_bytes {
-        return Err(SafetensorsFileError::Limit {
-            actual: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            maximum: limits.max_file_bytes,
-        });
-    }
-    Ok(bytes)
+    read_file_bytes_bounded(path, limits.max_file_bytes).map_err(|error| match error {
+        ExactFileError::Io { operation, source } => SafetensorsFileError::Io {
+            operation,
+            kind: source.kind(),
+        },
+        ExactFileError::Limit { actual, maximum } => {
+            SafetensorsFileError::Limit { actual, maximum }
+        }
+        ExactFileError::Allocation => {
+            SafetensorsFileError::Format(ser("file buffer allocation failed"))
+        }
+        ExactFileError::InvalidFileName | ExactFileError::StagingExhausted => {
+            SafetensorsFileError::Format(ser("file read path is invalid"))
+        }
+    })
 }
 
 /// Atomically replaces a local safetensors envelope from already validated
 /// exact bytes after syncing its uniquely created staging file.
 pub(crate) fn save_safetensors_file_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
-    let path = path.as_ref();
-    let file_name = path
-        .file_name()
-        .and_then(|x| x.to_str())
-        .ok_or_else(|| ser("path must have a UTF-8 filename"))?;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp = None;
-    for attempt in 0..128u16 {
-        let candidate = parent.join(format!(
-            ".{file_name}.rustgrad-{}-{attempt}.tmp",
-            std::process::id()
-        ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                let result = (|| {
-                    file.write_all(bytes)
-                        .map_err(|error| ser(error.to_string()))?;
-                    file.sync_all().map_err(|error| ser(error.to_string()))
-                })();
-                if let Err(error) = result {
-                    drop(file);
-                    let _ = fs::remove_file(&candidate);
-                    return Err(error);
-                }
-                temp = Some(candidate);
-                break;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(ser(error.to_string())),
-        }
-    }
-    let temp = temp.ok_or_else(|| ser("could not create unique safetensors staging file"))?;
-    fs::rename(&temp, path).map_err(|e| {
-        let _ = fs::remove_file(&temp);
-        ser(e.to_string())
+    replace_file_bytes_atomically(path, bytes).map_err(|error| match error {
+        ExactFileError::Io { source, .. } => ser(source.to_string()),
+        ExactFileError::Limit { actual, maximum } => ser(format!(
+            "file has {actual} bytes, exceeding byte limit {maximum}"
+        )),
+        ExactFileError::Allocation => ser("file buffer allocation failed"),
+        ExactFileError::InvalidFileName => ser("path must have a UTF-8 filename"),
+        ExactFileError::StagingExhausted => ser("could not create unique safetensors staging file"),
     })
 }
 

@@ -1,5 +1,7 @@
 use super::*;
+use crate::file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically};
 use serde::{Deserialize, Serialize};
+use std::{io, path::Path};
 
 const MAGIC: &[u8; 4] = b"RGAP";
 const FORMAT_VERSION: u8 = 1;
@@ -19,6 +21,71 @@ pub struct CompiledAdamWProgramArtifactInfo {
     flush_capture_identity: Option<u64>,
     zero_grad_capture_identity: Option<u64>,
     evaluation_capture_identity: Option<u64>,
+}
+
+/// A local compiled-program artifact file failure.
+#[derive(Debug)]
+pub enum CompiledAdamWProgramArtifactFileError {
+    Io {
+        operation: &'static str,
+        kind: io::ErrorKind,
+    },
+    Limit {
+        actual: u64,
+        maximum: usize,
+    },
+    Format(Error),
+}
+
+impl fmt::Display for CompiledAdamWProgramArtifactFileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { operation, kind } => {
+                write!(
+                    formatter,
+                    "compiled program artifact file {operation} failed: {kind:?}"
+                )
+            }
+            Self::Limit { actual, maximum } => write!(
+                formatter,
+                "compiled program artifact file has {actual} bytes, exceeding byte limit {maximum}"
+            ),
+            Self::Format(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for CompiledAdamWProgramArtifactFileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Format(error) => Some(error),
+            Self::Io { .. } | Self::Limit { .. } => None,
+        }
+    }
+}
+
+fn artifact_file_error(error: ExactFileError) -> CompiledAdamWProgramArtifactFileError {
+    match error {
+        ExactFileError::Io { operation, source } => CompiledAdamWProgramArtifactFileError::Io {
+            operation,
+            kind: source.kind(),
+        },
+        ExactFileError::Limit { actual, maximum } => {
+            CompiledAdamWProgramArtifactFileError::Limit { actual, maximum }
+        }
+        ExactFileError::Allocation => CompiledAdamWProgramArtifactFileError::Io {
+            operation: "allocate read buffer",
+            kind: io::ErrorKind::OutOfMemory,
+        },
+        ExactFileError::InvalidFileName => CompiledAdamWProgramArtifactFileError::Io {
+            operation: "validate path",
+            kind: io::ErrorKind::InvalidInput,
+        },
+        ExactFileError::StagingExhausted => CompiledAdamWProgramArtifactFileError::Io {
+            operation: "create unique staging file",
+            kind: io::ErrorKind::AlreadyExists,
+        },
+    }
 }
 
 impl CompiledAdamWProgramArtifactInfo {
@@ -57,6 +124,43 @@ impl CompiledAdamWProgramArtifact {
         let wire = decode(&bytes)?;
         let info = wire.validate()?;
         Ok(Self { bytes, info })
+    }
+
+    /// Loads and validates one local RGAP artifact under its intrinsic byte bound.
+    pub fn load_file(
+        path: impl AsRef<Path>,
+    ) -> std::result::Result<Self, CompiledAdamWProgramArtifactFileError> {
+        Self::load_file_with_byte_limit(path, MAX_ARTIFACT_BYTES)
+    }
+
+    /// Loads and validates one local RGAP artifact under the smaller of the
+    /// caller's byte limit and the format's intrinsic byte bound.
+    pub fn load_file_with_byte_limit(
+        path: impl AsRef<Path>,
+        maximum: usize,
+    ) -> std::result::Result<Self, CompiledAdamWProgramArtifactFileError> {
+        let bytes = read_file_bytes_bounded(path, maximum.min(MAX_ARTIFACT_BYTES))
+            .map_err(artifact_file_error)?;
+        Self::from_bytes(bytes).map_err(CompiledAdamWProgramArtifactFileError::Format)
+    }
+
+    /// Atomically replaces `path` with these exact validated artifact bytes
+    /// after syncing a uniquely created same-directory staging file.
+    pub fn save_file(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> std::result::Result<(), CompiledAdamWProgramArtifactFileError> {
+        let wire =
+            decode(self.as_bytes()).map_err(CompiledAdamWProgramArtifactFileError::Format)?;
+        let info = wire
+            .validate()
+            .map_err(CompiledAdamWProgramArtifactFileError::Format)?;
+        if info != self.info {
+            return Err(CompiledAdamWProgramArtifactFileError::Format(training(
+                "compiled program artifact info differs",
+            )));
+        }
+        replace_file_bytes_atomically(path, self.as_bytes()).map_err(artifact_file_error)
     }
 
     pub fn info(&self) -> &CompiledAdamWProgramArtifactInfo {

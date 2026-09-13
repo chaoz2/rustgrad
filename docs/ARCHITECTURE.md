@@ -1032,7 +1032,11 @@ runtime banks, native pointers, loaded libraries, or machine code.
 The artifact and checkpoint are an explicit pair: the artifact supplies
 immutable executable structure, while the unchanged checkpoint supplies the
 current parameter, optimizer, accumulation, loss/token, and dropout frontier.
-Neither can substitute for the other.
+Neither can substitute for the other. RGAP file loading bounds allocation before
+parsing and defends against growth during the read; saving syncs a unique
+same-directory staging file before atomic replacement. The checkpoint remains a
+separately atomic file. This is not a two-file transaction or a claim that the
+parent directory has been durably synced.
 
 #### Compile and replay contract
 

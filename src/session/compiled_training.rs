@@ -21,8 +21,8 @@ use self::module_adamw_checkpoint::{
     ModuleCheckpointVisit, decode_module_adamw_checkpoint, encode_module_adamw_checkpoint,
 };
 pub use self::program_artifact::{
-    CompiledAdamWProgramArtifact, CompiledAdamWProgramArtifactInfo,
-    CompiledModuleAdamWArtifactRestoreError,
+    CompiledAdamWProgramArtifact, CompiledAdamWProgramArtifactFileError,
+    CompiledAdamWProgramArtifactInfo, CompiledModuleAdamWArtifactRestoreError,
 };
 use self::state_schema::{
     AdamWGlobalState, AdamWParameterState, INTERNAL_PREFIX, RecurrentStateKey, StateSpec,
@@ -12806,6 +12806,10 @@ mod tests {
         path: PathBuf,
     }
 
+    struct TemporaryCheckpointDirectory {
+        path: PathBuf,
+    }
+
     impl TemporaryCheckpointPath {
         fn new(label: &str) -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -12826,6 +12830,27 @@ mod tests {
     impl Drop for TemporaryCheckpointPath {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    impl TemporaryCheckpointDirectory {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let ordinal = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("rustgrad-{label}-{}-{ordinal}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TemporaryCheckpointDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
         }
     }
 
@@ -19787,6 +19812,171 @@ mod tests {
     }
 
     #[test]
+    fn compiled_program_artifact_file_io_is_bounded_and_atomic() {
+        let plan = CompiledModuleAdamWPlan::compile_graph(
+            module_config().with_gradient_accumulation(2).unwrap(),
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap();
+        let artifact = plan.program_artifact().unwrap();
+        assert_eq!(plan.program_artifact().unwrap(), artifact);
+
+        let directory = TemporaryCheckpointDirectory::new("compiled-program-artifact-file");
+        let path = directory.path().join("program.rgap");
+        artifact.save_file(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), artifact.as_bytes());
+        assert_eq!(
+            CompiledAdamWProgramArtifact::load_file(&path).unwrap(),
+            artifact
+        );
+        assert_eq!(
+            CompiledAdamWProgramArtifact::load_file_with_byte_limit(
+                &path,
+                artifact.as_bytes().len(),
+            )
+            .unwrap(),
+            artifact
+        );
+        assert!(matches!(
+            CompiledAdamWProgramArtifact::load_file_with_byte_limit(
+                &path,
+                artifact.as_bytes().len() - 1,
+            ),
+            Err(CompiledAdamWProgramArtifactFileError::Limit { .. })
+        ));
+
+        fs::write(&path, b"truncated artifact").unwrap();
+        assert!(matches!(
+            CompiledAdamWProgramArtifact::load_file(&path),
+            Err(CompiledAdamWProgramArtifactFileError::Format(_))
+        ));
+        let mut corrupt = artifact.as_bytes().to_vec();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        fs::write(&path, corrupt).unwrap();
+        assert!(matches!(
+            CompiledAdamWProgramArtifact::load_file(&path),
+            Err(CompiledAdamWProgramArtifactFileError::Format(_))
+        ));
+        artifact.save_file(&path).unwrap();
+
+        let oversized = directory.path().join("oversized.rgap");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(268_435_457)
+            .unwrap();
+        assert!(matches!(
+            CompiledAdamWProgramArtifact::load_file_with_byte_limit(&oversized, usize::MAX),
+            Err(CompiledAdamWProgramArtifactFileError::Limit {
+                actual,
+                maximum: 268_435_456,
+            }) if actual == 268_435_457
+        ));
+
+        let preserved = artifact.as_bytes().to_vec();
+        for attempt in 0..128u16 {
+            fs::write(
+                directory.path().join(format!(
+                    ".program.rgap.rustgrad-{}-{attempt}.tmp",
+                    std::process::id()
+                )),
+                b"another writer",
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            artifact.save_file(&path),
+            Err(CompiledAdamWProgramArtifactFileError::Io {
+                operation: "create unique staging file",
+                ..
+            })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), preserved);
+
+        let invalid_path = directory.path().join("invalid.rgap");
+        artifact.save_file(&invalid_path).unwrap();
+        let (_, unchecked) = program_artifact::rewrite_json_for_test(&artifact, |json| {
+            json["gradient_accumulation_steps"] = serde_json::Value::from(1);
+        });
+        assert!(matches!(
+            unchecked.save_file(&invalid_path),
+            Err(CompiledAdamWProgramArtifactFileError::Format(_))
+        ));
+        assert_eq!(fs::read(&invalid_path).unwrap(), artifact.as_bytes());
+        assert!(
+            fs::read_dir(directory.path())
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .all(|name| !name.starts_with(".invalid.rgap.rustgrad-"))
+        );
+
+        let alternative = CompiledModuleAdamWPlan::compile_graph(
+            module_config().with_gradient_accumulation(3).unwrap(),
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap()
+        .program_artifact()
+        .unwrap();
+        assert_ne!(artifact, alternative);
+        let concurrent_path = directory.path().join("concurrent.rgap");
+        let first = artifact.clone();
+        let first_path = concurrent_path.clone();
+        let first_writer = std::thread::spawn(move || first.save_file(first_path));
+        let second = alternative.clone();
+        let second_path = concurrent_path.clone();
+        let second_writer = std::thread::spawn(move || second.save_file(second_path));
+        first_writer.join().unwrap().unwrap();
+        second_writer.join().unwrap().unwrap();
+        let concurrent = CompiledAdamWProgramArtifact::load_file(&concurrent_path).unwrap();
+        assert!(concurrent == artifact || concurrent == alternative);
+        assert!(
+            fs::read_dir(directory.path())
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .all(|name| !name.starts_with(".concurrent.rgap.rustgrad-"))
+        );
+
+        let failed_target = directory.path().join("directory.rgap");
+        fs::create_dir(&failed_target).unwrap();
+        let occupied = directory.path().join(format!(
+            ".directory.rgap.rustgrad-{}-0.tmp",
+            std::process::id()
+        ));
+        fs::write(&occupied, b"another writer").unwrap();
+        assert!(matches!(
+            artifact.save_file(&failed_target),
+            Err(CompiledAdamWProgramArtifactFileError::Io {
+                operation: "replace destination",
+                ..
+            })
+        ));
+        assert!(failed_target.is_dir());
+        assert_eq!(fs::read(&occupied).unwrap(), b"another writer");
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.starts_with(".directory.rgap.rustgrad-"))
+                .collect::<Vec<_>>(),
+            vec![format!(
+                ".directory.rgap.rustgrad-{}-0.tmp",
+                std::process::id()
+            )]
+        );
+    }
+
+    #[test]
     fn complete_module_checkpoint_restores_constants_without_mutating_destination() {
         let config = module_config().with_gradient_accumulation(2).unwrap();
         let source = TiedFrozenModule::new([1.0, -1.0]);
@@ -19805,10 +19995,10 @@ mod tests {
         let source_inspection = source_plan.inspection().unwrap();
         let program_artifact = source_plan.program_artifact().unwrap();
         assert_eq!(source_plan.program_artifact().unwrap(), program_artifact);
-        assert_eq!(
-            CompiledAdamWProgramArtifact::from_bytes(program_artifact.as_bytes().to_vec()).unwrap(),
-            program_artifact
-        );
+        let artifact_file = TemporaryCheckpointPath::new("compiled-adamw-program-artifact");
+        program_artifact.save_file(artifact_file.path()).unwrap();
+        let program_artifact =
+            CompiledAdamWProgramArtifact::load_file(artifact_file.path()).unwrap();
         let mut source = source_plan.prepare(&CpuSessionTarget::new()).unwrap();
         let batch =
             || BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]);
