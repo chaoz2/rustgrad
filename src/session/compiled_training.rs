@@ -4259,6 +4259,31 @@ pub trait CompiledAdamWRuntime:
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
 }
 
+/// CPU AdamW capability for committing replay state without returning
+/// graph-named outputs.
+///
+/// Loss and enabled diagnostic reports remain part of the result and retain
+/// their ordinary transition validation. This capability changes observation
+/// only; it does not define a distinct capture or checkpoint identity.
+pub trait CompiledAdamWCommitOnlyRuntime: CompiledAdamWRuntime {
+    fn step_commit_only(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step>;
+
+    fn step_batch_commit_only<B>(&mut self, batch: B, learning_rate: f32) -> Result<Self::Step>
+    where
+        Self: Sized,
+        B: CompiledInputBatch,
+    {
+        self.step_commit_only(
+            batch.into_compiled_inputs()?,
+            TensorData::scalar(learning_rate),
+        )
+    }
+}
+
 /// Optional extension for committing an incomplete compiled AdamW window.
 ///
 /// The transition consumes only the live parameter, moment, accumulator, and
@@ -4299,6 +4324,24 @@ pub trait CompiledScheduledAdamWRuntime: CompiledAdamWRuntime {
     }
 
     fn flush_partial_window_scheduled(&mut self) -> Result<Self::ScheduledFlush>;
+}
+
+/// Captured-rate counterpart of [`CompiledAdamWCommitOnlyRuntime`].
+pub trait CompiledScheduledAdamWCommitOnlyRuntime:
+    CompiledAdamWCommitOnlyRuntime + CompiledScheduledAdamWRuntime
+{
+    fn step_commit_only_scheduled(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step>;
+
+    fn step_batch_commit_only_scheduled<B>(&mut self, batch: B) -> Result<Self::Step>
+    where
+        Self: Sized,
+        B: CompiledInputBatch,
+    {
+        self.step_commit_only_scheduled(batch.into_compiled_inputs()?)
+    }
 }
 
 /// Resource-free output of compiled training graph construction.
@@ -4357,6 +4400,37 @@ struct CompiledEvaluationPlan {
 #[derive(Clone)]
 struct CpuCompiledEvaluation {
     plan: CompiledEvaluationPlan,
+}
+
+#[derive(Clone, Copy)]
+enum CompiledStepOutputSelection {
+    All,
+    CommitOnly,
+}
+
+impl CompiledStepOutputSelection {
+    const fn includes_named_outputs(self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    fn take_named_outputs(
+        self,
+        output_names: &[String],
+        outputs: &mut impl Iterator<Item = TensorData>,
+    ) -> BTreeMap<String, TensorData> {
+        if !self.includes_named_outputs() {
+            return BTreeMap::new();
+        }
+        output_names.iter().cloned().zip(outputs).collect()
+    }
+}
+
+struct CompiledStepReplayRequest {
+    inputs: BTreeMap<String, TensorData>,
+    learning_rate: Option<TensorData>,
+    non_finite_policy: CpuNonFinitePolicy,
+    output_selection: CompiledStepOutputSelection,
+    injected_failure: Option<u64>,
 }
 
 /// One static CPU training program with runtime-owned recurrent state.
@@ -6270,6 +6344,42 @@ impl CpuCompiledTrainingProgram {
         Ok(PreparedNativeCpuProgram { report, replay })
     }
 
+    fn selected_step_outputs(
+        &self,
+        capture: &CapturedMixedSchedule,
+        selection: CompiledStepOutputSelection,
+        include_reports: bool,
+    ) -> Result<Option<Vec<u64>>> {
+        if selection.includes_named_outputs() {
+            return Ok(None);
+        }
+        let report_count = if include_reports {
+            usize::from(self.clip_report) * 2 + usize::from(self.window_loss_report) * 2
+        } else {
+            0
+        };
+        let expected = 1usize
+            .checked_add(self.output_names.len())
+            .and_then(|count| count.checked_add(report_count))
+            .ok_or_else(|| training("compiled requested output count overflows"))?;
+        if capture.schedule.requested.len() != expected {
+            return Err(training(
+                "compiled requested output layout does not match its authenticated capture",
+            ));
+        }
+        let mut selected = Vec::with_capacity(1 + report_count);
+        selected.push(capture.schedule.requested[0]);
+        selected.extend(
+            capture
+                .schedule
+                .requested
+                .iter()
+                .skip(1 + self.output_names.len())
+                .copied(),
+        );
+        Ok(Some(selected))
+    }
+
     /// Executes one graph-free replay and atomically publishes every recurrent
     /// successor. The learning rate is an explicit rank-zero F32 input.
     fn step(
@@ -6287,22 +6397,29 @@ impl CpuCompiledTrainingProgram {
         injected_failure: Option<u64>,
     ) -> Result<CompiledTrainingStepResult> {
         self.step_inner_with_learning_rate(
-            inputs,
-            Some(learning_rate),
-            CpuNonFinitePolicy::Propagate,
+            CompiledStepReplayRequest {
+                inputs,
+                learning_rate: Some(learning_rate),
+                non_finite_policy: CpuNonFinitePolicy::Propagate,
+                output_selection: CompiledStepOutputSelection::All,
+                injected_failure,
+            },
             true,
-            injected_failure,
         )
     }
 
     fn step_inner_with_learning_rate(
         &mut self,
-        inputs: BTreeMap<String, TensorData>,
-        learning_rate: Option<TensorData>,
-        non_finite_policy: CpuNonFinitePolicy,
+        request: CompiledStepReplayRequest,
         validate_commit_reports: bool,
-        injected_failure: Option<u64>,
     ) -> Result<CompiledTrainingStepResult> {
+        let CompiledStepReplayRequest {
+            inputs,
+            learning_rate,
+            non_finite_policy,
+            output_selection: selection,
+            injected_failure,
+        } = request;
         validate_training_inputs(&self.inputs, &inputs)?;
         if let Some(learning_rate) = &learning_rate {
             validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
@@ -6316,15 +6433,19 @@ impl CpuCompiledTrainingProgram {
             provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
         }
         let clip_report = self.clip_report;
-        let clip_report_start = 1 + self.output_names.len();
+        let selected_requested = self.selected_step_outputs(&self.capture, selection, true)?;
+        let named_output_count =
+            usize::from(selection.includes_named_outputs()) * self.output_names.len();
+        let clip_report_start = 1 + named_output_count;
         let window_loss_report = self.window_loss_report;
         let window_loss_report_start = clip_report_start + usize::from(clip_report) * 2;
         let replay = self
             .capture
-            .replay_recurrent_checked(
+            .replay_recurrent_selected_checked(
                 &mut self.runtime,
                 &mut self.cursor,
                 &provided,
+                selected_requested.as_deref(),
                 injected_failure,
                 |outputs, successors| {
                     validate_staged_transition(outputs, successors, non_finite_policy, true)?;
@@ -6345,7 +6466,7 @@ impl CpuCompiledTrainingProgram {
             .map_err(replay_error)?;
         debug_assert_eq!(
             replay.outputs.len(),
-            1 + self.output_names.len()
+            1 + named_output_count
                 + usize::from(self.clip_report) * 2
                 + usize::from(self.window_loss_report) * 2
         );
@@ -6353,12 +6474,7 @@ impl CpuCompiledTrainingProgram {
         let loss = outputs
             .next()
             .expect("compiled output cardinality was validated before publication");
-        let named_outputs = self
-            .output_names
-            .iter()
-            .cloned()
-            .zip(outputs.by_ref())
-            .collect::<BTreeMap<_, _>>();
+        let named_outputs = selection.take_named_outputs(&self.output_names, &mut outputs);
         let clip_report = take_compiled_clip_report(&mut outputs, self.clip_report);
         let window_loss = take_compiled_window_loss_value(&mut outputs, self.window_loss_report);
         debug_assert!(outputs.next().is_none());
@@ -6375,13 +6491,17 @@ impl CpuCompiledTrainingProgram {
 
     fn step_native_inner_with_learning_rate(
         &mut self,
-        inputs: BTreeMap<String, TensorData>,
-        learning_rate: Option<TensorData>,
-        non_finite_policy: CpuNonFinitePolicy,
+        request: CompiledStepReplayRequest,
         validate_commit_reports: bool,
         native: NativeReplayContext<'_>,
-        injected_failure: Option<u64>,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
+        let CompiledStepReplayRequest {
+            inputs,
+            learning_rate,
+            non_finite_policy,
+            output_selection: selection,
+            injected_failure,
+        } = request;
         validate_training_inputs(&self.inputs, &inputs)?;
         if let Some(learning_rate) = &learning_rate {
             validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
@@ -6396,14 +6516,18 @@ impl CpuCompiledTrainingProgram {
         }
         let started = Instant::now();
         let clip_report = self.clip_report;
-        let clip_report_start = 1 + self.output_names.len();
+        let selected_requested = self.selected_step_outputs(&self.capture, selection, true)?;
+        let named_output_count =
+            usize::from(selection.includes_named_outputs()) * self.output_names.len();
+        let clip_report_start = 1 + named_output_count;
         let window_loss_report = self.window_loss_report;
         let window_loss_report_start = clip_report_start + usize::from(clip_report) * 2;
         let replay = native
-            .replay_recurrent_checked(
+            .replay_recurrent_selected_checked(
                 &mut self.runtime,
                 &mut self.cursor,
                 &provided,
+                selected_requested.as_deref(),
                 injected_failure,
                 |outputs, successors| {
                     validate_staged_transition(
@@ -6444,7 +6568,7 @@ impl CpuCompiledTrainingProgram {
         );
         debug_assert_eq!(
             replay.outputs.len(),
-            1 + self.output_names.len()
+            1 + named_output_count
                 + usize::from(self.clip_report) * 2
                 + usize::from(self.window_loss_report) * 2
         );
@@ -6452,12 +6576,7 @@ impl CpuCompiledTrainingProgram {
         let loss = outputs
             .next()
             .expect("compiled output cardinality was validated before publication");
-        let named_outputs = self
-            .output_names
-            .iter()
-            .cloned()
-            .zip(outputs.by_ref())
-            .collect();
+        let named_outputs = selection.take_named_outputs(&self.output_names, &mut outputs);
         let clip_report = take_compiled_clip_report(&mut outputs, self.clip_report);
         let window_loss = take_compiled_window_loss_value(&mut outputs, self.window_loss_report);
         debug_assert!(outputs.next().is_none());
@@ -6478,11 +6597,15 @@ impl CpuCompiledTrainingProgram {
     fn step_accumulation_inner_with_learning_rate(
         &mut self,
         transition: &CompiledAdamWAccumulationPlan,
-        inputs: BTreeMap<String, TensorData>,
-        learning_rate: Option<TensorData>,
-        non_finite_policy: CpuNonFinitePolicy,
-        injected_failure: Option<u64>,
+        request: CompiledStepReplayRequest,
     ) -> Result<CompiledTrainingStepResult> {
+        let CompiledStepReplayRequest {
+            inputs,
+            learning_rate,
+            non_finite_policy,
+            output_selection: selection,
+            injected_failure,
+        } = request;
         validate_training_inputs(&self.inputs, &inputs)?;
         if let Some(learning_rate) = &learning_rate {
             validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
@@ -6493,29 +6616,29 @@ impl CpuCompiledTrainingProgram {
             .ok_or_else(|| training("compiled training step overflow"))?;
         let mut prepared =
             self.prepare_phase_replay(&transition.capture, &transition.state_buffers, inputs)?;
+        let selected_requested =
+            self.selected_step_outputs(&transition.capture, selection, false)?;
         let replay = transition
             .capture
-            .replay_recurrent_checked(
+            .replay_recurrent_selected_checked(
                 &mut self.runtime,
                 &mut prepared.cursor,
                 &prepared.provided,
+                selected_requested.as_deref(),
                 injected_failure,
                 |outputs, successors| {
                     validate_staged_transition(outputs, successors, non_finite_policy, true)
                 },
             )
             .map_err(replay_error)?;
-        debug_assert_eq!(replay.outputs.len(), 1 + self.output_names.len());
+        let named_output_count =
+            usize::from(selection.includes_named_outputs()) * self.output_names.len();
+        debug_assert_eq!(replay.outputs.len(), 1 + named_output_count);
         let mut outputs = replay.outputs.into_iter();
         let loss = outputs
             .next()
             .expect("compiled accumulation output cardinality was validated");
-        let named_outputs = self
-            .output_names
-            .iter()
-            .cloned()
-            .zip(outputs.by_ref())
-            .collect();
+        let named_outputs = selection.take_named_outputs(&self.output_names, &mut outputs);
         debug_assert!(outputs.next().is_none());
         self.cursor = prepared.next_main_cursor;
         self.step = next_step;
@@ -6532,12 +6655,16 @@ impl CpuCompiledTrainingProgram {
     fn step_accumulation_native_inner_with_learning_rate(
         &mut self,
         transition: &CompiledAdamWAccumulationPlan,
-        inputs: BTreeMap<String, TensorData>,
-        learning_rate: Option<TensorData>,
-        non_finite_policy: CpuNonFinitePolicy,
+        request: CompiledStepReplayRequest,
         native: NativeReplayContext<'_>,
-        injected_failure: Option<u64>,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
+        let CompiledStepReplayRequest {
+            inputs,
+            learning_rate,
+            non_finite_policy,
+            output_selection: selection,
+            injected_failure,
+        } = request;
         validate_training_inputs(&self.inputs, &inputs)?;
         if let Some(learning_rate) = &learning_rate {
             validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
@@ -6549,11 +6676,14 @@ impl CpuCompiledTrainingProgram {
         let mut prepared =
             self.prepare_phase_replay(&transition.capture, &transition.state_buffers, inputs)?;
         let started = Instant::now();
+        let selected_requested =
+            self.selected_step_outputs(&transition.capture, selection, false)?;
         let replay = native
-            .replay_recurrent_checked(
+            .replay_recurrent_selected_checked(
                 &mut self.runtime,
                 &mut prepared.cursor,
                 &prepared.provided,
+                selected_requested.as_deref(),
                 injected_failure,
                 |outputs, successors| {
                     validate_staged_transition(
@@ -6568,17 +6698,14 @@ impl CpuCompiledTrainingProgram {
         let traffic = replay.traffic;
         let executor_wall_time = replay.executor_wall_time;
         let replay = replay.replay;
-        debug_assert_eq!(replay.outputs.len(), 1 + self.output_names.len());
+        let named_output_count =
+            usize::from(selection.includes_named_outputs()) * self.output_names.len();
+        debug_assert_eq!(replay.outputs.len(), 1 + named_output_count);
         let mut outputs = replay.outputs.into_iter();
         let loss = outputs
             .next()
             .expect("compiled accumulation output cardinality was validated");
-        let named_outputs = self
-            .output_names
-            .iter()
-            .cloned()
-            .zip(outputs.by_ref())
-            .collect();
+        let named_outputs = selection.take_named_outputs(&self.output_names, &mut outputs);
         debug_assert!(outputs.next().is_none());
         let native = replay
             .native_trace
@@ -8670,6 +8797,39 @@ impl<M: Module, R: CompiledScheduledAdamWRuntime> CompiledModuleAdamWSession<M, 
     }
 }
 
+impl<M: Module, R: CompiledAdamWCommitOnlyRuntime> CompiledModuleAdamWSession<M, R> {
+    pub fn step_commit_only(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<R::Step> {
+        self.runtime.step_commit_only(inputs, learning_rate)
+    }
+
+    pub fn step_batch_commit_only<B>(&mut self, batch: B, learning_rate: f32) -> Result<R::Step>
+    where
+        B: CompiledInputBatch,
+    {
+        self.runtime.step_batch_commit_only(batch, learning_rate)
+    }
+}
+
+impl<M: Module, R: CompiledScheduledAdamWCommitOnlyRuntime> CompiledModuleAdamWSession<M, R> {
+    pub fn step_commit_only_scheduled(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<R::Step> {
+        self.runtime.step_commit_only_scheduled(inputs)
+    }
+
+    pub fn step_batch_commit_only_scheduled<B>(&mut self, batch: B) -> Result<R::Step>
+    where
+        B: CompiledInputBatch,
+    {
+        self.runtime.step_batch_commit_only_scheduled(batch)
+    }
+}
+
 impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleAdamWSession<M, R> {
     /// Atomically publishes the runtime's exact trainable frontier and returns
     /// the owned module. The complete module topology, identities, versions,
@@ -9032,7 +9192,31 @@ impl CpuCompiledAdamW {
         learning_rate: TensorData,
     ) -> Result<CompiledAdamWStepResult> {
         self.learning_rate.require_external()?;
-        self.step_with_learning_rate(inputs, Some(learning_rate), None)
+        self.step_with_learning_rate(
+            inputs,
+            Some(learning_rate),
+            CompiledStepOutputSelection::All,
+            None,
+        )
+    }
+
+    /// Commits one external-rate replay while omitting graph-named outputs.
+    ///
+    /// Loss and enabled clip/window reports remain captured, validated, and
+    /// returned. Only the user-named output range is excluded from CPU egress;
+    /// recurrent state and checkpoint identity are unchanged.
+    pub fn step_commit_only(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<CompiledAdamWStepResult> {
+        self.learning_rate.require_external()?;
+        self.step_with_learning_rate(
+            inputs,
+            Some(learning_rate),
+            CompiledStepOutputSelection::CommitOnly,
+            None,
+        )
     }
 
     /// Replays one batch using the immutable MultiStep rate captured in the
@@ -9042,13 +9226,23 @@ impl CpuCompiledAdamW {
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<CompiledAdamWStepResult> {
         self.learning_rate.require_scheduled()?;
-        self.step_with_learning_rate(inputs, None, None)
+        self.step_with_learning_rate(inputs, None, CompiledStepOutputSelection::All, None)
+    }
+
+    /// Scheduled-rate counterpart of [`Self::step_commit_only`].
+    pub fn step_commit_only_scheduled(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<CompiledAdamWStepResult> {
+        self.learning_rate.require_scheduled()?;
+        self.step_with_learning_rate(inputs, None, CompiledStepOutputSelection::CommitOnly, None)
     }
 
     fn step_with_learning_rate(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
         learning_rate: Option<TensorData>,
+        selection: CompiledStepOutputSelection,
         injected_failure: Option<u64>,
     ) -> Result<CompiledAdamWStepResult> {
         validate_training_inputs(&self.inner.inputs, &inputs)?;
@@ -9064,27 +9258,23 @@ impl CpuCompiledAdamW {
         if let Some(dropout) = self.dropout {
             expected_dropout_counter(dropout, next.replay_step)?;
         }
+        let request = CompiledStepReplayRequest {
+            inputs,
+            learning_rate,
+            non_finite_policy: self.non_finite_policy,
+            output_selection: selection,
+            injected_failure,
+        };
         let mut result = if next.accumulation_index == 0 {
-            self.inner.step_inner_with_learning_rate(
-                inputs,
-                learning_rate,
-                self.non_finite_policy,
-                true,
-                injected_failure,
-            )?
+            self.inner.step_inner_with_learning_rate(request, true)?
         } else {
             let transition = self
                 .inner
                 .accumulation
                 .clone()
                 .ok_or_else(|| training("compiled accumulation replay is absent"))?;
-            self.inner.step_accumulation_inner_with_learning_rate(
-                &transition,
-                inputs,
-                learning_rate,
-                self.non_finite_policy,
-                injected_failure,
-            )?
+            self.inner
+                .step_accumulation_inner_with_learning_rate(&transition, request)?
         };
         result.step = next.replay_step;
         self.progress = next;
@@ -9101,6 +9291,30 @@ impl CpuCompiledAdamW {
         B: CompiledInputBatch,
     {
         self.step_scheduled(batch.into_compiled_inputs()?)
+    }
+
+    pub fn step_batch_commit_only<B>(
+        &mut self,
+        batch: B,
+        learning_rate: f32,
+    ) -> Result<CompiledAdamWStepResult>
+    where
+        B: CompiledInputBatch,
+    {
+        self.step_commit_only(
+            batch.into_compiled_inputs()?,
+            TensorData::scalar(learning_rate),
+        )
+    }
+
+    pub fn step_batch_commit_only_scheduled<B>(
+        &mut self,
+        batch: B,
+    ) -> Result<CompiledAdamWStepResult>
+    where
+        B: CompiledInputBatch,
+    {
+        self.step_commit_only_scheduled(batch.into_compiled_inputs()?)
     }
 
     pub fn evaluate(
@@ -9479,7 +9693,27 @@ impl CpuCompiledAdamW {
         learning_rate: TensorData,
         injected_failure: Option<u64>,
     ) -> Result<CompiledAdamWStepResult> {
-        self.step_with_learning_rate(inputs, Some(learning_rate), injected_failure)
+        self.step_with_learning_rate(
+            inputs,
+            Some(learning_rate),
+            CompiledStepOutputSelection::All,
+            injected_failure,
+        )
+    }
+
+    #[cfg(test)]
+    fn step_commit_only_inner(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledAdamWStepResult> {
+        self.step_with_learning_rate(
+            inputs,
+            Some(learning_rate),
+            CompiledStepOutputSelection::CommitOnly,
+            injected_failure,
+        )
     }
 
     #[cfg(test)]
@@ -9796,7 +10030,29 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         learning_rate: TensorData,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
         self.inner.learning_rate.require_external()?;
-        self.step_with_learning_rate(inputs, Some(learning_rate), None)
+        self.step_with_learning_rate(
+            inputs,
+            Some(learning_rate),
+            CompiledStepOutputSelection::All,
+            None,
+        )
+    }
+
+    /// Strict-native CPU replay that omits only graph-named output egress.
+    /// Loss and enabled report scalars retain their ordinary validation and
+    /// result semantics.
+    pub fn step_commit_only(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<NativeCpuCompiledAdamWStepResult> {
+        self.inner.learning_rate.require_external()?;
+        self.step_with_learning_rate(
+            inputs,
+            Some(learning_rate),
+            CompiledStepOutputSelection::CommitOnly,
+            None,
+        )
     }
 
     pub fn step_scheduled(
@@ -9804,13 +10060,22 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
         self.inner.learning_rate.require_scheduled()?;
-        self.step_with_learning_rate(inputs, None, None)
+        self.step_with_learning_rate(inputs, None, CompiledStepOutputSelection::All, None)
+    }
+
+    pub fn step_commit_only_scheduled(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<NativeCpuCompiledAdamWStepResult> {
+        self.inner.learning_rate.require_scheduled()?;
+        self.step_with_learning_rate(inputs, None, CompiledStepOutputSelection::CommitOnly, None)
     }
 
     fn step_with_learning_rate(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
         learning_rate: Option<TensorData>,
+        selection: CompiledStepOutputSelection,
         injected_failure: Option<u64>,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
         validate_training_inputs(&self.inner.inner.inputs, &inputs)?;
@@ -9832,14 +10097,18 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .successful_steps
             .checked_add(1)
             .ok_or_else(|| training("compiled native CPU run count overflow"))?;
+        let request = CompiledStepReplayRequest {
+            inputs,
+            learning_rate,
+            non_finite_policy: self.inner.non_finite_policy,
+            output_selection: selection,
+            injected_failure,
+        };
         let (mut result, mut report) = if next.accumulation_index == 0 {
             self.inner.inner.step_native_inner_with_learning_rate(
-                inputs,
-                learning_rate,
-                self.inner.non_finite_policy,
+                request,
                 true,
                 NativeReplayContext::new(self.executor, &mut self.main_replay),
-                injected_failure,
             )?
         } else {
             let transition = self
@@ -9856,11 +10125,8 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 .inner
                 .step_accumulation_native_inner_with_learning_rate(
                     &transition,
-                    inputs,
-                    learning_rate,
-                    self.inner.non_finite_policy,
+                    request,
                     NativeReplayContext::new(self.executor, replay),
-                    injected_failure,
                 )?
         };
         result.step = next.replay_step;
@@ -9885,6 +10151,30 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         self.step_scheduled(batch.into_compiled_inputs()?)
     }
 
+    pub fn step_batch_commit_only<B>(
+        &mut self,
+        batch: B,
+        learning_rate: f32,
+    ) -> Result<NativeCpuCompiledAdamWStepResult>
+    where
+        B: CompiledInputBatch,
+    {
+        self.step_commit_only(
+            batch.into_compiled_inputs()?,
+            TensorData::scalar(learning_rate),
+        )
+    }
+
+    pub fn step_batch_commit_only_scheduled<B>(
+        &mut self,
+        batch: B,
+    ) -> Result<NativeCpuCompiledAdamWStepResult>
+    where
+        B: CompiledInputBatch,
+    {
+        self.step_commit_only_scheduled(batch.into_compiled_inputs()?)
+    }
+
     #[cfg(test)]
     fn step_inner(
         &mut self,
@@ -9892,7 +10182,27 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         learning_rate: TensorData,
         injected_failure: Option<u64>,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
-        self.step_with_learning_rate(inputs, Some(learning_rate), injected_failure)
+        self.step_with_learning_rate(
+            inputs,
+            Some(learning_rate),
+            CompiledStepOutputSelection::All,
+            injected_failure,
+        )
+    }
+
+    #[cfg(test)]
+    fn step_commit_only_inner(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<NativeCpuCompiledAdamWStepResult> {
+        self.step_with_learning_rate(
+            inputs,
+            Some(learning_rate),
+            CompiledStepOutputSelection::CommitOnly,
+            injected_failure,
+        )
     }
 
     pub fn evaluate(
@@ -10216,6 +10526,16 @@ impl CompiledAdamWRuntime for CpuCompiledAdamW {
     }
 }
 
+impl CompiledAdamWCommitOnlyRuntime for CpuCompiledAdamW {
+    fn step_commit_only(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        CpuCompiledAdamW::step_commit_only(self, inputs, learning_rate)
+    }
+}
+
 impl CompiledAdamWFlushRuntime for CpuCompiledAdamW {
     type Flush = CompiledAdamWFlushResult;
 
@@ -10244,6 +10564,15 @@ impl CompiledScheduledAdamWRuntime for CpuCompiledAdamW {
 
     fn flush_partial_window_scheduled(&mut self) -> Result<Self::ScheduledFlush> {
         CpuCompiledAdamW::flush_partial_window_scheduled(self)
+    }
+}
+
+impl CompiledScheduledAdamWCommitOnlyRuntime for CpuCompiledAdamW {
+    fn step_commit_only_scheduled(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step> {
+        CpuCompiledAdamW::step_commit_only_scheduled(self, inputs)
     }
 }
 
@@ -10345,6 +10674,16 @@ impl CompiledAdamWRuntime for NativeCpuCompiledAdamW<'_> {
     }
 }
 
+impl CompiledAdamWCommitOnlyRuntime for NativeCpuCompiledAdamW<'_> {
+    fn step_commit_only(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        NativeCpuCompiledAdamW::step_commit_only(self, inputs, learning_rate)
+    }
+}
+
 impl CompiledAdamWFlushRuntime for NativeCpuCompiledAdamW<'_> {
     type Flush = NativeCpuCompiledAdamWFlushResult;
 
@@ -10370,6 +10709,15 @@ impl CompiledScheduledAdamWRuntime for NativeCpuCompiledAdamW<'_> {
 
     fn flush_partial_window_scheduled(&mut self) -> Result<Self::ScheduledFlush> {
         NativeCpuCompiledAdamW::flush_partial_window_scheduled(self)
+    }
+}
+
+impl CompiledScheduledAdamWCommitOnlyRuntime for NativeCpuCompiledAdamW<'_> {
+    fn step_commit_only_scheduled(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step> {
+        NativeCpuCompiledAdamW::step_commit_only_scheduled(self, inputs)
     }
 }
 
@@ -10479,6 +10827,19 @@ where
     }
 }
 
+impl<M, R> CompiledAdamWCommitOnlyRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledAdamWCommitOnlyRuntime,
+{
+    fn step_commit_only(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        self.runtime.step_commit_only(inputs, learning_rate)
+    }
+}
+
 impl<M, R> CompiledAdamWFlushRuntime for CompiledModuleAdamWSession<M, R>
 where
     R: CompiledAdamWFlushRuntime,
@@ -10510,6 +10871,18 @@ where
 
     fn flush_partial_window_scheduled(&mut self) -> Result<Self::ScheduledFlush> {
         self.runtime.flush_partial_window_scheduled()
+    }
+}
+
+impl<M, R> CompiledScheduledAdamWCommitOnlyRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledScheduledAdamWCommitOnlyRuntime,
+{
+    fn step_commit_only_scheduled(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step> {
+        self.runtime.step_commit_only_scheduled(inputs)
     }
 }
 
@@ -17785,6 +18158,334 @@ mod tests {
     }
 
     #[test]
+    fn cpu_commit_only_steps_preserve_adamw_state_and_skip_named_egress() {
+        let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
+            .unwrap()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_max_gradient_norm(1.0)
+            .unwrap()
+            .with_clip_report()
+            .with_window_loss_report()
+            .with_input("scale", [], DType::F32)
+            .unwrap();
+        let plan = CompiledAdamWPlan::compile(
+            config,
+            [TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap()],
+            |graph, inputs, parameters| {
+                let loss = graph.mul(parameters["weight"], inputs["scale"])?;
+                let output = graph.add(loss, parameters["weight"])?;
+                Ok((loss, BTreeMap::from([("prediction".into(), output)])))
+            },
+        )
+        .unwrap();
+        let input = |scale| BTreeMap::from([("scale".into(), TensorData::scalar(scale))]);
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut interpreted = plan.prepare_cpu().unwrap();
+        let mut interpreted_commit = plan.prepare_cpu().unwrap();
+        let mut native = target.prepare(&plan).unwrap();
+        let mut native_commit = target.prepare(&plan).unwrap();
+
+        for scale in [2.0, 4.0] {
+            let expected = interpreted
+                .step(input(scale), TensorData::scalar(0.01))
+                .unwrap();
+            let actual = interpreted_commit
+                .step_commit_only(input(scale), TensorData::scalar(0.01))
+                .unwrap();
+            assert_eq!(actual.loss(), expected.loss());
+            assert!(actual.outputs().is_empty());
+            assert_eq!(expected.outputs().len(), 1);
+            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+            assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+            assert_eq!(actual.clip_report(), expected.clip_report());
+            assert_eq!(actual.window_loss_report(), expected.window_loss_report());
+            assert_eq!(
+                interpreted_commit.checkpoint().unwrap(),
+                interpreted.checkpoint().unwrap()
+            );
+
+            let expected = native.step(input(scale), TensorData::scalar(0.01)).unwrap();
+            let actual = native_commit
+                .step_commit_only(input(scale), TensorData::scalar(0.01))
+                .unwrap();
+            assert_eq!(actual.loss(), expected.loss());
+            assert!(actual.outputs().is_empty());
+            assert_eq!(expected.outputs().len(), 1);
+            assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+            assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+            assert_eq!(actual.clip_report(), expected.clip_report());
+            assert_eq!(actual.window_loss_report(), expected.window_loss_report());
+            assert_eq!(
+                native_commit.checkpoint().unwrap(),
+                native.checkpoint().unwrap()
+            );
+        }
+        assert_eq!(
+            interpreted_commit.parameter_snapshots().unwrap(),
+            interpreted.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            interpreted_commit.first_moment_snapshots().unwrap(),
+            interpreted.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            interpreted_commit.second_moment_snapshots().unwrap(),
+            interpreted.second_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            interpreted_commit.gradient_accumulator_snapshots().unwrap(),
+            interpreted.gradient_accumulator_snapshots().unwrap()
+        );
+        assert_eq!(
+            native_commit.parameter_snapshots().unwrap(),
+            native.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            native_commit.first_moment_snapshots().unwrap(),
+            native.first_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            native_commit.second_moment_snapshots().unwrap(),
+            native.second_moment_snapshots().unwrap()
+        );
+        assert_eq!(
+            native_commit.gradient_accumulator_snapshots().unwrap(),
+            native.gradient_accumulator_snapshots().unwrap()
+        );
+
+        let ordinary_accumulation = native
+            .accumulation_replay
+            .as_ref()
+            .unwrap()
+            .workspace_stats();
+        let commit_accumulation = native_commit
+            .accumulation_replay
+            .as_ref()
+            .unwrap()
+            .workspace_stats();
+        assert_eq!(
+            ordinary_accumulation.last_materialized_egress_count,
+            commit_accumulation.last_materialized_egress_count + 1
+        );
+        assert_eq!(
+            ordinary_accumulation.last_materialized_egress_bytes,
+            commit_accumulation.last_materialized_egress_bytes + DType::F32.itemsize()
+        );
+        assert_eq!(commit_accumulation.last_materialized_egress_count, 1);
+        assert_eq!(
+            commit_accumulation.last_materialized_egress_bytes,
+            DType::F32.itemsize()
+        );
+        let ordinary_main = native.main_replay.workspace_stats();
+        let commit_main = native_commit.main_replay.workspace_stats();
+        assert_eq!(
+            ordinary_main.last_materialized_egress_count,
+            commit_main.last_materialized_egress_count + 1
+        );
+        assert_eq!(
+            ordinary_main.last_materialized_egress_bytes,
+            commit_main.last_materialized_egress_bytes + DType::F32.itemsize()
+        );
+        assert_eq!(commit_main.last_materialized_egress_count, 5);
+        assert_eq!(
+            commit_main.last_materialized_egress_bytes,
+            4 * DType::F32.itemsize() + DType::U64.itemsize()
+        );
+
+        let mut injected = plan.prepare_cpu().unwrap();
+        let mut retry_reference = plan.prepare_cpu().unwrap();
+        let before = injected.checkpoint().unwrap();
+        assert!(
+            injected
+                .step_commit_only_inner(input(2.0), TensorData::scalar(0.01), Some(0))
+                .is_err()
+        );
+        assert_eq!(injected.checkpoint().unwrap(), before);
+        let expected = retry_reference
+            .step(input(2.0), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = injected
+            .step_commit_only(input(2.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert!(actual.outputs().is_empty());
+        assert_eq!(
+            injected.checkpoint().unwrap(),
+            retry_reference.checkpoint().unwrap()
+        );
+
+        let mut injected = target.prepare(&plan).unwrap();
+        let mut retry_reference = target.prepare(&plan).unwrap();
+        let before = injected.checkpoint().unwrap();
+        assert!(
+            injected
+                .step_commit_only_inner(input(2.0), TensorData::scalar(0.01), Some(0))
+                .is_err()
+        );
+        assert_eq!(injected.checkpoint().unwrap(), before);
+        assert_eq!(injected.successful_steps, 0);
+        let expected = retry_reference
+            .step(input(2.0), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = injected
+            .step_commit_only(input(2.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert!(actual.outputs().is_empty());
+        assert_eq!(actual.report().successful_invocation(), 1);
+        assert_eq!(
+            injected.checkpoint().unwrap(),
+            retry_reference.checkpoint().unwrap()
+        );
+
+        native.step(input(6.0), TensorData::scalar(0.01)).unwrap();
+        native_commit
+            .step_commit_only(input(6.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(
+            native.zero_grad().unwrap(),
+            native_commit.zero_grad().unwrap()
+        );
+        assert_eq!(
+            native_commit.checkpoint().unwrap(),
+            native.checkpoint().unwrap()
+        );
+        native.step(input(8.0), TensorData::scalar(0.01)).unwrap();
+        native_commit
+            .step_commit_only(input(8.0), TensorData::scalar(0.01))
+            .unwrap();
+        let expected = native
+            .flush_partial_window(TensorData::scalar(0.01))
+            .unwrap();
+        let actual = native_commit
+            .flush_partial_window(TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(
+            actual.flushed_microbatches(),
+            expected.flushed_microbatches()
+        );
+        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+        assert_eq!(actual.clip_report(), expected.clip_report());
+        assert_eq!(actual.window_loss_report(), expected.window_loss_report());
+        assert_eq!(
+            native_commit.checkpoint().unwrap(),
+            native.checkpoint().unwrap()
+        );
+
+        let expected = interpreted
+            .step(input(6.0), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = interpreted_commit
+            .step_commit_only(input(6.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(
+            interpreted_commit.checkpoint().unwrap(),
+            interpreted.checkpoint().unwrap()
+        );
+        assert_eq!(
+            interpreted.zero_grad().unwrap(),
+            interpreted_commit.zero_grad().unwrap()
+        );
+        assert_eq!(
+            interpreted_commit.checkpoint().unwrap(),
+            interpreted.checkpoint().unwrap()
+        );
+        interpreted
+            .step(input(8.0), TensorData::scalar(0.01))
+            .unwrap();
+        interpreted_commit
+            .step_commit_only(input(8.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(
+            interpreted
+                .flush_partial_window(TensorData::scalar(0.01))
+                .unwrap(),
+            interpreted_commit
+                .flush_partial_window(TensorData::scalar(0.01))
+                .unwrap()
+        );
+        assert_eq!(
+            interpreted_commit.checkpoint().unwrap(),
+            interpreted.checkpoint().unwrap()
+        );
+
+        let dropout = CompiledDropoutConfig::new(CompiledDropoutKey([79, 83]));
+        let module = TiedFrozenModule::new([0.1, -0.2]);
+        let dropout_plan = CompiledAdamWPlan::compile_module_with_dropout(
+            module_config().with_gradient_accumulation(2).unwrap(),
+            dropout,
+            &module,
+            build_tied_dropout_with_input_guard,
+        )
+        .unwrap();
+        let rejecting = rejecting_cpu_target();
+        let mut dropout_reference = dropout_plan.prepare(&rejecting).unwrap();
+        let mut dropout_commit = dropout_plan.prepare(&rejecting).unwrap();
+        let finite =
+            || BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 2.0]).unwrap())]);
+        let invalid = BTreeMap::from([("x".into(), TensorData::new([2], vec![0.0, 2.0]).unwrap())]);
+        let before = dropout_commit.checkpoint().unwrap();
+        assert!(
+            dropout_commit
+                .step_commit_only(invalid, TensorData::scalar(0.01))
+                .is_err()
+        );
+        assert_eq!(dropout_commit.checkpoint().unwrap(), before);
+        assert_eq!(dropout_commit.dropout_block_counter().unwrap(), Some(0));
+        let expected = dropout_reference
+            .step(finite(), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = dropout_commit
+            .step_commit_only(finite(), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert!(actual.outputs().is_empty());
+        assert_eq!(dropout_commit.dropout_block_counter().unwrap(), Some(1));
+        assert_eq!(
+            dropout_commit.checkpoint().unwrap(),
+            dropout_reference.checkpoint().unwrap()
+        );
+
+        let native_target = NativeCpuSessionTarget::new(&executor)
+            .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+        let mut native_dropout_reference = native_target.prepare(&dropout_plan).unwrap();
+        let mut native_dropout_commit = native_target.prepare(&dropout_plan).unwrap();
+        let invalid = BTreeMap::from([("x".into(), TensorData::new([2], vec![0.0, 2.0]).unwrap())]);
+        let before = native_dropout_commit.checkpoint().unwrap();
+        assert!(
+            native_dropout_commit
+                .step_commit_only(invalid, TensorData::scalar(0.01))
+                .is_err()
+        );
+        assert_eq!(native_dropout_commit.checkpoint().unwrap(), before);
+        assert_eq!(native_dropout_commit.successful_steps, 0);
+        assert_eq!(
+            native_dropout_commit.dropout_block_counter().unwrap(),
+            Some(0)
+        );
+        let expected = native_dropout_reference
+            .step(finite(), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = native_dropout_commit
+            .step_commit_only(finite(), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert!(actual.outputs().is_empty());
+        assert_eq!(actual.report().successful_invocation(), 1);
+        assert_eq!(
+            native_dropout_commit.dropout_block_counter().unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            native_dropout_commit.checkpoint().unwrap(),
+            native_dropout_reference.checkpoint().unwrap()
+        );
+    }
+
+    #[test]
     fn non_finite_completed_window_loss_rejects_atomically_and_retries() {
         let config = CompiledAdamWConfig::new(0.0, 0.0, 1e-8, 0.0)
             .unwrap()
@@ -19930,6 +20631,28 @@ mod tests {
             CompiledAdamWPlan::compile(scheduled_config, initial_parameters(), build_tinybob)
                 .unwrap();
         assert_eq!(scheduled_plan.captured_multi_step_lr(), Some(&schedule));
+        let mut observed = scheduled_plan.prepare_cpu().unwrap();
+        let mut commit_only = scheduled_plan.prepare_cpu().unwrap();
+        let expected = observed.step_scheduled(batch()).unwrap();
+        let actual = commit_only.step_commit_only_scheduled(batch()).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert!(actual.outputs().is_empty());
+        assert_eq!(
+            commit_only.checkpoint().unwrap(),
+            observed.checkpoint().unwrap()
+        );
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut observed = target.prepare(&scheduled_plan).unwrap();
+        let mut commit_only = target.prepare(&scheduled_plan).unwrap();
+        let expected = observed.step_scheduled(batch()).unwrap();
+        let actual = commit_only.step_commit_only_scheduled(batch()).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert!(actual.outputs().is_empty());
+        assert_eq!(
+            commit_only.checkpoint().unwrap(),
+            observed.checkpoint().unwrap()
+        );
         let renderer = MetalRenderer::new(
             8,
             crate::runtime::metal::MetalCapabilities {

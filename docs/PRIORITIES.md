@@ -256,6 +256,11 @@ erased into a lowest-common-denominator result. Metal publication prevalidates
 and reads only the parameter fixed-state subset, including zero-read empty
 tensors; optimizer moments, accumulators, the optimizer step, and dropout
 counter remain device-resident and unread.
+CPU AdamW loops that need loss and optimizer reports but not graph-named
+outputs may use the typed commit-only runtime extensions. Interpreter and
+strict-native replay retain the same capture, validation, recurrent frontier,
+and result progress while native CPU materializes only that required observed
+subset; ordinary generic steps remain unchanged.
 Concrete Metal training can now commit selected iterations without
 materializing loss or named outputs on the host. The narrow
 `step_without_host_outputs` method retains the exact captured Transformer and

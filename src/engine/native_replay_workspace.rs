@@ -112,6 +112,10 @@ pub(super) struct NativeReplayWorkspace {
     #[cfg(test)]
     dispatch_metadata_build_count: usize,
     #[cfg(test)]
+    last_materialized_egress_count: usize,
+    #[cfg(test)]
+    last_materialized_egress_bytes: usize,
+    #[cfg(test)]
     injected_dispatch_failure: Option<usize>,
 }
 
@@ -144,6 +148,8 @@ pub(crate) struct NativeReplayWorkspaceStats {
     pub(crate) sealed_dispatch_segment_count: usize,
     pub(crate) sealed_prerequisite_slot_count: usize,
     pub(crate) dispatch_metadata_build_count: usize,
+    pub(crate) last_materialized_egress_count: usize,
+    pub(crate) last_materialized_egress_bytes: usize,
     pub(crate) dispatch_scratch_capacity_growth_count: usize,
     pub(crate) dispatch_scratch_is_empty: bool,
 }
@@ -185,6 +191,10 @@ impl NativeReplayWorkspace {
             skipped_output_clear_count: 0,
             #[cfg(test)]
             dispatch_metadata_build_count: 0,
+            #[cfg(test)]
+            last_materialized_egress_count: 0,
+            #[cfg(test)]
+            last_materialized_egress_bytes: 0,
             #[cfg(test)]
             injected_dispatch_failure: None,
         };
@@ -1225,12 +1235,16 @@ impl NativeReplayWorkspace {
     }
 
     pub(super) fn materialize(
-        &self,
+        &mut self,
         capture: &CapturedSchedule,
         borrowed: &NativeReplayBindings<'_>,
         selected: Option<&BTreeSet<u64>>,
     ) -> Result<ReplayValues, ReplayError> {
         let mut values = ReplayValues::default();
+        #[cfg(test)]
+        let mut materialized_egress_count = 0usize;
+        #[cfg(test)]
+        let mut materialized_egress_bytes = 0usize;
         for (buffer, slot, shape) in &self.egress {
             let wanted = selected.is_none_or(|selected| {
                 selected.contains(buffer)
@@ -1254,6 +1268,12 @@ impl NativeReplayWorkspace {
                     .map_err(|error| ReplayError::Backend(error.to_string()))?,
             };
             values.insert_tensor(*buffer, value);
+            #[cfg(test)]
+            {
+                materialized_egress_count = materialized_egress_count.saturating_add(1);
+                materialized_egress_bytes = materialized_egress_bytes
+                    .saturating_add(self.slots[*slot].key.descriptor.bytes);
+            }
         }
         let aliases = capture
             .requested_passthroughs
@@ -1264,6 +1284,11 @@ impl NativeReplayWorkspace {
             .cloned()
             .collect::<Vec<_>>();
         values.project_requested_aliases(&aliases)?;
+        #[cfg(test)]
+        {
+            self.last_materialized_egress_count = materialized_egress_count;
+            self.last_materialized_egress_bytes = materialized_egress_bytes;
+        }
         Ok(values)
     }
 
@@ -1429,6 +1454,8 @@ impl NativeReplayWorkspace {
             sealed_dispatch_segment_count,
             sealed_prerequisite_slot_count,
             dispatch_metadata_build_count: self.dispatch_metadata_build_count,
+            last_materialized_egress_count: self.last_materialized_egress_count,
+            last_materialized_egress_bytes: self.last_materialized_egress_bytes,
             dispatch_scratch_capacity_growth_count: self.dispatch_scratch.capacity_growth_count(),
             dispatch_scratch_is_empty: self.dispatch_scratch.is_empty(),
         }
