@@ -3000,8 +3000,33 @@ struct CompiledAdamWWindowLossNodes {
 struct CompiledOptimizerLowering {
     updates: BTreeMap<RecurrentStateKey, NodeId>,
     accumulation_updates: Option<BTreeMap<RecurrentStateKey, NodeId>>,
+    recurrent_store_groups: Vec<RecurrentStoreGroupSpec>,
     clip_report: Option<CompiledAdamWClipNodes>,
     window_loss_report: Option<CompiledAdamWWindowLossNodes>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecurrentStoreGroupSpec {
+    members: Vec<RecurrentStateKey>,
+}
+
+fn adamw_recurrent_store_group_specs<'a>(
+    parameters: impl Iterator<Item = &'a String>,
+    accumulating: bool,
+) -> Vec<RecurrentStoreGroupSpec> {
+    if !accumulating {
+        return Vec::new();
+    }
+    parameters
+        .map(|name| RecurrentStoreGroupSpec {
+            members: vec![
+                RecurrentStateKey::parameter(name),
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment),
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment),
+                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator),
+            ],
+        })
+        .collect()
 }
 
 struct ClippedGradients {
@@ -3064,6 +3089,7 @@ impl CompiledOptimizerProgram for MomentumProgram {
         Ok(CompiledOptimizerLowering {
             updates,
             accumulation_updates: None,
+            recurrent_store_groups: Vec::new(),
             clip_report: None,
             window_loss_report: None,
         })
@@ -3187,6 +3213,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
             return Ok(CompiledOptimizerLowering {
                 updates,
                 accumulation_updates: None,
+                recurrent_store_groups: Vec::new(),
                 clip_report: clipped.report,
                 window_loss_report,
             });
@@ -3331,6 +3358,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
         Ok(CompiledOptimizerLowering {
             updates,
             accumulation_updates: Some(accumulation_updates),
+            recurrent_store_groups: adamw_recurrent_store_group_specs(parameters.keys(), true),
             clip_report: clipped.report,
             window_loss_report: window_loss.map(|(_, _, mean_loss, loss_weight)| {
                 CompiledAdamWWindowLossNodes {
@@ -4412,7 +4440,7 @@ struct CompiledTrainingPlan {
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
     state_values: BTreeMap<RecurrentStateKey, TensorData>,
     state_versions: BTreeMap<RecurrentStateKey, u64>,
-    adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
+    recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
     frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
     accumulation: Option<CompiledAdamWAccumulationPlan>,
@@ -4432,7 +4460,7 @@ struct CompiledAdamWAuxiliaryPlan {
     recurrent_capture: CompiledRecurrentCapture,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
-    adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
+    recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
     capture_identity: u64,
     clip_report: bool,
     window_loss_report: bool,
@@ -4617,7 +4645,7 @@ struct CpuCompiledTrainingProgram {
     workload_buffers: BTreeMap<RecurrentStateKey, u64>,
     state_input_buffers: BTreeMap<String, u64>,
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
-    adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
+    recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
     frozen_parameter_nodes: BTreeSet<NodeId>,
     step: u64,
     accumulation: Option<CompiledAdamWAccumulationPlan>,
@@ -4765,64 +4793,40 @@ fn state_dependent_zero(graph: &mut Graph, input: NodeId) -> Result<NodeId> {
     graph.select(false_condition, input, zero)
 }
 
-fn adamw_native_update_manifests(
-    parameters: impl Iterator<Item = String>,
+fn resolve_recurrent_store_groups(
+    groups: &[RecurrentStoreGroupSpec],
     updates: &BTreeMap<RecurrentStateKey, NodeId>,
     state_buffers: &BTreeMap<RecurrentStateKey, u64>,
-) -> Result<Vec<crate::engine::AdamWNativeUpdateManifest>> {
-    let mut manifests = Vec::new();
-    for name in parameters {
-        let accumulator =
-            RecurrentStateKey::adamw_parameter(&name, AdamWParameterState::GradientAccumulator);
-        if !state_buffers.contains_key(&accumulator) && !updates.contains_key(&accumulator) {
-            continue;
-        }
-        let keys = [
-            (
-                crate::engine::AdamWNativeUpdateRole::Parameter,
-                RecurrentStateKey::parameter(&name),
-            ),
-            (
-                crate::engine::AdamWNativeUpdateRole::FirstMoment,
-                RecurrentStateKey::adamw_parameter(&name, AdamWParameterState::FirstMoment),
-            ),
-            (
-                crate::engine::AdamWNativeUpdateRole::SecondMoment,
-                RecurrentStateKey::adamw_parameter(&name, AdamWParameterState::SecondMoment),
-            ),
-            (
-                crate::engine::AdamWNativeUpdateRole::GradientAccumulator,
-                accumulator,
-            ),
-        ];
-        let members = keys
-            .iter()
-            .map(|(role, key)| {
-                let output = updates
-                    .get(key)
-                    .ok_or_else(|| training("compiled AdamW native update successor is absent"))?;
-                let state_buffer = state_buffers
-                    .get(key)
-                    .ok_or_else(|| training("compiled AdamW native update state is absent"))?;
-                Ok(crate::engine::AdamWNativeUpdateSuccessor {
-                    role: *role,
-                    output: output.index() as u64,
-                    state_buffer: *state_buffer,
+) -> Result<Vec<crate::engine::RecurrentStoreGroupManifest>> {
+    groups
+        .iter()
+        .map(|group| {
+            let members = group
+                .members
+                .iter()
+                .map(|key| {
+                    let output = updates
+                        .get(key)
+                        .ok_or_else(|| training("compiled recurrent store successor is absent"))?;
+                    let state_buffer = state_buffers
+                        .get(key)
+                        .ok_or_else(|| training("compiled recurrent store state is absent"))?;
+                    Ok(crate::engine::RecurrentStoreGroupMember {
+                        output: output.index() as u64,
+                        state_buffer: *state_buffer,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>>>()?
-            .try_into()
-            .map_err(|_| training("compiled AdamW native update inventory differs"))?;
-        manifests.push(crate::engine::AdamWNativeUpdateManifest { members });
-    }
-    Ok(manifests)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(crate::engine::RecurrentStoreGroupManifest { members })
+        })
+        .collect()
 }
 
 struct CompiledTrainingPhaseCapture {
     capture: CapturedMixedSchedule,
     recurrent_capture: CapturedStatefulInference,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
-    adamw_native_updates: Vec<crate::engine::AdamWNativeUpdateManifest>,
+    recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
 }
 
 struct CompiledTrainingPhaseInput<'a> {
@@ -4830,7 +4834,7 @@ struct CompiledTrainingPhaseInput<'a> {
     state_nodes: &'a BTreeMap<RecurrentStateKey, NodeId>,
     state_values: &'a [(u64, TensorData)],
     state_by_input: &'a BTreeMap<NodeId, BufferState>,
-    parameter_names: &'a [String],
+    recurrent_store_groups: &'a [RecurrentStoreGroupSpec],
     updates: &'a BTreeMap<RecurrentStateKey, NodeId>,
     public_requested: &'a [NodeId],
     external_input_names: &'a [String],
@@ -4846,7 +4850,7 @@ fn capture_training_phase(
         state_nodes,
         state_values,
         state_by_input,
-        parameter_names,
+        recurrent_store_groups,
         updates,
         public_requested,
         external_input_names,
@@ -4908,8 +4912,8 @@ fn capture_training_phase(
         .zip(state_values)
         .map(|(spec, (buffer, _))| (spec.key.clone(), *buffer))
         .collect::<BTreeMap<_, _>>();
-    let adamw_native_updates =
-        adamw_native_update_manifests(parameter_names.iter().cloned(), &updates, &state_buffers)?;
+    let recurrent_store_groups =
+        resolve_recurrent_store_groups(recurrent_store_groups, &updates, &state_buffers)?;
     let mut captured = CapturedSchedule::capture(graph, &pure, &requested[..public_output_count])
         .map_err(replay_error)?;
     if captured.requested.len() != public_output_count {
@@ -4958,7 +4962,7 @@ fn capture_training_phase(
         capture,
         recurrent_capture,
         state_buffers,
-        adamw_native_updates,
+        recurrent_store_groups,
     })
 }
 
@@ -5116,6 +5120,7 @@ impl CompiledTrainingPlan {
         let CompiledOptimizerLowering {
             mut updates,
             mut accumulation_updates,
+            recurrent_store_groups,
             clip_report,
             window_loss_report,
         } = optimizer.lower_updates(
@@ -5152,7 +5157,6 @@ impl CompiledTrainingPlan {
             .chain(clip_requested)
             .chain(window_loss_requested)
             .collect::<Vec<_>>();
-        let parameter_names = parameter_nodes.keys().cloned().collect::<Vec<_>>();
         let external_input_names = optimizer.inputs().keys().cloned().collect::<Vec<_>>();
         let main = capture_training_phase(
             &mut graph,
@@ -5161,7 +5165,7 @@ impl CompiledTrainingPlan {
                 state_nodes: &state_nodes,
                 state_values: &state_values,
                 state_by_input: &state_by_input,
-                parameter_names: &parameter_names,
+                recurrent_store_groups: &recurrent_store_groups,
                 updates: &updates,
                 public_requested: &main_public_requested,
                 external_input_names: &external_input_names,
@@ -5180,7 +5184,7 @@ impl CompiledTrainingPlan {
                         state_nodes: &state_nodes,
                         state_values: &state_values,
                         state_by_input: &state_by_input,
-                        parameter_names: &parameter_names,
+                        recurrent_store_groups: &recurrent_store_groups,
                         updates: &updates,
                         public_requested: &public_requested,
                         external_input_names: &external_input_names,
@@ -5233,7 +5237,7 @@ impl CompiledTrainingPlan {
                 .map(|spec| (spec.key.clone(), spec.value.clone()))
                 .collect(),
             state_versions: specs.iter().map(|spec| (spec.key.clone(), 0)).collect(),
-            adamw_native_updates: main.adamw_native_updates,
+            recurrent_store_groups: main.recurrent_store_groups,
             frozen_parameter_nodes: BTreeSet::new(),
             step: 0,
             accumulation,
@@ -5445,7 +5449,7 @@ impl CompiledTrainingPlan {
             workload_buffers: self.workload_buffers.clone(),
             state_input_buffers: self.state_input_buffers.clone(),
             state_input_keys: self.state_input_keys.clone(),
-            adamw_native_updates: self.adamw_native_updates.clone(),
+            recurrent_store_groups: self.recurrent_store_groups.clone(),
             frozen_parameter_nodes: self.frozen_parameter_nodes.clone(),
             step: 0,
             accumulation: self.accumulation.clone(),
@@ -5718,8 +5722,11 @@ impl CompiledAdamWAuxiliaryPlan {
             .initial_recurrent_cursor()
             .map_err(replay_error)?
             .capture_identity();
-        let adamw_native_updates =
-            adamw_native_update_manifests(parameters.keys().cloned(), &updates, &state_buffers)?;
+        let recurrent_store_groups = resolve_recurrent_store_groups(
+            &adamw_recurrent_store_group_specs(parameters.keys(), true),
+            &updates,
+            &state_buffers,
+        )?;
         Ok(Self {
             capture,
             recurrent_capture: CompiledRecurrentCapture::from_stateful(recurrent_capture),
@@ -5728,7 +5735,7 @@ impl CompiledAdamWAuxiliaryPlan {
                 .into_iter()
                 .map(|(input, key, ..)| (input, key))
                 .collect(),
-            adamw_native_updates,
+            recurrent_store_groups,
             capture_identity,
             clip_report: clipped.report.is_some(),
             window_loss_report: window_loss_report.is_some(),
@@ -5868,7 +5875,7 @@ impl CompiledAdamWAuxiliaryPlan {
                 .into_iter()
                 .map(|(input, key, ..)| (input, key))
                 .collect(),
-            adamw_native_updates: Vec::new(),
+            recurrent_store_groups: Vec::new(),
             capture_identity,
             clip_report: false,
             window_loss_report: false,
@@ -6961,7 +6968,7 @@ impl CpuCompiledTrainingProgram {
                 .into_iter()
                 .map(|(key, (_, version))| (key, version))
                 .collect(),
-            adamw_native_updates: self.adamw_native_updates.clone(),
+            recurrent_store_groups: self.recurrent_store_groups.clone(),
             frozen_parameter_nodes: self.frozen_parameter_nodes.clone(),
             step: self.step,
             accumulation: self.accumulation.clone(),
@@ -9933,10 +9940,10 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             let (pure, inputs) = main_preparation.pure_and_inputs();
             drafts.push(
                 executor
-                    .preflight_native_items_with_adamw_updates(
+                    .preflight_native_items_with_store_groups(
                         pure,
                         inputs,
-                        &inner.inner.adamw_native_updates,
+                        &inner.inner.recurrent_store_groups,
                     )
                     .map_err(replay_error)?,
             );
@@ -9976,10 +9983,10 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     let (pure, inputs) = preparation.pure_and_inputs();
                     drafts.push(
                         executor
-                            .preflight_native_items_with_adamw_updates(
+                            .preflight_native_items_with_store_groups(
                                 pure,
                                 inputs,
-                                &transition.adamw_native_updates,
+                                &transition.recurrent_store_groups,
                             )
                             .map_err(replay_error)?,
                     );
@@ -14865,6 +14872,62 @@ mod tests {
     }
 
     #[test]
+    fn adamw_lowering_resolves_ordered_recurrent_store_keys() {
+        assert!(adamw_recurrent_store_group_specs(["weight".to_string()].iter(), false).is_empty());
+        let specs = adamw_recurrent_store_group_specs(["weight".to_string()].iter(), true);
+        let expected_keys = vec![
+            RecurrentStateKey::parameter("weight"),
+            RecurrentStateKey::adamw_parameter("weight", AdamWParameterState::FirstMoment),
+            RecurrentStateKey::adamw_parameter("weight", AdamWParameterState::SecondMoment),
+            RecurrentStateKey::adamw_parameter("weight", AdamWParameterState::GradientAccumulator),
+        ];
+        assert_eq!(specs[0].members, expected_keys);
+
+        let mut graph = Graph::new();
+        let nodes = [
+            graph.input("parameter", [2]),
+            graph.input("first_moment", [2]),
+            graph.input("second_moment", [2]),
+            graph.input("accumulator", [2]),
+        ];
+        let updates = expected_keys
+            .iter()
+            .cloned()
+            .zip(nodes)
+            .collect::<BTreeMap<_, _>>();
+        let state_buffers = expected_keys
+            .iter()
+            .cloned()
+            .zip([101, 102, 103, 104])
+            .collect::<BTreeMap<_, _>>();
+        let manifests = resolve_recurrent_store_groups(&specs, &updates, &state_buffers).unwrap();
+        assert_eq!(
+            manifests[0]
+                .members
+                .iter()
+                .map(|member| (member.output, member.state_buffer))
+                .collect::<Vec<_>>(),
+            nodes
+                .iter()
+                .zip([101, 102, 103, 104])
+                .map(|(node, buffer)| (node.index() as u64, buffer))
+                .collect::<Vec<_>>()
+        );
+
+        let mut missing = state_buffers;
+        missing.remove(expected_keys.last().unwrap());
+        let error = match resolve_recurrent_store_groups(&specs, &updates, &missing) {
+            Ok(_) => panic!("missing recurrent store state resolved"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("recurrent store state is absent")
+        );
+    }
+
+    #[test]
     fn native_cpu_adamw_state_update_groups_preserve_logical_failure_atomicity() {
         let plan = CompiledAdamWPlan::compile(
             accumulated_adamw_config(2),
@@ -14873,14 +14936,9 @@ mod tests {
         )
         .unwrap();
         let partial_flush = plan.partial_flush.as_ref().unwrap();
-        for manifest in &partial_flush.adamw_native_updates {
-            let accumulator = manifest
-                .members
-                .iter()
-                .find(|member| {
-                    member.role == crate::engine::AdamWNativeUpdateRole::GradientAccumulator
-                })
-                .unwrap();
+        for manifest in &partial_flush.recurrent_store_groups {
+            assert_eq!(manifest.members.len(), 4);
+            let accumulator = manifest.members.last().unwrap();
             let item = partial_flush
                 .capture
                 .schedule
@@ -14902,22 +14960,25 @@ mod tests {
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
         let native = plan.prepare(&target).unwrap();
-        let main_updates = native.main_replay.adamw_native_update_indices();
+        let main_updates = native.main_replay.recurrent_store_group_indices();
         let main_update_admissions = native
             .main_replay
-            .adamw_native_update_admission_diagnostics();
+            .recurrent_store_group_admission_diagnostics();
         let flush_updates = native
             .partial_flush_replay
             .as_ref()
             .unwrap()
-            .adamw_native_update_indices();
+            .recurrent_store_group_indices();
         let flush_update_admissions = native
             .partial_flush_replay
             .as_ref()
             .unwrap()
-            .adamw_native_update_admission_diagnostics();
+            .recurrent_store_group_admission_diagnostics();
         assert!(
-            main_updates.len() == 2 && flush_updates.len() == 2,
+            main_updates.len() == 2
+                && main_updates.iter().all(|group| group.len() == 4)
+                && flush_updates.len() == 2
+                && flush_updates.iter().all(|group| group.len() == 4),
             "AdamW native update admissions:\nmain: {main_update_admissions:#?}\npartial flush: {flush_update_admissions:#?}"
         );
         let preparation = native.preparation_report();
@@ -14932,7 +14993,7 @@ mod tests {
             flush_updates.len() * 3
         );
 
-        for index in main_updates[0] {
+        for &index in &main_updates[0] {
             let mut native = plan.prepare(&target).unwrap();
             let mut interpreted = plan.prepare_cpu().unwrap();
             let expected = interpreted.step(batch(), lr()).unwrap();
@@ -15921,6 +15982,7 @@ mod tests {
     fn compiled_training_runtime_is_optimizer_neutral() {
         let mut momentum = compiled();
         let mut adamw = compiled_adamw();
+        assert!(momentum.inner.recurrent_store_groups.is_empty());
 
         let (momentum_loss, momentum_outputs) = run_core_training_step(&mut momentum);
         let (adamw_loss, adamw_outputs) = run_core_training_step(&mut adamw);

@@ -1030,49 +1030,58 @@ impl From<&TokenWeightWire> for CompiledTokenWeightPolicy {
     }
 }
 
-fn manifest_wire(manifest: &crate::engine::AdamWNativeUpdateManifest) -> AdamWManifestWire {
-    AdamWManifestWire {
-        members: manifest.members.map(|member| AdamWMemberWire {
-            role: match member.role {
-                crate::engine::AdamWNativeUpdateRole::Parameter => 0,
-                crate::engine::AdamWNativeUpdateRole::FirstMoment => 1,
-                crate::engine::AdamWNativeUpdateRole::SecondMoment => 2,
-                crate::engine::AdamWNativeUpdateRole::GradientAccumulator => 3,
-            },
-            output: member.output,
-            state_buffer: member.state_buffer,
-        }),
-    }
+fn manifest_wire(
+    manifest: &crate::engine::RecurrentStoreGroupManifest,
+) -> Result<AdamWManifestWire> {
+    let [parameter, first_moment, second_moment, accumulator] = manifest.members.as_slice() else {
+        return Err(training(
+            "compiled program artifact native AdamW update inventory differs",
+        ));
+    };
+    let member = |role, member: &crate::engine::RecurrentStoreGroupMember| AdamWMemberWire {
+        role,
+        output: member.output,
+        state_buffer: member.state_buffer,
+    };
+    // RGAP remains an AdamW artifact: adapt the optimizer-neutral runtime
+    // group back to its historical fixed role/order wire without serializing
+    // engine-only grouping metadata.
+    let members = [
+        member(0, parameter),
+        member(1, first_moment),
+        member(2, second_moment),
+        member(3, accumulator),
+    ];
+    Ok(AdamWManifestWire { members })
 }
 
-fn decode_manifest(wire: &AdamWManifestWire) -> Result<crate::engine::AdamWNativeUpdateManifest> {
-    let members = wire.members.map(|member| {
-        let role = match member.role {
-            0 => crate::engine::AdamWNativeUpdateRole::Parameter,
-            1 => crate::engine::AdamWNativeUpdateRole::FirstMoment,
-            2 => crate::engine::AdamWNativeUpdateRole::SecondMoment,
-            3 => crate::engine::AdamWNativeUpdateRole::GradientAccumulator,
-            _ => crate::engine::AdamWNativeUpdateRole::Parameter,
-        };
-        crate::engine::AdamWNativeUpdateSuccessor {
-            role,
-            output: member.output,
-            state_buffer: member.state_buffer,
-        }
-    });
-    if wire.members.iter().any(|member| member.role > 3) {
+fn decode_manifest(wire: &AdamWManifestWire) -> Result<crate::engine::RecurrentStoreGroupManifest> {
+    if wire
+        .members
+        .iter()
+        .enumerate()
+        .any(|(role, member)| usize::from(member.role) != role)
+    {
         return Err(training(
             "compiled program artifact native AdamW role is invalid",
         ));
     }
-    Ok(crate::engine::AdamWNativeUpdateManifest { members })
+    let members = wire
+        .members
+        .iter()
+        .map(|member| crate::engine::RecurrentStoreGroupMember {
+            output: member.output,
+            state_buffer: member.state_buffer,
+        })
+        .collect();
+    Ok(crate::engine::RecurrentStoreGroupManifest { members })
 }
 
 fn phase_wire(
     capture: &CapturedMixedSchedule,
     state_buffers: &BTreeMap<RecurrentStateKey, u64>,
     state_input_keys: &BTreeMap<String, RecurrentStateKey>,
-    native_updates: &[crate::engine::AdamWNativeUpdateManifest],
+    native_updates: &[crate::engine::RecurrentStoreGroupManifest],
     clip_report: bool,
     window_loss_report: bool,
 ) -> Result<PhaseWire> {
@@ -1080,7 +1089,10 @@ fn phase_wire(
         capture: capture.to_bytes().map_err(replay_error)?,
         state_buffers: key_map(state_buffers),
         state_input_keys: input_key_map(state_input_keys),
-        adamw_native_updates: native_updates.iter().map(manifest_wire).collect(),
+        adamw_native_updates: native_updates
+            .iter()
+            .map(manifest_wire)
+            .collect::<Result<_>>()?,
         clip_report,
         window_loss_report,
     })
@@ -1091,7 +1103,7 @@ fn auxiliary_wire(plan: &CompiledAdamWAuxiliaryPlan) -> Result<PhaseWire> {
         &plan.capture,
         &plan.state_buffers,
         &plan.state_input_keys,
-        &plan.adamw_native_updates,
+        &plan.recurrent_store_groups,
         plan.clip_report,
         plan.window_loss_report,
     )
@@ -1190,7 +1202,7 @@ fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
                 &main.capture,
                 &main_state_buffers,
                 &main.state_input_keys,
-                &main.adamw_native_updates,
+                &main.recurrent_store_groups,
                 main.clip_report,
                 main.window_loss_report,
             )?,
@@ -1338,7 +1350,7 @@ fn decode_auxiliary(wire: &PhaseWire) -> Result<CompiledAdamWAuxiliaryPlan> {
         recurrent_capture,
         state_buffers,
         state_input_keys: decode_input_key_map(&wire.state_input_keys)?,
-        adamw_native_updates: wire
+        recurrent_store_groups: wire
             .adamw_native_updates
             .iter()
             .map(decode_manifest)
@@ -1492,7 +1504,7 @@ fn restore_owner<M: Module>(
         state_input_keys,
         state_values,
         state_versions,
-        adamw_native_updates: wire
+        recurrent_store_groups: wire
             .main
             .phase
             .adamw_native_updates
