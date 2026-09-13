@@ -999,9 +999,13 @@ exclusive `with_token_weighted_ignore_index` policy over a fixed nonempty I32
 target input. The latter derives `target != ignore_index` inside the graph and
 uses that keep tensor for loss normalization, token counting, gradient
 weighting, accumulation, clipping, and window-loss reporting. Runtime admission
-counts the authenticated I32 lanes before replay. The maintained file-resume
-Transformer uses sentinel targets as the source for its broadcast attention
-validity too; legacy explicit-mask lowering and checkpoint bytes are unchanged.
+counts the authenticated I32 lanes before replay. An opt-in typed builder
+context exposes the exact target, Bool validity, and F32 weight nodes before
+the model callback; the compiler reuses that same F32 node for the objective
+and optimizer window. The maintained file-resume Transformer reshapes the Bool
+node for broadcast attention instead of accepting a second host-derived mask.
+Legacy-builder captures and checkpoint bytes, plus explicit-mask lowering, are
+unchanged.
 
 Token-mean training rejects a zero-valid-token batch by default. The explicit
 `CompiledAdamWConfig::with_zero_valid_token_microbatches` policy instead masks
