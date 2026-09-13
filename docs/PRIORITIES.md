@@ -238,63 +238,60 @@ The detailed contracts live in
 
 ### 3. P1 — lower the identical training capture to Metal
 
-The same captured loss/backward/AdamW program now passes strict Metal admission
-with zero fallback and initializes parameter, first/second-moment, and U64-step
-state in failure-atomic epoch-swapped device banks. The checked-in protected
-Apple-GPU acceptance now enters through the same public `CompiledAdamWPlan` and
-scoreboard-bound `MetalSessionTarget` path as the maintained example. It
-requires seven tiny-Transformer replays, proves decreasing deterministic
-eval-mode mean sparse loss over the same three fixed microbatches, checkpoints
-at step four, prepares a second Metal session from those bytes, executes the
-shared-state nonempty flush followed by a complete accumulation window, and
-requires bounded agreement with the same-seed CPU reference. The reference
-also proves exact uninterrupted-versus-restored checkpoint and module state.
-The frozen tied embedding/output remains absent from optimizer/checkpoint state
-and byte/version/flag unchanged through finish while another parameter changes.
-Its create-new schema-v7 evidence
-records the selected device, capture/deployment identities,
-kernel/command/transfer counts, LR-only zero-output flush, controlled evaluation
-endpoints, and resume result. Running that manual exact-SHA lane on provisioned
-Apple hardware is the remaining proof;
-the shared scoreboard now records this epoch-swapped training session directly,
-and `MetalSessionTarget::with_scoreboard` binds fail-soft observation before the
-first step rather than introducing a parallel training API.
-`CompiledTrainingRuntime` and `CompiledTrainingStep` now expose the common
-replay seam across CPU momentum-SGD, CPU AdamW, and Metal AdamW without an
-optimizer or backend enum. `CompiledCheckpointRuntime` isolates portable
-persistence, while the AdamW extension traits retain accumulation, clipping,
-loss-scaling, moment, and optimizer-step inspection. Workloads may implement
-`CompiledInputBatch` once to share one fixed schema and conversion between
-`with_input_batch`, `step_batch`, and `evaluate_batch` in that same generic
-loop; this removes repeated string-map and rank-zero learning-rate tensor
-assembly without exposing recurrent state or changing the existing exact-map
-replay ABI. Backend-specific reports and
-scoreboards remain available on the concrete Metal types rather than being
-erased into a lowest-common-denominator result. Metal publication prevalidates
-and reads only the parameter fixed-state subset, including zero-read empty
-tensors; optimizer moments, accumulators, the optimizer step, and dropout
-counter remain device-resident and unread.
-CPU AdamW loops that need loss and optimizer reports but not graph-named
-outputs may use the typed commit-only runtime extensions. Interpreter and
-strict-native replay retain the same capture, validation, recurrent frontier,
-and result progress while native CPU materializes only that required observed
-subset; ordinary generic steps remain unchanged.
-Concrete Metal training can now commit selected iterations without
-materializing loss or named outputs on the host. The narrow
-`step_without_host_outputs` method retains the exact captured Transformer and
-complete epoch-swapped AdamW/dropout frontier, returns typed progress plus the
-device report, and records zero retained D2H traffic. Callers use the unchanged
-observed `step` periodically. This removes per-step observation transfer but
-does not remove the synchronous command wait or claim a live-device speedup.
-`CompiledAdamWPlan` now makes compilation and checkpoint restoration themselves
-backend-neutral: callers choose CPU replay or strict Metal rendering only after
-the complete graph, gradient, optimizer, capture, and recurrent frontier have
-been authenticated. `SessionTarget<P>` makes preparation polymorphic while
-retaining each plan's concrete session, error, and ownership mode. The CPU and
-selected-device Metal implementations require no backend enum; the Metal target
-derives renderer capabilities from its retained device, binds optional
-observation before resources, and now prepares compiled AdamW, ResNet, and both
-GGUF Llama session plans through the same typed boundary.
+Repeated training replays one authenticated loss/backward/AdamW capture while
+its parameter and optimizer frontier remains inside the selected runtime.
+Metal remains a later priority than the complete CPU workflow: its bounded
+implementation is available, and missing provisioned-hardware evidence does
+not block CPU training.
+
+#### Runtime, policy, checkpoint, and module responsibilities
+
+| Boundary | Responsibility |
+| --- | --- |
+| Replay | `CompiledTrainingRuntime` and `CompiledTrainingStep` provide one seam across CPU momentum-SGD, CPU AdamW, and Metal AdamW without an optimizer or backend enum. AdamW extension traits retain accumulation, clipping, loss-scaling, moment, and optimizer-step inspection. |
+| Batch policy | `CompiledInputBatch` shares one fixed schema and conversion among `with_input_batch`, `step_batch`, and `evaluate_batch`, avoiding repeated string maps and rank-zero learning-rate tensors without exposing recurrent state or changing the exact-map replay ABI. |
+| Persistence | `CompiledCheckpointRuntime` isolates portable persistence. `CompiledAdamWPlan` keeps compilation and checkpoint restoration backend-neutral, and `SessionTarget<P>` makes preparation polymorphic while preserving each concrete session, error, and ownership mode. |
+| Module publication | The CPU reference proves exact uninterrupted-versus-restored checkpoint and module state. A frozen tied embedding/output stays outside optimizer and checkpoint state and remains byte-, version-, and flag-identical through finish while another parameter changes. |
+| Metal state | Parameters, first and second moments, and the U64 step use failure-atomic epoch-swapped device banks. Publication prevalidates and reads only the parameter fixed-state subset, including zero-read empty tensors; moments, accumulators, optimizer step, and dropout counter remain device-resident and unread. |
+
+#### Evaluation and loss-trajectory evidence
+
+The protected Apple-GPU acceptance uses the same public `CompiledAdamWPlan`
+and scoreboard-bound `MetalSessionTarget` path as the maintained example:
+
+| Stage | Checked evidence |
+| --- | --- |
+| Repeated replay | Seven tiny-Transformer replays show decreasing deterministic eval-mode mean sparse loss over the same three fixed microbatches and bounded agreement with the same-seed CPU reference. |
+| Resume | A checkpoint at step four prepares a second Metal session from the same bytes. |
+| Window completion | The restored path performs a shared-state nonempty flush followed by a complete accumulation window. |
+
+#### Metrics and output boundaries
+
+| Path | Contract |
+| --- | --- |
+| CPU AdamW commit-only | Typed commit-only extensions preserve capture, validation, recurrent frontier, result progress, loss, and optimizer reports for interpreter and strict-native replay while native CPU materializes no graph-named outputs. Ordinary generic steps are unchanged. |
+| Metal `step_without_host_outputs` | Selected iterations preserve the captured Transformer and complete epoch-swapped AdamW/dropout frontier, return typed progress and the device report, and record zero retained D2H traffic without materializing loss or named outputs on the host. Callers use the unchanged observed `step` periodically. This removes observation transfer, not the synchronous command wait, and makes no live-device speedup claim. |
+| Metal scoreboard | The shared scoreboard records the epoch-swapped session directly. `MetalSessionTarget::with_scoreboard` binds fail-soft observation before the first step instead of creating another training API. Backend-specific reports remain on concrete Metal types rather than being erased into a lowest-common-denominator result. |
+
+Create-new schema-v7 evidence records the selected device,
+capture/deployment identities, kernel/command/transfer counts, an LR-only
+zero-output flush, controlled evaluation endpoints, and the resume result.
+
+#### Metal selection and portable checkpoint boundary
+
+- The same captured loss/backward/AdamW program passes strict Metal admission
+  with zero fallback. Callers select CPU replay or strict Metal rendering only
+  after authenticating the graph, gradients, optimizer, capture, and recurrent
+  frontier.
+- The selected-device target derives renderer capabilities from its retained
+  device, binds optional observation before resources, and prepares compiled
+  AdamW, ResNet, and both GGUF Llama session plans through the same typed
+  boundary; CPU and Metal selection still requires no backend enum.
+- Checkpoint restoration remains backend-neutral. Restoring the portable bytes
+  prepares fresh selected-runtime resources while preserving the authenticated
+  plan and module lifecycle described above.
+- The manual exact-SHA lane on provisioned Apple hardware remains the final
+  evidence step. Until it runs, no live-hardware result or speedup is claimed.
 
 ## Deferred hardware inference queue
 
