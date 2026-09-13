@@ -65,6 +65,44 @@ pub(super) struct RecurrentStateKey {
 }
 
 impl RecurrentStateKey {
+    pub(super) fn from_canonical(name: &str) -> Result<Self> {
+        if let Some(parameter) = name.strip_prefix("parameter:") {
+            return Ok(Self::parameter(parameter));
+        }
+        if let Some(parameter) = name.strip_prefix("slot:") {
+            for state in [
+                AdamWParameterState::FirstMoment,
+                AdamWParameterState::SecondMoment,
+                AdamWParameterState::GradientAccumulator,
+            ] {
+                let suffix = format!(":{}", state.canonical_suffix());
+                if let Some(parameter) = parameter.strip_suffix(&suffix) {
+                    return Ok(Self::adamw_parameter(parameter, state));
+                }
+            }
+            if let Some(parameter) = parameter.strip_suffix(":momentum") {
+                return Ok(Self::momentum(parameter));
+            }
+        }
+        let key = match name {
+            "global:step" => Self::adamw_global(AdamWGlobalState::Step),
+            "global:accumulation_index" => Self::adamw_global(AdamWGlobalState::AccumulationIndex),
+            "global:accumulated_token_count" => {
+                Self::adamw_global(AdamWGlobalState::AccumulatedTokenCount)
+            }
+            "global:accumulated_loss_numerator" => {
+                Self::adamw_global(AdamWGlobalState::AccumulatedLossNumerator)
+            }
+            "workload:dropout_block_counter" => Self::dropout_counter(),
+            _ => {
+                return Err(crate::Error::SessionTraining {
+                    reason: "compiled recurrent state key is invalid".into(),
+                });
+            }
+        };
+        Ok(key)
+    }
+
     pub(super) fn parameter(name: impl AsRef<str>) -> Self {
         let (canonical, parameter) = Self::parameterized("parameter:", name.as_ref(), "", "");
         Self {
