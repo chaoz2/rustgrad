@@ -70,6 +70,24 @@ fn requested_materializations(capture: &CapturedSchedule) -> Vec<u64> {
     )
 }
 
+fn validate_requested_selection(all: &[u64], selected: &[u64]) -> Result<(), ReplayError> {
+    let mut next = 0;
+    for selected in selected {
+        let Some(offset) = all[next..]
+            .iter()
+            .position(|candidate| candidate == selected)
+        else {
+            return Err(ReplayError::Corrupt(
+                "selected recurrent output is not an ordered capture output".into(),
+            ));
+        };
+        next = next
+            .checked_add(offset + 1)
+            .ok_or_else(|| ReplayError::Corrupt("selected output index overflow".into()))?;
+    }
+    Ok(())
+}
+
 /// Graph-free mixed-schedule descriptor. The ordinary capture remains its
 /// canonical typed UOp/item payload; persistent identities are stored beside
 /// it so an effect runtime must prove the declared versions at replay time.
@@ -165,6 +183,12 @@ struct StagedMixedReplay {
     outputs: Vec<crate::TensorData>,
 }
 
+struct RecurrentReplayRequest<'a> {
+    native: Option<NativeReplayContext<'a>>,
+    selected_requested: Option<&'a [u64]>,
+    injected_failure: Option<u64>,
+}
+
 /// Execution context for a strict-native replay of a captured pure prefix.
 /// The prepared program owns kernels, immutable schema, and invalidatable
 /// scratch; authoritative tensor bytes remain caller/runtime-owned.
@@ -192,6 +216,28 @@ impl<'a> NativeReplayContext<'a> {
     where
         F: FnOnce(&[crate::TensorData], &[&crate::TensorData]) -> Result<(), String>,
     {
+        self.replay_recurrent_selected_checked(
+            runtime,
+            cursor,
+            provided,
+            None,
+            injected_failure,
+            validate_transition,
+        )
+    }
+
+    pub(crate) fn replay_recurrent_selected_checked<F>(
+        self,
+        runtime: &mut crate::EffectRuntime,
+        cursor: &mut MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        selected_requested: Option<&[u64]>,
+        injected_failure: Option<u64>,
+        validate_transition: F,
+    ) -> Result<NativeMixedReplayResult, ReplayError>
+    where
+        F: FnOnce(&[crate::TensorData], &[&crate::TensorData]) -> Result<(), String>,
+    {
         let Self { executor, prepared } = self;
         prepared.validate_cursor(cursor)?;
         let current = cursor.frontier.clone();
@@ -213,6 +259,9 @@ impl<'a> NativeReplayContext<'a> {
             requested,
             replacements,
         } = prepared;
+        let all_requested = requested.as_slice();
+        let requested = selected_requested.unwrap_or(all_requested);
+        validate_requested_selection(all_requested, requested)?;
         let retained = plan
             .retained_recurrent_states()
             .iter()
@@ -1229,12 +1278,37 @@ impl CapturedMixedSchedule {
     where
         F: FnOnce(&[crate::TensorData], &[crate::TensorData]) -> Result<(), String>,
     {
-        self.replay_recurrent_checked_impl(
+        self.replay_recurrent_selected_checked(
             runtime,
             cursor,
             provided,
             None,
             injected_failure,
+            validate_transition,
+        )
+    }
+
+    pub(crate) fn replay_recurrent_selected_checked<F>(
+        &self,
+        runtime: &mut crate::EffectRuntime,
+        cursor: &mut MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        selected_requested: Option<&[u64]>,
+        injected_failure: Option<u64>,
+        validate_transition: F,
+    ) -> Result<MixedReplayResult, ReplayError>
+    where
+        F: FnOnce(&[crate::TensorData], &[crate::TensorData]) -> Result<(), String>,
+    {
+        self.replay_recurrent_checked_impl(
+            runtime,
+            cursor,
+            provided,
+            RecurrentReplayRequest {
+                native: None,
+                selected_requested,
+                injected_failure,
+            },
             validate_transition,
         )
     }
@@ -1338,8 +1412,7 @@ impl CapturedMixedSchedule {
         runtime: &mut crate::EffectRuntime,
         cursor: &mut MixedReplayCursor,
         provided: &BTreeMap<String, crate::TensorData>,
-        native: Option<NativeReplayContext<'_>>,
-        injected_failure: Option<u64>,
+        request: RecurrentReplayRequest<'_>,
         validate_transition: F,
     ) -> Result<MixedReplayResult, ReplayError>
     where
@@ -1347,6 +1420,11 @@ impl CapturedMixedSchedule {
     {
         validate(self, true)?;
         validate_recurrent_cursor(self, cursor)?;
+        let RecurrentReplayRequest {
+            native,
+            selected_requested,
+            injected_failure,
+        } = request;
         let native_trace = native
             .as_ref()
             .map(|native| native.prepared.validate_capture(self))
@@ -1363,7 +1441,9 @@ impl CapturedMixedSchedule {
             candidates.insert(state.clone(), value);
         }
 
-        let staged = self.stage(&mut candidates, starts, provided, native, true)?;
+        let requested = selected_requested.unwrap_or(&self.schedule.requested);
+        validate_requested_selection(&self.schedule.requested, requested)?;
+        let staged = self.stage(&mut candidates, starts, provided, native, Some(requested))?;
         let batch = crate::EffectBatch::new(vec![staged.entry])
             .map_err(|error| ReplayError::Execute(format!("recurrent stage: {error:?}")))?;
         let next_frontier = recurrent_advanced_frontier(&cursor.frontier, &batch)?;
@@ -1399,7 +1479,7 @@ impl CapturedMixedSchedule {
         starts: BTreeMap<u64, BufferState>,
         provided: &BTreeMap<String, crate::TensorData>,
     ) -> Result<crate::EffectBatchEntry, ReplayError> {
-        Ok(self.stage(candidates, starts, provided, None, false)?.entry)
+        Ok(self.stage(candidates, starts, provided, None, None)?.entry)
     }
 
     fn stage(
@@ -1408,7 +1488,7 @@ impl CapturedMixedSchedule {
         starts: BTreeMap<u64, BufferState>,
         provided: &BTreeMap<String, crate::TensorData>,
         native: Option<NativeReplayContext<'_>>,
-        preserve_requested: bool,
+        requested: Option<&[u64]>,
     ) -> Result<StagedMixedReplay, ReplayError> {
         validate(self, true)?;
         let schedule = Schedule {
@@ -1458,8 +1538,8 @@ impl CapturedMixedSchedule {
             .iter()
             .map(|b| b.producer_output.id)
             .collect();
-        if preserve_requested {
-            for requested in &self.schedule.requested {
+        if let Some(requested) = requested {
+            for requested in requested {
                 if !pure.requested.contains(requested) {
                     pure.requested.push(*requested);
                 }
@@ -1493,9 +1573,8 @@ impl CapturedMixedSchedule {
             )?,
             None => super::captured_replay::replay_interpreter_items(&pure, &inputs)?,
         };
-        let outputs = if preserve_requested {
-            self.schedule
-                .requested
+        let outputs = if let Some(requested) = requested {
+            requested
                 .iter()
                 .map(|id| values.tensor(*id, "requested mixed output").cloned())
                 .collect::<Result<Vec<_>, _>>()?
@@ -2932,6 +3011,16 @@ mod tests {
         CapturedReplayExecutor, DType, EffectGraph, EffectRuntime, Shape, Storage, TensorData,
         schedule_effects,
     };
+
+    #[test]
+    fn recurrent_output_selection_is_an_exact_ordered_subset() {
+        let requested = [11, 17, 23, 29];
+        assert!(validate_requested_selection(&requested, &[]).is_ok());
+        assert!(validate_requested_selection(&requested, &[11, 23, 29]).is_ok());
+        assert!(validate_requested_selection(&requested, &[23, 17]).is_err());
+        assert!(validate_requested_selection(&requested, &[17, 17]).is_err());
+        assert!(validate_requested_selection(&requested, &[31]).is_err());
+    }
 
     fn captured_effect() -> CapturedMixedSchedule {
         let mut effects = EffectGraph::default();

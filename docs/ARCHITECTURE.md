@@ -1362,6 +1362,16 @@ Only a full-window commit or nonempty partial flush returns the immutable mean,
 total weight, and microbatch count; commit, flush, and `zero_grad` reset the
 numerator atomically. Checkpoint v8 authenticates and restores that lane, while
 programs without the option preserve their existing capture and v1--v7 bytes.
+
+#### CPU commit-only observation
+
+- Interpreter and strict-native CPU AdamW implement
+  `CompiledAdamWCommitOnlyRuntime` and its captured-rate extension.
+- Commit-only steps select loss plus enabled report scalars from the existing
+  authenticated output list, preserve transition validation and recurrent
+  publication, and return an empty named-output map.
+- Ordinary steps, captures, checkpoints, and Metal behavior are unchanged.
+
 The concrete `MetalCompiledAdamW` additionally exposes
 `step_without_host_outputs` for training iterations whose loss and named
 outputs do not need host observation. It executes the identical authenticated
