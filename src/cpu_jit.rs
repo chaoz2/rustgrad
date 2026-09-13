@@ -23,8 +23,15 @@ use std::{
 };
 #[path = "cpu_jit_random.rs"]
 mod random;
+mod schedule_module;
 mod store_group;
 pub(crate) mod symbolic_runtime;
+pub(crate) use schedule_module::{NativeScheduleModuleBuildMode, schedule_module_cache_key};
+use schedule_module::{compile_cached_schedule_module_under_gate, schedule_module_entry_symbol};
+#[cfg(test)]
+use schedule_module::{
+    render_schedule_module_source, schedule_module_local_symbol, schedule_module_manifest,
+};
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
@@ -34,6 +41,9 @@ const STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-c11-static-position-v1"
 const THREEFRY_RENDERER_VERSION: &str = "rustgrad-c11-live-threefry-v1";
 pub const ABI_VERSION: u32 = 2;
 const C11_COMPILER_COMMAND: &str = "cc";
+// This historical combined flag identity remains part of every durable native
+// cache key. Schedule-module construction may split compilation and linking,
+// but the final library retains the same semantic artifact identity.
 const C11_COMPILER_FLAGS: &[&str] = &[
     "-std=c11",
     "-O2",
@@ -749,13 +759,18 @@ impl JitScheduleDispatchScratch {
 /// A module is one content-addressed shared library even though every entry
 /// retains its own schedule ABI and call pointer. The durable-cache fact is
 /// observational and never participates in capture or replay identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct JitScheduleModuleLoad {
     pub(crate) durable_cache_hit: bool,
+    pub(crate) combined_compile_link_count: usize,
+    pub(crate) object_compile_count: usize,
+    pub(crate) linker_invocation_count: usize,
     pub(crate) compiler_invocation_count: usize,
     pub(crate) compiler_process_wall_time: Duration,
+    pub(crate) compiler_process_total_wall_time: Duration,
+    pub(crate) linker_process_wall_time: Duration,
     pub(crate) module_load_wall_time: Duration,
-    pub(crate) compiler_process_interval: Option<(Instant, Instant)>,
+    pub(crate) compiler_process_intervals: Vec<(Instant, Instant)>,
 }
 
 impl JitKernel {
@@ -4706,6 +4721,7 @@ fn cache_dir() -> PathBuf {
 static COMPILE_GATES: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
 static COMPILER_PROCESS_LIMIT: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
 static COMPILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MAX_COMPILER_PROCESS_COUNT: usize = 2;
 
 fn compile_gate(identity: String) -> Result<Arc<Mutex<()>>, JitError> {
     let mut gates = COMPILE_GATES
@@ -4730,7 +4746,7 @@ impl CompilerProcessPermit {
         let mut active = active
             .lock()
             .map_err(|_| std::io::Error::other("compiler-process limiter poisoned"))?;
-        while *active >= 2 {
+        while *active >= MAX_COMPILER_PROCESS_COUNT {
             active = available
                 .wait(active)
                 .map_err(|_| std::io::Error::other("compiler-process limiter poisoned"))?;
@@ -4762,178 +4778,6 @@ fn run_compiler(
     command
         .output()
         .map(|output| (output, (started, Instant::now())))
-}
-
-fn schedule_module_entry_symbol(index: usize) -> String {
-    format!("rustgrad_schedule_entry_{index:08x}")
-}
-
-fn schedule_module_local_symbol(index: usize, symbol: &str) -> String {
-    format!("rustgrad_schedule_{index:08x}_{symbol}")
-}
-
-fn render_schedule_module_source(rendered: &[RenderedC]) -> String {
-    let mut source = String::new();
-    for (index, entry) in rendered.iter().enumerate() {
-        source.push_str(&format!(
-            "#define rustgrad_kernel {}\n",
-            schedule_module_entry_symbol(index)
-        ));
-        for helper in C11LocalHelper::ALL {
-            let symbol = helper.name();
-            source.push_str(&format!(
-                "#define {symbol} {}\n",
-                schedule_module_local_symbol(index, symbol)
-            ));
-        }
-        source.push_str(&format!(
-            "#line 1 \"{}\"\n",
-            schedule_module_entry_symbol(index)
-        ));
-        source.push_str(&entry.source);
-        source.push_str("\n#undef rustgrad_kernel\n");
-        for helper in C11LocalHelper::ALL {
-            let symbol = helper.name();
-            source.push_str(&format!("#undef {symbol}\n"));
-        }
-    }
-    source.push_str(
-        "typedef int (*rg_schedule_entry_fn)(void **,const int64_t *,uint64_t *);\n\
-typedef struct { rg_schedule_entry_fn entry; void **buffers; const int64_t *symbols; } rg_schedule_call;\n\
-int rustgrad_schedule_dispatch(rg_schedule_call *calls,size_t count,uint64_t *failure){\n\
-  for(size_t i=0;i<count;i++){\n\
-    uint64_t local[2]={UINT64_MAX,0};\n\
-    int status=calls[i].entry(calls[i].buffers,calls[i].symbols,local);\n\
-    if(status!=0){failure[0]=(uint64_t)i;failure[1]=local[0];failure[2]=local[1];return status;}\n\
-  }\n\
-  return 0;\n\
-}\n",
-    );
-    source
-}
-
-fn schedule_module_manifest(rendered: &[RenderedC]) -> String {
-    let mut manifest = format!("rustgrad-c11-schedule-module-v3\u{1f}{}", rendered.len());
-    for helper in C11LocalHelper::ALL {
-        manifest.push('\u{1f}');
-        manifest.push_str(helper.name());
-    }
-    for (index, entry) in rendered.iter().enumerate() {
-        manifest.push('\u{1f}');
-        manifest.push_str(&schedule_module_entry_symbol(index));
-        manifest.push('\u{1f}');
-        manifest.push_str(&entry.cache_key);
-    }
-    manifest
-}
-
-pub(crate) fn schedule_module_cache_key(rendered: &[RenderedC]) -> String {
-    native_cache_key("schedule-module-v3", &schedule_module_manifest(rendered))
-}
-
-/// Compiles one helper-isolated C translation unit into one shared schedule
-/// module. Declarative macros bind the renderer's public entry and closed local
-/// symbol set without parsing or rewriting generated C.
-fn compile_cached_schedule_module_under_gate(
-    rendered: &[RenderedC],
-) -> Result<(PathBuf, JitScheduleModuleLoad), JitError> {
-    let cache_key = schedule_module_cache_key(rendered);
-    let directory = cache_dir();
-    fs::create_dir_all(&directory).map_err(|error| JitError::Io(error.to_string()))?;
-    let library = directory.join(format!(
-        "{cache_key}.{}",
-        if cfg!(target_os = "macos") {
-            "dylib"
-        } else {
-            "so"
-        }
-    ));
-    match fs::symlink_metadata(&library) {
-        Ok(metadata) if metadata.file_type().is_file() => {
-            return Ok((
-                library,
-                JitScheduleModuleLoad {
-                    durable_cache_hit: true,
-                    compiler_invocation_count: 0,
-                    compiler_process_wall_time: Duration::ZERO,
-                    module_load_wall_time: Duration::ZERO,
-                    compiler_process_interval: None,
-                },
-            ));
-        }
-        Ok(_) => {
-            return Err(JitError::Io(format!(
-                "CPU JIT cache entry is not a regular file: {}",
-                library.display()
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(JitError::Io(error.to_string())),
-    }
-    let sequence = COMPILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let stem = format!(".{cache_key}-{}-{sequence}", std::process::id());
-    let source = directory.join(format!("{stem}.c"));
-    fs::write(&source, render_schedule_module_source(rendered))
-        .map_err(|error| JitError::Io(error.to_string()))?;
-    let temporary = directory.join(format!("{stem}.tmp"));
-    let result = (|| {
-        let (output, (compiler_started, compiler_finished)) = run_compiler(
-            Command::new(C11_COMPILER_COMMAND)
-                .args(C11_COMPILER_FLAGS)
-                .arg("-o")
-                .arg(&temporary)
-                .arg(&source),
-        )
-        .map_err(|error| JitError::Compiler {
-            status: None,
-            stderr: error.to_string(),
-        })?;
-        let compiler_process_wall_time = compiler_finished.duration_since(compiler_started);
-        if !output.status.success() {
-            return Err(JitError::Compiler {
-                status: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr)
-                    .chars()
-                    .take(8192)
-                    .collect(),
-            });
-        }
-        fs::File::open(&temporary)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| JitError::Io(error.to_string()))?;
-        match fs::rename(&temporary, &library) {
-            Ok(()) => Ok((
-                library.clone(),
-                JitScheduleModuleLoad {
-                    durable_cache_hit: false,
-                    compiler_invocation_count: 1,
-                    compiler_process_wall_time,
-                    module_load_wall_time: Duration::ZERO,
-                    compiler_process_interval: Some((compiler_started, compiler_finished)),
-                },
-            )),
-            Err(error) => match fs::symlink_metadata(&library) {
-                // Another process won publication after this process compiled.
-                // The accepted artifact is reusable, but preparation still did
-                // one real compiler invocation and therefore was not a durable
-                // cache hit for this caller.
-                Ok(metadata) if metadata.file_type().is_file() => Ok((
-                    library.clone(),
-                    JitScheduleModuleLoad {
-                        durable_cache_hit: false,
-                        compiler_invocation_count: 1,
-                        compiler_process_wall_time,
-                        module_load_wall_time: Duration::ZERO,
-                        compiler_process_interval: Some((compiler_started, compiler_finished)),
-                    },
-                )),
-                _ => Err(JitError::Io(error.to_string())),
-            },
-        }
-    })();
-    let _ = fs::remove_file(&source);
-    let _ = fs::remove_file(&temporary);
-    result
 }
 
 #[cfg(test)]
@@ -6705,7 +6549,15 @@ mod tests {
         let (kernels, dispatcher, cold) = JitKernel::load_schedule_module(&rendered).unwrap();
         assert_eq!(kernels.len(), 2);
         assert!(!cold.durable_cache_hit);
+        assert_eq!(cold.combined_compile_link_count, 1);
+        assert_eq!(cold.object_compile_count, 0);
+        assert_eq!(cold.linker_invocation_count, 0);
         assert_eq!(cold.compiler_invocation_count, 1);
+        assert_eq!(
+            cold.compiler_process_total_wall_time,
+            cold.compiler_process_wall_time
+        );
+        assert_eq!(cold.compiler_process_intervals.len(), 1);
         assert!(Arc::ptr_eq(&kernels[0]._library, &kernels[1]._library));
         assert_eq!(kernels[0].abi, rendered[0].abi);
         assert_eq!(kernels[1].abi, rendered[1].abi);
@@ -6751,8 +6603,13 @@ mod tests {
         let (restored, _, warm) = JitKernel::load_schedule_module(&rendered).unwrap();
         assert_eq!(restored.len(), 2);
         assert!(warm.durable_cache_hit);
+        assert_eq!(warm.combined_compile_link_count, 0);
+        assert_eq!(warm.object_compile_count, 0);
+        assert_eq!(warm.linker_invocation_count, 0);
         assert_eq!(warm.compiler_invocation_count, 0);
         assert_eq!(warm.compiler_process_wall_time, Duration::ZERO);
+        assert_eq!(warm.compiler_process_total_wall_time, Duration::ZERO);
+        assert!(warm.compiler_process_intervals.is_empty());
         drop(restored);
         std::fs::remove_file(path).unwrap();
     }

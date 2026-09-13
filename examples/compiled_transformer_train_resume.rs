@@ -1807,6 +1807,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     const EXPECTED_MAIN_RENDERED_ENTRIES: usize = 787 - EXPECTED_ADAMW_UPDATE_GROUPS * 3;
     const EXPECTED_ACCUMULATION_RENDERED_ENTRIES: usize = 465;
     const EXPECTED_SHARED_ACCUMULATION_PREFIX: usize = 319;
+    const EXPECTED_COLD_COMPILER_PROCESSES: usize = 6;
     // One accumulator per update group, plus loss numerator, index, and token count.
     const EXPECTED_ZERO_GRAD_ENTRIES: usize = EXPECTED_ADAMW_UPDATE_GROUPS + 3;
 
@@ -1872,7 +1873,12 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         EXPECTED_MAIN_RENDERED_ENTRIES
     );
     assert_eq!(main_preparation.work().shared_prefix_entry_count(), 0);
-    assert!(main_preparation.work().compiler_invocation_count() <= 1);
+    assert!(main_preparation.work().compiler_invocation_count() <= 3);
+    if main_preparation.work().compiler_invocation_count() != 0 {
+        assert_eq!(main_preparation.work().combined_compile_link_count(), 0);
+        assert_eq!(main_preparation.work().object_compile_count(), 2);
+        assert_eq!(main_preparation.work().linker_invocation_count(), 1);
+    }
     let accumulation_preparation = session
         .preparation_report()
         .accumulation()
@@ -1926,6 +1932,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         partial_preparation.work().rendered_entry_count()
     );
     assert_eq!(partial_preparation.work().referenced_module_count(), 1);
+    assert!(partial_preparation.work().compiler_invocation_count() <= 1);
     assert_eq!(
         session
             .preparation_report()
@@ -1947,6 +1954,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         EXPECTED_ZERO_GRAD_ENTRIES
     );
     assert_eq!(zero_grad_preparation.work().referenced_module_count(), 1);
+    assert!(zero_grad_preparation.work().compiler_invocation_count() <= 1);
     assert_eq!(
         [
             main_preparation,
@@ -1959,7 +1967,9 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         .sum::<usize>(),
         1_118
     );
-    assert!(session.preparation_report().compiler_process_count() <= 4);
+    assert!(
+        session.preparation_report().compiler_process_count() <= EXPECTED_COLD_COMPILER_PROCESSES
+    );
     assert!(
         session
             .preparation_report()
@@ -1967,7 +1977,10 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             <= 2
     );
     if env::var_os("RUSTGRAD_REQUIRE_COLD_NATIVE_SCOREBOARD").is_some() {
-        assert_eq!(session.preparation_report().compiler_process_count(), 4);
+        assert_eq!(
+            session.preparation_report().compiler_process_count(),
+            EXPECTED_COLD_COMPILER_PROCESSES
+        );
         assert_eq!(
             session
                 .preparation_report()
@@ -1986,6 +1999,17 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
                 .parallel_module_overlap_wall_time()
                 > Duration::ZERO
         );
+        assert_eq!(main_preparation.work().object_compile_count(), 2);
+        assert_eq!(main_preparation.work().linker_invocation_count(), 1);
+        for preparation in [
+            accumulation_preparation,
+            partial_preparation,
+            zero_grad_preparation,
+        ] {
+            assert_eq!(preparation.work().combined_compile_link_count(), 1);
+            assert_eq!(preparation.work().object_compile_count(), 0);
+            assert_eq!(preparation.work().linker_invocation_count(), 0);
+        }
     }
     let mut scoreboard = NativeTrainingScoreboard::new(
         inspection.clone(),
@@ -2079,7 +2103,12 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         expected_main_rendered_entries
     );
     assert_eq!(report.main().shared_prefix_entry_count(), 0);
-    assert!(report.main().compiler_invocation_count() <= 1);
+    assert!(report.main().compiler_invocation_count() <= 3);
+    if report.main().compiler_invocation_count() != 0 {
+        assert_eq!(report.main().combined_compile_link_count(), 0);
+        assert_eq!(report.main().object_compile_count(), 2);
+        assert_eq!(report.main().linker_invocation_count(), 1);
+    }
     let accumulation_program = report
         .accumulation()
         .expect("current scoreboard reports accumulation preparation");

@@ -268,10 +268,15 @@ pub(crate) struct NativeScheduleModulePreparation {
     pub(crate) loaded_module_count: usize,
     pub(crate) durable_artifact_cache_hit_count: usize,
     pub(crate) durable_artifact_cache_miss_count: usize,
+    pub(crate) combined_compile_link_count: usize,
+    pub(crate) object_compile_count: usize,
+    pub(crate) linker_invocation_count: usize,
     pub(crate) compiler_invocation_count: usize,
     pub(crate) layout_wall_time: Duration,
     pub(crate) render_wall_time: Duration,
     pub(crate) compiler_process_wall_time: Duration,
+    pub(crate) compiler_process_total_wall_time: Duration,
+    pub(crate) linker_process_wall_time: Duration,
     pub(crate) module_load_wall_time: Duration,
     pub(crate) residual_wall_time: Duration,
 }
@@ -1391,11 +1396,12 @@ impl CpuJitBackend {
         }
         let compiler_intervals = compiled
             .values()
-            .filter_map(|(result, _)| {
+            .flat_map(|(result, _)| {
                 result
                     .as_ref()
                     .ok()
-                    .and_then(|(_, load)| load.compiler_process_interval)
+                    .into_iter()
+                    .flat_map(|(_, load)| load.compiler_process_intervals.iter().copied())
             })
             .collect::<Vec<_>>();
         let work_intervals = compiled
@@ -1656,9 +1662,11 @@ impl CpuJitBackend {
             prepared_program_entries.push(entry_bindings);
             prepared.sort_by_key(PreparedNativeDispatch::logical_anchor);
             let compiler_process_wall_time = load
+                .as_ref()
                 .map(|load| load.compiler_process_wall_time)
                 .unwrap_or(Duration::ZERO);
             let module_load_wall_time = load
+                .as_ref()
                 .map(|load| load.module_load_wall_time)
                 .unwrap_or(Duration::ZERO);
             let job_residual = job_interval
@@ -1686,17 +1694,40 @@ impl CpuJitBackend {
                     .then_some(reuse.source_program),
                 loaded_module_count: usize::from(unique_rendered_entry_count != 0),
                 durable_artifact_cache_hit_count: load
+                    .as_ref()
                     .map(|load| usize::from(load.durable_cache_hit))
                     .unwrap_or(0),
                 durable_artifact_cache_miss_count: load
+                    .as_ref()
                     .map(|load| usize::from(!load.durable_cache_hit))
                     .unwrap_or(0),
+                combined_compile_link_count: load
+                    .as_ref()
+                    .map(|load| load.combined_compile_link_count)
+                    .unwrap_or(0),
+                object_compile_count: load
+                    .as_ref()
+                    .map(|load| load.object_compile_count)
+                    .unwrap_or(0),
+                linker_invocation_count: load
+                    .as_ref()
+                    .map(|load| load.linker_invocation_count)
+                    .unwrap_or(0),
                 compiler_invocation_count: load
+                    .as_ref()
                     .map(|load| load.compiler_invocation_count)
                     .unwrap_or(0),
                 layout_wall_time: Duration::ZERO,
                 render_wall_time: module.render_wall_time,
                 compiler_process_wall_time,
+                compiler_process_total_wall_time: load
+                    .as_ref()
+                    .map(|load| load.compiler_process_total_wall_time)
+                    .unwrap_or(Duration::ZERO),
+                linker_process_wall_time: load
+                    .as_ref()
+                    .map(|load| load.linker_process_wall_time)
+                    .unwrap_or(Duration::ZERO),
                 module_load_wall_time,
                 residual_wall_time,
             };
