@@ -57,15 +57,16 @@ use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
     Backend, CapturedReplayExecutor, CompiledAdamWCheckpoint, CompiledAdamWConfig,
     CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWPlan,
-    CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig,
-    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
-    CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
-    CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledScheduledAdamWRuntime,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
-    CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, LossOptions, MetalSessionTarget, Module,
-    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuCompiledEvaluationResult,
-    NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Parameter, Reduction, Result, Scalar,
-    Shape, TensorData, TrainingDropoutProvider, TransformerBlock, sparse_categorical_cross_entropy,
+    CompiledAdamWProgramArtifact, CompiledAdamWRuntime, CompiledAdamWStep,
+    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
+    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
+    CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan, CompiledModuleAdamWSession,
+    CompiledMultiStepLr, CompiledScheduledAdamWRuntime, CompiledTrainingRuntime,
+    CompiledTrainingStep, CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget,
+    DType, Graph, LossOptions, MetalSessionTarget, Module, NativeCpuCompiledAdamW,
+    NativeCpuCompiledAdamWStepResult, NativeCpuCompiledEvaluationResult, NativeCpuSessionTarget,
+    NativeTrainingScoreboard, NodeId, Parameter, Reduction, Result, Scalar, Shape, TensorData,
+    TrainingDropoutProvider, TransformerBlock, sparse_categorical_cross_entropy,
 };
 use std::{
     cell::Cell,
@@ -1392,6 +1393,7 @@ fn assert_native_file_resume_preparation(
     let preparation = session.native_cpu_preparation_report();
     for program in [
         Some(preparation.main()),
+        preparation.accumulation(),
         preparation.partial_flush(),
         preparation.zero_grad(),
         preparation.evaluation(),
@@ -1431,10 +1433,24 @@ fn run_native_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
     let target = NativeCpuSessionTarget::new(&executor)
         .vectorized(true)
         .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let preparations = Cell::new(0_u64);
     run_file_resume::<NativeCpuCompiledAdamW<'_>, _, _, _, _>(
         "native CPU file resume",
         |plan| plan.prepare(&target).map_err(|error| error.into_parts().1),
-        assert_native_file_resume_preparation,
+        |session| {
+            assert_native_file_resume_preparation(session);
+            let invocation = preparations.get();
+            if invocation > 0 {
+                assert_eq!(
+                    session
+                        .native_cpu_preparation_report()
+                        .compiler_process_count(),
+                    0,
+                    "artifact-restored preparation must reuse durable native modules"
+                );
+            }
+            preparations.set(invocation + 1);
+        },
         assert_native_file_resume_step,
         assert_native_file_resume_evaluation,
     )
@@ -1486,6 +1502,11 @@ where
     let evaluation_identity = source_plan
         .evaluation_capture_identity()
         .expect("the compiler-owned token-mean evaluator is attached");
+    let program_artifact = source_plan.program_artifact()?;
+    let artifact_file = TemporaryCheckpointFile::new()?;
+    fs::write(artifact_file.path(), program_artifact.as_bytes())?;
+    let program_artifact =
+        CompiledAdamWProgramArtifact::from_bytes(fs::read(artifact_file.path())?)?;
     assert_eq!(source_plan.captured_multi_step_lr(), Some(&schedule));
     let mut uninterrupted = prepare(source_plan)?;
     validate_preparation(&uninterrupted);
@@ -1590,15 +1611,11 @@ where
     let tied_alias = tied_alias.expect("the destination exposes the tied output head");
     assert_eq!(tied_alias.id(), destination_tied_identity);
 
-    let restored_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout_from_module_checkpoint(
-        config,
-        dropout_config(),
+    let restored_plan = CompiledModuleAdamWPlan::restore_from_program_artifact(
         destination,
+        &program_artifact,
         &decoded,
-        build_file_resume,
     )
-    .map_err(|error| error.into_parts().1)?
-    .with_evaluation_graph(build_file_resume_evaluation)
     .map_err(|error| error.into_parts().1)?;
     assert_eq!(restored_plan.capture_identity(), capture_identity);
     assert_eq!(
@@ -1664,7 +1681,32 @@ where
         );
         assert_eq!(actual_checkpoint, expected_checkpoint);
     }
-    assert_eq!(resumed.optimizer_step()?, 3);
+    let expected_partial = uninterrupted.step_batch_scheduled(file_resume_batch(10)?)?;
+    let actual_partial = resumed.step_batch_scheduled(file_resume_batch(10)?)?;
+    validate_step(&expected_partial);
+    validate_step(&actual_partial);
+    assert_eq!(actual_partial.loss(), expected_partial.loss());
+    assert_eq!(actual_partial.outputs(), expected_partial.outputs());
+    let expected_flush = uninterrupted.flush_partial_window_scheduled()?;
+    let actual_flush = resumed.flush_partial_window_scheduled()?;
+    assert_eq!(actual_flush.did_update(), expected_flush.did_update());
+    assert_eq!(
+        actual_flush.optimizer_step(),
+        expected_flush.optimizer_step()
+    );
+    assert_eq!(actual_flush.flushed_microbatches(), 1);
+    let expected_discard = uninterrupted.step_batch_scheduled(file_resume_batch(11)?)?;
+    let actual_discard = resumed.step_batch_scheduled(file_resume_batch(11)?)?;
+    validate_step(&expected_discard);
+    validate_step(&actual_discard);
+    assert_eq!(actual_discard.loss(), expected_discard.loss());
+    assert_eq!(actual_discard.outputs(), expected_discard.outputs());
+    let expected_reset = uninterrupted.zero_grad()?;
+    let actual_reset = resumed.zero_grad()?;
+    assert_eq!(actual_reset, expected_reset);
+    assert_eq!(actual_reset.discarded_microbatches(), 1);
+    assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
+    assert_eq!(resumed.optimizer_step()?, 4);
     assert_eq!(resumed.accumulation_index()?, 0);
     for (_, parameter, _, before) in &destination_states {
         let after = parameter.snapshot()?;
@@ -1767,7 +1809,7 @@ where
         "file-resumed two-block causal Transformer loss did not decrease: {initial_loss} -> {final_loss}"
     );
     println!(
-        "{target_name}: capture={capture_identity:016x}, checkpoint=(replay=4, optimizer=1, accumulation=1), optimizer_steps=3, eval_mean_sparse_loss={initial_loss:.6} -> {final_loss:.6}, exact_resume=true, different_init=true, published=true"
+        "{target_name}: capture={capture_identity:016x}, checkpoint=(replay=4, optimizer=1, accumulation=1), optimizer_steps=4, eval_mean_sparse_loss={initial_loss:.6} -> {final_loss:.6}, exact_resume=true, different_init=true, published=true"
     );
     Ok(())
 }
