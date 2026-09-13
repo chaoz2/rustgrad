@@ -9,14 +9,15 @@ use rustgrad::runtime::metal::{
 use rustgrad::{
     Backend, BinaryOp, CapturedReplayExecutor, CapturedReplayOptions, CapturedSchedule, CompareOp,
     CompiledAdamWCheckpoint, CompiledAdamWClipReport, CompiledAdamWConfig, CompiledAdamWFlush,
-    CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWObjective, CompiledAdamWPlan,
-    CompiledAdamWRuntime, CompiledAdamWStep, CompiledAdamWStepResult,
-    CompiledAdamWWindowLossReport, CompiledCheckpointRuntime, CompiledDropoutConfig,
-    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
-    CompiledInputSpec, CompiledModuleAdamWPlan, CompiledMultiStepLr, CompiledTrainingRuntime,
-    CompiledTrainingStep, CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget,
-    DType, Error, Graph, LossOptions, MetalCompiledAdamWPlan, Module,
-    NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeCpuCompiledAdamW,
+    CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWIgnoreIndexContext,
+    CompiledAdamWObjective, CompiledAdamWPlan, CompiledAdamWProgramArtifact, CompiledAdamWRuntime,
+    CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWWindowLossReport,
+    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
+    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
+    CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan, CompiledModuleAdamWSession,
+    CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
+    CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions,
+    MetalCompiledAdamWPlan, Module, NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeCpuCompiledAdamW,
     NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget, NativeTrainingReport,
     NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
     TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy, load_safetensors,
@@ -319,6 +320,24 @@ impl TwoBlockPositionalGpt {
     }
 
     fn forward_eval(&self, graph: &mut Graph, tokens: NodeId) -> Result<NodeId> {
+        self.forward_eval_with_optional_attention_mask(graph, tokens, None)
+    }
+
+    fn forward_eval_with_attention_mask(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        attention_mask: NodeId,
+    ) -> Result<NodeId> {
+        self.forward_eval_with_optional_attention_mask(graph, tokens, Some(attention_mask))
+    }
+
+    fn forward_eval_with_optional_attention_mask(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        attention_mask: Option<NodeId>,
+    ) -> Result<NodeId> {
         let token_hidden = self.tokens.forward(graph, tokens)?;
         let positions = graph.constant(TensorData::from_scalars(
             [BATCH, TIME],
@@ -327,8 +346,22 @@ impl TwoBlockPositionalGpt {
         )?);
         let position_hidden = self.positions.forward(graph, positions)?;
         let hidden = graph.add(token_hidden, position_hidden)?;
-        let hidden = self.first.forward_mode(graph, hidden, Mode::Eval)?.output;
-        let hidden = self.second.forward_mode(graph, hidden, Mode::Eval)?.output;
+        let hidden = match attention_mask {
+            Some(mask) => {
+                self.first
+                    .forward_mode_with_attention_mask(graph, hidden, mask, Mode::Eval)?
+                    .output
+            }
+            None => self.first.forward_mode(graph, hidden, Mode::Eval)?.output,
+        };
+        let hidden = match attention_mask {
+            Some(mask) => {
+                self.second
+                    .forward_mode_with_attention_mask(graph, hidden, mask, Mode::Eval)?
+                    .output
+            }
+            None => self.second.forward_mode(graph, hidden, Mode::Eval)?.output,
+        };
         let hidden = self.norm.forward(graph, hidden)?;
         let tied_weight = self.tokens.weight.bind(graph)?;
         let tied_weight = graph.permute(tied_weight, [1, 0])?;
@@ -518,15 +551,11 @@ fn two_block_policy_frontier_config() -> CompiledAdamWConfig {
         .unwrap()
         .with_host_token_input("tokens", [BATCH, TIME])
         .unwrap()
-        .with_host_token_input("targets", [BATCH, TIME])
+        // Sparse loss lowers targets through source-literal one-hot comparison;
+        // only tokens drive the authenticated embedding Gather/ScatterAdd.
+        .with_input("targets", [BATCH, TIME], DType::I32)
         .unwrap()
         .with_input(ATTENTION_DROPOUT_TRANSITION_GUARD, [], DType::F32)
-        .unwrap()
-        .with_input(
-            ATTENTION_KEEP_MASK,
-            POLICY_ATTENTION_KEEP_MASK_SHAPE,
-            DType::Bool,
-        )
         .unwrap()
         .with_token_weighted_ignore_index("targets", POLICY_IGNORE_INDEX)
         .unwrap()
@@ -801,13 +830,16 @@ fn build_two_block_policy_frontier(
     model: &TwoBlockPositionalGpt,
     graph: &mut Graph,
     inputs: &BTreeMap<String, NodeId>,
+    ignore_index: CompiledAdamWIgnoreIndexContext,
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<CompiledAdamWGraph> {
+    let attention_keep_mask =
+        graph.reshape(ignore_index.validity(), POLICY_ATTENTION_KEEP_MASK_SHAPE)?;
     let (logits, outputs) = forward_two_block_with_attention_dropout(
         model,
         graph,
         inputs,
-        Some(inputs[ATTENTION_KEEP_MASK]),
+        Some(attention_keep_mask),
         dropout,
     )?;
     let losses = sparse_categorical_cross_entropy(
@@ -824,6 +856,32 @@ fn build_two_block_policy_frontier(
     let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
     let losses = graph.add(losses, guard)?;
     Ok(CompiledAdamWGraph::token_mean(losses, outputs))
+}
+
+fn build_two_block_policy_evaluation(
+    model: &TwoBlockPositionalGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    ignore_index: CompiledAdamWIgnoreIndexContext,
+) -> Result<CompiledAdamWGraph> {
+    let attention_keep_mask =
+        graph.reshape(ignore_index.validity(), POLICY_ATTENTION_KEEP_MASK_SHAPE)?;
+    let logits =
+        model.forward_eval_with_attention_mask(graph, inputs["tokens"], attention_keep_mask)?;
+    let losses = sparse_categorical_cross_entropy(
+        graph,
+        logits,
+        inputs["targets"],
+        LossOptions {
+            reduction: Reduction::None,
+            class_axis: 2,
+            ignore_index: Some(i64::from(POLICY_IGNORE_INDEX)),
+            label_smoothing: 0.0,
+        },
+    )?;
+    let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
+    let losses = graph.add(losses, guard)?;
+    Ok(CompiledAdamWGraph::token_mean(losses, BTreeMap::new()))
 }
 
 fn forward_two_block_with_attention_dropout(
@@ -1053,14 +1111,6 @@ fn policy_frontier_batch(replay: u64) -> BTreeMap<String, TensorData> {
             targets[lane] = POLICY_IGNORE_INDEX;
         }
     }
-    let attention_keep_mask = TensorData::from_scalars(
-        POLICY_ATTENTION_KEEP_MASK_SHAPE,
-        DType::Bool,
-        targets
-            .into_iter()
-            .map(|target| Scalar::Bool(target != POLICY_IGNORE_INDEX)),
-    )
-    .unwrap();
     BTreeMap::from([
         ("tokens".into(), token_tensor(tokens)),
         ("targets".into(), token_tensor(targets)),
@@ -1068,7 +1118,6 @@ fn policy_frontier_batch(replay: u64) -> BTreeMap<String, TensorData> {
             ATTENTION_DROPOUT_TRANSITION_GUARD.into(),
             TensorData::scalar(1.0),
         ),
-        (ATTENTION_KEEP_MASK.into(), attention_keep_mask),
     ])
 }
 
@@ -1752,6 +1801,22 @@ struct PyTorchPolicyPendingCheckpointFixture {
 }
 
 #[derive(Deserialize)]
+struct PyTorchPolicyEvaluationPointFixture {
+    replay_step: u64,
+    optimizer_step: u64,
+    batch_losses: [f32; 3],
+    token_mean_loss: f64,
+}
+
+#[derive(Deserialize)]
+struct PyTorchPolicyEvaluationFixture {
+    batch_replays: [u64; 3],
+    valid_token_counts: [u64; 3],
+    total_valid_token_count: u64,
+    points: Vec<PyTorchPolicyEvaluationPointFixture>,
+}
+
+#[derive(Deserialize)]
 struct PyTorchPolicyFrontierFixture {
     rustgrad_base: String,
     weight_decay: f32,
@@ -1770,6 +1835,7 @@ struct PyTorchPolicyFrontierFixture {
     commits: Vec<PyTorchPolicyAdamWWindowFixture>,
     pending_checkpoint: PyTorchPolicyPendingCheckpointFixture,
     partial_flush: PyTorchPolicyAdamWWindowFixture,
+    evaluation: PyTorchPolicyEvaluationFixture,
 }
 
 #[derive(Deserialize)]
@@ -2320,6 +2386,7 @@ fn assert_policy_frontier_replay(step: &CompiledAdamWStepResult, expected: &PyTo
     assert_eq!(step.loss_weight(), expected.valid_token_count);
     let inputs = policy_frontier_batch(replay);
     assert!(!inputs.contains_key(LOSS_MASK));
+    assert!(!inputs.contains_key(ATTENTION_KEEP_MASK));
     assert_eq!(
         inputs["tokens"]
             .to_vec_f64()
@@ -2335,19 +2402,6 @@ fn assert_policy_frontier_replay(step: &CompiledAdamWStepResult, expected: &PyTo
             .map(|value| value as i32)
             .collect::<Vec<_>>(),
         expected.targets
-    );
-    assert_eq!(
-        inputs[ATTENTION_KEEP_MASK].shape(),
-        &Shape::new(POLICY_ATTENTION_KEEP_MASK_SHAPE)
-    );
-    assert_eq!(inputs[ATTENTION_KEEP_MASK].dtype(), DType::Bool);
-    assert_eq!(
-        inputs[ATTENTION_KEEP_MASK]
-            .to_vec_f64()
-            .into_iter()
-            .map(|value| value != 0.0)
-            .collect::<Vec<_>>(),
-        expected.attention_keep_mask
     );
     assert_eq!(expected.attention_keep_mask.len(), BATCH * TIME);
     assert_eq!(
@@ -2454,6 +2508,137 @@ fn assert_policy_window_report(
         f64::from(report.mean_loss()),
         f64::from(expected.mean_loss),
     );
+}
+
+fn assert_policy_evaluation_point<R, F>(
+    session: &mut CompiledModuleAdamWSession<TwoBlockPositionalGpt, R>,
+    evaluation: &PyTorchPolicyEvaluationFixture,
+    expected: &PyTorchPolicyEvaluationPointFixture,
+    mut inspect: F,
+) -> ([f64; 3], f64)
+where
+    R: CompiledAdamWRuntime + CompiledEvaluationRuntime,
+    F: FnMut(&R::Evaluation),
+{
+    let checkpoint_before = session.module_checkpoint().unwrap();
+    let info = checkpoint_before.optimizer_checkpoint().info();
+    assert_eq!(info.replay_step(), expected.replay_step);
+    assert_eq!(info.optimizer_step(), expected.optimizer_step);
+    assert_eq!(info.accumulation_index(), 0);
+    assert_eq!(info.accumulated_token_count(), Some(0));
+    assert_eq!(
+        info.dropout_block_counter(),
+        Some(expected.replay_step * 84)
+    );
+    let evaluation_capture_identity = session.evaluation_capture_identity().unwrap();
+    assert_eq!(
+        checkpoint_before.evaluation_capture_identity(),
+        Some(evaluation_capture_identity)
+    );
+    let accumulators_before = session.gradient_accumulator_snapshots().unwrap();
+    let mut weighted_loss = 0.0;
+    let mut losses = [0.0; 3];
+    for (batch, ((replay, token_count), expected_loss)) in evaluation
+        .batch_replays
+        .iter()
+        .zip(evaluation.valid_token_counts)
+        .zip(expected.batch_losses)
+        .enumerate()
+    {
+        let actual = session.evaluate(policy_frontier_batch(*replay)).unwrap();
+        inspect(&actual);
+        assert_eq!(actual.capture_identity(), evaluation_capture_identity);
+        assert!(actual.outputs().is_empty());
+        assert_eq!(actual.loss_weight(), token_count);
+        losses[batch] = actual.loss().scalar_at(0).as_f64();
+        assert_pytorch_scalar_close(
+            &format!(
+                "policy evaluation replay {} optimizer {} batch {batch}",
+                expected.replay_step, expected.optimizer_step
+            ),
+            actual.loss().scalar_at(0).as_f64(),
+            f64::from(expected_loss),
+        );
+        weighted_loss += actual.loss().scalar_at(0).as_f64() * token_count as f64;
+        assert_eq!(session.module_checkpoint().unwrap(), checkpoint_before);
+        assert_eq!(
+            session.gradient_accumulator_snapshots().unwrap(),
+            accumulators_before
+        );
+    }
+    assert_eq!(
+        evaluation.valid_token_counts.iter().sum::<u64>(),
+        evaluation.total_valid_token_count
+    );
+    let aggregate_loss = weighted_loss / evaluation.total_valid_token_count as f64;
+    assert_pytorch_scalar_close(
+        &format!(
+            "policy evaluation replay {} optimizer {} aggregate",
+            expected.replay_step, expected.optimizer_step
+        ),
+        aggregate_loss,
+        expected.token_mean_loss,
+    );
+    (losses, aggregate_loss)
+}
+
+fn assert_native_policy_evaluation_from_checkpoint(
+    artifact: &CompiledAdamWProgramArtifact,
+    checkpoint: &CompiledModuleAdamWCheckpoint,
+    evaluation: &PyTorchPolicyEvaluationFixture,
+    expected: &PyTorchPolicyEvaluationPointFixture,
+    expected_losses: ([f64; 3], f64),
+    executor: &CapturedReplayExecutor,
+) {
+    let model = TwoBlockPositionalGpt::new_with_attention_dropout(0x8765, 0.25).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    let plan = CompiledModuleAdamWPlan::restore_from_program_artifact(model, artifact, checkpoint)
+        .unwrap();
+    let target = NativeCpuSessionTarget::new(executor);
+    let mut session = plan.prepare(&target).unwrap();
+    assert_eq!(&session.module_checkpoint().unwrap(), checkpoint);
+    let losses = assert_policy_evaluation_point(&mut session, evaluation, expected, |actual| {
+        assert_eq!(actual.report().fallback_count(), 0);
+        assert!(actual.report().executed_native_item_count() > 0);
+        assert!(actual.report().module_dispatched_native_item_count() > 0);
+    });
+    for (batch, (actual, expected)) in losses.0.into_iter().zip(expected_losses.0).enumerate() {
+        assert_pytorch_scalar_close(
+            &format!("policy native/interpreted evaluation batch {batch}"),
+            actual,
+            expected,
+        );
+    }
+    assert_pytorch_scalar_close(
+        "policy native/interpreted evaluation aggregate",
+        losses.1,
+        expected_losses.1,
+    );
+    assert_eq!(&session.module_checkpoint().unwrap(), checkpoint);
+    let model = session.into_module_without_publication();
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
+}
+
+fn assert_policy_evaluation_frontier(
+    session: &mut CompiledModuleAdamWSession<TwoBlockPositionalGpt, CpuCompiledAdamW>,
+    artifact: &CompiledAdamWProgramArtifact,
+    evaluation: &PyTorchPolicyEvaluationFixture,
+    expected: &PyTorchPolicyEvaluationPointFixture,
+    executor: &CapturedReplayExecutor,
+) -> f64 {
+    let checkpoint = session.module_checkpoint().unwrap();
+    let losses = assert_policy_evaluation_point(session, evaluation, expected, |_| {});
+    assert_native_policy_evaluation_from_checkpoint(
+        artifact,
+        &checkpoint,
+        evaluation,
+        expected,
+        losses,
+        executor,
+    );
+    losses.1
 }
 
 fn assert_compiled_adamw_steps_exact(
@@ -8716,13 +8901,20 @@ fn compiled_two_block_policy_frontier_matches_pytorch_across_resume_and_flush() 
 
     let compile_count = Cell::new(0);
     let optimizer = two_block_policy_frontier_config();
-    let plan = CompiledAdamWPlan::compile_module_graph_with_dropout(
+    assert_eq!(
+        optimizer
+            .host_token_inputs()
+            .map(|(name, shape)| (name, shape.dims()))
+            .collect::<Vec<_>>(),
+        [("tokens", &[BATCH, TIME][..])]
+    );
+    let plan = CompiledAdamWPlan::compile_module_graph_with_dropout_and_ignore_index(
         optimizer.clone(),
         dropout_config(),
         &model,
-        |model, graph, inputs, dropout| {
+        |model, graph, inputs, ignore_index, dropout| {
             compile_count.set(compile_count.get() + 1);
-            build_two_block_policy_frontier(model, graph, inputs, dropout)
+            build_two_block_policy_frontier(model, graph, inputs, ignore_index, dropout)
         },
     )
     .unwrap();
@@ -9002,6 +9194,106 @@ fn compiled_two_block_policy_frontier_matches_pytorch_across_resume_and_flush() 
     assert_eq!(model.state_dict().unwrap(), state_before);
     assert_eq!(module_parameter_state(&model), parameter_state_before);
     assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_evaluation_loss_trajectory_matches_pytorch_without_state_change() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+
+    let fixture = two_block_pytorch_fixture();
+    let policy = &fixture.policy_frontier;
+    let evaluation = &policy.evaluation;
+    assert_eq!(evaluation.batch_replays, [1, 2, 3]);
+    assert_eq!(evaluation.valid_token_counts, [5, 3, 3]);
+    assert_eq!(evaluation.total_valid_token_count, 11);
+    assert_eq!(evaluation.points.len(), 4);
+    assert_eq!(
+        evaluation
+            .points
+            .iter()
+            .map(|point| (point.replay_step, point.optimizer_step))
+            .collect::<Vec<_>>(),
+        [(0, 0), (3, 1), (6, 2), (7, 3)]
+    );
+    assert!(evaluation.points.iter().all(|point| {
+        point.token_mean_loss.is_finite() && point.batch_losses.iter().all(|loss| loss.is_finite())
+    }));
+    // Every intermediate point is independently pinned above; training is not
+    // required to be monotonic between commits, only better at the final point.
+    assert!(
+        evaluation.points.last().unwrap().token_mean_loss
+            < evaluation.points.first().unwrap().token_mean_loss
+    );
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    let plan = CompiledModuleAdamWPlan::compile_graph_with_dropout_and_ignore_index(
+        two_block_policy_frontier_config(),
+        dropout_config(),
+        model,
+        |model, graph, inputs, ignore_index, dropout| {
+            build_two_block_policy_frontier(model, graph, inputs, ignore_index, dropout)
+        },
+    )
+    .unwrap()
+    .with_evaluation_graph_and_ignore_index(|model, graph, inputs, ignore_index| {
+        build_two_block_policy_evaluation(model, graph, inputs, ignore_index)
+    })
+    .unwrap();
+    let artifact = plan.program_artifact().unwrap();
+    let mut session = plan.prepare(&CpuSessionTarget).unwrap();
+    let executor = CapturedReplayExecutor::default();
+
+    let initial_loss = assert_policy_evaluation_frontier(
+        &mut session,
+        &artifact,
+        evaluation,
+        &evaluation.points[0],
+        &executor,
+    );
+    for replay in 1..=3 {
+        session
+            .step_scheduled(policy_frontier_batch(replay))
+            .unwrap();
+    }
+    assert_policy_evaluation_frontier(
+        &mut session,
+        &artifact,
+        evaluation,
+        &evaluation.points[1],
+        &executor,
+    );
+    for replay in 4..=6 {
+        session
+            .step_scheduled(policy_frontier_batch(replay))
+            .unwrap();
+    }
+    assert_policy_evaluation_frontier(
+        &mut session,
+        &artifact,
+        evaluation,
+        &evaluation.points[2],
+        &executor,
+    );
+    session.step_scheduled(policy_frontier_batch(7)).unwrap();
+    let flush = session.flush_partial_window_scheduled().unwrap();
+    assert!(flush.did_update());
+    assert_eq!(flush.optimizer_step(), 3);
+    assert_eq!(flush.flushed_microbatches(), 1);
+    let final_loss = assert_policy_evaluation_frontier(
+        &mut session,
+        &artifact,
+        evaluation,
+        &evaluation.points[3],
+        &executor,
+    );
+    assert!(final_loss < initial_loss);
+
+    let model = session.into_module_without_publication();
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
 }
 
 #[test]

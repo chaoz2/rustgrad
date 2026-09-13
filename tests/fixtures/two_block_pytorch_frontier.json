@@ -6435,6 +6435,61 @@
         "valid_token_count": 11
       }
     ],
+    "evaluation": {
+      "batch_replays": [
+        1,
+        2,
+        3
+      ],
+      "points": [
+        {
+          "batch_losses": [
+            2.625709295272827,
+            2.7314844131469727,
+            2.9360227584838867
+          ],
+          "optimizer_step": 0,
+          "replay_step": 0,
+          "token_mean_loss": 2.7391879992051558
+        },
+        {
+          "batch_losses": [
+            2.6101412773132324,
+            2.7042160034179688,
+            2.8944480419158936
+          ],
+          "optimizer_step": 1,
+          "replay_step": 3,
+          "token_mean_loss": 2.713336229324341
+        },
+        {
+          "batch_losses": [
+            2.602055311203003,
+            2.692063093185425,
+            2.874063491821289
+          ],
+          "optimizer_step": 2,
+          "replay_step": 6,
+          "token_mean_loss": 2.7007869373668325
+        },
+        {
+          "batch_losses": [
+            2.5936310291290283,
+            2.6844775676727295,
+            2.857170820236206
+          ],
+          "optimizer_step": 3,
+          "replay_step": 7,
+          "token_mean_loss": 2.6902818463065405
+        }
+      ],
+      "total_valid_token_count": 11,
+      "valid_token_counts": [
+        5,
+        3,
+        3
+      ]
+    },
     "frozen_parameter": {
       "shape": [
         3,
