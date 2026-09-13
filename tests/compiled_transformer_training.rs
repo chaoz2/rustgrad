@@ -2846,6 +2846,176 @@ struct NumericalTwoBlockDirectionalEvaluation {
     epsilon: f64,
 }
 
+struct NumericalTwoBlockGradientFrontier {
+    loss: f64,
+    valid_token_count: u64,
+    gradients: BTreeMap<String, TensorData>,
+    forward_executions: usize,
+}
+
+struct TwoBlockForwardFiniteDifferenceOracle {
+    graph: Graph,
+    outputs: Vec<NodeId>,
+    bindings: HashMap<String, TensorData>,
+    parameter_inputs: BTreeMap<String, String>,
+    relu_count: usize,
+    base: Vec<TensorData>,
+    executions: Cell<usize>,
+}
+
+impl TwoBlockForwardFiniteDifferenceOracle {
+    const EPSILONS: [f64; 4] = [1e-2, 5e-3, 2.5e-3, 1e-3];
+    const RELU_MARGIN: f64 = 0.25;
+
+    fn new(
+        model: &TwoBlockPositionalGpt,
+        graph: Graph,
+        loss: NodeId,
+        inputs: BTreeMap<String, TensorData>,
+        observations: impl IntoIterator<Item = NodeId>,
+    ) -> Self {
+        let relu_inputs = relu_inputs(&graph, loss);
+        assert_eq!(relu_inputs.len(), 2);
+        let parameter_inputs = model
+            .trainable_parameters()
+            .unwrap()
+            .into_iter()
+            .map(|(name, parameter)| {
+                let node = parameter.node(&graph).unwrap();
+                let Op::Input { name: input_name } = graph.op(node).unwrap() else {
+                    panic!("bound trainable parameter {name} must be a graph input");
+                };
+                (name, input_name.clone())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut bindings = model.input_bindings(&graph).unwrap();
+        bindings.extend(inputs);
+        let mut outputs = Vec::with_capacity(1 + relu_inputs.len());
+        outputs.push(loss);
+        outputs.extend(relu_inputs.iter().copied());
+        outputs.extend(observations);
+        let base = CpuBackend
+            .execute_many(&graph, &outputs, &bindings)
+            .unwrap()
+            .outputs;
+        assert!(base[1..1 + relu_inputs.len()].iter().all(|relu| {
+            relu.to_vec_f64()
+                .into_iter()
+                .all(|value| value.abs() >= Self::RELU_MARGIN)
+        }));
+        Self {
+            graph,
+            outputs,
+            bindings,
+            parameter_inputs,
+            relu_count: relu_inputs.len(),
+            base,
+            executions: Cell::new(1),
+        }
+    }
+
+    fn base_loss(&self) -> f64 {
+        self.base[0].scalar_at(0).as_f64()
+    }
+
+    fn observation(&self, index: usize) -> &TensorData {
+        &self.base[1 + self.relu_count + index]
+    }
+
+    fn executions(&self) -> usize {
+        self.executions.get()
+    }
+
+    fn evaluate_coordinate(
+        &self,
+        parameter: &str,
+        coordinate: usize,
+        epsilon: f64,
+    ) -> Vec<TensorData> {
+        let input_name = &self.parameter_inputs[parameter];
+        let value = &self.bindings[input_name];
+        assert!(coordinate < value.len());
+        self.executions.set(
+            self.executions
+                .get()
+                .checked_add(1)
+                .expect("bounded forward execution count must not overflow"),
+        );
+        CpuBackend
+            .execute_many(
+                &self.graph,
+                &self.outputs,
+                &perturbed_parameter_bindings(
+                    &self.bindings,
+                    input_name,
+                    value,
+                    coordinate,
+                    epsilon,
+                ),
+            )
+            .unwrap()
+            .outputs
+    }
+
+    fn preserves_relu_region(&self, perturbed: &[TensorData]) -> bool {
+        self.base[1..1 + self.relu_count]
+            .iter()
+            .zip(&perturbed[1..1 + self.relu_count])
+            .all(|(base, perturbed)| relu_region_unchanged(base, perturbed))
+    }
+
+    fn central_difference(&self, parameter: &str, coordinate: usize) -> f64 {
+        Self::EPSILONS
+            .into_iter()
+            .find_map(|epsilon| {
+                let plus = self.evaluate_coordinate(parameter, coordinate, epsilon);
+                let minus = self.evaluate_coordinate(parameter, coordinate, -epsilon);
+                if !self.preserves_relu_region(&plus) || !self.preserves_relu_region(&minus) {
+                    return None;
+                }
+                let derivative = (plus[0].scalar_at(0).as_f64() - minus[0].scalar_at(0).as_f64())
+                    / (2.0 * epsilon);
+                derivative.is_finite().then_some(derivative)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no bounded central difference preserved {parameter}[{coordinate}] ReLU regions"
+                )
+            })
+    }
+
+    fn richardson_difference(&self, parameter: &str, coordinate: usize) -> f64 {
+        Self::EPSILONS
+            .into_iter()
+            .find_map(|epsilon| {
+                let fine_epsilon = epsilon / 2.0;
+                let coarse_plus = self.evaluate_coordinate(parameter, coordinate, epsilon);
+                let coarse_minus = self.evaluate_coordinate(parameter, coordinate, -epsilon);
+                let fine_plus = self.evaluate_coordinate(parameter, coordinate, fine_epsilon);
+                let fine_minus = self.evaluate_coordinate(parameter, coordinate, -fine_epsilon);
+                if [&coarse_plus, &coarse_minus, &fine_plus, &fine_minus]
+                    .into_iter()
+                    .any(|outputs| !self.preserves_relu_region(outputs))
+                {
+                    return None;
+                }
+                let coarse = (coarse_plus[0].scalar_at(0).as_f64()
+                    - coarse_minus[0].scalar_at(0).as_f64())
+                    / (2.0 * epsilon);
+                let fine = (fine_plus[0].scalar_at(0).as_f64()
+                    - fine_minus[0].scalar_at(0).as_f64())
+                    / (2.0 * fine_epsilon);
+                let derivative = (4.0 * fine - coarse) / 3.0;
+                derivative.is_finite().then_some(derivative)
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no bounded paired difference preserved {parameter}[{coordinate}] ReLU regions"
+                )
+            })
+    }
+}
+
 fn numerical_multi_head_transformer_gradient_lanes(
     model: &MultiHeadCausalTransformer,
     inputs: BTreeMap<String, TensorData>,
@@ -3533,107 +3703,99 @@ fn numerical_two_block_gradient_lanes_from_forward(
     inputs: BTreeMap<String, TensorData>,
     probes: &[TransformerGradientProbe],
 ) -> NumericalTwoBlockGptEvaluation {
-    const EPSILONS: [f64; 4] = [1e-2, 5e-3, 2.5e-3, 1e-3];
-    const RELU_MARGIN: f64 = 0.25;
-
-    let relu_inputs = relu_inputs(&graph, loss);
-    assert_eq!(relu_inputs.len(), 2);
-
-    let parameter_inputs = model
-        .trainable_parameters()
-        .unwrap()
-        .into_iter()
-        .map(|(name, parameter)| {
-            let node = parameter.node(&graph).unwrap();
-            let Op::Input { name: input_name } = graph.op(node).unwrap() else {
-                panic!("bound trainable parameter {name} must be a graph input");
-            };
-            (name, input_name.clone())
-        })
-        .collect::<BTreeMap<_, _>>();
-    assert!(
-        probes
-            .iter()
-            .all(|probe| parameter_inputs.contains_key(probe.parameter))
+    let oracle = TwoBlockForwardFiniteDifferenceOracle::new(
+        model,
+        graph,
+        loss,
+        inputs,
+        std::iter::empty::<NodeId>(),
     );
-
-    let mut bindings = model.input_bindings(&graph).unwrap();
-    bindings.extend(inputs);
-    let mut outputs = Vec::with_capacity(1 + relu_inputs.len());
-    outputs.push(loss);
-    outputs.extend(relu_inputs);
-    let base = CpuBackend
-        .execute_many(&graph, &outputs, &bindings)
-        .unwrap();
-    assert!(
-        base.outputs[1..].iter().all(|relu| {
-            relu.to_vec_f64()
-                .into_iter()
-                .all(|value| value.abs() >= RELU_MARGIN)
-        }),
-        "the two-block finite-difference fixture must stay away from ReLU kinks"
-    );
-
     let gradients = probes
         .iter()
         .map(|probe| {
-            let input_name = &parameter_inputs[probe.parameter];
-            let parameter = &bindings[input_name];
-            assert!(probe.coordinate < parameter.len());
-            let context = format!(
-                "{} through {}[{}]",
-                probe.boundary, probe.parameter, probe.coordinate
-            );
-            EPSILONS
-                .into_iter()
-                .find_map(|epsilon| {
-                    let plus = CpuBackend
-                        .execute_many(
-                            &graph,
-                            &outputs,
-                            &perturbed_parameter_bindings(
-                                &bindings,
-                                input_name,
-                                parameter,
-                                probe.coordinate,
-                                epsilon,
-                            ),
-                        )
-                        .unwrap();
-                    let minus = CpuBackend
-                        .execute_many(
-                            &graph,
-                            &outputs,
-                            &perturbed_parameter_bindings(
-                                &bindings,
-                                input_name,
-                                parameter,
-                                probe.coordinate,
-                                -epsilon,
-                            ),
-                        )
-                        .unwrap();
-                    let preserved = |perturbed: &[TensorData]| {
-                        base.outputs[1..]
-                            .iter()
-                            .zip(&perturbed[1..])
-                            .all(|(base, perturbed)| relu_region_unchanged(base, perturbed))
-                    };
-                    if !preserved(&plus.outputs) || !preserved(&minus.outputs) {
-                        return None;
-                    }
-                    Some(
-                        (plus.outputs[0].scalar_at(0).as_f64()
-                            - minus.outputs[0].scalar_at(0).as_f64())
-                            / (2.0 * epsilon),
-                    )
-                })
-                .unwrap_or_else(|| panic!("no bounded central difference preserved {context}"))
+            assert!(oracle.parameter_inputs.contains_key(probe.parameter));
+            oracle.central_difference(probe.parameter, probe.coordinate)
         })
         .collect();
     NumericalTwoBlockGptEvaluation {
-        loss: base.outputs[0].scalar_at(0).as_f64(),
+        loss: oracle.base_loss(),
         gradients,
+    }
+}
+
+fn numerical_two_block_attention_mask_gradient_frontier(
+    model: &TwoBlockPositionalGpt,
+    inputs: BTreeMap<String, TensorData>,
+    masks: [TensorData; 6],
+) -> NumericalTwoBlockGradientFrontier {
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let attention_mask =
+        graph.input_dtype(ATTENTION_KEEP_MASK, ATTENTION_KEEP_MASK_SHAPE, DType::Bool);
+    let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
+    let guard = graph.input_dtype(ATTENTION_DROPOUT_TRANSITION_GUARD, [], DType::F32);
+    let mut dropout = FixedResidualDropout::from_masks(masks);
+    let logits = model
+        .forward_with_attention_mask(&mut graph, tokens, attention_mask, &mut dropout)
+        .unwrap();
+    assert_eq!(dropout.next, 6);
+    let losses = multi_head_sparse_causal_losses(&mut graph, logits, targets).unwrap();
+    let guard_value = graph.reciprocal(guard).unwrap();
+    let losses = graph.add(losses, guard_value).unwrap();
+    let weighted = graph.mul(losses, loss_mask).unwrap();
+    let numerator = graph.sum_all(weighted).unwrap();
+    let valid_token_count = graph.sum_all(loss_mask).unwrap();
+    let loss = graph.div(numerator, valid_token_count).unwrap();
+
+    let trainable = model.trainable_parameters().unwrap();
+    assert_eq!(trainable.len(), 36);
+    let parameter_targets = trainable
+        .iter()
+        .map(|(_, parameter)| parameter.node(&graph).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parameter_targets
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        parameter_targets.len()
+    );
+    assert!(
+        [tokens, targets, attention_mask, loss_mask, guard]
+            .into_iter()
+            .all(|input| !parameter_targets.contains(&input)),
+        "batch masks and indices must remain outside the differentiation frontier"
+    );
+
+    let oracle =
+        TwoBlockForwardFiniteDifferenceOracle::new(model, graph, loss, inputs, [valid_token_count]);
+    assert_eq!(oracle.parameter_inputs.len(), trainable.len());
+    let observed_token_count = oracle.observation(0).scalar_at(0).as_f64();
+    assert!(observed_token_count.is_finite() && observed_token_count > 0.0);
+    let observed_token_count_u64 = observed_token_count as u64;
+    assert_eq!(observed_token_count_u64 as f64, observed_token_count);
+
+    let gradients = trainable
+        .iter()
+        .map(|(name, parameter)| {
+            let value = parameter.value().unwrap();
+            let gradient = TensorData::from_scalars(
+                value.shape().clone(),
+                DType::F32,
+                (0..value.len())
+                    .map(|coordinate| Scalar::F(oracle.richardson_difference(name, coordinate))),
+            )
+            .unwrap();
+            (name.clone(), gradient)
+        })
+        .collect::<BTreeMap<_, _>>();
+    NumericalTwoBlockGradientFrontier {
+        loss: oracle.base_loss(),
+        valid_token_count: observed_token_count_u64,
+        gradients,
+        forward_executions: oracle.executions(),
     }
 }
 
@@ -6319,6 +6481,159 @@ fn compiled_two_block_attention_mask_gradients_match_fixed_dropout_central_diffe
             probe.coordinate
         );
     }
+    assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_attention_mask_all_vjp_coordinates_match_forward_oracle() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+    const SCALE_AWARE_F32_TOLERANCE: f64 = 2e-2;
+    const MAX_FORWARD_EXECUTIONS: usize = 1 + 16 * 384;
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    let mut traversal_before = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        traversal_before.insert(name, (parameter.id(), parameter.is_trainable()));
+    });
+    assert_eq!(traversal_before.len(), 37);
+    let tied_id = traversal_before["tokens.weight"].0;
+    assert_eq!(tied_id, traversal_before["lm_head.weight"].0);
+    assert!(traversal_before["tokens.weight"].1);
+    assert!(traversal_before["lm_head.weight"].1);
+    assert_eq!(
+        traversal_before
+            .values()
+            .filter(|(id, _)| *id == tied_id)
+            .count(),
+        2,
+        "only the token embedding and language-model head may share their Parameter"
+    );
+    assert_eq!(
+        traversal_before
+            .values()
+            .map(|(id, _)| *id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        36
+    );
+
+    let parameters = model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.value().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(parameters.len(), 36);
+    assert_eq!(parameters.values().map(TensorData::len).sum::<usize>(), 384);
+    assert!(parameters.contains_key("tokens.weight"));
+    assert!(!parameters.contains_key("lm_head.weight"));
+    let mut expected_traversal_names = parameters.keys().cloned().collect::<BTreeSet<_>>();
+    assert!(expected_traversal_names.insert("lm_head.weight".into()));
+    assert_eq!(
+        traversal_before.keys().cloned().collect::<BTreeSet<_>>(),
+        expected_traversal_names
+    );
+    let coverage_directions = two_block_dense_parameter_directions(&parameters);
+    let coverage_direction = &coverage_directions[0];
+
+    assert_ne!(attention_keep_mask(1), attention_keep_mask(2));
+    assert_ne!(attention_loss_mask(1), attention_loss_mask(2));
+    let compile_count = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+        two_block_attention_mask_config(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_with_attention_mask(model, graph, inputs, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+
+    let inputs = attention_masked_dropout_batch(1, 1.0);
+    let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
+    let step = runtime
+        .step(inputs.clone(), TensorData::scalar(1e-3))
+        .unwrap();
+    let valid_token_count = attention_masked_loss_weight(1);
+    assert!(!step.did_update());
+    assert!(step.clip_report().is_none());
+    assert_eq!(step.loss_weight(), valid_token_count);
+    assert_eq!(runtime.optimizer_step().unwrap(), 0);
+    assert_eq!(runtime.accumulation_index().unwrap(), 1);
+    assert_eq!(
+        runtime
+            .checkpoint()
+            .unwrap()
+            .info()
+            .accumulated_token_count(),
+        Some(valid_token_count)
+    );
+    assert_attention_keep_mask_is_observed(
+        step.outputs(),
+        &attention_keep_mask(1),
+        &attention_loss_mask(1),
+    );
+
+    let captured = runtime.gradient_accumulator_snapshots().unwrap();
+    assert_two_block_gradient_frontier_coverage(&captured, coverage_direction);
+    let dropout_masks = observed_two_block_dropout_masks(step.outputs());
+    let numerical =
+        numerical_two_block_attention_mask_gradient_frontier(&model, inputs, dropout_masks);
+    assert_eq!(numerical.valid_token_count, valid_token_count);
+    assert_two_block_gradient_frontier_coverage(&numerical.gradients, coverage_direction);
+    let captured_loss = step.loss().scalar_at(0).as_f64();
+    assert!(captured_loss.is_finite() && numerical.loss.is_finite());
+    assert!(
+        (captured_loss - numerical.loss).abs() <= 2e-5,
+        "fixed-mask token-mean loss differs: captured={captured_loss}, numerical={}",
+        numerical.loss
+    );
+
+    let mut coordinates_checked = 0;
+    for (name, captured_gradient) in &captured {
+        let numerical_gradient = &numerical.gradients[name];
+        assert_eq!(captured_gradient.shape(), numerical_gradient.shape());
+        assert_eq!(captured_gradient.dtype(), DType::F32);
+        assert_eq!(numerical_gradient.dtype(), DType::F32);
+        for coordinate in 0..captured_gradient.len() {
+            let captured = captured_gradient.scalar_at(coordinate).as_f64();
+            let derivative = numerical_gradient.scalar_at(coordinate).as_f64();
+            let expected = derivative * valid_token_count as f64;
+            assert!(captured.is_finite() && derivative.is_finite() && expected.is_finite());
+            let error = (captured - expected).abs();
+            let scale = 1.0f64.max(captured.abs()).max(expected.abs());
+            let tolerance = SCALE_AWARE_F32_TOLERANCE * scale;
+            assert!(
+                error <= tolerance,
+                "{name}[{coordinate}] token-weighted VJP mismatch: captured={captured}, numerical={derivative}, valid_token_count={valid_token_count}, expected={expected}, error={error}, tolerance={tolerance}"
+            );
+            coordinates_checked += 1;
+        }
+    }
+    assert_eq!(coordinates_checked, 384);
+    assert!(
+        numerical.forward_executions > 4 * coordinates_checked,
+        "every coordinate must use paired coarse/fine forward evaluations"
+    );
+    assert!(
+        numerical.forward_executions <= MAX_FORWARD_EXECUTIONS,
+        "bounded epsilon search exceeded its fixed execution ceiling"
+    );
+
+    let mut traversal_after = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        traversal_after.insert(name, (parameter.id(), parameter.is_trainable()));
+    });
+    assert_eq!(traversal_after, traversal_before);
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
     assert_eq!(compile_count.get(), 1);
 }
 
