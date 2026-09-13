@@ -20,7 +20,7 @@ use rustgrad::{
     NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget, NativeTrainingReport,
     NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
     TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy, load_safetensors,
-    save_safetensors, schedule_many,
+    save_safetensors, schedule_many, sparse_categorical_cross_entropy,
 };
 use serde::Deserialize;
 use std::cell::Cell;
@@ -47,6 +47,13 @@ const TWO_BLOCK_MAX_GRADIENT_NORM: f32 = 1e-4;
 const ATTENTION_DROPOUT_TRANSITION_GUARD: &str = "attention_dropout_transition_guard";
 const ATTENTION_KEEP_MASK: &str = "attention_keep_mask";
 const ATTENTION_KEEP_MASK_SHAPE: [usize; 4] = [BATCH, 1, TIME, TIME];
+const POLICY_ATTENTION_KEEP_MASK_SHAPE: [usize; 4] = [BATCH, 1, 1, TIME];
+const POLICY_IGNORE_INDEX: i32 = -100;
+const POLICY_FROZEN_PARAMETER: &str = "positions.weight";
+// Each key bias adds one query-local constant to every key score. Softmax
+// cancels that gauge direction, so cross-engine AdamW successors are
+// ill-conditioned around epsilon even though each backend's recurrence is exact.
+const POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS: [&str; 2] = ["first.key.1", "second.key.1"];
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -500,6 +507,36 @@ fn two_block_attention_mask_config() -> CompiledAdamWConfig {
         .unwrap()
 }
 
+fn two_block_policy_frontier_config() -> CompiledAdamWConfig {
+    CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)
+        .unwrap()
+        .with_loss_scale(128.0)
+        .unwrap()
+        .with_gradient_accumulation(3)
+        .unwrap()
+        .with_max_gradient_norm(0.25)
+        .unwrap()
+        .with_host_token_input("tokens", [BATCH, TIME])
+        .unwrap()
+        .with_host_token_input("targets", [BATCH, TIME])
+        .unwrap()
+        .with_input(ATTENTION_DROPOUT_TRANSITION_GUARD, [], DType::F32)
+        .unwrap()
+        .with_input(
+            ATTENTION_KEEP_MASK,
+            POLICY_ATTENTION_KEEP_MASK_SHAPE,
+            DType::Bool,
+        )
+        .unwrap()
+        .with_token_weighted_ignore_index("targets", POLICY_IGNORE_INDEX)
+        .unwrap()
+        .with_frozen_parameters([POLICY_FROZEN_PARAMETER])
+        .unwrap()
+        .with_captured_multi_step_lr(CompiledMultiStepLr::new(1e-3, 0.5, [1]).unwrap())
+        .with_clip_report()
+        .with_window_loss_report()
+}
+
 fn sparse_causal_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
     let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
     let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
@@ -760,6 +797,35 @@ fn build_two_block_with_attention_mask(
     Ok((graph.add(losses, guard)?, outputs))
 }
 
+fn build_two_block_policy_frontier(
+    model: &TwoBlockPositionalGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<CompiledAdamWGraph> {
+    let (logits, outputs) = forward_two_block_with_attention_dropout(
+        model,
+        graph,
+        inputs,
+        Some(inputs[ATTENTION_KEEP_MASK]),
+        dropout,
+    )?;
+    let losses = sparse_categorical_cross_entropy(
+        graph,
+        logits,
+        inputs["targets"],
+        LossOptions {
+            reduction: Reduction::None,
+            class_axis: 2,
+            ignore_index: Some(i64::from(POLICY_IGNORE_INDEX)),
+            label_smoothing: 0.0,
+        },
+    )?;
+    let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
+    let losses = graph.add(losses, guard)?;
+    Ok(CompiledAdamWGraph::token_mean(losses, outputs))
+}
+
 fn forward_two_block_with_attention_dropout(
     model: &TwoBlockPositionalGpt,
     graph: &mut Graph,
@@ -972,6 +1038,38 @@ fn attention_masked_dropout_batch(replay: u64, guard: f32) -> BTreeMap<String, T
             .is_none()
     );
     batch
+}
+
+fn policy_frontier_batch(replay: u64) -> BTreeMap<String, TensorData> {
+    const VALID_LENGTHS: [[usize; BATCH]; 3] = [[3, 2], [2, 1], [3, 0]];
+
+    let valid_lengths = VALID_LENGTHS[((replay - 1) % 3) as usize];
+    let mut tokens = MULTI_HEAD_TOKENS;
+    let mut targets = MULTI_HEAD_TARGETS;
+    for (batch, valid_length) in valid_lengths.into_iter().enumerate() {
+        for time in valid_length..TIME {
+            let lane = batch * TIME + time;
+            tokens[lane] = 0;
+            targets[lane] = POLICY_IGNORE_INDEX;
+        }
+    }
+    let attention_keep_mask = TensorData::from_scalars(
+        POLICY_ATTENTION_KEEP_MASK_SHAPE,
+        DType::Bool,
+        targets
+            .into_iter()
+            .map(|target| Scalar::Bool(target != POLICY_IGNORE_INDEX)),
+    )
+    .unwrap();
+    BTreeMap::from([
+        ("tokens".into(), token_tensor(tokens)),
+        ("targets".into(), token_tensor(targets)),
+        (
+            ATTENTION_DROPOUT_TRANSITION_GUARD.into(),
+            TensorData::scalar(1.0),
+        ),
+        (ATTENTION_KEEP_MASK.into(), attention_keep_mask),
+    ])
 }
 
 fn attention_masked_padded_counterfactual_batch() -> BTreeMap<String, TensorData> {
@@ -1635,6 +1733,46 @@ struct PyTorchAdamWWindowFixture {
 }
 
 #[derive(Deserialize)]
+struct PyTorchPolicyAdamWWindowFixture {
+    #[serde(flatten)]
+    adamw: PyTorchAdamWWindowFixture,
+    learning_rate: f32,
+    mean_loss: f32,
+    microbatch_count: u64,
+}
+
+#[derive(Deserialize)]
+struct PyTorchPolicyPendingCheckpointFixture {
+    replay_step: u64,
+    optimizer_step: u64,
+    accumulation_index: u64,
+    valid_token_count: u64,
+    dropout_counter: u64,
+    loss_numerator: f32,
+}
+
+#[derive(Deserialize)]
+struct PyTorchPolicyFrontierFixture {
+    rustgrad_base: String,
+    weight_decay: f32,
+    loss_scale: f32,
+    accumulation_steps: u64,
+    max_gradient_norm: f32,
+    ignore_index: i32,
+    learning_rates: [f32; 2],
+    active_parameter_count: usize,
+    active_coordinate_count: usize,
+    analytic_gauge_null_parameters: Vec<String>,
+    frozen_parameter_name: String,
+    frozen_parameter: PyTorchTensorFixture,
+    initial_parameters: BTreeMap<String, PyTorchTensorFixture>,
+    replays: Vec<PyTorchReplayFixture>,
+    commits: Vec<PyTorchPolicyAdamWWindowFixture>,
+    pending_checkpoint: PyTorchPolicyPendingCheckpointFixture,
+    partial_flush: PyTorchPolicyAdamWWindowFixture,
+}
+
+#[derive(Deserialize)]
 struct PyTorchFixtureProvenance {
     generator: String,
     rustgrad_base: String,
@@ -1657,6 +1795,7 @@ struct TwoBlockPyTorchFixture {
     replays: Vec<PyTorchReplayFixture>,
     windows: Vec<PyTorchAdamWWindowFixture>,
     partial_flush: PyTorchAdamWWindowFixture,
+    policy_frontier: PyTorchPolicyFrontierFixture,
 }
 
 fn two_block_pytorch_fixture() -> TwoBlockPyTorchFixture {
@@ -1728,6 +1867,7 @@ fn assert_pytorch_adamw_moments_close(
     expected: &BTreeMap<String, PyTorchTensorFixture>,
     rounding_budget: f64,
     relative_tolerance: f64,
+    expected_coordinates: usize,
 ) {
     assert!(actual.keys().eq(expected.keys()), "{label} names changed");
     let expected_scale = expected
@@ -1767,9 +1907,21 @@ fn assert_pytorch_adamw_moments_close(
             );
         }
     }
-    assert_eq!(coordinates, 384, "{label} must cover the whole frontier");
+    assert_eq!(
+        coordinates, expected_coordinates,
+        "{label} must cover the whole frontier"
+    );
     assert!(expected_nonzero > 0, "{label} fixture must be nonzero");
     assert!(actual_nonzero > 0, "{label} must not collapse to all zero");
+}
+
+const PYTORCH_SUCCESSOR_ROUNDING_BUDGET_PER_MICROBATCH: f64 = 128.0;
+
+fn pytorch_successor_rounding_budget(microbatch_count: u64) -> f64 {
+    let microbatch_count =
+        u32::try_from(microbatch_count).expect("the checked PyTorch microbatch count must fit u32");
+    assert!(microbatch_count > 0);
+    PYTORCH_SUCCESSOR_ROUNDING_BUDGET_PER_MICROBATCH * f64::from(microbatch_count)
 }
 
 fn assert_pytorch_parameter_successors_close(
@@ -1777,8 +1929,10 @@ fn assert_pytorch_parameter_successors_close(
     actual_initial: &BTreeMap<String, TensorData>,
     expected: &BTreeMap<String, PyTorchTensorFixture>,
     expected_initial: &BTreeMap<String, PyTorchTensorFixture>,
+    microbatch_count: u64,
+    expected_coordinates: usize,
+    oracle: PyTorchSuccessorOracle<'_>,
 ) {
-    const ROUNDING_BUDGET: f64 = 128.0;
     const RELATIVE_TOLERANCE: f64 = 2e-3;
 
     assert!(actual.keys().eq(actual_initial.keys()));
@@ -1797,9 +1951,14 @@ fn assert_pytorch_parameter_successors_close(
         .fold(0.0f64, f64::max);
     assert!(expected_update_scale.is_finite() && expected_update_scale > 0.0);
     // Successor accuracy is about the AdamW update, not the absolute parameter
-    // magnitude. The bitwise check below also protects updates below this bound.
-    let absolute_tolerance = ROUNDING_BUDGET * f64::from(f32::EPSILON) * expected_update_scale;
+    // magnitude. Accumulated policy windows supply the same narrow F32 budget
+    // once per independently lowered microbatch; the bitwise check below still
+    // protects mutation-sensitive updates below this bound.
+    let absolute_tolerance = pytorch_successor_rounding_budget(microbatch_count)
+        * f64::from(f32::EPSILON)
+        * expected_update_scale;
     let mut fixture_changed_coordinates = 0usize;
+    let mut gauge_null_coordinates = 0usize;
     let mut coordinates = 0usize;
 
     for (name, actual) in actual {
@@ -1831,30 +1990,172 @@ fn assert_pytorch_parameter_successors_close(
             );
             let actual_update = actual - actual_initial;
             let expected_update = expected - expected_initial;
-            let error = (actual_update - expected_update).abs();
-            let tolerance = absolute_tolerance
-                + RELATIVE_TOLERANCE * actual_update.abs().max(expected_update.abs());
-            assert!(
-                error <= tolerance,
-                "parameter successor {name}[{coordinate}] update differs from PyTorch: actual={actual_update}, expected={expected_update}, error={error}, tolerance={tolerance}"
-            );
-
-            if (expected as f32).to_bits() != (expected_initial as f32).to_bits() {
-                fixture_changed_coordinates += 1;
-                assert_ne!(
-                    (actual as f32).to_bits(),
-                    (actual_initial as f32).to_bits(),
-                    "parameter successor {name}[{coordinate}] must preserve the fixture's mutation sensitivity"
+            if oracle.is_gauge_null(name) {
+                gauge_null_coordinates += 1;
+            } else {
+                let error = (actual_update - expected_update).abs();
+                let tolerance = absolute_tolerance
+                    + RELATIVE_TOLERANCE * actual_update.abs().max(expected_update.abs());
+                assert!(
+                    error <= tolerance,
+                    "parameter successor {name}[{coordinate}] update differs from PyTorch: actual={actual_update}, expected={expected_update}, error={error}, tolerance={tolerance}"
                 );
+
+                if (expected as f32).to_bits() != (expected_initial as f32).to_bits() {
+                    fixture_changed_coordinates += 1;
+                    assert_ne!(
+                        (actual as f32).to_bits(),
+                        (actual_initial as f32).to_bits(),
+                        "parameter successor {name}[{coordinate}] must preserve the fixture's mutation sensitivity"
+                    );
+                }
             }
             coordinates += 1;
         }
     }
-    assert_eq!(coordinates, 384, "successors must cover the whole frontier");
     assert_eq!(
-        fixture_changed_coordinates, 312,
-        "the checked fixture's changed-coordinate inventory drifted"
+        coordinates, expected_coordinates,
+        "successors must cover the whole frontier"
     );
+    assert_eq!(
+        gauge_null_coordinates,
+        oracle.expected_gauge_null_coordinates(),
+        "the analytic gauge-null coordinate inventory drifted"
+    );
+    match oracle.expected_changed_coordinates() {
+        Some(expected) => assert_eq!(
+            fixture_changed_coordinates, expected,
+            "the checked fixture's changed-coordinate inventory drifted"
+        ),
+        None => assert!(
+            fixture_changed_coordinates > 0,
+            "the checked fixture must retain mutation-sensitive coordinates"
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PyTorchSuccessorOracle<'a> {
+    CrossFramework {
+        expected_changed_coordinates: Option<usize>,
+    },
+    WithAnalyticGaugeNulls {
+        parameter_names: &'a BTreeSet<&'a str>,
+        optimizer: &'a CompiledAdamWConfig,
+        learning_rate: f32,
+    },
+}
+
+impl PyTorchSuccessorOracle<'_> {
+    fn is_gauge_null(self, name: &str) -> bool {
+        match self {
+            Self::CrossFramework { .. } => false,
+            Self::WithAnalyticGaugeNulls {
+                parameter_names, ..
+            } => parameter_names.contains(name),
+        }
+    }
+
+    fn expected_gauge_null_coordinates(self) -> usize {
+        match self {
+            Self::CrossFramework { .. } => 0,
+            Self::WithAnalyticGaugeNulls { .. } => 8,
+        }
+    }
+
+    fn expected_changed_coordinates(self) -> Option<usize> {
+        match self {
+            Self::CrossFramework {
+                expected_changed_coordinates,
+            } => expected_changed_coordinates,
+            Self::WithAnalyticGaugeNulls { .. } => None,
+        }
+    }
+}
+
+fn assert_adamw_gauge_null_successors(
+    label: &str,
+    window: &PyTorchAdamWWindowAssertion<'_>,
+    parameter_names: &BTreeSet<&str>,
+    optimizer: &CompiledAdamWConfig,
+    learning_rate: f32,
+) {
+    const MAX_RMS_TO_EPSILON_RATIO: f64 = 0.01;
+    const MAX_UPDATE_TO_LEARNING_RATE_RATIO: f64 = 0.01;
+
+    let reconstructed = reconstruct_adamw_parameters_from_moments(
+        window.actual_initial,
+        window.actual_first_moments,
+        window.actual_second_moments,
+        optimizer,
+        window.optimizer_step,
+        learning_rate,
+    );
+    let optimizer_step = i32::try_from(window.optimizer_step)
+        .expect("the checked PyTorch optimizer step must fit i32");
+    let second_correction = 1.0 - f64::from(optimizer.beta2()).powi(optimizer_step);
+    assert!(second_correction.is_finite() && second_correction > 0.0);
+    let epsilon = f64::from(optimizer.eps());
+    // Keep the exception narrower than the algorithmic epsilon region: the
+    // bias-corrected RMS and resulting update must each remain below one
+    // percent of their corresponding AdamW scale.
+    let maximum_rms = epsilon * MAX_RMS_TO_EPSILON_RATIO;
+    let maximum_update = f64::from(learning_rate) * MAX_UPDATE_TO_LEARNING_RATE_RATIO;
+    let decay_factor = graph_f32_sub(1.0, graph_f32_mul(learning_rate, optimizer.weight_decay()));
+    let decay_exclusions = optimizer.weight_decay_exclusions().collect::<BTreeSet<_>>();
+
+    for name in parameter_names {
+        let actual = &window.actual_successors[*name];
+        let actual_initial = &window.actual_initial[*name];
+        let actual_second = &window.actual_second_moments[*name];
+        let expected = window.expected.parameter_successors[*name].tensor();
+        let expected_initial = window.expected_initial[*name].tensor();
+        let expected_second = window.expected.second_moments[*name].tensor();
+        assert_eq!(
+            actual, &reconstructed[*name],
+            "{label} analytic gauge-null successor {name} must match the backend-local AdamW recurrence"
+        );
+        assert_eq!(actual.shape(), actual_initial.shape());
+        assert_eq!(actual.shape(), expected.shape());
+        assert_eq!(actual.shape(), expected_initial.shape());
+        assert_eq!(actual.shape(), actual_second.shape());
+        assert_eq!(actual.shape(), expected_second.shape());
+        assert_eq!(actual.dtype(), DType::F32);
+
+        for coordinate in 0..actual.len() {
+            let actual_second = actual_second.scalar_at(coordinate).as_f64();
+            let expected_second = expected_second.scalar_at(coordinate).as_f64();
+            assert!(actual_second.is_finite() && actual_second >= 0.0);
+            assert!(expected_second.is_finite() && expected_second >= 0.0);
+            let actual_rms = (actual_second / second_correction).sqrt();
+            let expected_rms = (expected_second / second_correction).sqrt();
+            assert!(
+                actual_rms <= maximum_rms && expected_rms <= maximum_rms,
+                "{label} analytic gauge-null {name}[{coordinate}] must remain epsilon-conditioned: actual_rms={actual_rms}, expected_rms={expected_rms}, maximum_rms={maximum_rms}"
+            );
+
+            let actual_initial = actual_initial.scalar_at(coordinate).as_f64() as f32;
+            let expected_initial = expected_initial.scalar_at(coordinate).as_f64() as f32;
+            let actual_decay_baseline = if decay_exclusions.contains(name) {
+                actual_initial
+            } else {
+                graph_f32_mul(actual_initial, decay_factor)
+            };
+            let expected_decay_baseline = if decay_exclusions.contains(name) {
+                expected_initial
+            } else {
+                graph_f32_mul(expected_initial, decay_factor)
+            };
+            let actual_update =
+                actual.scalar_at(coordinate).as_f64() - f64::from(actual_decay_baseline);
+            let expected_update =
+                expected.scalar_at(coordinate).as_f64() - f64::from(expected_decay_baseline);
+            assert!(
+                actual_update.abs() <= maximum_update && expected_update.abs() <= maximum_update,
+                "{label} analytic gauge-null {name}[{coordinate}] update must remain below one percent of the learning rate: actual={actual_update}, expected={expected_update}, maximum={maximum_update}"
+            );
+        }
+    }
 }
 
 struct PyTorchAdamWWindowAssertion<'a> {
@@ -1869,6 +2170,24 @@ struct PyTorchAdamWWindowAssertion<'a> {
 }
 
 fn assert_pytorch_adamw_window(label: &str, window: PyTorchAdamWWindowAssertion<'_>) {
+    assert_pytorch_adamw_window_for_frontier(
+        label,
+        window,
+        1,
+        384,
+        PyTorchSuccessorOracle::CrossFramework {
+            expected_changed_coordinates: Some(312),
+        },
+    );
+}
+
+fn assert_pytorch_adamw_window_for_frontier(
+    label: &str,
+    window: PyTorchAdamWWindowAssertion<'_>,
+    microbatch_count: u64,
+    expected_coordinates: usize,
+    successor_oracle: PyTorchSuccessorOracle<'_>,
+) {
     assert_eq!(window.expected.optimizer_step, window.optimizer_step);
     assert!(window.expected.valid_token_count > 0);
     let clip = window.clip_report;
@@ -1889,6 +2208,7 @@ fn assert_pytorch_adamw_window(label: &str, window: PyTorchAdamWWindowAssertion<
         &window.expected.first_moments,
         32.0,
         2e-3,
+        expected_coordinates,
     );
     assert_pytorch_adamw_moments_close(
         &format!("{label} second moment successor"),
@@ -1896,12 +2216,30 @@ fn assert_pytorch_adamw_window(label: &str, window: PyTorchAdamWWindowAssertion<
         &window.expected.second_moments,
         64.0,
         5e-3,
+        expected_coordinates,
     );
+    if let PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+        parameter_names,
+        optimizer,
+        learning_rate,
+    } = successor_oracle
+    {
+        assert_adamw_gauge_null_successors(
+            label,
+            &window,
+            parameter_names,
+            optimizer,
+            learning_rate,
+        );
+    }
     assert_pytorch_parameter_successors_close(
         window.actual_successors,
         window.actual_initial,
         &window.expected.parameter_successors,
         window.expected_initial,
+        microbatch_count,
+        expected_coordinates,
+        successor_oracle,
     );
 }
 
@@ -1949,6 +2287,209 @@ fn token_losses_from_logits(logits: &TensorData, targets: &[i32]) -> TensorData 
             .collect::<Vec<_>>(),
     )
     .unwrap()
+}
+
+fn policy_token_losses_from_logits(logits: &TensorData, targets: &[i32]) -> TensorData {
+    assert_eq!(logits.shape(), &Shape::new([BATCH, TIME, MULTI_HEAD_VOCAB]));
+    assert_eq!(targets.len(), TOKEN_COUNT);
+    TensorData::new(
+        [BATCH, TIME],
+        (0..TOKEN_COUNT)
+            .map(|row| {
+                if targets[row] == POLICY_IGNORE_INDEX {
+                    return 0.0;
+                }
+                let row_logits = (0..MULTI_HEAD_VOCAB)
+                    .map(|class| logits.scalar_at(row * MULTI_HEAD_VOCAB + class).as_f64())
+                    .collect::<Vec<_>>();
+                let maximum = row_logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let denominator = row_logits
+                    .iter()
+                    .map(|value| (value - maximum).exp())
+                    .sum::<f64>();
+                (-(row_logits[targets[row] as usize] - maximum - denominator.ln()) + 1.0) as f32
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
+fn assert_policy_frontier_replay(step: &CompiledAdamWStepResult, expected: &PyTorchReplayFixture) {
+    let replay = expected.replay;
+    assert!((1..=7).contains(&replay));
+    assert_eq!(step.loss_weight(), expected.valid_token_count);
+    let inputs = policy_frontier_batch(replay);
+    assert!(!inputs.contains_key(LOSS_MASK));
+    assert_eq!(
+        inputs["tokens"]
+            .to_vec_f64()
+            .into_iter()
+            .map(|value| value as i32)
+            .collect::<Vec<_>>(),
+        expected.tokens
+    );
+    assert_eq!(
+        inputs["targets"]
+            .to_vec_f64()
+            .into_iter()
+            .map(|value| value as i32)
+            .collect::<Vec<_>>(),
+        expected.targets
+    );
+    assert_eq!(
+        inputs[ATTENTION_KEEP_MASK].shape(),
+        &Shape::new(POLICY_ATTENTION_KEEP_MASK_SHAPE)
+    );
+    assert_eq!(inputs[ATTENTION_KEEP_MASK].dtype(), DType::Bool);
+    assert_eq!(
+        inputs[ATTENTION_KEEP_MASK]
+            .to_vec_f64()
+            .into_iter()
+            .map(|value| value != 0.0)
+            .collect::<Vec<_>>(),
+        expected.attention_keep_mask
+    );
+    assert_eq!(expected.attention_keep_mask.len(), BATCH * TIME);
+    assert_eq!(
+        expected.attention_keep_mask,
+        expected
+            .targets
+            .iter()
+            .map(|target| *target != POLICY_IGNORE_INDEX)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        expected.loss_mask,
+        expected
+            .targets
+            .iter()
+            .map(|target| {
+                if *target == POLICY_IGNORE_INDEX {
+                    0.0
+                } else {
+                    1.0
+                }
+            })
+            .collect::<Vec<_>>()
+    );
+    let effective = expected.effective_attention_mask.tensor();
+    let row_valid = expected.row_valid.tensor();
+    assert_eq!(effective.shape(), &Shape::new([BATCH, 2, TIME, TIME]));
+    assert_eq!(row_valid.shape(), &Shape::new([BATCH, 2, TIME, 1]));
+    for batch in 0..BATCH {
+        for head in 0..2 {
+            for query in 0..TIME {
+                let row = (batch * 2 + head) * TIME + query;
+                for key in 0..TIME {
+                    let expected_keep =
+                        expected.attention_keep_mask[batch * TIME + key] && key <= query;
+                    assert_eq!(
+                        effective.scalar_at(row * TIME + key).as_bool(),
+                        expected_keep
+                    );
+                }
+                assert_eq!(
+                    row_valid.scalar_at(row).as_bool(),
+                    (0..TIME).any(|key| effective.scalar_at(row * TIME + key).as_bool())
+                );
+            }
+        }
+    }
+    if replay % 3 == 0 {
+        assert!((0..2 * TIME).all(|row| !row_valid.scalar_at(2 * TIME + row).as_bool()));
+    }
+    assert_pytorch_scalar_close(
+        &format!("policy replay {replay} token-mean loss"),
+        step.loss().scalar_at(0).as_f64(),
+        f64::from(expected.token_mean_loss),
+    );
+    let logits = &step.outputs()["logits"];
+    assert_pytorch_f32_tensor_close(
+        &format!("policy replay {replay} logits"),
+        logits,
+        &expected.logits,
+    );
+    assert_pytorch_f32_tensor_close(
+        &format!("policy replay {replay} token losses"),
+        &policy_token_losses_from_logits(logits, &expected.targets),
+        &expected.token_losses,
+    );
+    let actual_masks = observed_two_block_dropout_masks(step.outputs());
+    assert_eq!(expected.dropout_masks.len(), actual_masks.len());
+    for (site, (actual, fixture)) in actual_masks.iter().zip(&expected.dropout_masks).enumerate() {
+        assert_eq!(
+            actual,
+            &fixture.tensor(),
+            "policy replay {replay} site {site}"
+        );
+    }
+    assert_eq!(expected.attention_probabilities.len(), 2);
+    for (block, site) in [0, 3].into_iter().enumerate() {
+        let probabilities = &step.outputs()[&format!("dropout_{site}_input")];
+        assert_pytorch_f32_tensor_close(
+            &format!("policy replay {replay} block {block} attention probabilities"),
+            probabilities,
+            &expected.attention_probabilities[block],
+        );
+        for row in 0..BATCH * 2 * TIME {
+            if !row_valid.scalar_at(row).as_bool() {
+                assert!(
+                    (0..TIME).all(|key| probabilities.scalar_at(row * TIME + key).as_f64() == 0.0)
+                );
+            }
+        }
+    }
+}
+
+fn assert_policy_window_report(
+    label: &str,
+    report: &CompiledAdamWWindowLossReport,
+    expected: &PyTorchPolicyAdamWWindowFixture,
+) {
+    assert_eq!(report.loss_weight(), expected.adamw.valid_token_count);
+    assert_eq!(report.microbatch_count(), expected.microbatch_count);
+    assert!(report.is_finite());
+    assert_pytorch_scalar_close(
+        &format!("{label} window mean loss"),
+        f64::from(report.mean_loss()),
+        f64::from(expected.mean_loss),
+    );
+}
+
+fn assert_compiled_adamw_steps_exact(
+    label: &str,
+    actual: &CompiledAdamWStepResult,
+    expected: &CompiledAdamWStepResult,
+) {
+    assert_eq!(actual.loss(), expected.loss(), "{label} loss");
+    assert_eq!(actual.outputs(), expected.outputs(), "{label} outputs");
+    assert_eq!(actual.step(), expected.step(), "{label} replay step");
+    assert_eq!(
+        actual.optimizer_step(),
+        expected.optimizer_step(),
+        "{label} optimizer step"
+    );
+    assert_eq!(
+        actual.accumulation_index(),
+        expected.accumulation_index(),
+        "{label} accumulation index"
+    );
+    assert_eq!(
+        actual.loss_weight(),
+        expected.loss_weight(),
+        "{label} weight"
+    );
+    assert_eq!(actual.clip_report(), expected.clip_report(), "{label} clip");
+    assert_eq!(
+        actual.window_loss_report(),
+        expected.window_loss_report(),
+        "{label} window loss"
+    );
+    assert_eq!(
+        actual.capture_identity(),
+        expected.capture_identity(),
+        "{label} capture identity"
+    );
 }
 
 fn assert_pytorch_gradient_family_evidence(
@@ -2143,6 +2684,10 @@ fn graph_f32_div(lhs: f32, rhs: f32) -> f32 {
 
 fn graph_f32_mul(lhs: f32, rhs: f32) -> f32 {
     (f64::from(lhs) * f64::from(rhs)) as f32
+}
+
+fn graph_f32_sub(lhs: f32, rhs: f32) -> f32 {
+    (f64::from(lhs) - f64::from(rhs)) as f32
 }
 
 fn graph_f32_sqrt(value: f32) -> f32 {
@@ -8041,6 +8586,418 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
     assert_eq!(
         zero_retry.checkpoint().unwrap(),
         zeroed.checkpoint().unwrap()
+    );
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
+    assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_policy_frontier_matches_pytorch_across_resume_and_flush() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+
+    let fixture = two_block_pytorch_fixture();
+    let policy = &fixture.policy_frontier;
+    assert_eq!(
+        policy.rustgrad_base,
+        "0b9bae3c69e072e050e7f9c08daf8184c0630133"
+    );
+    assert_eq!(policy.weight_decay.to_bits(), 0.01f32.to_bits());
+    assert_eq!(policy.loss_scale.to_bits(), 128.0f32.to_bits());
+    assert_eq!(policy.accumulation_steps, 3);
+    assert_eq!(policy.max_gradient_norm.to_bits(), 0.25f32.to_bits());
+    assert_eq!(policy.ignore_index, POLICY_IGNORE_INDEX);
+    assert_eq!(policy.learning_rates, [1e-3, 5e-4]);
+    assert_eq!(policy.active_parameter_count, 35);
+    assert_eq!(policy.active_coordinate_count, 372);
+    assert_eq!(
+        policy
+            .analytic_gauge_null_parameters
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS
+    );
+    let analytic_gauge_null_parameters = policy
+        .analytic_gauge_null_parameters
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(analytic_gauge_null_parameters.len(), 2);
+    let analytic_gauge_null_coordinates = analytic_gauge_null_parameters
+        .iter()
+        .map(|name| policy.initial_parameters[*name].tensor().len())
+        .sum::<usize>();
+    assert_eq!(analytic_gauge_null_coordinates, 8);
+    assert_eq!(
+        policy.active_coordinate_count - analytic_gauge_null_coordinates,
+        364
+    );
+    assert_eq!(policy.frozen_parameter_name, POLICY_FROZEN_PARAMETER);
+    assert_eq!(policy.frozen_parameter.tensor().len(), 12);
+    assert!(
+        !policy
+            .initial_parameters
+            .contains_key(POLICY_FROZEN_PARAMETER)
+    );
+    assert_eq!(policy.replays.len(), 7);
+    assert_eq!(policy.commits.len(), 2);
+    assert_eq!(
+        policy
+            .replays
+            .iter()
+            .map(|replay| replay.valid_token_count)
+            .collect::<Vec<_>>(),
+        [5, 3, 3, 5, 3, 3, 5]
+    );
+    for replay in &policy.replays {
+        assert_eq!(
+            replay.numerator_gradients.len(),
+            policy.active_parameter_count
+        );
+        assert_eq!(
+            replay
+                .numerator_gradients
+                .values()
+                .map(|gradient| gradient.tensor().len())
+                .sum::<usize>(),
+            policy.active_coordinate_count
+        );
+        assert!(
+            !replay
+                .numerator_gradients
+                .contains_key(POLICY_FROZEN_PARAMETER)
+        );
+        assert!(replay.numerator_gradients.contains_key("tokens.weight"));
+        assert!(!replay.numerator_gradients.contains_key("lm_head.weight"));
+    }
+    assert_eq!(
+        policy
+            .commits
+            .iter()
+            .map(|window| {
+                (
+                    window.adamw.optimizer_step,
+                    window.adamw.valid_token_count,
+                    window.microbatch_count,
+                    window.learning_rate.to_bits(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        [(1, 11, 3, 1e-3f32.to_bits()), (2, 11, 3, 5e-4f32.to_bits()),]
+    );
+    assert_eq!(policy.partial_flush.adamw.optimizer_step, 3);
+    assert_eq!(policy.partial_flush.adamw.valid_token_count, 5);
+    assert_eq!(policy.partial_flush.microbatch_count, 1);
+    assert_eq!(
+        policy.partial_flush.learning_rate.to_bits(),
+        5e-4f32.to_bits()
+    );
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    assert_eq!(
+        &state_before.tensors()[POLICY_FROZEN_PARAMETER],
+        &policy.frozen_parameter.tensor()
+    );
+    let mut traversal = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        assert!(traversal.insert(name, parameter.id()).is_none());
+    });
+    assert_eq!(traversal.len(), 37);
+    assert_eq!(traversal["tokens.weight"], traversal["lm_head.weight"]);
+    assert_ne!(
+        traversal["tokens.weight"],
+        traversal[POLICY_FROZEN_PARAMETER]
+    );
+
+    let compile_count = Cell::new(0);
+    let optimizer = two_block_policy_frontier_config();
+    let plan = CompiledAdamWPlan::compile_module_graph_with_dropout(
+        optimizer.clone(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_policy_frontier(model, graph, inputs, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(
+        plan.token_weighted_ignore_index(),
+        Some(("targets", POLICY_IGNORE_INDEX))
+    );
+    assert_eq!(plan.token_weighted_gradient_accumulation_mask(), None);
+    assert_eq!(
+        plan.gradient_accumulation_steps(),
+        policy.accumulation_steps
+    );
+    assert_eq!(plan.max_gradient_norm(), Some(policy.max_gradient_norm));
+    assert_eq!(plan.loss_scale().to_bits(), policy.loss_scale.to_bits());
+    assert_eq!(
+        plan.captured_multi_step_lr(),
+        Some(&CompiledMultiStepLr::new(1e-3, 0.5, [1]).unwrap())
+    );
+    assert!(plan.clip_report_enabled());
+    assert!(plan.window_loss_report_enabled());
+
+    let mut uninterrupted = plan.prepare_cpu().unwrap();
+    let initial_parameters = uninterrupted.parameter_snapshots().unwrap();
+    assert_eq!(initial_parameters.len(), policy.active_parameter_count);
+    assert_eq!(
+        initial_parameters
+            .values()
+            .map(TensorData::len)
+            .sum::<usize>(),
+        policy.active_coordinate_count
+    );
+    assert!(!initial_parameters.contains_key(POLICY_FROZEN_PARAMETER));
+    assert!(initial_parameters.contains_key("tokens.weight"));
+    assert!(!initial_parameters.contains_key("lm_head.weight"));
+    assert_eq!(
+        initial_parameters,
+        fixture_tensor_map(&policy.initial_parameters)
+    );
+
+    let first = uninterrupted
+        .step_scheduled(policy_frontier_batch(1))
+        .unwrap();
+    assert!(!first.did_update());
+    assert_policy_frontier_replay(&first, &policy.replays[0]);
+    let first_contribution = uninterrupted.gradient_accumulator_snapshots().unwrap();
+    assert_pytorch_tensor_map_close(
+        "policy replay 1 numerator gradient",
+        &first_contribution,
+        &policy.replays[0].numerator_gradients,
+    );
+    assert_eq!(first_contribution.len(), policy.active_parameter_count);
+    assert_eq!(
+        first_contribution
+            .values()
+            .map(TensorData::len)
+            .sum::<usize>(),
+        policy.active_coordinate_count
+    );
+
+    let second = uninterrupted
+        .step_scheduled(policy_frontier_batch(2))
+        .unwrap();
+    assert!(!second.did_update());
+    assert_policy_frontier_replay(&second, &policy.replays[1]);
+    let third = uninterrupted
+        .step_scheduled(policy_frontier_batch(3))
+        .unwrap();
+    assert!(third.did_update());
+    assert_policy_frontier_replay(&third, &policy.replays[2]);
+    let first_window_parameters = uninterrupted.parameter_snapshots().unwrap();
+    let first_window_first_moments = uninterrupted.first_moment_snapshots().unwrap();
+    let first_window_second_moments = uninterrupted.second_moment_snapshots().unwrap();
+    let first_expected = &policy.commits[0];
+    assert_pytorch_adamw_window_for_frontier(
+        "policy first window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 1,
+            clip_report: third.clip_report().unwrap(),
+            actual_initial: &initial_parameters,
+            actual_first_moments: &first_window_first_moments,
+            actual_second_moments: &first_window_second_moments,
+            actual_successors: &first_window_parameters,
+            expected_initial: &policy.initial_parameters,
+            expected: &first_expected.adamw,
+        },
+        first_expected.microbatch_count,
+        policy.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: first_expected.learning_rate,
+        },
+    );
+    assert_policy_window_report(
+        "policy first window",
+        third.window_loss_report().unwrap(),
+        first_expected,
+    );
+    let first_checkpoint = uninterrupted.checkpoint().unwrap();
+    assert_eq!(first_checkpoint.info().replay_step(), 3);
+    assert_eq!(first_checkpoint.info().optimizer_step(), 1);
+    assert_eq!(first_checkpoint.info().accumulation_index(), 0);
+    assert_eq!(first_checkpoint.info().accumulated_token_count(), Some(0));
+    assert_eq!(first_checkpoint.info().dropout_block_counter(), Some(252));
+
+    let fourth = uninterrupted
+        .step_scheduled(policy_frontier_batch(4))
+        .unwrap();
+    assert!(!fourth.did_update());
+    assert_policy_frontier_replay(&fourth, &policy.replays[3]);
+    let fourth_contribution = uninterrupted.gradient_accumulator_snapshots().unwrap();
+    assert_pytorch_tensor_map_close(
+        "policy replay 4 numerator gradient",
+        &fourth_contribution,
+        &policy.replays[3].numerator_gradients,
+    );
+    let pending_checkpoint = uninterrupted.checkpoint().unwrap();
+    let pending = &policy.pending_checkpoint;
+    assert_eq!(pending_checkpoint.info().replay_step(), pending.replay_step);
+    assert_eq!(
+        pending_checkpoint.info().optimizer_step(),
+        pending.optimizer_step
+    );
+    assert_eq!(
+        pending_checkpoint.info().accumulation_index(),
+        pending.accumulation_index
+    );
+    assert_eq!(
+        pending_checkpoint.info().accumulated_token_count(),
+        Some(pending.valid_token_count)
+    );
+    assert_eq!(
+        pending_checkpoint.info().dropout_block_counter(),
+        Some(pending.dropout_counter)
+    );
+    assert_pytorch_scalar_close(
+        "policy pending loss numerator",
+        f64::from(
+            pending_checkpoint
+                .info()
+                .accumulated_loss_numerator()
+                .unwrap(),
+        ),
+        f64::from(pending.loss_numerator),
+    );
+
+    let restored_plan = plan.restore_checkpoint(&pending_checkpoint).unwrap();
+    assert_eq!(restored_plan.capture_identity(), plan.capture_identity());
+    assert_eq!(compile_count.get(), 1);
+    let mut resumed = restored_plan.prepare_cpu().unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), pending_checkpoint);
+    let fifth = uninterrupted
+        .step_scheduled(policy_frontier_batch(5))
+        .unwrap();
+    let resumed_fifth = resumed.step_scheduled(policy_frontier_batch(5)).unwrap();
+    assert!(!fifth.did_update());
+    assert_policy_frontier_replay(&fifth, &policy.replays[4]);
+    assert_compiled_adamw_steps_exact("policy replay 5 resume", &resumed_fifth, &fifth);
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+    let sixth = uninterrupted
+        .step_scheduled(policy_frontier_batch(6))
+        .unwrap();
+    let resumed_sixth = resumed.step_scheduled(policy_frontier_batch(6)).unwrap();
+    assert!(sixth.did_update());
+    assert_policy_frontier_replay(&sixth, &policy.replays[5]);
+    assert_compiled_adamw_steps_exact("policy replay 6 resume", &resumed_sixth, &sixth);
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+    let second_window_parameters = uninterrupted.parameter_snapshots().unwrap();
+    let second_window_first_moments = uninterrupted.first_moment_snapshots().unwrap();
+    let second_window_second_moments = uninterrupted.second_moment_snapshots().unwrap();
+    let second_expected = &policy.commits[1];
+    assert_pytorch_adamw_window_for_frontier(
+        "policy second window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 2,
+            clip_report: sixth.clip_report().unwrap(),
+            actual_initial: &first_window_parameters,
+            actual_first_moments: &second_window_first_moments,
+            actual_second_moments: &second_window_second_moments,
+            actual_successors: &second_window_parameters,
+            expected_initial: &first_expected.adamw.parameter_successors,
+            expected: &second_expected.adamw,
+        },
+        second_expected.microbatch_count,
+        policy.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: second_expected.learning_rate,
+        },
+    );
+    assert_policy_window_report(
+        "policy second window",
+        sixth.window_loss_report().unwrap(),
+        second_expected,
+    );
+    let resumed_second = resumed.checkpoint().unwrap();
+    assert_eq!(resumed_second.info().replay_step(), 6);
+    assert_eq!(resumed_second.info().optimizer_step(), 2);
+    assert_eq!(resumed_second.info().accumulation_index(), 0);
+    assert_eq!(resumed_second.info().accumulated_token_count(), Some(0));
+    assert_eq!(resumed_second.info().dropout_block_counter(), Some(504));
+    let seventh = uninterrupted
+        .step_scheduled(policy_frontier_batch(7))
+        .unwrap();
+    let resumed_seventh = resumed.step_scheduled(policy_frontier_batch(7)).unwrap();
+    assert!(!seventh.did_update());
+    assert_policy_frontier_replay(&seventh, &policy.replays[6]);
+    assert_compiled_adamw_steps_exact("policy replay 7 resume", &resumed_seventh, &seventh);
+    let seventh_contribution = uninterrupted.gradient_accumulator_snapshots().unwrap();
+    assert_pytorch_tensor_map_close(
+        "policy replay 7 numerator gradient",
+        &seventh_contribution,
+        &policy.replays[6].numerator_gradients,
+    );
+    let partial_checkpoint = uninterrupted.checkpoint().unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), partial_checkpoint);
+    assert_eq!(partial_checkpoint.info().replay_step(), 7);
+    assert_eq!(partial_checkpoint.info().optimizer_step(), 2);
+    assert_eq!(partial_checkpoint.info().accumulation_index(), 1);
+    assert_eq!(partial_checkpoint.info().accumulated_token_count(), Some(5));
+    assert_eq!(partial_checkpoint.info().dropout_block_counter(), Some(588));
+
+    let expected_flush = uninterrupted.flush_partial_window_scheduled().unwrap();
+    let resumed_flush = resumed.flush_partial_window_scheduled().unwrap();
+    assert_eq!(resumed_flush, expected_flush);
+    assert!(expected_flush.did_update());
+    assert_eq!(expected_flush.flushed_microbatches(), 1);
+    assert_eq!(expected_flush.optimizer_step(), 3);
+    assert_pytorch_adamw_window_for_frontier(
+        "policy partial flush",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 3,
+            clip_report: expected_flush.clip_report().unwrap(),
+            actual_initial: &second_window_parameters,
+            actual_first_moments: &uninterrupted.first_moment_snapshots().unwrap(),
+            actual_second_moments: &uninterrupted.second_moment_snapshots().unwrap(),
+            actual_successors: &uninterrupted.parameter_snapshots().unwrap(),
+            expected_initial: &second_expected.adamw.parameter_successors,
+            expected: &policy.partial_flush.adamw,
+        },
+        policy.partial_flush.microbatch_count,
+        policy.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: policy.partial_flush.learning_rate,
+        },
+    );
+    assert_policy_window_report(
+        "policy partial flush",
+        expected_flush.window_loss_report().unwrap(),
+        &policy.partial_flush,
+    );
+    let flushed_checkpoint = uninterrupted.checkpoint().unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), flushed_checkpoint);
+    assert_eq!(flushed_checkpoint.info().replay_step(), 7);
+    assert_eq!(flushed_checkpoint.info().optimizer_step(), 3);
+    assert_eq!(flushed_checkpoint.info().accumulation_index(), 0);
+    assert_eq!(flushed_checkpoint.info().accumulated_token_count(), Some(0));
+    assert_eq!(flushed_checkpoint.info().dropout_block_counter(), Some(588));
+    assert!(
+        uninterrupted
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .all(|value| value.to_bits() == 0.0f64.to_bits())
     );
     assert_eq!(model.state_dict().unwrap(), state_before);
     assert_eq!(module_parameter_state(&model), parameter_state_before);
