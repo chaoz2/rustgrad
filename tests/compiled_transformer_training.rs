@@ -21,6 +21,7 @@ use rustgrad::{
     TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy, load_safetensors,
     save_safetensors, schedule_many,
 };
+use serde::Deserialize;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
@@ -38,6 +39,8 @@ const LOSS_MASK: &str = "loss_mask";
 const MULTI_HEAD_VOCAB: usize = 5;
 const MULTI_HEAD_EMBEDDING: usize = 4;
 const MULTI_HEAD_FEED_FORWARD: usize = 8;
+const MULTI_HEAD_TOKENS: [i32; TOKEN_COUNT] = [0, 1, 2, 3, 4, 1];
+const MULTI_HEAD_TARGETS: [i32; TOKEN_COUNT] = [1, 3, 4, 2, 0, 4];
 const TWO_BLOCK_ACCUMULATION_STEPS: u64 = 2;
 const TWO_BLOCK_MAX_GRADIENT_NORM: f32 = 1e-4;
 const ATTENTION_DROPOUT_TRANSITION_GUARD: &str = "attention_dropout_transition_guard";
@@ -913,11 +916,9 @@ fn batch(replay: u64) -> BTreeMap<String, TensorData> {
 }
 
 fn multi_head_batch() -> BTreeMap<String, TensorData> {
-    let tokens = [0, 1, 2, 3, 4, 1];
-    let targets = [1, 3, 4, 2, 0, 4];
     BTreeMap::from([
-        ("tokens".into(), token_tensor(tokens)),
-        ("targets".into(), token_tensor(targets)),
+        ("tokens".into(), token_tensor(MULTI_HEAD_TOKENS)),
+        ("targets".into(), token_tensor(MULTI_HEAD_TARGETS)),
     ])
 }
 
@@ -1576,6 +1577,357 @@ fn module_parameter_state(model: &impl Module) -> BTreeMap<String, (TensorData, 
         panic!("the maintained Transformer state must remain readable: {error}");
     }
     state
+}
+
+#[derive(Deserialize)]
+struct PyTorchTensorFixture {
+    shape: Vec<usize>,
+    #[serde(default)]
+    values: Vec<f32>,
+    #[serde(default)]
+    bool_values: Vec<bool>,
+}
+
+impl PyTorchTensorFixture {
+    fn tensor(&self) -> TensorData {
+        if self.bool_values.is_empty() {
+            TensorData::new(self.shape.clone(), self.values.clone()).unwrap()
+        } else {
+            assert!(self.values.is_empty());
+            TensorData::from_scalars(
+                self.shape.clone(),
+                DType::Bool,
+                self.bool_values.iter().copied().map(Scalar::Bool),
+            )
+            .unwrap()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct PyTorchReplayFixture {
+    replay: u64,
+    tokens: Vec<i32>,
+    targets: Vec<i32>,
+    attention_keep_mask: Vec<bool>,
+    loss_mask: Vec<f32>,
+    effective_attention_mask: PyTorchTensorFixture,
+    row_valid: PyTorchTensorFixture,
+    dropout_masks: Vec<PyTorchTensorFixture>,
+    attention_probabilities: Vec<PyTorchTensorFixture>,
+    logits: PyTorchTensorFixture,
+    token_losses: PyTorchTensorFixture,
+    token_mean_loss: f32,
+    valid_token_count: u64,
+    numerator_gradients: BTreeMap<String, PyTorchTensorFixture>,
+}
+
+#[derive(Deserialize)]
+struct PyTorchAdamWWindowFixture {
+    valid_token_count: u64,
+    pre_clip_norm: f32,
+    clip_scale: f32,
+    first_moments: BTreeMap<String, PyTorchTensorFixture>,
+    second_moments: BTreeMap<String, PyTorchTensorFixture>,
+    parameter_successors: BTreeMap<String, PyTorchTensorFixture>,
+}
+
+#[derive(Deserialize)]
+struct PyTorchFixtureProvenance {
+    generator: String,
+    rustgrad_base: String,
+    python: String,
+    torch: String,
+    device: String,
+    dtype: String,
+    model_seed: u64,
+    dropout_key: [u32; 2],
+}
+
+#[derive(Deserialize)]
+struct TwoBlockPyTorchFixture {
+    provenance: PyTorchFixtureProvenance,
+    traversal_name_count: usize,
+    canonical_parameter_count: usize,
+    canonical_coordinate_count: usize,
+    tied_names: [String; 2],
+    initial_parameters: BTreeMap<String, PyTorchTensorFixture>,
+    replays: Vec<PyTorchReplayFixture>,
+    window: PyTorchAdamWWindowFixture,
+}
+
+fn two_block_pytorch_fixture() -> TwoBlockPyTorchFixture {
+    serde_json::from_str(include_str!("fixtures/two_block_pytorch_frontier.json"))
+        .expect("the checked PyTorch Transformer fixture must decode")
+}
+
+fn assert_pytorch_f32_tensor_close(
+    label: &str,
+    actual: &TensorData,
+    expected: &PyTorchTensorFixture,
+) {
+    const ABSOLUTE_TOLERANCE: f64 = 2e-5;
+    const RELATIVE_TOLERANCE: f64 = 5e-4;
+
+    let expected = expected.tensor();
+    assert_eq!(actual.shape(), expected.shape(), "{label} shape changed");
+    assert_eq!(actual.dtype(), DType::F32, "{label} must remain F32");
+    assert_eq!(expected.dtype(), DType::F32);
+    for coordinate in 0..actual.len() {
+        let actual = actual.scalar_at(coordinate).as_f64();
+        let expected = expected.scalar_at(coordinate).as_f64();
+        assert!(actual.is_finite() && expected.is_finite());
+        let error = (actual - expected).abs();
+        let tolerance = ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * actual.abs().max(expected.abs());
+        assert!(
+            error <= tolerance,
+            "{label}[{coordinate}] differs from PyTorch: actual={actual}, expected={expected}, error={error}, tolerance={tolerance}"
+        );
+    }
+}
+
+fn assert_pytorch_scalar_close(label: &str, actual: f64, expected: f64) {
+    const ABSOLUTE_TOLERANCE: f64 = 2e-5;
+    const RELATIVE_TOLERANCE: f64 = 5e-4;
+
+    assert!(actual.is_finite() && expected.is_finite());
+    let error = (actual - expected).abs();
+    let tolerance = ABSOLUTE_TOLERANCE + RELATIVE_TOLERANCE * actual.abs().max(expected.abs());
+    assert!(
+        error <= tolerance,
+        "{label} differs from PyTorch: actual={actual}, expected={expected}, error={error}, tolerance={tolerance}"
+    );
+}
+
+fn fixture_tensor_map(
+    fixtures: &BTreeMap<String, PyTorchTensorFixture>,
+) -> BTreeMap<String, TensorData> {
+    fixtures
+        .iter()
+        .map(|(name, tensor)| (name.clone(), tensor.tensor()))
+        .collect()
+}
+
+fn assert_pytorch_tensor_map_close(
+    label: &str,
+    actual: &BTreeMap<String, TensorData>,
+    expected: &BTreeMap<String, PyTorchTensorFixture>,
+) {
+    assert!(actual.keys().eq(expected.keys()), "{label} names changed");
+    for (name, actual) in actual {
+        assert_pytorch_f32_tensor_close(&format!("{label} {name}"), actual, &expected[name]);
+    }
+}
+
+fn assert_pytorch_adamw_moments_close(
+    label: &str,
+    actual: &BTreeMap<String, TensorData>,
+    expected: &BTreeMap<String, PyTorchTensorFixture>,
+    rounding_budget: f64,
+    relative_tolerance: f64,
+) {
+    assert!(actual.keys().eq(expected.keys()), "{label} names changed");
+    let expected_scale = expected
+        .values()
+        .flat_map(|tensor| tensor.values.iter().copied())
+        .map(f32::abs)
+        .fold(0.0f32, f32::max);
+    assert!(expected_scale.is_finite() && expected_scale > 0.0);
+    // Bound accumulated F32 rounding at the scale of this optimizer state,
+    // rather than borrowing the much larger forward-value absolute tolerance.
+    let absolute_tolerance = rounding_budget * f64::from(f32::EPSILON) * f64::from(expected_scale);
+    let mut actual_nonzero = 0usize;
+    let mut expected_nonzero = 0usize;
+    let mut coordinates = 0usize;
+
+    for (name, actual) in actual {
+        let expected = expected[name].tensor();
+        assert_eq!(
+            actual.shape(),
+            expected.shape(),
+            "{label} {name} shape changed"
+        );
+        assert_eq!(actual.dtype(), DType::F32, "{label} {name} must remain F32");
+        for coordinate in 0..actual.len() {
+            let actual = actual.scalar_at(coordinate).as_f64();
+            let expected = expected.scalar_at(coordinate).as_f64();
+            assert!(actual.is_finite() && expected.is_finite());
+            actual_nonzero += usize::from(actual != 0.0);
+            expected_nonzero += usize::from(expected != 0.0);
+            coordinates += 1;
+            let error = (actual - expected).abs();
+            let tolerance =
+                absolute_tolerance + relative_tolerance * actual.abs().max(expected.abs());
+            assert!(
+                error <= tolerance,
+                "{label} {name}[{coordinate}] differs from PyTorch: actual={actual}, expected={expected}, error={error}, tolerance={tolerance}"
+            );
+        }
+    }
+    assert_eq!(coordinates, 384, "{label} must cover the whole frontier");
+    assert!(expected_nonzero > 0, "{label} fixture must be nonzero");
+    assert!(actual_nonzero > 0, "{label} must not collapse to all zero");
+}
+
+fn assert_pytorch_parameter_successors_close(
+    actual: &BTreeMap<String, TensorData>,
+    actual_initial: &BTreeMap<String, TensorData>,
+    expected: &BTreeMap<String, PyTorchTensorFixture>,
+    expected_initial: &BTreeMap<String, PyTorchTensorFixture>,
+) {
+    const ROUNDING_BUDGET: f64 = 128.0;
+    const RELATIVE_TOLERANCE: f64 = 2e-3;
+
+    assert!(actual.keys().eq(actual_initial.keys()));
+    assert!(actual.keys().eq(expected.keys()));
+    assert!(actual.keys().eq(expected_initial.keys()));
+    let expected_update_scale = expected
+        .iter()
+        .flat_map(|(name, successor)| {
+            successor
+                .values
+                .iter()
+                .zip(&expected_initial[name].values)
+                .map(|(successor, initial)| f64::from(*successor) - f64::from(*initial))
+        })
+        .map(f64::abs)
+        .fold(0.0f64, f64::max);
+    assert!(expected_update_scale.is_finite() && expected_update_scale > 0.0);
+    // Successor accuracy is about the AdamW update, not the absolute parameter
+    // magnitude. The bitwise check below also protects updates below this bound.
+    let absolute_tolerance = ROUNDING_BUDGET * f64::from(f32::EPSILON) * expected_update_scale;
+    let mut fixture_changed_coordinates = 0usize;
+    let mut coordinates = 0usize;
+
+    for (name, actual) in actual {
+        let actual_initial = &actual_initial[name];
+        let expected = expected[name].tensor();
+        let expected_initial = expected_initial[name].tensor();
+        assert_eq!(
+            actual.shape(),
+            actual_initial.shape(),
+            "{name} shape changed"
+        );
+        assert_eq!(
+            actual.shape(),
+            expected.shape(),
+            "{name} fixture shape changed"
+        );
+        assert_eq!(actual.shape(), expected_initial.shape());
+        assert_eq!(actual.dtype(), DType::F32);
+        assert_eq!(actual_initial.dtype(), DType::F32);
+        for coordinate in 0..actual.len() {
+            let actual = actual.scalar_at(coordinate).as_f64();
+            let actual_initial = actual_initial.scalar_at(coordinate).as_f64();
+            let expected = expected.scalar_at(coordinate).as_f64();
+            let expected_initial = expected_initial.scalar_at(coordinate).as_f64();
+            assert!(
+                [actual, actual_initial, expected, expected_initial]
+                    .into_iter()
+                    .all(f64::is_finite)
+            );
+            let actual_update = actual - actual_initial;
+            let expected_update = expected - expected_initial;
+            let error = (actual_update - expected_update).abs();
+            let tolerance = absolute_tolerance
+                + RELATIVE_TOLERANCE * actual_update.abs().max(expected_update.abs());
+            assert!(
+                error <= tolerance,
+                "parameter successor {name}[{coordinate}] update differs from PyTorch: actual={actual_update}, expected={expected_update}, error={error}, tolerance={tolerance}"
+            );
+
+            if (expected as f32).to_bits() != (expected_initial as f32).to_bits() {
+                fixture_changed_coordinates += 1;
+                assert_ne!(
+                    (actual as f32).to_bits(),
+                    (actual_initial as f32).to_bits(),
+                    "parameter successor {name}[{coordinate}] must preserve the fixture's mutation sensitivity"
+                );
+            }
+            coordinates += 1;
+        }
+    }
+    assert_eq!(coordinates, 384, "successors must cover the whole frontier");
+    assert_eq!(
+        fixture_changed_coordinates, 312,
+        "the checked fixture's changed-coordinate inventory drifted"
+    );
+}
+
+fn causal_attention_mask_fixture(replay: u64) -> TensorData {
+    let caller = attention_keep_mask(replay);
+    TensorData::from_scalars(
+        [BATCH, 2, TIME, TIME],
+        DType::Bool,
+        (0..BATCH).flat_map(|batch| {
+            let caller = &caller;
+            (0..2).flat_map(move |_| {
+                (0..TIME).flat_map(move |query| {
+                    (0..TIME).map(move |key| {
+                        Scalar::Bool(
+                            caller
+                                .scalar_at(batch * TIME * TIME + query * TIME + key)
+                                .as_bool()
+                                && key <= query,
+                        )
+                    })
+                })
+            })
+        }),
+    )
+    .unwrap()
+}
+
+fn token_losses_from_logits(logits: &TensorData, targets: &[i32]) -> TensorData {
+    assert_eq!(logits.shape(), &Shape::new([BATCH, TIME, MULTI_HEAD_VOCAB]));
+    assert_eq!(targets.len(), BATCH * TIME);
+    TensorData::new(
+        [BATCH, TIME],
+        (0..BATCH * TIME)
+            .map(|row| {
+                let row_logits = (0..MULTI_HEAD_VOCAB)
+                    .map(|class| logits.scalar_at(row * MULTI_HEAD_VOCAB + class).as_f64())
+                    .collect::<Vec<_>>();
+                let maximum = row_logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let denominator = row_logits
+                    .iter()
+                    .map(|value| (value - maximum).exp())
+                    .sum::<f64>();
+                (-(row_logits[targets[row] as usize] - maximum - denominator.ln()) + 1.0) as f32
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
+fn assert_pytorch_gradient_family_evidence(
+    actual: &BTreeMap<String, TensorData>,
+    expected: &BTreeMap<String, PyTorchTensorFixture>,
+) {
+    assert!(actual.keys().eq(expected.keys()));
+    let mut coordinates = [0; TWO_BLOCK_GRADIENT_FAMILIES.len()];
+    let mut actual_nonzero = [false; TWO_BLOCK_GRADIENT_FAMILIES.len()];
+    let mut expected_nonzero = [false; TWO_BLOCK_GRADIENT_FAMILIES.len()];
+    for (name, actual) in actual {
+        let family = two_block_gradient_family(name);
+        let expected = expected[name].tensor();
+        assert_eq!(actual.shape(), expected.shape());
+        coordinates[family] += actual.len();
+        actual_nonzero[family] |= actual.to_vec_f64().into_iter().any(|value| value != 0.0);
+        expected_nonzero[family] |= expected.to_vec_f64().into_iter().any(|value| value != 0.0);
+    }
+    for (family, ((label, expected_coordinates), actual_coordinates)) in TWO_BLOCK_GRADIENT_FAMILIES
+        .into_iter()
+        .zip(coordinates)
+        .enumerate()
+    {
+        assert_eq!(actual_coordinates, expected_coordinates, "{label} changed");
+        assert!(
+            actual_nonzero[family] && expected_nonzero[family],
+            "{label} must carry nonzero RustGrad and PyTorch gradients"
+        );
+    }
+    assert_eq!(coordinates.into_iter().sum::<usize>(), 384);
 }
 
 fn observed_dropout_masks(outputs: &BTreeMap<String, TensorData>) -> [TensorData; 2] {
@@ -7077,6 +7429,318 @@ fn compiled_two_block_attention_mask_accumulated_window_matches_adamw_oracle() {
     );
     assert_eq!(model.tokens.weight.id(), tied_identity);
     assert!(!actual_parameters.contains_key("lm_head.weight"));
+    assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+    const LEARNING_RATE: f32 = 1e-3;
+
+    let fixture = two_block_pytorch_fixture();
+    assert_eq!(
+        fixture.provenance.generator,
+        "tests/fixtures/generate_two_block_pytorch_frontier.py"
+    );
+    assert_eq!(
+        fixture.provenance.rustgrad_base,
+        "73029785579153f9dfc444060b48f3bbb70d3091"
+    );
+    assert_eq!(fixture.provenance.python, "3.11.13");
+    assert_eq!(fixture.provenance.torch, "2.1.2");
+    assert_eq!(fixture.provenance.device, "cpu");
+    assert_eq!(fixture.provenance.dtype, "float32");
+    assert_eq!(fixture.provenance.model_seed, 0x5678);
+    assert_eq!(
+        fixture.provenance.dropout_key,
+        dropout_config().key().words()
+    );
+    assert_eq!(fixture.traversal_name_count, 37);
+    assert_eq!(fixture.canonical_parameter_count, 36);
+    assert_eq!(fixture.canonical_coordinate_count, 384);
+    assert_eq!(
+        fixture.tied_names,
+        ["tokens.weight".to_owned(), "lm_head.weight".to_owned()]
+    );
+    assert_eq!(fixture.replays.len(), 2);
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    let mut traversal = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        assert!(traversal.insert(name, parameter.id()).is_none());
+    });
+    assert_eq!(traversal.len(), fixture.traversal_name_count);
+    assert_eq!(traversal["tokens.weight"], traversal["lm_head.weight"]);
+    let repeated_identities = traversal
+        .values()
+        .filter(|identity| {
+            traversal
+                .values()
+                .filter(|candidate| candidate == identity)
+                .count()
+                > 1
+        })
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        repeated_identities,
+        BTreeSet::from([traversal["tokens.weight"]])
+    );
+
+    let initial_parameters = model
+        .trainable_parameters()
+        .unwrap()
+        .into_iter()
+        .map(|(name, parameter)| (name, parameter.value().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(initial_parameters.len(), fixture.canonical_parameter_count);
+    assert_eq!(
+        initial_parameters
+            .values()
+            .map(TensorData::len)
+            .sum::<usize>(),
+        fixture.canonical_coordinate_count
+    );
+    assert!(initial_parameters.contains_key("tokens.weight"));
+    assert!(!initial_parameters.contains_key("lm_head.weight"));
+    assert_eq!(
+        initial_parameters,
+        fixture_tensor_map(&fixture.initial_parameters)
+    );
+    assert!(
+        ["tokens", "targets", ATTENTION_KEEP_MASK, LOSS_MASK]
+            .into_iter()
+            .all(|name| !fixture.initial_parameters.contains_key(name)
+                && fixture
+                    .replays
+                    .iter()
+                    .all(|replay| !replay.numerator_gradients.contains_key(name)))
+    );
+
+    let compile_count = Cell::new(0);
+    let optimizer = two_block_attention_mask_config().with_clip_report();
+    let plan = CompiledAdamWPlan::compile_token_mean_module_with_dropout(
+        optimizer,
+        dropout_config(),
+        &model,
+        |model, graph, inputs, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_with_attention_mask(model, graph, inputs, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+
+    let mut runtime = plan.prepare(&CpuSessionTarget).unwrap();
+    let mut isolated_second = plan.prepare(&CpuSessionTarget).unwrap();
+    assert_eq!(runtime.parameter_snapshots().unwrap(), initial_parameters);
+    assert_eq!(
+        isolated_second.parameter_snapshots().unwrap(),
+        initial_parameters
+    );
+
+    let first_step = runtime
+        .step(
+            attention_masked_dropout_batch(1, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    assert!(!first_step.did_update());
+    let first_gradients = runtime.gradient_accumulator_snapshots().unwrap();
+
+    let isolated_first = isolated_second
+        .step(
+            attention_masked_dropout_batch(1, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    assert_eq!(isolated_first.loss(), first_step.loss());
+    assert_eq!(isolated_first.outputs(), first_step.outputs());
+    let discarded = isolated_second.zero_grad().unwrap();
+    assert!(discarded.did_discard());
+    assert_eq!(discarded.discarded_microbatches(), 1);
+    let isolated_second_step = isolated_second
+        .step(
+            attention_masked_dropout_batch(2, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    assert!(!isolated_second_step.did_update());
+    let second_gradients = isolated_second.gradient_accumulator_snapshots().unwrap();
+
+    let second_step = runtime
+        .step(
+            attention_masked_dropout_batch(2, 1.0),
+            TensorData::scalar(LEARNING_RATE),
+        )
+        .unwrap();
+    assert!(second_step.did_update());
+    assert_eq!(second_step.loss(), isolated_second_step.loss());
+    assert_eq!(second_step.outputs(), isolated_second_step.outputs());
+    let observed_steps = [&first_step, &isolated_second_step];
+    let observed_gradients = [&first_gradients, &second_gradients];
+
+    for ((fixture_replay, step), gradients) in fixture
+        .replays
+        .iter()
+        .zip(observed_steps)
+        .zip(observed_gradients)
+    {
+        let replay = fixture_replay.replay;
+        assert!(replay == 1 || replay == 2);
+        assert_eq!(fixture_replay.tokens, MULTI_HEAD_TOKENS);
+        assert_eq!(fixture_replay.targets, MULTI_HEAD_TARGETS);
+        assert_eq!(
+            fixture_replay.attention_keep_mask,
+            attention_keep_mask(replay)
+                .to_vec_f64()
+                .into_iter()
+                .map(|value| value != 0.0)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fixture_replay.loss_mask,
+            attention_loss_mask(replay)
+                .to_vec_f64()
+                .into_iter()
+                .map(|value| value as f32)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fixture_replay.effective_attention_mask.tensor(),
+            causal_attention_mask_fixture(replay)
+        );
+        let effective = fixture_replay.effective_attention_mask.tensor();
+        let row_valid = fixture_replay.row_valid.tensor();
+        for row in 0..BATCH * 2 * TIME {
+            let expected = (0..TIME).any(|key| effective.scalar_at(row * TIME + key).as_bool());
+            assert_eq!(row_valid.scalar_at(row).as_bool(), expected);
+        }
+        assert_eq!(step.loss_weight(), fixture_replay.valid_token_count);
+        assert_eq!(
+            fixture_replay.valid_token_count,
+            if replay == 1 { 5 } else { 4 }
+        );
+        assert_pytorch_scalar_close(
+            &format!("replay {replay} token-mean loss"),
+            step.loss().scalar_at(0).as_f64(),
+            f64::from(fixture_replay.token_mean_loss),
+        );
+        let logits = &step.outputs()["logits"];
+        assert_pytorch_f32_tensor_close(
+            &format!("replay {replay} logits"),
+            logits,
+            &fixture_replay.logits,
+        );
+        let token_losses = token_losses_from_logits(logits, &fixture_replay.targets);
+        assert_pytorch_f32_tensor_close(
+            &format!("replay {replay} token losses"),
+            &token_losses,
+            &fixture_replay.token_losses,
+        );
+        let actual_masks = observed_two_block_dropout_masks(step.outputs());
+        assert_eq!(fixture_replay.dropout_masks.len(), actual_masks.len());
+        for (site, (actual, expected)) in actual_masks
+            .iter()
+            .zip(&fixture_replay.dropout_masks)
+            .enumerate()
+        {
+            assert_eq!(
+                actual,
+                &expected.tensor(),
+                "replay {replay} dropout site {site}"
+            );
+        }
+        assert_eq!(fixture_replay.attention_probabilities.len(), 2);
+        for (block, site) in [0, 3].into_iter().enumerate() {
+            let probabilities = &step.outputs()[&format!("dropout_{site}_input")];
+            assert_pytorch_f32_tensor_close(
+                &format!("replay {replay} block {block} attention probabilities"),
+                probabilities,
+                &fixture_replay.attention_probabilities[block],
+            );
+            for row in 0..BATCH * 2 * TIME {
+                if !row_valid.scalar_at(row).as_bool() {
+                    assert!(
+                        (0..TIME).all(|key| {
+                            probabilities.scalar_at(row * TIME + key).as_f64() == 0.0
+                        })
+                    );
+                }
+            }
+        }
+        assert_pytorch_tensor_map_close(
+            &format!("replay {replay} numerator gradient"),
+            gradients,
+            &fixture_replay.numerator_gradients,
+        );
+        assert_pytorch_gradient_family_evidence(gradients, &fixture_replay.numerator_gradients);
+    }
+
+    assert_eq!(fixture.window.valid_token_count, 9);
+    let clip = second_step
+        .clip_report()
+        .expect("the PyTorch reference window must commit a clipped update");
+    assert_eq!(clip.did_clip(), Some(true));
+    assert_pytorch_scalar_close(
+        "window pre-clip norm",
+        f64::from(clip.pre_clip_global_norm()),
+        f64::from(fixture.window.pre_clip_norm),
+    );
+    assert_pytorch_scalar_close(
+        "window clip scale",
+        f64::from(clip.applied_scale()),
+        f64::from(fixture.window.clip_scale),
+    );
+    let first_moments = runtime.first_moment_snapshots().unwrap();
+    assert_pytorch_adamw_moments_close(
+        "first moment successor",
+        &first_moments,
+        &fixture.window.first_moments,
+        32.0,
+        2e-3,
+    );
+    let second_moments = runtime.second_moment_snapshots().unwrap();
+    assert_pytorch_adamw_moments_close(
+        "second moment successor",
+        &second_moments,
+        &fixture.window.second_moments,
+        64.0,
+        5e-3,
+    );
+    let parameter_successors = runtime.parameter_snapshots().unwrap();
+    assert_pytorch_parameter_successors_close(
+        &parameter_successors,
+        &initial_parameters,
+        &fixture.window.parameter_successors,
+        &fixture.initial_parameters,
+    );
+    let accumulators = runtime.gradient_accumulator_snapshots().unwrap();
+    assert_eq!(accumulators.len(), fixture.canonical_parameter_count);
+    assert_eq!(
+        accumulators.values().map(TensorData::len).sum::<usize>(),
+        384
+    );
+    assert!(
+        accumulators
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .all(|value| value.to_bits() == 0.0f64.to_bits())
+    );
+    assert_eq!(runtime.optimizer_step().unwrap(), 1);
+    assert_eq!(runtime.accumulation_index().unwrap(), 0);
+    assert_eq!(runtime.dropout_block_counter().unwrap(), Some(168));
+    assert_eq!(
+        runtime.step_count() + isolated_second.step_count(),
+        4,
+        "the external frontier oracle must remain bounded to four compiled replays"
+    );
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
     assert_eq!(compile_count.get(), 1);
 }
 
