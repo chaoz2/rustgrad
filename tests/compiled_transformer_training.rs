@@ -15,10 +15,11 @@ use rustgrad::{
     CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan,
     CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
     CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions,
-    MetalCompiledAdamWPlan, Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult,
-    NativeCpuSessionTarget, NativeTrainingReport, NativeTrainingScoreboard, NodeId, Op, Parameter,
-    Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock,
-    UnaryOp, cross_entropy, load_safetensors, save_safetensors, schedule_many,
+    MetalCompiledAdamWPlan, Module, NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeCpuCompiledAdamW,
+    NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget, NativeTrainingReport,
+    NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
+    TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy, load_safetensors,
+    save_safetensors, schedule_many,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -5141,6 +5142,8 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let traffic = report.main_replay_traffic().unwrap();
     assert_eq!(traffic.external_input_import_count(), 0);
     assert_eq!(traffic.external_input_import_bytes(), 0);
+    assert!(traffic.materialized_egress_count() > 0);
+    assert!(traffic.materialized_egress_bytes() > 0);
     assert_eq!(
         usize::try_from(traffic.borrowed_recurrent_input_bytes()).unwrap(),
         inspection.recurrent_state_bytes()
@@ -5173,7 +5176,18 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     );
     assert!(json["main_replay_executor_wall_time"].is_object());
     assert!(json["main_replay_recurrent_overhead_wall_time"].is_object());
-    assert_eq!(json["format_version"], 12);
+    assert_eq!(
+        json["format_version"],
+        NATIVE_TRAINING_REPORT_FORMAT_VERSION
+    );
+    assert_eq!(
+        json["main_replay_traffic"]["materialized_egress_count"],
+        traffic.materialized_egress_count()
+    );
+    assert_eq!(
+        json["main_replay_traffic"]["materialized_egress_bytes"],
+        traffic.materialized_egress_bytes()
+    );
     assert_eq!(
         json["step_phases"]["warm_accumulation_only"]["wall_time"]["sample_count"],
         1

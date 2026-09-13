@@ -127,7 +127,7 @@ PTX, OpenCL, Metal, and WebGPU consume validated signed `AffineView` reads direc
 
 | Capability | Status | Acceptance requirement |
 |---|---:|---|
-| Strict-native CPU compiled AdamW replay | 🚧 | `NativeCpuSessionTarget` prepares strict-native main, private accumulation-only, partial-flush, zero-grad, and evaluation programs with fallback disabled. Non-commit accumulation prunes optimizer work and retains exactly authenticated unchanged host-state banks while advancing the complete logical frontier; mismatches use full replacement. Checkpoint v9 preserves both capture identities. `NativeTrainingScoreboard` v12 authenticates phase-specific programs and retained/replaced traffic while v1--v11 remain readable. Failed attempts publish no state, progress, or report. See **Compiled recurrent training** in `ARCHITECTURE.md` for detailed ownership and acceptance boundaries. |
+| Strict-native CPU compiled AdamW replay | 🚧 | `NativeCpuSessionTarget` prepares the attached CPU programs with fallback disabled. `NativeTrainingScoreboard` v13 authenticates phase-specific execution, recurrent traffic, and logical CPU egress; v1--v12 remain readable. Commit-only steps omit caller-named outputs while retaining required loss/report scalars. Failed attempts publish no state, progress, or report. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership and backend boundaries. |
 
 | Capability | Status | Acceptance requirement |
 |---|---:|---|

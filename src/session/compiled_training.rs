@@ -1815,8 +1815,9 @@ impl PreparedNativeCpuEvaluation {
 /// storage; supported dense F32/I32 inputs bind caller storage read-only for
 /// the invocation instead. Recurrent bytes are borrowed directly from the
 /// authoritative host banks. Exact unchanged recurrent successors may retain
-/// the active bank; all other successors borrow the inactive bank. None are
-/// host/device transfers.
+/// the active bank; all other successors borrow the inactive bank. Requested
+/// egress counts describe detached CPU outputs. None of these fields are
+/// host/device transfer measurements.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeCpuReplayTraffic {
@@ -1832,6 +1833,10 @@ pub struct NativeCpuReplayTraffic {
     replaced_recurrent_state_count: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     replaced_recurrent_state_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    materialized_egress_count: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    materialized_egress_bytes: u64,
 }
 
 const fn is_zero_u64(value: &u64) -> bool {
@@ -1854,6 +1859,8 @@ impl NativeCpuReplayTraffic {
             retained_recurrent_state_bytes: 0,
             replaced_recurrent_state_count: 0,
             replaced_recurrent_state_bytes: 0,
+            materialized_egress_count: 0,
+            materialized_egress_bytes: 0,
         }
     }
 
@@ -1868,6 +1875,12 @@ impl NativeCpuReplayTraffic {
         self.retained_recurrent_state_bytes = retained_bytes;
         self.replaced_recurrent_state_count = replaced_count;
         self.replaced_recurrent_state_bytes = replaced_bytes;
+        self
+    }
+
+    pub(crate) const fn with_materialized_egress(mut self, count: u64, bytes: u64) -> Self {
+        self.materialized_egress_count = count;
+        self.materialized_egress_bytes = bytes;
         self
     }
 
@@ -1906,6 +1919,17 @@ impl NativeCpuReplayTraffic {
     /// Recurrent successor bytes physically written into inactive banks.
     pub const fn replaced_recurrent_state_bytes(&self) -> u64 {
         self.replaced_recurrent_state_bytes
+    }
+
+    /// Logical workspace-backed requested CPU tensors detached for the caller.
+    pub const fn materialized_egress_count(&self) -> u64 {
+        self.materialized_egress_count
+    }
+
+    /// Logical descriptor bytes detached from the replay workspace. This is
+    /// host output materialization, not a device transfer measurement.
+    pub const fn materialized_egress_bytes(&self) -> u64 {
+        self.materialized_egress_bytes
     }
 }
 
@@ -4485,15 +4509,17 @@ fn materialize_compiled_public_aliases(
         .collect()
 }
 
-/// Gives public values that coincide with recurrent inputs or successors a
-/// distinct storage owner. Stateful capture deliberately rejects shared node
-/// identity even when the value is otherwise already materialized.
+/// Gives ownerless public values and values that coincide with recurrent
+/// inputs or successors distinct storage. Mixed capture requires every public
+/// request to name a scheduled owner and deliberately rejects shared recurrent
+/// node identity even when the value is otherwise already materialized.
 fn materialize_compiled_recurrent_public_aliases(
     graph: &mut Graph,
     requested: &[NodeId],
     state_links: &[InferenceStateLink],
 ) -> Result<Vec<NodeId>> {
     let requested = materialize_compiled_public_aliases(graph, requested)?;
+    let unowned = compiled_unowned_requests(graph, &requested)?;
     let state_nodes = state_links
         .iter()
         .flat_map(|link| [link.input(), link.output()])
@@ -4501,7 +4527,7 @@ fn materialize_compiled_recurrent_public_aliases(
     requested
         .into_iter()
         .map(|node| {
-            if state_nodes.contains(&node) {
+            if state_nodes.contains(&node) || unowned.contains(&node) {
                 let shape = graph.shape(node)?.clone();
                 let dtype = graph.dtype(node)?;
                 checked_descriptor(&shape, dtype)?;
@@ -6233,6 +6259,10 @@ const fn native_cpu_replay_traffic(traffic: NativeReplayTraffic) -> NativeCpuRep
         traffic.retained_recurrent_state_bytes,
         traffic.replaced_recurrent_state_count,
         traffic.replaced_recurrent_state_bytes,
+    )
+    .with_materialized_egress(
+        traffic.materialized_egress_count,
+        traffic.materialized_egress_bytes,
     )
 }
 
@@ -14450,6 +14480,8 @@ mod tests {
         let first_traffic = *actual.report().traffic();
         assert_eq!(first_traffic.external_input_import_count(), 1);
         assert_eq!(first_traffic.external_input_import_bytes(), 32);
+        assert!(first_traffic.materialized_egress_count() > 0);
+        assert!(first_traffic.materialized_egress_bytes() > 0);
         assert_eq!(
             first_traffic.borrowed_recurrent_input_bytes(),
             u64::try_from(recurrent_state_bytes).unwrap()
@@ -14559,8 +14591,19 @@ mod tests {
         );
         let raw_json: serde_json::Value =
             serde_json::from_slice(&scoreboard.report().unwrap().to_json_bytes().unwrap()).unwrap();
-        assert_eq!(raw_json["format_version"], 9);
+        assert_eq!(
+            raw_json["format_version"],
+            crate::NATIVE_TRAINING_REPORT_FORMAT_VERSION
+        );
         assert!(raw_json.get("step_phases").is_none());
+        assert_eq!(
+            raw_json["main_replay_traffic"]["materialized_egress_count"],
+            first_traffic.materialized_egress_count()
+        );
+        assert_eq!(
+            raw_json["main_replay_traffic"]["materialized_egress_bytes"],
+            first_traffic.materialized_egress_bytes()
+        );
         assert_native_adamw_state_close(&native, &interpreted);
         assert_eq!(executor.native_item_plan_count(), 2);
         let retried_workspace = native.main_replay.workspace_stats();
@@ -18168,24 +18211,72 @@ mod tests {
             .with_clip_report()
             .with_window_loss_report()
             .with_input("scale", [], DType::F32)
+            .unwrap()
+            .with_input("features", [4], DType::F32)
             .unwrap();
         let plan = CompiledAdamWPlan::compile(
             config,
             [TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap()],
             |graph, inputs, parameters| {
                 let loss = graph.mul(parameters["weight"], inputs["scale"])?;
-                let output = graph.add(loss, parameters["weight"])?;
-                Ok((loss, BTreeMap::from([("prediction".into(), output)])))
+                let direct = graph.square(inputs["features"])?;
+                let shrunk = graph.shrink(direct, [(1, 3)])?;
+                let empty = graph.constant(TensorData::new([0], Vec::<f32>::new())?);
+                Ok((
+                    loss,
+                    BTreeMap::from([
+                        ("direct".into(), direct),
+                        ("empty".into(), empty),
+                        ("shrunk".into(), shrunk),
+                    ]),
+                ))
             },
         )
         .unwrap();
-        let input = |scale| BTreeMap::from([("scale".into(), TensorData::scalar(scale))]);
+        assert_eq!(
+            plan.inner.output_names,
+            vec!["direct".to_owned(), "empty".to_owned(), "shrunk".to_owned()]
+        );
+        assert!(
+            plan.inner
+                .capture
+                .schedule
+                .requested_passthroughs
+                .is_empty()
+        );
+        let input = |scale| {
+            BTreeMap::from([
+                (
+                    "features".into(),
+                    TensorData::new([4], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+                ),
+                ("scale".into(), TensorData::scalar(scale)),
+            ])
+        };
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor);
         let mut interpreted = plan.prepare_cpu().unwrap();
         let mut interpreted_commit = plan.prepare_cpu().unwrap();
         let mut native = target.prepare(&plan).unwrap();
         let mut native_commit = target.prepare(&plan).unwrap();
+        assert_eq!(native.main_replay.zero_domain_item_count(), 1);
+        assert_eq!(native_commit.main_replay.zero_domain_item_count(), 1);
+        assert_eq!(
+            native
+                .accumulation_replay
+                .as_ref()
+                .unwrap()
+                .zero_domain_item_count(),
+            1
+        );
+        assert_eq!(
+            native_commit
+                .accumulation_replay
+                .as_ref()
+                .unwrap()
+                .zero_domain_item_count(),
+            1
+        );
 
         for scale in [2.0, 4.0] {
             let expected = interpreted
@@ -18196,7 +18287,15 @@ mod tests {
                 .unwrap();
             assert_eq!(actual.loss(), expected.loss());
             assert!(actual.outputs().is_empty());
-            assert_eq!(expected.outputs().len(), 1);
+            assert_eq!(expected.outputs().len(), 3);
+            assert_eq!(expected.output("direct").unwrap().len(), 4);
+            assert_eq!(expected.output("empty").unwrap().len(), 0);
+            assert_eq!(expected.output("shrunk").unwrap().len(), 2);
+            assert_eq!(
+                expected.output("direct").unwrap().values(),
+                [1.0, 4.0, 9.0, 16.0]
+            );
+            assert_eq!(expected.output("shrunk").unwrap().values(), [4.0, 9.0]);
             assert_eq!(actual.optimizer_step(), expected.optimizer_step());
             assert_eq!(actual.accumulation_index(), expected.accumulation_index());
             assert_eq!(actual.clip_report(), expected.clip_report());
@@ -18212,11 +18311,37 @@ mod tests {
                 .unwrap();
             assert_eq!(actual.loss(), expected.loss());
             assert!(actual.outputs().is_empty());
-            assert_eq!(expected.outputs().len(), 1);
+            assert_eq!(expected.outputs().len(), 3);
+            assert_eq!(expected.output("direct").unwrap().len(), 4);
+            assert_eq!(expected.output("empty").unwrap().len(), 0);
+            assert_eq!(expected.output("shrunk").unwrap().len(), 2);
+            assert_eq!(
+                expected.output("direct").unwrap().values(),
+                [1.0, 4.0, 9.0, 16.0]
+            );
+            assert_eq!(expected.output("shrunk").unwrap().values(), [4.0, 9.0]);
             assert_eq!(actual.optimizer_step(), expected.optimizer_step());
             assert_eq!(actual.accumulation_index(), expected.accumulation_index());
             assert_eq!(actual.clip_report(), expected.clip_report());
             assert_eq!(actual.window_loss_report(), expected.window_loss_report());
+            let required_egress_count = if actual.did_update() { 5 } else { 1 };
+            let required_egress_bytes = if actual.did_update() { 24 } else { 4 };
+            assert_eq!(
+                actual.report().traffic().materialized_egress_count(),
+                required_egress_count
+            );
+            assert_eq!(
+                actual.report().traffic().materialized_egress_bytes(),
+                required_egress_bytes
+            );
+            assert_eq!(
+                expected.report().traffic().materialized_egress_count(),
+                required_egress_count + 3
+            );
+            assert_eq!(
+                expected.report().traffic().materialized_egress_bytes(),
+                required_egress_bytes + 24
+            );
             assert_eq!(
                 native_commit.checkpoint().unwrap(),
                 native.checkpoint().unwrap()
@@ -18267,32 +18392,26 @@ mod tests {
             .workspace_stats();
         assert_eq!(
             ordinary_accumulation.last_materialized_egress_count,
-            commit_accumulation.last_materialized_egress_count + 1
+            commit_accumulation.last_materialized_egress_count + 3
         );
         assert_eq!(
             ordinary_accumulation.last_materialized_egress_bytes,
-            commit_accumulation.last_materialized_egress_bytes + DType::F32.itemsize()
+            commit_accumulation.last_materialized_egress_bytes + 24
         );
         assert_eq!(commit_accumulation.last_materialized_egress_count, 1);
-        assert_eq!(
-            commit_accumulation.last_materialized_egress_bytes,
-            DType::F32.itemsize()
-        );
+        assert_eq!(commit_accumulation.last_materialized_egress_bytes, 4);
         let ordinary_main = native.main_replay.workspace_stats();
         let commit_main = native_commit.main_replay.workspace_stats();
         assert_eq!(
             ordinary_main.last_materialized_egress_count,
-            commit_main.last_materialized_egress_count + 1
+            commit_main.last_materialized_egress_count + 3
         );
         assert_eq!(
             ordinary_main.last_materialized_egress_bytes,
-            commit_main.last_materialized_egress_bytes + DType::F32.itemsize()
+            commit_main.last_materialized_egress_bytes + 24
         );
         assert_eq!(commit_main.last_materialized_egress_count, 5);
-        assert_eq!(
-            commit_main.last_materialized_egress_bytes,
-            4 * DType::F32.itemsize() + DType::U64.itemsize()
-        );
+        assert_eq!(commit_main.last_materialized_egress_bytes, 24);
 
         let mut injected = plan.prepare_cpu().unwrap();
         let mut retry_reference = plan.prepare_cpu().unwrap();
@@ -18335,6 +18454,8 @@ mod tests {
         assert_eq!(actual.loss(), expected.loss());
         assert!(actual.outputs().is_empty());
         assert_eq!(actual.report().successful_invocation(), 1);
+        assert_eq!(actual.report().traffic().materialized_egress_count(), 1);
+        assert_eq!(actual.report().traffic().materialized_egress_bytes(), 4);
         assert_eq!(
             injected.checkpoint().unwrap(),
             retry_reference.checkpoint().unwrap()

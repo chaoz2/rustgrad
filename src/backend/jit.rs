@@ -90,8 +90,13 @@ struct RenderedScheduleEntry {
     output_initialization: crate::cpu_jit::NativeOutputInitialization,
 }
 
+struct PreparedZeroDomainEntry {
+    logical_index: usize,
+}
+
 struct RenderedScheduleModule {
     entries: Vec<RenderedScheduleEntry>,
+    zero_domains: Vec<PreparedZeroDomainEntry>,
     render_wall_time: Duration,
 }
 
@@ -137,6 +142,12 @@ pub(crate) enum PreparedNativeDispatch {
     Item {
         logical_index: usize,
         item: PreparedScheduleItem,
+    },
+    ZeroDomain {
+        logical_index: usize,
+        schedule_cache_key: u64,
+        native_layout: NativeScheduleLayout,
+        cache_hit: bool,
     },
     StoreGroup(Arc<PreparedNativeStoreGroup>),
 }
@@ -455,13 +466,13 @@ impl PreparedNativeDispatch {
     pub(crate) fn item(&self) -> Option<&PreparedScheduleItem> {
         match self {
             Self::Item { item, .. } => Some(item),
-            Self::StoreGroup(_) => None,
+            Self::ZeroDomain { .. } | Self::StoreGroup(_) => None,
         }
     }
 
     pub(crate) fn logical_item_count(&self) -> usize {
         match self {
-            Self::Item { .. } => 1,
+            Self::Item { .. } | Self::ZeroDomain { .. } => 1,
             Self::StoreGroup(update) => update.members.len(),
         }
     }
@@ -469,7 +480,25 @@ impl PreparedNativeDispatch {
     pub(crate) fn cache_hit(&self) -> bool {
         match self {
             Self::Item { item, .. } => item.cache_hit,
+            Self::ZeroDomain { cache_hit, .. } => *cache_hit,
             Self::StoreGroup(update) => update.cache_hit,
+        }
+    }
+
+    pub(crate) fn renders_entry(&self) -> bool {
+        !matches!(self, Self::ZeroDomain { .. })
+    }
+
+    fn logical_anchor(&self) -> usize {
+        match self {
+            Self::Item { logical_index, .. } | Self::ZeroDomain { logical_index, .. } => {
+                *logical_index
+            }
+            Self::StoreGroup(update) => update
+                .members
+                .last()
+                .map(|member| member.logical_index)
+                .expect("validated native store group has an anchor"),
         }
     }
 
@@ -484,6 +513,24 @@ impl PreparedNativeDispatch {
                 logical_index,
                 item: prepared,
             } => *logical_index == index && prepared.authenticates_layout(item, layout),
+            Self::ZeroDomain {
+                logical_index,
+                schedule_cache_key,
+                native_layout,
+                ..
+            } => {
+                *logical_index == index
+                    && *schedule_cache_key == item.cache_key
+                    && native_layout == layout
+                    && item.outputs.is_single()
+                    && item.boundary.is_none()
+                    && !item.is_effect()
+                    && item
+                        .primary_output()
+                        .shape
+                        .numel()
+                        .is_ok_and(|elements| elements == 0)
+            }
             Self::StoreGroup(_) => false,
         }
     }
@@ -919,6 +966,23 @@ impl CpuJitBackend {
         &self,
         item: &ScheduleItem,
     ) -> Result<bool, JitBackendError> {
+        self.validate_zero_domain_schedule_item(item)?;
+        let mut cache = self
+            .zero_domain_cache
+            .lock()
+            .map_err(|_| JitBackendError::Native("zero-domain cache lock poisoned".into()))?;
+        Ok(!cache.insert(item.cache_key))
+    }
+
+    fn validate_zero_domain_schedule_item(
+        &self,
+        item: &ScheduleItem,
+    ) -> Result<(), JitBackendError> {
+        if !item.outputs.is_single() || item.boundary.is_some() || item.is_effect() {
+            return Err(JitBackendError::Unsupported(
+                "zero-domain native preparation requires one pure boundary-free output".into(),
+            ));
+        }
         let elements = item
             .primary_output()
             .shape
@@ -929,11 +993,7 @@ impl CpuJitBackend {
                 "zero-domain preparation received a non-empty output".into(),
             ));
         }
-        let mut cache = self
-            .zero_domain_cache
-            .lock()
-            .map_err(|_| JitBackendError::Native("zero-domain cache lock poisoned".into()))?;
-        Ok(!cache.insert(item.cache_key))
+        Ok(())
     }
     fn render_kernel(
         &self,
@@ -1304,15 +1364,43 @@ impl CpuJitBackend {
             .cache
             .lock()
             .map_err(|_| JitBackendError::Native("cache lock poisoned".into()))?;
+        let mut zero_domain_cache = self
+            .zero_domain_cache
+            .lock()
+            .map_err(|_| JitBackendError::Native("zero-domain cache lock poisoned".into()))?;
         let mut staged_modules = HashMap::new();
         let mut staged_entries = Vec::new();
         let mut staged_entry_keys = HashSet::new();
+        let mut staged_zero_domain_keys = HashSet::new();
         let mut out = Vec::with_capacity(programs.len());
         for (index, (((items, layouts, store_groups), module), resolved)) in
             programs.into_iter().zip(rendered).zip(resolved).enumerate()
         {
+            let mut prepared = Vec::with_capacity(module.zero_domains.len());
+            for zero_domain in &module.zero_domains {
+                let item = items.get(zero_domain.logical_index).ok_or_else(|| {
+                    JitBackendError::Binding("zero-domain schedule item is absent".into())
+                })?;
+                let native_layout = layouts.get(zero_domain.logical_index).ok_or_else(|| {
+                    JitBackendError::Binding("zero-domain native layout is absent".into())
+                })?;
+                let cache_hit = zero_domain_cache.contains(&item.cache_key)
+                    || !staged_zero_domain_keys.insert(item.cache_key);
+                prepared.push(PreparedNativeDispatch::ZeroDomain {
+                    logical_index: zero_domain.logical_index,
+                    schedule_cache_key: item.cache_key,
+                    native_layout: native_layout.clone(),
+                    cache_hit,
+                });
+            }
             let Some((candidate, load, job_interval)) = resolved else {
-                out.push((Vec::new(), NativeScheduleModulePreparation::default()));
+                out.push((
+                    prepared,
+                    NativeScheduleModulePreparation {
+                        render_wall_time: module.render_wall_time,
+                        ..NativeScheduleModulePreparation::default()
+                    },
+                ));
                 continue;
             };
             let finalized = Instant::now();
@@ -1339,7 +1427,7 @@ impl CpuJitBackend {
                 ));
             }
             let rendered_entry_count = module.entries.len();
-            let mut prepared = Vec::with_capacity(module.entries.len());
+            prepared.reserve(module.entries.len());
             let store_groups = store_groups
                 .into_iter()
                 .map(|group| {
@@ -1409,6 +1497,7 @@ impl CpuJitBackend {
                 });
                 prepared.push(PreparedNativeDispatch::StoreGroup(prepared_group));
             }
+            prepared.sort_by_key(PreparedNativeDispatch::logical_anchor);
             let compiler_process_wall_time = load
                 .map(|load| load.compiler_process_wall_time)
                 .unwrap_or(Duration::ZERO);
@@ -1453,6 +1542,7 @@ impl CpuJitBackend {
         }
         modules.extend(staged_modules);
         cache.extend(staged_entries);
+        zero_domain_cache.extend(staged_zero_domain_keys);
         Ok((out, compilation))
     }
 

@@ -69,6 +69,8 @@ pub(crate) struct NativeReplayTraffic {
     pub(crate) retained_recurrent_state_bytes: u64,
     pub(crate) replaced_recurrent_state_count: u64,
     pub(crate) replaced_recurrent_state_bytes: u64,
+    pub(crate) materialized_egress_count: u64,
+    pub(crate) materialized_egress_bytes: u64,
     pub(crate) executed_native_item_count: usize,
     pub(crate) module_dispatch_count: usize,
     pub(crate) module_dispatched_native_item_count: usize,
@@ -112,10 +114,6 @@ pub(super) struct NativeReplayWorkspace {
     #[cfg(test)]
     dispatch_metadata_build_count: usize,
     #[cfg(test)]
-    last_materialized_egress_count: usize,
-    #[cfg(test)]
-    last_materialized_egress_bytes: usize,
-    #[cfg(test)]
     injected_dispatch_failure: Option<usize>,
 }
 
@@ -148,8 +146,8 @@ pub(crate) struct NativeReplayWorkspaceStats {
     pub(crate) sealed_dispatch_segment_count: usize,
     pub(crate) sealed_prerequisite_slot_count: usize,
     pub(crate) dispatch_metadata_build_count: usize,
-    pub(crate) last_materialized_egress_count: usize,
-    pub(crate) last_materialized_egress_bytes: usize,
+    pub(crate) last_materialized_egress_count: u64,
+    pub(crate) last_materialized_egress_bytes: u64,
     pub(crate) dispatch_scratch_capacity_growth_count: usize,
     pub(crate) dispatch_scratch_is_empty: bool,
 }
@@ -191,10 +189,6 @@ impl NativeReplayWorkspace {
             skipped_output_clear_count: 0,
             #[cfg(test)]
             dispatch_metadata_build_count: 0,
-            #[cfg(test)]
-            last_materialized_egress_count: 0,
-            #[cfg(test)]
-            last_materialized_egress_bytes: 0,
             #[cfg(test)]
             injected_dispatch_failure: None,
         };
@@ -253,6 +247,21 @@ impl NativeReplayWorkspace {
                         &capture.quantized_constants,
                     )?;
                 }
+                prepared @ PreparedNativeDispatch::ZeroDomain { logical_index, .. } => {
+                    let item = capture.items.get(*logical_index).ok_or_else(|| {
+                        ReplayError::Corrupt("prepared zero-domain item is out of range".into())
+                    })?;
+                    let layout = crate::backend::schedule_native_layout(item)
+                        .map_err(super::captured_replay::backend_error)?;
+                    if !covered.insert(*logical_index)
+                        || !prepared.authenticates_layout(*logical_index, item, &layout)
+                    {
+                        return Err(ReplayError::Corrupt(
+                            "prepared zero-domain item mismatch".into(),
+                        ));
+                    }
+                    workspace.add_zero_domain(*logical_index, item)?;
+                }
                 PreparedNativeDispatch::StoreGroup(group) => {
                     if group
                         .members
@@ -286,6 +295,42 @@ impl NativeReplayWorkspace {
         }
         workspace.plan_egress(capture)?;
         Ok(workspace)
+    }
+
+    fn add_zero_domain(
+        &mut self,
+        logical_index: usize,
+        item: &ScheduleItem,
+    ) -> Result<(), ReplayError> {
+        if !item.outputs.is_single() || item.boundary.is_some() || item.is_effect() {
+            return Err(ReplayError::Corrupt(
+                "prepared zero-domain item is not single-output pure work".into(),
+            ));
+        }
+        let output = item.primary_output();
+        let elements = output
+            .shape
+            .numel()
+            .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+        if elements != 0 {
+            return Err(ReplayError::Corrupt(
+                "prepared zero-domain item has a nonempty output".into(),
+            ));
+        }
+        let output_slot = self.add_canonical(output.id, output.clone(), elements, true)?;
+        // The distinct owner has no payload to initialize. Its validity is
+        // invocation-stable even though consumers may execute every replay.
+        self.immutable.insert(output_slot);
+        self.items.push(WorkspaceItem {
+            slots: Vec::new(),
+            output: output_slot,
+            outputs: vec![output_slot],
+            logical_indices: vec![logical_index],
+            elided: true,
+            dispatch: None,
+            output_initialization: crate::cpu_jit::NativeOutputInitialization::NeedsZero,
+        });
+        Ok(())
     }
 
     fn add_item(
@@ -955,7 +1000,7 @@ impl NativeReplayWorkspace {
         if self.items[index].elided {
             if !self.valid.get(output).copied().unwrap_or(false) {
                 return Err(ReplayError::Corrupt(
-                    "elided native transpose source is unavailable".into(),
+                    "elided native output is unavailable".into(),
                 ));
             }
             return Ok(());
@@ -1241,10 +1286,6 @@ impl NativeReplayWorkspace {
         selected: Option<&BTreeSet<u64>>,
     ) -> Result<ReplayValues, ReplayError> {
         let mut values = ReplayValues::default();
-        #[cfg(test)]
-        let mut materialized_egress_count = 0usize;
-        #[cfg(test)]
-        let mut materialized_egress_bytes = 0usize;
         for (buffer, slot, shape) in &self.egress {
             let wanted = selected.is_none_or(|selected| {
                 selected.contains(buffer)
@@ -1268,12 +1309,6 @@ impl NativeReplayWorkspace {
                     .map_err(|error| ReplayError::Backend(error.to_string()))?,
             };
             values.insert_tensor(*buffer, value);
-            #[cfg(test)]
-            {
-                materialized_egress_count = materialized_egress_count.saturating_add(1);
-                materialized_egress_bytes = materialized_egress_bytes
-                    .saturating_add(self.slots[*slot].key.descriptor.bytes);
-            }
         }
         let aliases = capture
             .requested_passthroughs
@@ -1284,11 +1319,26 @@ impl NativeReplayWorkspace {
             .cloned()
             .collect::<Vec<_>>();
         values.project_requested_aliases(&aliases)?;
-        #[cfg(test)]
+        let mut materialized_egress_count = 0u64;
+        let mut materialized_egress_bytes = 0u64;
+        for requested in capture
+            .requested
+            .iter()
+            .filter(|requested| selected.is_none_or(|selected| selected.contains(*requested)))
         {
-            self.last_materialized_egress_count = materialized_egress_count;
-            self.last_materialized_egress_bytes = materialized_egress_bytes;
+            let value = values.tensor(*requested, "native requested egress")?;
+            materialized_egress_count =
+                materialized_egress_count.checked_add(1).ok_or_else(|| {
+                    ReplayError::Descriptor("native materialized egress count overflows".into())
+                })?;
+            materialized_egress_bytes = materialized_egress_bytes
+                .checked_add(tensor_bytes(value)?)
+                .ok_or_else(|| {
+                    ReplayError::Descriptor("native materialized egress bytes overflow".into())
+                })?;
         }
+        self.current_traffic.materialized_egress_count = materialized_egress_count;
+        self.current_traffic.materialized_egress_bytes = materialized_egress_bytes;
         Ok(values)
     }
 
@@ -1347,10 +1397,10 @@ impl NativeReplayWorkspace {
         let mut segment_outputs = BTreeSet::new();
         for (index, item) in self.items.iter().enumerate() {
             if item.elided {
-                // The logical movement has no native call: every admitted
-                // consumer binds its authenticated physical source directly.
-                // Leaving it out of the tape also permits consumers on both
-                // sides to share one module invocation.
+                // An authenticated retained owner or zero-domain output needs
+                // no native call. Leaving it out of the tape also permits
+                // dispatchable consumers on both sides to share one module
+                // invocation.
                 continue;
             }
             if item.dispatch.is_none() {
@@ -1454,8 +1504,8 @@ impl NativeReplayWorkspace {
             sealed_dispatch_segment_count,
             sealed_prerequisite_slot_count,
             dispatch_metadata_build_count: self.dispatch_metadata_build_count,
-            last_materialized_egress_count: self.last_materialized_egress_count,
-            last_materialized_egress_bytes: self.last_materialized_egress_bytes,
+            last_materialized_egress_count: self.current_traffic.materialized_egress_count,
+            last_materialized_egress_bytes: self.current_traffic.materialized_egress_bytes,
             dispatch_scratch_capacity_growth_count: self.dispatch_scratch.capacity_growth_count(),
             dispatch_scratch_is_empty: self.dispatch_scratch.is_empty(),
         }

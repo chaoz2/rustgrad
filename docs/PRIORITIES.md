@@ -78,9 +78,11 @@ evidence; unsupported items fail closed without interpreter fallback. Its opt-in
 training scoreboard authenticates immutable plan inspection against preparation
 and committed replay reports, separates first from steady samples, and
 serializes caller-observed compile/prepare/checkpoint time plus logical
-work/cache/state facts. Unsupported kernel-launch, transfer, and physical-memory
-measurements are explicitly absent, and no protected test asserts a latency or
-throughput threshold. The shared
+work/cache/state facts. It also distinguishes logical CPU output materialization
+from unavailable host/device transfer evidence, so commit-only replay can prove
+that named outputs were not detached. Unsupported kernel-launch, transfer, and
+physical-memory measurements are explicitly absent, and no protected test
+asserts a latency or throughput threshold. The shared
 CPU/Metal proof and public example use the historical propagation target and
 external learning rate, while a dedicated CPU Transformer restore proof uses
 one borrowed compiled plan and captured MultiStep learning rate. It prepares
