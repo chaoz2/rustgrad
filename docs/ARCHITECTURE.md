@@ -1119,28 +1119,43 @@ times. Wall times do not participate in identity.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional accumulation/flush/zero-grad/evaluation programs plus checked logical
 recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v13 authenticates strict-native preparation
+separate `NativeTrainingScoreboard` v14 authenticates strict-native preparation
 and successful training-step reports, then emits bounded versioned JSON.
 
 | Evidence | Meaning |
 |---|---|
-| Preparation | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions for every attached program. |
+| Preparation | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions, plus referenced modules and the unique/shared-prefix entry partition for every attached program. |
 | Execution | Logical schedule/cache inventory, physical rendered/executed entries, and actual module-dispatch calls. |
 | Replay traffic | Owned external imports, borrowed/retained/replaced recurrent bytes, and logical CPU egress materialization count/bytes. CPU egress is not a device transfer. |
 | Timing | Caller-observed compile/prepare/checkpoint time plus bounded first/steady replay and executor/recurrent-overhead partitions. No threshold or speedup is claimed. |
 
 ##### Replay phases and wire versions
 
-V13 is emitted for both raw and classified recording. Classified steps use only
+V14 is emitted for both raw and classified recording. Classified steps use only
 `did_update`; the first replay remains separate, and warm accumulation-only and
 optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
 classification. One scoreboard rejects mixed recording modes without consuming
 a sample, and partial flush remains outside the main-step sample set.
 
-V1-v12 JSON remains readable with CPU egress evidence absent. V13 requires the
-successful main and, when present, accumulation replay inventories to include
+V1-v13 JSON remains readable. V1-v12 has CPU egress evidence absent; V13
+requires its successful main and, when present, accumulation replay inventories to include
 the workspace-backed tensors detached for the caller. Commit-only replay omits
 caller-named outputs while retaining loss and enabled validation/report scalars.
+Native preparation admits prefix reuse through four fail-closed contracts; v14
+records the resulting evidence without serializing entry metadata:
+
+- **Inventory.** Referenced modules and the exact unique-rendered/shared-prefix
+  entry partition are authenticated per program.
+- **Source.** An earlier program index/native-identity pair names one complete
+  standalone source module. The target references exactly that module plus its
+  loaded suffix module when a suffix exists.
+- **Backend admission.** Every reused physical entry has identical absolute
+  source-ordered logical indices (including store-group membership), layout,
+  output initialization, vector plan, rendered source/map/ABI, and cache
+  identity. Equal group arity alone is insufficient.
+- **Fallback.** Any mismatch, inherited-prefix source, or source/suffix module
+  alias keeps the complete-module preparation path.
+
 Dense F32/I32 inputs bind caller storage read-only for one call; unsupported
 storage retains the owned-import fallback. Failed calls publish no report or
 sample. Kernel launches, host/device transfers, and measured physical peak host

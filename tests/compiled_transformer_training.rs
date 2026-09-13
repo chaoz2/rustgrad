@@ -6116,6 +6116,28 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         report.accumulation_schedule_cache_keys().len(),
         accumulation.native_item_count() as usize
     );
+    assert_eq!(report.main().referenced_module_count(), 1);
+    assert_eq!(report.main().shared_prefix_entry_count(), 0);
+    assert_eq!(
+        report.main().unique_rendered_entry_count(),
+        report.main().rendered_entry_count()
+    );
+    assert_eq!(accumulation.loaded_module_count(), 1);
+    assert_eq!(accumulation.referenced_module_count(), 2);
+    assert!(accumulation.unique_rendered_entry_count() > 0);
+    assert!(accumulation.shared_prefix_entry_count() > 0);
+    assert_eq!(
+        accumulation
+            .unique_rendered_entry_count()
+            .checked_add(accumulation.shared_prefix_entry_count())
+            .unwrap(),
+        accumulation.rendered_entry_count()
+    );
+    assert_eq!(accumulation.shared_prefix_source_program_index(), Some(0));
+    assert_eq!(
+        accumulation.shared_prefix_source_native_identity(),
+        Some(report.main().native_identity())
+    );
     let accumulation_executed_native_item_count = report
         .accumulation_replay_executed_native_item_count()
         .unwrap();

@@ -1805,6 +1805,8 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     const REMAINING_RECURRENT_STATES: u64 = (EXPECTED_ADAMW_UPDATE_GROUPS + 4) as u64;
     const MANDATORY_REPLACED_RECURRENT_STATES: u64 = 4;
     const EXPECTED_MAIN_RENDERED_ENTRIES: usize = 787 - EXPECTED_ADAMW_UPDATE_GROUPS * 3;
+    const EXPECTED_ACCUMULATION_RENDERED_ENTRIES: usize = 465;
+    const EXPECTED_SHARED_ACCUMULATION_PREFIX: usize = 319;
     // One accumulator per update group, plus loss numerator, index, and token count.
     const EXPECTED_ZERO_GRAD_ENTRIES: usize = EXPECTED_ADAMW_UPDATE_GROUPS + 3;
 
@@ -1864,6 +1866,12 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         EXPECTED_MAIN_RENDERED_ENTRIES
     );
     assert_eq!(main_preparation.work().loaded_module_count(), 1);
+    assert_eq!(main_preparation.work().referenced_module_count(), 1);
+    assert_eq!(
+        main_preparation.work().unique_rendered_entry_count(),
+        EXPECTED_MAIN_RENDERED_ENTRIES
+    );
+    assert_eq!(main_preparation.work().shared_prefix_entry_count(), 0);
     assert!(main_preparation.work().compiler_invocation_count() <= 1);
     let accumulation_preparation = session
         .preparation_report()
@@ -1878,7 +1886,30 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         accumulation_preparation.work().rendered_entry_count()
             < main_preparation.work().rendered_entry_count()
     );
+    assert_eq!(
+        accumulation_preparation.work().rendered_entry_count(),
+        EXPECTED_ACCUMULATION_RENDERED_ENTRIES
+    );
     assert_eq!(accumulation_preparation.work().loaded_module_count(), 1);
+    assert_eq!(accumulation_preparation.work().referenced_module_count(), 2);
+    assert_eq!(
+        accumulation_preparation
+            .work()
+            .unique_rendered_entry_count(),
+        EXPECTED_ACCUMULATION_RENDERED_ENTRIES - EXPECTED_SHARED_ACCUMULATION_PREFIX
+    );
+    assert_eq!(
+        accumulation_preparation.work().shared_prefix_entry_count(),
+        EXPECTED_SHARED_ACCUMULATION_PREFIX
+    );
+    assert_eq!(
+        accumulation_preparation.cache_hit_count(),
+        EXPECTED_SHARED_ACCUMULATION_PREFIX
+    );
+    assert_eq!(
+        accumulation_preparation.cache_miss_count(),
+        EXPECTED_ACCUMULATION_RENDERED_ENTRIES - EXPECTED_SHARED_ACCUMULATION_PREFIX
+    );
     assert!(accumulation_preparation.work().compiler_invocation_count() <= 1);
     let partial_preparation = session
         .preparation_report()
@@ -1889,6 +1920,12 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         partial_preparation.work().rendered_entry_count(),
         357 - EXPECTED_ADAMW_UPDATE_GROUPS * 3
     );
+    assert_eq!(partial_preparation.work().shared_prefix_entry_count(), 0);
+    assert_eq!(
+        partial_preparation.work().unique_rendered_entry_count(),
+        partial_preparation.work().rendered_entry_count()
+    );
+    assert_eq!(partial_preparation.work().referenced_module_count(), 1);
     assert_eq!(
         session
             .preparation_report()
@@ -1897,14 +1934,30 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             .native_item_count(),
         EXPECTED_ZERO_GRAD_ENTRIES
     );
+    let zero_grad_preparation = session
+        .preparation_report()
+        .zero_grad()
+        .expect("scoreboard configuration captures zero grad");
     assert_eq!(
-        session
-            .preparation_report()
-            .zero_grad()
-            .expect("scoreboard configuration captures zero grad")
-            .work()
-            .rendered_entry_count(),
+        zero_grad_preparation.work().rendered_entry_count(),
         EXPECTED_ZERO_GRAD_ENTRIES
+    );
+    assert_eq!(
+        zero_grad_preparation.work().unique_rendered_entry_count(),
+        EXPECTED_ZERO_GRAD_ENTRIES
+    );
+    assert_eq!(zero_grad_preparation.work().referenced_module_count(), 1);
+    assert_eq!(
+        [
+            main_preparation,
+            accumulation_preparation,
+            partial_preparation,
+            zero_grad_preparation,
+        ]
+        .into_iter()
+        .map(|program| program.work().unique_rendered_entry_count())
+        .sum::<usize>(),
+        1_118
     );
     assert!(session.preparation_report().compiler_process_count() <= 4);
     assert!(
@@ -2020,7 +2073,50 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         expected_main_rendered_entries
     );
     assert_eq!(report.main().loaded_module_count(), 1);
+    assert_eq!(report.main().referenced_module_count(), 1);
+    assert_eq!(
+        report.main().unique_rendered_entry_count(),
+        expected_main_rendered_entries
+    );
+    assert_eq!(report.main().shared_prefix_entry_count(), 0);
     assert!(report.main().compiler_invocation_count() <= 1);
+    let accumulation_program = report
+        .accumulation()
+        .expect("current scoreboard reports accumulation preparation");
+    assert_eq!(
+        accumulation_program.rendered_entry_count(),
+        u64::try_from(EXPECTED_ACCUMULATION_RENDERED_ENTRIES)?
+    );
+    assert_eq!(accumulation_program.loaded_module_count(), 1);
+    assert_eq!(accumulation_program.referenced_module_count(), 2);
+    assert_eq!(
+        accumulation_program.unique_rendered_entry_count(),
+        u64::try_from(
+            EXPECTED_ACCUMULATION_RENDERED_ENTRIES - EXPECTED_SHARED_ACCUMULATION_PREFIX
+        )?
+    );
+    assert_eq!(
+        accumulation_program.shared_prefix_entry_count(),
+        u64::try_from(EXPECTED_SHARED_ACCUMULATION_PREFIX)?
+    );
+    assert_eq!(
+        accumulation_program.cache_hit_count(),
+        u64::try_from(EXPECTED_SHARED_ACCUMULATION_PREFIX)?
+    );
+    assert_eq!(
+        accumulation_program.cache_miss_count(),
+        u64::try_from(
+            EXPECTED_ACCUMULATION_RENDERED_ENTRIES - EXPECTED_SHARED_ACCUMULATION_PREFIX
+        )?
+    );
+    assert_eq!(
+        accumulation_program.shared_prefix_source_program_index(),
+        Some(0)
+    );
+    assert_eq!(
+        accumulation_program.shared_prefix_source_native_identity(),
+        Some(report.main().native_identity())
+    );
     let program_prepare_wall_time = [
         Some(report.main()),
         report.accumulation(),
@@ -2248,7 +2344,10 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         assert_eq!(program.cache_miss_count(), 0);
         assert_eq!(program.cache_hit_count(), program.native_item_count());
         assert!(program.work().rendered_entry_count() <= program.native_item_count());
-        assert_eq!(program.work().loaded_module_count(), 1);
+        assert_eq!(
+            program.work().loaded_module_count(),
+            usize::from(program.work().unique_rendered_entry_count() != 0)
+        );
         assert_eq!(program.work().durable_artifact_cache_hit_count(), 0);
         assert_eq!(program.work().durable_artifact_cache_miss_count(), 0);
         assert_eq!(program.work().compiler_invocation_count(), 0);

@@ -1389,6 +1389,10 @@ pub struct CompiledEvaluationResult {
 pub struct NativeCpuPreparationWork {
     rendered_entry_count: usize,
     loaded_module_count: usize,
+    referenced_module_count: usize,
+    unique_rendered_entry_count: usize,
+    shared_prefix_entry_count: usize,
+    shared_prefix_source_program: Option<usize>,
     durable_artifact_cache_hit_count: usize,
     durable_artifact_cache_miss_count: usize,
     compiler_invocation_count: usize,
@@ -1399,6 +1403,10 @@ impl NativeCpuPreparationWork {
         Self {
             rendered_entry_count: module.rendered_entry_count,
             loaded_module_count: module.loaded_module_count,
+            referenced_module_count: module.referenced_module_count,
+            unique_rendered_entry_count: module.unique_rendered_entry_count,
+            shared_prefix_entry_count: module.shared_prefix_entry_count,
+            shared_prefix_source_program: module.shared_prefix_source_program,
             durable_artifact_cache_hit_count: module.durable_artifact_cache_hit_count,
             durable_artifact_cache_miss_count: module.durable_artifact_cache_miss_count,
             compiler_invocation_count: module.compiler_invocation_count,
@@ -1411,6 +1419,26 @@ impl NativeCpuPreparationWork {
 
     pub const fn loaded_module_count(&self) -> usize {
         self.loaded_module_count
+    }
+
+    /// Distinct native schedule modules referenced by this program's entries.
+    pub const fn referenced_module_count(&self) -> usize {
+        self.referenced_module_count
+    }
+
+    /// Rendered entries compiled into this program's own native module.
+    pub const fn unique_rendered_entry_count(&self) -> usize {
+        self.unique_rendered_entry_count
+    }
+
+    /// Exact leading entries reused from an earlier program's native module.
+    pub const fn shared_prefix_entry_count(&self) -> usize {
+        self.shared_prefix_entry_count
+    }
+
+    /// Earlier batch-program ordinal used to bind public scoreboard identity.
+    pub(crate) const fn shared_prefix_source_program(&self) -> Option<usize> {
+        self.shared_prefix_source_program
     }
 
     pub const fn durable_artifact_cache_hit_count(&self) -> usize {
@@ -1432,7 +1460,17 @@ impl NativeCpuPreparationWork {
             .ok_or_else(|| training("compiled native CPU durable cache count overflows"))?;
         if self.rendered_entry_count > native_item_count
             || (self.rendered_entry_count == 0) != (native_item_count == 0)
-            || self.loaded_module_count != usize::from(self.rendered_entry_count != 0)
+            || self
+                .unique_rendered_entry_count
+                .checked_add(self.shared_prefix_entry_count)
+                != Some(self.rendered_entry_count)
+            || self.loaded_module_count != usize::from(self.unique_rendered_entry_count != 0)
+            || (self.rendered_entry_count == 0) != (self.referenced_module_count == 0)
+            || (self.shared_prefix_entry_count == 0) != self.shared_prefix_source_program.is_none()
+            || self
+                .loaded_module_count
+                .checked_add(usize::from(self.shared_prefix_entry_count != 0))
+                != Some(self.referenced_module_count)
             || durable_access_count > self.loaded_module_count
             || self.compiler_invocation_count != self.durable_artifact_cache_miss_count
         {
@@ -16294,7 +16332,10 @@ mod tests {
         .flatten()
         {
             assert!(program.work().rendered_entry_count() <= program.native_item_count());
-            assert_eq!(program.work().loaded_module_count(), 1);
+            assert_eq!(
+                program.work().loaded_module_count(),
+                usize::from(program.work().unique_rendered_entry_count() != 0)
+            );
             assert!(program.work().compiler_invocation_count() <= 1);
         }
 

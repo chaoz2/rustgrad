@@ -34,7 +34,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V9: u32 = 9;
 const NATIVE_TRAINING_REPORT_FORMAT_V10: u32 = 10;
 const NATIVE_TRAINING_REPORT_FORMAT_V11: u32 = 11;
 const NATIVE_TRAINING_REPORT_FORMAT_V12: u32 = 12;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 13;
+const NATIVE_TRAINING_REPORT_FORMAT_V13: u32 = 13;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 14;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -224,6 +225,16 @@ pub struct NativeTrainingProgramReport {
     rendered_entry_count: u64,
     #[serde(default)]
     loaded_module_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    referenced_module_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unique_rendered_entry_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shared_prefix_entry_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shared_prefix_source_program_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shared_prefix_source_native_identity: Option<u64>,
     #[serde(default)]
     durable_artifact_cache_hit_count: u64,
     #[serde(default)]
@@ -238,6 +249,7 @@ impl NativeTrainingProgramReport {
     fn new(
         inspection: &ProgramInspection,
         preparation: &NativeCpuProgramPreparationReport,
+        prior_native_identities: &[u64],
     ) -> Result<Self> {
         if inspection.capture_identity != preparation.capture_identity()
             || &inspection.execution_plan != preparation.execution_plan()
@@ -245,6 +257,21 @@ impl NativeTrainingProgramReport {
             return Err(invalid("plan and native preparation differ"));
         }
         let plan = &inspection.execution_plan;
+        let shared_prefix_source_program_index = preparation
+            .work()
+            .shared_prefix_source_program()
+            .map(|source| count(source, "native shared-prefix source program"))
+            .transpose()?;
+        let shared_prefix_source_native_identity = preparation
+            .work()
+            .shared_prefix_source_program()
+            .map(|source| {
+                prior_native_identities
+                    .get(source)
+                    .copied()
+                    .ok_or_else(|| invalid("native shared-prefix source program is not earlier"))
+            })
+            .transpose()?;
         Ok(Self {
             capture_identity: preparation.capture_identity(),
             native_identity: preparation.native_identity(),
@@ -267,6 +294,20 @@ impl NativeTrainingProgramReport {
                 "rendered entry",
             )?,
             loaded_module_count: count(preparation.work().loaded_module_count(), "loaded module")?,
+            referenced_module_count: Some(count(
+                preparation.work().referenced_module_count(),
+                "referenced module",
+            )?),
+            unique_rendered_entry_count: Some(count(
+                preparation.work().unique_rendered_entry_count(),
+                "unique rendered entry",
+            )?),
+            shared_prefix_entry_count: Some(count(
+                preparation.work().shared_prefix_entry_count(),
+                "shared prefix entry",
+            )?),
+            shared_prefix_source_program_index,
+            shared_prefix_source_native_identity,
             durable_artifact_cache_hit_count: count(
                 preparation.work().durable_artifact_cache_hit_count(),
                 "durable artifact cache hit",
@@ -294,6 +335,14 @@ impl NativeTrainingProgramReport {
         {
             return Err(invalid("native program cache inventory differs"));
         }
+        let prefix_evidence_is_present = self.referenced_module_count.is_some()
+            || self.unique_rendered_entry_count.is_some()
+            || self.shared_prefix_entry_count.is_some()
+            || self.shared_prefix_source_program_index.is_some()
+            || self.shared_prefix_source_native_identity.is_some();
+        let referenced_module_count = self.referenced_module_count.unwrap_or(0);
+        let unique_rendered_entry_count = self.unique_rendered_entry_count.unwrap_or(0);
+        let shared_prefix_entry_count = self.shared_prefix_entry_count.unwrap_or(0);
         let preparation = [
             self.rendered_entry_count,
             self.loaded_module_count,
@@ -302,12 +351,12 @@ impl NativeTrainingProgramReport {
             self.compiler_invocation_count,
         ];
         if format_version < NATIVE_TRAINING_REPORT_FORMAT_V5 {
-            if preparation.into_iter().any(|value| value != 0) {
+            if preparation.into_iter().any(|value| value != 0) || prefix_evidence_is_present {
                 return Err(invalid(
                     "legacy native program has module preparation evidence",
                 ));
             }
-        } else {
+        } else if format_version <= NATIVE_TRAINING_REPORT_FORMAT_V13 {
             let durable_access_count = self
                 .durable_artifact_cache_hit_count
                 .checked_add(self.durable_artifact_cache_miss_count)
@@ -329,6 +378,47 @@ impl NativeTrainingProgramReport {
                     "native program module preparation evidence differs",
                 ));
             }
+            if prefix_evidence_is_present {
+                return Err(invalid("legacy native program has prefix-module evidence"));
+            }
+        } else {
+            if self.referenced_module_count.is_none()
+                || self.unique_rendered_entry_count.is_none()
+                || self.shared_prefix_entry_count.is_none()
+            {
+                return Err(invalid("native program prefix-module evidence is absent"));
+            }
+            let durable_access_count = self
+                .durable_artifact_cache_hit_count
+                .checked_add(self.durable_artifact_cache_miss_count)
+                .ok_or_else(|| invalid("durable artifact cache count overflows"))?;
+            let rendered_inventory_is_valid = self.rendered_entry_count <= self.native_item_count
+                && (self.rendered_entry_count == 0) == (self.native_item_count == 0);
+            let prefix_partition = self
+                .unique_rendered_entry_count()
+                .checked_add(self.shared_prefix_entry_count())
+                .ok_or_else(|| invalid("native prefix entry count overflows"))?;
+            if !rendered_inventory_is_valid
+                || prefix_partition != self.rendered_entry_count
+                || self.cache_hit_count < shared_prefix_entry_count
+                || self.loaded_module_count != u64::from(unique_rendered_entry_count != 0)
+                || (self.rendered_entry_count == 0) != (referenced_module_count == 0)
+                || (shared_prefix_entry_count == 0)
+                    != self.shared_prefix_source_program_index.is_none()
+                || (shared_prefix_entry_count == 0)
+                    != self.shared_prefix_source_native_identity.is_none()
+                || referenced_module_count
+                    != self
+                        .loaded_module_count
+                        .checked_add(u64::from(shared_prefix_entry_count != 0))
+                        .ok_or_else(|| invalid("native module reference count overflows"))?
+                || durable_access_count > self.loaded_module_count
+                || self.compiler_invocation_count != self.durable_artifact_cache_miss_count
+            {
+                return Err(invalid(
+                    "native program prefix-module preparation evidence differs",
+                ));
+            }
         }
         match (format_version, &self.preparation_timing) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V6, None) => {}
@@ -339,6 +429,7 @@ impl NativeTrainingProgramReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V10
                 | NATIVE_TRAINING_REPORT_FORMAT_V11
                 | NATIVE_TRAINING_REPORT_FORMAT_V12
+                | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self)?,
@@ -402,6 +493,35 @@ impl NativeTrainingProgramReport {
 
     pub const fn loaded_module_count(&self) -> u64 {
         self.loaded_module_count
+    }
+
+    pub const fn referenced_module_count(&self) -> u64 {
+        match self.referenced_module_count {
+            Some(count) => count,
+            None => 0,
+        }
+    }
+
+    pub const fn unique_rendered_entry_count(&self) -> u64 {
+        match self.unique_rendered_entry_count {
+            Some(count) => count,
+            None => 0,
+        }
+    }
+
+    pub const fn shared_prefix_entry_count(&self) -> u64 {
+        match self.shared_prefix_entry_count {
+            Some(count) => count,
+            None => 0,
+        }
+    }
+
+    pub const fn shared_prefix_source_program_index(&self) -> Option<u64> {
+        self.shared_prefix_source_program_index
+    }
+
+    pub const fn shared_prefix_source_native_identity(&self) -> Option<u64> {
+        self.shared_prefix_source_native_identity
     }
 
     pub const fn durable_artifact_cache_hit_count(&self) -> u64 {
@@ -725,6 +845,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V10
                 | NATIVE_TRAINING_REPORT_FORMAT_V11
                 | NATIVE_TRAINING_REPORT_FORMAT_V12
+                | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -756,6 +877,15 @@ impl NativeTrainingReport {
                 .map_err(|_| invalid("invalid native training duration"))?;
         }
         self.main.validate(self.format_version)?;
+        if self.format_version == NATIVE_TRAINING_REPORT_FORMAT_VERSION
+            && (self.main.shared_prefix_entry_count() != 0
+                || self.main.shared_prefix_source_program_index.is_some()
+                || self.main.shared_prefix_source_native_identity.is_some())
+        {
+            return Err(invalid(
+                "native main program cannot reference an earlier prefix module",
+            ));
+        }
         match (
             self.format_version,
             &self.accumulation,
@@ -763,7 +893,12 @@ impl NativeTrainingReport {
             self.accumulation_replay_executed_native_item_count,
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V10, None, None, None) => {}
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, None, None, None) => {}
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V13 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                None,
+                None,
+                None,
+            ) => {}
             (NATIVE_TRAINING_REPORT_FORMAT_V11, Some(program), Some(traffic), Some(executed))
                 if traffic.borrowed_recurrent_input_bytes()
                     == self.recurrent_logical_state_bytes
@@ -782,7 +917,9 @@ impl NativeTrainingReport {
                 }
             }
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V12 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V12
+                | NATIVE_TRAINING_REPORT_FORMAT_V13
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(program),
                 Some(traffic),
                 Some(executed),
@@ -834,7 +971,9 @@ impl NativeTrainingReport {
                 && traffic.replaced_recurrent_state_count() == 0
                 && traffic.replaced_recurrent_state_bytes() == 0 => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V12 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V12
+                | NATIVE_TRAINING_REPORT_FORMAT_V13
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
                 && traffic.borrowed_recurrent_output_bytes()
@@ -857,13 +996,13 @@ impl NativeTrainingReport {
                 1..=NATIVE_TRAINING_REPORT_FORMAT_V12
                     if traffic.materialized_egress_count() == 0
                         && traffic.materialized_egress_bytes() == 0 => {}
-                NATIVE_TRAINING_REPORT_FORMAT_VERSION
+                NATIVE_TRAINING_REPORT_FORMAT_V13 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
                     if traffic.materialized_egress_count() != 0
                         && traffic.materialized_egress_bytes() != 0 => {}
                 1..=NATIVE_TRAINING_REPORT_FORMAT_V12 => {
                     return Err(invalid("legacy native report has CPU egress evidence"));
                 }
-                NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
+                NATIVE_TRAINING_REPORT_FORMAT_V13 | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                     return Err(invalid("native CPU egress evidence is absent"));
                 }
                 _ => unreachable!("format version was validated"),
@@ -887,7 +1026,9 @@ impl NativeTrainingReport {
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V12 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V12
+                | NATIVE_TRAINING_REPORT_FORMAT_V13
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
             (1 | NATIVE_TRAINING_REPORT_FORMAT_V2 | NATIVE_TRAINING_REPORT_FORMAT_V3, Some(_)) => {
@@ -895,6 +1036,7 @@ impl NativeTrainingReport {
             }
             _ => return Err(invalid("native training execution count differs")),
         }
+        let mut prior_programs = vec![&self.main];
         for program in self
             .accumulation
             .iter()
@@ -906,6 +1048,27 @@ impl NativeTrainingReport {
             if program.vectorized != self.main.vectorized {
                 return Err(invalid("native program vectorization policy differs"));
             }
+            if let Some(source_index) = program.shared_prefix_source_program_index {
+                let source_index = usize::try_from(source_index)
+                    .map_err(|_| invalid("native shared-prefix source index overflows"))?;
+                let source = prior_programs.get(source_index).copied().ok_or_else(|| {
+                    invalid("native shared-prefix source index is not an earlier program")
+                })?;
+                if program.shared_prefix_source_native_identity != Some(source.native_identity) {
+                    return Err(invalid(
+                        "native shared-prefix source identity differs from its program index",
+                    ));
+                }
+                if source.rendered_entry_count == 0
+                    || source.shared_prefix_entry_count() != 0
+                    || program.shared_prefix_entry_count() > source.rendered_entry_count
+                {
+                    return Err(invalid(
+                        "native shared prefix exceeds its source program inventory",
+                    ));
+                }
+            }
+            prior_programs.push(program);
         }
         let parallel_evidence = match self.format_version {
             1..=NATIVE_TRAINING_REPORT_FORMAT_V7 => {
@@ -924,6 +1087,7 @@ impl NativeTrainingReport {
             | NATIVE_TRAINING_REPORT_FORMAT_V10
             | NATIVE_TRAINING_REPORT_FORMAT_V11
             | NATIVE_TRAINING_REPORT_FORMAT_V12
+            | NATIVE_TRAINING_REPORT_FORMAT_V13
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
@@ -1009,6 +1173,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V10
                 | NATIVE_TRAINING_REPORT_FORMAT_V11
                 | NATIVE_TRAINING_REPORT_FORMAT_V12
+                | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
@@ -1021,6 +1186,7 @@ impl NativeTrainingReport {
                         | NATIVE_TRAINING_REPORT_FORMAT_V10
                         | NATIVE_TRAINING_REPORT_FORMAT_V11
                         | NATIVE_TRAINING_REPORT_FORMAT_V12
+                        | NATIVE_TRAINING_REPORT_FORMAT_V13
                         | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                         Some(overlap),
                     ) => overlap
@@ -1107,6 +1273,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V10
                 | NATIVE_TRAINING_REPORT_FORMAT_V11
                 | NATIVE_TRAINING_REPORT_FORMAT_V12
+                | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -1137,7 +1304,8 @@ impl NativeTrainingReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V10
                 | NATIVE_TRAINING_REPORT_FORMAT_V11
-                | NATIVE_TRAINING_REPORT_FORMAT_V12,
+                | NATIVE_TRAINING_REPORT_FORMAT_V12
+                | NATIVE_TRAINING_REPORT_FORMAT_V13,
                 Some(phases),
             ) => phases.validate(
                 self.successful_replay_count,
@@ -1253,26 +1421,45 @@ impl NativeTrainingScoreboard {
         compile_wall_time: Duration,
         prepare_wall_time: Duration,
     ) -> Result<Self> {
-        let main = NativeTrainingProgramReport::new(&inspection.main, preparation.main())?;
+        let mut prior_native_identities = Vec::new();
+        let main = NativeTrainingProgramReport::new(
+            &inspection.main,
+            preparation.main(),
+            &prior_native_identities,
+        )?;
+        prior_native_identities.push(main.native_identity());
         let accumulation = matching_program(
             "accumulation",
             inspection.accumulation.as_ref(),
             preparation.accumulation(),
+            &prior_native_identities,
         )?;
+        if let Some(program) = &accumulation {
+            prior_native_identities.push(program.native_identity());
+        }
         let partial_flush = matching_program(
             "partial flush",
             inspection.partial_flush.as_ref(),
             preparation.partial_flush(),
+            &prior_native_identities,
         )?;
+        if let Some(program) = &partial_flush {
+            prior_native_identities.push(program.native_identity());
+        }
         let zero_grad = matching_program(
             "zero grad",
             inspection.zero_grad.as_ref(),
             preparation.zero_grad(),
+            &prior_native_identities,
         )?;
+        if let Some(program) = &zero_grad {
+            prior_native_identities.push(program.native_identity());
+        }
         let evaluation = matching_program(
             "evaluation",
             inspection.evaluation.as_ref(),
             preparation.evaluation(),
+            &prior_native_identities,
         )?;
         if inspection.recurrent_state_count != preparation.recurrent_state_count()
             || inspection.recurrent_state_bytes != preparation.recurrent_state_bytes()
@@ -1635,11 +1822,13 @@ fn matching_program(
     label: &str,
     inspection: Option<&ProgramInspection>,
     preparation: Option<&NativeCpuProgramPreparationReport>,
+    prior_native_identities: &[u64],
 ) -> Result<Option<NativeTrainingProgramReport>> {
     match (inspection, preparation) {
         (None, None) => Ok(None),
         (Some(inspection), Some(preparation)) => {
-            NativeTrainingProgramReport::new(inspection, preparation).map(Some)
+            NativeTrainingProgramReport::new(inspection, preparation, prior_native_identities)
+                .map(Some)
         }
         _ => Err(invalid(format!(
             "plan and prepared {label} presence differ"
@@ -1868,6 +2057,29 @@ mod tests {
         }
     }
 
+    fn remove_prefix_module_evidence(json: &mut serde_json::Value) {
+        for program in [
+            "main",
+            "accumulation",
+            "partial_flush",
+            "zero_grad",
+            "evaluation",
+        ] {
+            let Some(program) = json[program].as_object_mut() else {
+                continue;
+            };
+            for field in [
+                "referenced_module_count",
+                "unique_rendered_entry_count",
+                "shared_prefix_entry_count",
+                "shared_prefix_source_program_index",
+                "shared_prefix_source_native_identity",
+            ] {
+                program.remove(field);
+            }
+        }
+    }
+
     fn zero_report() -> NativeTrainingReport {
         NativeTrainingReport {
             format_version: NATIVE_TRAINING_REPORT_FORMAT_V10,
@@ -1893,6 +2105,11 @@ mod tests {
                 cache_miss_count: 2,
                 rendered_entry_count: 2,
                 loaded_module_count: 1,
+                referenced_module_count: None,
+                unique_rendered_entry_count: None,
+                shared_prefix_entry_count: None,
+                shared_prefix_source_program_index: None,
+                shared_prefix_source_native_identity: None,
                 durable_artifact_cache_hit_count: 0,
                 durable_artifact_cache_miss_count: 1,
                 compiler_invocation_count: 1,
@@ -1978,10 +2195,20 @@ mod tests {
         report.main_replay_traffic = report
             .main_replay_traffic
             .map(|traffic| traffic.with_materialized_egress(5, 24));
+        report.main.referenced_module_count = Some(1);
+        report.main.unique_rendered_entry_count = Some(2);
+        report.main.shared_prefix_entry_count = Some(0);
         let mut accumulation = report.main.clone();
         accumulation.capture_identity = 8;
         accumulation.native_identity = 12;
         accumulation.execution_plan_identity = 14;
+        accumulation.cache_hit_count = 1;
+        accumulation.cache_miss_count = 1;
+        accumulation.referenced_module_count = Some(2);
+        accumulation.unique_rendered_entry_count = Some(1);
+        accumulation.shared_prefix_entry_count = Some(1);
+        accumulation.shared_prefix_source_program_index = Some(0);
+        accumulation.shared_prefix_source_native_identity = Some(report.main.native_identity);
         report.accumulation = Some(accumulation);
         report.accumulation_replay_traffic = Some(
             NativeCpuReplayTraffic::new(2, 12, 16, 8)
@@ -2072,6 +2299,7 @@ mod tests {
         let report = phase_specialized_report();
         let mut json = serde_json::to_value(report).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V11);
+        remove_prefix_module_evidence(&mut json);
         for phase in ["main_replay_traffic", "accumulation_replay_traffic"] {
             let traffic = json[phase].as_object_mut().unwrap();
             traffic.remove("retained_recurrent_state_count");
@@ -2099,6 +2327,7 @@ mod tests {
     fn phase_specialized_v12_report_decodes_without_egress_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V12);
+        remove_prefix_module_evidence(&mut json);
         for phase in ["main_replay_traffic", "accumulation_replay_traffic"] {
             let traffic = json[phase].as_object_mut().unwrap();
             traffic.remove("materialized_egress_count");
@@ -2120,6 +2349,160 @@ mod tests {
                 .unwrap()
                 .materialized_egress_bytes(),
             0
+        );
+    }
+
+    #[test]
+    fn version_thirteen_report_decodes_without_prefix_module_evidence() {
+        let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V13);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "v13 cannot claim v14 prefix-module evidence"
+        );
+        for program in ["main", "accumulation"] {
+            let program = json[program].as_object_mut().unwrap();
+            for field in [
+                "referenced_module_count",
+                "unique_rendered_entry_count",
+                "shared_prefix_entry_count",
+            ] {
+                program.insert(field.into(), serde_json::json!(0));
+            }
+            program.remove("shared_prefix_source_program_index");
+            program.remove("shared_prefix_source_native_identity");
+        }
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "v13 rejects even zero-valued v14 prefix-module fields"
+        );
+        remove_prefix_module_evidence(&mut json);
+        for program in ["main", "accumulation"] {
+            let program = json[program].as_object_mut().unwrap();
+            program.insert("loaded_module_count".into(), serde_json::json!(1));
+        }
+        let decoded =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V13);
+        assert_eq!(decoded.main().referenced_module_count(), 0);
+        assert_eq!(
+            decoded.accumulation().unwrap().shared_prefix_entry_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn current_report_authenticates_exact_prefix_source_and_partition() {
+        let report = phase_specialized_report();
+        assert_eq!(report.main().unique_rendered_entry_count(), 2);
+        assert_eq!(report.main().shared_prefix_entry_count(), 0);
+        let accumulation = report.accumulation().unwrap();
+        assert_eq!(accumulation.unique_rendered_entry_count(), 1);
+        assert_eq!(accumulation.shared_prefix_entry_count(), 1);
+        assert_eq!(accumulation.referenced_module_count(), 2);
+        assert_eq!(accumulation.shared_prefix_source_program_index(), Some(0));
+        assert_eq!(
+            accumulation.shared_prefix_source_native_identity(),
+            Some(report.main().native_identity())
+        );
+        assert!(report.validate().is_ok());
+
+        let mut equal_identity = report.clone();
+        let main_native_identity = equal_identity.main.native_identity;
+        equal_identity
+            .accumulation
+            .as_mut()
+            .unwrap()
+            .native_identity = main_native_identity;
+        assert!(
+            equal_identity.validate().is_ok(),
+            "the earlier program index disambiguates equal native identities"
+        );
+
+        let mut full_prefix = report.clone();
+        let accumulation_native_identity = {
+            let accumulation = full_prefix.accumulation.as_mut().unwrap();
+            accumulation.cache_hit_count = 2;
+            accumulation.cache_miss_count = 0;
+            accumulation.unique_rendered_entry_count = Some(0);
+            accumulation.shared_prefix_entry_count = Some(2);
+            accumulation.loaded_module_count = 0;
+            accumulation.referenced_module_count = Some(1);
+            accumulation.durable_artifact_cache_miss_count = 0;
+            accumulation.compiler_invocation_count = 0;
+            accumulation.native_identity()
+        };
+        full_prefix.prepare_compiler_process_count = Some(1);
+        assert!(
+            full_prefix.validate().is_ok(),
+            "a full exact prefix has no suffix compilation or module load"
+        );
+
+        for (field, value) in [
+            ("unique_rendered_entry_count", serde_json::json!(0)),
+            ("shared_prefix_entry_count", serde_json::json!(2)),
+            ("referenced_module_count", serde_json::json!(0)),
+            ("shared_prefix_source_program_index", serde_json::json!(1)),
+            (
+                "shared_prefix_source_native_identity",
+                serde_json::json!(accumulation_native_identity),
+            ),
+        ] {
+            let mut json = serde_json::to_value(&report).unwrap();
+            json["accumulation"][field] = value;
+            assert!(
+                NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+                "tampered {field} must reject"
+            );
+        }
+
+        let mut impossible = report;
+        impossible.main.rendered_entry_count = 1;
+        impossible.main.unique_rendered_entry_count = Some(1);
+        let accumulation = impossible.accumulation.as_mut().unwrap();
+        accumulation.cache_hit_count = 2;
+        accumulation.cache_miss_count = 0;
+        accumulation.unique_rendered_entry_count = Some(0);
+        accumulation.shared_prefix_entry_count = Some(2);
+        accumulation.loaded_module_count = 0;
+        accumulation.referenced_module_count = Some(1);
+        accumulation.durable_artifact_cache_miss_count = 0;
+        accumulation.compiler_invocation_count = 0;
+        impossible.prepare_compiler_process_count = Some(1);
+        assert!(
+            impossible
+                .accumulation
+                .as_ref()
+                .unwrap()
+                .validate(NATIVE_TRAINING_REPORT_FORMAT_VERSION)
+                .is_ok(),
+            "the per-program partition is otherwise coherent"
+        );
+        assert!(
+            impossible.validate().is_err(),
+            "a shared prefix cannot exceed the named source program"
+        );
+    }
+
+    #[test]
+    fn current_report_prefix_source_indices_compact_absent_optional_programs() {
+        let mut report = phase_specialized_report();
+        let evaluation = report.accumulation.take();
+        report.evaluation = evaluation;
+        report.accumulation_replay_traffic = None;
+        report.accumulation_replay_executed_native_item_count = None;
+        report.accumulation_schedule_cache_keys.clear();
+        report.step_phases = None;
+        assert!(report.validate().is_ok());
+
+        report
+            .evaluation
+            .as_mut()
+            .unwrap()
+            .shared_prefix_source_program_index = Some(1);
+        assert!(
+            report.validate().is_err(),
+            "absent optional programs cannot leave a hole in the source ordinal"
         );
     }
 
@@ -2590,6 +2973,7 @@ mod tests {
     fn current_program_distinguishes_zero_domain_items_from_missing_rendered_work() {
         let mut program = phase_specialized_report().main;
         program.rendered_entry_count = 1;
+        program.unique_rendered_entry_count = Some(1);
         assert!(
             program
                 .validate(NATIVE_TRAINING_REPORT_FORMAT_VERSION)
@@ -2599,6 +2983,8 @@ mod tests {
 
         program.rendered_entry_count = 0;
         program.loaded_module_count = 0;
+        program.referenced_module_count = Some(0);
+        program.unique_rendered_entry_count = Some(0);
         program.durable_artifact_cache_miss_count = 0;
         program.compiler_invocation_count = 0;
         assert!(

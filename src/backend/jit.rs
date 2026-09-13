@@ -82,8 +82,15 @@ struct NativeScheduleModule {
     dispatcher: Arc<JitScheduleDispatcher>,
 }
 
+#[derive(Clone)]
+struct PreparedNativeModuleEntry {
+    kernel: Arc<JitKernel>,
+    dispatcher: Arc<JitScheduleDispatcher>,
+}
+
 struct RenderedScheduleEntry {
     logical_indices: Vec<usize>,
+    native_layouts: Vec<NativeScheduleLayout>,
     vector: VectorPlan,
     rendered: crate::cpu_jit::RenderedC,
     native_cache_key: String,
@@ -98,6 +105,79 @@ struct RenderedScheduleModule {
     entries: Vec<RenderedScheduleEntry>,
     zero_domains: Vec<PreparedZeroDomainEntry>,
     render_wall_time: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativeSchedulePrefixReuse {
+    source_program: usize,
+    entry_count: usize,
+}
+
+fn exact_rendered_schedule_entry(
+    left: &RenderedScheduleEntry,
+    right: &RenderedScheduleEntry,
+) -> bool {
+    left.logical_indices == right.logical_indices
+        && left.native_layouts == right.native_layouts
+        && left.vector == right.vector
+        && left.native_cache_key == right.native_cache_key
+        && left.output_initialization == right.output_initialization
+        && left.rendered.source == right.rendered.source
+        && left.rendered.source_map == right.rendered.source_map
+        && left.rendered.abi == right.rendered.abi
+        && left.rendered.cache_key == right.rendered.cache_key
+}
+
+fn exact_longest_prior_prefix(
+    modules: &[RenderedScheduleModule],
+    standalone_sources: &[bool],
+    program: usize,
+) -> Option<NativeSchedulePrefixReuse> {
+    let current = modules.get(program)?;
+    (0..program)
+        .filter(|source_program| standalone_sources.get(*source_program) == Some(&true))
+        .filter_map(|source_program| {
+            let source = &modules[source_program];
+            let entry_count = source
+                .entries
+                .iter()
+                .zip(&current.entries)
+                .take_while(|(left, right)| exact_rendered_schedule_entry(left, right))
+                .count();
+            (entry_count != 0).then_some(NativeSchedulePrefixReuse {
+                source_program,
+                entry_count,
+            })
+        })
+        .max_by_key(|reuse| reuse.entry_count)
+}
+
+fn native_schedule_wrapper_key(
+    entries: &[RenderedScheduleEntry],
+) -> Option<NativeScheduleWrapperKey> {
+    (!entries.is_empty()).then(|| NativeScheduleWrapperKey {
+        artifact: crate::cpu_jit::schedule_module_cache_key(
+            &entries
+                .iter()
+                .map(|entry| entry.rendered.clone())
+                .collect::<Vec<_>>(),
+        ),
+        entries: entries
+            .iter()
+            .map(|entry| (entry.native_cache_key.clone(), entry.output_initialization))
+            .collect(),
+    })
+}
+
+fn exact_reusable_prior_prefix(
+    modules: &[RenderedScheduleModule],
+    standalone_sources: &[bool],
+    program: usize,
+) -> Option<NativeSchedulePrefixReuse> {
+    exact_longest_prior_prefix(modules, standalone_sources, program).filter(|reuse| {
+        native_schedule_wrapper_key(&modules[reuse.source_program].entries)
+            != native_schedule_wrapper_key(&modules[program].entries[reuse.entry_count..])
+    })
 }
 
 type NativeScheduleModuleJob = (
@@ -181,6 +261,10 @@ pub(crate) struct PreparedScheduleSegment {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeScheduleModulePreparation {
     pub(crate) rendered_entry_count: usize,
+    pub(crate) referenced_module_count: usize,
+    pub(crate) unique_rendered_entry_count: usize,
+    pub(crate) shared_prefix_entry_count: usize,
+    pub(crate) shared_prefix_source_program: Option<usize>,
     pub(crate) loaded_module_count: usize,
     pub(crate) durable_artifact_cache_hit_count: usize,
     pub(crate) durable_artifact_cache_miss_count: usize,
@@ -556,6 +640,10 @@ impl PreparedNativeDispatch {
 }
 
 impl PreparedScheduleDispatch {
+    pub(crate) fn shares_dispatcher_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.dispatcher, &other.dispatcher)
+    }
+
     pub(crate) fn seal_segment(
         entries: &[&Self],
     ) -> Result<PreparedScheduleSegment, JitBackendError> {
@@ -1209,23 +1297,21 @@ impl CpuJitBackend {
                 render_schedule_module_entries(self, items, layouts.clone(), store_groups)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut prefix_reuses = Vec::with_capacity(rendered.len());
+        for program in 0..rendered.len() {
+            let standalone_sources = prefix_reuses
+                .iter()
+                .map(|reuse: &NativeSchedulePrefixReuse| reuse.entry_count == 0)
+                .collect::<Vec<_>>();
+            let reuse = exact_reusable_prior_prefix(&rendered, &standalone_sources, program)
+                .unwrap_or_default();
+            prefix_reuses.push(reuse);
+        }
         let wrapper_keys = rendered
             .iter()
-            .map(|module| {
-                (!module.entries.is_empty()).then(|| NativeScheduleWrapperKey {
-                    artifact: crate::cpu_jit::schedule_module_cache_key(
-                        &module
-                            .entries
-                            .iter()
-                            .map(|entry| entry.rendered.clone())
-                            .collect::<Vec<_>>(),
-                    ),
-                    entries: module
-                        .entries
-                        .iter()
-                        .map(|entry| (entry.native_cache_key.clone(), entry.output_initialization))
-                        .collect(),
-                })
+            .zip(&prefix_reuses)
+            .map(|(module, reuse)| {
+                native_schedule_wrapper_key(&module.entries[reuse.entry_count..])
             })
             .collect::<Vec<_>>();
         let cached = {
@@ -1239,14 +1325,18 @@ impl CpuJitBackend {
         };
         let mut jobs = rendered
             .iter()
+            .zip(&prefix_reuses)
             .enumerate()
-            .filter(|(index, module)| !module.entries.is_empty() && cached[*index].is_none())
-            .map(|(index, module)| {
+            .filter(|(index, (module, reuse))| {
+                reuse.entry_count < module.entries.len() && cached[*index].is_none()
+            })
+            .map(|(index, (module, reuse))| {
                 (
                     index,
                     module
                         .entries
                         .iter()
+                        .skip(reuse.entry_count)
                         .map(|entry| entry.rendered.clone())
                         .collect::<Vec<_>>(),
                 )
@@ -1328,7 +1418,8 @@ impl CpuJitBackend {
         // after failure, but a failed batch must leave this backend retry-clean.
         let mut resolved = Vec::with_capacity(programs.len());
         for (index, module) in rendered.iter().enumerate() {
-            if module.entries.is_empty() {
+            let suffix = &module.entries[prefix_reuses[index].entry_count..];
+            if suffix.is_empty() {
                 resolved.push(None);
                 continue;
             }
@@ -1342,11 +1433,11 @@ impl CpuJitBackend {
                     (module, Some(load), Some(interval))
                 }
             };
-            if candidate.kernels.len() != module.entries.len()
+            if candidate.kernels.len() != suffix.len()
                 || candidate
                     .kernels
                     .iter()
-                    .zip(&module.entries)
+                    .zip(suffix)
                     .any(|(kernel, entry)| kernel.abi() != &entry.rendered.abi)
             {
                 return Err(JitBackendError::Binding(
@@ -1373,9 +1464,19 @@ impl CpuJitBackend {
         let mut staged_entry_keys = HashSet::new();
         let mut staged_zero_domain_keys = HashSet::new();
         let mut out = Vec::with_capacity(programs.len());
+        let mut prepared_program_entries: Vec<Vec<PreparedNativeModuleEntry>> =
+            Vec::with_capacity(programs.len());
         for (index, (((items, layouts, store_groups), module), resolved)) in
             programs.into_iter().zip(rendered).zip(resolved).enumerate()
         {
+            let finalized = Instant::now();
+            let reuse = prefix_reuses[index];
+            let rendered_entry_count = module.entries.len();
+            let unique_rendered_entry_count = rendered_entry_count
+                .checked_sub(reuse.entry_count)
+                .ok_or_else(|| {
+                JitBackendError::Binding("native shared prefix exceeds program".into())
+            })?;
             let mut prepared = Vec::with_capacity(module.zero_domains.len());
             for zero_domain in &module.zero_domains {
                 let item = items.get(zero_domain.logical_index).ok_or_else(|| {
@@ -1393,40 +1494,90 @@ impl CpuJitBackend {
                     cache_hit,
                 });
             }
-            let Some((candidate, load, job_interval)) = resolved else {
-                out.push((
-                    prepared,
-                    NativeScheduleModulePreparation {
-                        render_wall_time: module.render_wall_time,
-                        ..NativeScheduleModulePreparation::default()
-                    },
-                ));
-                continue;
+            let mut entry_bindings = if reuse.entry_count == 0 {
+                Vec::new()
+            } else {
+                let source = prepared_program_entries
+                    .get(reuse.source_program)
+                    .ok_or_else(|| {
+                        JitBackendError::Binding("native shared-prefix source is absent".into())
+                    })?;
+                if source.len() < reuse.entry_count {
+                    return Err(JitBackendError::Binding(
+                        "native shared-prefix source is incomplete".into(),
+                    ));
+                }
+                source[..reuse.entry_count].to_vec()
             };
-            let finalized = Instant::now();
-            let key = wrapper_keys[index]
-                .clone()
-                .expect("nonempty rendered schedule has a wrapper key");
-            let selected = modules
-                .get(&key)
-                .or_else(|| staged_modules.get(&key))
-                .cloned()
-                .unwrap_or_else(|| {
-                    staged_modules.insert(key, candidate.clone());
-                    candidate
-                });
-            if selected.kernels.len() != module.entries.len()
-                || selected
-                    .kernels
+            let (load, job_interval) = match resolved {
+                Some((candidate, load, job_interval)) => {
+                    let key = wrapper_keys[index]
+                        .clone()
+                        .expect("nonempty native suffix has a wrapper key");
+                    let selected = modules
+                        .get(&key)
+                        .or_else(|| staged_modules.get(&key))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            staged_modules.insert(key, candidate.clone());
+                            candidate
+                        });
+                    let suffix = &module.entries[reuse.entry_count..];
+                    if selected.kernels.len() != suffix.len()
+                        || selected
+                            .kernels
+                            .iter()
+                            .zip(suffix)
+                            .any(|(kernel, entry)| kernel.abi() != &entry.rendered.abi)
+                    {
+                        return Err(JitBackendError::Binding(
+                            "cached native schedule module ABI mismatch".into(),
+                        ));
+                    }
+                    entry_bindings.extend(selected.kernels.iter().cloned().map(|kernel| {
+                        PreparedNativeModuleEntry {
+                            kernel,
+                            dispatcher: selected.dispatcher.clone(),
+                        }
+                    }));
+                    (load, job_interval)
+                }
+                None if unique_rendered_entry_count == 0 => (None, None),
+                None => {
+                    return Err(JitBackendError::Binding(
+                        "native schedule module suffix is absent".into(),
+                    ));
+                }
+            };
+            if entry_bindings.len() != module.entries.len()
+                || entry_bindings
                     .iter()
                     .zip(&module.entries)
-                    .any(|(kernel, entry)| kernel.abi() != &entry.rendered.abi)
+                    .any(|(binding, entry)| binding.kernel.abi() != &entry.rendered.abi)
             {
                 return Err(JitBackendError::Binding(
-                    "cached native schedule module ABI mismatch".into(),
+                    "native shared-prefix module ABI mismatch".into(),
                 ));
             }
-            let rendered_entry_count = module.entries.len();
+            let referenced_modules = entry_bindings.iter().fold(
+                Vec::<Arc<JitScheduleDispatcher>>::new(),
+                |mut dispatchers, binding| {
+                    if !dispatchers
+                        .iter()
+                        .any(|seen| Arc::ptr_eq(seen, &binding.dispatcher))
+                    {
+                        dispatchers.push(binding.dispatcher.clone());
+                    }
+                    dispatchers
+                },
+            );
+            let expected_referenced_module_count =
+                usize::from(unique_rendered_entry_count != 0) + usize::from(reuse.entry_count != 0);
+            if referenced_modules.len() != expected_referenced_module_count {
+                return Err(JitBackendError::Binding(
+                    "native shared-prefix module reference inventory mismatch".into(),
+                ));
+            }
             prepared.reserve(module.entries.len());
             let store_groups = store_groups
                 .into_iter()
@@ -1439,7 +1590,12 @@ impl CpuJitBackend {
                     (anchor, group)
                 })
                 .collect::<BTreeMap<_, _>>();
-            for (entry, kernel) in module.entries.into_iter().zip(selected.kernels) {
+            for (entry, binding) in module
+                .entries
+                .into_iter()
+                .zip(entry_bindings.iter().cloned())
+            {
+                let PreparedNativeModuleEntry { kernel, dispatcher } = binding;
                 let cache_hit = cache.contains_key(&entry.native_cache_key)
                     || !staged_entry_keys.insert(entry.native_cache_key.clone());
                 staged_entries.push((entry.native_cache_key.clone(), kernel.clone()));
@@ -1450,7 +1606,7 @@ impl CpuJitBackend {
                         logical_index: logical,
                         item: PreparedScheduleItem {
                             kernel,
-                            dispatcher: Some(selected.dispatcher.clone()),
+                            dispatcher: Some(dispatcher),
                             native_cache_key: entry.native_cache_key,
                             cache_hit,
                             vector: entry.vector,
@@ -1493,10 +1649,11 @@ impl CpuJitBackend {
                     cache_hit,
                     output_initialization: entry.output_initialization,
                     kernel: kernel.clone(),
-                    dispatcher: selected.dispatcher.clone(),
+                    dispatcher,
                 });
                 prepared.push(PreparedNativeDispatch::StoreGroup(prepared_group));
             }
+            prepared_program_entries.push(entry_bindings);
             prepared.sort_by_key(PreparedNativeDispatch::logical_anchor);
             let compiler_process_wall_time = load
                 .map(|load| load.compiler_process_wall_time)
@@ -1522,7 +1679,12 @@ impl CpuJitBackend {
                     })?;
             let preparation = NativeScheduleModulePreparation {
                 rendered_entry_count,
-                loaded_module_count: 1,
+                referenced_module_count: referenced_modules.len(),
+                unique_rendered_entry_count,
+                shared_prefix_entry_count: reuse.entry_count,
+                shared_prefix_source_program: (reuse.entry_count != 0)
+                    .then_some(reuse.source_program),
+                loaded_module_count: usize::from(unique_rendered_entry_count != 0),
                 durable_artifact_cache_hit_count: load
                     .map(|load| usize::from(load.durable_cache_hit))
                     .unwrap_or(0),
@@ -1844,6 +2006,223 @@ fn jit_error(e: JitError) -> JitBackendError {
 mod tests {
     use super::*;
     use crate::{DType, Scalar, Shape};
+
+    fn rendered_entry(cache_key: &str, logical_indices: Vec<usize>) -> RenderedScheduleEntry {
+        RenderedScheduleEntry {
+            native_layouts: logical_indices
+                .iter()
+                .map(|_| NativeScheduleLayout::default())
+                .collect(),
+            logical_indices,
+            vector: VectorPlan {
+                lanes: 1,
+                enabled: false,
+                reason: "prefix fixture".into(),
+            },
+            rendered: crate::cpu_jit::RenderedC {
+                source: format!("void {cache_key}(void) {{}}"),
+                source_map: BTreeMap::new(),
+                abi: crate::cpu_jit::KernelAbi {
+                    version: crate::cpu_jit::ABI_VERSION,
+                    buffers: Vec::new(),
+                    quantized_buffers: Vec::new(),
+                    pointer_order: Vec::new(),
+                    symbol_count: 0,
+                },
+                cache_key: cache_key.into(),
+            },
+            native_cache_key: format!("native-{cache_key}"),
+            output_initialization: crate::cpu_jit::NativeOutputInitialization::FullyOverwritten,
+        }
+    }
+
+    fn rendered_module(entries: Vec<RenderedScheduleEntry>) -> RenderedScheduleModule {
+        RenderedScheduleModule {
+            entries,
+            zero_domains: Vec::new(),
+            render_wall_time: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn exact_native_prefix_requires_every_physical_entry_contract() {
+        let main = rendered_module(vec![
+            rendered_entry("first", vec![0]),
+            rendered_entry("group", vec![1, 3]),
+            rendered_entry("last", vec![4]),
+        ]);
+        let accumulation = rendered_module(vec![
+            rendered_entry("first", vec![0]),
+            rendered_entry("group", vec![1, 3]),
+        ]);
+        let modules = vec![main, accumulation];
+        assert_eq!(
+            exact_longest_prior_prefix(&modules, &[true], 1),
+            Some(NativeSchedulePrefixReuse {
+                source_program: 0,
+                entry_count: 2,
+            })
+        );
+
+        let mutations: [fn(&mut RenderedScheduleEntry); 4] = [
+            |entry: &mut RenderedScheduleEntry| entry.logical_indices = vec![1, 2],
+            |entry: &mut RenderedScheduleEntry| {
+                entry.native_layouts[0].elided_output_source = Some(7)
+            },
+            |entry: &mut RenderedScheduleEntry| {
+                entry.output_initialization = crate::cpu_jit::NativeOutputInitialization::NeedsZero
+            },
+            |entry: &mut RenderedScheduleEntry| entry.rendered.abi.symbol_count = 1,
+        ];
+        for mutate in mutations {
+            let mut candidate = rendered_module(vec![
+                rendered_entry("first", vec![0]),
+                rendered_entry("group", vec![1, 3]),
+            ]);
+            mutate(&mut candidate.entries[1]);
+            assert_eq!(
+                exact_longest_prior_prefix(
+                    &[
+                        rendered_module(vec![
+                            rendered_entry("first", vec![0]),
+                            rendered_entry("group", vec![1, 3]),
+                            rendered_entry("last", vec![4]),
+                        ]),
+                        candidate
+                    ],
+                    &[true],
+                    1
+                ),
+                Some(NativeSchedulePrefixReuse {
+                    source_program: 0,
+                    entry_count: 1,
+                })
+            );
+        }
+
+        let no_prefix = rendered_module(vec![rendered_entry("different", vec![0])]);
+        assert_eq!(
+            exact_longest_prior_prefix(
+                &[
+                    rendered_module(vec![rendered_entry("first", vec![0])]),
+                    no_prefix,
+                ],
+                &[true],
+                1,
+            ),
+            None,
+            "a first-entry mismatch must retain whole-module preparation"
+        );
+
+        let chained = vec![
+            rendered_module(vec![
+                rendered_entry("first", vec![0]),
+                rendered_entry("second", vec![1]),
+                rendered_entry("main-tail", vec![2]),
+            ]),
+            rendered_module(vec![
+                rendered_entry("first", vec![0]),
+                rendered_entry("second", vec![1]),
+                rendered_entry("accumulation-tail", vec![2]),
+            ]),
+            rendered_module(vec![
+                rendered_entry("first", vec![0]),
+                rendered_entry("second", vec![1]),
+                rendered_entry("accumulation-tail", vec![2]),
+                rendered_entry("later-tail", vec![3]),
+            ]),
+        ];
+        assert_eq!(
+            exact_longest_prior_prefix(&chained, &[true, false], 2),
+            Some(NativeSchedulePrefixReuse {
+                source_program: 0,
+                entry_count: 2,
+            }),
+            "v14 prefix sources must own one complete standalone module"
+        );
+
+        let repeated_wrapper = vec![
+            rendered_module(vec![rendered_entry("same", vec![0])]),
+            rendered_module(vec![
+                rendered_entry("same", vec![0]),
+                rendered_entry("same", vec![0]),
+            ]),
+        ];
+        assert_eq!(
+            exact_reusable_prior_prefix(&repeated_wrapper, &[true], 1),
+            None,
+            "a suffix resolving to the source dispatcher must keep full-module preparation"
+        );
+    }
+
+    #[test]
+    fn native_module_preparation_reuses_prefix_and_compiles_only_suffix() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [4], DType::F32);
+        let first = graph.relu(input).unwrap();
+        let second = graph.square(input).unwrap();
+        let schedule = crate::schedule_many(&graph, &[first, second]).unwrap();
+        assert_eq!(schedule.items.len(), 2);
+        let layouts = schedule
+            .items
+            .iter()
+            .map(schedule_native_layout)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let backend = CpuJitBackend::new(JitFallback::Error);
+        let (programs, compilation) = backend
+            .prepare_schedule_modules(vec![
+                (&schedule.items[..1], layouts[..1].to_vec(), Vec::new()),
+                (&schedule.items, layouts.clone(), Vec::new()),
+                (&schedule.items[..1], layouts[..1].to_vec(), Vec::new()),
+            ])
+            .unwrap();
+        assert_eq!(programs.len(), 3);
+        assert!(compilation.compiler_process_count <= 2);
+        let (prefix, prefix_work) = &programs[0];
+        let (extended, extended_work) = &programs[1];
+        let (fully_reused, fully_reused_work) = &programs[2];
+        assert_eq!(prefix_work.rendered_entry_count, 1);
+        assert_eq!(prefix_work.unique_rendered_entry_count, 1);
+        assert_eq!(prefix_work.shared_prefix_entry_count, 0);
+        assert_eq!(prefix_work.referenced_module_count, 1);
+        assert_eq!(extended_work.rendered_entry_count, 2);
+        assert_eq!(extended_work.unique_rendered_entry_count, 1);
+        assert_eq!(extended_work.shared_prefix_entry_count, 1);
+        assert_eq!(extended_work.shared_prefix_source_program, Some(0));
+        assert_eq!(extended_work.referenced_module_count, 2);
+        let prefix_dispatcher = prefix[0]
+            .item()
+            .and_then(|item| item.dispatcher.as_ref())
+            .unwrap();
+        let reused_dispatcher = extended[0]
+            .item()
+            .and_then(|item| item.dispatcher.as_ref())
+            .unwrap();
+        let suffix_dispatcher = extended[1]
+            .item()
+            .and_then(|item| item.dispatcher.as_ref())
+            .unwrap();
+        assert!(Arc::ptr_eq(prefix_dispatcher, reused_dispatcher));
+        assert!(!Arc::ptr_eq(reused_dispatcher, suffix_dispatcher));
+        assert!(extended[0].cache_hit());
+        assert_eq!(fully_reused_work.rendered_entry_count, 1);
+        assert_eq!(fully_reused_work.unique_rendered_entry_count, 0);
+        assert_eq!(fully_reused_work.shared_prefix_entry_count, 1);
+        assert_eq!(fully_reused_work.shared_prefix_source_program, Some(0));
+        assert_eq!(fully_reused_work.loaded_module_count, 0);
+        assert_eq!(fully_reused_work.referenced_module_count, 1);
+        assert_eq!(fully_reused_work.durable_artifact_cache_hit_count, 0);
+        assert_eq!(fully_reused_work.durable_artifact_cache_miss_count, 0);
+        assert_eq!(fully_reused_work.compiler_invocation_count, 0);
+        assert_eq!(fully_reused_work.compiler_process_wall_time, Duration::ZERO);
+        assert_eq!(fully_reused_work.module_load_wall_time, Duration::ZERO);
+        let fully_reused_dispatcher = fully_reused[0]
+            .item()
+            .and_then(|item| item.dispatcher.as_ref())
+            .unwrap();
+        assert!(Arc::ptr_eq(prefix_dispatcher, fully_reused_dispatcher));
+    }
 
     #[test]
     fn native_store_group_rejects_malformed_member_provenance_before_compilation() {

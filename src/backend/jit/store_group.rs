@@ -92,7 +92,7 @@ pub(crate) fn render_schedule_module_entries(
     }
     let mut entries = Vec::with_capacity(items.len());
     let mut zero_domains = Vec::new();
-    for (index, (item, layout)) in items.iter().zip(layouts).enumerate() {
+    for (index, (item, layout)) in items.iter().zip(&layouts).enumerate() {
         let elements = item
             .primary_output()
             .shape
@@ -104,7 +104,7 @@ pub(crate) fn render_schedule_module_entries(
                     "zero-domain item belongs to a native store group".into(),
                 ));
             }
-            super::validate_native_layout(item, &layout)?;
+            super::validate_native_layout(item, layout)?;
             backend.validate_zero_domain_schedule_item(item)?;
             zero_domains.push(super::PreparedZeroDomainEntry {
                 logical_index: index,
@@ -141,6 +141,11 @@ pub(crate) fn render_schedule_module_entries(
                     .iter()
                     .map(|member| member.logical_index)
                     .collect(),
+                native_layouts: group
+                    .members
+                    .iter()
+                    .map(|member| layouts[member.logical_index].clone())
+                    .collect(),
                 vector: VectorPlan {
                     lanes: 1,
                     enabled: false,
@@ -154,13 +159,14 @@ pub(crate) fn render_schedule_module_entries(
                 rendered,
             });
         } else {
-            super::validate_native_layout(item, &layout)?;
-            let (vector, rendered, _) = backend.render_schedule_kernel(item, &layout)?;
+            super::validate_native_layout(item, layout)?;
+            let (vector, rendered, _) = backend.render_schedule_kernel(item, layout)?;
             backend.validate_rendered_schedule_item(item, &rendered)?;
             let native_cache_key =
                 format!("{}-schedule-{:016x}", rendered.cache_key, item.cache_key);
             entries.push(RenderedScheduleEntry {
                 logical_indices: vec![index],
+                native_layouts: vec![layout.clone()],
                 vector,
                 rendered,
                 native_cache_key,
