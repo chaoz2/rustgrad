@@ -3,9 +3,9 @@
 //!
 //! Same-process callers may instead retain one `CompiledAdamWPlan` and call
 //! `restore_checkpoint` without rebuilding its graph or captures. That CPU
-//! path uses fixed-capacity right-padded batches; compilation derives the
-//! masked token-mean loss and weights its gradient by each valid-token count
-//! across an accumulation window.
+//! path uses fixed-capacity right-padded batches; compilation derives token
+//! validity from ignore-index targets, owns the token-mean loss, and weights
+//! each gradient by its valid-token count across an accumulation window.
 //!
 //! Run that compile-once, same-process CPU path:
 //!
@@ -62,10 +62,10 @@ use rustgrad::{
     CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
     CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledScheduledAdamWRuntime,
     CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
-    CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, MetalSessionTarget, Module,
+    CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, LossOptions, MetalSessionTarget, Module,
     NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuCompiledEvaluationResult,
-    NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Parameter, Result, Scalar, Shape,
-    TensorData, TrainingDropoutProvider, TransformerBlock,
+    NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Parameter, Reduction, Result, Scalar,
+    Shape, TensorData, TrainingDropoutProvider, TransformerBlock, sparse_categorical_cross_entropy,
 };
 use std::{
     cell::Cell,
@@ -104,6 +104,7 @@ const POLICY_FROZEN: &str = "block.ff1.0";
 const FILE_RESUME_POLICY_FROZEN: &str = "positions.weight";
 const LOSS_MASK: &str = "loss_mask";
 const ATTENTION_KEEP_MASK: &str = "attention_keep_mask";
+const FILE_RESUME_IGNORE_INDEX: i32 = -100;
 // Per-sample key validity broadcasts across heads and query positions.
 const ATTENTION_KEEP_MASK_SHAPE: [usize; 4] = [BATCH, 1, 1, TIME];
 
@@ -376,7 +377,19 @@ fn two_block_config<B: CompiledInputBatch>(
 }
 
 fn file_resume_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
-    two_block_config::<FileResumeBatch>(schedule)
+    Ok(CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)?
+        .with_loss_scale(128.0)?
+        .with_gradient_accumulation(ACCUMULATION_STEPS)?
+        .with_max_gradient_norm(MAX_GRADIENT_NORM)?
+        .with_input_batch::<FileResumeBatch>()?
+        .with_token_weighted_ignore_index(
+            MaskedTransformerBatch::TARGETS,
+            FILE_RESUME_IGNORE_INDEX,
+        )?
+        .with_frozen_parameters([FILE_RESUME_POLICY_FROZEN])?
+        .with_captured_multi_step_lr(schedule)
+        .with_clip_report()
+        .with_window_loss_report())
 }
 
 fn scoreboard_config(schedule: CompiledMultiStepLr) -> Result<CompiledAdamWConfig> {
@@ -400,6 +413,20 @@ fn sparse_causal_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> R
 fn sparse_causal_loss(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
     let losses = sparse_causal_losses(graph, logits, targets)?;
     graph.mean_default(losses)
+}
+
+fn file_resume_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
+    sparse_categorical_cross_entropy(
+        graph,
+        logits,
+        targets,
+        LossOptions {
+            reduction: Reduction::None,
+            class_axis: 2,
+            ignore_index: Some(i64::from(FILE_RESUME_IGNORE_INDEX)),
+            label_smoothing: 0.0,
+        },
+    )
 }
 
 fn masked_sparse_causal_loss(
@@ -452,7 +479,7 @@ fn build_file_resume(
         inputs[ATTENTION_KEEP_MASK],
         dropout,
     )?;
-    let losses = sparse_causal_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
+    let losses = file_resume_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
     Ok(CompiledAdamWGraph::token_mean(
         losses,
         BTreeMap::from([("logits".into(), logits)]),
@@ -469,7 +496,7 @@ fn build_file_resume_evaluation(
         inputs[MaskedTransformerBatch::TOKENS],
         inputs[ATTENTION_KEEP_MASK],
     )?;
-    let losses = sparse_causal_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
+    let losses = file_resume_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
     Ok(CompiledAdamWGraph::token_mean(
         losses,
         BTreeMap::from([("logits".into(), logits)]),
@@ -536,10 +563,9 @@ struct FileResumeBatch {
 }
 
 impl FileResumeBatch {
-    const SCHEMA: [CompiledInputSpec; 4] = [
+    const SCHEMA: [CompiledInputSpec; 3] = [
         CompiledInputSpec::new(ATTENTION_KEEP_MASK, &ATTENTION_KEEP_MASK_SHAPE, DType::Bool),
-        CompiledInputSpec::new(LOSS_MASK, &[BATCH, TIME], DType::F32),
-        CompiledInputSpec::host_token(MaskedTransformerBatch::TARGETS, &[BATCH, TIME]),
+        CompiledInputSpec::new(MaskedTransformerBatch::TARGETS, &[BATCH, TIME], DType::I32),
         CompiledInputSpec::host_token(MaskedTransformerBatch::TOKENS, &[BATCH, TIME]),
     ];
 
@@ -552,11 +578,34 @@ impl FileResumeBatch {
                 .iter()
                 .all(|value| value.is_finite() && (*value == 0.0 || *value == 1.0))
         );
+        let targets = masked.targets.to_vec_f64();
+        let sentinel_values = targets
+            .into_iter()
+            .zip(&validity)
+            .map(|(target, keep)| {
+                if *keep == 1.0 {
+                    target as i64
+                } else {
+                    i64::from(FILE_RESUME_IGNORE_INDEX)
+                }
+            })
+            .collect::<Vec<_>>();
+        let sentinel_targets = TensorData::from_scalars(
+            [BATCH, TIME],
+            DType::I32,
+            sentinel_values.iter().copied().map(Scalar::I),
+        )?;
         let attention_keep_mask = TensorData::from_scalars(
             ATTENTION_KEEP_MASK_SHAPE,
             DType::Bool,
-            validity.iter().map(|value| Scalar::Bool(*value == 1.0)),
+            sentinel_values
+                .iter()
+                .map(|target| Scalar::Bool(*target != i64::from(FILE_RESUME_IGNORE_INDEX))),
         )?;
+        let masked = MaskedTransformerBatch {
+            targets: sentinel_targets,
+            ..masked
+        };
         let batch = Self {
             masked,
             attention_keep_mask,
@@ -571,10 +620,20 @@ impl FileResumeBatch {
             &Shape::new(ATTENTION_KEEP_MASK_SHAPE)
         );
         assert_eq!(self.attention_keep_mask.dtype(), DType::Bool);
-        assert_eq!(
-            self.attention_keep_mask.to_vec_f64(),
-            self.masked.loss_mask.to_vec_f64()
-        );
+        let expected = self
+            .masked
+            .targets
+            .to_vec_f64()
+            .into_iter()
+            .map(|target| {
+                if target as i32 == FILE_RESUME_IGNORE_INDEX {
+                    0.0
+                } else {
+                    1.0
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(self.attention_keep_mask.to_vec_f64(), expected);
     }
 
     fn has_fully_masked_sample(&self) -> bool {
@@ -595,13 +654,11 @@ impl CompiledInputBatch for FileResumeBatch {
     }
 
     fn into_compiled_inputs(self) -> Result<BTreeMap<String, TensorData>> {
-        let mut inputs = self.masked.into_compiled_inputs()?;
-        assert!(
-            inputs
-                .insert(ATTENTION_KEEP_MASK.into(), self.attention_keep_mask)
-                .is_none()
-        );
-        Ok(inputs)
+        Ok(BTreeMap::from([
+            (ATTENTION_KEEP_MASK.into(), self.attention_keep_mask),
+            (MaskedTransformerBatch::TARGETS.into(), self.masked.targets),
+            (MaskedTransformerBatch::TOKENS.into(), self.masked.tokens),
+        ]))
     }
 }
 
@@ -1406,6 +1463,10 @@ where
     let config = file_resume_config(schedule.clone())?;
     assert!(config.clip_report_enabled());
     assert!(config.window_loss_report_enabled());
+    assert_eq!(
+        config.token_weighted_ignore_index(),
+        Some((MaskedTransformerBatch::TARGETS, FILE_RESUME_IGNORE_INDEX))
+    );
     assert!(
         file_resume_batch(3)?.has_fully_masked_sample(),
         "the zero-length row must exercise fully masked attention"

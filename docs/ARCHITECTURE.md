@@ -989,7 +989,16 @@ semantic implementation.
 
 #### Token-weighted objectives and empty microbatches
 
-Token-mean training rejects a zero-valid-token mask by default. The explicit
+Token-mean training accepts either a fixed F32 binary mask or the mutually
+exclusive `with_token_weighted_ignore_index` policy over a fixed nonempty I32
+target input. The latter derives `target != ignore_index` inside the graph and
+uses that keep tensor for loss normalization, token counting, gradient
+weighting, accumulation, clipping, and window-loss reporting. Runtime admission
+counts the authenticated I32 lanes before replay. The maintained file-resume
+Transformer uses sentinel targets as the source for its broadcast attention
+validity too; legacy explicit-mask lowering and checkpoint bytes are unchanged.
+
+Token-mean training rejects a zero-valid-token batch by default. The explicit
 `CompiledAdamWConfig::with_zero_valid_token_microbatches` policy instead masks
 invalid loss lanes with exact graph zeros and divides by `count > 0 ? count :
 1`. An empty fixed-shape replay therefore contributes zero loss numerator,
@@ -999,7 +1008,8 @@ window or nonempty partial flush whose accumulated token count remains zero is
 rejected before recurrent replay, progress, report, or checkpoint publication;
 the same frontier may be retried with a nonempty mask or discarded with
 `zero_grad`. CPU interpreter and strict-native replay share this admission;
-token-weighted Metal remains fail-closed.
+token-weighted Metal remains fail-closed. Dynamic shapes, non-token objective
+weighting, and an inference ignore-index surface remain outside this policy.
 
 #### Compile and replay contract
 
@@ -1384,20 +1394,20 @@ value-preserving `[B, T] -> [B*T, 1] -> [B*T, width]` reshape/optional-expand
 materialization, including checked products and normalized `[1, 0]` strides
 (`[0, 0]` when `B*T == 1` because singleton axes normalize to zero), and
 reauthenticates those facts plus the complete two-owner consumer inventory.
-The maintained causal Transformer uses one pair at width `E` for embedding and
-one width-one pair to select each target token from `[B*T, V]` log
-probabilities. Its scalar mean loss therefore avoids the general
-cross-entropy helper's dense `[B*T, V]` one-hot selection while leaving that
-helper's probability-target, ignore-index, smoothing, and invalid-label
-semantics unchanged. Both owners of each proven pair
+The maintained ordinary causal Transformer uses one pair at width `E` for
+embedding and one width-one pair to select each target token from `[B*T, V]`
+log probabilities. Its scalar mean loss therefore avoids the general
+cross-entropy helper's dense `[B*T, V]` one-hot selection. The CPU file-resume
+mode instead uses that helper's ignore-index semantics and compiler-owned
+target-derived weighting, deliberately outside the host-token Gather fast
+path. Both owners of each proven pair
 then use versioned status-free kernels, allowing the otherwise unchanged static
 schedule to submit one command buffer. Every token lane is checked before any
 driver call or epoch/progress/scoreboard mutation. The policy changes Metal
 deployment identity but is neither recurrent state nor checkpoint/capture
 identity; ordinary Gather/Scatter rendering remains status-bearing. Dynamic
-batch or sequence extents, rank-three minibatch index materializations,
-weighted loss, ignore-index, and label-smoothed compiled causal loss are not
-admitted.
+batch or sequence extents, rank-three minibatch index materializations, Metal
+ignore-index weighting, and label-smoothed compiled causal loss are not admitted.
 When singleton reductions leave a public loss or named output as a terminal
 affine alias, compiled training selectively inserts a concrete owner before
 mixed capture. Already-owned outputs keep their existing topology, and RGSM
