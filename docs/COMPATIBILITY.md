@@ -127,7 +127,7 @@ PTX, OpenCL, Metal, and WebGPU consume validated signed `AffineView` reads direc
 
 | Capability | Status | Acceptance requirement |
 |---|---:|---|
-| Strict-native CPU compiled AdamW replay | 🚧 | `NativeCpuSessionTarget` prepares the attached CPU programs with fallback disabled. `NativeTrainingScoreboard` v13 authenticates phase-specific execution, recurrent traffic, and logical CPU egress; v1--v12 remain readable. Commit-only steps omit caller-named outputs while retaining required loss/report scalars. Failed attempts publish no state, progress, or report. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership and backend boundaries. |
+| Strict-native CPU compiled AdamW replay | 🚧 | `NativeCpuSessionTarget` prepares the attached CPU programs with fallback disabled. `NativeTrainingScoreboard` v14 authenticates phase execution, recurrent traffic, logical CPU egress, and native-module prefix-reuse evidence; v1--v13 remain readable. Commit-only steps omit caller-named outputs while retaining required loss/report scalars. Failed attempts publish no state, progress, or report. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership and backend boundaries. |
 
 | Capability | Status | Acceptance requirement |
 |---|---:|---|

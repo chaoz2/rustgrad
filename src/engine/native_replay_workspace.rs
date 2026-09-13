@@ -1423,10 +1423,22 @@ impl NativeReplayWorkspace {
                     segment_outputs.contains(&source)
                 })
             });
-            if item
-                .outputs
-                .iter()
-                .any(|output| segment_slots.contains(output))
+            let crosses_module = segment.first().is_some_and(|first| {
+                let first = self.items[*first]
+                    .dispatch
+                    .as_ref()
+                    .expect("dispatchable segment entry has a dispatcher");
+                !item
+                    .dispatch
+                    .as_ref()
+                    .expect("dispatchable workspace item has a dispatcher")
+                    .shares_dispatcher_with(first)
+            });
+            if crosses_module
+                || item
+                    .outputs
+                    .iter()
+                    .any(|output| segment_slots.contains(output))
                 || derived_depends_on_segment
             {
                 steps.push(WorkspaceDispatchStep::Segment(seal_workspace_segment(
