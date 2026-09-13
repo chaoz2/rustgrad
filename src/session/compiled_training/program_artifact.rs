@@ -1147,6 +1147,11 @@ fn module_wire(seal: &CompiledModuleSeal) -> ModuleWire {
 fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
     let plan = &owner.plan;
     let main = &plan.inner;
+    validate_adamw_observation_schema(
+        &main.phase_outputs.observations,
+        plan.clip_report,
+        plan.window_loss_report,
+    )?;
     let main_state_buffers = main
         .parameter_buffers
         .iter()
@@ -1203,11 +1208,11 @@ fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
                 &main_state_buffers,
                 &main.state_input_keys,
                 &main.recurrent_store_groups,
-                main.clip_report,
-                main.window_loss_report,
+                plan.clip_report,
+                plan.window_loss_report,
             )?,
             inputs: main.inputs.clone(),
-            output_names: main.output_names.clone(),
+            output_names: main.phase_outputs.named_outputs.clone(),
             parameter_buffers: main.parameter_buffers.clone(),
             optimizer_buffers: key_map(&main.optimizer_buffers),
             workload_buffers: key_map(&main.workload_buffers),
@@ -1482,7 +1487,7 @@ fn restore_owner<M: Module>(
                 .initial_recurrent_cursor()
                 .map_err(replay_error)?
                 .capture_identity();
-            Ok(CompiledAdamWAccumulationPlan {
+            Ok(CompiledTrainingSiblingPlan {
                 recurrent_capture: CompiledRecurrentCapture::from_artifact(&capture)?,
                 capture,
                 state_buffers,
@@ -1494,9 +1499,14 @@ fn restore_owner<M: Module>(
         capture,
         recurrent_capture,
         inputs: wire.main.inputs.clone(),
-        output_names: wire.main.output_names.clone(),
-        clip_report: wire.main.phase.clip_report,
-        window_loss_report: wire.main.phase.window_loss_report,
+        phase_outputs: CompiledTrainingPhaseOutputSchema {
+            loss: CompiledTrainingLossOutput::ScalarF32,
+            named_outputs: wire.main.output_names.clone(),
+            observations: adamw_observation_schema(
+                wire.main.phase.clip_report,
+                wire.main.phase.window_loss_report,
+            ),
+        },
         parameter_buffers,
         optimizer_buffers,
         workload_buffers,
