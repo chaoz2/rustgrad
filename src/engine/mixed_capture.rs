@@ -560,7 +560,7 @@ impl PreparedRecurrentNativeReplay {
         requested: Vec<u64>,
         replacements: PreparedRecurrentReplacementPlan,
     ) -> Result<Self, ReplayError> {
-        replacements.authenticate_adamw_native_updates(plan.adamw_native_updates())?;
+        replacements.authenticate_recurrent_store_groups(plan.recurrent_store_groups())?;
         replacements
             .authenticate_retained_recurrent_states(&pure, plan.retained_recurrent_states())?;
         let plan = plan.seal(&pure)?;
@@ -631,14 +631,14 @@ impl PreparedRecurrentNativeReplay {
     }
 
     #[cfg(test)]
-    pub(crate) fn adamw_native_update_indices(&self) -> Vec<[usize; 4]> {
-        self.plan.adamw_native_update_indices()
+    pub(crate) fn recurrent_store_group_indices(&self) -> Vec<Vec<usize>> {
+        self.plan.recurrent_store_group_indices()
     }
 
     #[cfg(test)]
-    pub(crate) fn adamw_native_update_admission_diagnostics(&self) -> Vec<String> {
+    pub(crate) fn recurrent_store_group_admission_diagnostics(&self) -> Vec<String> {
         self.plan
-            .adamw_native_update_admissions()
+            .recurrent_store_group_admissions()
             .iter()
             .enumerate()
             .map(|(manifest, diagnostic)| format!("manifest {manifest}: {}", diagnostic.describe()))
@@ -782,19 +782,19 @@ impl PreparedRecurrentReplacementPlan {
         Ok(retained)
     }
 
-    fn authenticate_adamw_native_updates(
+    fn authenticate_recurrent_store_groups(
         &self,
-        updates: &[super::captured_replay::AdamWNativeUpdateManifest],
+        groups: &[super::captured_replay::RecurrentStoreGroupManifest],
     ) -> Result<(), ReplayError> {
         let replacements = self
             .replacements
             .iter()
             .map(|replacement| (replacement.producer, replacement.buffer))
             .collect::<BTreeMap<_, _>>();
-        for member in updates.iter().flat_map(|update| update.members) {
+        for member in groups.iter().flat_map(|group| &group.members) {
             if replacements.get(&member.output) != Some(&member.state_buffer) {
                 return Err(ReplayError::Corrupt(
-                    "prepared AdamW native update replacement mismatch".into(),
+                    "prepared recurrent store-group replacement mismatch".into(),
                 ));
             }
         }

@@ -816,10 +816,10 @@ pub(crate) struct PlannedNativeItems {
     capture_identity: u64,
     input_schema: Vec<crate::ReplayInput>,
     schedule_cache_keys: Vec<u64>,
-    adamw_native_updates: Vec<AdamWNativeUpdateManifest>,
+    recurrent_store_groups: Vec<RecurrentStoreGroupManifest>,
     retained_recurrent_states: Vec<NativeRecurrentStateRetention>,
     #[cfg(test)]
-    adamw_native_update_admissions: Vec<AdamWNativeUpdateAdmissionDiagnostic>,
+    recurrent_store_group_admissions: Vec<RecurrentStoreGroupAdmissionDiagnostic>,
     #[cfg(test)]
     structure_validation_count: std::sync::atomic::AtomicUsize,
 }
@@ -827,31 +827,22 @@ pub(crate) struct PlannedNativeItems {
 pub(crate) struct NativeItemPlanDraft {
     layouts: Vec<crate::backend::NativeScheduleLayout>,
     layout_wall_time: Duration,
-    adamw_native_updates: Vec<crate::backend::NativeStoreGroup>,
-    admitted_adamw_updates: Vec<AdamWNativeUpdateManifest>,
+    native_store_groups: Vec<crate::backend::NativeStoreGroup>,
+    admitted_recurrent_store_groups: Vec<RecurrentStoreGroupManifest>,
     retained_recurrent_states: Vec<NativeRecurrentStateRetention>,
     #[cfg(test)]
-    adamw_native_update_admissions: Vec<AdamWNativeUpdateAdmissionDiagnostic>,
+    recurrent_store_group_admissions: Vec<RecurrentStoreGroupAdmissionDiagnostic>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdamWNativeUpdateRole {
-    Parameter,
-    FirstMoment,
-    SecondMoment,
-    GradientAccumulator,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AdamWNativeUpdateSuccessor {
-    pub(crate) role: AdamWNativeUpdateRole,
+pub(crate) struct RecurrentStoreGroupMember {
     pub(crate) output: u64,
     pub(crate) state_buffer: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AdamWNativeUpdateManifest {
-    pub(crate) members: [AdamWNativeUpdateSuccessor; 4],
+pub(crate) struct RecurrentStoreGroupManifest {
+    pub(crate) members: Vec<RecurrentStoreGroupMember>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -864,20 +855,18 @@ pub(crate) struct NativeRecurrentStateRetention {
 
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AdamWNativeUpdateAdmissionDiagnostic {
-    Admitted { logical_indices: [usize; 4] },
-    Rejected(AdamWNativeUpdateRejection),
+pub(crate) enum RecurrentStoreGroupAdmissionDiagnostic {
+    Admitted { logical_indices: Vec<usize> },
+    Rejected(RecurrentStoreGroupRejection),
 }
 
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AdamWNativeUpdateRejection {
+pub(crate) enum RecurrentStoreGroupRejection {
     MissingMember {
-        role: AdamWNativeUpdateRole,
         output: u64,
     },
     MemberDescriptor {
-        role: AdamWNativeUpdateRole,
         output: u64,
         logical_index: usize,
     },
@@ -908,7 +897,7 @@ pub(crate) enum AdamWNativeUpdateRejection {
 }
 
 #[cfg(test)]
-impl AdamWNativeUpdateAdmissionDiagnostic {
+impl RecurrentStoreGroupAdmissionDiagnostic {
     pub(crate) fn describe(&self) -> String {
         match self {
             Self::Admitted { logical_indices } => {
@@ -920,19 +909,16 @@ impl AdamWNativeUpdateAdmissionDiagnostic {
 }
 
 #[cfg(test)]
-impl AdamWNativeUpdateRejection {
+impl RecurrentStoreGroupRejection {
     fn describe(&self) -> String {
         match self {
-            Self::MissingMember { role, output } => {
-                format!("missing member: role={role:?}, output={output}")
+            Self::MissingMember { output } => {
+                format!("missing member: output={output}")
             }
             Self::MemberDescriptor {
-                role,
                 output,
                 logical_index,
-            } => format!(
-                "member descriptor: role={role:?}, output={output}, logical_index={logical_index}"
-            ),
+            } => format!("member descriptor: output={output}, logical_index={logical_index}"),
             Self::EscapingConsumer {
                 logical_index,
                 consumer,
@@ -964,26 +950,29 @@ impl AdamWNativeUpdateRejection {
     }
 }
 
-enum AdamWNativeUpdateAdmission {
+enum RecurrentStoreGroupAdmission {
     Admitted {
         group: crate::backend::NativeStoreGroup,
-        logical_indices: [usize; 4],
+        logical_indices: Vec<usize>,
     },
     Rejected {
         #[cfg(test)]
-        reason: AdamWNativeUpdateRejection,
+        reason: RecurrentStoreGroupRejection,
     },
 }
 
-struct AdamWNativeUpdateGroupPlan {
-    groups: Vec<(crate::backend::NativeStoreGroup, AdamWNativeUpdateManifest)>,
+struct RecurrentStoreGroupPlan {
+    groups: Vec<(
+        crate::backend::NativeStoreGroup,
+        RecurrentStoreGroupManifest,
+    )>,
     #[cfg(test)]
-    diagnostics: Vec<AdamWNativeUpdateAdmissionDiagnostic>,
+    diagnostics: Vec<RecurrentStoreGroupAdmissionDiagnostic>,
 }
 
-macro_rules! reject_adamw_native_update {
+macro_rules! reject_recurrent_store_group {
     ($reason:expr) => {
-        AdamWNativeUpdateAdmission::Rejected {
+        RecurrentStoreGroupAdmission::Rejected {
             #[cfg(test)]
             reason: $reason,
         }
@@ -1022,8 +1011,8 @@ impl PlannedNativeItems {
         self.vectorized
     }
 
-    pub(crate) fn adamw_native_updates(&self) -> &[AdamWNativeUpdateManifest] {
-        &self.adamw_native_updates
+    pub(crate) fn recurrent_store_groups(&self) -> &[RecurrentStoreGroupManifest] {
+        &self.recurrent_store_groups
     }
 
     pub(crate) fn retained_recurrent_states(&self) -> &[NativeRecurrentStateRetention] {
@@ -1031,8 +1020,10 @@ impl PlannedNativeItems {
     }
 
     #[cfg(test)]
-    pub(crate) fn adamw_native_update_admissions(&self) -> &[AdamWNativeUpdateAdmissionDiagnostic] {
-        &self.adamw_native_update_admissions
+    pub(crate) fn recurrent_store_group_admissions(
+        &self,
+    ) -> &[RecurrentStoreGroupAdmissionDiagnostic] {
+        &self.recurrent_store_group_admissions
     }
 
     pub(crate) fn schedule_cache_keys(&self) -> &[u64] {
@@ -1182,7 +1173,7 @@ impl PlannedNativeItems {
                             .map(|((item, layout), slot)| (item, layout, slot))
                         else {
                             return Err(ReplayError::Corrupt(
-                                "prepared AdamW update item is out of range".into(),
+                                "prepared recurrent store-group item is out of range".into(),
                             ));
                         };
                         if *slot
@@ -1194,7 +1185,7 @@ impl PlannedNativeItems {
                             )
                         {
                             return Err(ReplayError::Corrupt(
-                                "prepared AdamW update layout mismatch".into(),
+                                "prepared recurrent store-group layout mismatch".into(),
                             ));
                         }
                         *slot = true;
@@ -1253,31 +1244,37 @@ impl SealedPlannedNativeItems {
     }
 
     #[cfg(test)]
-    pub(super) fn adamw_native_update_admissions(&self) -> &[AdamWNativeUpdateAdmissionDiagnostic] {
-        self.plan.adamw_native_update_admissions()
+    pub(super) fn recurrent_store_group_admissions(
+        &self,
+    ) -> &[RecurrentStoreGroupAdmissionDiagnostic] {
+        self.plan.recurrent_store_group_admissions()
     }
 
     #[cfg(test)]
-    pub(super) fn adamw_native_update_indices(&self) -> Vec<[usize; 4]> {
+    pub(super) fn recurrent_store_group_indices(&self) -> Vec<Vec<usize>> {
         self.plan
-            .adamw_native_updates
+            .recurrent_store_groups
             .iter()
             .map(|manifest| {
-                manifest.members.map(|successor| {
-                    self.plan
-                        .items
-                        .iter()
-                        .find_map(|dispatch| match dispatch {
-                            PreparedNativeDispatch::StoreGroup(group) => group
-                                .members
-                                .iter()
-                                .find(|member| member.output_buffer == successor.output)
-                                .map(|member| member.logical_index),
-                            PreparedNativeDispatch::Item { .. }
-                            | PreparedNativeDispatch::ZeroDomain { .. } => None,
-                        })
-                        .expect("sealed AdamW native update has a physical store-group member")
-                })
+                manifest
+                    .members
+                    .iter()
+                    .map(|successor| {
+                        self.plan
+                            .items
+                            .iter()
+                            .find_map(|dispatch| match dispatch {
+                                PreparedNativeDispatch::StoreGroup(group) => group
+                                    .members
+                                    .iter()
+                                    .find(|member| member.output_buffer == successor.output)
+                                    .map(|member| member.logical_index),
+                                PreparedNativeDispatch::Item { .. }
+                                | PreparedNativeDispatch::ZeroDomain { .. } => None,
+                            })
+                            .expect("sealed recurrent store group has a physical member")
+                    })
+                    .collect()
             })
             .collect()
     }
@@ -1543,25 +1540,24 @@ fn native_schedule_layouts(
     native_schedule_layouts_with_retained(capture, &[])
 }
 
-fn plan_adamw_native_update(
+fn plan_recurrent_store_group(
     capture: &CapturedSchedule,
     layouts: &[crate::backend::NativeScheduleLayout],
     item_ids: &BTreeSet<u64>,
-    manifest: &AdamWNativeUpdateManifest,
-) -> Result<AdamWNativeUpdateAdmission, ReplayError> {
+    manifest: &RecurrentStoreGroupManifest,
+) -> Result<RecurrentStoreGroupAdmission, ReplayError> {
     let mut indexed_members = Vec::with_capacity(manifest.members.len());
     let mut outputs = BTreeSet::new();
     let mut state_buffers = BTreeSet::new();
     let mut descriptor = None;
-    for member in manifest.members {
+    for member in &manifest.members {
         let Some(index) = capture
             .items
             .iter()
             .position(|item| item.primary_output().id == member.output)
         else {
-            return Ok(reject_adamw_native_update!(
-                AdamWNativeUpdateRejection::MissingMember {
-                    role: member.role,
+            return Ok(reject_recurrent_store_group!(
+                RecurrentStoreGroupRejection::MissingMember {
                     output: member.output,
                 }
             ));
@@ -1593,16 +1589,15 @@ fn plan_adamw_native_update(
             || crate::cpu_jit::native_output_initialization(&item.kernel)
                 != crate::cpu_jit::NativeOutputInitialization::FullyOverwritten
         {
-            return Ok(reject_adamw_native_update!(
-                AdamWNativeUpdateRejection::MemberDescriptor {
-                    role: member.role,
+            return Ok(reject_recurrent_store_group!(
+                RecurrentStoreGroupRejection::MemberDescriptor {
                     output: member.output,
                     logical_index: index,
                 }
             ));
         }
         descriptor = Some(output.clone());
-        indexed_members.push((index, member));
+        indexed_members.push((index, *member));
     }
     indexed_members.sort_unstable_by_key(|(index, _)| *index);
     let indices = indexed_members
@@ -1619,8 +1614,8 @@ fn plan_adamw_native_update(
             .iter()
             .find(|consumer| item_ids.contains(consumer) && !member_ids.contains(consumer))
         {
-            return Ok(reject_adamw_native_update!(
-                AdamWNativeUpdateRejection::EscapingConsumer {
+            return Ok(reject_recurrent_store_group!(
+                RecurrentStoreGroupRejection::EscapingConsumer {
                     logical_index: *index,
                     consumer: *_consumer,
                 }
@@ -1634,8 +1629,8 @@ fn plan_adamw_native_update(
     let kernel = match crate::kernel::fuse_native_store_group(&kernels) {
         Ok(kernel) => kernel,
         Err(_error) => {
-            return Ok(reject_adamw_native_update!(
-                AdamWNativeUpdateRejection::KernelFusion(_error)
+            return Ok(reject_recurrent_store_group!(
+                RecurrentStoreGroupRejection::KernelFusion(_error)
             ));
         }
     };
@@ -1643,20 +1638,20 @@ fn plan_adamw_native_update(
     {
         Ok(rendered) => rendered,
         Err(_error) => {
-            return Ok(reject_adamw_native_update!(
-                AdamWNativeUpdateRejection::KernelRendering(_error.to_string())
+            return Ok(reject_recurrent_store_group!(
+                RecurrentStoreGroupRejection::KernelRendering(_error.to_string())
             ));
         }
     };
     let dispatch_anchor = *indices
         .last()
-        .expect("native update group has authenticated members");
+        .expect("recurrent store group has authenticated members");
     let mut effective_input_owners = BTreeSet::new();
     for abi in &rendered.abi.buffers {
         if abi.mutable {
             if !outputs.contains(&abi.id) {
-                return Ok(reject_adamw_native_update!(
-                    AdamWNativeUpdateRejection::MutableOutputAbi { buffer: abi.id }
+                return Ok(reject_recurrent_store_group!(
+                    RecurrentStoreGroupRejection::MutableOutputAbi { buffer: abi.id }
                 ));
             }
             continue;
@@ -1667,8 +1662,8 @@ fn plan_adamw_native_update(
             .filter(|binding| binding.desc.id == abi.id)
             .collect::<Vec<_>>();
         let Some(binding) = bindings.first() else {
-            return Ok(reject_adamw_native_update!(
-                AdamWNativeUpdateRejection::MissingInputBinding { buffer: abi.id }
+            return Ok(reject_recurrent_store_group!(
+                RecurrentStoreGroupRejection::MissingInputBinding { buffer: abi.id }
             ));
         };
         if !bindings.iter().all(|candidate| {
@@ -1681,8 +1676,8 @@ fn plan_adamw_native_update(
                     .numel()
                     .is_ok_and(|elements| elements == abi.elements)
         }) {
-            return Ok(reject_adamw_native_update!(
-                AdamWNativeUpdateRejection::InputBindingDescriptor { buffer: abi.id }
+            return Ok(reject_recurrent_store_group!(
+                RecurrentStoreGroupRejection::InputBindingDescriptor { buffer: abi.id }
             ));
         }
         let producer = capture
@@ -1692,8 +1687,8 @@ fn plan_adamw_native_update(
         if let Some(producer) = producer
             && producer >= dispatch_anchor
         {
-            return Ok(reject_adamw_native_update!(
-                AdamWNativeUpdateRejection::InputProducerOrder {
+            return Ok(reject_recurrent_store_group!(
+                RecurrentStoreGroupRejection::InputProducerOrder {
                     buffer: abi.id,
                     producer,
                     dispatch_anchor,
@@ -1705,28 +1700,24 @@ fn plan_adamw_native_update(
             .and_then(|layout| layout.elided_output_source)
             .unwrap_or(abi.id);
         if !effective_input_owners.insert(effective_owner) {
-            return Ok(reject_adamw_native_update!(
-                AdamWNativeUpdateRejection::EffectiveInputOwnerCollision {
+            return Ok(reject_recurrent_store_group!(
+                RecurrentStoreGroupRejection::EffectiveInputOwnerCollision {
                     buffer: abi.id,
                     owner: effective_owner,
                 }
             ));
         }
     }
-    let member_indices: [usize; 4] = indices
-        .try_into()
-        .map_err(|_| ReplayError::Corrupt("AdamW native update cardinality changed".into()))?;
-    let members: [AdamWNativeUpdateSuccessor; 4] = indexed_members
+    let members = indexed_members
         .into_iter()
         .map(|(_, member)| member)
-        .collect::<Vec<_>>()
-        .try_into()
-        .map_err(|_| ReplayError::Corrupt("AdamW native update cardinality changed".into()))?;
-    Ok(AdamWNativeUpdateAdmission::Admitted {
+        .collect::<Vec<_>>();
+    Ok(RecurrentStoreGroupAdmission::Admitted {
         group: crate::backend::NativeStoreGroup {
-            members: member_indices
-                .into_iter()
-                .zip(members)
+            members: indices
+                .iter()
+                .copied()
+                .zip(&members)
                 .map(
                     |(logical_index, member)| crate::backend::NativeStoreGroupMember {
                         logical_index,
@@ -1737,35 +1728,24 @@ fn plan_adamw_native_update(
             kernel,
             output_initialization,
         },
-        logical_indices: member_indices,
+        logical_indices: indices,
     })
 }
 
-fn adamw_native_update_groups(
+fn recurrent_store_groups(
     capture: &CapturedSchedule,
     layouts: &[crate::backend::NativeScheduleLayout],
-    manifests: &[AdamWNativeUpdateManifest],
-) -> Result<AdamWNativeUpdateGroupPlan, ReplayError> {
-    let expected_roles = [
-        AdamWNativeUpdateRole::Parameter,
-        AdamWNativeUpdateRole::FirstMoment,
-        AdamWNativeUpdateRole::SecondMoment,
-        AdamWNativeUpdateRole::GradientAccumulator,
-    ];
+    manifests: &[RecurrentStoreGroupManifest],
+) -> Result<RecurrentStoreGroupPlan, ReplayError> {
     let mut manifested_outputs = BTreeSet::new();
     let mut manifested_states = BTreeSet::new();
     for manifest in manifests {
-        if manifest
-            .members
-            .iter()
-            .map(|member| member.role)
-            .ne(expected_roles)
-        {
+        if manifest.members.len() < 2 {
             return Err(ReplayError::Corrupt(
-                "AdamW native update role inventory mismatch".into(),
+                "recurrent store group requires multiple members".into(),
             ));
         }
-        for member in manifest.members {
+        for member in &manifest.members {
             if !manifested_outputs.insert(member.output)
                 || !manifested_states.insert(member.state_buffer)
                 || capture
@@ -1776,7 +1756,7 @@ fn adamw_native_update_groups(
                     != 1
             {
                 return Err(ReplayError::Corrupt(
-                    "AdamW native update successor inventory mismatch".into(),
+                    "recurrent store-group successor inventory mismatch".into(),
                 ));
             }
         }
@@ -1791,8 +1771,8 @@ fn adamw_native_update_groups(
     #[cfg(test)]
     let mut diagnostics = Vec::with_capacity(manifests.len());
     for manifest in manifests {
-        match plan_adamw_native_update(capture, layouts, &item_ids, manifest)? {
-            AdamWNativeUpdateAdmission::Admitted {
+        match plan_recurrent_store_group(capture, layouts, &item_ids, manifest)? {
+            RecurrentStoreGroupAdmission::Admitted {
                 group,
                 logical_indices,
             } => {
@@ -1801,25 +1781,25 @@ fn adamw_native_update_groups(
                     .any(|index| claimed_items.contains(index))
                 {
                     return Err(ReplayError::Corrupt(
-                        "AdamW native update schedule items overlap".into(),
+                        "recurrent store-group schedule items overlap".into(),
                     ));
                 }
-                claimed_items.extend(logical_indices);
+                claimed_items.extend(logical_indices.iter().copied());
                 #[cfg(test)]
                 diagnostics
-                    .push(AdamWNativeUpdateAdmissionDiagnostic::Admitted { logical_indices });
+                    .push(RecurrentStoreGroupAdmissionDiagnostic::Admitted { logical_indices });
                 groups.push((group, manifest.clone()));
             }
-            AdamWNativeUpdateAdmission::Rejected {
+            RecurrentStoreGroupAdmission::Rejected {
                 #[cfg(test)]
                 reason,
             } => {
                 #[cfg(test)]
-                diagnostics.push(AdamWNativeUpdateAdmissionDiagnostic::Rejected(reason));
+                diagnostics.push(RecurrentStoreGroupAdmissionDiagnostic::Rejected(reason));
             }
         }
     }
-    Ok(AdamWNativeUpdateGroupPlan {
+    Ok(RecurrentStoreGroupPlan {
         groups,
         #[cfg(test)]
         diagnostics,
@@ -1832,14 +1812,14 @@ impl CapturedReplayExecutor {
         capture: &CapturedSchedule,
         provided: &BTreeMap<String, TensorData>,
     ) -> Result<NativeItemPlanDraft, ReplayError> {
-        self.preflight_native_items_with_adamw_updates(capture, provided, &[])
+        self.preflight_native_items_with_store_groups(capture, provided, &[])
     }
 
-    pub(crate) fn preflight_native_items_with_adamw_updates(
+    pub(crate) fn preflight_native_items_with_store_groups(
         &self,
         capture: &CapturedSchedule,
         provided: &BTreeMap<String, TensorData>,
-        manifests: &[AdamWNativeUpdateManifest],
+        manifests: &[RecurrentStoreGroupManifest],
     ) -> Result<NativeItemPlanDraft, ReplayError> {
         #[cfg(test)]
         self.native_item_plan_count
@@ -1857,16 +1837,17 @@ impl CapturedReplayExecutor {
         }
         let started = Instant::now();
         let layouts = native_schedule_layouts(capture)?;
-        let admitted = adamw_native_update_groups(capture, &layouts, manifests)?;
-        let (adamw_native_updates, admitted_adamw_updates) = admitted.groups.into_iter().unzip();
+        let admitted = recurrent_store_groups(capture, &layouts, manifests)?;
+        let (native_store_groups, admitted_recurrent_store_groups) =
+            admitted.groups.into_iter().unzip();
         Ok(NativeItemPlanDraft {
             layouts,
             layout_wall_time: started.elapsed(),
-            adamw_native_updates,
-            admitted_adamw_updates,
+            native_store_groups,
+            admitted_recurrent_store_groups,
             retained_recurrent_states: Vec::new(),
             #[cfg(test)]
-            adamw_native_update_admissions: admitted.diagnostics,
+            recurrent_store_group_admissions: admitted.diagnostics,
         })
     }
 
@@ -1941,7 +1922,7 @@ impl CapturedReplayExecutor {
                 (
                     capture.items.as_slice(),
                     draft.layouts.clone(),
-                    draft.adamw_native_updates.clone(),
+                    draft.native_store_groups.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1964,10 +1945,10 @@ impl CapturedReplayExecutor {
                     capture_identity: capture.identity,
                     input_schema: capture.inputs.clone(),
                     schedule_cache_keys: capture.items.iter().map(|item| item.cache_key).collect(),
-                    adamw_native_updates: draft.admitted_adamw_updates,
+                    recurrent_store_groups: draft.admitted_recurrent_store_groups,
                     retained_recurrent_states: draft.retained_recurrent_states,
                     #[cfg(test)]
-                    adamw_native_update_admissions: draft.adamw_native_update_admissions,
+                    recurrent_store_group_admissions: draft.recurrent_store_group_admissions,
                     #[cfg(test)]
                     structure_validation_count: std::sync::atomic::AtomicUsize::new(0),
                 })
@@ -2615,8 +2596,195 @@ mod tests {
         assert_eq!(native.trace.items[0].backend, ItemBackend::NativeJit);
     }
 
+    fn two_member_store_group_fixture() -> (CapturedSchedule, RecurrentStoreGroupManifest) {
+        let mut graph = Graph::new();
+        let left = graph.input("left", [2]);
+        let right = graph.input("right", [2]);
+        let left = graph.square(left).unwrap();
+        let right = graph.relu(right).unwrap();
+        let capture = captured(&graph, &[left, right]);
+        let manifest = RecurrentStoreGroupManifest {
+            members: vec![
+                RecurrentStoreGroupMember {
+                    output: left.index() as u64,
+                    state_buffer: 101,
+                },
+                RecurrentStoreGroupMember {
+                    output: right.index() as u64,
+                    state_buffer: 102,
+                },
+            ],
+        };
+        (capture, manifest)
+    }
+
     #[test]
-    fn adamw_update_admission_accepts_two_interleaved_parameter_frontiers() {
+    fn recurrent_store_group_admission_is_generic_and_fail_closed() {
+        let (capture, manifest) = two_member_store_group_fixture();
+        let layouts = native_schedule_layouts(&capture).unwrap();
+        let admitted =
+            recurrent_store_groups(&capture, &layouts, std::slice::from_ref(&manifest)).unwrap();
+        assert_eq!(admitted.groups.len(), 1);
+        assert!(matches!(
+            admitted.diagnostics.as_slice(),
+            [RecurrentStoreGroupAdmissionDiagnostic::Admitted { logical_indices }]
+                if logical_indices.len() == 2
+        ));
+
+        let duplicate = RecurrentStoreGroupManifest {
+            members: vec![manifest.members[0], manifest.members[0]],
+        };
+        assert!(matches!(
+            recurrent_store_groups(&capture, &layouts, &[duplicate]),
+            Err(ReplayError::Corrupt(reason))
+                if reason.contains("successor inventory mismatch")
+        ));
+        let duplicate_state = RecurrentStoreGroupManifest {
+            members: vec![
+                manifest.members[0],
+                RecurrentStoreGroupMember {
+                    state_buffer: manifest.members[0].state_buffer,
+                    ..manifest.members[1]
+                },
+            ],
+        };
+        assert!(matches!(
+            recurrent_store_groups(&capture, &layouts, &[duplicate_state]),
+            Err(ReplayError::Corrupt(reason))
+                if reason.contains("successor inventory mismatch")
+        ));
+        let missing = RecurrentStoreGroupManifest {
+            members: vec![
+                manifest.members[0],
+                RecurrentStoreGroupMember {
+                    output: u64::MAX,
+                    state_buffer: 103,
+                },
+            ],
+        };
+        assert!(matches!(
+            recurrent_store_groups(&capture, &layouts, &[missing]),
+            Err(ReplayError::Corrupt(reason))
+                if reason.contains("successor inventory mismatch")
+        ));
+
+        let mut graph = Graph::new();
+        let left = graph.input("left", [2]);
+        let right = graph.input("right", [3]);
+        let left = graph.square(left).unwrap();
+        let right = graph.relu(right).unwrap();
+        let capture = captured(&graph, &[left, right]);
+        let layouts = native_schedule_layouts(&capture).unwrap();
+        let mixed_descriptor = RecurrentStoreGroupManifest {
+            members: vec![
+                RecurrentStoreGroupMember {
+                    output: left.index() as u64,
+                    state_buffer: 201,
+                },
+                RecurrentStoreGroupMember {
+                    output: right.index() as u64,
+                    state_buffer: 202,
+                },
+            ],
+        };
+        let rejected = recurrent_store_groups(&capture, &layouts, &[mixed_descriptor]).unwrap();
+        assert!(rejected.groups.is_empty());
+        assert!(matches!(
+            rejected.diagnostics.as_slice(),
+            [RecurrentStoreGroupAdmissionDiagnostic::Rejected(
+                RecurrentStoreGroupRejection::MemberDescriptor { .. }
+            )]
+        ));
+    }
+
+    #[test]
+    fn recurrent_store_group_rejects_escaping_consumers_and_unsafe_input_owners() {
+        let mut graph = Graph::new();
+        let left_input = graph.input("left", [2]);
+        let right_input = graph.input("right", [2]);
+        let left = graph.square(left_input).unwrap();
+        let right = graph.relu(right_input).unwrap();
+        let escaping = graph.relu(left).unwrap();
+        let capture = captured(&graph, &[left, right, escaping]);
+        let layouts = native_schedule_layouts(&capture).unwrap();
+        let manifest = RecurrentStoreGroupManifest {
+            members: vec![
+                RecurrentStoreGroupMember {
+                    output: left.index() as u64,
+                    state_buffer: 301,
+                },
+                RecurrentStoreGroupMember {
+                    output: right.index() as u64,
+                    state_buffer: 302,
+                },
+            ],
+        };
+        let rejected = recurrent_store_groups(&capture, &layouts, &[manifest]).unwrap();
+        assert!(rejected.groups.is_empty());
+        assert!(matches!(
+            rejected.diagnostics.as_slice(),
+            [RecurrentStoreGroupAdmissionDiagnostic::Rejected(
+                RecurrentStoreGroupRejection::EscapingConsumer { .. }
+            )]
+        ));
+
+        let mut graph = Graph::new();
+        let left_input = graph.input("left", [2]);
+        let right_input = graph.input("right", [2]);
+        let source = graph.square(left_input).unwrap();
+        let source = graph.contiguous(source).unwrap();
+        let left = graph.relu(source).unwrap();
+        let right = graph.relu(right_input).unwrap();
+        let capture = captured(&graph, &[left, right]);
+        let manifest = RecurrentStoreGroupManifest {
+            members: vec![
+                RecurrentStoreGroupMember {
+                    output: left.index() as u64,
+                    state_buffer: 401,
+                },
+                RecurrentStoreGroupMember {
+                    output: right.index() as u64,
+                    state_buffer: 402,
+                },
+            ],
+        };
+        let source_index = capture
+            .items
+            .iter()
+            .position(|item| item.primary_output().id == source.index() as u64)
+            .unwrap();
+        let mut colliding_layouts = native_schedule_layouts(&capture).unwrap();
+        colliding_layouts[source_index].elided_output_source = Some(right_input.index() as u64);
+        let rejected = recurrent_store_groups(
+            &capture,
+            &colliding_layouts,
+            std::slice::from_ref(&manifest),
+        )
+        .unwrap();
+        assert!(rejected.groups.is_empty());
+        assert!(matches!(
+            rejected.diagnostics.as_slice(),
+            [RecurrentStoreGroupAdmissionDiagnostic::Rejected(
+                RecurrentStoreGroupRejection::EffectiveInputOwnerCollision { .. }
+            )]
+        ));
+
+        let mut reordered = capture.clone();
+        let source_item = reordered.items.remove(source_index);
+        reordered.items.push(source_item);
+        let reordered_layouts = native_schedule_layouts(&reordered).unwrap();
+        let rejected = recurrent_store_groups(&reordered, &reordered_layouts, &[manifest]).unwrap();
+        assert!(rejected.groups.is_empty());
+        assert!(matches!(
+            rejected.diagnostics.as_slice(),
+            [RecurrentStoreGroupAdmissionDiagnostic::Rejected(
+                RecurrentStoreGroupRejection::InputProducerOrder { .. }
+            )]
+        ));
+    }
+
+    #[test]
+    fn recurrent_store_group_admission_accepts_interleaved_frontiers() {
         let mut graph = Graph::new();
         let seed_a = graph.input("seed_a", [2]);
         let seed_b = graph.input("seed_b", [2]);
@@ -2654,30 +2822,29 @@ mod tests {
         ];
         let capture = captured(&graph, &requested);
         let layouts = native_schedule_layouts(&capture).unwrap();
-        let successor = |role, output: crate::NodeId, state_buffer| AdamWNativeUpdateSuccessor {
-            role,
+        let member = |output: crate::NodeId, state_buffer| RecurrentStoreGroupMember {
             output: output.index() as u64,
             state_buffer,
         };
         let manifests = [
-            AdamWNativeUpdateManifest {
-                members: [
-                    successor(AdamWNativeUpdateRole::Parameter, parameter_a, 101),
-                    successor(AdamWNativeUpdateRole::FirstMoment, first_moment_a, 102),
-                    successor(AdamWNativeUpdateRole::SecondMoment, second_moment_a, 103),
-                    successor(AdamWNativeUpdateRole::GradientAccumulator, cleared_a, 104),
+            RecurrentStoreGroupManifest {
+                members: vec![
+                    member(parameter_a, 101),
+                    member(first_moment_a, 102),
+                    member(second_moment_a, 103),
+                    member(cleared_a, 104),
                 ],
             },
-            AdamWNativeUpdateManifest {
-                members: [
-                    successor(AdamWNativeUpdateRole::Parameter, parameter_b, 201),
-                    successor(AdamWNativeUpdateRole::FirstMoment, first_moment_b, 202),
-                    successor(AdamWNativeUpdateRole::SecondMoment, second_moment_b, 203),
-                    successor(AdamWNativeUpdateRole::GradientAccumulator, cleared_b, 204),
+            RecurrentStoreGroupManifest {
+                members: vec![
+                    member(parameter_b, 201),
+                    member(first_moment_b, 202),
+                    member(second_moment_b, 203),
+                    member(cleared_b, 204),
                 ],
             },
         ];
-        let admitted = adamw_native_update_groups(&capture, &layouts, &manifests).unwrap();
+        let admitted = recurrent_store_groups(&capture, &layouts, &manifests).unwrap();
         assert_eq!(admitted.groups.len(), 2);
 
         for ((group, manifest), gradient) in admitted.groups.iter().zip([gradient_a, gradient_b]) {
