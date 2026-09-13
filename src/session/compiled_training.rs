@@ -1057,7 +1057,9 @@ impl CompiledAdamWConfig {
     /// Derives token-mean weighting from an existing fixed I32 target input.
     /// Target lanes equal to `ignore_index` contribute exact zero loss, token
     /// weight, and gradient; every other lane contributes one. This policy is
-    /// mutually exclusive with an explicit F32 token-weight mask.
+    /// mutually exclusive with an explicit F32 token-weight mask. Use
+    /// [`CompiledAdamWPlan::compile_module_graph_with_ignore_index`] when the
+    /// model graph also needs the compiler-owned validity node.
     pub fn with_token_weighted_ignore_index(
         mut self,
         target_input: impl Into<String>,
@@ -2979,6 +2981,7 @@ trait CompiledOptimizerProgram {
 struct CompiledOptimizerLoweringContext<'a> {
     loss: NodeId,
     learning_rate: NodeId,
+    token_weight: Option<NodeId>,
     inputs: &'a BTreeMap<String, NodeId>,
     parameters: &'a BTreeMap<String, NodeId>,
     gradients: &'a BTreeMap<String, NodeId>,
@@ -3533,6 +3536,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
         let CompiledOptimizerLoweringContext {
             loss,
             learning_rate,
+            token_weight,
             inputs,
             parameters,
             gradients,
@@ -3593,7 +3597,11 @@ impl CompiledOptimizerProgram for AdamWProgram {
             .token_weight_policy
             .as_ref()
             .map(|policy| {
-                let mask = lower_token_weight_mask(graph, inputs, policy)?;
+                let mask = match token_weight {
+                    Some(mask) => mask,
+                    None => lower_token_weight_mask(graph, inputs, policy)?,
+                };
+                validate_token_weight_node(graph, mask, policy, &self.config.inputs)?;
                 let batch_count = graph.sum_all(mask)?;
                 let batch_count_u64 = graph.cast(batch_count, DType::U64)?;
                 let count_key =
@@ -4024,6 +4032,35 @@ impl CompiledAdamWObjective {
 pub struct CompiledAdamWGraph {
     objective: CompiledAdamWObjective,
     outputs: BTreeMap<String, NodeId>,
+}
+
+/// Compiler-derived graph nodes for one configured ignore-index token policy.
+///
+/// All three nodes have the configured fixed target shape. [`Self::targets`] is
+/// the declared I32 target input, [`Self::validity`] is the Bool result of the
+/// exact `target != ignore_index` comparison, and [`Self::weight`] is that same
+/// validity cast to F32. Context-aware builders may reshape the Bool node for a
+/// model's attention policy while compilation reuses the F32 node for the
+/// token-mean objective and optimizer window accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledAdamWIgnoreIndexContext {
+    targets: NodeId,
+    validity: NodeId,
+    weight: NodeId,
+}
+
+impl CompiledAdamWIgnoreIndexContext {
+    pub const fn targets(self) -> NodeId {
+        self.targets
+    }
+
+    pub const fn validity(self) -> NodeId {
+        self.validity
+    }
+
+    pub const fn weight(self) -> NodeId {
+        self.weight
+    }
 }
 
 impl CompiledAdamWGraph {
@@ -5341,7 +5378,31 @@ impl CompiledTrainingPlan {
             None,
             |graph, inputs, parameters, _| {
                 let (loss, outputs) = build(graph, inputs, parameters)?;
-                Ok((loss, outputs, None))
+                Ok((loss, outputs, None, None))
+            },
+        )
+    }
+
+    fn compile_with_token_weight<F, O>(
+        optimizer: O,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        build: F,
+    ) -> Result<Self>
+    where
+        O: CompiledOptimizerProgram,
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>, NodeId)>,
+    {
+        Self::compile_with_workload(
+            optimizer,
+            parameters,
+            None,
+            |graph, inputs, parameters, _| {
+                let (loss, outputs, token_weight) = build(graph, inputs, parameters)?;
+                Ok((loss, outputs, None, Some(token_weight)))
             },
         )
     }
@@ -5359,7 +5420,12 @@ impl CompiledTrainingPlan {
             &BTreeMap<String, NodeId>,
             &BTreeMap<String, NodeId>,
             Option<NodeId>,
-        ) -> Result<(NodeId, BTreeMap<String, NodeId>, Option<NodeId>)>,
+        ) -> Result<(
+            NodeId,
+            BTreeMap<String, NodeId>,
+            Option<NodeId>,
+            Option<NodeId>,
+        )>,
     {
         let parameters = canonical_parameters(parameters)?;
         if parameters.is_empty() {
@@ -5447,7 +5513,7 @@ impl CompiledTrainingPlan {
         let workload_node = specs
             .get(optimizer_spec_count)
             .map(|spec| state_nodes[&spec.key]);
-        let (loss, outputs, workload_successor) =
+        let (loss, outputs, workload_successor, token_weight) =
             build(&mut graph, &inputs, &parameter_nodes, workload_node)?;
         validate_loss(&graph, loss)?;
         validate_outputs(
@@ -5476,6 +5542,7 @@ impl CompiledTrainingPlan {
             CompiledOptimizerLoweringContext {
                 loss,
                 learning_rate,
+                token_weight,
                 inputs: &inputs,
                 parameters: &parameter_nodes,
                 gradients: &gradients,
@@ -6303,6 +6370,46 @@ impl CompiledEvaluationPlan {
                     training_plan.allow_zero_valid_token_microbatches,
                 )?;
                 Ok((loss, outputs, loss_weight_policy))
+            },
+        )
+    }
+
+    fn compile_graph_with_ignore_index_parameter_plan<M, F>(
+        module: &M,
+        training_plan: &CompiledAdamWPlan,
+        parameter_plan: ModuleParameterPlan,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            CompiledAdamWIgnoreIndexContext,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        Self::compile_with_parameter_plan_inner(
+            module,
+            training_plan,
+            parameter_plan,
+            |module, graph, inputs| {
+                let nodes = lower_ignore_index_nodes_for_policy(
+                    training_plan.token_weight_policy.as_ref(),
+                    &training_plan.inner.inputs,
+                    graph,
+                    inputs,
+                )?;
+                let (objective, outputs) = build(module, graph, inputs, nodes)?.into_parts();
+                let loss = lower_compiled_adamw_objective_for_ignore_index_policy(
+                    graph,
+                    objective,
+                    nodes,
+                    training_plan.token_weight_policy.as_ref(),
+                    &training_plan.inner.inputs,
+                    training_plan.allow_zero_valid_token_microbatches,
+                )?;
+                Ok((loss, outputs, training_plan.token_weight_policy.clone()))
             },
         )
     }
@@ -7845,6 +7952,47 @@ impl CompiledAdamWPlan {
             &config,
             parameters.iter().map(TrainingParameterInit::name),
         )?;
+        let inner = CompiledTrainingPlan::compile(
+            AdamWProgram {
+                config: config.clone(),
+            },
+            parameters,
+            build,
+        )?;
+        Self::from_compiled_inner(config, inner)
+    }
+
+    fn compile_parameters_with_ignore_index<F>(
+        config: CompiledAdamWConfig,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        build: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>, NodeId)>,
+    {
+        let parameters = parameters.into_iter().collect::<Vec<_>>();
+        validate_weight_decay_exclusion_names(
+            &config,
+            parameters.iter().map(TrainingParameterInit::name),
+        )?;
+        let inner = CompiledTrainingPlan::compile_with_token_weight(
+            AdamWProgram {
+                config: config.clone(),
+            },
+            parameters,
+            build,
+        )?;
+        Self::from_compiled_inner(config, inner)
+    }
+
+    fn from_compiled_inner(
+        config: CompiledAdamWConfig,
+        inner: CompiledTrainingPlan,
+    ) -> Result<Self> {
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let token_weight_policy = config.token_weight_policy.clone();
         let allow_zero_valid_token_microbatches = config.allow_zero_valid_token_microbatches;
@@ -7856,13 +8004,6 @@ impl CompiledAdamWPlan {
         let frozen_parameters = config.frozen_parameters.clone();
         let learning_rate = config.learning_rate.clone();
         let adamw_policy = CompiledAdamWPolicy::from_config(&config);
-        let inner = CompiledTrainingPlan::compile(
-            AdamWProgram {
-                config: config.clone(),
-            },
-            parameters,
-            build,
-        )?;
         let partial_flush = (gradient_accumulation_steps > 1)
             .then(|| CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config))
             .transpose()?;
@@ -7939,6 +8080,35 @@ impl CompiledAdamWPlan {
         Self::compile_module_graph_parameters(config, module, parameter_plan, build)
     }
 
+    /// Compiles an ignore-index token-mean module while exposing the exact
+    /// compiler-owned target validity nodes to the graph builder.
+    ///
+    /// This opt-in surface is available only for
+    /// [`CompiledAdamWConfig::with_token_weighted_ignore_index`]. Existing graph
+    /// constructors retain their capture topology and bytes.
+    pub fn compile_module_graph_with_ignore_index<M, F>(
+        config: CompiledAdamWConfig,
+        module: &M,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            CompiledAdamWIgnoreIndexContext,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
+        Self::compile_module_graph_with_ignore_index_parameters(
+            config,
+            module,
+            parameter_plan,
+            build,
+        )
+    }
+
     fn compile_module_graph_parameters<M, F>(
         config: CompiledAdamWConfig,
         module: &M,
@@ -7971,6 +8141,52 @@ impl CompiledAdamWPlan {
                             objective,
                         )?;
                         Ok((loss, outputs))
+                    },
+                )
+            },
+        )?;
+        plan.inner.frozen_parameter_nodes = frozen_parameter_nodes;
+        Ok(plan)
+    }
+
+    fn compile_module_graph_with_ignore_index_parameters<M, F>(
+        config: CompiledAdamWConfig,
+        module: &M,
+        parameter_plan: ModuleParameterPlan,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            CompiledAdamWIgnoreIndexContext,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        parameter_plan.validate_weight_decay_exclusions(&config)?;
+        let parameters = parameter_plan.initial_parameters()?;
+        let objective_config = config.clone();
+        let mut frozen_parameter_nodes = BTreeSet::new();
+        let mut plan = Self::compile_parameters_with_ignore_index(
+            config,
+            parameters,
+            |graph, inputs, parameters| {
+                parameter_plan.lower_with_frozen_parameter_nodes(
+                    graph,
+                    parameters,
+                    &mut frozen_parameter_nodes,
+                    |graph| {
+                        let nodes = lower_ignore_index_nodes(&objective_config, graph, inputs)?;
+                        let built = build(module, graph, inputs, nodes)?;
+                        let (objective, outputs) = built.into_parts();
+                        let loss = lower_compiled_adamw_objective_with_ignore_index_nodes(
+                            &objective_config,
+                            graph,
+                            objective,
+                            nodes,
+                        )?;
+                        Ok((loss, outputs, nodes.weight))
                     },
                 )
             },
@@ -8045,6 +8261,47 @@ impl CompiledAdamWPlan {
         )
     }
 
+    /// Dropout counterpart of [`Self::compile_module_graph_with_ignore_index`].
+    pub fn compile_module_graph_with_dropout_and_ignore_index<M, F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: &M,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            CompiledAdamWIgnoreIndexContext,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        let parameter_plan = ModuleParameterPlan::new(module, &config.frozen_parameters)?;
+        let parameters = parameter_plan.initial_parameters()?;
+        let objective_config = config.clone();
+        Self::compile_module_with_dropout_parameters_inner(
+            config,
+            dropout,
+            module,
+            parameter_plan,
+            parameters,
+            |module, graph, inputs, dropout| {
+                let nodes = lower_ignore_index_nodes(&objective_config, graph, inputs)?;
+                let built = build(module, graph, inputs, nodes, dropout)?;
+                let (objective, outputs) = built.into_parts();
+                let loss = lower_compiled_adamw_objective_with_ignore_index_nodes(
+                    &objective_config,
+                    graph,
+                    objective,
+                    nodes,
+                )?;
+                Ok((loss, outputs, Some(nodes.weight)))
+            },
+        )
+    }
+
     /// Compiles module-bound AdamW and derives its scalar differentiation root
     /// from fixed-shape per-token F32 losses and the configured token mask.
     ///
@@ -8108,6 +8365,36 @@ impl CompiledAdamWPlan {
             &mut dyn TrainingDropoutProvider,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
+        Self::compile_module_with_dropout_parameters_inner(
+            config,
+            dropout,
+            module,
+            parameter_plan,
+            parameters,
+            |module, graph, inputs, dropout| {
+                let (loss, outputs) = build(module, graph, inputs, dropout)?;
+                Ok((loss, outputs, None))
+            },
+        )
+    }
+
+    fn compile_module_with_dropout_parameters_inner<M, F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: &M,
+        parameter_plan: ModuleParameterPlan,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>, Option<NodeId>)>,
+    {
         parameter_plan.validate_weight_decay_exclusions(&config)?;
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
         let token_weight_policy = config.token_weight_policy.clone();
@@ -8133,15 +8420,16 @@ impl CompiledAdamWPlan {
                 let counter =
                     counter.ok_or_else(|| training("compiled dropout state is absent"))?;
                 let mut provider = CompiledDropoutStream::new(counter, dropout);
-                let (loss, outputs) = parameter_plan.lower_with_frozen_parameter_nodes(
-                    graph,
-                    parameters,
-                    &mut frozen_parameter_nodes,
-                    |graph| build(module, graph, inputs, &mut provider),
-                )?;
+                let (loss, outputs, token_weight) = parameter_plan
+                    .lower_with_frozen_parameter_nodes(
+                        graph,
+                        parameters,
+                        &mut frozen_parameter_nodes,
+                        |graph| build(module, graph, inputs, &mut provider),
+                    )?;
                 let (successor, state) = provider.finish(graph)?;
                 dropout_state = Some(state);
-                Ok((loss, outputs, Some(successor)))
+                Ok((loss, outputs, Some(successor), token_weight))
             },
         )?;
         inner.frozen_parameter_nodes = frozen_parameter_nodes;
@@ -8879,6 +9167,27 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         })
     }
 
+    /// Owned-module counterpart of
+    /// [`CompiledAdamWPlan::compile_module_graph_with_ignore_index`].
+    pub fn compile_graph_with_ignore_index<F>(
+        config: CompiledAdamWConfig,
+        module: M,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            CompiledAdamWIgnoreIndexContext,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        let frozen_parameters = config.frozen_parameters.clone();
+        Self::build_owned(module, &frozen_parameters, |module| {
+            CompiledAdamWPlan::compile_module_graph_with_ignore_index(config, module, build)
+        })
+    }
+
     /// Compiles and owns a recurrent-dropout module through the unified
     /// explicit objective facade.
     pub fn compile_graph_with_dropout<F>(
@@ -8898,6 +9207,31 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         let frozen_parameters = config.frozen_parameters.clone();
         Self::build_owned(module, &frozen_parameters, |module| {
             CompiledAdamWPlan::compile_module_graph_with_dropout(config, dropout, module, build)
+        })
+    }
+
+    /// Owned-module dropout counterpart of
+    /// [`CompiledAdamWPlan::compile_module_graph_with_dropout_and_ignore_index`].
+    pub fn compile_graph_with_dropout_and_ignore_index<F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: M,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            CompiledAdamWIgnoreIndexContext,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        let frozen_parameters = config.frozen_parameters.clone();
+        Self::build_owned(module, &frozen_parameters, |module| {
+            CompiledAdamWPlan::compile_module_graph_with_dropout_and_ignore_index(
+                config, dropout, module, build,
+            )
         })
     }
 
@@ -8925,6 +9259,38 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             checkpoint,
             move |module, parameter_plan| {
                 CompiledAdamWPlan::compile_module_graph_parameters(
+                    objective_config,
+                    module,
+                    parameter_plan,
+                    build,
+                )
+            },
+        )
+    }
+
+    /// Ignore-index-context counterpart of
+    /// [`Self::compile_graph_from_module_checkpoint`].
+    pub fn compile_graph_with_ignore_index_from_module_checkpoint<F>(
+        config: CompiledAdamWConfig,
+        module: M,
+        checkpoint: &CompiledModuleAdamWCheckpoint,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            CompiledAdamWIgnoreIndexContext,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        let objective_config = config.clone();
+        Self::build_owned_from_module_checkpoint(
+            &config,
+            module,
+            checkpoint,
+            move |module, parameter_plan| {
+                CompiledAdamWPlan::compile_module_graph_with_ignore_index_parameters(
                     objective_config,
                     module,
                     parameter_plan,
@@ -8977,6 +9343,55 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                             objective,
                         )?;
                         Ok((loss, outputs))
+                    },
+                )
+            },
+        )
+    }
+
+    /// Ignore-index-context counterpart of
+    /// [`Self::compile_graph_with_dropout_from_module_checkpoint`].
+    pub fn compile_graph_with_dropout_and_ignore_index_from_module_checkpoint<F>(
+        config: CompiledAdamWConfig,
+        dropout: CompiledDropoutConfig,
+        module: M,
+        checkpoint: &CompiledModuleAdamWCheckpoint,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            CompiledAdamWIgnoreIndexContext,
+            &mut dyn TrainingDropoutProvider,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        let objective_config = config.clone();
+        Self::build_owned_from_module_checkpoint(
+            &config,
+            module,
+            checkpoint,
+            move |module, parameter_plan| {
+                let parameters = parameter_plan.initial_parameters()?;
+                let lower_config = objective_config.clone();
+                CompiledAdamWPlan::compile_module_with_dropout_parameters_inner(
+                    objective_config,
+                    dropout,
+                    module,
+                    parameter_plan,
+                    parameters,
+                    move |module, graph, inputs, dropout| {
+                        let nodes = lower_ignore_index_nodes(&lower_config, graph, inputs)?;
+                        let built = build(module, graph, inputs, nodes, dropout)?;
+                        let (objective, outputs) = built.into_parts();
+                        let loss = lower_compiled_adamw_objective_with_ignore_index_nodes(
+                            &lower_config,
+                            graph,
+                            objective,
+                            nodes,
+                        )?;
+                        Ok((loss, outputs, Some(nodes.weight)))
                     },
                 )
             },
@@ -9142,6 +9557,50 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 parameter_plan,
                 build,
             )?;
+            self.seal.validate_unchanged(&self.module)?;
+            self.authenticate_restored_evaluation(&evaluation)?;
+            Ok(evaluation)
+        })();
+        match result {
+            Ok(evaluation) => {
+                self.plan.evaluation = Some(evaluation);
+                self.required_evaluation_capture_identity = None;
+                Ok(self)
+            }
+            Err(source) => Err(CompiledModuleAdamWEvaluationError {
+                plan: Box::new(self),
+                source,
+            }),
+        }
+    }
+
+    /// Attaches a read-only token-mean evaluator while exposing the exact
+    /// compiler-owned ignore-index nodes to its graph builder.
+    pub fn with_evaluation_graph_and_ignore_index<F>(
+        mut self,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleAdamWEvaluationError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            CompiledAdamWIgnoreIndexContext,
+        ) -> Result<CompiledAdamWGraph>,
+    {
+        let result = (|| {
+            if self.plan.evaluation.is_some() {
+                return Err(training("compiled evaluation is already attached"));
+            }
+            self.seal.validate_unchanged(&self.module)?;
+            let parameter_plan = self.seal.parameter_plan(&self.module)?;
+            let evaluation =
+                CompiledEvaluationPlan::compile_graph_with_ignore_index_parameter_plan(
+                    &self.module,
+                    &self.plan,
+                    parameter_plan,
+                    build,
+                )?;
             self.seal.validate_unchanged(&self.module)?;
             self.authenticate_restored_evaluation(&evaluation)?;
             Ok(evaluation)
@@ -12775,6 +13234,46 @@ fn lower_compiled_adamw_objective(
     )
 }
 
+fn lower_compiled_adamw_objective_with_ignore_index_nodes(
+    config: &CompiledAdamWConfig,
+    graph: &mut Graph,
+    objective: CompiledAdamWObjective,
+    nodes: CompiledAdamWIgnoreIndexContext,
+) -> Result<NodeId> {
+    lower_compiled_adamw_objective_for_ignore_index_policy(
+        graph,
+        objective,
+        nodes,
+        config.token_weight_policy.as_ref(),
+        &config.inputs,
+        config.allow_zero_valid_token_microbatches,
+    )
+}
+
+fn lower_compiled_adamw_objective_for_ignore_index_policy(
+    graph: &mut Graph,
+    objective: CompiledAdamWObjective,
+    nodes: CompiledAdamWIgnoreIndexContext,
+    policy: Option<&CompiledTokenWeightPolicy>,
+    input_descriptors: &BTreeMap<String, (Shape, DType)>,
+    allow_zero_valid_token_microbatches: bool,
+) -> Result<NodeId> {
+    let policy = require_ignore_index_policy(policy)?;
+    let (token_shape, _) = policy.expected_descriptor(input_descriptors)?;
+    match objective {
+        CompiledAdamWObjective::Scalar(_) => Err(training(
+            "compiled AdamW token-weighted accumulation requires the token-mean-loss compile surface",
+        )),
+        CompiledAdamWObjective::TokenMean(losses) => lower_token_mean_loss(
+            graph,
+            losses,
+            nodes.weight,
+            token_shape,
+            allow_zero_valid_token_microbatches,
+        ),
+    }
+}
+
 fn lower_compiled_adamw_objective_for_policy(
     graph: &mut Graph,
     inputs: &BTreeMap<String, NodeId>,
@@ -12856,6 +13355,103 @@ fn lower_token_weight_mask(
             graph.cast(keep, DType::F32)
         }
     }
+}
+
+fn lower_ignore_index_nodes(
+    config: &CompiledAdamWConfig,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+) -> Result<CompiledAdamWIgnoreIndexContext> {
+    lower_ignore_index_nodes_for_policy(
+        config.token_weight_policy.as_ref(),
+        &config.inputs,
+        graph,
+        inputs,
+    )
+}
+
+fn lower_ignore_index_nodes_for_policy(
+    policy: Option<&CompiledTokenWeightPolicy>,
+    input_descriptors: &BTreeMap<String, (Shape, DType)>,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+) -> Result<CompiledAdamWIgnoreIndexContext> {
+    let (policy, target_input, value) = match policy {
+        Some(
+            policy @ CompiledTokenWeightPolicy::IgnoreIndex {
+                target_input,
+                value,
+            },
+        ) => (policy, target_input, value),
+        _ => {
+            return Err(training(
+                "compiled AdamW ignore-index graph context requires ignore-index weighting",
+            ));
+        }
+    };
+    let targets = inputs
+        .get(target_input)
+        .copied()
+        .ok_or_else(|| training("compiled AdamW ignore-index target input is absent"))?;
+    let ignored =
+        graph.full_with_dtype(Shape::from([]), Scalar::I(i64::from(*value)), DType::I32)?;
+    let validity = graph.compare(CompareOp::Ne, targets, ignored)?;
+    let weight = graph.cast(validity, DType::F32)?;
+    let nodes = CompiledAdamWIgnoreIndexContext {
+        targets,
+        validity,
+        weight,
+    };
+    validate_ignore_index_nodes(policy, input_descriptors, graph, nodes)?;
+    Ok(nodes)
+}
+
+fn require_ignore_index_policy(
+    policy: Option<&CompiledTokenWeightPolicy>,
+) -> Result<&CompiledTokenWeightPolicy> {
+    match policy {
+        Some(policy @ CompiledTokenWeightPolicy::IgnoreIndex { .. }) => Ok(policy),
+        _ => Err(training(
+            "compiled AdamW ignore-index graph context requires ignore-index weighting",
+        )),
+    }
+}
+
+fn validate_ignore_index_nodes(
+    policy: &CompiledTokenWeightPolicy,
+    input_descriptors: &BTreeMap<String, (Shape, DType)>,
+    graph: &Graph,
+    nodes: CompiledAdamWIgnoreIndexContext,
+) -> Result<()> {
+    let (shape, dtype) = policy.expected_descriptor(input_descriptors)?;
+    if *dtype != DType::I32
+        || graph.shape(nodes.targets)? != shape
+        || graph.dtype(nodes.targets)? != DType::I32
+        || graph.shape(nodes.validity)? != shape
+        || graph.dtype(nodes.validity)? != DType::Bool
+        || graph.shape(nodes.weight)? != shape
+        || graph.dtype(nodes.weight)? != DType::F32
+    {
+        return Err(training(
+            "compiled AdamW ignore-index graph context descriptor differs",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_token_weight_node(
+    graph: &Graph,
+    node: NodeId,
+    policy: &CompiledTokenWeightPolicy,
+    inputs: &BTreeMap<String, (Shape, DType)>,
+) -> Result<()> {
+    let (shape, _) = policy.expected_descriptor(inputs)?;
+    if graph.shape(node)? != shape || graph.dtype(node)? != DType::F32 {
+        return Err(training(
+            "compiled AdamW token-weight graph context descriptor differs",
+        ));
+    }
+    Ok(())
 }
 
 fn lower_token_mean_loss(
@@ -18031,6 +18627,19 @@ mod tests {
         ])
     }
 
+    fn malformed_ignore_index_batch() -> BTreeMap<String, TensorData> {
+        BTreeMap::from([
+            (
+                "features".into(),
+                TensorData::new([3], vec![1.0, 100.0, 3.0]).unwrap(),
+            ),
+            (
+                "targets".into(),
+                TensorData::new([3], vec![0.0, -100.0, 1.0]).unwrap(),
+            ),
+        ])
+    }
+
     fn compile_ignore_index_plan() -> CompiledAdamWPlan {
         let module = TokenMeanModule::new();
         CompiledAdamWPlan::compile_module_graph(
@@ -18043,6 +18652,143 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn compile_ignore_index_context_plan() -> CompiledAdamWPlan {
+        let module = TokenMeanModule::new();
+        CompiledAdamWPlan::compile_module_graph_with_ignore_index(
+            ignore_index_config(),
+            &module,
+            |module, graph, inputs, ignore_index| {
+                assert_eq!(ignore_index.targets(), inputs["targets"]);
+                assert_eq!(graph.shape(ignore_index.validity())?, &Shape::new([3]));
+                assert_eq!(graph.dtype(ignore_index.validity())?, DType::Bool);
+                assert_eq!(graph.shape(ignore_index.weight())?, &Shape::new([3]));
+                assert_eq!(graph.dtype(ignore_index.weight())?, DType::F32);
+                let weight = module.weight.bind(graph)?;
+                let losses = graph.mul(weight, inputs["features"])?;
+                Ok(CompiledAdamWGraph::token_mean(
+                    losses,
+                    BTreeMap::from([
+                        ("ignore_index_validity".into(), ignore_index.validity()),
+                        ("ignore_index_weight".into(), ignore_index.weight()),
+                    ]),
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ignore_index_graph_context_shares_weight_and_authenticates_capture() {
+        let legacy = compile_ignore_index_plan();
+        let context = compile_ignore_index_context_plan();
+        assert_ne!(legacy.capture_identity(), context.capture_identity());
+        let matching_context = compile_ignore_index_context_plan();
+        assert_eq!(
+            context.capture_identity(),
+            matching_context.capture_identity()
+        );
+        assert_eq!(
+            context
+                .inner
+                .inputs
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["features", "targets"]
+        );
+
+        let mut runtime = context.prepare_cpu().unwrap();
+        let initial = runtime.checkpoint().unwrap();
+        let error = match runtime.step(malformed_ignore_index_batch(), TensorData::scalar(0.1)) {
+            Ok(_) => panic!("malformed ignore-index target unexpectedly replayed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("input descriptor mismatch"));
+        assert_eq!(runtime.checkpoint().unwrap(), initial);
+
+        let step = runtime
+            .step(
+                ignore_index_batch([1.0, 100.0, 3.0], [0, -100, 1]),
+                TensorData::scalar(0.1),
+            )
+            .unwrap();
+        assert_eq!(step.loss_weight(), 2);
+        assert_eq!(
+            step.outputs()["ignore_index_validity"].to_vec_f64(),
+            [1.0, 0.0, 1.0]
+        );
+        assert_eq!(
+            step.outputs()["ignore_index_weight"].to_vec_f64(),
+            [1.0, 0.0, 1.0]
+        );
+        let checkpoint = runtime.checkpoint().unwrap();
+        assert!(legacy.restore_checkpoint(&checkpoint).is_err());
+        assert!(matching_context.restore_checkpoint(&checkpoint).is_ok());
+
+        let invoked = Cell::new(false);
+        let explicit = token_weighted_config(2);
+        let error = CompiledAdamWPlan::compile_module_graph_with_ignore_index(
+            explicit,
+            &TokenMeanModule::new(),
+            |_, _, _, _| {
+                invoked.set(true);
+                Err(training("ignore-index builder must not run"))
+            },
+        );
+        assert!(error.is_err());
+        assert!(!invoked.get());
+
+        let repeated_legacy = compile_ignore_index_plan();
+        assert_eq!(
+            legacy.capture_identity(),
+            repeated_legacy.capture_identity()
+        );
+        let legacy_checkpoint = legacy.prepare_cpu().unwrap().checkpoint().unwrap();
+        assert_eq!(
+            repeated_legacy.prepare_cpu().unwrap().checkpoint().unwrap(),
+            legacy_checkpoint
+        );
+    }
+
+    #[test]
+    fn ignore_index_graph_context_evaluation_is_read_only() {
+        let owner = CompiledModuleAdamWPlan::compile_graph_with_ignore_index(
+            ignore_index_config(),
+            TokenMeanModule::new(),
+            |module, graph, inputs, ignore_index| {
+                let weight = module.weight.bind(graph)?;
+                let losses = graph.mul(weight, inputs["features"])?;
+                Ok(CompiledAdamWGraph::token_mean(
+                    losses,
+                    BTreeMap::from([("ignore_index_validity".into(), ignore_index.validity())]),
+                ))
+            },
+        )
+        .unwrap()
+        .with_evaluation_graph_and_ignore_index(|module, graph, inputs, ignore_index| {
+            let weight = module.weight.bind(graph)?;
+            let losses = graph.mul(weight, inputs["features"])?;
+            Ok(CompiledAdamWGraph::token_mean(
+                losses,
+                BTreeMap::from([("ignore_index_weight".into(), ignore_index.weight())]),
+            ))
+        })
+        .unwrap();
+        let mut session = owner.prepare(&CpuSessionTarget::new()).unwrap();
+        let before = session.checkpoint().unwrap();
+        assert!(session.evaluate(malformed_ignore_index_batch()).is_err());
+        assert_eq!(session.checkpoint().unwrap(), before);
+        let evaluation = session
+            .evaluate(ignore_index_batch([1.0, 100.0, 3.0], [0, -100, 1]))
+            .unwrap();
+        assert_eq!(evaluation.loss_weight(), 2);
+        assert_eq!(
+            evaluation.outputs()["ignore_index_weight"].to_vec_f64(),
+            [1.0, 0.0, 1.0]
+        );
+        assert_eq!(session.checkpoint().unwrap(), before);
     }
 
     #[test]

@@ -56,17 +56,17 @@ use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
     Backend, CapturedReplayExecutor, CompiledAdamWCheckpoint, CompiledAdamWConfig,
-    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWPlan,
-    CompiledAdamWProgramArtifact, CompiledAdamWRuntime, CompiledAdamWStep,
-    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
-    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
-    CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan, CompiledModuleAdamWSession,
-    CompiledMultiStepLr, CompiledScheduledAdamWRuntime, CompiledTrainingRuntime,
-    CompiledTrainingStep, CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget,
-    DType, Graph, LossOptions, MetalSessionTarget, Module, NativeCpuCompiledAdamW,
-    NativeCpuCompiledAdamWStepResult, NativeCpuCompiledEvaluationResult, NativeCpuSessionTarget,
-    NativeTrainingScoreboard, NodeId, Parameter, Reduction, Result, Scalar, Shape, TensorData,
-    TrainingDropoutProvider, TransformerBlock, sparse_categorical_cross_entropy,
+    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWGraph,
+    CompiledAdamWIgnoreIndexContext, CompiledAdamWPlan, CompiledAdamWProgramArtifact,
+    CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig,
+    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
+    CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
+    CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledScheduledAdamWRuntime,
+    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
+    CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, LossOptions, MetalSessionTarget, Module,
+    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuCompiledEvaluationResult,
+    NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Parameter, Reduction, Result, Scalar,
+    Shape, TensorData, TrainingDropoutProvider, TransformerBlock, sparse_categorical_cross_entropy,
 };
 use std::{
     cell::Cell,
@@ -104,7 +104,6 @@ const RESUMED_STEPS: usize = 3;
 const POLICY_FROZEN: &str = "block.ff1.0";
 const FILE_RESUME_POLICY_FROZEN: &str = "positions.weight";
 const LOSS_MASK: &str = "loss_mask";
-const ATTENTION_KEEP_MASK: &str = "attention_keep_mask";
 const FILE_RESUME_IGNORE_INDEX: i32 = -100;
 // Per-sample key validity broadcasts across heads and query positions.
 const ATTENTION_KEEP_MASK_SHAPE: [usize; 4] = [BATCH, 1, 1, TIME];
@@ -472,12 +471,14 @@ fn build_file_resume(
     model: &FileResumeTransformer,
     graph: &mut Graph,
     inputs: &BTreeMap<String, NodeId>,
+    ignore_index: CompiledAdamWIgnoreIndexContext,
     dropout: &mut dyn TrainingDropoutProvider,
 ) -> Result<CompiledAdamWGraph> {
+    let attention_keep_mask = graph.reshape(ignore_index.validity(), ATTENTION_KEEP_MASK_SHAPE)?;
     let logits = model.forward(
         graph,
         inputs[MaskedTransformerBatch::TOKENS],
-        inputs[ATTENTION_KEEP_MASK],
+        attention_keep_mask,
         dropout,
     )?;
     let losses = file_resume_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
@@ -491,11 +492,13 @@ fn build_file_resume_evaluation(
     model: &FileResumeTransformer,
     graph: &mut Graph,
     inputs: &BTreeMap<String, NodeId>,
+    ignore_index: CompiledAdamWIgnoreIndexContext,
 ) -> Result<CompiledAdamWGraph> {
+    let attention_keep_mask = graph.reshape(ignore_index.validity(), ATTENTION_KEEP_MASK_SHAPE)?;
     let logits = model.forward_eval(
         graph,
         inputs[MaskedTransformerBatch::TOKENS],
-        inputs[ATTENTION_KEEP_MASK],
+        attention_keep_mask,
     )?;
     let losses = file_resume_losses(graph, logits, inputs[MaskedTransformerBatch::TARGETS])?;
     Ok(CompiledAdamWGraph::token_mean(
@@ -560,12 +563,10 @@ struct MaskedTransformerBatch {
 
 struct FileResumeBatch {
     masked: MaskedTransformerBatch,
-    attention_keep_mask: TensorData,
 }
 
 impl FileResumeBatch {
-    const SCHEMA: [CompiledInputSpec; 3] = [
-        CompiledInputSpec::new(ATTENTION_KEEP_MASK, &ATTENTION_KEEP_MASK_SHAPE, DType::Bool),
+    const SCHEMA: [CompiledInputSpec; 2] = [
         CompiledInputSpec::new(MaskedTransformerBatch::TARGETS, &[BATCH, TIME], DType::I32),
         CompiledInputSpec::host_token(MaskedTransformerBatch::TOKENS, &[BATCH, TIME]),
     ];
@@ -596,52 +597,22 @@ impl FileResumeBatch {
             DType::I32,
             sentinel_values.iter().copied().map(Scalar::I),
         )?;
-        let attention_keep_mask = TensorData::from_scalars(
-            ATTENTION_KEEP_MASK_SHAPE,
-            DType::Bool,
-            sentinel_values
-                .iter()
-                .map(|target| Scalar::Bool(*target != i64::from(FILE_RESUME_IGNORE_INDEX))),
-        )?;
         let masked = MaskedTransformerBatch {
             targets: sentinel_targets,
             ..masked
         };
-        let batch = Self {
-            masked,
-            attention_keep_mask,
-        };
-        batch.assert_attention_keep_mask();
-        Ok(batch)
-    }
-
-    fn assert_attention_keep_mask(&self) {
-        assert_eq!(
-            self.attention_keep_mask.shape(),
-            &Shape::new(ATTENTION_KEEP_MASK_SHAPE)
-        );
-        assert_eq!(self.attention_keep_mask.dtype(), DType::Bool);
-        let expected = self
-            .masked
-            .targets
-            .to_vec_f64()
-            .into_iter()
-            .map(|target| {
-                if target as i32 == FILE_RESUME_IGNORE_INDEX {
-                    0.0
-                } else {
-                    1.0
-                }
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(self.attention_keep_mask.to_vec_f64(), expected);
+        Ok(Self { masked })
     }
 
     fn has_fully_masked_sample(&self) -> bool {
-        self.attention_keep_mask
+        self.masked
+            .targets
             .to_vec_f64()
             .chunks_exact(TIME)
-            .any(|row| row.iter().all(|value| *value == 0.0))
+            .any(|row| {
+                row.iter()
+                    .all(|value| *value as i32 == FILE_RESUME_IGNORE_INDEX)
+            })
     }
 
     fn loss_mask(&self) -> &TensorData {
@@ -656,7 +627,6 @@ impl CompiledInputBatch for FileResumeBatch {
 
     fn into_compiled_inputs(self) -> Result<BTreeMap<String, TensorData>> {
         Ok(BTreeMap::from([
-            (ATTENTION_KEEP_MASK.into(), self.attention_keep_mask),
             (MaskedTransformerBatch::TARGETS.into(), self.masked.targets),
             (MaskedTransformerBatch::TOKENS.into(), self.masked.tokens),
         ]))
@@ -1483,20 +1453,28 @@ where
         config.token_weighted_ignore_index(),
         Some((MaskedTransformerBatch::TARGETS, FILE_RESUME_IGNORE_INDEX))
     );
+    assert_eq!(
+        config.inputs().map(|(name, _, _)| name).collect::<Vec<_>>(),
+        [
+            MaskedTransformerBatch::TARGETS,
+            MaskedTransformerBatch::TOKENS
+        ],
+        "sentinel targets are the only attention-validity source"
+    );
     assert!(
         file_resume_batch(3)?.has_fully_masked_sample(),
         "the zero-length row must exercise fully masked attention"
     );
     let source = FileResumeTransformer::new(0x5678)?;
     let source_initial = source.state_dict()?;
-    let source_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout(
+    let source_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout_and_ignore_index(
         config.clone(),
         dropout_config(),
         source,
         build_file_resume,
     )
     .map_err(|error| error.into_parts().1)?
-    .with_evaluation_graph(build_file_resume_evaluation)
+    .with_evaluation_graph_and_ignore_index(build_file_resume_evaluation)
     .map_err(|error| error.into_parts().1)?;
     let capture_identity = source_plan.capture_identity();
     let evaluation_identity = source_plan

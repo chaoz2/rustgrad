@@ -137,10 +137,12 @@ The detailed contracts live in
   avoiding a dense
   `[B*T, V]` one-hot without changing the general cross-entropy helper.
 - Compiler-owned ignore-index weighting derives both the token keep tensor and
-  exact U64 valid-token count from sentinel targets; the same validity source
-  supplies the compact broadcast attention mask. Fixed-shape per-token F32 loss
-  must match the target descriptor exactly, and its weighted mean is the sole
-  public and differentiation scalar.
+  exact U64 valid-token count from sentinel targets. Its opt-in typed builder
+  context exposes the exact Bool validity and F32 weight nodes; the maintained
+  file-resume workload reshapes that Bool node into its compact broadcast
+  attention mask, while the compiler reuses the F32 node for weighting.
+  Fixed-shape per-token F32 loss must match the target descriptor exactly, and
+  its weighted mean is the sole public and differentiation scalar.
 - The CPU policy re-sums valid tokens in-capture and weights each normalized
   microbatch gradient before the window divide, clipping, and AdamW update.
   Interpreter and strict-native results expose the same count as the normalized
