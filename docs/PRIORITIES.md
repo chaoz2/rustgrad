@@ -50,18 +50,21 @@ that they are the next concrete blocker.
 ### 1. P0 — one compiled persistent-state training runtime
 
 Compile `forward → loss → backward → optimizer update → recurrent state` once,
-then replay it with new batches without reconstructing a Graph or materializing
-gradients through host `TensorData`. Generalize the existing graph-free
-momentum-SGD vertical behind optimizer-program and persistent-state contracts;
-AdamW is the first implementation, including first/second moments and a step
-counter in the same atomic state frontier as parameters. Deterministic
-capture-authenticated checkpoint bytes restore values and their exact logical
-versions into that same runtime rather than creating a host optimizer path.
-The module-bound AdamW entry point maps canonical trainable identities directly
-onto that frontier, retains tied weights once, and captures frozen state as
-immutable program data. This CPU runtime and its deterministic checkpoint
-boundary are delivered; new optimizer work now requires the Transformer
-workload to demonstrate the need.
+then replay new batches without rebuilding a Graph or materializing gradients
+through host `TensorData`.
+
+Delivered boundaries:
+
+- The optimizer-program and persistent-state contracts generalize the original
+  graph-free momentum-SGD vertical. AdamW is the first implementation.
+- Parameters, first and second moments, and optimizer step share one atomic
+  frontier. Capture-authenticated checkpoint bytes restore values and exact
+  logical versions into that runtime; they do not create a host optimizer path.
+- Module-bound AdamW maps canonical trainable identities onto the frontier,
+  retains tied weights once, and captures frozen state as immutable program
+  data.
+- The CPU runtime and deterministic checkpoint boundary are complete. A new
+  optimizer must now be justified by the maintained Transformer workload.
 
 ### 2. P0 — tiny Transformer training and exact resume
 
