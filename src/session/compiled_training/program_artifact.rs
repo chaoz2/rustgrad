@@ -1351,22 +1351,26 @@ fn decode_phase(
     Ok((capture, state_buffers))
 }
 
-fn decode_auxiliary(wire: &PhaseWire) -> Result<CompiledAdamWAuxiliaryPlan> {
+fn decode_auxiliary(
+    main: &CapturedMixedSchedule,
+    wire: &PhaseWire,
+) -> Result<CompiledAdamWAuxiliaryPlan> {
     let (capture, state_buffers) = decode_phase(wire)?;
     let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
         wire.clip_report,
         wire.window_loss_report,
     );
     outputs.validate_report_flags(wire.clip_report, wire.window_loss_report)?;
-    let capture_identity = capture
-        .initial_recurrent_cursor()
-        .map_err(replay_error)?
-        .capture_identity();
+    let cursor_projection =
+        PreparedRecurrentCursorProjection::prepare(main, &capture, state_buffers.values().copied())
+            .map_err(replay_error)?;
+    let capture_identity = cursor_projection.target_capture_identity();
     let recurrent_capture = CompiledRecurrentCapture::from_artifact(&capture)?;
     Ok(CompiledAdamWAuxiliaryPlan {
         capture,
         recurrent_capture,
         state_buffers,
+        cursor_projection,
         state_input_keys: decode_input_key_map(&wire.state_input_keys)?,
         recurrent_store_groups: wire
             .adamw_native_updates
@@ -1494,15 +1498,19 @@ fn restore_owner<M: Module>(
         .accumulation
         .as_ref()
         .map(|phase| {
-            let (capture, state_buffers) = decode_phase(phase)?;
-            let capture_identity = capture
-                .initial_recurrent_cursor()
-                .map_err(replay_error)?
-                .capture_identity();
+            let (phase_capture, state_buffers) = decode_phase(phase)?;
+            let cursor_projection = PreparedRecurrentCursorProjection::prepare(
+                &capture,
+                &phase_capture,
+                state_buffers.values().copied(),
+            )
+            .map_err(replay_error)?;
+            let capture_identity = cursor_projection.target_capture_identity();
             Ok(CompiledTrainingSiblingPlan {
-                recurrent_capture: CompiledRecurrentCapture::from_artifact(&capture)?,
-                capture,
+                recurrent_capture: CompiledRecurrentCapture::from_artifact(&phase_capture)?,
+                capture: phase_capture,
                 state_buffers,
+                cursor_projection,
                 capture_identity,
             })
         })
@@ -1579,15 +1587,21 @@ fn restore_owner<M: Module>(
         )?),
     };
     let program_identity = inner.capture_identity()?;
+    let partial_flush = wire
+        .partial_flush
+        .as_ref()
+        .map(|phase| decode_auxiliary(&inner.capture, phase))
+        .transpose()?;
+    let zero_grad = wire
+        .zero_grad
+        .as_ref()
+        .map(|phase| decode_auxiliary(&inner.capture, phase))
+        .transpose()?;
     let plan = CompiledAdamWPlan {
         program_identity,
         inner,
-        partial_flush: wire
-            .partial_flush
-            .as_ref()
-            .map(decode_auxiliary)
-            .transpose()?,
-        zero_grad: wire.zero_grad.as_ref().map(decode_auxiliary).transpose()?,
+        partial_flush,
+        zero_grad,
         gradient_accumulation_steps: wire.gradient_accumulation_steps,
         token_weight_policy: wire.token_weight_policy.as_ref().map(Into::into),
         allow_zero_valid_token_microbatches: wire.allow_zero_valid_token_microbatches,
