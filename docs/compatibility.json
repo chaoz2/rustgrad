@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:0b76a0b153fe17ff",
+  "source_fingerprint": "fnv1a64:e0cadc9e868c23db",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -459,7 +459,7 @@
       "subject": "Compiled persistent-state training runtime",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CompiledAdamWPlan` compiles fixed-shape forward, objective, one reverse traversal, and AdamW recurrent state once for graph-free CPU, strict-native CPU, or the bounded strict-Metal target. Replay atomically preserves accumulation, partial flush, `zero_grad`, clipping and loss scaling, schedules and dropout, freezing and ties, evaluation and publication, and portable checkpoint semantics. Prepared interpreter and strict-native CPU sessions may atomically restore an older authenticated checkpoint in place; strict-native restore retains prepared programs and lifetime evidence without claiming physical state-slot identity. A bounded `CompiledAdamWProgramArtifact`, paired with unchanged complete-module checkpoint bytes directly or through one atomic `CompiledAdamWResumeBundle`, restores the resource-free CPU plan without graph, autograd, schedule, or capture reconstruction. The maintained two-block Transformer covers exact in-process and different-initialization file continuation with decreasing loss. Artifact-restored Metal remains fail-closed, and Metal has no in-place restore implementation. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership, artifacts, evidence, versioning, and backend limits; dynamic shapes, mixed-precision state, distributed or asynchronous training, broad optimizer construction, and unverified live-Metal performance remain outside this capability."
+        "Acceptance requirement": "`CompiledAdamWPlan` compiles one fixed-shape forward, objective, reverse traversal, and AdamW recurrent program once for graph-free atomic replay on interpreter CPU, strict-native CPU, or the bounded strict-Metal target. It preserves accumulation and partial flush, `zero_grad`, clipping and loss scaling, schedules and dropout, freezing and ties, evaluation and publication, and portable checkpoint semantics. Maintained two-block Transformer acceptance covers exact in-process and different-initialization file continuation with decreasing loss. Prepared interpreter and strict-native CPU sessions restore older authenticated checkpoints in place; strict-native restore retains prepared programs and lifetime evidence without claiming physical state-slot identity. A bounded program artifact plus unchanged complete-module checkpoint bytes—directly or in one atomic resume bundle—restores a fresh CPU plan without graph, autograd, schedule, or capture reconstruction. Artifact and bundle exclude native resources; artifact-restored Metal fails closed and Metal has no in-place restore. Dynamic shapes, mixed-precision state, distributed or asynchronous training, broad optimizer construction, and live-Metal performance evidence remain outside the capability. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for details."
       }
     },
     {
@@ -468,7 +468,7 @@
       "subject": "Compiled checkpoint local-file persistence",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CompiledAdamWProgramArtifact`, `CompiledAdamWCheckpoint`, and `CompiledModuleAdamWCheckpoint` retain their exact formats. `CompiledAdamWResumeBundle` preserves one validated program artifact and complete-module checkpoint byte-for-byte inside a single bounded, checksummed file. Each loader applies an intrinsic or caller-supplied bound, and each writer atomically replaces its target only after writing and syncing a unique same-directory staging file. The maintained Transformer file-resume example uses the bundle directly. Reads defend against inspected-size and growth limits; failed staging or validation publishes no checkpoint or training state and cleans only RustGrad's own staging file. A successful rename is not a claim of parent-directory durability across a system crash."
+        "Acceptance requirement": "Existing program-artifact, AdamW-checkpoint, and complete-module-checkpoint formats remain unchanged; `CompiledAdamWResumeBundle` stores one validated program-artifact/complete-module-checkpoint pair byte-for-byte in a bounded, checksummed file used by the maintained Transformer example. Loaders apply an intrinsic or caller-supplied bound to inspected size and growth before validation or publication. Writers sync one unique same-directory staging file before atomic replacement, and a failed write or validation publishes no checkpoint or training state and cleans only RustGrad's own staging file. Constituent files remain independently usable, and successful rename does not claim parent-directory durability across a system crash."
       }
     },
     {
