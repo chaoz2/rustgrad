@@ -2022,6 +2022,32 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             assert_eq!(preparation.work().linker_invocation_count(), 0);
         }
     }
+    let main_segmentation = *session.preparation_report().main().dispatch_segmentation();
+    let expected_module_dispatches = u64::try_from(EXPECTED_MODULE_DISPATCHES)?;
+    assert_eq!(
+        main_segmentation.segment_count(),
+        expected_module_dispatches
+    );
+    assert_eq!(main_segmentation.dispatch_reached_module_count(), 1);
+    assert_eq!(main_segmentation.terminal_segment_count(), 1);
+    assert_eq!(main_segmentation.non_dispatch_boundary_count(), 0);
+    assert_eq!(main_segmentation.module_change_count(), 0);
+    assert_eq!(
+        main_segmentation
+            .output_slot_alias_count()
+            .checked_add(main_segmentation.derived_slot_dependency_count()),
+        Some(expected_module_dispatches - 1),
+        "every nonterminal main-program segment must end at an authenticated slot hazard"
+    );
+    let accumulation_segmentation = *accumulation_preparation.dispatch_segmentation();
+    assert_eq!(accumulation_segmentation.terminal_segment_count(), 1);
+    assert_eq!(accumulation_segmentation.dispatch_reached_module_count(), 2);
+    assert_eq!(accumulation_segmentation.non_dispatch_boundary_count(), 0);
+    assert_eq!(
+        accumulation_segmentation.module_change_count(),
+        u64::try_from(accumulation_preparation.work().referenced_module_count() - 1)?,
+        "the accumulation preparation crosses once from its shared prefix to its suffix module"
+    );
     let mut scoreboard = NativeTrainingScoreboard::new(
         inspection.clone(),
         session.preparation_report(),
@@ -2073,8 +2099,8 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         assert!(executed <= report.native_item_count());
         if step.did_update() {
             assert_eq!(
-                report.module_dispatch_count(),
-                EXPECTED_MODULE_DISPATCHES,
+                u64::try_from(report.module_dispatch_count())?,
+                main_segmentation.segment_count(),
                 "the commit program must retain its authenticated safe-segment partition"
             );
         }
@@ -2114,6 +2140,23 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         expected_main_rendered_entries
     );
     assert_eq!(report.main().shared_prefix_entry_count(), 0);
+    let recorded_segmentation = report
+        .main()
+        .dispatch_segmentation()
+        .expect("current scoreboard reports dispatch segmentation");
+    assert_eq!(
+        recorded_segmentation.segment_count(),
+        u64::try_from(EXPECTED_MODULE_DISPATCHES)?
+    );
+    assert_eq!(recorded_segmentation.dispatch_reached_module_count(), 1);
+    assert_eq!(recorded_segmentation.terminal_segment_count(), 1);
+    assert_eq!(recorded_segmentation.non_dispatch_boundary_count(), 0);
+    assert_eq!(recorded_segmentation.module_change_count(), 0);
+    assert_eq!(
+        recorded_segmentation.output_slot_alias_count()
+            + recorded_segmentation.derived_slot_dependency_count(),
+        u64::try_from(EXPECTED_MODULE_DISPATCHES - 1)?
+    );
     assert!(report.main().compiler_invocation_count() <= 3);
     if report.main().compiler_invocation_count() != 0 {
         assert_eq!(report.main().combined_compile_link_count(), 0);
@@ -2156,6 +2199,17 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(
         accumulation_program.shared_prefix_source_native_identity(),
         Some(report.main().native_identity())
+    );
+    let accumulation_segmentation = accumulation_program
+        .dispatch_segmentation()
+        .expect("current scoreboard reports accumulation dispatch segmentation");
+    assert_eq!(accumulation_segmentation.terminal_segment_count(), 1);
+    assert_eq!(accumulation_segmentation.dispatch_reached_module_count(), 2);
+    assert_eq!(accumulation_segmentation.non_dispatch_boundary_count(), 0);
+    assert_eq!(
+        accumulation_segmentation.module_change_count(),
+        accumulation_program.referenced_module_count() - 1,
+        "the accumulation program crosses exactly once from its shared prefix to its suffix module"
     );
     let program_prepare_wall_time = [
         Some(report.main()),

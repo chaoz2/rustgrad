@@ -37,9 +37,9 @@ pub use compiled_training::{
     MetalCompiledAdamWFlushResult, MetalCompiledAdamWPlan, MetalCompiledAdamWStepResult,
     MetalCompiledEvaluationResult, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWFlushResult,
     NativeCpuCompiledAdamWPreparationReport, NativeCpuCompiledAdamWStepResult,
-    NativeCpuCompiledEvaluationResult, NativeCpuPreparationPhases, NativeCpuPreparationWork,
-    NativeCpuProgramPreparationReport, NativeCpuReplayTraffic, NativeCpuRunReport,
-    TrainingParameterInit,
+    NativeCpuCompiledEvaluationResult, NativeCpuDispatchSegmentation, NativeCpuPreparationPhases,
+    NativeCpuPreparationWork, NativeCpuProgramPreparationReport, NativeCpuReplayTraffic,
+    NativeCpuRunReport, TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,

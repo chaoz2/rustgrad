@@ -1034,6 +1034,12 @@ impl PlannedNativeItems {
         self.module_preparation
     }
 
+    pub(crate) fn dispatch_segmentation(
+        &self,
+    ) -> super::native_replay_workspace::NativeDispatchSegmentation {
+        self.workspace.dispatch_segmentation()
+    }
+
     pub(crate) fn validate_structure(&self, capture: &CapturedSchedule) -> Result<(), ReplayError> {
         self.validate_replay_structure(capture)
     }
@@ -2897,6 +2903,14 @@ mod tests {
         assert_eq!(prepared.intermediate_materialization_count, 0);
         assert_eq!(prepared.sealed_dispatch_step_count, 1);
         assert_eq!(prepared.sealed_dispatch_segment_count, 1);
+        let segmentation = plan.dispatch_segmentation();
+        assert_eq!(segmentation.segment_count, 1);
+        assert_eq!(segmentation.dispatch_reached_module_count, 1);
+        assert_eq!(segmentation.terminal_segment_count, 1);
+        assert_eq!(segmentation.non_dispatch_boundary_count, 0);
+        assert_eq!(segmentation.module_change_count, 0);
+        assert_eq!(segmentation.output_slot_alias_count, 0);
+        assert_eq!(segmentation.derived_slot_dependency_count, 0);
         assert_eq!(prepared.sealed_prerequisite_slot_count, 1);
         assert_eq!(prepared.dispatch_metadata_build_count, 1);
         assert_eq!(prepared.dispatch_scratch_capacity_growth_count, 0);
@@ -3134,6 +3148,14 @@ mod tests {
         assert_eq!(sealed.dispatch_metadata_build_count, 2);
         assert_eq!(sealed.sealed_dispatch_step_count, 3);
         assert_eq!(sealed.sealed_dispatch_segment_count, 2);
+        let segmentation = plan.dispatch_segmentation();
+        assert_eq!(segmentation.segment_count, 2);
+        assert_eq!(segmentation.dispatch_reached_module_count, 1);
+        assert_eq!(segmentation.terminal_segment_count, 1);
+        assert_eq!(segmentation.non_dispatch_boundary_count, 1);
+        assert_eq!(segmentation.module_change_count, 0);
+        assert_eq!(segmentation.output_slot_alias_count, 0);
+        assert_eq!(segmentation.derived_slot_dependency_count, 0);
         assert_eq!(sealed.dispatch_scratch_capacity_growth_count, 0);
         assert!(sealed.dispatch_scratch_is_empty);
 
@@ -3509,6 +3531,17 @@ mod tests {
         let prepared = plan.workspace_stats();
         assert_eq!(prepared.retained_transpose_matmul_input_count, 1);
         assert_eq!(prepared.affine_matmul_materialization_bytes, 0);
+        assert_eq!(
+            plan.module_preparation().rendered_entry_count,
+            capture.items.len(),
+            "the canonical transpose is rendered before authenticated tape elision"
+        );
+        assert_eq!(plan.module_preparation().referenced_module_count, 1);
+        let segmentation = plan.dispatch_segmentation();
+        assert_eq!(segmentation.segment_count, 1);
+        assert_eq!(segmentation.dispatch_reached_module_count, 1);
+        assert_eq!(segmentation.terminal_segment_count, 1);
+        assert_eq!(segmentation.module_change_count, 0);
 
         let (actual, traffic) = executor
             .execute_planned_native_items_observed(&capture, &bindings, &mut plan)

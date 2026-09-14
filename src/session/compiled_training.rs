@@ -1381,6 +1381,131 @@ pub struct CompiledEvaluationResult {
     capture_identity: u64,
 }
 
+/// Deterministic explanation of a strict-native program's module-dispatch
+/// segmentation and the referenced modules it actually reaches. Counts
+/// describe the sealed tape, not replay timing. A boundary satisfying multiple
+/// conditions is classified in module-change, output-alias, then
+/// derived-dependency order.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeCpuDispatchSegmentation {
+    pub(super) segment_count: u64,
+    pub(super) dispatch_reached_module_count: u64,
+    pub(super) terminal_segment_count: u64,
+    pub(super) non_dispatch_boundary_count: u64,
+    pub(super) module_change_count: u64,
+    pub(super) output_slot_alias_count: u64,
+    pub(super) derived_slot_dependency_count: u64,
+}
+
+impl NativeCpuDispatchSegmentation {
+    fn from_native(segmentation: crate::engine::NativeDispatchSegmentation) -> Result<Self> {
+        let count = |value, label| {
+            u64::try_from(value)
+                .map_err(|_| training(format!("native CPU {label} count overflows")))
+        };
+        Ok(Self {
+            segment_count: count(segmentation.segment_count, "dispatch segment")?,
+            dispatch_reached_module_count: count(
+                segmentation.dispatch_reached_module_count,
+                "dispatch-reached module",
+            )?,
+            terminal_segment_count: count(
+                segmentation.terminal_segment_count,
+                "terminal dispatch segment",
+            )?,
+            non_dispatch_boundary_count: count(
+                segmentation.non_dispatch_boundary_count,
+                "non-dispatch boundary",
+            )?,
+            module_change_count: count(segmentation.module_change_count, "module-change boundary")?,
+            output_slot_alias_count: count(
+                segmentation.output_slot_alias_count,
+                "output-slot-alias boundary",
+            )?,
+            derived_slot_dependency_count: count(
+                segmentation.derived_slot_dependency_count,
+                "derived-slot-dependency boundary",
+            )?,
+        })
+    }
+
+    pub(super) fn authenticates(
+        &self,
+        rendered_entry_count: u64,
+        referenced_module_count: u64,
+    ) -> bool {
+        let explained = self
+            .terminal_segment_count
+            .checked_add(self.non_dispatch_boundary_count)
+            .and_then(|count| count.checked_add(self.module_change_count))
+            .and_then(|count| count.checked_add(self.output_slot_alias_count))
+            .and_then(|count| count.checked_add(self.derived_slot_dependency_count));
+        let has_dispatch_segments = self.segment_count != 0;
+        let expected_module_change_count = self.dispatch_reached_module_count.saturating_sub(1);
+        explained == Some(self.segment_count)
+            && self.segment_count <= rendered_entry_count
+            && self.terminal_segment_count == u64::from(has_dispatch_segments)
+            && self.non_dispatch_boundary_count == 0
+            && (self.dispatch_reached_module_count != 0) == has_dispatch_segments
+            && self.dispatch_reached_module_count <= self.segment_count
+            && self.dispatch_reached_module_count <= referenced_module_count
+            && self.module_change_count == expected_module_change_count
+    }
+
+    fn validate(&self, rendered_entry_count: usize, referenced_module_count: usize) -> Result<()> {
+        let rendered_entry_count = u64::try_from(rendered_entry_count)
+            .map_err(|_| training("native CPU rendered entry count overflows"))?;
+        let referenced_module_count = u64::try_from(referenced_module_count)
+            .map_err(|_| training("native CPU referenced module count overflows"))?;
+        if !self.authenticates(rendered_entry_count, referenced_module_count) {
+            return Err(training(
+                "native CPU dispatch segmentation evidence differs",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Native module calls encoded by the sealed dispatch tape. This is zero
+    /// when every rendered entry is omitted by authenticated elision.
+    pub const fn segment_count(&self) -> u64 {
+        self.segment_count
+    }
+
+    /// Distinct referenced modules reached by at least one sealed dispatch
+    /// segment. Rendered modules containing only elided entries are excluded.
+    pub const fn dispatch_reached_module_count(&self) -> u64 {
+        self.dispatch_reached_module_count
+    }
+
+    /// Segment ending at the terminal edge; one for a nonempty dispatch tape.
+    pub const fn terminal_segment_count(&self) -> u64 {
+        self.terminal_segment_count
+    }
+
+    /// Segments ended before an item without a shared dispatcher; strict
+    /// preparation authenticates this as zero.
+    pub const fn non_dispatch_boundary_count(&self) -> u64 {
+        self.non_dispatch_boundary_count
+    }
+
+    /// Segments ended because the next item uses a different reached module.
+    pub const fn module_change_count(&self) -> u64 {
+        self.module_change_count
+    }
+
+    /// Segments ended to prevent an output from aliasing an input slot in the
+    /// same module invocation.
+    pub const fn output_slot_alias_count(&self) -> u64 {
+        self.output_slot_alias_count
+    }
+
+    /// Segments ended before a derived slot reads an earlier segment output.
+    pub const fn derived_slot_dependency_count(&self) -> u64 {
+        self.derived_slot_dependency_count
+    }
+}
+
 /// Preparation evidence for one strict-native CPU pure program.
 ///
 /// Stable identities and cache counts describe compilation only. Wall time is
@@ -1669,6 +1794,7 @@ pub struct NativeCpuProgramPreparationReport {
     cache_miss_count: usize,
     work: NativeCpuPreparationWork,
     phases: NativeCpuPreparationPhases,
+    dispatch_segmentation: NativeCpuDispatchSegmentation,
     execution_plan: ExecutionPlanSummary,
     wall_time: Duration,
 }
@@ -1676,7 +1802,11 @@ pub struct NativeCpuProgramPreparationReport {
 impl NativeCpuProgramPreparationReport {
     fn validate_work(&self) -> Result<()> {
         self.work.validate(self.native_item_count)?;
-        self.phases.validate(self.wall_time, &self.work)
+        self.phases.validate(self.wall_time, &self.work)?;
+        self.dispatch_segmentation.validate(
+            self.work.rendered_entry_count,
+            self.work.referenced_module_count,
+        )
     }
 
     pub const fn capture_identity(&self) -> u64 {
@@ -1715,6 +1845,12 @@ impl NativeCpuProgramPreparationReport {
     /// Observed host-time phases within this program's total preparation.
     pub const fn phases(&self) -> &NativeCpuPreparationPhases {
         &self.phases
+    }
+
+    /// Exact, mutually exclusive reasons for every sealed module-dispatch
+    /// segment in this program.
+    pub const fn dispatch_segmentation(&self) -> &NativeCpuDispatchSegmentation {
+        &self.dispatch_segmentation
     }
 
     /// Strict preparation never admits an interpreter fallback item.
@@ -6782,6 +6918,9 @@ impl CompiledEvaluationPlan {
             cache_miss_count: plan.cache_miss_count(),
             work,
             phases: NativeCpuPreparationPhases::from_module(module_preparation, wall_time)?,
+            dispatch_segmentation: NativeCpuDispatchSegmentation::from_native(
+                plan.dispatch_segmentation(),
+            )?,
             execution_plan,
             wall_time,
         };
@@ -7093,6 +7232,9 @@ impl CpuCompiledTrainingProgram {
             cache_miss_count: trace.cache_miss_count,
             work: NativeCpuPreparationWork::from_module(trace.module),
             phases: NativeCpuPreparationPhases::from_module(trace.module, wall_time)?,
+            dispatch_segmentation: NativeCpuDispatchSegmentation::from_native(
+                trace.dispatch_segmentation,
+            )?,
             execution_plan: self.recurrent_capture.execution_plan().clone(),
             wall_time,
         };
@@ -7816,6 +7958,9 @@ impl CpuCompiledTrainingProgram {
             cache_miss_count: trace.cache_miss_count,
             work: NativeCpuPreparationWork::from_module(trace.module),
             phases: NativeCpuPreparationPhases::from_module(trace.module, wall_time)?,
+            dispatch_segmentation: NativeCpuDispatchSegmentation::from_native(
+                trace.dispatch_segmentation,
+            )?,
             execution_plan: transition.recurrent_capture.execution_plan().clone(),
             wall_time,
         };
@@ -7842,6 +7987,9 @@ impl CpuCompiledTrainingProgram {
             cache_miss_count: trace.cache_miss_count,
             work: NativeCpuPreparationWork::from_module(trace.module),
             phases: NativeCpuPreparationPhases::from_module(trace.module, wall_time)?,
+            dispatch_segmentation: NativeCpuDispatchSegmentation::from_native(
+                trace.dispatch_segmentation,
+            )?,
             execution_plan: transition.recurrent_capture.execution_plan().clone(),
             wall_time,
         };
@@ -13973,6 +14121,62 @@ mod tests {
             ..chunked
         };
         assert!(bounded_chunked.validate(512).is_err());
+    }
+
+    #[test]
+    fn native_preparation_authenticates_strict_dispatch_segmentation() {
+        let segmentation = NativeCpuDispatchSegmentation {
+            segment_count: 3,
+            dispatch_reached_module_count: 2,
+            terminal_segment_count: 1,
+            non_dispatch_boundary_count: 0,
+            module_change_count: 1,
+            output_slot_alias_count: 1,
+            derived_slot_dependency_count: 0,
+        };
+        assert!(segmentation.validate(465, 2).is_ok());
+
+        let mut missing_terminal = segmentation;
+        missing_terminal.terminal_segment_count = 0;
+        missing_terminal.output_slot_alias_count = 2;
+        assert!(missing_terminal.validate(465, 2).is_err());
+
+        let mut fallback_boundary = segmentation;
+        fallback_boundary.non_dispatch_boundary_count = 1;
+        fallback_boundary.output_slot_alias_count = 0;
+        assert!(fallback_boundary.validate(465, 2).is_err());
+
+        let mut too_few_module_changes = segmentation;
+        too_few_module_changes.module_change_count = 0;
+        too_few_module_changes.output_slot_alias_count = 2;
+        assert!(too_few_module_changes.validate(465, 2).is_err());
+
+        let mut too_many_module_changes = segmentation;
+        too_many_module_changes.module_change_count = 2;
+        too_many_module_changes.output_slot_alias_count = 0;
+        assert!(too_many_module_changes.validate(465, 2).is_err());
+
+        let all_elided = NativeCpuDispatchSegmentation {
+            segment_count: 0,
+            dispatch_reached_module_count: 0,
+            terminal_segment_count: 0,
+            non_dispatch_boundary_count: 0,
+            module_change_count: 0,
+            output_slot_alias_count: 0,
+            derived_slot_dependency_count: 0,
+        };
+        assert!(all_elided.validate(1, 1).is_ok());
+
+        let elided_only_suffix = NativeCpuDispatchSegmentation {
+            segment_count: 1,
+            dispatch_reached_module_count: 1,
+            terminal_segment_count: 1,
+            non_dispatch_boundary_count: 0,
+            module_change_count: 0,
+            output_slot_alias_count: 0,
+            derived_slot_dependency_count: 0,
+        };
+        assert!(elided_only_suffix.validate(2, 2).is_ok());
     }
 
     #[test]
