@@ -1295,6 +1295,18 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             Err(source) => Err(CompiledModuleAdamWArtifactRestoreError { module, source }),
         }
     }
+
+    /// Restores from one atomically persisted executable-and-state bundle.
+    ///
+    /// The bundle retains the exact existing program-artifact and checkpoint
+    /// formats. Their ordinary restore validator remains authoritative, and all
+    /// validation completes before runtime preparation or module publication.
+    pub fn restore_from_resume_bundle(
+        module: M,
+        bundle: &CompiledAdamWResumeBundle,
+    ) -> std::result::Result<Self, CompiledModuleAdamWArtifactRestoreError<M>> {
+        Self::restore_from_program_artifact(module, bundle.program_artifact(), bundle.checkpoint())
+    }
 }
 
 fn decode_phase(
@@ -1420,6 +1432,75 @@ fn checkpoint_module_wire(decoded: &DecodedModuleAdamWCheckpoint) -> Result<Modu
     })
 }
 
+struct AdmittedArtifactCheckpointPair {
+    wire: ProgramWire,
+    checkpoint: DecodedModuleAdamWCheckpoint,
+}
+
+fn decode_admitted_artifact_checkpoint_pair(
+    artifact: &CompiledAdamWProgramArtifact,
+    checkpoint: &CompiledModuleAdamWCheckpoint,
+) -> Result<AdmittedArtifactCheckpointPair> {
+    let wire = decode(artifact.as_bytes())?;
+    let artifact_info = wire.validate()?;
+    if artifact_info != *artifact.info() {
+        return Err(training("compiled program artifact info differs"));
+    }
+    let decoded_module = decode_module_adamw_checkpoint(checkpoint.as_bytes())?;
+    if checkpoint_module_wire(&decoded_module)? != wire.module {
+        return Err(training("compiled program artifact module schema mismatch"));
+    }
+    if decoded_module.evaluation_capture_identity != artifact_info.evaluation_capture_identity {
+        return Err(training(
+            "compiled program artifact evaluation identity mismatch",
+        ));
+    }
+    let checkpoint_info = checkpoint.optimizer_checkpoint().info();
+    if checkpoint_info.capture_identity() != artifact_info.capture_identity
+        || checkpoint_info.gradient_accumulation_steps() != wire.gradient_accumulation_steps
+        || checkpoint_info.window_loss_report_enabled() != wire.window_loss_report
+        || wire.token_weight_policy.is_some() != checkpoint_info.accumulated_token_count().is_some()
+        || wire.dropout.is_some() != checkpoint_info.dropout_block_counter().is_some()
+    {
+        return Err(training(
+            "compiled program artifact checkpoint policy mismatch",
+        ));
+    }
+    if checkpoint_info.accumulation_capture_identity().is_some()
+        && checkpoint_info.accumulation_capture_identity()
+            != artifact_info.accumulation_capture_identity
+    {
+        return Err(training(
+            "compiled program artifact accumulation identity mismatch",
+        ));
+    }
+    if checkpoint_info.flush_capture_identity().is_some()
+        && checkpoint_info.flush_capture_identity() != artifact_info.flush_capture_identity
+    {
+        return Err(training(
+            "compiled program artifact partial flush identity mismatch",
+        ));
+    }
+    if checkpoint_info.reset_capture_identity().is_some()
+        && checkpoint_info.reset_capture_identity() != artifact_info.zero_grad_capture_identity
+    {
+        return Err(training(
+            "compiled program artifact zero-grad identity mismatch",
+        ));
+    }
+    Ok(AdmittedArtifactCheckpointPair {
+        wire,
+        checkpoint: decoded_module,
+    })
+}
+
+pub(super) fn admit_artifact_checkpoint_pair(
+    artifact: &CompiledAdamWProgramArtifact,
+    checkpoint: &CompiledModuleAdamWCheckpoint,
+) -> Result<()> {
+    decode_admitted_artifact_checkpoint_pair(artifact, checkpoint).map(drop)
+}
+
 fn zero_frontier(
     capture: &CapturedMixedSchedule,
     state_buffers: &BTreeMap<RecurrentStateKey, u64>,
@@ -1454,14 +1535,10 @@ fn restore_owner<M: Module>(
     artifact: &CompiledAdamWProgramArtifact,
     checkpoint: &CompiledModuleAdamWCheckpoint,
 ) -> Result<(CompiledAdamWPlan, CompiledModuleSeal)> {
-    let wire = decode(artifact.as_bytes())?;
-    if wire.validate()? != *artifact.info() {
-        return Err(training("compiled program artifact info differs"));
-    }
-    let decoded_module = decode_module_adamw_checkpoint(checkpoint.as_bytes())?;
-    if checkpoint_module_wire(&decoded_module)? != wire.module {
-        return Err(training("compiled program artifact module schema mismatch"));
-    }
+    let AdmittedArtifactCheckpointPair {
+        wire,
+        checkpoint: decoded_module,
+    } = decode_admitted_artifact_checkpoint_pair(artifact, checkpoint)?;
     let mut seal = CompiledModuleSeal::capture(module, &wire.frozen_parameters)?;
     let _immutable_values = seal.apply_module_checkpoint(&decoded_module)?;
     if module_wire(&seal) != wire.module {
