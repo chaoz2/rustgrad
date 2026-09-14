@@ -942,6 +942,19 @@ pub(crate) struct JitScheduleDispatcher {
     invocation_count: Arc<AtomicU64>,
 }
 
+/// Time spent inside one synchronous native schedule-module dispatcher call.
+/// Pointer assembly and all workspace work remain outside this interval.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeDispatchTiming {
+    dispatcher_wall_time: Duration,
+}
+
+impl NativeDispatchTiming {
+    pub(crate) const fn dispatcher_wall_time(self) -> Duration {
+        self.dispatcher_wall_time
+    }
+}
+
 /// Capacity-owned pointer/action/call scratch for one synchronous
 /// schedule-module dispatch. Sealing reserves the full action and affine-axis
 /// inventory before raw pointers are installed, so their backing vectors
@@ -1571,7 +1584,7 @@ impl JitScheduleDispatcher {
         mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
         scratch: &mut JitScheduleDispatchScratch,
         mut entry: F,
-    ) -> Result<(), (usize, JitError)>
+    ) -> Result<NativeDispatchTiming, (usize, JitError)>
     where
         F: FnMut(
             usize,
@@ -1677,9 +1690,13 @@ impl JitScheduleDispatcher {
             self.invocation_count.fetch_add(1, Ordering::Relaxed);
             let call_count = scratch.calls.len();
             let calls = scratch.calls.as_mut_ptr();
+            let dispatcher_started = Instant::now();
             let status = unsafe { (self.call)(calls, call_count, failure.as_mut_ptr()) };
+            let dispatcher_wall_time = dispatcher_started.elapsed();
             if status == 0 {
-                return Ok(());
+                return Ok(NativeDispatchTiming {
+                    dispatcher_wall_time,
+                });
             }
             let entry = usize::try_from(failure[0]).unwrap_or(usize::MAX);
             let lane = usize::try_from(failure[1]).unwrap_or(usize::MAX);
@@ -6997,7 +7014,7 @@ mod tests {
         ];
         let dense = NativeDispatchMaterialization::copy(1, 1, 2, DType::F32, 1).unwrap();
         let mut scratch = JitScheduleDispatchScratch::with_capacity(2, 4, 1, 0);
-        dispatcher
+        let timing = dispatcher
             .call_prepared(
                 NativeScheduleDispatchPlan::new(2, 4, &[dense]),
                 &mut chained_arena,
@@ -7007,6 +7024,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dispatcher.invocation_count(), 2);
+        assert!(scratch.is_empty());
+        let empty_timing = dispatcher
+            .call_prepared(
+                NativeScheduleDispatchPlan::new(0, 0, &[]),
+                &mut chained_arena,
+                None,
+                &mut scratch,
+                |_| unreachable!("empty dispatch has no entry"),
+            )
+            .unwrap();
+        assert!(
+            timing
+                .dispatcher_wall_time()
+                .checked_add(empty_timing.dispatcher_wall_time())
+                .is_some()
+        );
+        assert_eq!(dispatcher.invocation_count(), 3);
         assert!(scratch.is_empty());
         assert_eq!(
             chained_arena[2]
@@ -7045,7 +7079,7 @@ mod tests {
                 |index| single[index],
             )
             .unwrap();
-        assert_eq!(dispatcher.invocation_count(), 3);
+        assert_eq!(dispatcher.invocation_count(), 4);
         assert!(scratch.is_empty());
 
         let malformed = NativeDispatchMaterialization::copy(0, 1, 99, DType::F32, 1).unwrap();
@@ -7060,7 +7094,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(dispatcher.invocation_count(), 3);
+        assert_eq!(dispatcher.invocation_count(), 4);
         assert!(scratch.is_empty());
         drop(kernels);
 

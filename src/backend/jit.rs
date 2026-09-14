@@ -869,7 +869,7 @@ impl PreparedScheduleSegment {
         buffers: &mut [JitBuffer],
         borrowed: Option<&mut BTreeMap<usize, crate::cpu_jit::BorrowedJitBuffer<'_>>>,
         scratch: &mut crate::cpu_jit::JitScheduleDispatchScratch,
-    ) -> Result<(), PreparedScheduleDispatchFailure> {
+    ) -> Result<crate::cpu_jit::NativeDispatchTiming, PreparedScheduleDispatchFailure> {
         self.dispatcher
             .call_prepared(
                 crate::cpu_jit::NativeScheduleDispatchPlan::new(

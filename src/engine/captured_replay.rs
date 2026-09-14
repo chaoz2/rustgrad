@@ -2913,9 +2913,11 @@ mod tests {
         assert!(prepared.dispatch_scratch_is_empty);
         plan.poison_outputs(0xa5);
 
+        let first_started = Instant::now();
         let (first, first_traffic) = executor
             .execute_planned_native_items_observed(&capture, &bindings, &mut plan)
             .unwrap();
+        assert!(first_traffic.native_dispatcher_wall_time <= first_started.elapsed());
         assert_eq!(first_traffic.external_input_import_count, 0);
         assert_eq!(first_traffic.external_input_import_bytes, 0);
         assert_eq!(first_traffic.borrowed_recurrent_input_bytes, 0);
@@ -2947,10 +2949,16 @@ mod tests {
             TensorData::new([2], vec![3.0, -4.0]).unwrap(),
         )]);
         plan.poison_outputs(0x5a);
+        let second_started = Instant::now();
         let (second, second_traffic) = executor
             .execute_planned_native_items_observed(&capture, &changed, &mut plan)
             .unwrap();
-        assert_eq!(second_traffic, first_traffic);
+        assert!(second_traffic.native_dispatcher_wall_time <= second_started.elapsed());
+        let mut first_deterministic_traffic = first_traffic;
+        first_deterministic_traffic.native_dispatcher_wall_time = Duration::ZERO;
+        let mut second_deterministic_traffic = second_traffic;
+        second_deterministic_traffic.native_dispatcher_wall_time = Duration::ZERO;
+        assert_eq!(second_deterministic_traffic, first_deterministic_traffic);
         let second_stats = plan.workspace_stats();
         assert_eq!(second_stats.allocation_count, prepared.allocation_count);
         assert_eq!(second_stats.input_import_count, 0);
@@ -2971,6 +2979,7 @@ mod tests {
         assert_eq!(plan.workspace_stats(), second_stats);
         assert_eq!(executor.native_item_plan_count(), 1);
 
+        let retried_started = Instant::now();
         let (_, retried_traffic) = executor
             .execute_planned_native_items_observed(
                 &capture,
@@ -2978,7 +2987,10 @@ mod tests {
                 &mut plan,
             )
             .unwrap();
-        assert_eq!(retried_traffic, first_traffic);
+        assert!(retried_traffic.native_dispatcher_wall_time <= retried_started.elapsed());
+        let mut retried_deterministic_traffic = retried_traffic;
+        retried_deterministic_traffic.native_dispatcher_wall_time = Duration::ZERO;
+        assert_eq!(retried_deterministic_traffic, first_deterministic_traffic);
         assert_eq!(plan.workspace_stats().borrowed_external_input_bytes, 24);
         assert_eq!(plan.workspace_stats().dispatch_metadata_build_count, 1);
         assert_eq!(

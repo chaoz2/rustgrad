@@ -2212,6 +2212,7 @@ pub struct NativeCpuRunReport {
     skipped_output_clear_count: usize,
     schedule_cache_keys: Vec<u64>,
     traffic: NativeCpuReplayTraffic,
+    native_dispatcher_wall_time: Duration,
     executor_wall_time: Duration,
     wall_time: Duration,
 }
@@ -2284,6 +2285,21 @@ impl NativeCpuRunReport {
     /// invocation. Validation failures and uncommitted calls expose no report.
     pub const fn executor_wall_time(&self) -> Duration {
         self.executor_wall_time
+    }
+
+    /// Wall time spent inside authenticated native schedule-module dispatcher
+    /// calls. This excludes Rust-side workspace and pointer preparation.
+    pub const fn native_dispatcher_wall_time(&self) -> Duration {
+        self.native_dispatcher_wall_time
+    }
+
+    /// Checked executor remainder outside native dispatcher calls. This covers
+    /// Rust-side workspace, binding, input/output work, and any conservative
+    /// per-entry execution that did not enter a sealed dispatcher segment.
+    pub fn executor_host_wall_time(&self) -> Duration {
+        self.executor_wall_time
+            .checked_sub(self.native_dispatcher_wall_time)
+            .expect("native CPU run report validates dispatcher timing")
     }
 
     /// End-to-end replay time outside the sealed native executor. For
@@ -7016,6 +7032,7 @@ impl CompiledEvaluationPlan {
             module_dispatched_native_item_count: traffic.module_dispatched_native_item_count,
             skipped_output_clear_count: traffic.skipped_output_clear_count,
             schedule_cache_keys,
+            native_dispatcher_wall_time: traffic.native_dispatcher_wall_time,
             traffic: native_cpu_replay_traffic(traffic),
             executor_wall_time,
             wall_time,
@@ -7089,6 +7106,7 @@ fn native_cpu_run_report(
         module_dispatched_native_item_count: traffic.module_dispatched_native_item_count,
         skipped_output_clear_count: traffic.skipped_output_clear_count,
         schedule_cache_keys: trace.pure_item_cache_keys.clone(),
+        native_dispatcher_wall_time: traffic.native_dispatcher_wall_time,
         traffic: native_cpu_replay_traffic(traffic),
         executor_wall_time,
         wall_time,
@@ -7107,6 +7125,10 @@ fn validate_native_cpu_run_report(report: &NativeCpuRunReport) -> Result<()> {
             "native CPU physical execution evidence exceeds logical coverage",
         ));
     }
+    report
+        .executor_wall_time
+        .checked_sub(report.native_dispatcher_wall_time)
+        .ok_or_else(|| training("native CPU dispatcher time exceeds executor time"))?;
     report
         .wall_time
         .checked_sub(report.executor_wall_time)
@@ -15878,6 +15900,13 @@ mod tests {
     fn assert_native_run_timing(report: &NativeCpuRunReport) {
         assert_eq!(
             report
+                .native_dispatcher_wall_time()
+                .checked_add(report.executor_host_wall_time())
+                .unwrap(),
+            report.executor_wall_time()
+        );
+        assert_eq!(
+            report
                 .executor_wall_time()
                 .checked_add(report.replay_overhead_wall_time())
                 .unwrap(),
@@ -16055,6 +16084,13 @@ mod tests {
         let mut malformed_report = actual.report().clone();
         malformed_report.executor_wall_time = malformed_report
             .wall_time
+            .checked_add(Duration::from_nanos(1))
+            .unwrap();
+        assert!(validate_native_cpu_run_report(&malformed_report).is_err());
+        assert!(scoreboard.record(&malformed_report).is_err());
+        let mut malformed_report = actual.report().clone();
+        malformed_report.native_dispatcher_wall_time = malformed_report
+            .executor_wall_time
             .checked_add(Duration::from_nanos(1))
             .unwrap();
         assert!(validate_native_cpu_run_report(&malformed_report).is_err());
