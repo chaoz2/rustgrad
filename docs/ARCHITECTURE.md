@@ -926,13 +926,16 @@ trainer, optimizer, state format, device fallback, or persistent gradient map.
 
 ### Compiled recurrent training
 
-`session/compiled_training.rs` is the static recurrent-training seam.
-Its private optimizer-program interface separates optimizer state/update math
-from one shared compiler, capture, replay, and effect-commit engine. After
-lowering, an optimizer-neutral Metal plan/runtime core likewise owns recurrent
-rendering, resource preparation, input validation, output projection,
-evaluation, scoreboard observation, and semantic state snapshots; the AdamW
-facade adds only its progress/policy interpretation and portable checkpoint.
+`session/compiled_training.rs` is the static recurrent-training seam. Its
+private optimizer-program interface separates optimizer state and update math
+from the shared execution machinery:
+
+- The compiler, capture, replay, and effect-commit engine are shared.
+- After lowering, an optimizer-neutral Metal core owns recurrent rendering,
+  resource preparation, input validation, output projection, evaluation,
+  scoreboard observation, and semantic state snapshots.
+- The AdamW facade adds progress and policy interpretation plus its portable
+  checkpoint.
 
 | Contract | Architectural owner |
 |---|---|
@@ -994,57 +997,78 @@ attached evaluation without replacing that main program.
 
 #### Token-weighted objectives and empty microbatches
 
-Token-mean training accepts either a fixed F32 binary mask or the mutually
-exclusive `with_token_weighted_ignore_index` policy over a fixed nonempty I32
-target input. The latter derives `target != ignore_index` inside the graph and
-uses that keep tensor for loss normalization, token counting, gradient
-weighting, accumulation, clipping, and window-loss reporting. Runtime admission
-counts the authenticated I32 lanes before replay. An opt-in typed builder
-context exposes the exact target, Bool validity, and F32 weight nodes before
-the model callback; the compiler reuses that same F32 node for the objective
-and optimizer window. The maintained file-resume Transformer reshapes the Bool
-node for broadcast attention instead of accepting a second host-derived mask.
-Legacy-builder captures and checkpoint bytes, plus explicit-mask lowering, are
-unchanged.
+Token-mean training has two mutually exclusive input policies:
 
-Token-mean training rejects a zero-valid-token batch by default. The explicit
-`CompiledAdamWConfig::with_zero_valid_token_microbatches` policy instead masks
-invalid loss lanes with exact graph zeros and divides by `count > 0 ? count :
-1`. An empty fixed-shape replay therefore contributes zero loss numerator,
-token weight, and gradient while still advancing authenticated replay and
-dropout state. Mixed windows retain the ordinary token-weighted mean. A full
-window or nonempty partial flush whose accumulated token count remains zero is
-rejected before recurrent replay, progress, report, or checkpoint publication;
-the same frontier may be retried with a nonempty mask or discarded with
-`zero_grad`. CPU interpreter and strict-native replay share this admission;
-token-weighted Metal remains fail-closed. Dynamic shapes, non-token objective
-weighting, and an inference ignore-index surface remain outside this policy.
+| Policy | Contract |
+|---|---|
+| Fixed mask | A fixed F32 binary mask supplies the keep tensor. Explicit-mask lowering is unchanged. |
+| Ignore index | `with_token_weighted_ignore_index` accepts one fixed nonempty I32 target input and derives the keep tensor as `target != ignore_index` inside the graph. Runtime admission counts the authenticated I32 lanes before replay. |
+| Typed builder context | The opt-in context exposes the exact target, Bool validity, and F32 weight nodes before the model callback. The compiler reuses that F32 node for the objective and optimizer window. |
+
+The keep tensor drives loss normalization, token counting, gradient weighting,
+accumulation, clipping, and window-loss reporting in both modes.
+
+The maintained file-resume Transformer reshapes the compiler-owned Bool node
+for broadcast attention rather than accepting a second host-derived mask.
+Legacy-builder captures and checkpoint bytes remain unchanged.
+
+##### Empty-microbatch policy
+
+- By default, token-mean training rejects a zero-valid-token batch.
+- `CompiledAdamWConfig::with_zero_valid_token_microbatches` masks invalid loss
+  lanes with exact graph zeros and divides by `count > 0 ? count : 1`.
+- An empty fixed-shape replay contributes zero loss numerator, token weight, and
+  gradient while still advancing authenticated replay and dropout state. Mixed
+  windows retain the ordinary token-weighted mean.
+- A full window or nonempty partial flush with an accumulated token count of
+  zero rejects before recurrent replay, progress, report, or checkpoint
+  publication. The same frontier can be retried with a nonempty mask or
+  discarded with `zero_grad`.
+- CPU interpreter and strict-native replay share this admission.
+  Token-weighted Metal remains fail-closed.
+
+Dynamic shapes, non-token objective weighting, and an inference ignore-index
+surface remain outside this policy.
 
 #### Compiled AdamW program artifacts
 
 `CompiledAdamWProgramArtifact` is a separate bounded, checksummed envelope for
-the resource-free CPU training program. It owns deterministic RGSM/RGSA bytes
-for the main capture and every present accumulation, partial-flush,
-`zero_grad`, and evaluation sibling, plus their input/output, recurrent-buffer,
-optimizer, dropout, learning-rate, token-weight, freeze/tie, and native-update
-schemas. It never contains checkpoint tensors, live `Parameter` handles,
-runtime banks, native pointers, loaded libraries, or machine code.
+the resource-free CPU training program.
 
-| Boundary | Contract |
-|---|---|
-| Save | An owned module plan emits deterministic artifact bytes; AdamW and complete-module checkpoint bytes remain unchanged. |
-| Restore | `restore_from_program_artifact` consumes a differently initialized compatible module together with its complete-module checkpoint and rebuilds the resource-free CPU plan without invoking the workload builder, autograd, scheduling, capture, or evaluator construction. |
-| Admission | Envelope version, byte bound, checksum, every embedded capture, sibling cardinality/identity, state maps, module topology, evaluator identity, policy, and checkpoint capture identities authenticate before runtime preparation or module publication. |
-| Execution | Interpreter and strict-native CPU use the existing replay, commit-only egress, failure atomicity, checkpoint, and durable native-cache paths. Artifact-restored plans reject strict-Metal rendering because the graph-origin stateful wrapper is intentionally not serialized. |
+##### Artifact contents
 
-The artifact and checkpoint are an explicit pair: the artifact supplies
-immutable executable structure, while the unchanged checkpoint supplies the
-current parameter, optimizer, accumulation, loss/token, and dropout frontier.
-Neither can substitute for the other. RGAP file loading bounds allocation before
-parsing and defends against growth during the read; saving syncs a unique
-same-directory staging file before atomic replacement. The checkpoint remains a
-separately atomic file. This is not a two-file transaction or a claim that the
-parent directory has been durably synced.
+- It owns deterministic RGSM/RGSA bytes for the main capture and every present
+  accumulation, partial-flush, `zero_grad`, and evaluation sibling.
+- It includes each program's input/output, recurrent-buffer, optimizer,
+  dropout, learning-rate, token-weight, freeze/tie, and native-update schemas.
+- It never contains checkpoint tensors, live `Parameter` handles, runtime
+  banks, native pointers, loaded libraries, or machine code.
+
+##### Artifact and checkpoint boundary
+
+- **Save.** An owned module plan emits deterministic artifact bytes. AdamW and
+  complete-module checkpoint bytes remain unchanged.
+- **Restore.** `restore_from_program_artifact` consumes a differently
+  initialized compatible module and its complete-module checkpoint. It rebuilds
+  the resource-free CPU plan without invoking the workload builder, autograd,
+  scheduling, capture, or evaluator construction.
+- **Admission.** Envelope version, byte bound, checksum, every embedded
+  capture, sibling cardinality and identity, state maps, module topology,
+  evaluator identity, policy, and checkpoint capture identities authenticate
+  before runtime preparation or module publication.
+- **Execution.** Interpreter and strict-native CPU retain the existing replay,
+  commit-only egress, failure atomicity, checkpoint, and durable native-cache
+  paths. Artifact-restored plans reject strict-Metal rendering because the
+  graph-origin stateful wrapper is intentionally not serialized.
+
+The artifact supplies immutable executable structure. The unchanged checkpoint
+supplies the current parameter, optimizer, accumulation, loss/token, and
+dropout frontier; neither can substitute for the other.
+
+RGAP file loading bounds allocation before parsing and defends against growth
+during the read. Saving syncs a unique same-directory staging file before
+atomic replacement. The checkpoint remains a separately atomic file: this is
+not a two-file transaction, and it does not claim parent-directory durability.
 
 #### Compile and replay contract
 
@@ -1072,19 +1096,24 @@ interpreter fallback disabled.
 
 ##### Native preparation
 
-Capture and recurrent witnesses plus per-program layouts are derived before the
-bounded parallel render batch. Only after every render result succeeds in
-canonical main, accumulation, partial-flush, `zero_grad`, evaluation order does
-preparation resolve reusable prefixes and wrapper/cache identities, enter
-durable-cache compile/load gates, authenticate every loaded module ABI, and
-publish prepared modules. Distinct cache misses share the process-wide
-two-permit compiler pool. Identical keys cannot race loading or damaged-cache
-recovery; optional programs do not change another program's artifact key.
+Preparation has one ordered, fail-closed pipeline:
 
-Each schedule renders its ordered native entries once and loads uniquely named
-functions into one content-addressed shared module. Preparation also
-authenticates an immutable workspace tape covering fixed ABI slots, derived
-affine reads, typed output initialization, and quantized resources.
+1. **Derive.** Capture and recurrent witnesses plus per-program layouts are
+   derived before rendering.
+2. **Render.** Attached programs enter one bounded parallel render batch.
+   Results return in canonical main, accumulation, partial-flush, `zero_grad`,
+   evaluation order. Every render must succeed before prefix reuse is resolved.
+3. **Resolve.** Reusable prefixes and wrapper/cache identities are authenticated.
+   Optional programs do not change another program's artifact key.
+4. **Compile or load.** Durable-cache gates serialize identical keys, including
+   damaged-cache recovery. Distinct misses share the process-wide two-permit
+   compiler pool.
+5. **Authenticate.** Every loaded module ABI and the immutable workspace tape
+   are checked before publication. The tape covers fixed ABI slots, derived
+   affine reads, typed output initialization, and quantized resources.
+6. **Publish.** Preparation authenticates and publishes the ordered referenced
+   module set. A unique target suffix, when present, contributes one
+   content-addressed module; full-prefix reuse needs no target-owned module.
 
 ##### Replay execution
 
@@ -1109,26 +1138,27 @@ Unsupported preparation and failed execution or commit publish neither state
 nor progress. Checkpoint bytes and capture identity remain shared with the
 interpreter and strict-Metal targets.
 
-Typed preparation and run reports expose CPU facts only: native-item and cache
-counts, rendered entries, loaded modules, durable artifact hits and misses,
-actual compiler invocations, per-run module segment and entry dispatch counts,
-successful full-writer clear-elision counts, static execution summaries,
+Typed preparation and run reports expose CPU facts only. These include native
+item and cache counts, rendered entries, loaded modules, durable artifact hits
+and misses, actual compiler invocations, per-run module segment and entry
+dispatch counts, successful full-writer clear elisions, static execution summaries,
 recurrent logical bytes, stable capture/native identities, and call-local wall
 times. Wall times do not participate in identity.
 
-An oversized unique schedule suffix is deterministically divided into two
-contiguous source-balanced translation units. Both compile to ephemeral PIC
-objects under the process-wide two-compiler limit; one ordered final link still
-publishes and loads exactly one content-addressed schedule library. Smaller
-suffixes retain the single combined compile/link command. Chunk sources and
-objects are cleaned on every result, and neither chunk boundaries nor process
-observations enter capture, cache, checkpoint, or replay identity.
+##### Bounded parallel work
 
-Before compilation, at most two private workers render attached programs in
-parallel. Each worker receives an immutable typed program view; results and
-errors are restored to program order, and prefix reuse is resolved only after
-the complete ordered render batch succeeds. Rendering changes no cache key,
-module ABI, or publication boundary.
+- **Compilation.** An oversized unique schedule suffix is split
+  deterministically into two contiguous source-balanced translation units.
+  Both compile to ephemeral PIC objects under the process-wide two-compiler
+  limit, then one ordered final link publishes and loads exactly one
+  content-addressed schedule library. Smaller suffixes retain the single
+  combined compile/link command.
+- **Rendering.** At most two private workers render attached programs in
+  parallel. Each receives an immutable typed program view. Results and errors
+  return to program order, and prefix reuse waits for the complete render batch.
+- **Cleanup and identity.** Chunk sources and objects are cleaned on every
+  result. Chunk boundaries, process observations, and render parallelism change
+  no capture, cache, checkpoint, replay, module ABI, or publication identity.
 
 #### Native CPU scoreboard evidence
 
@@ -1141,28 +1171,32 @@ bounded versioned JSON.
 
 | Evidence | Meaning |
 |---|---|
-| Preparation | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions; bounded render concurrency/overlap; combined/object/link process inventories and cumulative versus effective compiler wall; plus referenced modules and the unique/shared-prefix entry partition for every attached program. |
+| Preparation phases | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions, including bounded render concurrency and overlap. |
+| Compiler work | Combined/object/link process inventories and cumulative versus effective compiler wall time. |
+| Module reuse | Referenced modules and the unique/shared-prefix entry partition for every attached program. |
 | Execution | Logical schedule/cache inventory, physical rendered/executed entries, and actual module-dispatch calls. |
 | Replay traffic | Owned external imports, borrowed/retained/replaced recurrent bytes, and logical CPU egress materialization count/bytes. CPU egress is not a device transfer. |
-| Timing | Caller-observed compile/prepare/checkpoint time plus bounded first/steady replay and executor/recurrent-overhead partitions. No threshold or speedup is claimed. |
+| Timing | Caller-observed compile, prepare, and checkpoint time plus bounded first/steady replay and executor/recurrent-overhead partitions. No threshold or speedup is claimed. |
 
 ##### Replay phases and wire versions
 
-V16 is emitted for both raw and classified recording. Classified steps use only
-`did_update`; the first replay remains separate, and warm accumulation-only and
-optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
-classification. One scoreboard rejects mixed recording modes without consuming
-a sample, and partial flush remains outside the main-step sample set.
+V1-v15 JSON remains readable. The current wire additions are:
 
-V1-v15 JSON remains readable. V1-v12 has CPU egress evidence absent; V13
-requires its successful main and, when present, accumulation replay inventories to include
-the workspace-backed tensors detached for the caller. Commit-only replay omits
-caller-named outputs while retaining loss and enabled validation/report scalars.
-Native preparation admits prefix reuse through four fail-closed contracts; v14
-records the resulting evidence without serializing entry metadata. V15 adds
-compiler process-mode and cumulative-wall evidence; v16 adds observational
-per-program render overlap and maximum concurrency. Neither changes that
-prefix contract:
+| Version | Added contract |
+|---|---|
+| V13 | Successful main and, when present, accumulation replay inventories must include workspace-backed tensors detached for the caller. V1-v12 has no CPU egress evidence. |
+| V14 | Prefix-reuse evidence, without serialized entry metadata. |
+| V15 | Compiler process-mode and cumulative-wall evidence. |
+| V16 | Per-program render overlap and maximum concurrency as observations. |
+
+V16 is emitted for raw and classified recording. Classified steps use only
+`did_update`; the first replay stays separate, and warm accumulation-only and
+optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
+classification. A scoreboard rejects mixed recording modes without consuming a
+sample. Partial flush remains outside the main-step sample set.
+
+Commit-only replay omits caller-named outputs while retaining loss and enabled
+validation/report scalars. Prefix reuse retains four fail-closed contracts:
 
 - **Inventory.** Referenced modules and the exact unique-rendered/shared-prefix
   entry partition are authenticated per program.
@@ -1176,28 +1210,40 @@ prefix contract:
 - **Fallback.** Any mismatch, inherited-prefix source, or source/suffix module
   alias keeps the complete-module preparation path.
 
-Dense F32/I32 inputs bind caller storage read-only for one call; unsupported
-storage retains the owned-import fallback. Failed calls publish no report or
-sample. Kernel launches, host/device transfers, and measured physical peak host
-memory remain unavailable (`null`), and observations change no execution or
-checkpoint identity.
+##### Observational boundaries
+
+- Dense F32/I32 inputs bind caller storage read-only for one call. Unsupported
+  storage retains the owned-import fallback.
+- Failed calls publish no report or sample.
+- Kernel launches, host/device transfers, and measured physical peak host
+  memory remain unavailable (`null`).
+- Observations change no execution or checkpoint identity.
 
 ##### Protected evidence
 
-Protected CI keeps the debug invocation as
-a correctness smoke. After that test matrix passes, protected-main pushes alone
-run the same bounded scoreboard once in release mode on pinned Ubuntu and Rust,
-under a fresh SHA-scoped temporary cache, and upload its JSON beside exact
-runner/toolchain/compiler provenance plus normalized `lscpu` CPU model,
-topology, and architectural identity. Missing or ambiguous required CPU fields
-fail the evidence job rather than creating an under-specified artifact.
-Hosted-runner durations remain observational and are comparable only with
-matching workload, toolchain/compiler, runner image, and CPU-hardware
-provenance; they never gate CI. Legacy v1 reports without zero-grad
-inventory, v2 reports without replay traffic, v3 reports without executed
-native-item counts, v4 reports without shared-module preparation evidence, and
-v5 reports without replay-phase timing, v6 reports without preparation-phase
-timing, and v7 reports without parallel-module evidence remain readable.
+- **Correctness gate.** Protected CI retains the debug invocation as a smoke.
+  Only after that matrix passes, and only on protected-main pushes, does it run
+  the same bounded scoreboard once in release mode on pinned Ubuntu and Rust.
+- **Cold evidence.** The release run uses a fresh SHA-scoped temporary cache and
+  uploads JSON with exact runner, toolchain, and compiler provenance plus
+  normalized `lscpu` model, topology, and architectural identity.
+- **Admission.** Missing or ambiguous required CPU fields fail the evidence job
+  instead of producing an under-specified artifact.
+- **Interpretation.** Hosted-runner durations are observational and comparable
+  only when workload, toolchain/compiler, runner image, and CPU hardware
+  provenance match. They never gate CI.
+
+Legacy reports remain readable when these evidence fields are absent:
+
+| Version | Absent evidence |
+|---|---|
+| V1 | `zero_grad` inventory |
+| V2 | Replay traffic |
+| V3 | Executed native-item counts |
+| V4 | Shared-module preparation evidence |
+| V5 | Replay-phase timing |
+| V6 | Preparation-phase timing |
+| V7 | Parallel-module evidence |
 
 ##### Failure publication
 
@@ -1550,19 +1596,19 @@ v1--v7 bytes.
 
 #### Compiled-training backend boundaries
 
-`SessionTarget<P>` is the preparation seam: implementations retain
-the plan-specific concrete session, error, and borrowed-versus-consumed
-ownership without a central backend switch. `CpuSessionTarget` prepares
-independent host runtimes, while `MetalSessionTarget` owns one explicitly
-selected device, derives its renderer from that device's capabilities, and
-optionally binds the existing scoreboard before resources are created. The same
-Metal target now prepares compiled AdamW by reference and consumes typed ResNet,
-host-logits Llama, or device-greedy Llama plans into persistent sessions. Plan
-implementations remain beside their owning training or model facade rather than
-accumulating in the target module. This keeps backend selection out of graph
-construction, optimizer, and persistence logic without introducing a dispatcher
-enum or hiding device evidence. Mixed-precision and dynamic-shape training remain
-outside the contract.
+`SessionTarget<P>` is the preparation seam. Each implementation retains its
+plan-specific concrete session, error, and borrowed-versus-consumed ownership:
+
+| Target | Ownership boundary |
+|---|---|
+| `CpuSessionTarget` | Prepares independent host runtimes. |
+| `MetalSessionTarget` | Owns one explicitly selected device, derives rendering from that device's capabilities, and may bind the existing scoreboard before creating resources. It prepares compiled AdamW by reference and consumes typed ResNet, host-logits Llama, or device-greedy Llama plans into persistent sessions. |
+| Plan implementations | Remain beside their owning training or model facade rather than accumulating in the target module. |
+
+This design keeps backend selection out of graph construction, optimizer, and
+persistence logic. It introduces no central dispatcher enum and does not hide
+device evidence. Mixed-precision and dynamic-shape training remain outside the
+contract.
 
 `session/classification.rs` is a pure post-evaluation helper for rank-two F32
 logits and integer targets; it owns deterministic first-tie predictions and

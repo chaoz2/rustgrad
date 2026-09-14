@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:f0e1aec4c2ccb0ca",
+  "source_fingerprint": "fnv1a64:c7191a169b1a5d46",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -612,7 +612,7 @@
       "subject": "Compiled module training state binding",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CpuCompiledAdamW::compile_module` and `compile_module_from_checkpoint` use canonical `Module` traversal to deduplicate tied trainable state into the recurrent AdamW frontier and capture frozen parameters and buffers as immutable values. Freeze and weight-decay policies, input schemas, topology, capture identity, checkpoint restore, exact publication, and failure ownership are specified in [State ownership and atomicity](ARCHITECTURE.md#state-ownership-and-atomicity), [Resume modes and module ownership](ARCHITECTURE.md#resume-modes-and-module-ownership), and [Training inputs and optimizer policies](ARCHITECTURE.md#training-inputs-and-optimizer-policies). The maintained Transformer acceptance covers right-padded token means, token-weighted accumulation and empty-microbatch policy, scheduled learning rates, non-finite rejection, strict-native zero fallback, exact continuation, and atomic publication into a different matching initialization; backend limits are in [Compiled-training backend boundaries](ARCHITECTURE.md#compiled-training-backend-boundaries). Invalid policy, batch, topology, checkpoint, or publication candidates expose no partial transition and retain retryable ownership. Stateful pending module effects, runtime freeze-policy mutation, automatic live-module synchronization, mixed-precision parameter state, dynamic loss scaling, and dynamic shapes remain unsupported."
+        "Acceptance requirement": "Canonical module traversal deduplicates tied trainable state into the recurrent AdamW frontier and captures frozen parameters and buffers as immutable values. The authenticated [state and atomicity](ARCHITECTURE.md#state-ownership-and-atomicity), [resume modes](ARCHITECTURE.md#resume-modes-and-module-ownership), [training policies](ARCHITECTURE.md#training-inputs-and-optimizer-policies), maintained Transformer acceptance, and [backend limits](ARCHITECTURE.md#compiled-training-backend-boundaries) define the complete contract. Stateful pending module effects, runtime freeze-policy mutation, automatic live-module synchronization, mixed-precision parameter state, dynamic loss scaling, and dynamic shapes remain unsupported."
       }
     },
     {
