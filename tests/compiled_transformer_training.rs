@@ -6891,6 +6891,18 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         json["format_version"],
         NATIVE_TRAINING_REPORT_FORMAT_VERSION
     );
+    let compiler_process_count = json["prepare_compiler_process_count"].as_u64().unwrap();
+    assert_eq!(
+        json["prepare_compiler_process_timings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        usize::try_from(compiler_process_count).unwrap()
+    );
+    assert_eq!(
+        json["prepare_compiler_critical_tail"].is_object(),
+        compiler_process_count != 0
+    );
     assert!(json["prepare_parallel_render_overlap_wall_time"].is_object());
     assert!(
         json["prepare_max_parallel_render_job_count"]

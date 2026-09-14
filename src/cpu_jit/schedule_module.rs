@@ -1,6 +1,7 @@
 use super::{
     C11_COMPILER_COMMAND, C11_COMPILER_FLAGS, C11LocalHelper, COMPILE_SEQUENCE, JitError,
-    JitScheduleModuleLoad, RenderedC, cache_dir, native_cache_key, run_compiler,
+    JitScheduleModuleLoad, NativeCompilerProcessKind, NativeCompilerProcessObservation, RenderedC,
+    cache_dir, native_cache_key, run_compiler,
 };
 use std::{
     fs,
@@ -113,20 +114,8 @@ fn balanced_split(rendered: &[RenderedC]) -> Result<usize, JitError> {
     Ok(best.1)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CompilerProcessKind {
-    Combined,
-    Object(usize),
-    Link,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CompilerProcessObservation {
-    kind: CompilerProcessKind,
-    interval: (Instant, Instant),
-}
-
-type TranslationUnitThreadResult = thread::Result<Result<CompilerProcessObservation, JitError>>;
+type TranslationUnitThreadResult =
+    thread::Result<Result<NativeCompilerProcessObservation, JitError>>;
 
 struct JoinedTranslationUnit {
     ordinal: usize,
@@ -141,32 +130,31 @@ struct ScheduleModuleBuildEvidence {
     compiler_process_wall_time: Duration,
     compiler_process_total_wall_time: Duration,
     linker_process_wall_time: Duration,
-    compiler_process_intervals: Vec<(Instant, Instant)>,
 }
 
 impl ScheduleModuleBuildEvidence {
     fn new(
         mode: NativeScheduleModuleBuildMode,
-        observations: &[CompilerProcessObservation],
+        observations: &[NativeCompilerProcessObservation],
     ) -> Result<Self, JitError> {
         let combined_compile_link_count = observations
             .iter()
-            .filter(|observation| observation.kind == CompilerProcessKind::Combined)
+            .filter(|observation| observation.kind == NativeCompilerProcessKind::Combined)
             .count();
         let object_compile_count = observations
             .iter()
-            .filter(|observation| matches!(observation.kind, CompilerProcessKind::Object(_)))
+            .filter(|observation| matches!(observation.kind, NativeCompilerProcessKind::Object(_)))
             .count();
         let object_ordinals_are_ordered = observations
             .iter()
             .filter_map(|observation| match observation.kind {
-                CompilerProcessKind::Object(ordinal) => Some(ordinal),
-                CompilerProcessKind::Combined | CompilerProcessKind::Link => None,
+                NativeCompilerProcessKind::Object(ordinal) => Some(ordinal),
+                NativeCompilerProcessKind::Combined | NativeCompilerProcessKind::Link => None,
             })
             .eq(0..object_compile_count);
         let linker = observations
             .iter()
-            .filter(|observation| observation.kind == CompilerProcessKind::Link)
+            .filter(|observation| observation.kind == NativeCompilerProcessKind::Link)
             .collect::<Vec<_>>();
         let process_inventory = (
             u64::try_from(combined_compile_link_count)
@@ -188,7 +176,7 @@ impl ScheduleModuleBuildEvidence {
         }
         let compiler_process_intervals = observations
             .iter()
-            .map(|observation| observation.interval)
+            .map(|observation| (observation.process_started, observation.process_finished))
             .collect::<Vec<_>>();
         let (compiler_process_total_wall_time, compiler_process_wall_time) =
             process_wall_times(&compiler_process_intervals)?;
@@ -200,9 +188,12 @@ impl ScheduleModuleBuildEvidence {
             compiler_process_total_wall_time,
             linker_process_wall_time: linker
                 .first()
-                .map(|linker| linker.interval.1.duration_since(linker.interval.0))
+                .map(|linker| {
+                    linker
+                        .process_finished
+                        .duration_since(linker.process_started)
+                })
                 .unwrap_or(Duration::ZERO),
-            compiler_process_intervals,
         })
     }
 }
@@ -360,39 +351,40 @@ fn compile_translation_unit(
     ordinal: usize,
     source: &Path,
     object: &Path,
-) -> Result<CompilerProcessObservation, JitError> {
+) -> Result<NativeCompilerProcessObservation, JitError> {
     run_checked_compiler(
         Command::new(C11_COMPILER_COMMAND)
             .args(C11_TRANSLATION_UNIT_FLAGS)
             .arg("-o")
             .arg(object)
             .arg(source),
-        CompilerProcessKind::Object(ordinal),
+        NativeCompilerProcessKind::Object(ordinal),
     )
 }
 
 fn compile_combined_module(
     source: &Path,
     temporary: &Path,
-) -> Result<CompilerProcessObservation, JitError> {
+) -> Result<NativeCompilerProcessObservation, JitError> {
     run_checked_compiler(
         Command::new(C11_COMPILER_COMMAND)
             .args(C11_COMPILER_FLAGS)
             .arg("-o")
             .arg(temporary)
             .arg(source),
-        CompilerProcessKind::Combined,
+        NativeCompilerProcessKind::Combined,
     )
 }
 
 fn run_checked_compiler(
     command: &mut Command,
-    kind: CompilerProcessKind,
-) -> Result<CompilerProcessObservation, JitError> {
-    let (output, interval) = run_compiler(command).map_err(|error| JitError::Compiler {
-        status: None,
-        stderr: error.to_string(),
-    })?;
+    kind: NativeCompilerProcessKind,
+) -> Result<NativeCompilerProcessObservation, JitError> {
+    let (output, observation) =
+        run_compiler(command, kind).map_err(|error| JitError::Compiler {
+            status: None,
+            stderr: error.to_string(),
+        })?;
     if !output.status.success() {
         return Err(JitError::Compiler {
             status: output.status.code(),
@@ -402,13 +394,13 @@ fn run_checked_compiler(
                 .collect(),
         });
     }
-    Ok(CompilerProcessObservation { kind, interval })
+    Ok(observation)
 }
 
 fn compile_translation_units(
     sources: &[PathBuf],
     objects: &[PathBuf],
-) -> Result<Vec<CompilerProcessObservation>, JitError> {
+) -> Result<Vec<NativeCompilerProcessObservation>, JitError> {
     if sources.len() != objects.len() || sources.is_empty() {
         return Err(JitError::Io(
             "native schedule translation-unit inventory differs".into(),
@@ -455,7 +447,7 @@ fn compile_translation_units(
 
 fn canonical_translation_unit_results(
     mut joined: Vec<JoinedTranslationUnit>,
-) -> Result<Vec<CompilerProcessObservation>, JitError> {
+) -> Result<Vec<NativeCompilerProcessObservation>, JitError> {
     joined.sort_by_key(|joined| joined.ordinal);
     let mut observations = Vec::with_capacity(joined.len());
     for joined in joined {
@@ -476,14 +468,14 @@ fn canonical_translation_unit_results(
 fn link_schedule_module(
     objects: &[PathBuf],
     temporary: &Path,
-) -> Result<CompilerProcessObservation, JitError> {
+) -> Result<NativeCompilerProcessObservation, JitError> {
     run_checked_compiler(
         Command::new(C11_COMPILER_COMMAND)
             .args(C11_LINK_FLAGS)
             .arg("-o")
             .arg(temporary)
             .args(objects),
-        CompilerProcessKind::Link,
+        NativeCompilerProcessKind::Link,
     )
 }
 
@@ -517,7 +509,7 @@ pub(super) fn compile_cached_schedule_module_under_gate(
                     compiler_process_total_wall_time: Duration::ZERO,
                     linker_process_wall_time: Duration::ZERO,
                     module_load_wall_time: Duration::ZERO,
-                    compiler_process_intervals: Vec::new(),
+                    compiler_process_observations: Vec::new(),
                 },
             ));
         }
@@ -599,7 +591,7 @@ pub(super) fn compile_cached_schedule_module_under_gate(
             compiler_process_total_wall_time: evidence.compiler_process_total_wall_time,
             linker_process_wall_time: evidence.linker_process_wall_time,
             module_load_wall_time: Duration::ZERO,
-            compiler_process_intervals: evidence.compiler_process_intervals,
+            compiler_process_observations: observations,
         },
     ))
 }
@@ -626,13 +618,15 @@ mod tests {
     }
 
     fn observation(
-        kind: CompilerProcessKind,
+        kind: NativeCompilerProcessKind,
         start: Instant,
         nanos: u64,
-    ) -> CompilerProcessObservation {
-        CompilerProcessObservation {
+    ) -> NativeCompilerProcessObservation {
+        NativeCompilerProcessObservation {
             kind,
-            interval: (start, start + Duration::from_nanos(nanos)),
+            permit_requested: start,
+            process_started: start,
+            process_finished: start + Duration::from_nanos(nanos),
         }
     }
 
@@ -710,7 +704,7 @@ mod tests {
     #[test]
     fn direct_build_evidence_is_one_combined_process() {
         let start = Instant::now();
-        let observations = [observation(CompilerProcessKind::Combined, start, 2)];
+        let observations = [observation(NativeCompilerProcessKind::Combined, start, 2)];
         let evidence = ScheduleModuleBuildEvidence::new(
             NativeScheduleModuleBuildMode::Combined,
             &observations,
@@ -749,10 +743,10 @@ mod tests {
     fn build_evidence_distinguishes_cumulative_and_effective_compiler_wall() {
         let start = Instant::now();
         let observations = [
-            observation(CompilerProcessKind::Object(0), start, 3),
-            observation(CompilerProcessKind::Object(1), start, 2),
+            observation(NativeCompilerProcessKind::Object(0), start, 3),
+            observation(NativeCompilerProcessKind::Object(1), start, 2),
             observation(
-                CompilerProcessKind::Link,
+                NativeCompilerProcessKind::Link,
                 start + Duration::from_nanos(3),
                 1,
             ),
@@ -793,7 +787,11 @@ mod tests {
             },
             JoinedTranslationUnit {
                 ordinal: 3,
-                result: Ok(Ok(observation(CompilerProcessKind::Object(3), start, 1))),
+                result: Ok(Ok(observation(
+                    NativeCompilerProcessKind::Object(3),
+                    start,
+                    1,
+                ))),
             },
         ]);
         assert_eq!(result, Err(compile_error));

@@ -1313,14 +1313,14 @@ times. Wall times do not participate in identity.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional accumulation/flush/zero-grad/evaluation programs plus
 checked logical recurrent state bytes without preparing a target or exposing a
-capture. The separate `NativeTrainingScoreboard` v18 authenticates
+capture. The separate `NativeTrainingScoreboard` v19 authenticates
 strict-native preparation and successful training-step reports, then emits
 bounded versioned JSON.
 
 | Evidence | Meaning |
 |---|---|
 | Preparation phases | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions, including bounded render concurrency and overlap. |
-| Compiler work | Combined/object/link process inventories and cumulative versus effective compiler wall time. |
+| Compiler work | Combined/object/link inventories, cumulative versus effective wall time, and bounded per-program process intervals/permit waits normalized to one preparation-batch origin. The derived last-finishing process identifies any post-main auxiliary tail without claiming a speedup. |
 | Module reuse | Referenced modules and the unique/shared-prefix entry partition for every attached program. |
 | Execution | Logical schedule/cache inventory, physical rendered/executed entries, actual module-dispatch calls, and mutually exclusive reasons each sealed dispatch segment ends. |
 | Replay traffic | Owned external imports, borrowed/retained/replaced recurrent bytes, and logical CPU egress materialization count/bytes. CPU egress is not a device transfer. |
@@ -1337,7 +1337,7 @@ themselves add dispatch segments or reached-module evidence.
 
 ##### Replay phases and wire versions
 
-V1-v17 JSON remains readable. The current wire additions are:
+V1-v18 JSON remains readable. The current wire additions are:
 
 | Version | Added contract |
 |---|---|
@@ -1347,8 +1347,9 @@ V1-v17 JSON remains readable. The current wire additions are:
 | V16 | Per-program render overlap and maximum concurrency as observations. |
 | V17 | Dispatch-reached module inventory plus terminal, non-dispatch, module-change, output-slot-alias, and derived-slot-dependency segment counts. |
 | V18 | Time inside authenticated native dispatcher calls and the checked executor-host remainder, both globally and for classified first/warm accumulation and commit phases. |
+| V19 | Bounded normalized compiler-process timing, permit waits, ordered program/native identity, and a re-derived last-finishing critical-tail owner. |
 
-V18 is emitted for raw and classified recording. Classified steps use only
+V19 is emitted for raw and classified recording. Classified steps use only
 `did_update`; the first replay stays separate, and warm accumulation-only and
 optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
 classification. A scoreboard rejects mixed recording modes without consuming a

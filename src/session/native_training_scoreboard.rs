@@ -12,11 +12,13 @@ pub use step_phases::{
     NativeTrainingWarmStepReport,
 };
 
+use super::compiled_training::NativeCpuCompilerProcessTiming;
 use super::{
     CompiledAdamWCheckpoint, NativeCpuCompiledAdamWPreparationReport,
     NativeCpuCompiledAdamWStepResult, NativeCpuDispatchSegmentation,
     NativeCpuProgramPreparationReport, NativeCpuReplayTraffic, NativeCpuRunReport,
 };
+use crate::cpu_jit::NativeCompilerProcessKind;
 use crate::{
     BenchmarkDuration, BenchmarkLatencySummary, BenchmarkTransfer, Error, ExecutionPlanSummary,
     Result,
@@ -40,8 +42,294 @@ const NATIVE_TRAINING_REPORT_FORMAT_V14: u32 = 14;
 const NATIVE_TRAINING_REPORT_FORMAT_V15: u32 = 15;
 const NATIVE_TRAINING_REPORT_FORMAT_V16: u32 = 16;
 const NATIVE_TRAINING_REPORT_FORMAT_V17: u32 = 17;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 18;
+const NATIVE_TRAINING_REPORT_FORMAT_V18: u32 = 18;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 19;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
+
+/// Compiler subprocess role in one cold native preparation batch.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+enum NativeTrainingCompilerProcessKind {
+    Combined,
+    Object { ordinal: u64 },
+    Link,
+}
+
+/// Portable compiler subprocess timing normalized to one preparation-batch
+/// origin. These observations never participate in executable identities.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTrainingCompilerProcessTiming {
+    program_index: u64,
+    native_identity: u64,
+    process: NativeTrainingCompilerProcessKind,
+    permit_request_offset: BenchmarkDuration,
+    permit_wait: BenchmarkDuration,
+    process_wall_time: BenchmarkDuration,
+}
+
+impl NativeTrainingCompilerProcessTiming {
+    fn from_preparation(
+        timing: &NativeCpuCompilerProcessTiming,
+        programs: &[&NativeTrainingProgramReport],
+    ) -> Result<Self> {
+        let program = programs
+            .get(timing.program_index())
+            .ok_or_else(|| invalid("native compiler process program is absent"))?;
+        let process = match timing.kind() {
+            NativeCompilerProcessKind::Combined => NativeTrainingCompilerProcessKind::Combined,
+            NativeCompilerProcessKind::Object(ordinal) => {
+                NativeTrainingCompilerProcessKind::Object {
+                    ordinal: count(ordinal, "native compiler object ordinal")?,
+                }
+            }
+            NativeCompilerProcessKind::Link => NativeTrainingCompilerProcessKind::Link,
+        };
+        Ok(Self {
+            program_index: count(timing.program_index(), "native compiler program")?,
+            native_identity: program.native_identity(),
+            process,
+            permit_request_offset: BenchmarkDuration::from_duration(timing.permit_request_offset()),
+            permit_wait: BenchmarkDuration::from_duration(timing.permit_wait_time()),
+            process_wall_time: BenchmarkDuration::from_duration(timing.process_wall_time()),
+        })
+    }
+
+    fn interval(&self) -> Result<(u128, u128, u128)> {
+        let requested = self
+            .permit_request_offset
+            .as_nanos()
+            .map_err(|_| invalid("invalid native compiler permit request offset"))?;
+        let wait = self
+            .permit_wait
+            .as_nanos()
+            .map_err(|_| invalid("invalid native compiler permit wait duration"))?;
+        let process = self
+            .process_wall_time
+            .as_nanos()
+            .map_err(|_| invalid("invalid native compiler process duration"))?;
+        let started = requested
+            .checked_add(wait)
+            .ok_or_else(|| invalid("native compiler process start overflows"))?;
+        let finished = started
+            .checked_add(process)
+            .ok_or_else(|| invalid("native compiler process finish overflows"))?;
+        Ok((requested, started, finished))
+    }
+}
+
+/// Derived owner of the compiler subprocess that finishes last in the batch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTrainingCompilerCriticalTail {
+    program_index: u64,
+    native_identity: u64,
+    process: NativeTrainingCompilerProcessKind,
+    finish_offset: BenchmarkDuration,
+    post_main_tail: BenchmarkDuration,
+}
+
+fn compiler_process_evidence(
+    preparation: &NativeCpuCompiledAdamWPreparationReport,
+    programs: &[&NativeTrainingProgramReport],
+    prepare_wall_time: Duration,
+) -> Result<(
+    Vec<NativeTrainingCompilerProcessTiming>,
+    Option<NativeTrainingCompilerCriticalTail>,
+)> {
+    let timings = preparation
+        .compiler_process_timings()
+        .iter()
+        .map(|timing| NativeTrainingCompilerProcessTiming::from_preparation(timing, programs))
+        .collect::<Result<Vec<_>>>()?;
+    validate_compiler_process_evidence(
+        &timings,
+        None,
+        programs,
+        count(
+            preparation.compiler_process_count(),
+            "native compiler process",
+        )?,
+        count(
+            preparation.max_parallel_compiler_process_count(),
+            "parallel native compiler process",
+        )?,
+        BenchmarkDuration::from_duration(preparation.compiler_process_overlap_wall_time()),
+        BenchmarkDuration::from_duration(prepare_wall_time),
+    )
+    .map(|tail| (timings, tail))
+}
+
+fn validate_compiler_process_evidence(
+    timings: &[NativeTrainingCompilerProcessTiming],
+    claimed_tail: Option<&NativeTrainingCompilerCriticalTail>,
+    programs: &[&NativeTrainingProgramReport],
+    process_count: u64,
+    max_parallel: u64,
+    claimed_overlap: BenchmarkDuration,
+    prepare_wall_time: BenchmarkDuration,
+) -> Result<Option<NativeTrainingCompilerCriticalTail>> {
+    if count(timings.len(), "native compiler process")? != process_count {
+        return Err(invalid("native compiler process timing inventory differs"));
+    }
+    let mut expected_program = 0usize;
+    let mut program_total = vec![0u128; programs.len()];
+    let mut intervals = Vec::with_capacity(timings.len());
+    let mut latest: Option<(u128, &NativeTrainingCompilerProcessTiming)> = None;
+    let mut main_finish = 0u128;
+    let prepare_wall_time = prepare_wall_time
+        .as_nanos()
+        .map_err(|_| invalid("invalid native preparation wall duration"))?;
+    for timing in timings {
+        let program_index = usize::try_from(timing.program_index)
+            .map_err(|_| invalid("native compiler process program index overflows"))?;
+        if program_index < expected_program || program_index >= programs.len() {
+            return Err(invalid("native compiler process program order differs"));
+        }
+        expected_program = program_index;
+        let program = programs[program_index];
+        if timing.native_identity != program.native_identity {
+            return Err(invalid("native compiler process program identity differs"));
+        }
+        let (requested, started, finished) = timing.interval()?;
+        if requested > prepare_wall_time
+            || started > prepare_wall_time
+            || finished > prepare_wall_time
+        {
+            return Err(invalid(
+                "native compiler process exceeds preparation wall time",
+            ));
+        }
+        let duration = finished
+            .checked_sub(started)
+            .ok_or_else(|| invalid("native compiler process interval is reversed"))?;
+        program_total[program_index] = program_total[program_index]
+            .checked_add(duration)
+            .ok_or_else(|| invalid("native compiler program duration overflows"))?;
+        intervals.push((started, finished));
+        if program_index == 0 {
+            main_finish = main_finish.max(finished);
+        }
+        if latest.is_none_or(|(latest_finish, _)| finished > latest_finish) {
+            latest = Some((finished, timing));
+        }
+    }
+    for (program_index, program) in programs.iter().enumerate() {
+        let program_index_wire = count(program_index, "native compiler program")?;
+        let expected = program
+            .preparation_timing
+            .as_ref()
+            .and_then(|timing| timing.compiler_process_total)
+            .ok_or_else(|| invalid("native cumulative compiler timing is absent"))?
+            .as_nanos()
+            .map_err(|_| invalid("invalid native cumulative compiler duration"))?;
+        if program_total[program_index] != expected {
+            return Err(invalid("native compiler process program duration differs"));
+        }
+        let actual = timings
+            .iter()
+            .filter(|timing| timing.program_index == program_index_wire)
+            .map(|timing| timing.process)
+            .collect::<Vec<_>>();
+        let mut expected_kinds = Vec::new();
+        if program.combined_compile_link_count() == 1 {
+            expected_kinds.push(NativeTrainingCompilerProcessKind::Combined);
+        }
+        for ordinal in 0..program.object_compile_count() {
+            expected_kinds.push(NativeTrainingCompilerProcessKind::Object { ordinal });
+        }
+        if program.linker_invocation_count() == 1 {
+            expected_kinds.push(NativeTrainingCompilerProcessKind::Link);
+        }
+        if actual != expected_kinds {
+            return Err(invalid("native compiler process kind inventory differs"));
+        }
+    }
+    intervals.sort_unstable();
+    let total = intervals.iter().try_fold(0u128, |total, (start, finish)| {
+        finish
+            .checked_sub(*start)
+            .and_then(|duration| total.checked_add(duration))
+            .ok_or_else(|| invalid("native compiler process duration overflows"))
+    })?;
+    let mut union = 0u128;
+    let mut current: Option<(u128, u128)> = None;
+    let mut events = Vec::with_capacity(intervals.len() * 2);
+    for (start, finish) in intervals {
+        if start != finish {
+            events.push((start, true));
+            events.push((finish, false));
+        }
+        match current {
+            Some((range_start, range_finish)) if start <= range_finish => {
+                current = Some((range_start, range_finish.max(finish)));
+            }
+            Some((range_start, range_finish)) => {
+                union = union
+                    .checked_add(range_finish - range_start)
+                    .ok_or_else(|| invalid("native compiler process union overflows"))?;
+                current = Some((start, finish));
+            }
+            None => current = Some((start, finish)),
+        }
+    }
+    if let Some((start, finish)) = current {
+        union = union
+            .checked_add(finish - start)
+            .ok_or_else(|| invalid("native compiler process union overflows"))?;
+    }
+    events.sort_unstable_by_key(|(at, starts)| (*at, *starts));
+    let mut active = 0u64;
+    let mut observed_max_parallel = u64::from(!timings.is_empty());
+    for (_, starts) in events {
+        if starts {
+            active = active
+                .checked_add(1)
+                .ok_or_else(|| invalid("native compiler concurrency overflows"))?;
+            observed_max_parallel = observed_max_parallel.max(active);
+        } else {
+            active = active
+                .checked_sub(1)
+                .ok_or_else(|| invalid("native compiler concurrency underflows"))?;
+        }
+    }
+    let overlap = total
+        .checked_sub(union)
+        .ok_or_else(|| invalid("native compiler overlap underflows"))?;
+    if overlap
+        != claimed_overlap
+            .as_nanos()
+            .map_err(|_| invalid("invalid native compiler overlap duration"))?
+        || observed_max_parallel != max_parallel
+    {
+        return Err(invalid("native compiler process interval evidence differs"));
+    }
+    let tail = match latest {
+        Some((finish, timing)) => Some(NativeTrainingCompilerCriticalTail {
+            program_index: timing.program_index,
+            native_identity: timing.native_identity,
+            process: timing.process,
+            finish_offset: benchmark_duration_from_nanos(finish)?,
+            post_main_tail: benchmark_duration_from_nanos(finish.saturating_sub(main_finish))?,
+        }),
+        None => None,
+    };
+    if claimed_tail.is_some() && claimed_tail != tail.as_ref() {
+        return Err(invalid("native compiler critical-tail attribution differs"));
+    }
+    Ok(tail)
+}
+
+fn benchmark_duration_from_nanos(nanos: u128) -> Result<BenchmarkDuration> {
+    let seconds = nanos / 1_000_000_000;
+    let subsecond = nanos % 1_000_000_000;
+    Ok(BenchmarkDuration {
+        secs: u64::try_from(seconds)
+            .map_err(|_| invalid("native compiler timing seconds overflow"))?,
+        nanos: u32::try_from(subsecond)
+            .map_err(|_| invalid("native compiler timing nanoseconds overflow"))?,
+    })
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProgramInspection {
@@ -124,6 +412,7 @@ impl NativeTrainingPreparationTiming {
                 NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(total),
                 Some(linker),
@@ -147,6 +436,7 @@ impl NativeTrainingPreparationTiming {
                 NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 _,
                 _,
@@ -584,6 +874,7 @@ impl NativeTrainingProgramReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self, format_version)?,
@@ -929,6 +1220,10 @@ pub struct NativeTrainingReport {
     prepare_compiler_process_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepare_max_parallel_compiler_process_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_compiler_process_timings: Option<Vec<NativeTrainingCompilerProcessTiming>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_compiler_critical_tail: Option<NativeTrainingCompilerCriticalTail>,
     initial_replay_step: u64,
     successful_replay_count: u64,
     main: NativeTrainingProgramReport,
@@ -1167,6 +1462,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -1220,6 +1516,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 None,
                 None,
@@ -1249,6 +1546,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(program),
                 Some(traffic),
@@ -1307,6 +1605,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -1335,6 +1634,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
                     if traffic.materialized_egress_count() != 0
                         && traffic.materialized_egress_bytes() != 0 => {}
@@ -1346,6 +1646,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                     return Err(invalid("native CPU egress evidence is absent"));
                 }
@@ -1376,6 +1677,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
@@ -1440,6 +1742,7 @@ impl NativeTrainingReport {
             | NATIVE_TRAINING_REPORT_FORMAT_V15
             | NATIVE_TRAINING_REPORT_FORMAT_V16
             | NATIVE_TRAINING_REPORT_FORMAT_V17
+            | NATIVE_TRAINING_REPORT_FORMAT_V18
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
@@ -1496,6 +1799,42 @@ impl NativeTrainingReport {
             }
             _ => unreachable!("format version was validated"),
         };
+        match (
+            self.format_version,
+            &self.prepare_compiler_process_timings,
+            &self.prepare_compiler_critical_tail,
+        ) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V18, None, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(timings), claimed_tail) => {
+                let process_count = self
+                    .prepare_compiler_process_count
+                    .ok_or_else(|| invalid("native compiler process count is absent"))?;
+                let max_parallel = self
+                    .prepare_max_parallel_compiler_process_count
+                    .ok_or_else(|| invalid("native compiler concurrency is absent"))?;
+                let overlap = self
+                    .prepare_compiler_process_overlap_wall_time
+                    .ok_or_else(|| invalid("native compiler overlap timing is absent"))?;
+                let derived_tail = validate_compiler_process_evidence(
+                    timings,
+                    claimed_tail.as_ref(),
+                    &prior_programs,
+                    process_count,
+                    max_parallel,
+                    overlap,
+                    self.prepare_wall_time,
+                )?;
+                if derived_tail.is_some() != claimed_tail.is_some() {
+                    return Err(invalid("native compiler critical-tail presence differs"));
+                }
+            }
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V18, _, _) => {
+                return Err(invalid(
+                    "legacy native report has compiler critical-path evidence",
+                ));
+            }
+            _ => return Err(invalid("native compiler critical-path evidence is absent")),
+        }
         let render_overlap = match (
             self.format_version,
             self.prepare_parallel_render_overlap_wall_time,
@@ -1505,6 +1844,7 @@ impl NativeTrainingReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overlap),
                 Some(max_parallel),
@@ -1556,6 +1896,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
@@ -1573,6 +1914,7 @@ impl NativeTrainingReport {
                         | NATIVE_TRAINING_REPORT_FORMAT_V15
                         | NATIVE_TRAINING_REPORT_FORMAT_V16
                         | NATIVE_TRAINING_REPORT_FORMAT_V17
+                        | NATIVE_TRAINING_REPORT_FORMAT_V18
                         | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                         Some(overlap),
                     ) => overlap
@@ -1670,6 +2012,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -1702,7 +2045,7 @@ impl NativeTrainingReport {
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V17, None, None) => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V18 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(native_dispatcher),
                 Some(executor_host),
             ) => {
@@ -1765,7 +2108,10 @@ impl NativeTrainingReport {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V9, Some(_)) => {
                 return Err(invalid("legacy native training report has step phases"));
             }
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(phases)) => phases.validate(
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V18 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(phases),
+            ) => phases.validate(
                 self.successful_replay_count,
                 self.first_replay_wall_time,
                 self.steady_replay_total_wall_time,
@@ -1786,6 +2132,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 None,
             ) if self.accumulation.is_none() => {}
@@ -1850,6 +2197,8 @@ pub struct NativeTrainingScoreboard {
     prepare_compiler_process_overlap_wall_time: Duration,
     prepare_compiler_process_count: u64,
     prepare_max_parallel_compiler_process_count: u64,
+    prepare_compiler_process_timings: Vec<NativeTrainingCompilerProcessTiming>,
+    prepare_compiler_critical_tail: Option<NativeTrainingCompilerCriticalTail>,
     inspection: CompiledAdamWInspection,
     main: NativeTrainingProgramReport,
     accumulation: Option<NativeTrainingProgramReport>,
@@ -1919,6 +2268,14 @@ impl NativeTrainingScoreboard {
             preparation.evaluation(),
             &prior_native_identities,
         )?;
+        let programs = std::iter::once(&main)
+            .chain(accumulation.iter())
+            .chain(partial_flush.iter())
+            .chain(zero_grad.iter())
+            .chain(evaluation.iter())
+            .collect::<Vec<_>>();
+        let (prepare_compiler_process_timings, prepare_compiler_critical_tail) =
+            compiler_process_evidence(preparation, &programs, prepare_wall_time)?;
         if inspection.recurrent_state_count != preparation.recurrent_state_count()
             || inspection.recurrent_state_bytes != preparation.recurrent_state_bytes()
         {
@@ -1968,6 +2325,8 @@ impl NativeTrainingScoreboard {
                 .compiler_process_overlap_wall_time(),
             prepare_compiler_process_count,
             prepare_max_parallel_compiler_process_count,
+            prepare_compiler_process_timings,
+            prepare_compiler_critical_tail,
             inspection,
             main,
             accumulation,
@@ -2260,6 +2619,8 @@ impl NativeTrainingScoreboard {
             prepare_max_parallel_compiler_process_count: Some(
                 self.prepare_max_parallel_compiler_process_count,
             ),
+            prepare_compiler_process_timings: Some(self.prepare_compiler_process_timings.clone()),
+            prepare_compiler_critical_tail: self.prepare_compiler_critical_tail.clone(),
             initial_replay_step: self.inspection.initial_replay_step,
             successful_replay_count: self.replay_timings.len() as u64,
             main: self.main.clone(),
@@ -2540,6 +2901,7 @@ mod tests {
     }
 
     fn remove_dispatcher_timing(json: &mut serde_json::Value) {
+        remove_compiler_critical_path(json);
         for field in [
             "main_replay_native_dispatcher_wall_time",
             "main_replay_executor_host_wall_time",
@@ -2575,6 +2937,12 @@ mod tests {
                 warm.remove(field);
             }
         }
+    }
+
+    fn remove_compiler_critical_path(json: &mut serde_json::Value) {
+        let report = json.as_object_mut().unwrap();
+        report.remove("prepare_compiler_process_timings");
+        report.remove("prepare_compiler_critical_tail");
     }
 
     fn remove_step_phases(json: &mut serde_json::Value) {
@@ -2685,6 +3053,8 @@ mod tests {
             prepare_compiler_process_overlap_wall_time: Some(zero_duration()),
             prepare_compiler_process_count: Some(1),
             prepare_max_parallel_compiler_process_count: Some(1),
+            prepare_compiler_process_timings: None,
+            prepare_compiler_critical_tail: None,
             initial_replay_step: 0,
             successful_replay_count: 2,
             main: NativeTrainingProgramReport {
@@ -2862,6 +3232,31 @@ mod tests {
             report.main_replay_executed_native_item_count;
         report.accumulation_schedule_cache_keys = vec![23, 29];
         report.prepare_compiler_process_count = Some(2);
+        report.prepare_compiler_process_timings = Some(vec![
+            NativeTrainingCompilerProcessTiming {
+                program_index: 0,
+                native_identity: report.main.native_identity,
+                process: NativeTrainingCompilerProcessKind::Combined,
+                permit_request_offset: zero_duration(),
+                permit_wait: zero_duration(),
+                process_wall_time: zero_duration(),
+            },
+            NativeTrainingCompilerProcessTiming {
+                program_index: 1,
+                native_identity: report.accumulation.as_ref().unwrap().native_identity,
+                process: NativeTrainingCompilerProcessKind::Combined,
+                permit_request_offset: zero_duration(),
+                permit_wait: zero_duration(),
+                process_wall_time: zero_duration(),
+            },
+        ]);
+        report.prepare_compiler_critical_tail = Some(NativeTrainingCompilerCriticalTail {
+            program_index: 0,
+            native_identity: report.main.native_identity,
+            process: NativeTrainingCompilerProcessKind::Combined,
+            finish_offset: zero_duration(),
+            post_main_tail: zero_duration(),
+        });
         report
     }
 
@@ -2892,11 +3287,65 @@ mod tests {
         assert_eq!(decoded.accumulation_schedule_cache_keys(), [23, 29]);
         assert!(decoded.main_replay_native_dispatcher_wall_time().is_some());
         assert!(decoded.main_replay_executor_host_wall_time().is_some());
+        assert_eq!(
+            decoded
+                .prepare_compiler_process_timings
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            decoded
+                .prepare_compiler_critical_tail
+                .as_ref()
+                .unwrap()
+                .program_index,
+            0
+        );
 
         let mut json = serde_json::to_value(&report).unwrap();
         json["accumulation_schedule_cache_keys"] = serde_json::json!([23]);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["prepare_compiler_process_timings"][1]["native_identity"] = serde_json::json!(99);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "compiler process timing must remain bound to its ordered program"
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["prepare_compiler_process_timings"][0]["process"] =
+            serde_json::json!({ "kind": "object", "ordinal": 0 });
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "compiler process roles must match the authenticated program build mode"
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["prepare_compiler_process_timings"][0]["permit_wait"]["nanos"] =
+            serde_json::json!(1_000_000_000u64);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "malformed compiler interval durations must fail closed"
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["prepare_compiler_process_timings"][0]["permit_request_offset"]["nanos"] =
+            serde_json::json!(1);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "compiler process intervals must remain inside caller-observed preparation"
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["prepare_compiler_critical_tail"]["program_index"] = serde_json::json!(1);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "critical-tail ownership is derived from authenticated intervals"
         );
 
         let mut json = serde_json::to_value(&report).unwrap();
@@ -3112,6 +3561,47 @@ mod tests {
         timing.compiler_process_total =
             Some(BenchmarkDuration::from_duration(Duration::from_nanos(3)));
         timing.linker_process = Some(BenchmarkDuration::from_duration(Duration::from_nanos(1)));
+        report.prepare_compiler_process_timings = Some(vec![
+            NativeTrainingCompilerProcessTiming {
+                program_index: 0,
+                native_identity: report.main.native_identity,
+                process: NativeTrainingCompilerProcessKind::Object { ordinal: 0 },
+                permit_request_offset: zero_duration(),
+                permit_wait: zero_duration(),
+                process_wall_time: BenchmarkDuration::from_duration(Duration::from_nanos(1)),
+            },
+            NativeTrainingCompilerProcessTiming {
+                program_index: 0,
+                native_identity: report.main.native_identity,
+                process: NativeTrainingCompilerProcessKind::Object { ordinal: 1 },
+                permit_request_offset: zero_duration(),
+                permit_wait: zero_duration(),
+                process_wall_time: BenchmarkDuration::from_duration(Duration::from_nanos(1)),
+            },
+            NativeTrainingCompilerProcessTiming {
+                program_index: 0,
+                native_identity: report.main.native_identity,
+                process: NativeTrainingCompilerProcessKind::Link,
+                permit_request_offset: BenchmarkDuration::from_duration(Duration::from_nanos(1)),
+                permit_wait: zero_duration(),
+                process_wall_time: BenchmarkDuration::from_duration(Duration::from_nanos(1)),
+            },
+            NativeTrainingCompilerProcessTiming {
+                program_index: 1,
+                native_identity: report.accumulation.as_ref().unwrap().native_identity,
+                process: NativeTrainingCompilerProcessKind::Combined,
+                permit_request_offset: zero_duration(),
+                permit_wait: zero_duration(),
+                process_wall_time: zero_duration(),
+            },
+        ]);
+        report.prepare_compiler_critical_tail = Some(NativeTrainingCompilerCriticalTail {
+            program_index: 0,
+            native_identity: report.main.native_identity,
+            process: NativeTrainingCompilerProcessKind::Link,
+            finish_offset: BenchmarkDuration::from_duration(Duration::from_nanos(2)),
+            post_main_tail: zero_duration(),
+        });
         assert!(report.validate().is_ok());
 
         let valid = report.clone();
@@ -3242,6 +3732,77 @@ mod tests {
                 .first()
                 .native_dispatcher_wall_time()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn version_eighteen_decodes_without_compiler_critical_path() {
+        let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V18);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "v18 cannot claim v19 compiler critical-path evidence"
+        );
+        remove_compiler_critical_path(&mut json);
+        let decoded =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V18);
+        assert!(decoded.main_replay_native_dispatcher_wall_time().is_some());
+    }
+
+    #[test]
+    fn current_report_attributes_an_auxiliary_post_main_compiler_tail() {
+        let mut report = phase_specialized_report();
+        report.prepare_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(3));
+        report.prepare_runtime_overhead_wall_time = Some(zero_duration());
+        let main_timing = report.main.preparation_timing.as_mut().unwrap();
+        main_timing.total = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        main_timing.compiler_process = main_timing.total;
+        main_timing.compiler_process_total = Some(main_timing.total);
+        let accumulation_timing = report
+            .accumulation
+            .as_mut()
+            .unwrap()
+            .preparation_timing
+            .as_mut()
+            .unwrap();
+        accumulation_timing.total = BenchmarkDuration::from_duration(Duration::from_nanos(2));
+        accumulation_timing.compiler_process = accumulation_timing.total;
+        accumulation_timing.compiler_process_total = Some(accumulation_timing.total);
+        let timings = report.prepare_compiler_process_timings.as_mut().unwrap();
+        timings[0].process_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        timings[1].permit_request_offset = zero_duration();
+        timings[1].permit_wait = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        timings[1].process_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(2));
+        report.prepare_compiler_critical_tail = Some(NativeTrainingCompilerCriticalTail {
+            program_index: 1,
+            native_identity: report.accumulation.as_ref().unwrap().native_identity,
+            process: NativeTrainingCompilerProcessKind::Combined,
+            finish_offset: BenchmarkDuration::from_duration(Duration::from_nanos(3)),
+            post_main_tail: BenchmarkDuration::from_duration(Duration::from_nanos(2)),
+        });
+        assert!(report.validate().is_ok());
+    }
+
+    #[test]
+    fn current_report_accepts_an_empty_warm_cache_compiler_critical_path() {
+        let mut report = phase_specialized_report();
+        for program in [&mut report.main, report.accumulation.as_mut().unwrap()] {
+            program.durable_artifact_cache_hit_count = 1;
+            program.durable_artifact_cache_miss_count = 0;
+            program.compiler_invocation_count = 0;
+            program.combined_compile_link_count = Some(0);
+        }
+        report.prepare_compiler_process_count = Some(0);
+        report.prepare_max_parallel_compiler_process_count = Some(0);
+        report.prepare_compiler_process_timings = Some(Vec::new());
+        report.prepare_compiler_critical_tail = None;
+        assert!(report.validate().is_ok());
+
+        report.prepare_compiler_process_timings = None;
+        assert!(
+            report.validate().is_err(),
+            "v19 preserves an authenticated empty timing inventory on warm cache hits"
         );
     }
 
@@ -3504,6 +4065,11 @@ mod tests {
             .as_mut()
             .unwrap()
             .native_identity = main_native_identity;
+        equal_identity
+            .prepare_compiler_process_timings
+            .as_mut()
+            .unwrap()[1]
+            .native_identity = main_native_identity;
         assert!(
             equal_identity.validate().is_ok(),
             "the earlier program index disambiguates equal native identities"
@@ -3526,6 +4092,11 @@ mod tests {
             accumulation.native_identity()
         };
         full_prefix.prepare_compiler_process_count = Some(1);
+        full_prefix
+            .prepare_compiler_process_timings
+            .as_mut()
+            .unwrap()
+            .truncate(1);
         assert!(
             full_prefix.validate().is_ok(),
             "a full exact prefix has no suffix compilation or module load"
@@ -3574,6 +4145,11 @@ mod tests {
         accumulation.combined_compile_link_count = Some(0);
         accumulation.dispatch_segmentation = Some(source_segmentation);
         impossible.prepare_compiler_process_count = Some(1);
+        impossible
+            .prepare_compiler_process_timings
+            .as_mut()
+            .unwrap()
+            .truncate(1);
         assert!(
             impossible
                 .accumulation

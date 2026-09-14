@@ -1226,7 +1226,26 @@ pub(crate) struct JitScheduleModuleLoad {
     pub(crate) compiler_process_total_wall_time: Duration,
     pub(crate) linker_process_wall_time: Duration,
     pub(crate) module_load_wall_time: Duration,
-    pub(crate) compiler_process_intervals: Vec<(Instant, Instant)>,
+    pub(crate) compiler_process_observations: Vec<NativeCompilerProcessObservation>,
+}
+
+/// Process-local compiler phase. This remains private preparation evidence;
+/// it does not participate in native module or durable-cache identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeCompilerProcessKind {
+    Combined,
+    Object(usize),
+    Link,
+}
+
+/// Monotonic compiler-process observation retained only until a preparation
+/// batch normalizes it into portable durations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeCompilerProcessObservation {
+    pub(crate) kind: NativeCompilerProcessKind,
+    pub(crate) permit_requested: Instant,
+    pub(crate) process_started: Instant,
+    pub(crate) process_finished: Instant,
 }
 
 impl JitKernel {
@@ -5348,12 +5367,22 @@ impl Drop for CompilerProcessPermit {
 
 fn run_compiler(
     command: &mut Command,
-) -> std::io::Result<(std::process::Output, (Instant, Instant))> {
+    kind: NativeCompilerProcessKind,
+) -> std::io::Result<(std::process::Output, NativeCompilerProcessObservation)> {
+    let permit_requested = Instant::now();
     let _permit = CompilerProcessPermit::acquire()?;
-    let started = Instant::now();
-    command
-        .output()
-        .map(|output| (output, (started, Instant::now())))
+    let process_started = Instant::now();
+    command.output().map(|output| {
+        (
+            output,
+            NativeCompilerProcessObservation {
+                kind,
+                permit_requested,
+                process_started,
+                process_finished: Instant::now(),
+            },
+        )
+    })
 }
 
 #[cfg(test)]
@@ -5400,6 +5429,7 @@ fn compile_cached_under_gate(r: &RenderedC) -> Result<PathBuf, JitError> {
                 .arg("-o")
                 .arg(&temp)
                 .arg(&source),
+            NativeCompilerProcessKind::Combined,
         )
         .map_err(|e| JitError::Compiler {
             status: None,
@@ -7138,7 +7168,7 @@ mod tests {
             cold.compiler_process_total_wall_time,
             cold.compiler_process_wall_time
         );
-        assert_eq!(cold.compiler_process_intervals.len(), 1);
+        assert_eq!(cold.compiler_process_observations.len(), 1);
         assert!(Arc::ptr_eq(&kernels[0]._library, &kernels[1]._library));
         assert_eq!(kernels[0].abi, rendered[0].abi);
         assert_eq!(kernels[1].abi, rendered[1].abi);
@@ -7344,7 +7374,7 @@ mod tests {
         assert_eq!(warm.compiler_invocation_count, 0);
         assert_eq!(warm.compiler_process_wall_time, Duration::ZERO);
         assert_eq!(warm.compiler_process_total_wall_time, Duration::ZERO);
-        assert!(warm.compiler_process_intervals.is_empty());
+        assert!(warm.compiler_process_observations.is_empty());
         drop(restored);
         std::fs::remove_file(path).unwrap();
     }
