@@ -2126,7 +2126,7 @@ struct PyTorchGeluPolicyWindowFixture {
     accumulation_steps: u64,
     max_gradient_norm: f32,
     ignore_index: i32,
-    learning_rate: f32,
+    learning_rates: [f32; 2],
     active_parameter_count: usize,
     active_coordinate_count: usize,
     analytic_gauge_null_parameters: Vec<String>,
@@ -2134,8 +2134,9 @@ struct PyTorchGeluPolicyWindowFixture {
     frozen_parameter: PyTorchTensorFixture,
     initial_parameters: BTreeMap<String, PyTorchTensorFixture>,
     replays: Vec<PyTorchReplayFixture>,
+    first_pending_checkpoint: PyTorchPolicyPendingCheckpointFixture,
     pending_checkpoint: PyTorchPolicyPendingCheckpointFixture,
-    commit: PyTorchPolicyAdamWWindowFixture,
+    commits: Vec<PyTorchPolicyAdamWWindowFixture>,
 }
 
 #[derive(Deserialize)]
@@ -2410,8 +2411,14 @@ enum PyTorchSuccessorOracle<'a> {
         parameter_names: &'a BTreeSet<&'a str>,
         optimizer: &'a CompiledAdamWConfig,
         learning_rate: f32,
-        recurrence_ulp_tolerance: u32,
+        recurrence_tolerance: GaugeNullRecurrenceTolerance,
     },
+}
+
+#[derive(Clone, Copy)]
+enum GaugeNullRecurrenceTolerance {
+    Exact,
+    SuccessorUlps(u32),
 }
 
 impl PyTorchSuccessorOracle<'_> {
@@ -2447,7 +2454,7 @@ fn assert_adamw_gauge_null_successors(
     parameter_names: &BTreeSet<&str>,
     optimizer: &CompiledAdamWConfig,
     learning_rate: f32,
-    recurrence_ulp_tolerance: u32,
+    recurrence_tolerance: GaugeNullRecurrenceTolerance,
 ) {
     const MAX_RMS_TO_EPSILON_RATIO: f64 = 0.01;
     const MAX_UPDATE_TO_LEARNING_RATE_RATIO: f64 = 0.01;
@@ -2498,19 +2505,23 @@ fn assert_adamw_gauge_null_successors(
             };
             let recurrence_ulp_distance =
                 ordered_bits(actual_value).abs_diff(ordered_bits(reconstructed_value));
-            // The interpreted recurrence remains raw-bit exact. Fused native
-            // execution uses backend-specific F32 instruction ordering, so its
-            // dedicated oracle admits a two-ULP rounding envelope only for these
-            // analytically softmax-null, epsilon-conditioned successor lanes.
-            let recurrence_matches = if recurrence_ulp_tolerance == 0 {
-                actual_value.to_bits() == reconstructed_value.to_bits()
+            let actual_initial = actual_initial.scalar_at(coordinate).as_f64() as f32;
+            let actual_decay_baseline = if decay_exclusions.contains(name) {
+                actual_initial
             } else {
-                recurrence_ulp_distance <= recurrence_ulp_tolerance
+                graph_f32_mul(actual_initial, decay_factor)
             };
-            assert!(
-                recurrence_matches,
-                "{label} analytic gauge-null successor {name}[{coordinate}] must match the backend-local AdamW recurrence within {recurrence_ulp_tolerance} F32 ULPs: actual={actual_value}, reconstructed={reconstructed_value}, distance={recurrence_ulp_distance}"
-            );
+            match recurrence_tolerance {
+                GaugeNullRecurrenceTolerance::Exact => assert_eq!(
+                    actual_value.to_bits(),
+                    reconstructed_value.to_bits(),
+                    "{label} analytic gauge-null successor {name}[{coordinate}] must match the interpreted AdamW recurrence exactly"
+                ),
+                GaugeNullRecurrenceTolerance::SuccessorUlps(tolerance) => assert!(
+                    recurrence_ulp_distance <= tolerance,
+                    "{label} analytic gauge-null successor {name}[{coordinate}] must match the backend-local AdamW recurrence within {tolerance} F32 ULPs: actual={actual_value}, reconstructed={reconstructed_value}, distance={recurrence_ulp_distance}"
+                ),
+            }
             let actual_second = actual_second.scalar_at(coordinate).as_f64();
             let expected_second = expected_second.scalar_at(coordinate).as_f64();
             assert!(actual_second.is_finite() && actual_second >= 0.0);
@@ -2522,13 +2533,7 @@ fn assert_adamw_gauge_null_successors(
                 "{label} analytic gauge-null {name}[{coordinate}] must remain epsilon-conditioned: actual_rms={actual_rms}, expected_rms={expected_rms}, maximum_rms={maximum_rms}"
             );
 
-            let actual_initial = actual_initial.scalar_at(coordinate).as_f64() as f32;
             let expected_initial = expected_initial.scalar_at(coordinate).as_f64() as f32;
-            let actual_decay_baseline = if decay_exclusions.contains(name) {
-                actual_initial
-            } else {
-                graph_f32_mul(actual_initial, decay_factor)
-            };
             let expected_decay_baseline = if decay_exclusions.contains(name) {
                 expected_initial
             } else {
@@ -2610,7 +2615,7 @@ fn assert_pytorch_adamw_window_for_frontier(
         parameter_names,
         optimizer,
         learning_rate,
-        recurrence_ulp_tolerance,
+        recurrence_tolerance,
     } = successor_oracle
     {
         assert_adamw_gauge_null_successors(
@@ -2619,7 +2624,7 @@ fn assert_pytorch_adamw_window_for_frontier(
             parameter_names,
             optimizer,
             learning_rate,
-            recurrence_ulp_tolerance,
+            recurrence_tolerance,
         );
     }
     assert_pytorch_parameter_successors_close(
@@ -2905,6 +2910,40 @@ fn assert_native_policy_progress(
         Some(accumulated_token_count)
     );
     assert_eq!(info.dropout_block_counter(), Some(replay_step * 84));
+}
+
+fn assert_policy_pending_checkpoint(
+    label: &str,
+    checkpoint: &CompiledAdamWCheckpoint,
+    expected: &PyTorchPolicyPendingCheckpointFixture,
+) {
+    let info = checkpoint.info();
+    assert_eq!(info.replay_step(), expected.replay_step, "{label} replay");
+    assert_eq!(
+        info.optimizer_step(),
+        expected.optimizer_step,
+        "{label} optimizer step"
+    );
+    assert_eq!(
+        info.accumulation_index(),
+        expected.accumulation_index,
+        "{label} accumulation index"
+    );
+    assert_eq!(
+        info.accumulated_token_count(),
+        Some(expected.valid_token_count),
+        "{label} token count"
+    );
+    assert_eq!(
+        info.dropout_block_counter(),
+        Some(expected.dropout_counter),
+        "{label} dropout counter"
+    );
+    assert_pytorch_scalar_close(
+        &format!("{label} loss numerator"),
+        f64::from(info.accumulated_loss_numerator().unwrap()),
+        f64::from(expected.loss_numerator),
+    );
 }
 
 fn assert_policy_accumulators_are_positive_zero(runtime: &impl CompiledAdamWRuntime) {
@@ -8565,14 +8604,14 @@ fn compiled_two_block_gelu_autograd_matches_paired_finite_differences_and_native
 }
 
 #[test]
-fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
+fn compiled_two_block_gelu_adamw_windows_match_pytorch_across_checkpoint() {
     const ATTENTION_DROPOUT: f64 = 0.25;
 
     let fixture = two_block_pytorch_fixture();
     let expected = &fixture.gelu_policy_window;
     assert_eq!(
         expected.rustgrad_base,
-        "89bd150e01eb35068b8bdba05b264e49bb30616e"
+        "1b00de2a586b9d0493acfe6438d357c0cf4fcb1f"
     );
     assert_eq!(expected.approximation, "tanh");
     assert_eq!(expected.weight_decay.to_bits(), 0.01f32.to_bits());
@@ -8580,25 +8619,35 @@ fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
     assert_eq!(expected.accumulation_steps, 3);
     assert_eq!(expected.max_gradient_norm.to_bits(), 0.25f32.to_bits());
     assert_eq!(expected.ignore_index, POLICY_IGNORE_INDEX);
-    assert_eq!(expected.learning_rate.to_bits(), 1e-3f32.to_bits());
+    assert_eq!(
+        expected.learning_rates.map(f32::to_bits),
+        [1e-3f32.to_bits(), 5e-4f32.to_bits()]
+    );
     assert_eq!(expected.active_parameter_count, 35);
     assert_eq!(expected.active_coordinate_count, 372);
-    assert_eq!(expected.replays.len(), 3);
+    assert_eq!(expected.replays.len(), 6);
     assert_eq!(
         expected
             .replays
             .iter()
             .map(|replay| replay.valid_token_count)
             .collect::<Vec<_>>(),
-        [5, 3, 3]
+        [5, 3, 3, 5, 3, 3]
     );
-    assert_eq!(expected.commit.adamw.optimizer_step, 1);
-    assert_eq!(expected.commit.adamw.valid_token_count, 11);
-    assert_eq!(expected.commit.microbatch_count, 3);
-    assert_eq!(
-        expected.commit.learning_rate.to_bits(),
-        expected.learning_rate.to_bits()
-    );
+    assert_eq!(expected.commits.len(), 2);
+    let first_commit = &expected.commits[0];
+    let second_commit = &expected.commits[1];
+    for (optimizer_step, (commit, learning_rate)) in expected
+        .commits
+        .iter()
+        .zip(expected.learning_rates)
+        .enumerate()
+    {
+        assert_eq!(commit.adamw.optimizer_step, optimizer_step as u64 + 1);
+        assert_eq!(commit.adamw.valid_token_count, 11);
+        assert_eq!(commit.microbatch_count, 3);
+        assert_eq!(commit.learning_rate.to_bits(), learning_rate.to_bits());
+    }
     assert_eq!(expected.frozen_parameter_name, POLICY_FROZEN_PARAMETER);
     assert_eq!(expected.frozen_parameter.tensor().len(), 12);
 
@@ -8640,7 +8689,17 @@ fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
         assert!(traversal.insert(name, parameter.id()).is_none());
     });
     assert_eq!(traversal.len(), 37);
-    assert_eq!(traversal["tokens.weight"], traversal["lm_head.weight"]);
+    let tied_id = traversal["tokens.weight"];
+    assert_eq!(tied_id, traversal["lm_head.weight"]);
+    assert_eq!(
+        traversal.values().filter(|id| **id == tied_id).count(),
+        2,
+        "only the token embedding and language-model head may be tied"
+    );
+    assert_eq!(
+        traversal.values().copied().collect::<BTreeSet<_>>().len(),
+        36
+    );
 
     let optimizer = two_block_gelu_policy_config();
     assert_eq!(
@@ -8717,7 +8776,7 @@ fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
     // dropout progress remain monotonic, so each isolated snapshot observes the
     // exact source-ordered mask and numerator gradient used by the real window.
     let mut isolated = plan.prepare_cpu().unwrap();
-    for (index, replay) in expected.replays.iter().enumerate() {
+    for (index, replay) in expected.replays[..3].iter().enumerate() {
         let step = isolated
             .step_scheduled(policy_frontier_batch(replay.replay))
             .unwrap();
@@ -8730,7 +8789,7 @@ fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
             &replay.numerator_gradients,
         );
         assert_pytorch_active_gradient_family_evidence(&gradients, &replay.numerator_gradients);
-        if index + 1 != expected.replays.len() {
+        if index + 1 != 3 {
             let reset = isolated.zero_grad().unwrap();
             assert!(reset.did_discard());
             assert_eq!(reset.discarded_microbatches(), 1);
@@ -8748,34 +8807,8 @@ fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
     assert!(!second.did_update());
     assert_policy_frontier_replay(&second, &expected.replays[1]);
     let pending_checkpoint = uninterrupted.checkpoint().unwrap();
-    let pending = &expected.pending_checkpoint;
-    assert_eq!(pending_checkpoint.info().replay_step(), pending.replay_step);
-    assert_eq!(
-        pending_checkpoint.info().optimizer_step(),
-        pending.optimizer_step
-    );
-    assert_eq!(
-        pending_checkpoint.info().accumulation_index(),
-        pending.accumulation_index
-    );
-    assert_eq!(
-        pending_checkpoint.info().accumulated_token_count(),
-        Some(pending.valid_token_count)
-    );
-    assert_eq!(
-        pending_checkpoint.info().dropout_block_counter(),
-        Some(pending.dropout_counter)
-    );
-    assert_pytorch_scalar_close(
-        "GELU pending loss numerator",
-        f64::from(
-            pending_checkpoint
-                .info()
-                .accumulated_loss_numerator()
-                .unwrap(),
-        ),
-        f64::from(pending.loss_numerator),
-    );
+    let pending = &expected.first_pending_checkpoint;
+    assert_policy_pending_checkpoint("GELU replay 2 pending", &pending_checkpoint, pending);
 
     let restored_plan = plan.restore_checkpoint(&pending_checkpoint).unwrap();
     assert_eq!(restored_plan.capture_identity(), plan.capture_identity());
@@ -8794,34 +8827,34 @@ fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
         uninterrupted.checkpoint().unwrap()
     );
 
-    let parameters = uninterrupted.parameter_snapshots().unwrap();
-    let first_moments = uninterrupted.first_moment_snapshots().unwrap();
-    let second_moments = uninterrupted.second_moment_snapshots().unwrap();
+    let first_parameters = uninterrupted.parameter_snapshots().unwrap();
+    let first_first_moments = uninterrupted.first_moment_snapshots().unwrap();
+    let first_second_moments = uninterrupted.second_moment_snapshots().unwrap();
     assert_pytorch_adamw_window_for_frontier(
         "GELU first window",
         PyTorchAdamWWindowAssertion {
             optimizer_step: 1,
             clip_report: third.clip_report().unwrap(),
             actual_initial: &initial_parameters,
-            actual_first_moments: &first_moments,
-            actual_second_moments: &second_moments,
-            actual_successors: &parameters,
+            actual_first_moments: &first_first_moments,
+            actual_second_moments: &first_second_moments,
+            actual_successors: &first_parameters,
             expected_initial: &expected.initial_parameters,
-            expected: &expected.commit.adamw,
+            expected: &first_commit.adamw,
         },
-        expected.commit.microbatch_count,
+        first_commit.microbatch_count,
         expected.active_coordinate_count,
         PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
-            learning_rate: expected.learning_rate,
-            recurrence_ulp_tolerance: 0,
+            learning_rate: expected.learning_rates[0],
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::Exact,
         },
     );
     assert_policy_window_report(
         "GELU first window",
         third.window_loss_report().unwrap(),
-        &expected.commit,
+        first_commit,
     );
     assert_policy_accumulators_are_positive_zero(&uninterrupted);
     let committed = uninterrupted.checkpoint().unwrap();
@@ -8830,6 +8863,152 @@ fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
     assert_eq!(committed.info().accumulation_index(), 0);
     assert_eq!(committed.info().accumulated_token_count(), Some(0));
     assert_eq!(committed.info().dropout_block_counter(), Some(252));
+
+    // Authenticate every replay-4..6 numerator lane from the first committed
+    // parameter state without letting one isolated replay update the next.
+    let second_window_isolated_plan = plan.restore_checkpoint(&committed).unwrap();
+    assert_eq!(compile_count.get(), 1);
+    let mut second_window_isolated = second_window_isolated_plan.prepare_cpu().unwrap();
+    for (index, replay) in expected.replays[3..].iter().enumerate() {
+        let step = second_window_isolated
+            .step_scheduled(policy_frontier_batch(replay.replay))
+            .unwrap();
+        assert!(!step.did_update());
+        assert_policy_frontier_replay(&step, replay);
+        let gradients = second_window_isolated
+            .gradient_accumulator_snapshots()
+            .unwrap();
+        assert_pytorch_tensor_map_close(
+            &format!("GELU replay {} numerator gradient", replay.replay),
+            &gradients,
+            &replay.numerator_gradients,
+        );
+        assert_pytorch_active_gradient_family_evidence(&gradients, &replay.numerator_gradients);
+        if index + 1 != 3 {
+            let reset = second_window_isolated.zero_grad().unwrap();
+            assert!(reset.did_discard());
+            assert_eq!(reset.discarded_microbatches(), 1);
+        }
+    }
+
+    let fourth = uninterrupted
+        .step_scheduled(policy_frontier_batch(4))
+        .unwrap();
+    assert!(!fourth.did_update());
+    assert_policy_frontier_replay(&fourth, &expected.replays[3]);
+    assert_eq!(
+        uninterrupted.parameter_snapshots().unwrap(),
+        first_parameters
+    );
+    assert_eq!(
+        uninterrupted.first_moment_snapshots().unwrap(),
+        first_first_moments
+    );
+    assert_eq!(
+        uninterrupted.second_moment_snapshots().unwrap(),
+        first_second_moments
+    );
+    assert_pytorch_tensor_map_close(
+        "GELU replay 4 pending numerator gradient",
+        &uninterrupted.gradient_accumulator_snapshots().unwrap(),
+        &expected.replays[3].numerator_gradients,
+    );
+
+    let second_pending_checkpoint = uninterrupted.checkpoint().unwrap();
+    let second_pending = &expected.pending_checkpoint;
+    assert_policy_pending_checkpoint(
+        "GELU replay 4 pending",
+        &second_pending_checkpoint,
+        second_pending,
+    );
+
+    let second_restored_plan = plan.restore_checkpoint(&second_pending_checkpoint).unwrap();
+    assert_eq!(
+        second_restored_plan.capture_identity(),
+        plan.capture_identity()
+    );
+    assert_eq!(compile_count.get(), 1);
+    let mut second_resumed = second_restored_plan.prepare_cpu().unwrap();
+    assert_eq!(
+        second_resumed.checkpoint().unwrap(),
+        second_pending_checkpoint
+    );
+    assert_eq!(
+        second_resumed.parameter_snapshots().unwrap(),
+        first_parameters
+    );
+    assert_eq!(
+        second_resumed.first_moment_snapshots().unwrap(),
+        first_first_moments
+    );
+    assert_eq!(
+        second_resumed.second_moment_snapshots().unwrap(),
+        first_second_moments
+    );
+
+    let fifth = uninterrupted
+        .step_scheduled(policy_frontier_batch(5))
+        .unwrap();
+    let resumed_fifth = second_resumed
+        .step_scheduled(policy_frontier_batch(5))
+        .unwrap();
+    assert!(!fifth.did_update());
+    assert_policy_frontier_replay(&fifth, &expected.replays[4]);
+    assert_compiled_adamw_steps_exact("GELU replay 5 restore", &resumed_fifth, &fifth);
+    let sixth = uninterrupted
+        .step_scheduled(policy_frontier_batch(6))
+        .unwrap();
+    let resumed_sixth = second_resumed
+        .step_scheduled(policy_frontier_batch(6))
+        .unwrap();
+    assert!(sixth.did_update());
+    assert_policy_frontier_replay(&sixth, &expected.replays[5]);
+    assert_compiled_adamw_steps_exact("GELU replay 6 restore", &resumed_sixth, &sixth);
+    assert_eq!(
+        second_resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+
+    let second_parameters = uninterrupted.parameter_snapshots().unwrap();
+    let second_first_moments = uninterrupted.first_moment_snapshots().unwrap();
+    let second_second_moments = uninterrupted.second_moment_snapshots().unwrap();
+    assert_pytorch_adamw_window_for_frontier(
+        "GELU second window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 2,
+            clip_report: sixth.clip_report().unwrap(),
+            actual_initial: &first_parameters,
+            actual_first_moments: &second_first_moments,
+            actual_second_moments: &second_second_moments,
+            actual_successors: &second_parameters,
+            expected_initial: &first_commit.adamw.parameter_successors,
+            expected: &second_commit.adamw,
+        },
+        second_commit.microbatch_count,
+        expected.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: expected.learning_rates[1],
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::Exact,
+        },
+    );
+    assert_policy_window_report(
+        "GELU second window",
+        sixth.window_loss_report().unwrap(),
+        second_commit,
+    );
+    assert_policy_accumulators_are_positive_zero(&uninterrupted);
+    assert_policy_accumulators_are_positive_zero(&second_resumed);
+    let second_committed = uninterrupted.checkpoint().unwrap();
+    assert_eq!(second_committed.info().replay_step(), 6);
+    assert_eq!(second_committed.info().optimizer_step(), 2);
+    assert_eq!(second_committed.info().accumulation_index(), 0);
+    assert_eq!(second_committed.info().accumulated_token_count(), Some(0));
+    assert_eq!(
+        second_committed.info().dropout_block_counter(),
+        Some(6 * 84)
+    );
 
     let executor = CapturedReplayExecutor::default();
     let native_target = NativeCpuSessionTarget::new(&executor).vectorized(true);
@@ -8855,25 +9034,10 @@ fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
     assert_eq!(native_second.report().successful_invocation(), 2);
     assert_native_policy_progress(&native, 2, 0, 2, 8);
     let native_pending_checkpoint = native.checkpoint().unwrap();
-    assert_eq!(
-        native_pending_checkpoint.info().replay_step(),
-        pending.replay_step
-    );
-    assert_eq!(
-        native_pending_checkpoint.info().optimizer_step(),
-        pending.optimizer_step
-    );
-    assert_eq!(
-        native_pending_checkpoint.info().accumulation_index(),
-        pending.accumulation_index
-    );
-    assert_eq!(
-        native_pending_checkpoint.info().accumulated_token_count(),
-        Some(pending.valid_token_count)
-    );
-    assert_eq!(
-        native_pending_checkpoint.info().dropout_block_counter(),
-        Some(pending.dropout_counter)
+    assert_policy_pending_checkpoint(
+        "strict-native GELU replay 2 pending",
+        &native_pending_checkpoint,
+        pending,
     );
 
     let native_restored_plan = plan.restore_checkpoint(&native_pending_checkpoint).unwrap();
@@ -8923,21 +9087,151 @@ fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
             actual_second_moments: &native.second_moment_snapshots().unwrap(),
             actual_successors: &native.parameter_snapshots().unwrap(),
             expected_initial: &expected.initial_parameters,
-            expected: &expected.commit.adamw,
+            expected: &first_commit.adamw,
         },
-        expected.commit.microbatch_count,
+        first_commit.microbatch_count,
         expected.active_coordinate_count,
         PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
-            learning_rate: expected.learning_rate,
-            recurrence_ulp_tolerance: 2,
+            learning_rate: expected.learning_rates[0],
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::SuccessorUlps(2),
         },
     );
     assert_policy_window_report(
         "strict-native GELU first window",
         native_third.window_loss_report().unwrap(),
-        &expected.commit,
+        first_commit,
+    );
+    let native_first_parameters = native.parameter_snapshots().unwrap();
+    let native_first_first_moments = native.first_moment_snapshots().unwrap();
+    let native_first_second_moments = native.second_moment_snapshots().unwrap();
+    assert_policy_accumulators_are_positive_zero(&native);
+
+    let native_fourth = native.step_scheduled(policy_frontier_batch(4)).unwrap();
+    assert!(!native_fourth.did_update());
+    assert_native_policy_step(&native_fourth, &expected.replays[3]);
+    assert_eq!(native_fourth.report().successful_invocation(), 4);
+    assert_native_policy_progress(&native, 4, 1, 1, 5);
+    assert_eq!(
+        native.parameter_snapshots().unwrap(),
+        native_first_parameters
+    );
+    assert_eq!(
+        native.first_moment_snapshots().unwrap(),
+        native_first_first_moments
+    );
+    assert_eq!(
+        native.second_moment_snapshots().unwrap(),
+        native_first_second_moments
+    );
+    assert_pytorch_tensor_map_close(
+        "strict-native GELU replay 4 pending numerator gradient",
+        &native.gradient_accumulator_snapshots().unwrap(),
+        &expected.replays[3].numerator_gradients,
+    );
+
+    let native_second_pending_checkpoint = native.checkpoint().unwrap();
+    assert_policy_pending_checkpoint(
+        "strict-native GELU replay 4 pending",
+        &native_second_pending_checkpoint,
+        second_pending,
+    );
+
+    let native_second_restored_plan = plan
+        .restore_checkpoint(&native_second_pending_checkpoint)
+        .unwrap();
+    assert_eq!(
+        native_second_restored_plan.capture_identity(),
+        plan.capture_identity()
+    );
+    assert_eq!(compile_count.get(), 1);
+    let mut native_second_resumed = native_second_restored_plan.prepare(&native_target).unwrap();
+    assert_native_policy_preparation(&native_second_resumed);
+    assert_eq!(
+        native_second_resumed.checkpoint().unwrap(),
+        native_second_pending_checkpoint
+    );
+    assert_eq!(
+        native_second_resumed.parameter_snapshots().unwrap(),
+        native_first_parameters
+    );
+    assert_eq!(
+        native_second_resumed.first_moment_snapshots().unwrap(),
+        native_first_first_moments
+    );
+    assert_eq!(
+        native_second_resumed.second_moment_snapshots().unwrap(),
+        native_first_second_moments
+    );
+
+    let native_fifth = native.step_scheduled(policy_frontier_batch(5)).unwrap();
+    let native_resumed_fifth = native_second_resumed
+        .step_scheduled(policy_frontier_batch(5))
+        .unwrap();
+    for step in [&native_fifth, &native_resumed_fifth] {
+        assert!(!step.did_update());
+        assert_native_policy_step(step, &expected.replays[4]);
+    }
+    assert_eq!(native_fifth.report().successful_invocation(), 5);
+    assert_eq!(native_resumed_fifth.report().successful_invocation(), 1);
+    assert_compiled_adamw_steps_exact(
+        "strict-native GELU replay 5 restore",
+        &native_resumed_fifth,
+        &native_fifth,
+    );
+    assert_native_policy_progress(&native, 5, 1, 2, 8);
+    assert_native_policy_progress(&native_second_resumed, 5, 1, 2, 8);
+
+    let native_sixth = native.step_scheduled(policy_frontier_batch(6)).unwrap();
+    let native_resumed_sixth = native_second_resumed
+        .step_scheduled(policy_frontier_batch(6))
+        .unwrap();
+    for step in [&native_sixth, &native_resumed_sixth] {
+        assert!(step.did_update());
+        assert_native_policy_step(step, &expected.replays[5]);
+    }
+    assert_eq!(native_sixth.report().successful_invocation(), 6);
+    assert_eq!(native_resumed_sixth.report().successful_invocation(), 2);
+    assert_compiled_adamw_steps_exact(
+        "strict-native GELU replay 6 restore",
+        &native_resumed_sixth,
+        &native_sixth,
+    );
+    assert_native_policy_progress(&native, 6, 2, 0, 0);
+    assert_native_policy_progress(&native_second_resumed, 6, 2, 0, 0);
+    assert_eq!(
+        native_second_resumed.checkpoint().unwrap(),
+        native.checkpoint().unwrap()
+    );
+    assert_policy_accumulators_are_positive_zero(&native);
+    assert_policy_accumulators_are_positive_zero(&native_second_resumed);
+
+    assert_pytorch_adamw_window_for_frontier(
+        "strict-native GELU second window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 2,
+            clip_report: native_sixth.clip_report().unwrap(),
+            actual_initial: &native_first_parameters,
+            actual_first_moments: &native.first_moment_snapshots().unwrap(),
+            actual_second_moments: &native.second_moment_snapshots().unwrap(),
+            actual_successors: &native.parameter_snapshots().unwrap(),
+            expected_initial: &first_commit.adamw.parameter_successors,
+            expected: &second_commit.adamw,
+        },
+        second_commit.microbatch_count,
+        expected.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: expected.learning_rates[1],
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::SuccessorUlps(2),
+        },
+    );
+    assert_policy_window_report(
+        "strict-native GELU second window",
+        native_sixth.window_loss_report().unwrap(),
+        second_commit,
     );
     assert_eq!(compile_count.get(), 1);
     assert_eq!(model.state_dict().unwrap(), state_before);
@@ -10320,7 +10614,7 @@ fn compiled_two_block_policy_frontier_matches_pytorch_across_resume_and_flush() 
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
             learning_rate: first_expected.learning_rate,
-            recurrence_ulp_tolerance: 0,
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::Exact,
         },
     );
     assert_policy_window_report(
@@ -10425,7 +10719,7 @@ fn compiled_two_block_policy_frontier_matches_pytorch_across_resume_and_flush() 
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
             learning_rate: second_expected.learning_rate,
-            recurrence_ulp_tolerance: 0,
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::Exact,
         },
     );
     assert_policy_window_report(
@@ -10484,7 +10778,7 @@ fn compiled_two_block_policy_frontier_matches_pytorch_across_resume_and_flush() 
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
             learning_rate: policy.partial_flush.learning_rate,
-            recurrence_ulp_tolerance: 0,
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::Exact,
         },
     );
     assert_policy_window_report(
@@ -10664,7 +10958,7 @@ fn compiled_two_block_policy_frontier_matches_pytorch_on_strict_native_cpu() {
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
             learning_rate: first_expected.learning_rate,
-            recurrence_ulp_tolerance: 2,
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::SuccessorUlps(2),
         },
     );
     assert_policy_window_report(
@@ -10889,7 +11183,7 @@ fn compiled_two_block_policy_frontier_matches_pytorch_on_strict_native_cpu() {
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
             learning_rate: second_expected.learning_rate,
-            recurrence_ulp_tolerance: 2,
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::SuccessorUlps(2),
         },
     );
     assert_policy_window_report(
@@ -10968,7 +11262,7 @@ fn compiled_two_block_policy_frontier_matches_pytorch_on_strict_native_cpu() {
             parameter_names: &analytic_gauge_null_parameters,
             optimizer: &optimizer,
             learning_rate: policy.partial_flush.learning_rate,
-            recurrence_ulp_tolerance: 2,
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::SuccessorUlps(2),
         },
     );
     assert_policy_window_report(
