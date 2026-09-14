@@ -1122,7 +1122,7 @@ Preparation has one ordered, fail-closed pipeline:
 | Bindings | External and recurrent pointers exist only for the synchronous call. |
 | Output initialization | Proven dense full writers skip the retained clear; reduction, scatter, prefix-scan, and unknown families retain conservative zero filling. |
 | Dispatch | Admitted contiguous tape segments call existing module entries; ineligible entries retain the conservative per-item path. |
-| Segment barriers | A segment closes before physical output-slot reuse or a Rust-prepared affine input that depends on an output inside the open segment. This prevents clearing a live value or deriving an input before its producer runs. |
+| Segment barriers | A segment closes before physical output-slot reuse or a module change. A derived Copy/Affine input whose source is produced inside the open segment is instead a sealed, prevalidated action immediately before its first consumer in the same dispatcher call; cross-module derivations retain Rust preparation. |
 | Ordering and failures | The segment count is the actual Rust-to-C call count; logical order and exact failing-item attribution do not change. |
 
 Each prepared recurrent program seals its validated RGSM identity, pure

@@ -291,10 +291,36 @@ fn render_schedule_module_chunk(
     }
     if include_dispatcher {
         source.push_str(
-            "typedef int (*rg_schedule_entry_fn)(void **,const int64_t *,uint64_t *);\n\
-typedef struct { rg_schedule_entry_fn entry; void **buffers; const int64_t *symbols; } rg_schedule_call;\n\
+            "#include <stddef.h>\n#include <stdint.h>\n#include <string.h>\n\
+typedef int (*rg_schedule_entry_fn)(void **,const int64_t *,uint64_t *);\n\
+typedef struct { size_t extent; size_t divisor; size_t stride; size_t reversed; } rg_schedule_axis;\n\
+enum { RG_SCHEDULE_COPY=0, RG_SCHEDULE_AFFINE=1 };\n\
+typedef struct { size_t kind; const void *source; void *target; size_t width; size_t elements; size_t offset; const rg_schedule_axis *axes; size_t axis_count; } rg_schedule_action;\n\
+typedef struct { rg_schedule_entry_fn entry; void **buffers; const int64_t *symbols; const rg_schedule_action *actions; size_t action_count; } rg_schedule_call;\n\
+static int rg_schedule_apply(const rg_schedule_action *action){\n\
+  if(action->kind==RG_SCHEDULE_COPY){\n\
+    if(action->elements!=0)memmove(action->target,action->source,action->elements*action->width);\n\
+    return 0;\n\
+  }\n\
+  if(action->kind!=RG_SCHEDULE_AFFINE)return 4;\n\
+  for(size_t logical=0;logical<action->elements;logical++){\n\
+    size_t physical=action->offset;\n\
+    for(size_t axis=0;axis<action->axis_count;axis++){\n\
+      const rg_schedule_axis *term=&action->axes[axis];\n\
+      size_t coordinate=(logical/term->divisor)%term->extent;\n\
+      if(term->reversed)coordinate=term->extent-1-coordinate;\n\
+      physical+=coordinate*term->stride;\n\
+    }\n\
+    memcpy((unsigned char*)action->target+logical*action->width,(const unsigned char*)action->source+physical*action->width,action->width);\n\
+  }\n\
+  return 0;\n\
+}\n\
 int rustgrad_schedule_dispatch(rg_schedule_call *calls,size_t count,uint64_t *failure){\n\
   for(size_t i=0;i<count;i++){\n\
+    for(size_t action=0;action<calls[i].action_count;action++){\n\
+      int status=rg_schedule_apply(&calls[i].actions[action]);\n\
+      if(status!=0){failure[0]=(uint64_t)i;failure[1]=UINT64_MAX;failure[2]=0;return status;}\n\
+    }\n\
     uint64_t local[2]={UINT64_MAX,0};\n\
     int status=calls[i].entry(calls[i].buffers,calls[i].symbols,local);\n\
     if(status!=0){failure[0]=(uint64_t)i;failure[1]=local[0];failure[2]=local[1];return status;}\n\
@@ -312,7 +338,7 @@ pub(super) fn render_schedule_module_source(rendered: &[RenderedC]) -> String {
 }
 
 pub(super) fn schedule_module_manifest(rendered: &[RenderedC]) -> String {
-    let mut manifest = format!("rustgrad-c11-schedule-module-v3\u{1f}{}", rendered.len());
+    let mut manifest = format!("rustgrad-c11-schedule-module-v4\u{1f}{}", rendered.len());
     for helper in C11LocalHelper::ALL {
         manifest.push('\u{1f}');
         manifest.push_str(helper.name());
@@ -327,7 +353,7 @@ pub(super) fn schedule_module_manifest(rendered: &[RenderedC]) -> String {
 }
 
 pub(crate) fn schedule_module_cache_key(rendered: &[RenderedC]) -> String {
-    native_cache_key("schedule-module-v3", &schedule_module_manifest(rendered))
+    native_cache_key("schedule-module-v4", &schedule_module_manifest(rendered))
 }
 
 fn compile_translation_unit(

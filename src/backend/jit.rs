@@ -865,14 +865,18 @@ impl PreparedScheduleSegment {
 
     pub(crate) fn execute_authenticated(
         &self,
+        materializations: &[crate::cpu_jit::NativeDispatchMaterialization],
         buffers: &mut [JitBuffer],
         borrowed: Option<&mut BTreeMap<usize, crate::cpu_jit::BorrowedJitBuffer<'_>>>,
         scratch: &mut crate::cpu_jit::JitScheduleDispatchScratch,
     ) -> Result<(), PreparedScheduleDispatchFailure> {
         self.dispatcher
             .call_prepared(
-                self.entries.len(),
-                self.pointer_count,
+                crate::cpu_jit::NativeScheduleDispatchPlan::new(
+                    self.entries.len(),
+                    self.pointer_count,
+                    materializations,
+                ),
                 buffers,
                 borrowed,
                 scratch,
