@@ -1241,10 +1241,6 @@ impl SealedPlannedNativeItems {
         self.plan.schedule_cache_keys()
     }
 
-    pub(super) fn retained_recurrent_states(&self) -> &[NativeRecurrentStateRetention] {
-        self.plan.retained_recurrent_states()
-    }
-
     pub(super) fn module_preparation(&self) -> crate::backend::NativeScheduleModulePreparation {
         self.plan.module_preparation()
     }

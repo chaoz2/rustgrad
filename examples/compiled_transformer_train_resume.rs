@@ -1807,6 +1807,10 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     const MANDATORY_REPLACED_RECURRENT_STATES: u64 = 4;
     const EXPECTED_MAIN_RENDERED_ENTRIES: usize = 787 - EXPECTED_ADAMW_UPDATE_GROUPS * 3;
     const EXPECTED_ACCUMULATION_RENDERED_ENTRIES: usize = 465;
+    const EXPECTED_MAIN_EXECUTED_ENTRIES: u64 = 681;
+    const EXPECTED_ACCUMULATION_EXECUTED_ENTRIES: u64 = 358;
+    const EXPECTED_RECURRENT_STATES: usize = 145;
+    const EXPECTED_RECURRENT_BYTES: u64 = 1_924;
     const EXPECTED_SHARED_ACCUMULATION_PREFIX: usize = 319;
     const EXPECTED_COLD_COMPILER_PROCESSES: usize = 6;
     // One accumulator per update group, plus loss numerator, index, and token count.
@@ -1852,6 +1856,14 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(
         u64::try_from(inspection.recurrent_state_count())?,
         GUARANTEED_RETAINED_RECURRENT_STATES + REMAINING_RECURRENT_STATES
+    );
+    assert_eq!(
+        inspection.recurrent_state_count(),
+        EXPECTED_RECURRENT_STATES
+    );
+    assert_eq!(
+        u64::try_from(inspection.recurrent_state_bytes())?,
+        EXPECTED_RECURRENT_BYTES
     );
 
     let executor = CapturedReplayExecutor::default();
@@ -2131,6 +2143,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         .checked_sub(1)
         .expect("the main program has one nonexecuted native entry");
     assert_eq!(executed_native_items, expected_executed_native_items);
+    assert_eq!(executed_native_items, EXPECTED_MAIN_EXECUTED_ENTRIES);
     assert_eq!(
         report.main().rendered_entry_count(),
         expected_main_rendered_entries
@@ -2349,6 +2362,10 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let accumulation_executed = report
         .accumulation_replay_executed_native_item_count()
         .expect("phase-specialized scoreboard reports accumulation execution");
+    assert_eq!(
+        accumulation_executed,
+        EXPECTED_ACCUMULATION_EXECUTED_ENTRIES
+    );
     assert_eq!(
         Some(usize::try_from(accumulation_executed)?),
         stable_accumulation_executed_native_items

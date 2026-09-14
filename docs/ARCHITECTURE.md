@@ -1126,7 +1126,8 @@ Preparation has one ordered, fail-closed pipeline:
 | Ordering and failures | The segment count is the actual Rust-to-C call count; logical order and exact failing-item attribution do not change. |
 
 Each prepared recurrent program seals its validated RGSM identity, pure
-cache/layout inventory, replacement map, and initial frontier descriptor once.
+cache/layout inventory, canonical ordinal bank/input/replacement layout,
+ordered retain modes, retained counts/bytes, and initial frontier descriptor once.
 Main, accumulation, partial-flush, and `zero_grad` hot replay repeats only
 call-dependent cursor, input, active-bank, quantized-index, successor, and
 transaction admission. Generic artifact replay retains full per-call artifact

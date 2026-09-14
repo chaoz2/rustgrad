@@ -29,6 +29,7 @@ struct PreparedReplayValidationCounts {
     mixed_capture_validations: usize,
     schedule_rekeys: usize,
     identity_serializations: usize,
+    recurrent_bank_layouts: usize,
 }
 
 #[cfg(test)]
@@ -39,8 +40,16 @@ std::thread_local! {
                 mixed_capture_validations: 0,
                 schedule_rekeys: 0,
                 identity_serializations: 0,
+                recurrent_bank_layouts: 0,
             })
         };
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static INDEXED_RECURRENT_BANK_BINDINGS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 #[cfg(test)]
@@ -55,11 +64,17 @@ fn record_prepared_replay_validation(update: impl FnOnce(&mut PreparedReplayVali
 #[cfg(test)]
 fn reset_prepared_replay_validation_counts() {
     PREPARED_REPLAY_VALIDATION_COUNTS.with(|counts| counts.set(Default::default()));
+    INDEXED_RECURRENT_BANK_BINDINGS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
 fn prepared_replay_validation_counts() -> PreparedReplayValidationCounts {
     PREPARED_REPLAY_VALIDATION_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn indexed_recurrent_bank_binding_count() -> usize {
+    INDEXED_RECURRENT_BANK_BINDINGS.with(std::cell::Cell::get)
 }
 
 fn requested_materializations(capture: &CapturedSchedule) -> Vec<u64> {
@@ -240,7 +255,7 @@ impl<'a> NativeReplayContext<'a> {
     {
         let Self { executor, prepared } = self;
         prepared.validate_cursor(cursor)?;
-        let current = cursor.frontier.clone();
+        let current = &cursor.frontier;
         let next = current
             .iter()
             .cloned()
@@ -257,37 +272,46 @@ impl<'a> NativeReplayContext<'a> {
             plan,
             pure,
             requested,
-            replacements,
+            banks: bank_layout,
         } = prepared;
         let all_requested = requested.as_slice();
         let requested = selected_requested.unwrap_or(all_requested);
         validate_requested_selection(all_requested, requested)?;
-        let retained = plan
-            .retained_recurrent_states()
-            .iter()
-            .map(|state| state.state_buffer)
-            .collect::<BTreeSet<_>>();
-        replacements.validate_external_inputs(provided)?;
+        bank_layout.validate_external_inputs(provided)?;
         let public = requested.iter().copied().collect::<BTreeSet<_>>();
         let staged = runtime.transact_recurrent_native_banks_retaining(
-            &current,
+            current,
             &next,
-            &retained,
+            &bank_layout.modes,
             |banks| {
                 let (mut values, traffic, executor_wall_time) = {
-                    let mut active = BTreeMap::new();
-                    let mut inactive = BTreeMap::new();
-                    for bank in banks.iter_mut() {
-                        let buffer = bank.buffer_id();
-                        if bank.is_retained() {
-                            active.insert(buffer, bank.successor());
+                    if banks.len() != bank_layout.banks.len() {
+                        return Err(ReplayError::Corrupt(
+                            "prepared recurrent bank cardinality mismatch".into(),
+                        ));
+                    }
+                    let bank_count = banks.len();
+                    let mut active = Vec::with_capacity(bank_count);
+                    let mut inactive = Vec::with_capacity(bank_count);
+                    for (ordinal, (bank, binding)) in
+                        banks.iter_mut().zip(bank_layout.banks.iter()).enumerate()
+                    {
+                        let mode = bank_layout.validate_bank(ordinal, bank, binding)?;
+                        if matches!(mode, crate::effects::runtime::RecurrentBankMode::Retain) {
+                            active.push(bank.successor());
+                            inactive.push(None);
                         } else {
                             let (current, successor) = bank.tensors();
-                            active.insert(buffer, current);
-                            inactive.insert(buffer, successor);
+                            active.push(current);
+                            inactive.push(Some(successor));
                         }
                     }
+                    #[cfg(test)]
+                    INDEXED_RECURRENT_BANK_BINDINGS.with(|count| {
+                        count.set(count.get().saturating_add(bank_count));
+                    });
                     let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
+                    let mut input_ordinal = 0usize;
                     let executor_started = Instant::now();
                     let executed = executor.execute_sealed_planned_native_items_resolved(
                         pure,
@@ -295,24 +319,31 @@ impl<'a> NativeReplayContext<'a> {
                         &mut borrowed,
                         Some(&public),
                         |workspace, borrowed| {
-                            for replacement in &replacements.replacements {
-                                if retained.contains(&replacement.buffer) {
+                            for (ordinal, (binding, mode)) in bank_layout
+                                .banks
+                                .iter()
+                                .zip(bank_layout.modes.iter())
+                                .enumerate()
+                            {
+                                if matches!(
+                                    mode,
+                                    crate::effects::runtime::RecurrentBankMode::Retain
+                                ) {
                                     continue;
                                 }
-                                let successor =
-                                    inactive.remove(&replacement.buffer).ok_or_else(|| {
-                                        ReplayError::Missing(format!(
-                                            "recurrent successor state {}",
-                                            replacement.buffer
-                                        ))
-                                    })?;
+                                let successor = inactive[ordinal].take().ok_or_else(|| {
+                                    ReplayError::Missing(format!(
+                                        "recurrent successor state {}",
+                                        binding.initial.buffer
+                                    ))
+                                })?;
                                 workspace.borrow_recurrent_output(
-                                    replacement.producer,
+                                    binding.replacement.producer,
                                     successor,
                                     borrowed,
                                 )?;
                             }
-                            if !inactive.is_empty() {
+                            if inactive.iter().any(Option::is_some) {
                                 return Err(ReplayError::Corrupt(
                                     "recurrent successor binding set mismatch".into(),
                                 ));
@@ -320,34 +351,53 @@ impl<'a> NativeReplayContext<'a> {
                             Ok(())
                         },
                         |input, workspace, borrowed| {
-                            if let Some(buffer) = replacements.state_inputs.get(&input.name) {
-                                let value = active.get(buffer).copied().ok_or_else(|| {
-                                    ReplayError::Missing(format!("recurrent input state {buffer}"))
+                            let binding =
+                                bank_layout.inputs.get(input_ordinal).ok_or_else(|| {
+                                    ReplayError::Corrupt(
+                                        "prepared recurrent input ordinal is absent".into(),
+                                    )
                                 })?;
-                                super::captured_replay::validate_input_value(pure, input, value)?;
-                                workspace.borrow_recurrent_input(&input.name, value, borrowed)?;
-                            } else {
-                                let value = provided
+                            input_ordinal = input_ordinal.checked_add(1).ok_or_else(|| {
+                                ReplayError::Corrupt(
+                                    "prepared recurrent input ordinal overflow".into(),
+                                )
+                            })?;
+                            let value = match binding.source {
+                                PreparedRecurrentInputSource::State { ordinal } => {
+                                    active.get(ordinal).copied().ok_or_else(|| {
+                                        ReplayError::Missing(format!(
+                                            "recurrent input state ordinal {ordinal}"
+                                        ))
+                                    })?
+                                }
+                                PreparedRecurrentInputSource::External => provided
                                     .get(&input.name)
-                                    .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
-                                super::captured_replay::validate_input_value(pure, input, value)?;
-                                workspace.bind_external_input(&input.name, value, borrowed)?;
+                                    .ok_or_else(|| ReplayError::Missing(input.name.clone()))?,
+                            };
+                            super::captured_replay::validate_input_value(pure, input, value)?;
+                            match binding.source {
+                                PreparedRecurrentInputSource::State { .. } => workspace
+                                    .borrow_recurrent_input(&input.name, value, borrowed)?,
+                                PreparedRecurrentInputSource::External => {
+                                    workspace.bind_external_input(&input.name, value, borrowed)?;
+                                }
                             }
                             Ok(())
                         },
                     );
                     let executor_wall_time = executor_started.elapsed();
                     let (values, traffic) = executed?;
+                    if input_ordinal != bank_layout.inputs.len() {
+                        return Err(ReplayError::Corrupt(
+                            "prepared recurrent input cardinality mismatch".into(),
+                        ));
+                    }
                     (values, traffic, executor_wall_time)
                 };
                 let outputs = requested
                     .iter()
                     .map(|id| {
-                        if replacements
-                            .replacements
-                            .iter()
-                            .any(|replacement| replacement.producer == *id)
-                        {
+                        if bank_layout.successor_outputs.contains(id) {
                             // A public state successor was materialized as an
                             // independent snapshot; preserve it while the inactive
                             // recurrent bank becomes authoritative.
@@ -357,63 +407,29 @@ impl<'a> NativeReplayContext<'a> {
                         }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let successor_values = replacements
-                    .replacements
+                let successor_values = banks
                     .iter()
-                    .map(|replacement| {
-                        banks
-                            .iter()
-                            .find(|bank| bank.buffer_id() == replacement.buffer)
-                            .map(|bank| bank.successor())
-                            .ok_or_else(|| {
-                                ReplayError::Missing(format!(
-                                    "recurrent successor state {}",
-                                    replacement.buffer
-                                ))
-                            })
+                    .zip(bank_layout.banks.iter())
+                    .enumerate()
+                    .map(|(ordinal, (bank, binding))| {
+                        bank_layout.validate_bank(ordinal, bank, binding)?;
+                        Ok(bank.successor())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 validate_transition(&outputs, &successor_values).map_err(ReplayError::Execute)?;
                 if let Some(step) = injected_failure
-                    && replacements
-                        .replacements
-                        .iter()
-                        .any(|replacement| replacement.step == step)
+                    && bank_layout.replacement_steps.contains(&step)
                 {
                     return Err(ReplayError::Execute(format!(
                         "recurrent commit: {:?}",
                         crate::RuntimeError::InjectedFailure(step)
                     )));
                 }
-                let retained_state_count = u64::try_from(retained.len()).map_err(|_| {
-                    ReplayError::Corrupt("retained recurrent state count exceeds u64".into())
-                })?;
-                let retained_state_bytes = current
-                    .iter()
-                    .filter(|state| retained.contains(&state.buffer))
-                    .try_fold(0u64, |total, state| {
-                        total
-                            .checked_add(u64::try_from(state.bytes).map_err(|_| {
-                                ReplayError::Corrupt(
-                                    "retained recurrent state bytes exceed u64".into(),
-                                )
-                            })?)
-                            .ok_or_else(|| {
-                                ReplayError::Corrupt(
-                                    "retained recurrent state bytes overflow".into(),
-                                )
-                            })
-                    })?;
                 let mut traffic = traffic;
-                if !retained.is_empty() {
-                    traffic.retained_recurrent_state_count = retained_state_count;
-                    traffic.retained_recurrent_state_bytes = retained_state_bytes;
-                    traffic.replaced_recurrent_state_count = u64::try_from(
-                        current.len().saturating_sub(retained.len()),
-                    )
-                    .map_err(|_| {
-                        ReplayError::Corrupt("replaced recurrent state count exceeds u64".into())
-                    })?;
+                if bank_layout.retained_count != 0 {
+                    traffic.retained_recurrent_state_count = bank_layout.retained_count;
+                    traffic.retained_recurrent_state_bytes = bank_layout.retained_bytes;
+                    traffic.replaced_recurrent_state_count = bank_layout.replaced_count;
                     traffic.replaced_recurrent_state_bytes =
                         traffic.borrowed_recurrent_output_bytes;
                 }
@@ -479,7 +495,7 @@ pub(crate) struct PreparedRecurrentNativeReplay {
     plan: super::captured_replay::SealedPlannedNativeItems,
     pure: CapturedSchedule,
     requested: Vec<u64>,
-    replacements: PreparedRecurrentReplacementPlan,
+    banks: PreparedRecurrentBankLayout,
 }
 
 pub(crate) struct RecurrentNativePreparation {
@@ -554,6 +570,48 @@ struct PreparedRecurrentReplacementPlan {
     replacements: Vec<PreparedRecurrentReplacement>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PreparedRecurrentInputSource {
+    External,
+    State { ordinal: usize },
+}
+
+#[derive(Clone, Debug)]
+struct PreparedRecurrentInputBinding {
+    source: PreparedRecurrentInputSource,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedRecurrentBankBinding {
+    initial: BufferState,
+    replacement: PreparedRecurrentReplacement,
+}
+
+/// Immutable projection from canonical frontier ordinals to replay bindings.
+/// It owns descriptors and indices only; leases, generations, tensors, and
+/// pointers remain call-scoped and are revalidated by `EffectRuntime`.
+#[derive(Clone, Debug)]
+struct PreparedRecurrentBankLayout {
+    inputs: Box<[PreparedRecurrentInputBinding]>,
+    banks: Box<[PreparedRecurrentBankBinding]>,
+    modes: Box<[crate::effects::runtime::RecurrentBankMode]>,
+    retained_count: u64,
+    retained_bytes: u64,
+    replaced_count: u64,
+    successor_outputs: BTreeSet<u64>,
+    replacement_steps: BTreeSet<u64>,
+    external_inputs: BTreeSet<String>,
+}
+
+#[cfg(test)]
+pub(crate) struct RecurrentBankLayoutEvidence {
+    pub(crate) buffers: Vec<u64>,
+    pub(crate) input_ordinals: Vec<usize>,
+    pub(crate) retained: Vec<bool>,
+    pub(crate) retained_count: u64,
+    pub(crate) retained_bytes: u64,
+}
+
 impl PreparedRecurrentNativeReplay {
     fn new(
         trace: NativeMixedPreparationTrace,
@@ -565,6 +623,11 @@ impl PreparedRecurrentNativeReplay {
         replacements.authenticate_recurrent_store_groups(plan.recurrent_store_groups())?;
         replacements
             .authenticate_retained_recurrent_states(&pure, plan.retained_recurrent_states())?;
+        let banks = PreparedRecurrentBankLayout::new(
+            &pure,
+            replacements,
+            plan.retained_recurrent_states(),
+        )?;
         let plan = plan.seal(&pure)?;
         if trace.item_count != plan.item_count()
             || trace.cache_hit_count != plan.cache_hit_count()
@@ -583,7 +646,7 @@ impl PreparedRecurrentNativeReplay {
             plan,
             pure,
             requested,
-            replacements,
+            banks,
         })
     }
 
@@ -610,16 +673,53 @@ impl PreparedRecurrentNativeReplay {
 
     #[cfg(test)]
     pub(crate) fn retained_recurrent_state_count(&self) -> usize {
-        self.plan.retained_recurrent_states().len()
+        usize::try_from(self.banks.retained_count)
+            .expect("prepared retained-state count was checked from usize")
     }
 
     #[cfg(test)]
     pub(crate) fn retained_recurrent_state_buffers(&self) -> BTreeSet<u64> {
-        self.plan
-            .retained_recurrent_states()
+        self.banks
+            .banks
             .iter()
-            .map(|state| state.state_buffer)
+            .zip(self.banks.modes.iter())
+            .filter_map(|(binding, mode)| {
+                matches!(mode, crate::effects::runtime::RecurrentBankMode::Retain)
+                    .then_some(binding.initial.buffer)
+            })
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recurrent_bank_layout_evidence(&self) -> RecurrentBankLayoutEvidence {
+        let buffers = self
+            .banks
+            .banks
+            .iter()
+            .map(|binding| binding.initial.buffer)
+            .collect();
+        let input_ordinals = self
+            .banks
+            .inputs
+            .iter()
+            .filter_map(|binding| match binding.source {
+                PreparedRecurrentInputSource::External => None,
+                PreparedRecurrentInputSource::State { ordinal } => Some(ordinal),
+            })
+            .collect();
+        let retained = self
+            .banks
+            .modes
+            .iter()
+            .map(|mode| matches!(mode, crate::effects::runtime::RecurrentBankMode::Retain))
+            .collect();
+        RecurrentBankLayoutEvidence {
+            buffers,
+            input_ordinals,
+            retained,
+            retained_count: self.banks.retained_count,
+            retained_bytes: self.banks.retained_bytes,
+        }
     }
 
     #[cfg(test)]
@@ -653,16 +753,13 @@ impl PreparedRecurrentNativeReplay {
                 "recurrent cursor belongs to a different mixed capture".into(),
             ));
         }
-        if cursor.frontier.len() != self.replacements.initial_frontier.len() {
+        if cursor.frontier.len() != self.banks.banks.len() {
             return Err(ReplayError::Descriptor(
                 "recurrent cursor state frontier is incomplete".into(),
             ));
         }
-        for (actual, initial) in cursor
-            .frontier
-            .iter()
-            .zip(&self.replacements.initial_frontier)
-        {
+        for (actual, initial) in cursor.frontier.iter().zip(self.banks.banks.iter()) {
+            let initial = &initial.initial;
             if actual.buffer != initial.buffer
                 || actual.version < initial.version
                 || actual.shape != initial.shape
@@ -696,6 +793,169 @@ impl PreparedRecurrentNativeReplay {
     #[cfg(test)]
     pub(crate) fn structure_validation_count(&self) -> usize {
         self.plan.structure_validation_count()
+    }
+}
+
+impl PreparedRecurrentBankLayout {
+    fn validate_bank(
+        &self,
+        ordinal: usize,
+        bank: &crate::host_buffer::HostBufferBank<'_>,
+        binding: &PreparedRecurrentBankBinding,
+    ) -> Result<crate::effects::runtime::RecurrentBankMode, ReplayError> {
+        let mode =
+            self.modes.get(ordinal).copied().ok_or_else(|| {
+                ReplayError::Corrupt("prepared recurrent bank mode is absent".into())
+            })?;
+        if bank.ordinal() != ordinal
+            || bank.buffer_id() != binding.initial.buffer
+            || bank.is_retained()
+                != matches!(mode, crate::effects::runtime::RecurrentBankMode::Retain)
+        {
+            return Err(ReplayError::Corrupt(
+                "prepared recurrent bank order mismatch".into(),
+            ));
+        }
+        Ok(mode)
+    }
+
+    fn new(
+        pure: &CapturedSchedule,
+        replacements: PreparedRecurrentReplacementPlan,
+        retained: &[super::captured_replay::NativeRecurrentStateRetention],
+    ) -> Result<Self, ReplayError> {
+        let PreparedRecurrentReplacementPlan {
+            external_inputs,
+            state_inputs,
+            initial_frontier,
+            replacements,
+        } = replacements;
+        if initial_frontier.len() != replacements.len() {
+            return Err(ReplayError::Corrupt(
+                "prepared recurrent bank cardinality mismatch".into(),
+            ));
+        }
+        let retained = retained
+            .iter()
+            .map(|state| state.state_buffer)
+            .collect::<BTreeSet<_>>();
+        let retained_count = u64::try_from(retained.len()).map_err(|_| {
+            ReplayError::Corrupt("retained recurrent state count exceeds u64".into())
+        })?;
+        let replaced_count = u64::try_from(
+            initial_frontier
+                .len()
+                .checked_sub(retained.len())
+                .ok_or_else(|| {
+                    ReplayError::Corrupt("retained recurrent state count exceeds frontier".into())
+                })?,
+        )
+        .map_err(|_| ReplayError::Corrupt("replaced recurrent state count exceeds u64".into()))?;
+        let mut retained_bytes = 0u64;
+        let mut modes = Vec::with_capacity(initial_frontier.len());
+        let mut banks = Vec::with_capacity(initial_frontier.len());
+        let mut successor_outputs = BTreeSet::new();
+        let mut replacement_steps = BTreeSet::new();
+        let mut previous_buffer = None;
+        for (initial, replacement) in initial_frontier.into_iter().zip(replacements) {
+            if initial.buffer != replacement.buffer
+                || previous_buffer.is_some_and(|buffer| buffer >= initial.buffer)
+                || !successor_outputs.insert(replacement.producer)
+                || !replacement_steps.insert(replacement.step)
+            {
+                return Err(ReplayError::Corrupt(
+                    "prepared recurrent bank binding mismatch".into(),
+                ));
+            }
+            previous_buffer = Some(initial.buffer);
+            let is_retained = retained.contains(&initial.buffer);
+            if is_retained {
+                retained_bytes = retained_bytes
+                    .checked_add(u64::try_from(initial.bytes).map_err(|_| {
+                        ReplayError::Corrupt("retained recurrent state bytes exceed u64".into())
+                    })?)
+                    .ok_or_else(|| {
+                        ReplayError::Corrupt("retained recurrent state bytes overflow".into())
+                    })?;
+            }
+            modes.push(if is_retained {
+                crate::effects::runtime::RecurrentBankMode::Retain
+            } else {
+                crate::effects::runtime::RecurrentBankMode::Replace
+            });
+            banks.push(PreparedRecurrentBankBinding {
+                initial,
+                replacement,
+            });
+        }
+        if retained.iter().any(|buffer| {
+            banks
+                .binary_search_by_key(buffer, |binding| binding.initial.buffer)
+                .is_err()
+        }) {
+            return Err(ReplayError::Corrupt(
+                "retained recurrent state is absent from the frontier".into(),
+            ));
+        }
+        let mut inputs = Vec::with_capacity(pure.inputs.len());
+        for input in &pure.inputs {
+            let source = match state_inputs.get(&input.name) {
+                Some(buffer) => {
+                    let ordinal = banks
+                        .binary_search_by_key(buffer, |binding| binding.initial.buffer)
+                        .map_err(|_| {
+                            ReplayError::Corrupt(
+                                "prepared recurrent input is absent from the frontier".into(),
+                            )
+                        })?;
+                    PreparedRecurrentInputSource::State { ordinal }
+                }
+                None if external_inputs.contains(&input.name) => {
+                    PreparedRecurrentInputSource::External
+                }
+                None => {
+                    return Err(ReplayError::Corrupt(
+                        "prepared recurrent input binding is absent".into(),
+                    ));
+                }
+            };
+            inputs.push(PreparedRecurrentInputBinding { source });
+        }
+        #[cfg(test)]
+        record_prepared_replay_validation(|counts| {
+            counts.recurrent_bank_layouts = counts.recurrent_bank_layouts.saturating_add(1);
+        });
+        Ok(Self {
+            inputs: inputs.into_boxed_slice(),
+            banks: banks.into_boxed_slice(),
+            modes: modes.into_boxed_slice(),
+            retained_count,
+            retained_bytes,
+            replaced_count,
+            successor_outputs,
+            replacement_steps,
+            external_inputs,
+        })
+    }
+
+    fn validate_external_inputs(
+        &self,
+        provided: &BTreeMap<String, crate::TensorData>,
+    ) -> Result<(), ReplayError> {
+        if let Some(name) = provided
+            .keys()
+            .find(|name| !self.external_inputs.contains(*name))
+        {
+            return Err(ReplayError::Extra(name.clone()));
+        }
+        if let Some(name) = self
+            .external_inputs
+            .iter()
+            .find(|name| !provided.contains_key(*name))
+        {
+            return Err(ReplayError::Missing(name.clone()));
+        }
+        Ok(())
     }
 }
 
@@ -924,26 +1184,6 @@ impl PreparedRecurrentReplacementPlan {
             initial_frontier: frontier,
             replacements,
         })
-    }
-
-    fn validate_external_inputs(
-        &self,
-        provided: &BTreeMap<String, crate::TensorData>,
-    ) -> Result<(), ReplayError> {
-        if let Some(name) = provided
-            .keys()
-            .find(|name| !self.external_inputs.contains(*name))
-        {
-            return Err(ReplayError::Extra(name.clone()));
-        }
-        if let Some(name) = self
-            .external_inputs
-            .iter()
-            .find(|name| !provided.contains_key(*name))
-        {
-            return Err(ReplayError::Missing(name.clone()));
-        }
-        Ok(())
     }
 }
 
@@ -2876,6 +3116,13 @@ mod recurrent_tests {
         assert!(sealed_validation_counts.mixed_capture_validations > 0);
         assert!(sealed_validation_counts.schedule_rekeys > 0);
         assert!(sealed_validation_counts.identity_serializations > 0);
+        assert_eq!(sealed_validation_counts.recurrent_bank_layouts, 1);
+        assert_eq!(indexed_recurrent_bank_binding_count(), 0);
+        let layout = prepared.recurrent_bank_layout_evidence();
+        assert_eq!(layout.buffers, vec![321]);
+        assert_eq!(layout.input_ordinals, vec![0]);
+        assert_eq!(layout.retained, vec![false]);
+        assert_eq!((layout.retained_count, layout.retained_bytes), (0, 0));
         assert_eq!(prepared.structure_validation_count(), 1);
         let mut viewed = capture.clone();
         viewed.state_bindings[0].view = Some(crate::AffineView::identity(Shape::from([2])));
@@ -2894,6 +3141,22 @@ mod recurrent_tests {
         let initial_cursor = cursor.clone();
         let initial_values = frontier_values(&runtime, &cursor);
         let initial_runtime_counts = runtime.recurrent_test_counts();
+        let mut wrong_descriptor = cursor.clone();
+        wrong_descriptor.frontier[0].shape = Shape::from([1]);
+        wrong_descriptor.frontier[0].bytes = DType::F32.itemsize();
+        assert!(matches!(
+            NativeReplayContext::new(&executor, &mut prepared).replay_recurrent_checked(
+                &mut runtime,
+                &mut wrong_descriptor,
+                &inputs,
+                None,
+                |_, _| Ok(()),
+            ),
+            Err(ReplayError::Descriptor(message))
+                if message == "recurrent cursor state descriptor mismatch"
+        ));
+        assert_eq!(indexed_recurrent_bank_binding_count(), 0);
+        assert_eq!(runtime.recurrent_test_counts(), initial_runtime_counts);
         let malformed = BTreeMap::from([(
             "delta".into(),
             TensorData::from_storage([1], Storage::F32(vec![1.0])).unwrap(),
@@ -2912,6 +3175,7 @@ mod recurrent_tests {
         assert_eq!(runtime.recurrent_test_counts(), initial_runtime_counts);
         assert_eq!(frontier_values(&runtime, &cursor), initial_values);
         assert_eq!(prepared.structure_validation_count(), 1);
+        assert_eq!(indexed_recurrent_bank_binding_count(), 1);
         let before = runtime.recurrent_test_counts();
         let replay_started = Instant::now();
         let replay = NativeReplayContext::new(&executor, &mut prepared)
@@ -2940,6 +3204,7 @@ mod recurrent_tests {
         assert_eq!(replay.traffic.external_input_import_bytes, 0);
         assert_eq!(replay.traffic.borrowed_recurrent_input_bytes, 8);
         assert_eq!(replay.traffic.borrowed_recurrent_output_bytes, 8);
+        assert_eq!(indexed_recurrent_bank_binding_count(), 2);
         let expected_traffic = replay.traffic;
         assert_eq!(
             prepared_replay_validation_counts(),
@@ -3004,7 +3269,56 @@ mod recurrent_tests {
             sealed_validation_counts,
             "failure and retry must retain the prepared immutable seal"
         );
+        assert_eq!(
+            indexed_recurrent_bank_binding_count(),
+            5,
+            "only callbacks admitted by live runtime validation bind the sealed ordinal bank"
+        );
         assert_eq!(prepared.structure_validation_count(), 1);
+    }
+
+    #[test]
+    fn prepared_recurrent_bank_layout_rejects_noncanonical_ordinals() {
+        let (capture, _runtime) = fixture(330);
+        let replacement = PreparedRecurrentReplacementPlan::from_capture(&capture).unwrap();
+
+        let mut missing = replacement.clone();
+        missing.replacements.clear();
+        assert!(matches!(
+            PreparedRecurrentBankLayout::new(&capture.schedule, missing, &[]),
+            Err(ReplayError::Corrupt(message))
+                if message == "prepared recurrent bank cardinality mismatch"
+        ));
+
+        let mut duplicate = replacement.clone();
+        let mut duplicate_replacement = duplicate.replacements[0].clone();
+        duplicate_replacement.producer += 1;
+        duplicate_replacement.step += 1;
+        duplicate
+            .initial_frontier
+            .push(duplicate.initial_frontier[0].clone());
+        duplicate.replacements.push(duplicate_replacement);
+        assert!(matches!(
+            PreparedRecurrentBankLayout::new(&capture.schedule, duplicate, &[]),
+            Err(ReplayError::Corrupt(message))
+                if message == "prepared recurrent bank binding mismatch"
+        ));
+
+        let mut reordered = replacement;
+        let mut second_state = reordered.initial_frontier[0].clone();
+        second_state.buffer += 1;
+        let mut second_replacement = reordered.replacements[0].clone();
+        second_replacement.buffer = second_state.buffer;
+        second_replacement.producer += 1;
+        second_replacement.step += 1;
+        reordered.initial_frontier.push(second_state);
+        reordered.replacements.push(second_replacement);
+        reordered.replacements.swap(0, 1);
+        assert!(matches!(
+            PreparedRecurrentBankLayout::new(&capture.schedule, reordered, &[]),
+            Err(ReplayError::Corrupt(message))
+                if message == "prepared recurrent bank binding mismatch"
+        ));
     }
 }
 

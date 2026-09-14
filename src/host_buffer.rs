@@ -470,6 +470,10 @@ pub(crate) struct HostBufferBank<'a> {
 }
 
 impl HostBufferBank<'_> {
+    pub(crate) const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
     pub(crate) fn buffer_id(&self) -> u64 {
         self.buffer_id
     }
