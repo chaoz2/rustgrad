@@ -460,7 +460,7 @@ impl<'a> NativeReplayContext<'a> {
         validate_requested_selection(all_requested, requested)?;
         bank_layout.validate_external_inputs(provided)?;
         let public = requested.iter().copied().collect::<BTreeSet<_>>();
-        let staged = runtime.transact_recurrent_native_banks_retaining(
+        let staged = runtime.transact_recurrent_native_full_frontier(
             current,
             &next,
             &bank_layout.modes,
@@ -3284,6 +3284,7 @@ mod recurrent_tests {
         let mut cursor = capture.initial_recurrent_cursor().unwrap();
         let inputs = delta(1.0);
         reset_prepared_replay_validation_counts();
+        crate::host_buffer::reset_host_bank_transaction_test_counts();
         let mut prepared = capture
             .prepare_recurrent_native(&runtime, &cursor, &inputs, &executor, false)
             .unwrap();
@@ -3295,6 +3296,22 @@ mod recurrent_tests {
         assert_eq!(indexed_recurrent_bank_binding_count(), 0);
         let layout = prepared.recurrent_bank_layout_evidence();
         assert_eq!(layout.buffers, vec![321]);
+        assert_eq!(
+            layout.buffers,
+            cursor
+                .frontier()
+                .iter()
+                .map(|state| state.buffer)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            layout.buffers,
+            cursor
+                .frontier()
+                .iter()
+                .map(|state| runtime.slot_identity(state).unwrap().slot)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(layout.input_ordinals, vec![0]);
         assert_eq!(layout.retained, vec![false]);
         assert_eq!((layout.retained_count, layout.retained_bytes), (0, 0));
@@ -3362,6 +3379,15 @@ mod recurrent_tests {
         assert_eq!(
             crate::engine::captured_replay::whole_capture_input_validation_scan_count(),
             0
+        );
+        assert_eq!(
+            crate::host_buffer::host_bank_transaction_test_counts(),
+            crate::host_buffer::HostBankTransactionTestCounts {
+                ordered_full_frontier_transactions: 1,
+                request_map_builds: 0,
+                ordinal_sorts: 0,
+            },
+            "the malformed external input is rejected inside one atomic ordered transaction"
         );
         assert_eq!(indexed_recurrent_bank_binding_count(), 1);
         let before = runtime.recurrent_test_counts();
@@ -3500,6 +3526,10 @@ mod recurrent_tests {
             0,
             "sealed success, failure, and retry must use only prepared input validators"
         );
+        let host_transactions = crate::host_buffer::host_bank_transaction_test_counts();
+        assert_eq!(host_transactions.ordered_full_frontier_transactions, 5);
+        assert_eq!(host_transactions.request_map_builds, 0);
+        assert_eq!(host_transactions.ordinal_sorts, 0);
     }
 
     #[test]

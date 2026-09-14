@@ -16916,8 +16916,17 @@ mod tests {
         let second_moments = native.second_moment_snapshots().unwrap();
         let state_versions = native.inner.inner.plan().unwrap().state_versions;
         crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
+        crate::host_buffer::reset_host_bank_transaction_test_counts();
         let actual = native.step(batch(), lr()).unwrap();
         assert_no_hot_phase_capture_work();
+        assert_eq!(
+            crate::host_buffer::host_bank_transaction_test_counts(),
+            crate::host_buffer::HostBankTransactionTestCounts {
+                ordered_full_frontier_transactions: 1,
+                request_map_builds: 0,
+                ordinal_sorts: 0,
+            }
+        );
         let expected = interpreted.step(batch(), lr()).unwrap();
         assert!(!actual.did_update());
         assert_eq!(actual.capture_identity(), plan.capture_identity());
@@ -19901,6 +19910,7 @@ mod tests {
 
         runtime.restore_checkpoint_in_place(&older).unwrap();
         assert_eq!(runtime.checkpoint().unwrap(), older);
+        crate::host_buffer::reset_host_bank_transaction_test_counts();
         assert_eq!(
             format!("{:?}", runtime.runtime.preparation_report()),
             preparation
@@ -19911,6 +19921,15 @@ mod tests {
         assert_eq!(runtime.runtime.successful_evaluations, 1);
 
         assert!(runtime.zero_grad().unwrap().did_discard());
+        assert_eq!(
+            crate::host_buffer::host_bank_transaction_test_counts(),
+            crate::host_buffer::HostBankTransactionTestCounts {
+                ordered_full_frontier_transactions: 0,
+                request_map_builds: 1,
+                ordinal_sorts: 1,
+            },
+            "zero-grad projects only reset states and retains the generic subset transaction"
+        );
         let reset_replay = runtime.runtime.zero_grad_replay.as_ref().unwrap();
         assert!(reset_replay.last_executed_native_item_count() > 0);
         let reset_dispatch = reset_replay.last_module_dispatch_counts();
@@ -19925,6 +19944,15 @@ mod tests {
                 .flush_partial_window(TensorData::scalar(0.01))
                 .unwrap()
                 .did_update()
+        );
+        assert_eq!(
+            crate::host_buffer::host_bank_transaction_test_counts(),
+            crate::host_buffer::HostBankTransactionTestCounts {
+                ordered_full_frontier_transactions: 1,
+                request_map_builds: 1,
+                ordinal_sorts: 1,
+            },
+            "partial flush uses the canonical full-frontier transaction"
         );
         runtime.restore_checkpoint_in_place(&older).unwrap();
         assert_eq!(runtime.runtime.successful_zero_grads, 1);
@@ -19966,6 +19994,15 @@ mod tests {
         assert_eq!(runtime.runtime.successful_steps, 3);
         assert_eq!(runtime.runtime.successful_evaluations, 2);
         assert_eq!(executor.native_item_plan_count(), native_plan_count * 2);
+        assert_eq!(
+            crate::host_buffer::host_bank_transaction_test_counts(),
+            crate::host_buffer::HostBankTransactionTestCounts {
+                ordered_full_frontier_transactions: 5,
+                request_map_builds: 1,
+                ordinal_sorts: 1,
+            },
+            "restored main, accumulation, and flush use canonical order while reset keeps the subset fallback"
+        );
     }
 
     #[test]
