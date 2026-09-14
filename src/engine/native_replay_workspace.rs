@@ -59,6 +59,64 @@ enum WorkspaceDispatchStep {
     PerItem(usize),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeDispatchSegmentEnd {
+    NonDispatchBoundary,
+    ModuleChange,
+    OutputSlotAlias,
+    DerivedSlotDependency,
+    Terminal,
+}
+
+/// Authenticated reasons why the sealed native dispatch tape contains its
+/// observed number of module segments. Every segment has exactly one ending:
+/// a mutually exclusive split cause or the terminal end of the tape. When
+/// conditions coincide, module change precedes output alias, which precedes a
+/// derived-slot dependency. The reached-module inventory excludes rendered
+/// entries omitted from the tape by authenticated elision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeDispatchSegmentation {
+    pub(crate) segment_count: usize,
+    pub(crate) dispatch_reached_module_count: usize,
+    pub(crate) terminal_segment_count: usize,
+    pub(crate) non_dispatch_boundary_count: usize,
+    pub(crate) module_change_count: usize,
+    pub(crate) output_slot_alias_count: usize,
+    pub(crate) derived_slot_dependency_count: usize,
+}
+
+impl NativeDispatchSegmentation {
+    fn record(&mut self, end: NativeDispatchSegmentEnd) {
+        self.segment_count += 1;
+        let count = match end {
+            NativeDispatchSegmentEnd::NonDispatchBoundary => &mut self.non_dispatch_boundary_count,
+            NativeDispatchSegmentEnd::ModuleChange => &mut self.module_change_count,
+            NativeDispatchSegmentEnd::OutputSlotAlias => &mut self.output_slot_alias_count,
+            NativeDispatchSegmentEnd::DerivedSlotDependency => {
+                &mut self.derived_slot_dependency_count
+            }
+            NativeDispatchSegmentEnd::Terminal => &mut self.terminal_segment_count,
+        };
+        *count += 1;
+    }
+}
+
+fn dispatch_segment_split(
+    crosses_module: bool,
+    output_aliases_slot: bool,
+    derived_depends_on_segment: bool,
+) -> Option<NativeDispatchSegmentEnd> {
+    if crosses_module {
+        Some(NativeDispatchSegmentEnd::ModuleChange)
+    } else if output_aliases_slot {
+        Some(NativeDispatchSegmentEnd::OutputSlotAlias)
+    } else if derived_depends_on_segment {
+        Some(NativeDispatchSegmentEnd::DerivedSlotDependency)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeReplayTraffic {
     pub(crate) external_input_import_count: u64,
@@ -86,6 +144,7 @@ pub(super) struct NativeReplayWorkspace {
     slots: Vec<WorkspaceSlot>,
     items: Vec<WorkspaceItem>,
     dispatch_tape: Arc<[WorkspaceDispatchStep]>,
+    dispatch_segmentation: NativeDispatchSegmentation,
     dispatch_scratch: crate::cpu_jit::JitScheduleDispatchScratch,
     owners: BTreeMap<u64, usize>,
     inputs: Vec<(String, usize)>,
@@ -162,6 +221,7 @@ impl NativeReplayWorkspace {
             slots: Vec::new(),
             items: Vec::with_capacity(items.len()),
             dispatch_tape: Arc::from([]),
+            dispatch_segmentation: NativeDispatchSegmentation::default(),
             dispatch_scratch: crate::cpu_jit::JitScheduleDispatchScratch::with_capacity(0, 0),
             owners: BTreeMap::new(),
             inputs: Vec::with_capacity(capture.inputs.len()),
@@ -1392,9 +1452,11 @@ impl NativeReplayWorkspace {
 
     fn seal_dispatch_tape(&mut self) -> Result<(), ReplayError> {
         let mut steps = Vec::new();
+        let mut segmentation = NativeDispatchSegmentation::default();
         let mut segment = Vec::new();
         let mut segment_slots = BTreeSet::new();
         let mut segment_outputs = BTreeSet::new();
+        let mut reached_module_anchors: Vec<usize> = Vec::new();
         for (index, item) in self.items.iter().enumerate() {
             if item.elided {
                 // An authenticated retained owner or zero-domain output needs
@@ -1409,11 +1471,24 @@ impl NativeReplayWorkspace {
                         &self.items,
                         std::mem::take(&mut segment),
                     )?));
+                    segmentation.record(NativeDispatchSegmentEnd::NonDispatchBoundary);
                     segment_slots.clear();
                     segment_outputs.clear();
                 }
                 steps.push(WorkspaceDispatchStep::PerItem(index));
                 continue;
+            }
+            if !reached_module_anchors.iter().any(|anchor| {
+                let reached = self.items[*anchor]
+                    .dispatch
+                    .as_ref()
+                    .expect("dispatch-reached module anchor has a dispatcher");
+                item.dispatch
+                    .as_ref()
+                    .expect("dispatchable workspace item has a dispatcher")
+                    .shares_dispatcher_with(reached)
+            }) {
+                reached_module_anchors.push(index);
             }
             let derived_depends_on_segment = item.slots.iter().any(|slot| {
                 self.slots[*slot].source.as_ref().is_some_and(|source| {
@@ -1434,17 +1509,21 @@ impl NativeReplayWorkspace {
                     .expect("dispatchable workspace item has a dispatcher")
                     .shares_dispatcher_with(first)
             });
-            if crosses_module
-                || item
-                    .outputs
-                    .iter()
-                    .any(|output| segment_slots.contains(output))
-                || derived_depends_on_segment
-            {
+            let output_aliases_slot = item
+                .outputs
+                .iter()
+                .any(|output| segment_slots.contains(output));
+            let split = dispatch_segment_split(
+                crosses_module,
+                output_aliases_slot,
+                derived_depends_on_segment,
+            );
+            if let Some(split) = split {
                 steps.push(WorkspaceDispatchStep::Segment(seal_workspace_segment(
                     &self.items,
                     std::mem::take(&mut segment),
                 )?));
+                segmentation.record(split);
                 segment_slots.clear();
                 segment_outputs.clear();
             }
@@ -1457,7 +1536,9 @@ impl NativeReplayWorkspace {
                 &self.items,
                 segment,
             )?));
+            segmentation.record(NativeDispatchSegmentEnd::Terminal);
         }
+        segmentation.dispatch_reached_module_count = reached_module_anchors.len();
         let (entries, pointers) = steps
             .iter()
             .filter_map(|step| match step {
@@ -1477,12 +1558,17 @@ impl NativeReplayWorkspace {
             self.dispatch_scratch.ensure_capacity(entries, pointers);
         }
         self.dispatch_tape = Arc::from(steps);
+        self.dispatch_segmentation = segmentation;
         #[cfg(test)]
         {
             self.dispatch_metadata_build_count =
                 self.dispatch_metadata_build_count.saturating_add(1);
         }
         Ok(())
+    }
+
+    pub(super) const fn dispatch_segmentation(&self) -> NativeDispatchSegmentation {
+        self.dispatch_segmentation
     }
 
     #[cfg(test)]
@@ -1626,5 +1712,27 @@ fn two_buffers(
     } else {
         let (left, right) = buffers.split_at_mut(target);
         Ok((&mut right[0], &left[source]))
+    }
+}
+
+#[cfg(test)]
+mod dispatch_segmentation_tests {
+    use super::{NativeDispatchSegmentEnd, dispatch_segment_split};
+
+    #[test]
+    fn split_causes_are_mutually_exclusive_in_runtime_precedence_order() {
+        assert_eq!(dispatch_segment_split(false, false, false), None);
+        assert_eq!(
+            dispatch_segment_split(false, false, true),
+            Some(NativeDispatchSegmentEnd::DerivedSlotDependency)
+        );
+        assert_eq!(
+            dispatch_segment_split(false, true, true),
+            Some(NativeDispatchSegmentEnd::OutputSlotAlias)
+        );
+        assert_eq!(
+            dispatch_segment_split(true, true, true),
+            Some(NativeDispatchSegmentEnd::ModuleChange)
+        );
     }
 }

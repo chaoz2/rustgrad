@@ -13,8 +13,8 @@ pub use step_phases::{
 
 use super::{
     CompiledAdamWCheckpoint, NativeCpuCompiledAdamWPreparationReport,
-    NativeCpuCompiledAdamWStepResult, NativeCpuProgramPreparationReport, NativeCpuReplayTraffic,
-    NativeCpuRunReport,
+    NativeCpuCompiledAdamWStepResult, NativeCpuDispatchSegmentation,
+    NativeCpuProgramPreparationReport, NativeCpuReplayTraffic, NativeCpuRunReport,
 };
 use crate::{
     BenchmarkDuration, BenchmarkLatencySummary, BenchmarkTransfer, Error, ExecutionPlanSummary,
@@ -37,7 +37,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V12: u32 = 12;
 const NATIVE_TRAINING_REPORT_FORMAT_V13: u32 = 13;
 const NATIVE_TRAINING_REPORT_FORMAT_V14: u32 = 14;
 const NATIVE_TRAINING_REPORT_FORMAT_V15: u32 = 15;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 16;
+const NATIVE_TRAINING_REPORT_FORMAT_V16: u32 = 16;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 17;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,7 +119,9 @@ impl NativeTrainingPreparationTiming {
             self.linker_process,
         ) {
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V15 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(total),
                 Some(linker),
             ) => {
@@ -137,7 +140,13 @@ impl NativeTrainingPreparationTiming {
                 }
                 total
             }
-            (NATIVE_TRAINING_REPORT_FORMAT_V15 | NATIVE_TRAINING_REPORT_FORMAT_VERSION, _, _) => {
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                _,
+                _,
+            ) => {
                 return Err(invalid("native chunk compiler timing is absent"));
             }
             (_, None, None) => compiler_process,
@@ -312,6 +321,8 @@ pub struct NativeTrainingProgramReport {
     linker_invocation_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     preparation_timing: Option<NativeTrainingPreparationTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatch_segmentation: Option<NativeCpuDispatchSegmentation>,
 }
 
 impl NativeTrainingProgramReport {
@@ -404,6 +415,7 @@ impl NativeTrainingProgramReport {
             preparation_timing: Some(NativeTrainingPreparationTiming::from_preparation(
                 preparation,
             )),
+            dispatch_segmentation: Some(*preparation.dispatch_segmentation()),
         })
     }
 
@@ -424,11 +436,25 @@ impl NativeTrainingProgramReport {
         let chunk_compiler_evidence_is_present = self.combined_compile_link_count.is_some()
             || self.object_compile_count.is_some()
             || self.linker_invocation_count.is_some();
+        let referenced_module_count = self.referenced_module_count.unwrap_or(0);
+        if format_version <= NATIVE_TRAINING_REPORT_FORMAT_V16 {
+            if self.dispatch_segmentation.is_some() {
+                return Err(invalid(
+                    "legacy native program has dispatch segmentation evidence",
+                ));
+            }
+        } else {
+            self.dispatch_segmentation
+                .as_ref()
+                .ok_or_else(|| invalid("native dispatch segmentation evidence is absent"))?
+                .authenticates(self.rendered_entry_count, referenced_module_count)
+                .then_some(())
+                .ok_or_else(|| invalid("native dispatch segmentation evidence differs"))?;
+        }
         if format_version <= NATIVE_TRAINING_REPORT_FORMAT_V14 && chunk_compiler_evidence_is_present
         {
             return Err(invalid("legacy native program has chunk compiler evidence"));
         }
-        let referenced_module_count = self.referenced_module_count.unwrap_or(0);
         let unique_rendered_entry_count = self.unique_rendered_entry_count.unwrap_or(0);
         let shared_prefix_entry_count = self.shared_prefix_entry_count.unwrap_or(0);
         let preparation = [
@@ -552,6 +578,7 @@ impl NativeTrainingProgramReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self, format_version)?,
@@ -681,6 +708,10 @@ impl NativeTrainingProgramReport {
 
     pub const fn preparation_timing(&self) -> Option<&NativeTrainingPreparationTiming> {
         self.preparation_timing.as_ref()
+    }
+
+    pub const fn dispatch_segmentation(&self) -> Option<&NativeCpuDispatchSegmentation> {
+        self.dispatch_segmentation.as_ref()
     }
 }
 
@@ -1110,6 +1141,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -1161,6 +1193,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 None,
                 None,
@@ -1188,6 +1221,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(program),
                 Some(traffic),
@@ -1244,6 +1278,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -1270,6 +1305,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
                     if traffic.materialized_egress_count() != 0
                         && traffic.materialized_egress_bytes() != 0 => {}
@@ -1279,6 +1315,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                     return Err(invalid("native CPU egress evidence is absent"));
                 }
@@ -1307,6 +1344,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
@@ -1369,6 +1407,7 @@ impl NativeTrainingReport {
             | NATIVE_TRAINING_REPORT_FORMAT_V13
             | NATIVE_TRAINING_REPORT_FORMAT_V14
             | NATIVE_TRAINING_REPORT_FORMAT_V15
+            | NATIVE_TRAINING_REPORT_FORMAT_V16
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
@@ -1431,7 +1470,11 @@ impl NativeTrainingReport {
             self.prepare_max_parallel_render_job_count,
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V15, None, None) => 0,
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(overlap), Some(max_parallel)) => {
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V16 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(overlap),
+                Some(max_parallel),
+            ) => {
                 let overlap = overlap
                     .as_nanos()
                     .map_err(|_| invalid("invalid native render overlap duration"))?;
@@ -1477,6 +1520,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
@@ -1492,6 +1536,7 @@ impl NativeTrainingReport {
                         | NATIVE_TRAINING_REPORT_FORMAT_V13
                         | NATIVE_TRAINING_REPORT_FORMAT_V14
                         | NATIVE_TRAINING_REPORT_FORMAT_V15
+                        | NATIVE_TRAINING_REPORT_FORMAT_V16
                         | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                         Some(overlap),
                     ) => overlap
@@ -1587,6 +1632,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -1636,7 +1682,9 @@ impl NativeTrainingReport {
                 return Err(invalid("legacy native training report has step phases"));
             }
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V15 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(phases),
             ) => phases.validate(
                 self.successful_replay_count,
@@ -1649,8 +1697,12 @@ impl NativeTrainingReport {
                     .as_ref()
                     .ok_or_else(|| invalid("classified replay overhead timing is absent"))?,
             )?,
-            (NATIVE_TRAINING_REPORT_FORMAT_V15 | NATIVE_TRAINING_REPORT_FORMAT_VERSION, None)
-                if self.accumulation.is_none() => {}
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                None,
+            ) if self.accumulation.is_none() => {}
             _ => return Err(invalid("native training step phases differ")),
         }
         let expected_rate = rate_from_total(
@@ -1921,6 +1973,12 @@ impl NativeTrainingScoreboard {
             || report.executed_native_item_count()
                 > usize::try_from(expected.rendered_entry_count)
                     .map_err(|_| invalid("native rendered entry count overflows usize"))?
+            || count(report.module_dispatch_count(), "native module dispatch")?
+                != expected
+                    .dispatch_segmentation
+                    .as_ref()
+                    .ok_or_else(|| invalid("native dispatch segmentation evidence is absent"))?
+                    .segment_count
             || report.fallback_count() != 0
             || report.successful_invocation() != expected_invocation
             || report.schedule_cache_keys().len() != report.native_item_count()
@@ -2449,6 +2507,20 @@ mod tests {
             .remove("prepare_max_parallel_render_job_count");
     }
 
+    fn remove_dispatch_segmentation_evidence(json: &mut serde_json::Value) {
+        for program in [
+            "main",
+            "accumulation",
+            "partial_flush",
+            "zero_grad",
+            "evaluation",
+        ] {
+            if let Some(program) = json[program].as_object_mut() {
+                program.remove("dispatch_segmentation");
+            }
+        }
+    }
+
     fn zero_report() -> NativeTrainingReport {
         NativeTrainingReport {
             format_version: NATIVE_TRAINING_REPORT_FORMAT_V10,
@@ -2488,6 +2560,7 @@ mod tests {
                 object_compile_count: None,
                 linker_invocation_count: None,
                 preparation_timing: Some(zero_preparation_timing()),
+                dispatch_segmentation: None,
             },
             accumulation: None,
             partial_flush: None,
@@ -2577,6 +2650,15 @@ mod tests {
         report.main.combined_compile_link_count = Some(1);
         report.main.object_compile_count = Some(0);
         report.main.linker_invocation_count = Some(0);
+        report.main.dispatch_segmentation = Some(NativeCpuDispatchSegmentation {
+            segment_count: 1,
+            dispatch_reached_module_count: 1,
+            terminal_segment_count: 1,
+            non_dispatch_boundary_count: 0,
+            module_change_count: 0,
+            output_slot_alias_count: 0,
+            derived_slot_dependency_count: 0,
+        });
         let timing = report.main.preparation_timing.as_mut().unwrap();
         timing.compiler_process_total = Some(timing.compiler_process);
         timing.linker_process = Some(zero_duration());
@@ -2591,6 +2673,15 @@ mod tests {
         accumulation.shared_prefix_entry_count = Some(1);
         accumulation.shared_prefix_source_program_index = Some(0);
         accumulation.shared_prefix_source_native_identity = Some(report.main.native_identity);
+        accumulation.dispatch_segmentation = Some(NativeCpuDispatchSegmentation {
+            segment_count: 2,
+            dispatch_reached_module_count: 2,
+            terminal_segment_count: 1,
+            non_dispatch_boundary_count: 0,
+            module_change_count: 1,
+            output_slot_alias_count: 0,
+            derived_slot_dependency_count: 0,
+        });
         report.accumulation = Some(accumulation);
         report.accumulation_replay_traffic = Some(
             NativeCpuReplayTraffic::new(2, 12, 16, 8)
@@ -2694,6 +2785,7 @@ mod tests {
         let report = phase_specialized_report();
         let mut json = serde_json::to_value(report).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V11);
+        remove_dispatch_segmentation_evidence(&mut json);
         remove_parallel_render_evidence(&mut json);
         remove_prefix_module_evidence(&mut json);
         remove_chunk_compiler_evidence(&mut json);
@@ -2724,6 +2816,7 @@ mod tests {
     fn phase_specialized_v12_report_decodes_without_egress_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V12);
+        remove_dispatch_segmentation_evidence(&mut json);
         remove_parallel_render_evidence(&mut json);
         remove_prefix_module_evidence(&mut json);
         remove_chunk_compiler_evidence(&mut json);
@@ -2755,6 +2848,7 @@ mod tests {
     fn version_thirteen_report_decodes_without_prefix_module_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V13);
+        remove_dispatch_segmentation_evidence(&mut json);
         remove_parallel_render_evidence(&mut json);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
@@ -2796,6 +2890,7 @@ mod tests {
     fn version_fourteen_preserves_prefix_evidence_and_rejects_v15_compiler_fields() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V14);
+        remove_dispatch_segmentation_evidence(&mut json);
         remove_parallel_render_evidence(&mut json);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
@@ -2901,6 +2996,7 @@ mod tests {
     fn version_fifteen_decodes_without_parallel_render_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V15);
+        remove_dispatch_segmentation_evidence(&mut json);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
             "v15 cannot claim v16 parallel render evidence"
@@ -2915,6 +3011,188 @@ mod tests {
                 .is_none()
         );
         assert!(decoded.prepare_max_parallel_render_job_count().is_none());
+    }
+
+    #[test]
+    fn version_sixteen_rejects_dispatch_segmentation_even_when_zero() {
+        let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V16);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "v16 cannot claim v17 dispatch segmentation evidence"
+        );
+        for program in ["main", "accumulation"] {
+            json[program]["dispatch_segmentation"] = serde_json::json!({
+                "segment_count": 0,
+                "dispatch_reached_module_count": 0,
+                "terminal_segment_count": 0,
+                "non_dispatch_boundary_count": 0,
+                "module_change_count": 0,
+                "output_slot_alias_count": 0,
+                "derived_slot_dependency_count": 0,
+            });
+        }
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "v16 rejects explicit zero-valued v17 evidence"
+        );
+        remove_dispatch_segmentation_evidence(&mut json);
+        let decoded =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V16);
+        assert!(decoded.main().dispatch_segmentation().is_none());
+    }
+
+    #[test]
+    fn current_report_authenticates_dispatch_segmentation_partition() {
+        let report = phase_specialized_report();
+        let segmentation = report.main().dispatch_segmentation().unwrap();
+        assert_eq!(segmentation.segment_count(), 1);
+        assert_eq!(segmentation.dispatch_reached_module_count(), 1);
+        assert_eq!(segmentation.terminal_segment_count(), 1);
+        assert_eq!(segmentation.non_dispatch_boundary_count(), 0);
+        assert_eq!(segmentation.module_change_count(), 0);
+        assert_eq!(segmentation.output_slot_alias_count(), 0);
+        assert_eq!(segmentation.derived_slot_dependency_count(), 0);
+        let accumulation = report
+            .accumulation()
+            .unwrap()
+            .dispatch_segmentation()
+            .unwrap();
+        assert_eq!(accumulation.segment_count(), 2);
+        assert_eq!(accumulation.dispatch_reached_module_count(), 2);
+        assert_eq!(accumulation.terminal_segment_count(), 1);
+        assert_eq!(accumulation.non_dispatch_boundary_count(), 0);
+        assert_eq!(accumulation.module_change_count(), 1);
+        assert_eq!(report.accumulation().unwrap().referenced_module_count(), 2);
+        assert!(report.validate().is_ok());
+
+        let all_elided = NativeCpuDispatchSegmentation {
+            segment_count: 0,
+            dispatch_reached_module_count: 0,
+            terminal_segment_count: 0,
+            non_dispatch_boundary_count: 0,
+            module_change_count: 0,
+            output_slot_alias_count: 0,
+            derived_slot_dependency_count: 0,
+        };
+        assert!(
+            all_elided.authenticates(1, 1),
+            "structural validation permits rendered work omitted by authenticated elision"
+        );
+
+        let elided_only_suffix = NativeCpuDispatchSegmentation {
+            segment_count: 1,
+            dispatch_reached_module_count: 1,
+            terminal_segment_count: 1,
+            non_dispatch_boundary_count: 0,
+            module_change_count: 0,
+            output_slot_alias_count: 0,
+            derived_slot_dependency_count: 0,
+        };
+        assert!(
+            elided_only_suffix.authenticates(2, 2),
+            "a referenced suffix module may contain only elided entries"
+        );
+
+        let mut missing_terminal = report.clone();
+        let segmentation = missing_terminal
+            .main
+            .dispatch_segmentation
+            .as_mut()
+            .unwrap();
+        segmentation.terminal_segment_count = 0;
+        segmentation.output_slot_alias_count = 1;
+        assert!(
+            missing_terminal.validate().is_err(),
+            "partition-preserving evidence must retain one terminal segment"
+        );
+
+        let mut fallback_boundary = report.clone();
+        let segmentation = fallback_boundary
+            .accumulation
+            .as_mut()
+            .unwrap()
+            .dispatch_segmentation
+            .as_mut()
+            .unwrap();
+        segmentation.non_dispatch_boundary_count = 1;
+        segmentation.module_change_count = 0;
+        assert!(
+            fallback_boundary.validate().is_err(),
+            "strict-native evidence cannot replace a module change with a fallback boundary"
+        );
+
+        let mut missing_module_change = report.clone();
+        let segmentation = missing_module_change
+            .accumulation
+            .as_mut()
+            .unwrap()
+            .dispatch_segmentation
+            .as_mut()
+            .unwrap();
+        segmentation.module_change_count = 0;
+        segmentation.derived_slot_dependency_count = 1;
+        assert!(
+            missing_module_change.validate().is_err(),
+            "two referenced modules require one module-change segment while preserving the partition"
+        );
+
+        let mut one_module_two_segments = report.clone();
+        let segmentation = one_module_two_segments
+            .main
+            .dispatch_segmentation
+            .as_mut()
+            .unwrap();
+        segmentation.segment_count = 2;
+        segmentation.output_slot_alias_count = 1;
+        assert!(one_module_two_segments.validate().is_ok());
+        let segmentation = one_module_two_segments
+            .main
+            .dispatch_segmentation
+            .as_mut()
+            .unwrap();
+        segmentation.dispatch_reached_module_count = 2;
+        segmentation.module_change_count = 1;
+        segmentation.output_slot_alias_count = 0;
+        assert!(
+            one_module_two_segments.validate().is_err(),
+            "one referenced module cannot claim a partition-preserving module change"
+        );
+
+        let mut empty_tape_with_reached_module = report.clone();
+        empty_tape_with_reached_module.main.dispatch_segmentation =
+            Some(NativeCpuDispatchSegmentation {
+                dispatch_reached_module_count: 1,
+                ..all_elided
+            });
+        assert!(
+            empty_tape_with_reached_module.validate().is_err(),
+            "an empty dispatch tape cannot claim a reached module"
+        );
+
+        let mut missing = serde_json::to_value(&report).unwrap();
+        missing["main"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dispatch_segmentation");
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&missing).unwrap()).is_err(),
+            "v17 requires dispatch segmentation evidence"
+        );
+
+        let mut missing_reached_modules = serde_json::to_value(&report).unwrap();
+        missing_reached_modules["main"]["dispatch_segmentation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dispatch_reached_module_count");
+        assert!(
+            NativeTrainingReport::from_json_bytes(
+                &serde_json::to_vec(&missing_reached_modules).unwrap()
+            )
+            .is_err(),
+            "v17 requires the dispatch-reached module inventory"
+        );
     }
 
     #[test]
@@ -2985,6 +3263,7 @@ mod tests {
         );
 
         let mut full_prefix = report.clone();
+        let source_segmentation = full_prefix.main.dispatch_segmentation.unwrap();
         let accumulation_native_identity = {
             let accumulation = full_prefix.accumulation.as_mut().unwrap();
             accumulation.cache_hit_count = 2;
@@ -2996,12 +3275,22 @@ mod tests {
             accumulation.durable_artifact_cache_miss_count = 0;
             accumulation.compiler_invocation_count = 0;
             accumulation.combined_compile_link_count = Some(0);
+            accumulation.dispatch_segmentation = Some(source_segmentation);
             accumulation.native_identity()
         };
         full_prefix.prepare_compiler_process_count = Some(1);
         assert!(
             full_prefix.validate().is_ok(),
             "a full exact prefix has no suffix compilation or module load"
+        );
+        assert_eq!(
+            full_prefix
+                .accumulation
+                .as_ref()
+                .unwrap()
+                .dispatch_segmentation,
+            full_prefix.main.dispatch_segmentation,
+            "a full prefix reuses the source program's sealed segmentation"
         );
 
         for (field, value) in [
@@ -3025,6 +3314,7 @@ mod tests {
         let mut impossible = report;
         impossible.main.rendered_entry_count = 1;
         impossible.main.unique_rendered_entry_count = Some(1);
+        let source_segmentation = impossible.main.dispatch_segmentation.unwrap();
         let accumulation = impossible.accumulation.as_mut().unwrap();
         accumulation.cache_hit_count = 2;
         accumulation.cache_miss_count = 0;
@@ -3035,6 +3325,7 @@ mod tests {
         accumulation.durable_artifact_cache_miss_count = 0;
         accumulation.compiler_invocation_count = 0;
         accumulation.combined_compile_link_count = Some(0);
+        accumulation.dispatch_segmentation = Some(source_segmentation);
         impossible.prepare_compiler_process_count = Some(1);
         assert!(
             impossible

@@ -467,6 +467,7 @@ pub(crate) struct NativeMixedPreparationTrace {
     pub(crate) cache_hit_count: usize,
     pub(crate) cache_miss_count: usize,
     pub(crate) module: crate::backend::NativeScheduleModulePreparation,
+    pub(crate) dispatch_segmentation: super::native_replay_workspace::NativeDispatchSegmentation,
 }
 
 /// Reusable strict-native ownership for one recurrent mixed capture. It keeps
@@ -526,6 +527,7 @@ impl RecurrentNativePreparation {
             cache_hit_count: plan.cache_hit_count(),
             cache_miss_count: plan.cache_miss_count(),
             module: plan.module_preparation(),
+            dispatch_segmentation: plan.dispatch_segmentation(),
         };
         PreparedRecurrentNativeReplay::new(
             trace,

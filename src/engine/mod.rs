@@ -30,7 +30,7 @@ pub(crate) use captured_replay::{
     validate_input_value,
 };
 pub use mixed::realize_mixed_effects;
-pub(crate) use native_replay_workspace::NativeReplayTraffic;
+pub(crate) use native_replay_workspace::{NativeDispatchSegmentation, NativeReplayTraffic};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,

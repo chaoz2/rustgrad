@@ -1165,7 +1165,7 @@ times. Wall times do not participate in identity.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional accumulation/flush/zero-grad/evaluation programs plus
 checked logical recurrent state bytes without preparing a target or exposing a
-capture. The separate `NativeTrainingScoreboard` v16 authenticates
+capture. The separate `NativeTrainingScoreboard` v17 authenticates
 strict-native preparation and successful training-step reports, then emits
 bounded versioned JSON.
 
@@ -1174,13 +1174,18 @@ bounded versioned JSON.
 | Preparation phases | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions, including bounded render concurrency and overlap. |
 | Compiler work | Combined/object/link process inventories and cumulative versus effective compiler wall time. |
 | Module reuse | Referenced modules and the unique/shared-prefix entry partition for every attached program. |
-| Execution | Logical schedule/cache inventory, physical rendered/executed entries, and actual module-dispatch calls. |
+| Execution | Logical schedule/cache inventory, physical rendered/executed entries, actual module-dispatch calls, and mutually exclusive reasons each sealed dispatch segment ends. |
 | Replay traffic | Owned external imports, borrowed/retained/replaced recurrent bytes, and logical CPU egress materialization count/bytes. CPU egress is not a device transfer. |
 | Timing | Caller-observed compile, prepare, and checkpoint time plus bounded first/steady replay and executor/recurrent-overhead partitions. No threshold or speedup is claimed. |
 
+For nonempty dispatch tapes, segmentation authenticates one terminal segment,
+no fallback boundary, and one fewer module changes than distinct modules
+actually reached. Rendered entries omitted by authenticated elision do not
+themselves add dispatch segments or reached-module evidence.
+
 ##### Replay phases and wire versions
 
-V1-v15 JSON remains readable. The current wire additions are:
+V1-v16 JSON remains readable. The current wire additions are:
 
 | Version | Added contract |
 |---|---|
@@ -1188,8 +1193,9 @@ V1-v15 JSON remains readable. The current wire additions are:
 | V14 | Prefix-reuse evidence, without serialized entry metadata. |
 | V15 | Compiler process-mode and cumulative-wall evidence. |
 | V16 | Per-program render overlap and maximum concurrency as observations. |
+| V17 | Dispatch-reached module inventory plus terminal, non-dispatch, module-change, output-slot-alias, and derived-slot-dependency segment counts. |
 
-V16 is emitted for raw and classified recording. Classified steps use only
+V17 is emitted for raw and classified recording. Classified steps use only
 `did_update`; the first replay stays separate, and warm accumulation-only and
 optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
 classification. A scoreboard rejects mixed recording modes without consuming a
