@@ -113,6 +113,67 @@ struct NativeSchedulePrefixReuse {
     entry_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeScheduleModuleOverlap {
+    pub(crate) program_index: usize,
+    pub(crate) contiguous_prefix_entry_count: usize,
+    pub(crate) contiguous_prefix_source_bytes: usize,
+    pub(crate) additional_scattered_entry_count: usize,
+    pub(crate) additional_scattered_source_bytes: usize,
+}
+
+fn rendered_source_bytes<'a>(
+    entries: impl IntoIterator<Item = &'a RenderedScheduleEntry>,
+) -> Result<usize, JitBackendError> {
+    entries.into_iter().try_fold(0usize, |total, entry| {
+        total
+            .checked_add(entry.rendered.source.len())
+            .ok_or_else(|| {
+                JitBackendError::Binding("native rendered source byte count overflowed".into())
+            })
+    })
+}
+
+fn exact_main_module_overlaps(
+    modules: &[RenderedScheduleModule],
+) -> Result<Vec<NativeScheduleModuleOverlap>, JitBackendError> {
+    let Some(main) = modules.first() else {
+        return Ok(Vec::new());
+    };
+    modules
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(program_index, module)| {
+            let contiguous_prefix_entry_count = main
+                .entries
+                .iter()
+                .zip(&module.entries)
+                .take_while(|(left, right)| exact_rendered_schedule_entry(left, right))
+                .count();
+            // Deliberately reuse the full prefix-admission predicate for
+            // scattered evidence. Source equality alone cannot authenticate
+            // logical ownership, retained layouts, initialization, or ABI.
+            let prefix = &module.entries[..contiguous_prefix_entry_count];
+            let scattered = module.entries[contiguous_prefix_entry_count..]
+                .iter()
+                .filter(|entry| {
+                    main.entries
+                        .iter()
+                        .any(|candidate| exact_rendered_schedule_entry(candidate, entry))
+                });
+            let additional_scattered_entry_count = scattered.clone().count();
+            Ok(NativeScheduleModuleOverlap {
+                program_index,
+                contiguous_prefix_entry_count,
+                contiguous_prefix_source_bytes: rendered_source_bytes(prefix)?,
+                additional_scattered_entry_count,
+                additional_scattered_source_bytes: rendered_source_bytes(scattered)?,
+            })
+        })
+        .collect()
+}
+
 fn exact_rendered_schedule_entry(
     left: &RenderedScheduleEntry,
     right: &RenderedScheduleEntry,
@@ -261,9 +322,12 @@ pub(crate) struct PreparedScheduleSegment {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeScheduleModulePreparation {
     pub(crate) rendered_entry_count: usize,
+    pub(crate) rendered_source_bytes: usize,
     pub(crate) referenced_module_count: usize,
     pub(crate) unique_rendered_entry_count: usize,
+    pub(crate) unique_rendered_source_bytes: usize,
     pub(crate) shared_prefix_entry_count: usize,
+    pub(crate) shared_prefix_source_bytes: usize,
     pub(crate) shared_prefix_source_program: Option<usize>,
     pub(crate) loaded_module_count: usize,
     pub(crate) durable_artifact_cache_hit_count: usize,
@@ -285,6 +349,7 @@ pub(crate) struct NativeScheduleModulePreparation {
 pub(crate) struct NativeScheduleCompilerProcessTiming {
     pub(crate) program_index: usize,
     pub(crate) kind: crate::cpu_jit::NativeCompilerProcessKind,
+    pub(crate) rendered_source_bytes: usize,
     pub(crate) permit_request_offset: Duration,
     pub(crate) permit_wait_time: Duration,
     pub(crate) process_wall_time: Duration,
@@ -299,6 +364,7 @@ pub(crate) struct NativeScheduleCompilationBatch {
     pub(crate) compiler_process_count: usize,
     pub(crate) max_parallel_compiler_process_count: usize,
     pub(crate) compiler_process_timings: Vec<NativeScheduleCompilerProcessTiming>,
+    pub(crate) module_overlaps: Vec<NativeScheduleModuleOverlap>,
 }
 
 const MAX_PARALLEL_NATIVE_RENDER_JOB_COUNT: usize = 2;
@@ -1497,6 +1563,7 @@ impl CpuJitBackend {
             parallel_overlap_wall_time: parallel_render_overlap_wall_time,
             max_parallel_job_count: max_parallel_render_job_count,
         } = render_schedule_modules(self, &programs)?;
+        let module_overlaps = exact_main_module_overlaps(&rendered)?;
         let mut prefix_reuses = Vec::with_capacity(rendered.len());
         for program in 0..rendered.len() {
             let standalone_sources = prefix_reuses
@@ -1633,6 +1700,7 @@ impl CpuJitBackend {
                 Ok(NativeScheduleCompilerProcessTiming {
                     program_index: *program_index,
                     kind: observation.kind,
+                    rendered_source_bytes: observation.rendered_source_bytes,
                     permit_request_offset,
                     permit_wait_time,
                     process_wall_time,
@@ -1655,6 +1723,7 @@ impl CpuJitBackend {
             compiler_process_count: compiler_intervals.len(),
             max_parallel_compiler_process_count,
             compiler_process_timings,
+            module_overlaps,
         };
 
         // Resolve every worker result and authenticate every module ABI before
@@ -1717,11 +1786,23 @@ impl CpuJitBackend {
             let finalized = Instant::now();
             let reuse = prefix_reuses[index];
             let rendered_entry_count = module.entries.len();
+            let total_rendered_source_bytes = rendered_source_bytes(&module.entries)?;
             let unique_rendered_entry_count = rendered_entry_count
                 .checked_sub(reuse.entry_count)
                 .ok_or_else(|| {
                 JitBackendError::Binding("native shared prefix exceeds program".into())
             })?;
+            let shared_prefix_source_bytes =
+                rendered_source_bytes(&module.entries[..reuse.entry_count])?;
+            let unique_rendered_source_bytes =
+                rendered_source_bytes(&module.entries[reuse.entry_count..])?;
+            if shared_prefix_source_bytes.checked_add(unique_rendered_source_bytes)
+                != Some(total_rendered_source_bytes)
+            {
+                return Err(JitBackendError::Binding(
+                    "native rendered source byte partition mismatch".into(),
+                ));
+            }
             let mut prepared = Vec::with_capacity(module.zero_domains.len());
             for zero_domain in &module.zero_domains {
                 let item = items.get(zero_domain.logical_index).ok_or_else(|| {
@@ -1926,9 +2007,12 @@ impl CpuJitBackend {
                     })?;
             let preparation = NativeScheduleModulePreparation {
                 rendered_entry_count,
+                rendered_source_bytes: total_rendered_source_bytes,
                 referenced_module_count: referenced_modules.len(),
                 unique_rendered_entry_count,
+                unique_rendered_source_bytes,
                 shared_prefix_entry_count: reuse.entry_count,
+                shared_prefix_source_bytes,
                 shared_prefix_source_program: (reuse.entry_count != 0)
                     .then_some(reuse.source_program),
                 loaded_module_count: usize::from(unique_rendered_entry_count != 0),
@@ -2426,6 +2510,45 @@ mod tests {
     }
 
     #[test]
+    fn exact_main_overlap_separates_prefix_and_scattered_content() {
+        let main = rendered_module(vec![
+            rendered_entry("first", vec![0]),
+            rendered_entry("main-only", vec![1]),
+            rendered_entry("shared-later", vec![2]),
+        ]);
+        let target = rendered_module(vec![
+            rendered_entry("first", vec![0]),
+            rendered_entry("target-only", vec![3]),
+            rendered_entry("shared-later", vec![2]),
+        ]);
+        let expected_prefix_bytes = target.entries[0].rendered.source.len();
+        let expected_scattered_bytes = target.entries[2].rendered.source.len();
+        let overlaps = exact_main_module_overlaps(&[main, target]).unwrap();
+        assert_eq!(
+            overlaps,
+            vec![NativeScheduleModuleOverlap {
+                program_index: 1,
+                contiguous_prefix_entry_count: 1,
+                contiguous_prefix_source_bytes: expected_prefix_bytes,
+                additional_scattered_entry_count: 1,
+                additional_scattered_source_bytes: expected_scattered_bytes,
+            }]
+        );
+
+        let mut different_logical = rendered_entry("shared-later", vec![9]);
+        different_logical.rendered = rendered_entry("shared-later", vec![2]).rendered;
+        let no_scattered = exact_main_module_overlaps(&[
+            rendered_module(vec![rendered_entry("shared-later", vec![2])]),
+            rendered_module(vec![
+                rendered_entry("different", vec![0]),
+                different_logical,
+            ]),
+        ])
+        .unwrap();
+        assert_eq!(no_scattered[0].additional_scattered_entry_count, 0);
+    }
+
+    #[test]
     fn native_render_worker_count_is_bounded_to_two() {
         assert_eq!(native_render_worker_count(0), 0);
         assert_eq!(native_render_worker_count(1), 1);
@@ -2477,7 +2600,22 @@ mod tests {
                 .checked_add(timing.permit_wait_time)
                 .and_then(|started| started.checked_add(timing.process_wall_time))
                 .expect("normalized compiler timing arithmetic remains bounded");
+            assert!(
+                (timing.rendered_source_bytes == 0)
+                    == matches!(timing.kind, crate::cpu_jit::NativeCompilerProcessKind::Link)
+            );
         }
+        assert_eq!(compilation.module_overlaps.len(), 2);
+        assert_eq!(compilation.module_overlaps[0].program_index, 1);
+        assert_eq!(
+            compilation.module_overlaps[0].contiguous_prefix_entry_count,
+            1
+        );
+        assert_eq!(compilation.module_overlaps[1].program_index, 2);
+        assert_eq!(
+            compilation.module_overlaps[1].contiguous_prefix_entry_count,
+            1
+        );
         let (prefix, prefix_work) = &programs[0];
         let (extended, extended_work) = &programs[1];
         let (fully_reused, fully_reused_work) = &programs[2];
@@ -2532,6 +2670,10 @@ mod tests {
         assert_eq!(warm_programs.len(), programs.len());
         assert_eq!(warm_compilation.compiler_process_count, 0);
         assert!(warm_compilation.compiler_process_timings.is_empty());
+        assert_eq!(
+            warm_compilation.module_overlaps,
+            compilation.module_overlaps
+        );
         assert!(warm_compilation.max_parallel_render_job_count > 0);
         assert!(warm_compilation.max_parallel_render_job_count <= 2);
     }
