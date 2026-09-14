@@ -35,7 +35,7 @@ use schedule_module::{
 
 // Bump whenever the scalar expression surface changes: mixed captures include
 // this identity before they can reuse a native-renderer admission decision.
-pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v35";
+pub const RENDERER_VERSION: &str = "rustgrad-c11-scalar-v36";
 const MOVEMENT_RENDERER_VERSION: &str = "rustgrad-c11-movement-v2";
 const STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-c11-static-position-v1";
 const THREEFRY_RENDERER_VERSION: &str = "rustgrad-c11-live-threefry-v1";
@@ -3986,6 +3986,27 @@ fn wrap_expr(dtype: DType, value: String) -> Result<String, JitError> {
         _ => format!("(({u})({value}))"),
     })
 }
+/// Commits one scalar ALU node to its declared typed value before a parent
+/// expression consumes it. The scalar renderer otherwise recursively inlines
+/// UOps, so relying on only the final Store cast would keep F32 and narrow
+/// floating intermediates in C `double` precision and could expose exact
+/// integer operations to wider signed arithmetic. Float8 retains its explicit
+/// raw-byte codec path and never enters this helper.
+fn scalar_alu_commit_expr(dtype: DType, value: String) -> Result<String, JitError> {
+    Ok(match dtype {
+        DType::F32 => format!("((float)({value}))"),
+        DType::F16 => format!("rg_f16_to_f32(rg_f32_to_f16((float)({value})))"),
+        DType::BF16 => format!("rg_bf16_to_f32(rg_f32_to_bf16((float)({value})))"),
+        DType::F64 => format!("((double)({value}))"),
+        dtype if dtype.is_float8() => {
+            return Err(JitError::Unsupported(
+                "Float8 scalar ALU requires the explicit codec path".into(),
+            ));
+        }
+        _ => wrap_expr(dtype, value)?,
+    })
+}
+
 fn vector_binary_expr(
     dtype: DType,
     op: crate::BinaryOp,
@@ -4813,15 +4834,11 @@ pub(crate) fn emit_with_substitution(
                 // Raw GraphUnary Bool negation is storage-level logical-not.
                 // Public Graph::neg deliberately uses its own source-literal
                 // logical_not composition and does not depend on this arm.
-                crate::UnaryOp::Neg if input_ty == DType::Bool => {
-                    format!("((uint8_t)!({a}))")
-                }
+                crate::UnaryOp::Neg if input_ty == DType::Bool => format!("!({a})"),
                 // Negating exact integer storage must never ask C to negate a
                 // signed minimum. Subtract from zero in the corresponding
                 // unsigned width, then restore the source storage lane.
-                crate::UnaryOp::Neg => {
-                    wrap_expr(input_ty, format!("0-({})({a})", unsigned_ctype(input_ty)?))?
-                }
+                crate::UnaryOp::Neg => format!("0-({})({a})", unsigned_ctype(input_ty)?),
                 crate::UnaryOp::Abs if input_ty.is_float() => format!("fabs({a})"),
                 crate::UnaryOp::Abs if input_ty == DType::Bool => a,
                 crate::UnaryOp::Abs
@@ -4837,15 +4854,12 @@ pub(crate) fn emit_with_substitution(
                     if matches!(input_ty.category(), crate::DTypeCategory::Signed) =>
                 {
                     let unsigned = unsigned_ctype(input_ty)?;
-                    wrap_expr(
-                        input_ty,
-                        format!("({a})<0 ? 0-({unsigned})({a}) : ({unsigned})({a})"),
-                    )?
+                    format!("({a})<0 ? 0-({unsigned})({a}) : ({unsigned})({a})")
                 }
                 // CPU/generic evaluate arithmetic after widening a typed
                 // storage lane to f64. Keep that working-value contract for
-                // the direct multiply instead of letting C evaluate two
-                // float operands before the typed output store.
+                // the direct multiply; the shared typed boundary below then
+                // commits this node before a parent expression consumes it.
                 crate::UnaryOp::Square if ty.is_float() => {
                     format!("((double)({a}))*((double)({a}))")
                 }
@@ -4854,9 +4868,7 @@ pub(crate) fn emit_with_substitution(
                 // then restore the original storage width. This avoids C's
                 // signed-overflow UB and the narrow unsigned integer promotions
                 // that would otherwise make U16 multiplication overflow `int`.
-                crate::UnaryOp::Square => {
-                    wrap_expr(input_ty, format!("((uint64_t)({a}))*((uint64_t)({a}))"))?
-                }
+                crate::UnaryOp::Square => format!("((uint64_t)({a}))*((uint64_t)({a}))"),
                 crate::UnaryOp::Relu
                     if input_ty == DType::Bool
                         || matches!(input_ty.category(), crate::DTypeCategory::Unsigned) =>
@@ -4872,14 +4884,14 @@ pub(crate) fn emit_with_substitution(
                 // The CPU and generic evaluators both promote a storage lane
                 // to f64 before evaluating Exp2, then quantize only at the
                 // result boundary.  C11's `exp2` has that same double input
-                // contract; the existing narrow-float store helpers below
-                // perform the F16/BF16 rounding.  Keep raw exact-dtype Exp2
+                // contract; the shared scalar commit below performs the
+                // F16/BF16 rounding. Keep raw exact-dtype Exp2
                 // fail-closed by admitting only the floating UOp contract.
                 crate::UnaryOp::Exp2 if ty.is_float() => format!("exp2({a})"),
                 // As for Exp2, the CPU and generic evaluators perform Log2
                 // after widening the stored lane to f64. C11 `log2` keeps
-                // that double evaluation, while the established stores below
-                // make the F16/BF16/F32 result rounding explicit. The public
+                // that double evaluation, while the shared commit below makes
+                // the F16/BF16/F32 result rounding explicit. The public
                 // non-float path has this floating result contract, matching
                 // CPU/generic's scalar-to-f64 evaluation.
                 crate::UnaryOp::Log2 if ty.is_float() => format!("log2({a})"),
@@ -4906,7 +4918,7 @@ pub(crate) fn emit_with_substitution(
                 crate::UnaryOp::Acosh if ty.is_float() => format!("acosh({a})"),
                 crate::UnaryOp::Atanh if ty.is_float() => format!("atanh({a})"),
                 // CPU/generic evaluate floating Trunc after widening the
-                // storage lane to f64, then narrow only at the output store.
+                // storage lane to f64, then narrow at this node boundary.
                 // C11's `trunc` has the same double contract and preserves
                 // signed zero, NaN, and infinities. Exact Bool/integer Trunc
                 // is an identity in the shared evaluator; calling C `trunc`
@@ -4923,9 +4935,9 @@ pub(crate) fn emit_with_substitution(
                 }
                 crate::UnaryOp::Round => a,
                 crate::UnaryOp::IsNan if ty == DType::Bool && input_ty.is_float() => {
-                    format!("((uint8_t)isnan({a}))")
+                    format!("isnan({a})")
                 }
-                crate::UnaryOp::IsNan if ty == DType::Bool => "((uint8_t)0)".into(),
+                crate::UnaryOp::IsNan if ty == DType::Bool => "0".into(),
                 // The raw IsInf public helper has Bool output. C11's
                 // type-generic predicate precisely recognizes both floating
                 // infinities and excludes NaN/finite/signed-zero lanes. Do
@@ -4933,21 +4945,19 @@ pub(crate) fn emit_with_substitution(
                 // CPU/generic semantics make those lanes deterministically
                 // false without a lossy wide-integer conversion.
                 crate::UnaryOp::IsInf if ty == DType::Bool && input_ty.is_float() => {
-                    format!("((uint8_t)isinf({a}))")
+                    format!("isinf({a})")
                 }
-                crate::UnaryOp::IsInf if ty == DType::Bool => "((uint8_t)0)".into(),
+                crate::UnaryOp::IsInf if ty == DType::Bool => "0".into(),
                 crate::UnaryOp::IsFinite if ty == DType::Bool && input_ty.is_float() => {
-                    format!("((uint8_t)isfinite({a}))")
+                    format!("isfinite({a})")
                 }
-                crate::UnaryOp::IsFinite if ty == DType::Bool => "((uint8_t)1)".into(),
+                crate::UnaryOp::IsFinite if ty == DType::Bool => "1".into(),
                 // tinygrad Sign is `ne(0).where(lt(0).where(-1, 1), 0)`.
                 // Keep its ordered comparisons: NaN is nonzero but unordered
                 // and therefore +1, while either signed zero takes the
                 // canonical positive zero branch. Integer branches avoid
                 // arithmetic so signed minima never overflow.
-                crate::UnaryOp::Sign if ty == DType::Bool => {
-                    format!("((uint8_t)(({a})!=0))")
-                }
+                crate::UnaryOp::Sign if ty == DType::Bool => format!("({a})!=0"),
                 crate::UnaryOp::Sign if matches!(ty.category(), crate::DTypeCategory::Unsigned) => {
                     format!("(({a})==0?0:1)")
                 }
@@ -4960,7 +4970,7 @@ pub(crate) fn emit_with_substitution(
                 crate::UnaryOp::Reciprocal => format!("(1.0/({a}))"),
                 _ => return Err(JitError::Unsupported(format!("unary {op:?}"))),
             };
-            Ok(x)
+            scalar_alu_commit_expr(ty, x)
         }
         Operation::GraphBinary(op) => {
             let (mut a, mut b) = (s(0)?, s(1)?);
@@ -4980,13 +4990,45 @@ pub(crate) fn emit_with_substitution(
                     float8_encode_expr(ty, &value).expect("guarded Float8 binary output dtype")
                 );
             }
-            if *op == crate::BinaryOp::Pow && ty == DType::F32 {
-                return Ok(format!("pow((double)({a}),(double)({b}))"));
+            if ty == DType::Bool {
+                let value = match op {
+                    crate::BinaryOp::Add | crate::BinaryOp::BitOr | crate::BinaryOp::Maximum => {
+                        format!("({a})||({b})")
+                    }
+                    crate::BinaryOp::Sub | crate::BinaryOp::BitXor => {
+                        format!("({a})!=({b})")
+                    }
+                    crate::BinaryOp::Mul
+                    | crate::BinaryOp::Div
+                    | crate::BinaryOp::BitAnd
+                    | crate::BinaryOp::Minimum => format!("({a})&&({b})"),
+                    _ => return Err(JitError::Unsupported(format!("Bool binary {op:?}"))),
+                };
+                return scalar_alu_commit_expr(ty, value);
             }
-            let x = match op {
-                crate::BinaryOp::Add => "+",
-                crate::BinaryOp::Sub => "-",
-                crate::BinaryOp::Mul => "*",
+            let value = match op {
+                crate::BinaryOp::Pow if ty == DType::F32 => {
+                    format!("pow((double)({a}),(double)({b}))")
+                }
+                crate::BinaryOp::Add | crate::BinaryOp::Sub | crate::BinaryOp::Mul => {
+                    let operator = match op {
+                        crate::BinaryOp::Add => "+",
+                        crate::BinaryOp::Sub => "-",
+                        crate::BinaryOp::Mul => "*",
+                        _ => unreachable!(),
+                    };
+                    if ty.is_float() {
+                        // CPU/generic widen typed storage lanes to f64 for the
+                        // operation itself, then commit this node below.
+                        format!("(((double)({a})) {operator} ((double)({b})))")
+                    } else {
+                        // Exact arithmetic is wrapping at the declared storage
+                        // width. Evaluate in U64 so signed minima and narrow
+                        // integer promotions cannot trigger C UB, then narrow
+                        // once through the shared typed boundary below.
+                        format!("((uint64_t)({a})) {operator} ((uint64_t)({b}))")
+                    }
+                }
                 crate::BinaryOp::Div
                 | crate::BinaryOp::FloorDiv
                 | crate::BinaryOp::TruncDiv
@@ -4994,59 +5036,54 @@ pub(crate) fn emit_with_substitution(
                 | crate::BinaryOp::FMod
                     if !ty.is_float() =>
                 {
-                    return Ok(int_call(*op, ty, &a, &b));
+                    int_call(*op, ty, &a, &b)
                 }
-                crate::BinaryOp::Shl if !ty.is_float() => {
-                    return Ok(format!(
-                        "(({})rg_shl((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure))",
-                        ctype(ty),
-                        ty.bits()
-                    ));
-                }
+                crate::BinaryOp::Shl if !ty.is_float() => format!(
+                    "rg_shl((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure)",
+                    ty.bits()
+                ),
                 crate::BinaryOp::Shr if !ty.is_float() => {
                     if matches!(ty.category(), crate::DTypeCategory::Signed) {
-                        return Ok(format!(
-                            "(({})rg_sshr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure))",
-                            ctype(ty),
+                        format!(
+                            "rg_sshr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure)",
                             ty.bits()
-                        ));
+                        )
+                    } else {
+                        format!(
+                            "rg_shr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure)",
+                            ty.bits()
+                        )
                     }
-                    return Ok(format!(
-                        "(({})rg_shr((uint64_t)({a}),(int64_t)({b}),{},rg_i,failure))",
-                        ctype(ty),
-                        ty.bits()
-                    ));
                 }
-                crate::BinaryOp::Div => "/",
+                crate::BinaryOp::Div => {
+                    format!("(((double)({a})) / ((double)({b})))")
+                }
                 crate::BinaryOp::FloorDiv if ty.is_float() => {
-                    return Ok(format!("floor(((double)({a}))/((double)({b})))"));
+                    format!("floor(((double)({a}))/((double)({b})))")
                 }
                 crate::BinaryOp::TruncDiv if ty.is_float() => {
-                    return Ok(format!("trunc(((double)({a}))/((double)({b})))"));
+                    format!("trunc(((double)({a}))/((double)({b})))")
                 }
-                crate::BinaryOp::Mod if ty.is_float() => {
-                    return Ok(format!(
-                        "(((double)({a}))-floor(((double)({a}))/((double)({b})))*((double)({b})))"
-                    ));
-                }
+                crate::BinaryOp::Mod if ty.is_float() => format!(
+                    "(((double)({a}))-floor(((double)({a}))/((double)({b})))*((double)({b})))"
+                ),
                 crate::BinaryOp::FMod if ty.is_float() => {
-                    return Ok(format!("fmod((double)({a}),(double)({b}))"));
+                    format!("fmod((double)({a}),(double)({b}))")
                 }
-                crate::BinaryOp::BitAnd => "&",
-                crate::BinaryOp::BitOr => "|",
-                crate::BinaryOp::BitXor => "^",
-                crate::BinaryOp::Maximum => return Ok(format!("(({a})<({b})?({b}):({a}))")),
-                crate::BinaryOp::Minimum => return Ok(format!("(({a})>({b})?({b}):({a}))")),
+                crate::BinaryOp::BitAnd | crate::BinaryOp::BitOr | crate::BinaryOp::BitXor => {
+                    let operator = match op {
+                        crate::BinaryOp::BitAnd => "&",
+                        crate::BinaryOp::BitOr => "|",
+                        crate::BinaryOp::BitXor => "^",
+                        _ => unreachable!(),
+                    };
+                    format!("(({a}) {operator} ({b}))")
+                }
+                crate::BinaryOp::Maximum => format!("(({a})<({b})?({b}):({a}))"),
+                crate::BinaryOp::Minimum => format!("(({a})>({b})?({b}):({a}))"),
                 _ => return Err(JitError::Unsupported(format!("binary {op:?}"))),
             };
-            if ty.is_float() {
-                // A typed Cast rounds its source value before this operation,
-                // but CPU/generic then evaluate the ALU at f64 and narrow
-                // only at this result's storage boundary.
-                Ok(format!("(((double)({a})) {x} ((double)({b})))"))
-            } else {
-                Ok(format!("(({a}) {x} ({b}))"))
-            }
+            scalar_alu_commit_expr(ty, value)
         }
         Operation::GraphLogical(op) => {
             if ty != DType::Bool {
@@ -5111,8 +5148,7 @@ fn int_call(op: crate::BinaryOp, ty: DType, a: &str, b: &str) -> String {
         _ => unreachable!(),
     };
     format!(
-        "(({}){helper}(({})({a}),({})({b}),rg_i,failure))",
-        ctype(ty),
+        "{helper}(({})({a}),({})({b}),rg_i,failure)",
         if signed { "int64_t" } else { "uint64_t" },
         if signed { "int64_t" } else { "uint64_t" }
     )
@@ -5993,7 +6029,7 @@ mod tests {
 
     #[test]
     fn float8_casts_use_exact_native_codecs_and_preserve_same_format_bytes() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v35");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v36");
 
         let execute = |graph: &Graph,
                        output,
@@ -6161,7 +6197,7 @@ mod tests {
 
     #[test]
     fn raw_graph_unary_neg_abs_keep_exact_integer_storage_and_bool_semantics() {
-        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v35");
+        assert_eq!(RENDERER_VERSION, "rustgrad-c11-scalar-v36");
 
         let signed = [
             (DType::I8, "uint8_t", "rg_i8"),
@@ -6252,7 +6288,7 @@ mod tests {
         let bool_abs_source =
             CpuJit::render(&crate::lower_graph_elementwise(&bool_graph, bool_abs).unwrap())
                 .unwrap();
-        assert!(bool_neg_source.source.contains("((uint8_t)!("));
+        assert!(bool_neg_source.source.contains("((uint8_t)((!("));
         assert!(!bool_abs_source.source.contains("fabs("));
         assert!(
             CpuJit::render_vectorized(
@@ -6466,9 +6502,9 @@ mod tests {
         assert!(round_source.contains("copysign(0.0,x)"));
 
         for (dtype, op, expected) in [
-            (DType::I64, crate::UnaryOp::IsNan, "((uint8_t)0)"),
-            (DType::U64, crate::UnaryOp::IsInf, "((uint8_t)0)"),
-            (DType::Bool, crate::UnaryOp::IsFinite, "((uint8_t)1)"),
+            (DType::I64, crate::UnaryOp::IsNan, "((0)!=0)"),
+            (DType::U64, crate::UnaryOp::IsInf, "((0)!=0)"),
+            (DType::Bool, crate::UnaryOp::IsFinite, "((1)!=0)"),
         ] {
             let mut graph = Graph::new();
             let input = graph.input_dtype("input", Shape::from([1]), dtype);
@@ -6590,8 +6626,8 @@ mod tests {
             CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_output).unwrap())
                 .unwrap()
                 .source;
-        assert!(f16_source.contains("rg_f32_to_f16(exp2("));
-        assert!(bf16_source.contains("rg_f32_to_bf16(exp2("));
+        assert!(f16_source.contains("rg_f32_to_f16((float)(exp2("));
+        assert!(bf16_source.contains("rg_f32_to_bf16((float)(exp2("));
 
         // Exp2 VJPs retain an Exp2 node and typed ln(2) multiplication. The
         // JIT renderer must accept that generated forward subexpression too.
@@ -6656,8 +6692,8 @@ mod tests {
             CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_output).unwrap())
                 .unwrap()
                 .source;
-        assert!(f16_source.contains("rg_f32_to_f16(log2("));
-        assert!(bf16_source.contains("rg_f32_to_bf16(log2("));
+        assert!(f16_source.contains("rg_f32_to_f16((float)(log2("));
+        assert!(bf16_source.contains("rg_f32_to_bf16((float)(log2("));
 
         // Log2 VJPs carry a source-width ln(2) denominator. Rendering the
         // gradient validates that the Log2 source remains admitted alongside
@@ -6718,13 +6754,13 @@ mod tests {
             CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_out).unwrap())
                 .unwrap()
                 .source
-                .contains("rg_f32_to_f16(sin(")
+                .contains("rg_f32_to_f16((float)(sin(")
         );
         assert!(
             CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_out).unwrap())
                 .unwrap()
                 .source
-                .contains("rg_f32_to_bf16(sin(")
+                .contains("rg_f32_to_bf16((float)(sin(")
         );
 
         // The source VJP is `sin(pi/2 - x) * upstream`, not a raw Cos node.
@@ -6796,13 +6832,13 @@ mod tests {
             CpuJit::render(&crate::lower_graph_elementwise(&narrow, f16_output).unwrap())
                 .unwrap()
                 .source
-                .contains("rg_f32_to_f16(trunc(")
+                .contains("rg_f32_to_f16((float)(trunc(")
         );
         assert!(
             CpuJit::render(&crate::lower_graph_elementwise(&narrow, bf16_output).unwrap())
                 .unwrap()
                 .source
-                .contains("rg_f32_to_bf16(trunc(")
+                .contains("rg_f32_to_bf16((float)(trunc(")
         );
 
         // Floor, Ceil, Round, and float division modes source-literally use
@@ -6861,7 +6897,8 @@ mod tests {
             if dtype.is_float() {
                 // C11 isinf recognizes both infinities while excluding finite
                 // values, either signed zero, and NaN.
-                assert!(scalar.source.contains("(uint8_t)isinf("), "{dtype:?}");
+                assert!(scalar.source.contains("isinf("), "{dtype:?}");
+                assert!(scalar.source.contains("((uint8_t)(("), "{dtype:?}");
             } else {
                 // Exact non-float lanes never take a floating conversion.
                 assert!(!scalar.source.contains("isinf("), "{dtype:?}");
@@ -6872,7 +6909,8 @@ mod tests {
             // deterministic scalar-expression-per-lane vector fallback.
             let vector = CpuJit::render_vectorized(&uop).unwrap();
             if dtype.is_float() {
-                assert!(vector.source.contains("(uint8_t)isinf("), "{dtype:?}");
+                assert!(vector.source.contains("isinf("), "{dtype:?}");
+                assert!(vector.source.contains("((uint8_t)(("), "{dtype:?}");
             }
             assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
             assert_eq!(
@@ -6895,9 +6933,9 @@ mod tests {
                 .unwrap()
                 .source;
         assert!(f16_source.contains("rg_f16_to_f32"));
-        assert!(f16_source.contains("(uint8_t)isinf("));
+        assert!(f16_source.contains("isinf("));
         assert!(bf16_source.contains("rg_bf16_to_f32"));
-        assert!(bf16_source.contains("(uint8_t)isinf("));
+        assert!(bf16_source.contains("isinf("));
 
         // Default both-sign IsInf and source-literal IsFinite must retain the
         // raw predicate, typed Bool logical-or/not, and no gradient route.
@@ -6910,7 +6948,7 @@ mod tests {
             CpuJit::render(&crate::lower_graph_elementwise(&composed, both).unwrap())
                 .unwrap()
                 .source
-                .contains("(uint8_t)isinf(")
+                .contains("isinf(")
         );
         assert!(
             CpuJit::render(&crate::lower_graph_elementwise(&composed, positive).unwrap())
@@ -6922,7 +6960,7 @@ mod tests {
             CpuJit::render(&crate::lower_graph_elementwise(&composed, finite).unwrap())
                 .unwrap()
                 .source;
-        assert!(finite_source.contains("(uint8_t)isinf("));
+        assert!(finite_source.contains("isinf("));
         assert!(finite_source.contains("||"));
         assert!(finite_source.contains("!="));
         assert!(matches!(
@@ -8374,6 +8412,213 @@ mod tests {
             let vector = CpuJit::render_vectorized(&uop).unwrap();
             assert!(!vector.source.contains("B2 VectorProgram"), "{dtype:?}");
             assert!(vector.source.contains(marker), "{dtype:?}");
+        }
+    }
+
+    #[test]
+    fn scalar_alu_nodes_commit_declared_float_storage_before_parent_use() {
+        for (dtype, marker) in [
+            (DType::F32, "((float)("),
+            (DType::F16, "rg_f16_to_f32(rg_f32_to_f16"),
+            (DType::BF16, "rg_bf16_to_f32(rg_f32_to_bf16"),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", Shape::from([1]), dtype);
+            let rhs = graph.input_dtype("rhs", Shape::from([1]), dtype);
+            let sum = graph.add(lhs, rhs).unwrap();
+            let root = graph.sqrt(sum).unwrap();
+            let output = graph.mul(root, sum).unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let scalar = CpuJit::render(&uop).unwrap();
+            assert!(
+                scalar.source.matches(marker).count() >= 3,
+                "{dtype:?}: {}",
+                scalar.source
+            );
+        }
+
+        let mut pow_graph = Graph::new();
+        let lhs = pow_graph.input("lhs", Shape::from([1]));
+        let rhs = pow_graph.input("rhs", Shape::from([1]));
+        let output = pow_graph.binary(crate::BinaryOp::Pow, lhs, rhs).unwrap();
+        let source = CpuJit::render(&crate::lower_graph_elementwise(&pow_graph, output).unwrap())
+            .unwrap()
+            .source;
+        assert!(source.contains("((float)(pow((double)"));
+    }
+
+    #[test]
+    fn scalar_f32_chain_matches_interpreter_node_rounding() {
+        // At F32 this addition is a ties-to-even no-op. If the scalar C
+        // renderer inlines both nodes in `double`, the subtraction instead
+        // exposes the half-ULP addend and this exact comparison fails.
+        let mut graph = Graph::new();
+        let input = graph.input("input", Shape::from([1]));
+        let half_ulp =
+            graph.constant(TensorData::new([], vec![f32::from_bits(0x3380_0000)]).unwrap());
+        let sum = graph.add(input, half_ulp).unwrap();
+        let output = graph.sub(sum, input).unwrap();
+        let values = TensorData::new([1], vec![1.0]).unwrap();
+        let bindings = HashMap::from([("input".into(), values.clone())]);
+        let expected = crate::execute_elementwise(&graph, output, &bindings).unwrap();
+        assert_eq!(expected, TensorData::new([1], vec![0.0]).unwrap());
+
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        let kernel = CpuJit::compile(&uop).unwrap();
+        let mut buffers = [
+            JitBuffer::from_tensor(&values, false),
+            JitBuffer::zeroed(DType::F32, 1, true),
+        ];
+        kernel.call(&mut buffers, &[]).unwrap();
+        assert_eq!(
+            buffers[1].clone().into_tensor(Shape::from([1])).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn scalar_exact_chain_commits_each_storage_width() {
+        let mut graph = Graph::new();
+        let lhs = graph.input_dtype("lhs", Shape::from([1]), DType::I8);
+        let rhs = graph.input_dtype("rhs", Shape::from([1]), DType::I8);
+        let zero = graph.constant(TensorData::from_scalars([], DType::I8, [Scalar::I(0)]).unwrap());
+        let wrapped = graph.binary(crate::BinaryOp::Add, lhs, rhs).unwrap();
+        let output = graph
+            .binary(crate::BinaryOp::Maximum, wrapped, zero)
+            .unwrap();
+        let lhs_values = TensorData::from_scalars([1], DType::I8, [Scalar::I(127)]).unwrap();
+        let rhs_values = TensorData::from_scalars([1], DType::I8, [Scalar::I(1)]).unwrap();
+        let bindings = HashMap::from([
+            ("lhs".into(), lhs_values.clone()),
+            ("rhs".into(), rhs_values.clone()),
+        ]);
+        let expected = CpuBackend.execute(&graph, output, &bindings).unwrap();
+        assert_eq!(
+            expected,
+            TensorData::from_scalars([1], DType::I8, [Scalar::I(0)]).unwrap()
+        );
+        let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+        let kernel = CpuJit::compile(&uop).unwrap();
+        let mut buffers = [
+            JitBuffer::from_tensor(&lhs_values, false),
+            JitBuffer::from_tensor(&rhs_values, false),
+            JitBuffer::zeroed(DType::I8, 1, true),
+        ];
+        kernel.call(&mut buffers, &[]).unwrap();
+        assert_eq!(
+            buffers[2].clone().into_tensor(Shape::from([1])).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn scalar_i16_u16_mul_chains_commit_intermediate_storage() {
+        for (dtype, lhs_scalar, rhs_scalar, parent_op, expected_scalar, marker, minimum_count) in [
+            (
+                DType::I16,
+                Scalar::I(-1),
+                Scalar::I(-1),
+                crate::BinaryOp::Minimum,
+                Scalar::I(-1),
+                "rg_i16((uint16_t)(",
+                2,
+            ),
+            (
+                DType::U16,
+                Scalar::U(u64::from(u16::MAX)),
+                Scalar::U(u64::from(u16::MAX)),
+                crate::BinaryOp::Maximum,
+                Scalar::U(u64::from(u16::MAX)),
+                "((uint16_t)(",
+                2,
+            ),
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", Shape::from([1]), dtype);
+            let rhs = graph.input_dtype("rhs", Shape::from([1]), dtype);
+            let product = graph.binary(crate::BinaryOp::Mul, lhs, rhs).unwrap();
+            let output = graph.binary(parent_op, product, lhs).unwrap();
+            let lhs_values = TensorData::from_scalars([1], dtype, [lhs_scalar]).unwrap();
+            let rhs_values = TensorData::from_scalars([1], dtype, [rhs_scalar]).unwrap();
+            let bindings = HashMap::from([
+                ("lhs".into(), lhs_values.clone()),
+                ("rhs".into(), rhs_values.clone()),
+            ]);
+            let expected = CpuBackend.execute(&graph, output, &bindings).unwrap();
+            assert_eq!(
+                expected,
+                TensorData::from_scalars([1], dtype, [expected_scalar]).unwrap(),
+                "{dtype:?}"
+            );
+
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let rendered = CpuJit::render(&uop).unwrap();
+            assert!(
+                rendered.source.matches(marker).count() >= minimum_count,
+                "{dtype:?}: {}",
+                rendered.source
+            );
+            let kernel = CpuJit::compile(&uop).unwrap();
+            let mut buffers = [
+                JitBuffer::from_tensor(&lhs_values, false),
+                JitBuffer::from_tensor(&rhs_values, false),
+                JitBuffer::zeroed(dtype, 1, true),
+            ];
+            kernel.call(&mut buffers, &[]).unwrap();
+            assert_eq!(
+                buffers[2].clone().into_tensor(Shape::from([1])).unwrap(),
+                expected,
+                "{dtype:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_bool_binary_nodes_keep_typed_truth_table() {
+        let lhs_values =
+            TensorData::from_storage([4], Storage::Bool(vec![false, false, true, true])).unwrap();
+        let rhs_values =
+            TensorData::from_storage([4], Storage::Bool(vec![false, true, false, true])).unwrap();
+        for op in [
+            crate::BinaryOp::Add,
+            crate::BinaryOp::Sub,
+            crate::BinaryOp::Mul,
+            crate::BinaryOp::Div,
+            crate::BinaryOp::BitAnd,
+            crate::BinaryOp::BitOr,
+            crate::BinaryOp::BitXor,
+            crate::BinaryOp::Maximum,
+            crate::BinaryOp::Minimum,
+        ] {
+            let mut graph = Graph::new();
+            let lhs = graph.input_dtype("lhs", Shape::from([4]), DType::Bool);
+            let rhs = graph.input_dtype("rhs", Shape::from([4]), DType::Bool);
+            let output = graph.binary(op, lhs, rhs).unwrap();
+            let expected = CpuBackend
+                .execute(
+                    &graph,
+                    output,
+                    &HashMap::from([
+                        ("lhs".into(), lhs_values.clone()),
+                        ("rhs".into(), rhs_values.clone()),
+                    ]),
+                )
+                .unwrap();
+            let uop = crate::lower_graph_elementwise(&graph, output).unwrap();
+            let rendered = CpuJit::render(&uop).unwrap();
+            assert!(rendered.source.contains("((uint8_t)(("), "{op:?}");
+            let kernel = CpuJit::compile(&uop).unwrap();
+            let mut buffers = [
+                JitBuffer::from_tensor(&lhs_values, false),
+                JitBuffer::from_tensor(&rhs_values, false),
+                JitBuffer::zeroed(DType::Bool, 4, true),
+            ];
+            kernel.call(&mut buffers, &[]).unwrap();
+            assert_eq!(
+                buffers[2].clone().into_tensor(Shape::from([4])).unwrap(),
+                expected,
+                "{op:?}"
+            );
         }
     }
 
