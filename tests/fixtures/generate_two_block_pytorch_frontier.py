@@ -9,7 +9,7 @@ Run with the repository's offline PyTorch environment:
 
 The generator mirrors only RustGrad's deterministic parameter initializer and
 compiled Threefry dropout stream. Forward, loss, gradients, clipping, moments,
-and the AdamW successor are computed by PyTorch on CPU.
+and AdamW successors are computed by PyTorch on CPU.
 """
 
 from __future__ import annotations
@@ -828,7 +828,8 @@ def generate_gelu_policy_window() -> dict[str, object]:
     replays = []
     gradients_by_replay = []
     numerators = []
-    for replay in range(1, 4):
+
+    def record_replay(replay: int) -> None:
         gradients, fixture, numerator = policy_replay_fixture(
             params, replay, "gelu_tanh"
         )
@@ -836,33 +837,80 @@ def generate_gelu_policy_window() -> dict[str, object]:
         replays.append(fixture)
         numerators.append(numerator)
 
-    pending_loss_numerator = f32(f32(0.0) + numerators[0])
-    pending_loss_numerator = f32(pending_loss_numerator + numerators[1])
-    _, next_first_moments, next_second_moments, commit = adamw_window(
-        active_params,
-        first_moments,
-        second_moments,
-        gradients_by_replay,
-        1,
-        11,
-        max_gradient_norm=POLICY_MAX_GRADIENT_NORM,
-        learning_rate=1.0e-3,
-        weight_decay=POLICY_WEIGHT_DECAY,
-        weight_decay_exclusions=exclusions,
-    )
-    assert all(torch.isfinite(value).all() for value in next_first_moments.values())
-    assert all(torch.isfinite(value).all() for value in next_second_moments.values())
-    window_loss_numerator = f32(pending_loss_numerator + numerators[2])
-    commit.update(
-        {
-            "learning_rate": 1.0e-3,
-            "mean_loss": f32(window_loss_numerator / f32(11.0)),
-            "microbatch_count": 3,
-        }
-    )
+    def commit_window(
+        replay_start: int,
+        replay_end: int,
+        optimizer_step: int,
+        learning_rate: float,
+    ) -> dict[str, object]:
+        nonlocal params, active_params, first_moments, second_moments
+        prior_active = active_params
+        next_active, first_moments, second_moments, window = adamw_window(
+            active_params,
+            first_moments,
+            second_moments,
+            gradients_by_replay[replay_start - 1 : replay_end],
+            optimizer_step,
+            11,
+            max_gradient_norm=POLICY_MAX_GRADIENT_NORM,
+            learning_rate=learning_rate,
+            weight_decay=POLICY_WEIGHT_DECAY,
+            weight_decay_exclusions=exclusions,
+        )
+        assert prior_active.keys() == next_active.keys()
+        params = OrderedDict(
+            (
+                name,
+                frozen_parameter.detach().clone().requires_grad_()
+                if name == POLICY_FROZEN_PARAMETER
+                else next_active[name],
+            )
+            for name in params
+        )
+        active_params = OrderedDict(
+            (name, parameter)
+            for name, parameter in params.items()
+            if name != POLICY_FROZEN_PARAMETER
+        )
+        window_loss_numerator = f32(0.0)
+        for numerator in numerators[replay_start - 1 : replay_end]:
+            window_loss_numerator = f32(window_loss_numerator + numerator)
+        window.update(
+            {
+                "learning_rate": learning_rate,
+                "mean_loss": f32(window_loss_numerator / f32(11.0)),
+                "microbatch_count": replay_end - replay_start + 1,
+            }
+        )
+        assert torch.equal(params[POLICY_FROZEN_PARAMETER], frozen_parameter)
+        return window
+
+    for replay in range(1, 4):
+        record_replay(replay)
+    first_pending_loss_numerator = f32(f32(0.0) + numerators[0])
+    first_pending_loss_numerator = f32(first_pending_loss_numerator + numerators[1])
+    first_commit = commit_window(1, 3, 1, 1.0e-3)
+    assert all(torch.isfinite(value).all() for value in first_moments.values())
+    assert all(torch.isfinite(value).all() for value in second_moments.values())
+
+    record_replay(4)
+    pending_checkpoint = {
+        "replay_step": 4,
+        "optimizer_step": 1,
+        "accumulation_index": 1,
+        "valid_token_count": 5,
+        "dropout_counter": 4 * 84,
+        "loss_numerator": numerators[3],
+    }
+    for replay in (5, 6):
+        record_replay(replay)
+    second_commit = commit_window(4, 6, 2, 5.0e-4)
+    assert all(torch.isfinite(value).all() for value in first_moments.values())
+    assert all(torch.isfinite(value).all() for value in second_moments.values())
+
     assert torch.equal(params[POLICY_FROZEN_PARAMETER], frozen_parameter)
     return {
-        "rustgrad_base": "89bd150e01eb35068b8bdba05b264e49bb30616e",
+        "rustgrad_base": "1b00de2a586b9d0493acfe6438d357c0cf4fcb1f",
         "approximation": "tanh",
         "weight_decay": POLICY_WEIGHT_DECAY,
         "weight_decay_exclusions": list(GELU_WEIGHT_DECAY_EXCLUSIONS),
@@ -870,7 +918,7 @@ def generate_gelu_policy_window() -> dict[str, object]:
         "accumulation_steps": 3,
         "max_gradient_norm": POLICY_MAX_GRADIENT_NORM,
         "ignore_index": POLICY_IGNORE_INDEX,
-        "learning_rate": 1.0e-3,
+        "learning_rates": [1.0e-3, 5.0e-4],
         "active_parameter_count": len(active_params),
         "active_coordinate_count": sum(
             parameter.numel() for parameter in active_params.values()
@@ -880,15 +928,16 @@ def generate_gelu_policy_window() -> dict[str, object]:
         "frozen_parameter": tensor(frozen_parameter),
         "initial_parameters": tensor_map(initial_parameters),
         "replays": replays,
-        "pending_checkpoint": {
+        "first_pending_checkpoint": {
             "replay_step": 2,
             "optimizer_step": 0,
             "accumulation_index": 2,
             "valid_token_count": 8,
             "dropout_counter": 2 * 84,
-            "loss_numerator": pending_loss_numerator,
+            "loss_numerator": first_pending_loss_numerator,
         },
-        "commit": commit,
+        "pending_checkpoint": pending_checkpoint,
+        "commits": [first_commit, second_commit],
     }
 
 
