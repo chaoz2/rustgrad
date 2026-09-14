@@ -1,3 +1,4 @@
+use super::adamw_contract::{CompiledAdamWContract, CompiledAdamWPolicy};
 use super::*;
 use crate::file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically};
 use serde::{Deserialize, Serialize};
@@ -1157,8 +1158,8 @@ fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
     let main = &plan.inner;
     validate_adamw_observation_schema(
         &main.phase_outputs.observations,
-        plan.clip_report,
-        plan.window_loss_report,
+        plan.contract.clip_report,
+        plan.contract.window_loss_report,
     )?;
     let main_state_buffers = main
         .parameter_buffers
@@ -1216,8 +1217,8 @@ fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
                 &main_state_buffers,
                 &main.state_input_keys,
                 &main.recurrent_store_groups,
-                plan.clip_report,
-                plan.window_loss_report,
+                plan.contract.clip_report,
+                plan.contract.window_loss_report,
             )?,
             inputs: main.inputs.clone(),
             output_names: main.phase_outputs.named_outputs.clone(),
@@ -1235,20 +1236,20 @@ fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
             .transpose()?,
         zero_grad: plan.zero_grad.as_ref().map(auxiliary_wire).transpose()?,
         evaluation,
-        gradient_accumulation_steps: plan.gradient_accumulation_steps,
-        token_weight_policy: plan.token_weight_policy.as_ref().map(Into::into),
-        allow_zero_valid_token_microbatches: plan.allow_zero_valid_token_microbatches,
-        max_gradient_norm_bits: plan.max_gradient_norm.map(f32::to_bits),
-        clip_report: plan.clip_report,
-        window_loss_report: plan.window_loss_report,
-        loss_scale_bits: plan.loss_scale.to_bits(),
-        dropout: plan.dropout.map(|dropout| DropoutWire {
+        gradient_accumulation_steps: plan.contract.gradient_accumulation_steps,
+        token_weight_policy: plan.contract.token_weight_policy.as_ref().map(Into::into),
+        allow_zero_valid_token_microbatches: plan.contract.allow_zero_valid_token_microbatches,
+        max_gradient_norm_bits: plan.contract.max_gradient_norm.map(f32::to_bits),
+        clip_report: plan.contract.clip_report,
+        window_loss_report: plan.contract.window_loss_report,
+        loss_scale_bits: plan.contract.loss_scale.to_bits(),
+        dropout: plan.contract.dropout.map(|dropout| DropoutWire {
             key: dropout.config.key().words(),
             blocks_per_replay: dropout.blocks_per_replay,
         }),
-        host_token_inputs: plan.host_token_inputs.clone(),
-        frozen_parameters: plan.frozen_parameters.clone(),
-        learning_rate: match &plan.learning_rate {
+        host_token_inputs: plan.contract.host_token_inputs.clone(),
+        frozen_parameters: plan.contract.frozen_parameters.clone(),
+        learning_rate: match &plan.contract.learning_rate {
             CompiledLearningRatePolicy::External => LearningRateWire::External,
             CompiledLearningRatePolicy::MultiStep(schedule) => LearningRateWire::MultiStep {
                 base_bits: schedule.base.to_bits(),
@@ -1257,11 +1258,11 @@ fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
             },
         },
         adamw: AdamWPolicyWire {
-            beta1_bits: plan.adamw_policy.beta1.to_bits(),
-            beta2_bits: plan.adamw_policy.beta2.to_bits(),
-            eps_bits: plan.adamw_policy.eps.to_bits(),
-            weight_decay_bits: plan.adamw_policy.weight_decay.to_bits(),
-            weight_decay_exclusions: plan.adamw_policy.weight_decay_exclusions.clone(),
+            beta1_bits: plan.contract.optimizer.beta1.to_bits(),
+            beta2_bits: plan.contract.optimizer.beta2.to_bits(),
+            eps_bits: plan.contract.optimizer.eps.to_bits(),
+            weight_decay_bits: plan.contract.optimizer.weight_decay.to_bits(),
+            weight_decay_exclusions: plan.contract.optimizer.weight_decay_exclusions.clone(),
         },
     })
 }
@@ -1679,29 +1680,31 @@ fn restore_owner<M: Module>(
         inner,
         partial_flush,
         zero_grad,
-        gradient_accumulation_steps: wire.gradient_accumulation_steps,
-        token_weight_policy: wire.token_weight_policy.as_ref().map(Into::into),
-        allow_zero_valid_token_microbatches: wire.allow_zero_valid_token_microbatches,
-        max_gradient_norm: wire.max_gradient_norm_bits.map(f32::from_bits),
-        clip_report: wire.clip_report,
-        window_loss_report: wire.window_loss_report,
-        loss_scale: f32::from_bits(wire.loss_scale_bits),
-        progress: AdamWProgress::INITIAL,
-        dropout: wire.dropout.map(|dropout| CompiledDropoutState {
-            config: CompiledDropoutConfig::new(CompiledDropoutKey(dropout.key)),
-            blocks_per_replay: dropout.blocks_per_replay,
-        }),
-        host_token_inputs: wire.host_token_inputs.clone(),
-        frozen_parameters: wire.frozen_parameters.clone(),
-        evaluation,
-        learning_rate,
-        adamw_policy: CompiledAdamWPolicy {
-            beta1: f32::from_bits(wire.adamw.beta1_bits),
-            beta2: f32::from_bits(wire.adamw.beta2_bits),
-            eps: f32::from_bits(wire.adamw.eps_bits),
-            weight_decay: f32::from_bits(wire.adamw.weight_decay_bits),
-            weight_decay_exclusions: wire.adamw.weight_decay_exclusions.clone(),
+        contract: CompiledAdamWContract {
+            gradient_accumulation_steps: wire.gradient_accumulation_steps,
+            token_weight_policy: wire.token_weight_policy.as_ref().map(Into::into),
+            allow_zero_valid_token_microbatches: wire.allow_zero_valid_token_microbatches,
+            max_gradient_norm: wire.max_gradient_norm_bits.map(f32::from_bits),
+            clip_report: wire.clip_report,
+            window_loss_report: wire.window_loss_report,
+            loss_scale: f32::from_bits(wire.loss_scale_bits),
+            dropout: wire.dropout.map(|dropout| CompiledDropoutState {
+                config: CompiledDropoutConfig::new(CompiledDropoutKey(dropout.key)),
+                blocks_per_replay: dropout.blocks_per_replay,
+            }),
+            host_token_inputs: wire.host_token_inputs.clone(),
+            frozen_parameters: wire.frozen_parameters.clone(),
+            learning_rate,
+            optimizer: CompiledAdamWPolicy {
+                beta1: f32::from_bits(wire.adamw.beta1_bits),
+                beta2: f32::from_bits(wire.adamw.beta2_bits),
+                eps: f32::from_bits(wire.adamw.eps_bits),
+                weight_decay: f32::from_bits(wire.adamw.weight_decay_bits),
+                weight_decay_exclusions: wire.adamw.weight_decay_exclusions.clone(),
+            },
         },
+        progress: AdamWProgress::INITIAL,
+        evaluation,
     }
     .restore_checkpoint(checkpoint.optimizer_checkpoint())?;
     seal.validate_unchanged(module)?;
