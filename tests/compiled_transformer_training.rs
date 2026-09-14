@@ -9649,6 +9649,92 @@ fn compiled_two_block_policy_frontier_matches_pytorch_on_strict_native_cpu() {
         f64::from(pending.loss_numerator),
     );
 
+    let mut zeroed = plan
+        .restore_checkpoint(&pending_checkpoint)
+        .unwrap()
+        .prepare(&target)
+        .unwrap();
+    assert_native_policy_preparation(&zeroed);
+    let zeroed_preparation = native_policy_preparation_identity(&zeroed);
+    let zeroed_parameters = zeroed.parameter_snapshots().unwrap();
+    let zeroed_first_moments = zeroed.first_moment_snapshots().unwrap();
+    let zeroed_second_moments = zeroed.second_moment_snapshots().unwrap();
+    let reset = zeroed.zero_grad().unwrap();
+    assert_eq!(reset.discarded_microbatches(), 1);
+    assert_eq!(
+        native_policy_preparation_identity(&zeroed),
+        zeroed_preparation
+    );
+    assert_native_policy_progress(&zeroed, 4, 1, 0, 0);
+    let zeroed_checkpoint = zeroed.checkpoint().unwrap();
+    let zeroed_info = zeroed_checkpoint.info();
+    assert_eq!(zeroed_info.discarded_microbatches(), 1);
+    assert_eq!(zeroed_info.reset_transition_count(), 1);
+    assert_eq!(
+        zeroed_info.accumulated_loss_numerator().map(f32::to_bits),
+        Some(0.0f32.to_bits())
+    );
+    assert_eq!(
+        zeroed_info.reset_capture_identity(),
+        zeroed.zero_grad_capture_identity()
+    );
+    assert_eq!(zeroed_info.flushed_window_count(), 0);
+    assert_eq!(zeroed_info.flushed_microbatch_count(), 0);
+    assert_eq!(zeroed.parameter_snapshots().unwrap(), zeroed_parameters);
+    assert_eq!(
+        zeroed.first_moment_snapshots().unwrap(),
+        zeroed_first_moments
+    );
+    assert_eq!(
+        zeroed.second_moment_snapshots().unwrap(),
+        zeroed_second_moments
+    );
+    assert_policy_accumulators_are_positive_zero(&zeroed);
+    let zeroed_accumulators = zeroed.gradient_accumulator_snapshots().unwrap();
+    assert_eq!(zeroed_accumulators.len(), policy.active_parameter_count);
+    assert_eq!(
+        zeroed_accumulators
+            .values()
+            .map(TensorData::len)
+            .sum::<usize>(),
+        policy.active_coordinate_count
+    );
+    let zeroed_parameter_names = zeroed_parameters.keys().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(zeroed_parameter_names.len(), policy.active_parameter_count);
+    assert!(zeroed_parameter_names.contains("tokens.weight"));
+    assert!(!zeroed_parameter_names.contains("lm_head.weight"));
+    assert!(!zeroed_parameter_names.contains(POLICY_FROZEN_PARAMETER));
+
+    let mut zeroed_reference = plan
+        .restore_checkpoint(&zeroed_checkpoint)
+        .unwrap()
+        .prepare(&target)
+        .unwrap();
+    assert_eq!(zeroed_reference.checkpoint().unwrap(), zeroed_checkpoint);
+    let zeroed_fifth = zeroed.step_scheduled(policy_frontier_batch(5)).unwrap();
+    let reference_fifth = zeroed_reference
+        .step_scheduled(policy_frontier_batch(5))
+        .unwrap();
+    assert_native_policy_step(&zeroed_fifth, &policy.replays[4]);
+    assert_native_policy_step(&reference_fifth, &policy.replays[4]);
+    assert_eq!(zeroed_fifth.report().successful_invocation(), 1);
+    assert_eq!(reference_fifth.report().successful_invocation(), 1);
+    assert_compiled_adamw_steps_exact(
+        "strict-native policy post-zero-grad restore",
+        &reference_fifth,
+        &zeroed_fifth,
+    );
+    assert_native_policy_progress(&zeroed, 5, 1, 1, 3);
+    assert_eq!(
+        zeroed_reference.checkpoint().unwrap(),
+        zeroed.checkpoint().unwrap()
+    );
+    assert_pytorch_tensor_map_close(
+        "strict-native policy post-zero-grad replay 5 numerator gradient",
+        &zeroed.gradient_accumulator_snapshots().unwrap(),
+        &policy.replays[4].numerator_gradients,
+    );
+
     // Advance both ordinary and reset-transition versions, then roll the same
     // prepared native runtime back without preparing another native program.
     let preparation_before_restore = native_policy_preparation_identity(&uninterrupted);
