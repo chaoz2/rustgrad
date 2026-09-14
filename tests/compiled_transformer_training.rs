@@ -1,6 +1,6 @@
 #[cfg(target_os = "macos")]
 use rustgrad::MetalSessionTarget;
-use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateDict, StateKind};
+use rustgrad::nn::{Embedding, GELU, LayerNorm, Mode, ModeModuleForward, StateDict, StateKind};
 use rustgrad::runtime::metal::{MetalCapabilities, MetalRenderer};
 #[cfg(target_os = "macos")]
 use rustgrad::runtime::metal::{
@@ -428,6 +428,97 @@ impl Module for TwoBlockPositionalGpt {
     }
 }
 
+struct TwoBlockPositionalGeluGpt {
+    tokens: Embedding,
+    positions: Embedding,
+    first: TransformerBlock<GELU>,
+    second: TransformerBlock<GELU>,
+    norm: LayerNorm,
+}
+
+impl TwoBlockPositionalGeluGpt {
+    fn new(seed: u64) -> Result<Self> {
+        Ok(Self {
+            tokens: Embedding::new_static(MULTI_HEAD_VOCAB, MULTI_HEAD_EMBEDDING, None, seed)?,
+            positions: Embedding::new_static(
+                TIME,
+                MULTI_HEAD_EMBEDDING,
+                None,
+                seed.wrapping_add(1),
+            )?,
+            first: TransformerBlock::new_static_with_activation(
+                MULTI_HEAD_EMBEDDING,
+                2,
+                MULTI_HEAD_FEED_FORWARD,
+                true,
+                0.0,
+                seed.wrapping_add(2),
+                GELU::tanh(),
+            )?
+            .with_causal_attention(true),
+            second: TransformerBlock::new_static_with_activation(
+                MULTI_HEAD_EMBEDDING,
+                2,
+                MULTI_HEAD_FEED_FORWARD,
+                true,
+                0.0,
+                seed.wrapping_add(3),
+                GELU::tanh(),
+            )?
+            .with_causal_attention(true),
+            norm: LayerNorm::new_static([MULTI_HEAD_EMBEDDING], 1e-5, true)?,
+        })
+    }
+
+    fn forward(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<NodeId> {
+        let token_hidden = self.tokens.forward(graph, tokens)?;
+        let positions = graph.constant(TensorData::from_scalars(
+            [BATCH, TIME],
+            DType::I32,
+            [0, 1, 2, 0, 1, 2].into_iter().map(Scalar::I),
+        )?);
+        let position_hidden = self.positions.forward(graph, positions)?;
+        let hidden = graph.add(token_hidden, position_hidden)?;
+        let hidden = self
+            .first
+            .forward_training_with_dropout(graph, hidden, dropout)?;
+        let hidden = self
+            .second
+            .forward_training_with_dropout(graph, hidden, dropout)?;
+        let hidden = self.norm.forward(graph, hidden)?;
+        let tied_weight = self.tokens.weight.bind(graph)?;
+        let tied_weight = graph.permute(tied_weight, [1, 0])?;
+        graph.matmul(hidden, tied_weight)
+    }
+}
+
+impl Module for TwoBlockPositionalGeluGpt {
+    fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        let child = |name: &str| {
+            if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}.{name}")
+            }
+        };
+        self.tokens.visit(&child("tokens"), visitor);
+        self.positions.visit(&child("positions"), visitor);
+        self.first.visit(&child("first"), visitor);
+        self.second.visit(&child("second"), visitor);
+        self.norm.visit(&child("norm"), visitor);
+        visitor(
+            child("lm_head.weight"),
+            &self.tokens.weight,
+            StateKind::Parameter,
+        );
+    }
+}
+
 struct BufferedTinyCausalTransformer {
     transformer: TinyCausalTransformer,
     running_marker: Parameter,
@@ -521,6 +612,14 @@ fn two_block_config() -> CompiledAdamWConfig {
         .with_host_token_input("tokens", [BATCH, TIME])
         .unwrap()
         .with_host_token_input("targets", [BATCH, TIME])
+        .unwrap()
+}
+
+fn two_block_gelu_config() -> CompiledAdamWConfig {
+    two_block_config()
+        .with_input(LOSS_MASK, [BATCH, TIME], DType::F32)
+        .unwrap()
+        .with_token_weighted_gradient_accumulation(LOSS_MASK)
         .unwrap()
 }
 
@@ -650,6 +749,17 @@ fn build_two_block(
     assert_eq!(dropout.next, 4);
     let loss = multi_head_sparse_causal_loss(graph, logits, inputs["targets"])?;
     Ok((loss, BTreeMap::from([("logits".into(), logits)])))
+}
+
+fn build_two_block_gelu(
+    model: &TwoBlockPositionalGeluGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+) -> Result<CompiledAdamWGraph> {
+    let mut no_dropout = ZeroProbabilityDropout;
+    let logits = model.forward(graph, inputs["tokens"], &mut no_dropout)?;
+    let losses = multi_head_sparse_causal_losses(graph, logits, inputs["targets"])?;
+    Ok(CompiledAdamWGraph::token_mean(losses, BTreeMap::new()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1045,6 +1155,24 @@ fn multi_head_batch() -> BTreeMap<String, TensorData> {
         ("tokens".into(), token_tensor(MULTI_HEAD_TOKENS)),
         ("targets".into(), token_tensor(MULTI_HEAD_TARGETS)),
     ])
+}
+
+fn two_block_gelu_batch() -> BTreeMap<String, TensorData> {
+    let mut inputs = multi_head_batch();
+    assert!(
+        inputs
+            .insert(
+                LOSS_MASK.into(),
+                TensorData::from_scalars(
+                    [BATCH, TIME],
+                    DType::F32,
+                    std::iter::repeat_n(Scalar::F(1.0), TOKEN_COUNT),
+                )
+                .unwrap(),
+            )
+            .is_none()
+    );
+    inputs
 }
 
 fn attention_dropout_batch(guard: f32) -> BTreeMap<String, TensorData> {
@@ -1616,6 +1744,15 @@ fn sparse_causal_loss_matches_dense_reference_and_analytic_gradient() {
 struct FixedResidualDropout {
     masks: Vec<TensorData>,
     next: usize,
+}
+
+struct ZeroProbabilityDropout;
+
+impl TrainingDropoutProvider for ZeroProbabilityDropout {
+    fn dropout(&mut self, _graph: &mut Graph, input: NodeId, probability: f64) -> Result<NodeId> {
+        assert_eq!(probability.to_bits(), 0.0f64.to_bits());
+        Ok(input)
+    }
 }
 
 impl FixedResidualDropout {
@@ -7875,6 +8012,343 @@ fn compiled_two_block_attention_mask_gradients_match_fixed_dropout_central_diffe
             probe.coordinate
         );
     }
+    assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_gelu_autograd_matches_paired_finite_differences_and_native() {
+    const EPSILON: f64 = 1e-2;
+    const VJP_TOLERANCE: f64 = 2e-2;
+    const HVP_TOLERANCE: f64 = 3e-2;
+
+    let model = TwoBlockPositionalGeluGpt::new(0x5678).unwrap();
+    assert!(model.first.is_causal() && model.second.is_causal());
+    assert_eq!(
+        model.first.activation().approximation(),
+        rustgrad::nn::GeluApproximation::Tanh
+    );
+    assert_eq!(
+        model.second.activation().approximation(),
+        rustgrad::nn::GeluApproximation::Tanh
+    );
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+
+    let mut traversal = BTreeMap::new();
+    let mut traversal_order = Vec::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        traversal_order.push(name.clone());
+        traversal.insert(name, (parameter.id(), parameter.is_trainable()));
+    });
+    let mut expected_traversal_order = vec!["tokens.weight".into(), "positions.weight".into()];
+    for block in ["first", "second"] {
+        for state in [
+            "query.0", "query.1", "key.0", "key.1", "value.0", "value.1", "out.0", "out.1",
+            "ff1.0", "ff1.1", "ff2.0", "ff2.1", "ln1.0", "ln1.1", "ln2.0", "ln2.1",
+        ] {
+            expected_traversal_order.push(format!("{block}.{state}"));
+        }
+    }
+    expected_traversal_order.extend(["norm.weight".into(), "norm.bias".into()]);
+    expected_traversal_order.push("lm_head.weight".into());
+    assert_eq!(traversal_order, expected_traversal_order);
+    assert_eq!(traversal.len(), 37);
+    assert_eq!(traversal["tokens.weight"].0, traversal["lm_head.weight"].0);
+    assert!(traversal["tokens.weight"].1 && traversal["lm_head.weight"].1);
+    assert_eq!(
+        traversal
+            .values()
+            .map(|(identity, _)| *identity)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        36
+    );
+    assert_eq!(
+        traversal
+            .values()
+            .filter(|(identity, _)| *identity == traversal["tokens.weight"].0)
+            .count(),
+        2
+    );
+
+    let trainable = model.trainable_parameters().unwrap();
+    let mut expected_canonical_order = expected_traversal_order
+        .iter()
+        .filter(|name| name.as_str() != "lm_head.weight")
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    expected_canonical_order.sort_unstable();
+    assert_eq!(
+        trainable
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        expected_canonical_order
+    );
+    let parameters = trainable
+        .iter()
+        .map(|(name, parameter)| (name.clone(), parameter.value().unwrap()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(parameters.len(), 36);
+    assert_eq!(parameters.values().map(TensorData::len).sum::<usize>(), 384);
+    assert!(parameters.contains_key("tokens.weight"));
+    assert!(!parameters.contains_key("lm_head.weight"));
+    let mut traversal_names = parameters.keys().cloned().collect::<BTreeSet<_>>();
+    assert!(traversal_names.insert("lm_head.weight".into()));
+    assert_eq!(
+        traversal.keys().cloned().collect::<BTreeSet<_>>(),
+        traversal_names
+    );
+    let directions = two_block_dense_parameter_directions(&parameters);
+
+    let mut graph = Graph::new();
+    let tokens = graph.input_dtype("tokens", [BATCH, TIME], DType::I32);
+    let targets = graph.input_dtype("targets", [BATCH, TIME], DType::I32);
+    let loss_mask = graph.input_dtype(LOSS_MASK, [BATCH, TIME], DType::F32);
+    let mut no_dropout = ZeroProbabilityDropout;
+    let logits = model.forward(&mut graph, tokens, &mut no_dropout).unwrap();
+    let losses = multi_head_sparse_causal_losses(&mut graph, logits, targets).unwrap();
+    let weighted_losses = graph.mul(losses, loss_mask).unwrap();
+    let numerator = graph.sum_all(weighted_losses).unwrap();
+    let parameter_targets = trainable
+        .iter()
+        .map(|(_, parameter)| parameter.node(&graph).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parameter_targets
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len(),
+        parameter_targets.len()
+    );
+    let parameter_input_names = parameter_targets
+        .iter()
+        .map(|target| match graph.op(*target).unwrap() {
+            Op::Input { name } => name.clone(),
+            op => panic!("GELU autograd target %{target} must be an input, got {op:?}"),
+        })
+        .collect::<Vec<_>>();
+    let gradients = graph
+        .gradient_default(numerator, &parameter_targets)
+        .unwrap();
+    assert_eq!(gradients.len(), trainable.len());
+
+    let hvps = directions.each_ref().map(|direction| {
+        let directional_terms = gradients
+            .iter()
+            .zip(trainable.iter())
+            .map(|(gradient, (name, _))| {
+                let direction = graph.constant(direction[name].clone());
+                let product = graph.mul(*gradient, direction).unwrap();
+                graph.sum_all(product).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let directional_gradient = directional_terms
+            .into_iter()
+            .reduce(|sum, term| graph.add(sum, term).unwrap())
+            .expect("the GELU Transformer frontier is nonempty");
+        graph
+            .gradient_default(directional_gradient, &parameter_targets)
+            .unwrap()
+    });
+    assert!(hvps.iter().all(|hvp| hvp.len() == trainable.len()));
+
+    let mut bindings = model.input_bindings(&graph).unwrap();
+    bindings.extend(two_block_gelu_batch());
+    let mut base_outputs = Vec::with_capacity(1 + gradients.len() + 2 * trainable.len());
+    base_outputs.push(numerator);
+    base_outputs.extend(gradients.iter().copied());
+    base_outputs.extend(hvps.iter().flatten().copied());
+    let base = CpuBackend
+        .execute_many(&graph, &base_outputs, &bindings)
+        .unwrap();
+    let analytic_gradients = trainable
+        .iter()
+        .map(|(name, _)| name.clone())
+        .zip(base.outputs[1..1 + gradients.len()].iter().cloned())
+        .collect::<BTreeMap<_, _>>();
+    assert_two_block_gradient_frontier_coverage(&analytic_gradients, &directions[0]);
+
+    let numerator_evaluations = Cell::new(0_usize);
+    let evaluate_numerator = |input_name: &str, value: &TensorData, coordinate, epsilon| {
+        numerator_evaluations.set(
+            numerator_evaluations
+                .get()
+                .checked_add(1)
+                .expect("the bounded GELU VJP oracle count must not overflow"),
+        );
+        CpuBackend
+            .execute(
+                &graph,
+                numerator,
+                &perturbed_parameter_bindings(&bindings, input_name, value, coordinate, epsilon),
+            )
+            .unwrap()
+            .scalar_at(0)
+            .as_f64()
+    };
+    let mut numerical_gradients = BTreeMap::new();
+    let mut vjp_coordinates = 0;
+    for ((name, _), input_name) in trainable.iter().zip(&parameter_input_names) {
+        let value = &parameters[name];
+        let numerical = TensorData::from_scalars(
+            value.shape().clone(),
+            DType::F32,
+            (0..value.len()).map(|coordinate| {
+                let coarse = (evaluate_numerator(input_name, value, coordinate, EPSILON)
+                    - evaluate_numerator(input_name, value, coordinate, -EPSILON))
+                    / (2.0 * EPSILON);
+                let fine = (evaluate_numerator(input_name, value, coordinate, EPSILON / 2.0)
+                    - evaluate_numerator(input_name, value, coordinate, -EPSILON / 2.0))
+                    / EPSILON;
+                Scalar::F((4.0 * fine - coarse) / 3.0)
+            }),
+        )
+        .unwrap();
+        let analytic = &analytic_gradients[name];
+        for coordinate in 0..value.len() {
+            let analytic = analytic.scalar_at(coordinate).as_f64();
+            let numerical = numerical.scalar_at(coordinate).as_f64();
+            let error = (analytic - numerical).abs();
+            let tolerance = VJP_TOLERANCE * 1.0f64.max(analytic.abs()).max(numerical.abs());
+            assert!(
+                analytic.is_finite() && numerical.is_finite() && error <= tolerance,
+                "{name}[{coordinate}] GELU numerator VJP mismatch: analytic={analytic}, numerical={numerical}, error={error}, tolerance={tolerance}"
+            );
+            vjp_coordinates += 1;
+        }
+        assert!(
+            numerical_gradients
+                .insert(name.clone(), numerical)
+                .is_none()
+        );
+    }
+    assert_eq!(vjp_coordinates, 384);
+    assert_eq!(numerator_evaluations.get(), 4 * vjp_coordinates);
+    assert_two_block_gradient_frontier_coverage(&numerical_gradients, &directions[0]);
+
+    let hvp_gradient_evaluations = Cell::new(0_usize);
+    for (direction_index, direction) in directions.iter().enumerate() {
+        let direction_values = trainable
+            .iter()
+            .map(|(name, _)| direction[name].clone())
+            .collect::<Vec<_>>();
+        let evaluate_gradients = |epsilon| {
+            hvp_gradient_evaluations.set(
+                hvp_gradient_evaluations
+                    .get()
+                    .checked_add(1)
+                    .expect("the bounded GELU HVP oracle count must not overflow"),
+            );
+            CpuBackend
+                .execute_many(
+                    &graph,
+                    &gradients,
+                    &directionally_perturbed_parameter_bindings(
+                        &bindings,
+                        &parameter_input_names,
+                        &direction_values,
+                        epsilon,
+                    ),
+                )
+                .unwrap()
+        };
+        let coarse_plus = evaluate_gradients(EPSILON);
+        let coarse_minus = evaluate_gradients(-EPSILON);
+        let fine_plus = evaluate_gradients(EPSILON / 2.0);
+        let fine_minus = evaluate_gradients(-EPSILON / 2.0);
+        let analytic_start = 1 + gradients.len() + direction_index * gradients.len();
+        let mut hvp_coordinates = 0;
+        for (parameter_index, (name, _)) in trainable.iter().enumerate() {
+            let analytic = &base.outputs[analytic_start + parameter_index];
+            for coordinate in 0..analytic.len() {
+                let coarse = (coarse_plus.outputs[parameter_index]
+                    .scalar_at(coordinate)
+                    .as_f64()
+                    - coarse_minus.outputs[parameter_index]
+                        .scalar_at(coordinate)
+                        .as_f64())
+                    / (2.0 * EPSILON);
+                let fine = (fine_plus.outputs[parameter_index]
+                    .scalar_at(coordinate)
+                    .as_f64()
+                    - fine_minus.outputs[parameter_index]
+                        .scalar_at(coordinate)
+                        .as_f64())
+                    / EPSILON;
+                let numerical = (4.0 * fine - coarse) / 3.0;
+                let analytic = analytic.scalar_at(coordinate).as_f64();
+                let error = (analytic - numerical).abs();
+                let tolerance = HVP_TOLERANCE * 1.0f64.max(analytic.abs()).max(numerical.abs());
+                assert!(
+                    analytic.is_finite() && numerical.is_finite() && error <= tolerance,
+                    "direction {direction_index} {name}[{coordinate}] GELU Richardson HVP mismatch: analytic={analytic}, numerical={numerical}, error={error}, tolerance={tolerance}"
+                );
+                hvp_coordinates += 1;
+            }
+        }
+        assert_eq!(hvp_coordinates, 384);
+    }
+    assert_eq!(hvp_gradient_evaluations.get(), 4 * directions.len());
+
+    let compile_count = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_module_graph(
+        two_block_gelu_config(),
+        &model,
+        |model, graph, inputs| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_gelu(model, graph, inputs)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    let executor = CapturedReplayExecutor::default();
+    let native_target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let mut interpreted = plan.prepare(&CpuSessionTarget).unwrap();
+    let mut native = plan.prepare(&native_target).unwrap();
+    assert!(native.preparation_report().main().native_item_count() > 0);
+    assert_eq!(native.preparation_report().main().fallback_count(), 0);
+    let inputs = two_block_gelu_batch();
+    let interpreted_step = interpreted
+        .step(inputs.clone(), TensorData::scalar(1e-3))
+        .unwrap();
+    let native_step = native.step(inputs, TensorData::scalar(1e-3)).unwrap();
+    assert!(!interpreted_step.did_update() && !native_step.did_update());
+    assert_eq!(interpreted.accumulation_index().unwrap(), 1);
+    assert_eq!(native.accumulation_index().unwrap(), 1);
+    assert_eq!(interpreted_step.loss_weight(), TOKEN_COUNT as u64);
+    assert_eq!(native_step.loss_weight(), TOKEN_COUNT as u64);
+    assert!(native_step.report().executed_native_item_count() > 0);
+    assert_eq!(native_step.report().fallback_count(), 0);
+    assert_two_block_step_close(1, &interpreted_step, &native_step);
+    let interpreted_accumulators = interpreted.gradient_accumulator_snapshots().unwrap();
+    let native_accumulators = native.gradient_accumulator_snapshots().unwrap();
+    assert_two_block_gradient_frontier_coverage(&interpreted_accumulators, &directions[0]);
+    assert_two_block_tensor_maps_close(
+        "GELU accumulation frontier",
+        &interpreted_accumulators,
+        &native_accumulators,
+    );
+    for (name, analytic) in &analytic_gradients {
+        let captured = &interpreted_accumulators[name];
+        for coordinate in 0..analytic.len() {
+            let analytic = analytic.scalar_at(coordinate).as_f64();
+            let captured = captured.scalar_at(coordinate).as_f64();
+            let error = (analytic - captured).abs();
+            let tolerance = VJP_TOLERANCE * 1.0f64.max(analytic.abs()).max(captured.abs());
+            assert!(
+                analytic.is_finite() && captured.is_finite() && error <= tolerance,
+                "{name}[{coordinate}] compiled GELU numerator gradient mismatch: analytic={analytic}, captured={captured}, error={error}, tolerance={tolerance}"
+            );
+        }
+    }
+    let expected_loss = base.outputs[0].scalar_at(0).as_f64() / TOKEN_COUNT as f64;
+    let actual_loss = interpreted_step.loss().scalar_at(0).as_f64();
+    assert!((actual_loss - expected_loss).abs() <= 2e-5);
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
     assert_eq!(compile_count.get(), 1);
 }
 
