@@ -245,7 +245,8 @@ pub(crate) fn render_native_store_group(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Graph, Slice};
+    use crate::cpu_jit::{JitBuffer, JitKernel};
+    use crate::{Graph, Slice, TensorData};
     use std::collections::HashMap;
 
     fn adamw_shaped_kernels(cross_lane: bool) -> (Vec<UOp>, [u64; 4]) {
@@ -432,6 +433,67 @@ mod tests {
             ))
             .unwrap();
         assert!(first_store < parameter_store);
+    }
+
+    #[test]
+    fn fused_store_group_commits_each_f32_alu_node() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [1]);
+        let half_ulp =
+            graph.constant(TensorData::new([], vec![f32::from_bits(0x3380_0000)]).unwrap());
+        let first = graph.add(input, input).unwrap();
+        let rounded = graph.add(input, half_ulp).unwrap();
+        let second = graph.sub(rounded, input).unwrap();
+        let outputs = [first, second];
+        let schedule = crate::schedule_many(&graph, &outputs).unwrap();
+        let kernels = outputs
+            .iter()
+            .map(|output| {
+                schedule
+                    .items
+                    .iter()
+                    .find(|item| item.primary_output().id == output.index() as u64)
+                    .unwrap()
+                    .kernel
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        let members = kernels.iter().collect::<Vec<_>>();
+        let fused = crate::kernel::fuse_native_store_group(&members).unwrap();
+        let (rendered, _) = render_native_store_group(&fused).unwrap();
+        assert!(rendered.source.matches("((float)(").count() >= 3);
+
+        let values = TensorData::new([1], vec![1.0]).unwrap();
+        let input_id = input.index() as u64;
+        let mut buffers = rendered
+            .abi
+            .buffers
+            .iter()
+            .map(|buffer| {
+                if buffer.id == input_id {
+                    JitBuffer::from_tensor(&values, false)
+                } else {
+                    JitBuffer::zeroed(buffer.dtype, buffer.elements, buffer.mutable)
+                }
+            })
+            .collect::<Vec<_>>();
+        JitKernel::load(&rendered)
+            .unwrap()
+            .call(&mut buffers, &[])
+            .unwrap();
+        let second_slot = rendered
+            .abi
+            .buffers
+            .iter()
+            .position(|buffer| buffer.id == second.index() as u64)
+            .unwrap();
+        assert_eq!(
+            buffers[second_slot]
+                .clone()
+                .into_tensor(Shape::from([1]))
+                .unwrap(),
+            TensorData::new([1], vec![0.0]).unwrap()
+        );
     }
 
     #[test]
