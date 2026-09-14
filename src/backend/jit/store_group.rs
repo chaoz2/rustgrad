@@ -40,7 +40,7 @@ pub(crate) struct PreparedNativeStoreGroup {
 pub(crate) fn render_schedule_module_entries(
     backend: &CpuJitBackend,
     items: &[ScheduleItem],
-    layouts: Vec<NativeScheduleLayout>,
+    layouts: &[NativeScheduleLayout],
     store_groups: &[NativeStoreGroup],
 ) -> Result<RenderedScheduleModule, JitBackendError> {
     if items.len() != layouts.len() {
@@ -92,7 +92,7 @@ pub(crate) fn render_schedule_module_entries(
     }
     let mut entries = Vec::with_capacity(items.len());
     let mut zero_domains = Vec::new();
-    for (index, (item, layout)) in items.iter().zip(&layouts).enumerate() {
+    for (index, (item, layout)) in items.iter().zip(layouts).enumerate() {
         let elements = item
             .primary_output()
             .shape

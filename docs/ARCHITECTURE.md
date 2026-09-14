@@ -1072,12 +1072,14 @@ interpreter fallback disabled.
 
 ##### Native preparation
 
-Capture and recurrent witnesses, layouts, rendering, ABI, and durable-cache
-preflight remain sequential. Distinct cache misses enter per-artifact
-compile/load gates through a process-wide two-permit compiler pool, then finish
-in canonical main, accumulation, partial-flush, `zero_grad`, evaluation order.
-Identical keys cannot race loading or damaged-cache recovery; optional programs
-do not change another program's artifact key.
+Capture and recurrent witnesses plus per-program layouts are derived before the
+bounded parallel render batch. Only after every render result succeeds in
+canonical main, accumulation, partial-flush, `zero_grad`, evaluation order does
+preparation resolve reusable prefixes and wrapper/cache identities, enter
+durable-cache compile/load gates, authenticate every loaded module ABI, and
+publish prepared modules. Distinct cache misses share the process-wide
+two-permit compiler pool. Identical keys cannot race loading or damaged-cache
+recovery; optional programs do not change another program's artifact key.
 
 Each schedule renders its ordered native entries once and loads uniquely named
 functions into one content-addressed shared module. Preparation also
@@ -1122,37 +1124,45 @@ suffixes retain the single combined compile/link command. Chunk sources and
 objects are cleaned on every result, and neither chunk boundaries nor process
 observations enter capture, cache, checkpoint, or replay identity.
 
+Before compilation, at most two private workers render attached programs in
+parallel. Each worker receives an immutable typed program view; results and
+errors are restored to program order, and prefix reuse is resolved only after
+the complete ordered render batch succeeds. Rendering changes no cache key,
+module ABI, or publication boundary.
+
 #### Native CPU scoreboard evidence
 
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
-the main and optional accumulation/flush/zero-grad/evaluation programs plus checked logical
-recurrent state bytes without preparing a target or exposing a capture. The
-separate `NativeTrainingScoreboard` v15 authenticates strict-native preparation
-and successful training-step reports, then emits bounded versioned JSON.
+the main and optional accumulation/flush/zero-grad/evaluation programs plus
+checked logical recurrent state bytes without preparing a target or exposing a
+capture. The separate `NativeTrainingScoreboard` v16 authenticates
+strict-native preparation and successful training-step reports, then emits
+bounded versioned JSON.
 
 | Evidence | Meaning |
 |---|---|
-| Preparation | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions; combined/object/link process inventories and cumulative versus effective compiler wall; plus referenced modules and the unique/shared-prefix entry partition for every attached program. |
+| Preparation | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions; bounded render concurrency/overlap; combined/object/link process inventories and cumulative versus effective compiler wall; plus referenced modules and the unique/shared-prefix entry partition for every attached program. |
 | Execution | Logical schedule/cache inventory, physical rendered/executed entries, and actual module-dispatch calls. |
 | Replay traffic | Owned external imports, borrowed/retained/replaced recurrent bytes, and logical CPU egress materialization count/bytes. CPU egress is not a device transfer. |
 | Timing | Caller-observed compile/prepare/checkpoint time plus bounded first/steady replay and executor/recurrent-overhead partitions. No threshold or speedup is claimed. |
 
 ##### Replay phases and wire versions
 
-V15 is emitted for both raw and classified recording. Classified steps use only
+V16 is emitted for both raw and classified recording. Classified steps use only
 `did_update`; the first replay remains separate, and warm accumulation-only and
 optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
 classification. One scoreboard rejects mixed recording modes without consuming
 a sample, and partial flush remains outside the main-step sample set.
 
-V1-v14 JSON remains readable. V1-v12 has CPU egress evidence absent; V13
+V1-v15 JSON remains readable. V1-v12 has CPU egress evidence absent; V13
 requires its successful main and, when present, accumulation replay inventories to include
 the workspace-backed tensors detached for the caller. Commit-only replay omits
 caller-named outputs while retaining loss and enabled validation/report scalars.
 Native preparation admits prefix reuse through four fail-closed contracts; v14
-records the resulting evidence without serializing entry metadata, and v15
-adds the compiler process-mode and cumulative-wall evidence without changing
-that prefix contract:
+records the resulting evidence without serializing entry metadata. V15 adds
+compiler process-mode and cumulative-wall evidence; v16 adds observational
+per-program render overlap and maximum concurrency. Neither changes that
+prefix contract:
 
 - **Inventory.** Referenced modules and the exact unique-rendered/shared-prefix
   entry partition are authenticated per program.

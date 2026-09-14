@@ -1976,6 +1976,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             .max_parallel_compiler_process_count()
             <= 2
     );
+    assert!((1..=2).contains(&session.preparation_report().max_parallel_render_job_count()));
     if env::var_os("RUSTGRAD_REQUIRE_COLD_NATIVE_SCOREBOARD").is_some() {
         assert_eq!(
             session.preparation_report().compiler_process_count(),
@@ -1997,6 +1998,16 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             session
                 .preparation_report()
                 .parallel_module_overlap_wall_time()
+                > Duration::ZERO
+        );
+        assert_eq!(
+            session.preparation_report().max_parallel_render_job_count(),
+            2
+        );
+        assert!(
+            session
+                .preparation_report()
+                .parallel_render_overlap_wall_time()
                 > Duration::ZERO
         );
         assert_eq!(main_preparation.work().object_compile_count(), 2);
@@ -2177,6 +2188,13 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
                     .to_duration()?,
             )
             .expect("parallel module overlap fits program preparation")
+            .checked_sub(
+                report
+                    .prepare_parallel_render_overlap_wall_time()
+                    .expect("current native CPU scoreboard reports parallel render overlap")
+                    .to_duration()?,
+            )
+            .expect("parallel render overlap fits program preparation")
             .checked_add(
                 report
                     .prepare_runtime_overhead_wall_time()
@@ -2360,6 +2378,7 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         restored_preparation.parallel_module_overlap_wall_time(),
         Duration::ZERO
     );
+    assert!((1..=2).contains(&restored_preparation.max_parallel_render_job_count()));
     for program in [
         Some(restored_preparation.main()),
         restored_preparation.accumulation(),
