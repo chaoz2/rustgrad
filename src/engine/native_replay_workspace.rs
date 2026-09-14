@@ -50,6 +50,7 @@ struct WorkspaceOutputAction {
 struct WorkspaceDispatchSegment {
     indices: Vec<usize>,
     prerequisites: Vec<usize>,
+    materializations: Vec<crate::cpu_jit::NativeDispatchMaterialization>,
     outputs: Vec<WorkspaceOutputAction>,
     dispatch: PreparedScheduleSegment,
 }
@@ -64,16 +65,16 @@ enum NativeDispatchSegmentEnd {
     NonDispatchBoundary,
     ModuleChange,
     OutputSlotAlias,
-    DerivedSlotDependency,
     Terminal,
 }
 
 /// Authenticated reasons why the sealed native dispatch tape contains its
 /// observed number of module segments. Every segment has exactly one ending:
 /// a mutually exclusive split cause or the terminal end of the tape. When
-/// conditions coincide, module change precedes output alias, which precedes a
-/// derived-slot dependency. The reached-module inventory excludes rendered
-/// entries omitted from the tape by authenticated elision.
+/// conditions coincide, module change precedes output alias. Derived inputs
+/// produced inside a segment are sealed as typed pre-entry materializations,
+/// so they no longer end a segment. The reached-module inventory excludes
+/// rendered entries omitted from the tape by authenticated elision.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeDispatchSegmentation {
     pub(crate) segment_count: usize,
@@ -92,9 +93,6 @@ impl NativeDispatchSegmentation {
             NativeDispatchSegmentEnd::NonDispatchBoundary => &mut self.non_dispatch_boundary_count,
             NativeDispatchSegmentEnd::ModuleChange => &mut self.module_change_count,
             NativeDispatchSegmentEnd::OutputSlotAlias => &mut self.output_slot_alias_count,
-            NativeDispatchSegmentEnd::DerivedSlotDependency => {
-                &mut self.derived_slot_dependency_count
-            }
             NativeDispatchSegmentEnd::Terminal => &mut self.terminal_segment_count,
         };
         *count += 1;
@@ -104,14 +102,11 @@ impl NativeDispatchSegmentation {
 fn dispatch_segment_split(
     crosses_module: bool,
     output_aliases_slot: bool,
-    derived_depends_on_segment: bool,
 ) -> Option<NativeDispatchSegmentEnd> {
     if crosses_module {
         Some(NativeDispatchSegmentEnd::ModuleChange)
     } else if output_aliases_slot {
         Some(NativeDispatchSegmentEnd::OutputSlotAlias)
-    } else if derived_depends_on_segment {
-        Some(NativeDispatchSegmentEnd::DerivedSlotDependency)
     } else {
         None
     }
@@ -204,6 +199,7 @@ pub(crate) struct NativeReplayWorkspaceStats {
     pub(crate) sealed_dispatch_step_count: usize,
     pub(crate) sealed_dispatch_segment_count: usize,
     pub(crate) sealed_prerequisite_slot_count: usize,
+    pub(crate) sealed_derived_materialization_count: usize,
     pub(crate) dispatch_metadata_build_count: usize,
     pub(crate) last_materialized_egress_count: u64,
     pub(crate) last_materialized_egress_bytes: u64,
@@ -222,7 +218,7 @@ impl NativeReplayWorkspace {
             items: Vec::with_capacity(items.len()),
             dispatch_tape: Arc::from([]),
             dispatch_segmentation: NativeDispatchSegmentation::default(),
-            dispatch_scratch: crate::cpu_jit::JitScheduleDispatchScratch::with_capacity(0, 0),
+            dispatch_scratch: crate::cpu_jit::JitScheduleDispatchScratch::with_capacity(0, 0, 0, 0),
             owners: BTreeMap::new(),
             inputs: Vec::with_capacity(capture.inputs.len()),
             immutable: BTreeSet::new(),
@@ -1245,6 +1241,7 @@ impl NativeReplayWorkspace {
                 ReplayError::Descriptor("native item execution count overflows".into())
             })?;
         let execution = segment.dispatch.execute_authenticated(
+            &segment.materializations,
             &mut self.buffers,
             (!borrowed.slots.is_empty()).then_some(&mut borrowed.slots),
             &mut self.dispatch_scratch,
@@ -1261,6 +1258,9 @@ impl NativeReplayWorkspace {
             for output in &action.outputs {
                 self.valid[*output] = true;
             }
+        }
+        for materialization in &segment.materializations {
+            self.valid[materialization.target()] = true;
         }
         self.current_traffic.module_dispatch_count = next_dispatch_count;
         self.current_traffic.module_dispatched_native_item_count = next_dispatched_items;
@@ -1455,7 +1455,6 @@ impl NativeReplayWorkspace {
         let mut segmentation = NativeDispatchSegmentation::default();
         let mut segment = Vec::new();
         let mut segment_slots = BTreeSet::new();
-        let mut segment_outputs = BTreeSet::new();
         let mut reached_module_anchors: Vec<usize> = Vec::new();
         for (index, item) in self.items.iter().enumerate() {
             if item.elided {
@@ -1469,11 +1468,11 @@ impl NativeReplayWorkspace {
                 if !segment.is_empty() {
                     steps.push(WorkspaceDispatchStep::Segment(seal_workspace_segment(
                         &self.items,
+                        &self.slots,
                         std::mem::take(&mut segment),
                     )?));
                     segmentation.record(NativeDispatchSegmentEnd::NonDispatchBoundary);
                     segment_slots.clear();
-                    segment_outputs.clear();
                 }
                 steps.push(WorkspaceDispatchStep::PerItem(index));
                 continue;
@@ -1490,14 +1489,6 @@ impl NativeReplayWorkspace {
             }) {
                 reached_module_anchors.push(index);
             }
-            let derived_depends_on_segment = item.slots.iter().any(|slot| {
-                self.slots[*slot].source.as_ref().is_some_and(|source| {
-                    let source = match source {
-                        SlotSource::Copy(source) | SlotSource::Affine { source, .. } => *source,
-                    };
-                    segment_outputs.contains(&source)
-                })
-            });
             let crosses_module = segment.first().is_some_and(|first| {
                 let first = self.items[*first]
                     .dispatch
@@ -1513,49 +1504,62 @@ impl NativeReplayWorkspace {
                 .outputs
                 .iter()
                 .any(|output| segment_slots.contains(output));
-            let split = dispatch_segment_split(
-                crosses_module,
-                output_aliases_slot,
-                derived_depends_on_segment,
-            );
+            let split = dispatch_segment_split(crosses_module, output_aliases_slot);
             if let Some(split) = split {
                 steps.push(WorkspaceDispatchStep::Segment(seal_workspace_segment(
                     &self.items,
+                    &self.slots,
                     std::mem::take(&mut segment),
                 )?));
                 segmentation.record(split);
                 segment_slots.clear();
-                segment_outputs.clear();
             }
             segment.extend([index]);
             segment_slots.extend(item.slots.iter().copied());
-            segment_outputs.extend(item.outputs.iter().copied());
         }
         if !segment.is_empty() {
             steps.push(WorkspaceDispatchStep::Segment(seal_workspace_segment(
                 &self.items,
+                &self.slots,
                 segment,
             )?));
             segmentation.record(NativeDispatchSegmentEnd::Terminal);
         }
         segmentation.dispatch_reached_module_count = reached_module_anchors.len();
-        let (entries, pointers) = steps
-            .iter()
-            .filter_map(|step| match step {
-                WorkspaceDispatchStep::Segment(segment) => Some((
-                    segment.dispatch.entry_count(),
-                    segment.dispatch.pointer_count(),
-                )),
-                WorkspaceDispatchStep::PerItem(_) => None,
-            })
-            .fold((0, 0), |(entries, pointers), next| {
-                (entries.max(next.0), pointers.max(next.1))
-            });
+        let mut scratch_capacity = (0, 0, 0, 0);
+        for step in &steps {
+            let WorkspaceDispatchStep::Segment(segment) = step else {
+                continue;
+            };
+            let affine_axes =
+                segment
+                    .materializations
+                    .iter()
+                    .try_fold(0usize, |count, action| {
+                        count
+                            .checked_add(action.affine_axis_count())
+                            .ok_or_else(|| {
+                                ReplayError::Descriptor(
+                                    "native dispatch affine axis count overflows".into(),
+                                )
+                            })
+                    })?;
+            scratch_capacity.0 = scratch_capacity.0.max(segment.dispatch.entry_count());
+            scratch_capacity.1 = scratch_capacity.1.max(segment.dispatch.pointer_count());
+            scratch_capacity.2 = scratch_capacity.2.max(segment.materializations.len());
+            scratch_capacity.3 = scratch_capacity.3.max(affine_axes);
+        }
+        let (entries, pointers, materializations, affine_axes) = scratch_capacity;
         if self.dispatch_tape.is_empty() {
-            self.dispatch_scratch =
-                crate::cpu_jit::JitScheduleDispatchScratch::with_capacity(entries, pointers);
+            self.dispatch_scratch = crate::cpu_jit::JitScheduleDispatchScratch::with_capacity(
+                entries,
+                pointers,
+                materializations,
+                affine_axes,
+            );
         } else {
-            self.dispatch_scratch.ensure_capacity(entries, pointers);
+            self.dispatch_scratch
+                .ensure_capacity(entries, pointers, materializations, affine_axes);
         }
         self.dispatch_tape = Arc::from(steps);
         self.dispatch_segmentation = segmentation;
@@ -1587,6 +1591,14 @@ impl NativeReplayWorkspace {
                 WorkspaceDispatchStep::PerItem(_) => None,
             })
             .sum();
+        let sealed_derived_materialization_count = self
+            .dispatch_tape
+            .iter()
+            .filter_map(|step| match step {
+                WorkspaceDispatchStep::Segment(segment) => Some(segment.materializations.len()),
+                WorkspaceDispatchStep::PerItem(_) => None,
+            })
+            .sum();
         NativeReplayWorkspaceStats {
             allocation_count: self.buffers.len(),
             input_import_count: self.input_import_count,
@@ -1601,6 +1613,7 @@ impl NativeReplayWorkspace {
             sealed_dispatch_step_count,
             sealed_dispatch_segment_count,
             sealed_prerequisite_slot_count,
+            sealed_derived_materialization_count,
             dispatch_metadata_build_count: self.dispatch_metadata_build_count,
             last_materialized_egress_count: self.current_traffic.materialized_egress_count,
             last_materialized_egress_bytes: self.current_traffic.materialized_egress_bytes,
@@ -1612,6 +1625,7 @@ impl NativeReplayWorkspace {
 
 fn seal_workspace_segment(
     items: &[WorkspaceItem],
+    slots: &[WorkspaceSlot],
     indices: Vec<usize>,
 ) -> Result<WorkspaceDispatchSegment, ReplayError> {
     if indices.is_empty() {
@@ -1632,18 +1646,34 @@ fn seal_workspace_segment(
         .collect::<Result<Vec<_>, _>>()?;
     let dispatch = PreparedScheduleDispatch::seal_segment(&dispatches).map_err(backend_error)?;
     let mut produced = BTreeSet::new();
+    let mut materialized = BTreeSet::new();
     let mut seen_prerequisites = BTreeSet::new();
     let mut prerequisites = Vec::new();
+    let mut materializations = Vec::new();
     let mut outputs = Vec::with_capacity(indices.len());
-    for index in &indices {
+    for (entry, index) in indices.iter().enumerate() {
         let item = items.get(*index).ok_or_else(|| {
             ReplayError::Corrupt("native dispatcher segment item is absent".into())
         })?;
-        for slot in &item.slots {
-            if !item.outputs.contains(slot)
-                && !produced.contains(slot)
-                && seen_prerequisites.insert(*slot)
-            {
+        for slot in item
+            .slots
+            .iter()
+            .filter(|slot| !item.outputs.contains(slot))
+        {
+            if produced.contains(slot) || materialized.contains(slot) {
+                continue;
+            }
+            if derived_slot_depends_on_outputs(*slot, slots, &produced)? {
+                append_segment_materializations(
+                    *slot,
+                    entry,
+                    slots,
+                    &produced,
+                    &mut materialized,
+                    &mut BTreeSet::new(),
+                    &mut materializations,
+                )?;
+            } else if seen_prerequisites.insert(*slot) {
                 prerequisites.push(*slot);
             }
         }
@@ -1656,9 +1686,127 @@ fn seal_workspace_segment(
     Ok(WorkspaceDispatchSegment {
         indices,
         prerequisites,
+        materializations,
         outputs,
         dispatch,
     })
+}
+
+fn derived_slot_depends_on_outputs(
+    slot: usize,
+    slots: &[WorkspaceSlot],
+    produced: &BTreeSet<usize>,
+) -> Result<bool, ReplayError> {
+    let mut current = slot;
+    let mut visited = BTreeSet::new();
+    loop {
+        if produced.contains(&current) {
+            return Ok(true);
+        }
+        if !visited.insert(current) {
+            return Err(ReplayError::Corrupt(
+                "native workspace derived slot cycle".into(),
+            ));
+        }
+        let Some(source) = slots.get(current).and_then(|slot| slot.source.as_ref()) else {
+            return Ok(false);
+        };
+        current = match source {
+            SlotSource::Copy(source) | SlotSource::Affine { source, .. } => *source,
+        };
+    }
+}
+
+fn append_segment_materializations(
+    slot: usize,
+    before_entry: usize,
+    slots: &[WorkspaceSlot],
+    produced: &BTreeSet<usize>,
+    materialized: &mut BTreeSet<usize>,
+    visiting: &mut BTreeSet<usize>,
+    actions: &mut Vec<crate::cpu_jit::NativeDispatchMaterialization>,
+) -> Result<(), ReplayError> {
+    if produced.contains(&slot) || materialized.contains(&slot) {
+        return Ok(());
+    }
+    if !visiting.insert(slot) {
+        return Err(ReplayError::Corrupt(
+            "native workspace derived slot cycle".into(),
+        ));
+    }
+    let planned = slots
+        .get(slot)
+        .ok_or_else(|| ReplayError::Corrupt("native workspace derived slot is absent".into()))?;
+    let source = planned.source.as_ref().ok_or_else(|| {
+        ReplayError::Corrupt("native workspace derived action has no source".into())
+    })?;
+    let source_slot = match source {
+        SlotSource::Copy(source) | SlotSource::Affine { source, .. } => *source,
+    };
+    if !produced.contains(&source_slot) && !materialized.contains(&source_slot) {
+        append_segment_materializations(
+            source_slot,
+            before_entry,
+            slots,
+            produced,
+            materialized,
+            visiting,
+            actions,
+        )?;
+    }
+    let source_key = slots
+        .get(source_slot)
+        .ok_or_else(|| ReplayError::Corrupt("native workspace action source is absent".into()))?;
+    if source_key.key.descriptor.dtype != planned.key.descriptor.dtype {
+        return Err(ReplayError::Corrupt(
+            "native workspace action dtype differs".into(),
+        ));
+    }
+    let action = match source {
+        SlotSource::Copy(_) => {
+            if source_key.key.elements != planned.key.elements {
+                return Err(ReplayError::Corrupt(
+                    "native workspace copy action shape differs".into(),
+                ));
+            }
+            crate::cpu_jit::NativeDispatchMaterialization::copy(
+                before_entry,
+                source_slot,
+                slot,
+                planned.key.descriptor.dtype,
+                planned.key.elements,
+            )
+        }
+        SlotSource::Affine { view, .. } => {
+            let source_elements = view
+                .source_shape
+                .numel()
+                .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+            let logical_elements = view
+                .logical_shape
+                .numel()
+                .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
+            if source_key.key.elements != source_elements
+                || planned.key.elements != logical_elements
+            {
+                return Err(ReplayError::Corrupt(
+                    "native workspace affine action shape differs".into(),
+                ));
+            }
+            crate::cpu_jit::NativeDispatchMaterialization::affine(
+                before_entry,
+                source_slot,
+                slot,
+                planned.key.descriptor.dtype,
+                view,
+            )
+        }
+    }
+    .map_err(|error| ReplayError::Backend(error.to_string()))?;
+    actions.push(action);
+    materialized.insert(slot);
+    visiting.remove(&slot);
+    Ok(())
 }
 
 fn map_dispatch_failure(
@@ -1717,22 +1865,162 @@ fn two_buffers(
 
 #[cfg(test)]
 mod dispatch_segmentation_tests {
-    use super::{NativeDispatchSegmentEnd, dispatch_segment_split};
+    use super::{
+        BufferKey, NativeDispatchSegmentEnd, SlotSource, WorkspaceSlot,
+        append_segment_materializations, derived_slot_depends_on_outputs, dispatch_segment_split,
+    };
+    use crate::{AffineView, BufferDesc, DType, Shape};
+    use std::collections::BTreeSet;
 
     #[test]
     fn split_causes_are_mutually_exclusive_in_runtime_precedence_order() {
-        assert_eq!(dispatch_segment_split(false, false, false), None);
+        assert_eq!(dispatch_segment_split(false, false), None);
         assert_eq!(
-            dispatch_segment_split(false, false, true),
-            Some(NativeDispatchSegmentEnd::DerivedSlotDependency)
-        );
-        assert_eq!(
-            dispatch_segment_split(false, true, true),
+            dispatch_segment_split(false, true),
             Some(NativeDispatchSegmentEnd::OutputSlotAlias)
         );
         assert_eq!(
-            dispatch_segment_split(true, true, true),
+            dispatch_segment_split(true, true),
             Some(NativeDispatchSegmentEnd::ModuleChange)
+        );
+    }
+
+    fn slot(buffer: u64, shape: Shape, source: Option<SlotSource>) -> WorkspaceSlot {
+        let elements = shape.numel().unwrap();
+        WorkspaceSlot {
+            key: BufferKey {
+                buffer,
+                descriptor: BufferDesc {
+                    id: buffer,
+                    shape,
+                    dtype: DType::F32,
+                    bytes: elements * DType::F32.itemsize(),
+                    alignment: DType::F32.itemsize(),
+                    read_only: false,
+                    view: None,
+                },
+                elements,
+                direct_view: None,
+            },
+            source,
+        }
+    }
+
+    #[test]
+    fn typed_materializations_follow_producers_and_deduplicate_targets() {
+        let reversed = AffineView {
+            source_shape: Shape::new([5]),
+            logical_shape: Shape::new([5]),
+            strides: vec![-1],
+            offset: 4,
+        };
+        let slots = vec![
+            slot(0, Shape::new([5]), None),
+            slot(1, Shape::new([5]), Some(SlotSource::Copy(0))),
+            slot(
+                2,
+                Shape::new([5]),
+                Some(SlotSource::Affine {
+                    source: 1,
+                    view: reversed,
+                }),
+            ),
+        ];
+        let produced = BTreeSet::from([0]);
+        assert!(derived_slot_depends_on_outputs(2, &slots, &produced).unwrap());
+        let mut materialized = BTreeSet::new();
+        let mut actions = Vec::new();
+        append_segment_materializations(
+            2,
+            3,
+            &slots,
+            &produced,
+            &mut materialized,
+            &mut BTreeSet::new(),
+            &mut actions,
+        )
+        .unwrap();
+        append_segment_materializations(
+            2,
+            4,
+            &slots,
+            &produced,
+            &mut materialized,
+            &mut BTreeSet::new(),
+            &mut actions,
+        )
+        .unwrap();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            actions[0],
+            crate::cpu_jit::NativeDispatchMaterialization::Copy {
+                before_entry: 3,
+                source: 0,
+                target: 1,
+                elements: 5,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &actions[1],
+            crate::cpu_jit::NativeDispatchMaterialization::Affine {
+                before_entry: 3,
+                source: 1,
+                target: 2,
+                logical_elements: 5,
+                axes,
+                ..
+            } if axes.len() == 1 && axes[0].reversed
+        ));
+    }
+
+    #[test]
+    fn external_and_recurrent_derived_sources_remain_segment_prerequisites() {
+        let slots = vec![
+            slot(0, Shape::new([5]), None),
+            slot(1, Shape::new([5]), Some(SlotSource::Copy(0))),
+        ];
+        assert!(!derived_slot_depends_on_outputs(1, &slots, &BTreeSet::new()).unwrap());
+    }
+
+    #[test]
+    fn affine_materialization_accepts_empty_broadcast_and_tail_geometry() {
+        let empty = AffineView {
+            source_shape: Shape::new([2, 3]),
+            logical_shape: Shape::new([0, 3]),
+            strides: vec![3, 1],
+            offset: 0,
+        };
+        let broadcast = AffineView {
+            source_shape: Shape::new([1]),
+            logical_shape: Shape::new([5]),
+            strides: vec![0],
+            offset: 0,
+        };
+        let empty_action =
+            crate::cpu_jit::NativeDispatchMaterialization::affine(0, 0, 1, DType::F32, &empty)
+                .unwrap();
+        let broadcast_action =
+            crate::cpu_jit::NativeDispatchMaterialization::affine(1, 0, 1, DType::F32, &broadcast)
+                .unwrap();
+        assert!(matches!(
+            empty_action,
+            crate::cpu_jit::NativeDispatchMaterialization::Affine {
+                logical_elements: 0,
+                ref axes,
+                ..
+            } if axes.is_empty()
+        ));
+        assert!(matches!(
+            broadcast_action,
+            crate::cpu_jit::NativeDispatchMaterialization::Affine {
+                logical_elements: 5,
+                ref axes,
+                ..
+            } if axes.is_empty()
+        ));
+        assert!(
+            crate::cpu_jit::NativeDispatchMaterialization::copy(2, 0, 1, DType::F32, 5,).is_ok()
         );
     }
 }

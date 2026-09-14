@@ -1383,9 +1383,9 @@ pub struct CompiledEvaluationResult {
 
 /// Deterministic explanation of a strict-native program's module-dispatch
 /// segmentation and the referenced modules it actually reaches. Counts
-/// describe the sealed tape, not replay timing. A boundary satisfying multiple
-/// conditions is classified in module-change, output-alias, then
-/// derived-dependency order.
+/// describe the sealed tape, not replay timing. Current preparation keeps
+/// same-module derived dependencies inside typed dispatcher actions; the
+/// derived-dependency field remains for authenticated v17 wire compatibility.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeCpuDispatchSegmentation {
@@ -1500,7 +1500,9 @@ impl NativeCpuDispatchSegmentation {
         self.output_slot_alias_count
     }
 
-    /// Segments ended before a derived slot reads an earlier segment output.
+    /// Legacy count of segments ended before a derived slot dependency. New
+    /// private Copy/Affine actions keep admitted same-module dependencies
+    /// inside one call, so current prepared programs report zero here.
     pub const fn derived_slot_dependency_count(&self) -> u64 {
         self.derived_slot_dependency_count
     }
@@ -15908,6 +15910,10 @@ mod tests {
         assert_eq!(workspace.borrowed_recurrent_output_bytes, 0);
         assert!(workspace.sealed_dispatch_step_count > 0);
         assert!(workspace.sealed_dispatch_segment_count > 0);
+        assert!(
+            workspace.sealed_derived_materialization_count > 0,
+            "the real compiled AdamW workspace must seal derived inputs as dispatcher actions"
+        );
         assert_eq!(workspace.dispatch_metadata_build_count, 1);
         assert_eq!(workspace.dispatch_scratch_capacity_growth_count, 0);
         assert!(workspace.dispatch_scratch_is_empty);

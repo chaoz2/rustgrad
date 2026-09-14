@@ -195,6 +195,16 @@ impl BorrowedJitBuffer<'_> {
         }
     }
 
+    fn validate_dispatch_layout(&self, dtype: DType, elements: usize) -> Result<(), JitError> {
+        let value = self.tensor();
+        if value.dtype() != dtype || value.len() != elements || value.native_dense_ptr().is_none() {
+            return Err(JitError::InvalidBuffer(
+                "native dispatch action source descriptor mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn clear(&mut self) -> Result<(), JitError> {
         match self {
             Self::Read(_) => Err(JitError::InvalidBuffer(
@@ -653,10 +663,275 @@ type ScheduleDispatchFn =
     unsafe extern "C" fn(*mut NativeScheduleDispatchCall, usize, *mut u64) -> c_int;
 
 #[repr(C)]
+struct NativeScheduleDispatchAffineAxis {
+    extent: usize,
+    divisor: usize,
+    stride: usize,
+    reversed: usize,
+}
+
+#[repr(C)]
+struct NativeScheduleDispatchAction {
+    kind: usize,
+    source: *const c_void,
+    target: *mut c_void,
+    width: usize,
+    elements: usize,
+    offset: usize,
+    axes: *const NativeScheduleDispatchAffineAxis,
+    axis_count: usize,
+}
+
+const NATIVE_DISPATCH_COPY: usize = 0;
+const NATIVE_DISPATCH_AFFINE: usize = 1;
+
+#[repr(C)]
 struct NativeScheduleDispatchCall {
     entry: unsafe extern "C" fn(*mut *mut c_void, *const i64, *mut u64) -> c_int,
     buffers: *mut *mut c_void,
     symbols: *const i64,
+    actions: *const NativeScheduleDispatchAction,
+    action_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NativeDispatchMaterialization {
+    Copy {
+        before_entry: usize,
+        source: usize,
+        target: usize,
+        dtype: DType,
+        elements: usize,
+    },
+    Affine {
+        before_entry: usize,
+        source: usize,
+        target: usize,
+        dtype: DType,
+        source_elements: usize,
+        logical_elements: usize,
+        offset: usize,
+        axes: Box<[crate::movement_plan::RawCopyAxis]>,
+    },
+}
+
+/// One sealed logical-entry, pointer, and pre-entry-action inventory for a
+/// synchronous native schedule dispatch.
+pub(crate) struct NativeScheduleDispatchPlan<'a> {
+    entry_count: usize,
+    pointer_count: usize,
+    materializations: &'a [NativeDispatchMaterialization],
+}
+
+impl<'a> NativeScheduleDispatchPlan<'a> {
+    pub(crate) const fn new(
+        entry_count: usize,
+        pointer_count: usize,
+        materializations: &'a [NativeDispatchMaterialization],
+    ) -> Self {
+        Self {
+            entry_count,
+            pointer_count,
+            materializations,
+        }
+    }
+}
+
+impl NativeDispatchMaterialization {
+    pub(crate) fn copy(
+        before_entry: usize,
+        source: usize,
+        target: usize,
+        dtype: DType,
+        elements: usize,
+    ) -> Result<Self, JitError> {
+        elements
+            .checked_mul(dtype.itemsize())
+            .ok_or_else(|| JitError::InvalidBuffer("native dispatch copy bytes overflow".into()))?;
+        if source == target {
+            return Err(JitError::InvalidBuffer(
+                "native dispatch copy aliases its source".into(),
+            ));
+        }
+        Ok(Self::Copy {
+            before_entry,
+            source,
+            target,
+            dtype,
+            elements,
+        })
+    }
+
+    pub(crate) fn affine(
+        before_entry: usize,
+        source: usize,
+        target: usize,
+        dtype: DType,
+        view: &crate::AffineView,
+    ) -> Result<Self, JitError> {
+        if source == target {
+            return Err(JitError::InvalidBuffer(
+                "native dispatch affine copy aliases its source".into(),
+            ));
+        }
+        let address = crate::movement_plan::RawCopyAddress::from_affine(view)
+            .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+        let source_elements = view
+            .source_shape
+            .numel()
+            .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+        let logical_elements = view
+            .logical_shape
+            .numel()
+            .map_err(|error| JitError::InvalidBuffer(error.to_string()))?;
+        source_elements
+            .checked_mul(dtype.itemsize())
+            .and_then(|_| logical_elements.checked_mul(dtype.itemsize()))
+            .ok_or_else(|| {
+                JitError::InvalidBuffer("native dispatch affine bytes overflow".into())
+            })?;
+        Ok(Self::Affine {
+            before_entry,
+            source,
+            target,
+            dtype,
+            source_elements,
+            logical_elements,
+            offset: address.offset,
+            axes: address.axes.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) const fn before_entry(&self) -> usize {
+        match self {
+            Self::Copy { before_entry, .. } | Self::Affine { before_entry, .. } => *before_entry,
+        }
+    }
+
+    pub(crate) const fn target(&self) -> usize {
+        match self {
+            Self::Copy { target, .. } | Self::Affine { target, .. } => *target,
+        }
+    }
+
+    pub(crate) fn affine_axis_count(&self) -> usize {
+        match self {
+            Self::Copy { .. } => 0,
+            Self::Affine { axes, .. } => axes.len(),
+        }
+    }
+
+    fn append_native(
+        &self,
+        arena: &mut [JitBuffer],
+        mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
+        axes: &mut Vec<NativeScheduleDispatchAffineAxis>,
+        actions: &mut Vec<NativeScheduleDispatchAction>,
+    ) -> Result<(), JitError> {
+        let (source, target, dtype, source_elements, target_elements) = match self {
+            Self::Copy {
+                source,
+                target,
+                dtype,
+                elements,
+                ..
+            } => (*source, *target, *dtype, *elements, *elements),
+            Self::Affine {
+                source,
+                target,
+                dtype,
+                source_elements,
+                logical_elements,
+                ..
+            } => (
+                *source,
+                *target,
+                *dtype,
+                *source_elements,
+                *logical_elements,
+            ),
+        };
+        if source == target
+            || borrowed
+                .as_ref()
+                .is_some_and(|bindings| bindings.contains_key(&target))
+        {
+            return Err(JitError::InvalidBuffer(
+                "native dispatch action target is not private".into(),
+            ));
+        }
+        let target_buffer = arena.get_mut(target).ok_or_else(|| {
+            JitError::InvalidBuffer("native dispatch action target is absent".into())
+        })?;
+        if target_buffer.dtype != dtype || target_buffer.elements != target_elements {
+            return Err(JitError::InvalidBuffer(
+                "native dispatch action target descriptor mismatch".into(),
+            ));
+        }
+        let target_pointer = target_buffer.bytes.as_mut_ptr().cast();
+        let source_pointer = match borrowed
+            .as_mut()
+            .and_then(|bindings| bindings.get_mut(&source))
+        {
+            Some(binding) => {
+                binding.validate_dispatch_layout(dtype, source_elements)?;
+                binding.pointer()?.cast_const()
+            }
+            None => {
+                let source_buffer = arena.get_mut(source).ok_or_else(|| {
+                    JitError::InvalidBuffer("native dispatch action source is absent".into())
+                })?;
+                if source_buffer.dtype != dtype || source_buffer.elements != source_elements {
+                    return Err(JitError::InvalidBuffer(
+                        "native dispatch action source descriptor mismatch".into(),
+                    ));
+                }
+                source_buffer.bytes.as_ptr().cast()
+            }
+        };
+        let width = dtype.itemsize();
+        let (kind, elements, offset, action_axes, axis_count) =
+            match self {
+                Self::Copy { elements, .. } => {
+                    (NATIVE_DISPATCH_COPY, *elements, 0, std::ptr::null(), 0)
+                }
+                Self::Affine {
+                    logical_elements,
+                    offset,
+                    axes: prepared_axes,
+                    ..
+                } => {
+                    let axis_offset = axes.len();
+                    axes.extend(prepared_axes.iter().map(|axis| {
+                        NativeScheduleDispatchAffineAxis {
+                            extent: axis.dimension,
+                            divisor: axis.divisor,
+                            stride: axis.stride,
+                            reversed: usize::from(axis.reversed),
+                        }
+                    }));
+                    let action_axes = unsafe { axes.as_ptr().add(axis_offset) };
+                    (
+                        NATIVE_DISPATCH_AFFINE,
+                        *logical_elements,
+                        *offset,
+                        action_axes,
+                        prepared_axes.len(),
+                    )
+                }
+            };
+        actions.push(NativeScheduleDispatchAction {
+            kind,
+            source: source_pointer,
+            target: target_pointer,
+            width,
+            elements,
+            offset,
+            axes: action_axes,
+            axis_count,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -667,11 +942,15 @@ pub(crate) struct JitScheduleDispatcher {
     invocation_count: Arc<AtomicU64>,
 }
 
-/// Capacity-owned pointer/call scratch for one synchronous schedule-module
-/// dispatch. Raw pointers are populated only for the duration of `call` and
-/// cleared on every success or error return.
+/// Capacity-owned pointer/action/call scratch for one synchronous
+/// schedule-module dispatch. Sealing reserves the full action and affine-axis
+/// inventory before raw pointers are installed, so their backing vectors
+/// cannot move during the call. Every pointer is cleared on success, error, or
+/// unwind.
 pub(crate) struct JitScheduleDispatchScratch {
     pointers: Vec<*mut c_void>,
+    affine_axes: Vec<NativeScheduleDispatchAffineAxis>,
+    actions: Vec<NativeScheduleDispatchAction>,
     calls: Vec<NativeScheduleDispatchCall>,
     #[cfg(test)]
     capacity_growth_count: usize,
@@ -708,23 +987,45 @@ impl Drop for JitScheduleDispatchScratchScope<'_> {
 }
 
 impl JitScheduleDispatchScratch {
-    pub(crate) fn with_capacity(entries: usize, pointers: usize) -> Self {
+    pub(crate) fn with_capacity(
+        entries: usize,
+        pointers: usize,
+        actions: usize,
+        affine_axes: usize,
+    ) -> Self {
         Self {
             pointers: Vec::with_capacity(pointers),
+            affine_axes: Vec::with_capacity(affine_axes),
+            actions: Vec::with_capacity(actions),
             calls: Vec::with_capacity(entries),
             #[cfg(test)]
             capacity_growth_count: 0,
         }
     }
 
-    pub(crate) fn ensure_capacity(&mut self, entries: usize, pointers: usize) {
+    pub(crate) fn ensure_capacity(
+        &mut self,
+        entries: usize,
+        pointers: usize,
+        actions: usize,
+        affine_axes: usize,
+    ) {
         #[cfg(test)]
-        let grew = entries > self.calls.capacity() || pointers > self.pointers.capacity();
+        let grew = entries > self.calls.capacity()
+            || pointers > self.pointers.capacity()
+            || actions > self.actions.capacity()
+            || affine_axes > self.affine_axes.capacity();
         if entries > self.calls.capacity() {
             self.calls.reserve(entries);
         }
         if pointers > self.pointers.capacity() {
             self.pointers.reserve(pointers);
+        }
+        if actions > self.actions.capacity() {
+            self.actions.reserve(actions);
+        }
+        if affine_axes > self.affine_axes.capacity() {
+            self.affine_axes.reserve(affine_axes);
         }
         #[cfg(test)]
         if grew {
@@ -734,12 +1035,29 @@ impl JitScheduleDispatchScratch {
 
     fn clear(&mut self) {
         self.calls.clear();
+        self.actions.clear();
+        self.affine_axes.clear();
         self.pointers.clear();
     }
 
-    fn scope(&mut self, entries: usize, pointers: usize) -> JitScheduleDispatchScratchScope<'_> {
+    fn append_materialization(
+        &mut self,
+        action: &NativeDispatchMaterialization,
+        arena: &mut [JitBuffer],
+        borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
+    ) -> Result<(), JitError> {
+        action.append_native(arena, borrowed, &mut self.affine_axes, &mut self.actions)
+    }
+
+    fn scope(
+        &mut self,
+        entries: usize,
+        pointers: usize,
+        actions: usize,
+        affine_axes: usize,
+    ) -> JitScheduleDispatchScratchScope<'_> {
         self.clear();
-        self.ensure_capacity(entries, pointers);
+        self.ensure_capacity(entries, pointers, actions, affine_axes);
         JitScheduleDispatchScratchScope { scratch: self }
     }
 
@@ -750,7 +1068,10 @@ impl JitScheduleDispatchScratch {
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.calls.is_empty() && self.pointers.is_empty()
+        self.calls.is_empty()
+            && self.actions.is_empty()
+            && self.affine_axes.is_empty()
+            && self.pointers.is_empty()
     }
 }
 
@@ -1245,8 +1566,7 @@ impl JitKernel {
 impl JitScheduleDispatcher {
     pub(crate) fn call_prepared<'a, F>(
         &self,
-        entry_count: usize,
-        pointer_count: usize,
+        plan: NativeScheduleDispatchPlan<'_>,
         arena: &mut [JitBuffer],
         mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
         scratch: &mut JitScheduleDispatchScratch,
@@ -1262,7 +1582,23 @@ impl JitScheduleDispatcher {
             usize,
         ),
     {
-        let mut scratch = scratch.scope(entry_count, pointer_count);
+        let NativeScheduleDispatchPlan {
+            entry_count,
+            pointer_count,
+            materializations,
+        } = plan;
+        let affine_axis_count = materializations.iter().try_fold(0usize, |count, action| {
+            count.checked_add(action.affine_axis_count()).ok_or((
+                action.before_entry(),
+                JitError::InvalidBuffer("native dispatch affine axis count overflows".into()),
+            ))
+        })?;
+        let mut scratch = scratch.scope(
+            entry_count,
+            pointer_count,
+            materializations.len(),
+            affine_axis_count,
+        );
         (|| {
             for index in 0..entry_count {
                 let (kernel, slots, quantized, offset) = entry(index);
@@ -1292,14 +1628,49 @@ impl JitScheduleDispatcher {
                     ),
                 ));
             }
+            let mut materialization_index = 0;
             for index in 0..entry_count {
                 let (kernel, _, _, offset) = entry(index);
                 let buffers = unsafe { scratch.pointers.as_mut_ptr().add(offset) };
+                let action_offset = scratch.actions.len();
+                while let Some(action) = materializations.get(materialization_index) {
+                    if action.before_entry() < index {
+                        return Err((
+                            index,
+                            JitError::InvalidBuffer(
+                                "native dispatch materialization order differs".into(),
+                            ),
+                        ));
+                    }
+                    if action.before_entry() != index {
+                        break;
+                    }
+                    scratch
+                        .append_materialization(action, arena, borrowed.as_deref_mut())
+                        .map_err(|error| (index, error))?;
+                    materialization_index += 1;
+                }
+                let action_count = scratch.actions.len() - action_offset;
+                let actions = if action_count == 0 {
+                    std::ptr::null()
+                } else {
+                    unsafe { scratch.actions.as_ptr().add(action_offset) }
+                };
                 scratch.calls.push(NativeScheduleDispatchCall {
                     entry: kernel.call,
                     buffers,
                     symbols: std::ptr::null(),
+                    actions,
+                    action_count,
                 });
+            }
+            if materialization_index != materializations.len() {
+                return Err((
+                    entry_count.saturating_sub(1),
+                    JitError::InvalidBuffer(
+                        "native dispatch materialization entry is out of range".into(),
+                    ),
+                ));
             }
             let mut failure = [u64::MAX, u64::MAX, 0];
             #[cfg(test)]
@@ -1351,6 +1722,8 @@ impl JitScheduleDispatcher {
                 entry: entry.call,
                 buffers: pointers.as_mut_ptr(),
                 symbols: std::ptr::null(),
+                actions: std::ptr::null(),
+                action_count: 0,
             })
             .collect::<Vec<_>>();
         let mut failure = [u64::MAX, u64::MAX, 0];
@@ -6494,6 +6867,11 @@ mod tests {
         let module = render_schedule_module_source(&rendered);
         let manifest = schedule_module_manifest(&rendered);
 
+        assert!(module.contains("static int rg_schedule_apply("));
+        assert!(module.contains("calls[i].actions[action]"));
+        assert!(module.contains("if(action->elements!=0)memmove("));
+        assert!(manifest.starts_with("rustgrad-c11-schedule-module-v4\u{1f}2"));
+
         for (index, _) in rendered.iter().enumerate() {
             for helper in C11LocalHelper::ALL {
                 let symbol = helper.name();
@@ -6518,7 +6896,7 @@ mod tests {
         }
         assert_eq!(
             schedule_module_cache_key(&rendered),
-            native_cache_key("schedule-module-v3", &manifest)
+            native_cache_key("schedule-module-v4", &manifest)
         );
     }
 
@@ -6598,6 +6976,92 @@ mod tests {
             arena[2].clone().into_tensor(Shape::from([1])).unwrap(),
             TensorData::new([1], vec![4.0]).unwrap()
         );
+
+        let mut chained_arena = vec![
+            JitBuffer::from_tensor(&values, false),
+            JitBuffer::zeroed(DType::F32, 1, true),
+            JitBuffer::zeroed(DType::F32, 1, false),
+            JitBuffer::zeroed(DType::F32, 1, true),
+        ];
+        let first_slots = [0, 1];
+        let second_slots = [2, 3];
+        let no_packed = Vec::<crate::QuantizedTensorData>::new();
+        let entries = [
+            (&kernels[0], first_slots.as_slice(), no_packed.as_slice(), 0),
+            (
+                &kernels[1],
+                second_slots.as_slice(),
+                no_packed.as_slice(),
+                2,
+            ),
+        ];
+        let dense = NativeDispatchMaterialization::copy(1, 1, 2, DType::F32, 1).unwrap();
+        let mut scratch = JitScheduleDispatchScratch::with_capacity(2, 4, 1, 0);
+        dispatcher
+            .call_prepared(
+                NativeScheduleDispatchPlan::new(2, 4, &[dense]),
+                &mut chained_arena,
+                None,
+                &mut scratch,
+                |index| entries[index],
+            )
+            .unwrap();
+        assert_eq!(dispatcher.invocation_count(), 2);
+        assert!(scratch.is_empty());
+        assert_eq!(
+            chained_arena[2]
+                .clone()
+                .into_tensor(Shape::from([1]))
+                .unwrap(),
+            TensorData::new([1], vec![-2.0]).unwrap()
+        );
+        assert_eq!(
+            chained_arena[3]
+                .clone()
+                .into_tensor(Shape::from([1]))
+                .unwrap(),
+            TensorData::new([1], vec![4.0]).unwrap()
+        );
+
+        let reversed = crate::AffineView {
+            source_shape: Shape::new([1]),
+            logical_shape: Shape::new([1]),
+            strides: vec![-1],
+            offset: 0,
+        };
+        let affine = NativeDispatchMaterialization::affine(0, 0, 2, DType::F32, &reversed).unwrap();
+        let single = [(
+            &kernels[1],
+            second_slots.as_slice(),
+            no_packed.as_slice(),
+            0,
+        )];
+        dispatcher
+            .call_prepared(
+                NativeScheduleDispatchPlan::new(1, 2, &[affine]),
+                &mut chained_arena,
+                None,
+                &mut scratch,
+                |index| single[index],
+            )
+            .unwrap();
+        assert_eq!(dispatcher.invocation_count(), 3);
+        assert!(scratch.is_empty());
+
+        let malformed = NativeDispatchMaterialization::copy(0, 1, 99, DType::F32, 1).unwrap();
+        assert!(
+            dispatcher
+                .call_prepared(
+                    NativeScheduleDispatchPlan::new(1, 2, &[malformed]),
+                    &mut chained_arena,
+                    None,
+                    &mut scratch,
+                    |index| single[index],
+                )
+                .is_err()
+        );
+        assert_eq!(dispatcher.invocation_count(), 3);
+        assert!(scratch.is_empty());
         drop(kernels);
 
         let (restored, _, warm) = JitKernel::load_schedule_module(&rendered).unwrap();
@@ -6658,6 +7122,62 @@ mod tests {
             );
             assert_eq!(dispatcher.invocation_count(), (failure + 1) as u64);
         }
+
+        let scalar = |value: i64, mutable| {
+            let mut buffer = JitBuffer::zeroed(DType::I64, 1, mutable);
+            buffer.bytes_mut().copy_from_slice(&value.to_ne_bytes());
+            buffer
+        };
+        let mut arena = vec![
+            scalar(42, false),
+            scalar(1, false),
+            scalar(0, true),
+            scalar(-1, false),
+            scalar(0, false),
+            scalar(0, true),
+        ];
+        let first_slots = [0, 1, 2];
+        let failing_slots = [3, 4, 5];
+        let no_packed = Vec::<crate::QuantizedTensorData>::new();
+        let entries = [
+            (&kernels[0], first_slots.as_slice(), no_packed.as_slice(), 0),
+            (
+                &kernels[1],
+                failing_slots.as_slice(),
+                no_packed.as_slice(),
+                3,
+            ),
+        ];
+        let action = NativeDispatchMaterialization::copy(1, 2, 3, DType::I64, 1).unwrap();
+        let mut scratch = JitScheduleDispatchScratch::with_capacity(2, 6, 1, 0);
+        assert_eq!(
+            dispatcher.call_prepared(
+                NativeScheduleDispatchPlan::new(2, 6, std::slice::from_ref(&action)),
+                &mut arena,
+                None,
+                &mut scratch,
+                |index| entries[index],
+            ),
+            Err((1, JitError::DivisionByZero { index: 0 }))
+        );
+        assert!(scratch.is_empty());
+        arena[3].bytes_mut().copy_from_slice(&(-7i64).to_ne_bytes());
+        arena[4].bytes_mut().copy_from_slice(&1i64.to_ne_bytes());
+        dispatcher
+            .call_prepared(
+                NativeScheduleDispatchPlan::new(2, 6, &[action]),
+                &mut arena,
+                None,
+                &mut scratch,
+                |index| entries[index],
+            )
+            .unwrap();
+        assert!(scratch.is_empty());
+        assert_eq!(
+            i64::from_ne_bytes(arena[5].bytes().try_into().unwrap()),
+            42,
+            "retry must rerun the pre-entry action before its logical consumer"
+        );
     }
 
     #[test]

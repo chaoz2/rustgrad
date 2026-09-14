@@ -811,6 +811,45 @@ pub(crate) struct RawCopyAddress {
     pub(crate) axes: Vec<RawCopyAxis>,
 }
 
+impl RawCopyAddress {
+    pub(crate) fn from_affine(view: &crate::AffineView) -> Result<Self, MovementPlanError> {
+        let normalized = view
+            .normalized_read()
+            .map_err(|_| MovementPlanError::InvalidGeometry)?;
+        let elements = view
+            .logical_shape
+            .numel()
+            .map_err(|_| MovementPlanError::Overflow)?;
+        let mut axes = Vec::new();
+        for (output_axis, (&dimension, normalized_axis)) in view
+            .logical_shape
+            .dims()
+            .iter()
+            .zip(&normalized.axes)
+            .enumerate()
+        {
+            if elements == 0 || dimension <= 1 || normalized_axis.stride == 0 {
+                continue;
+            }
+            let divisor = view.logical_shape.dims()[output_axis + 1..]
+                .iter()
+                .try_fold(1usize, |product, next| product.checked_mul(*next))
+                .ok_or(MovementPlanError::Overflow)?;
+            axes.push(RawCopyAxis {
+                output_axis,
+                dimension,
+                divisor,
+                stride: normalized_axis.stride,
+                reversed: normalized_axis.reversed,
+            });
+        }
+        Ok(Self {
+            offset: normalized.offset,
+            axes,
+        })
+    }
+}
+
 /// Borrowed, fully checked projection of one injective static placement into a
 /// race-free output-driven kernel. Every output lane is written exactly once:
 /// it either names one source lane through `axes`, or receives raw zero bits.
@@ -853,37 +892,7 @@ impl<'a> RawCopyView<'a> {
         let Some(view) = self.view else {
             return Ok(None);
         };
-        let normalized = view
-            .normalized_read()
-            .map_err(|_| MovementPlanError::InvalidGeometry)?;
-        let mut axes = Vec::new();
-        for (output_axis, (&dimension, normalized_axis)) in self
-            .plan
-            .output_shape
-            .dims()
-            .iter()
-            .zip(&normalized.axes)
-            .enumerate()
-        {
-            if self.elements == 0 || dimension <= 1 || normalized_axis.stride == 0 {
-                continue;
-            }
-            let divisor = self.plan.output_shape.dims()[output_axis + 1..]
-                .iter()
-                .try_fold(1usize, |product, next| product.checked_mul(*next))
-                .ok_or(MovementPlanError::Overflow)?;
-            axes.push(RawCopyAxis {
-                output_axis,
-                dimension,
-                divisor,
-                stride: normalized_axis.stride,
-                reversed: normalized_axis.reversed,
-            });
-        }
-        Ok(Some(RawCopyAddress {
-            offset: normalized.offset,
-            axes,
-        }))
+        Ok(Some(RawCopyAddress::from_affine(view)?))
     }
 
     pub(crate) fn input_elements(self) -> usize {
