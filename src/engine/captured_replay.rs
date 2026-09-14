@@ -1,6 +1,8 @@
 //! Graph-independent interpreter/native replay and deterministic batching.
 use super::capture::{CapturedSchedule, ReplayError};
-use super::native_replay_workspace::{NativeReplayTraffic, NativeReplayWorkspace};
+use super::native_replay_workspace::{
+    NativeReplayTraffic, NativeReplayWorkspace, ResolvedNativeReplayInput,
+};
 use super::replay_liveness::ReplayLivenessPlan;
 use crate::backend::{
     JitBackendError, NativeScheduleLayout, PreparedNativeDispatch, PreparedScheduleItem,
@@ -15,6 +17,35 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+#[cfg(test)]
+std::thread_local! {
+    static WHOLE_CAPTURE_INPUT_VALIDATION_SCAN_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn record_whole_capture_input_validation_scan() {
+    WHOLE_CAPTURE_INPUT_VALIDATION_SCAN_COUNT.with(|count| {
+        count.set(
+            count
+                .get()
+                .checked_add(1)
+                .expect("whole-capture input validation scan count overflow"),
+        );
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_whole_capture_input_validation_scan_count() {
+    WHOLE_CAPTURE_INPUT_VALIDATION_SCAN_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn whole_capture_input_validation_scan_count() -> usize {
+    WHOLE_CAPTURE_INPUT_VALIDATION_SCAN_COUNT.with(std::cell::Cell::get)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapturedBackendPolicy {
@@ -2014,16 +2045,16 @@ impl CapturedReplayExecutor {
             &mut borrowed,
             Some(&public),
             |_workspace, _borrowed| Ok(()),
-            |input_ordinal, input, workspace, borrowed| {
+            |_input_ordinal, input, _workspace| {
                 if let Some(value) = recurrent.get(&input.name).copied() {
                     validate_input_value(capture, input, value)?;
-                    workspace.borrow_recurrent_input_at(input_ordinal, value, borrowed)
+                    Ok(ResolvedNativeReplayInput::Recurrent(value))
                 } else {
                     let value = external
                         .get(&input.name)
                         .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
                     validate_input_value(capture, input, value)?;
-                    workspace.bind_external_input_at(input_ordinal, value, borrowed)
+                    Ok(ResolvedNativeReplayInput::External(value))
                 }
             },
         )
@@ -2039,16 +2070,15 @@ impl CapturedReplayExecutor {
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         ) -> Result<(), ReplayError>,
-        import: impl FnMut(
+        resolve: impl FnMut(
             usize,
             &crate::ReplayInput,
-            &mut NativeReplayWorkspace,
-            &mut super::native_replay_workspace::NativeReplayBindings<'a>,
-        ) -> Result<(), ReplayError>,
+            &NativeReplayWorkspace,
+        ) -> Result<ResolvedNativeReplayInput<'a>, ReplayError>,
     ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
         plan.validate_replay_structure(capture)?;
         self.execute_authenticated_native_items_resolved(
-            capture, plan, borrowed, selected, setup, import,
+            capture, plan, borrowed, selected, setup, resolve,
         )
     }
 
@@ -2062,12 +2092,11 @@ impl CapturedReplayExecutor {
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         ) -> Result<(), ReplayError>,
-        import: impl FnMut(
+        resolve: impl FnMut(
             usize,
             &crate::ReplayInput,
-            &mut NativeReplayWorkspace,
-            &mut super::native_replay_workspace::NativeReplayBindings<'a>,
-        ) -> Result<(), ReplayError>,
+            &NativeReplayWorkspace,
+        ) -> Result<ResolvedNativeReplayInput<'a>, ReplayError>,
     ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
         self.execute_authenticated_native_items_resolved(
             capture,
@@ -2075,7 +2104,7 @@ impl CapturedReplayExecutor {
             borrowed,
             selected,
             setup,
-            import,
+            resolve,
         )
     }
 
@@ -2085,7 +2114,9 @@ impl CapturedReplayExecutor {
         provided: &BTreeMap<String, TensorData>,
         plan: &mut SealedPlannedNativeItems,
     ) -> Result<ReplayValues, ReplayError> {
-        validate_inputs(capture, provided)?;
+        plan.plan
+            .workspace
+            .validate_provided_input_names(provided)?;
         let mut borrowed = plan.plan.workspace.new_bindings();
         self.execute_authenticated_native_items_resolved(
             capture,
@@ -2093,11 +2124,11 @@ impl CapturedReplayExecutor {
             &mut borrowed,
             None,
             |_workspace, _borrowed| Ok(()),
-            |input_ordinal, input, workspace, borrowed| {
+            |_input_ordinal, input, _workspace| {
                 let value = provided
                     .get(&input.name)
                     .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
-                workspace.bind_external_input_at(input_ordinal, value, borrowed)
+                Ok(ResolvedNativeReplayInput::External(value))
             },
         )
         .map(|(values, _)| values)
@@ -2113,18 +2144,33 @@ impl CapturedReplayExecutor {
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         ) -> Result<(), ReplayError>,
-        mut import: impl FnMut(
+        mut resolve: impl FnMut(
             usize,
             &crate::ReplayInput,
-            &mut NativeReplayWorkspace,
-            &mut super::native_replay_workspace::NativeReplayBindings<'a>,
-        ) -> Result<(), ReplayError>,
+            &NativeReplayWorkspace,
+        ) -> Result<ResolvedNativeReplayInput<'a>, ReplayError>,
     ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
-        validate_quantized_index_inputs(capture)?;
+        let mut resolved = Vec::with_capacity(capture.inputs.len());
+        for (input_ordinal, input) in capture.inputs.iter().enumerate() {
+            let value = resolve(input_ordinal, input, &plan.workspace)?;
+            plan.workspace
+                .validate_input_descriptor_at(input_ordinal, value.value())?;
+            resolved.push(value);
+        }
+        plan.workspace.validate_input_validators(&resolved)?;
         plan.workspace.begin_resolved();
         setup(&mut plan.workspace, borrowed)?;
-        for (input_ordinal, input) in capture.inputs.iter().enumerate() {
-            import(input_ordinal, input, &mut plan.workspace, borrowed)?;
+        for (input_ordinal, value) in resolved.into_iter().enumerate() {
+            match value {
+                ResolvedNativeReplayInput::External(value) => {
+                    plan.workspace
+                        .bind_external_input_at(input_ordinal, value, borrowed)?;
+                }
+                ResolvedNativeReplayInput::Recurrent(value) => {
+                    plan.workspace
+                        .borrow_recurrent_input_at(input_ordinal, value, borrowed)?;
+                }
+            }
         }
         plan.workspace.finish_inputs()?;
         plan.workspace.execute_items(
@@ -2339,6 +2385,8 @@ pub(crate) fn validate_inputs(
             .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
         validate_input_descriptor(input, value)?;
     }
+    #[cfg(test)]
+    record_whole_capture_input_validation_scan();
     for item in &capture.items {
         let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
             item.kernel.operation()
@@ -2361,32 +2409,14 @@ pub(crate) fn validate_inputs(
     Ok(())
 }
 
-fn validate_quantized_index_inputs(capture: &CapturedSchedule) -> Result<(), ReplayError> {
-    for item in &capture.items {
-        let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
-            item.kernel.operation()
-        else {
-            continue;
-        };
-        if !capture
-            .inputs
-            .iter()
-            .any(|input| input.node == plan.indices)
-        {
-            return Err(ReplayError::Corrupt(
-                "quantized gather indices are not an input".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_input_value(
     capture: &CapturedSchedule,
     input: &crate::ReplayInput,
     value: &TensorData,
 ) -> Result<(), ReplayError> {
     validate_input_descriptor(input, value)?;
+    #[cfg(test)]
+    record_whole_capture_input_validation_scan();
     for item in &capture.items {
         let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
             item.kernel.operation()
@@ -2557,6 +2587,72 @@ mod tests {
             .unwrap()
             .outputs
             .remove(0)
+    }
+
+    #[test]
+    fn sealed_quantized_input_validation_rejects_before_dispatch_without_capture_scans() {
+        let capture = CapturedSchedule::capture_quantized_row_gather(
+            "indices",
+            crate::NodeId::from_index(0),
+            crate::NodeId::from_index(1),
+            crate::NodeId::from_index(2),
+            Shape::from([2]),
+            DType::I64,
+            crate::QuantizedTensorData::new(
+                crate::GgmlType::Q4_0,
+                Shape::from([2, 32]),
+                vec![0; 36],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let valid = BTreeMap::from([(
+            "indices".into(),
+            TensorData::from_storage([2], Storage::I64(vec![0, 1])).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let plan = executor.plan_native_items(&capture, &valid, false).unwrap();
+        let prepared = plan.workspace_stats();
+        assert_eq!(prepared.input_validation_layout_build_count, 1);
+        assert_eq!(prepared.sealed_input_validator_count, 1);
+        let mut sealed = plan.seal(&capture).unwrap();
+        reset_whole_capture_input_validation_scan_count();
+
+        let wrong_descriptor = BTreeMap::from([(
+            "indices".into(),
+            TensorData::from_storage([1], Storage::I64(vec![0])).unwrap(),
+        )]);
+        assert!(matches!(
+            executor.execute_sealed_planned_native_items(
+                &capture,
+                &wrong_descriptor,
+                &mut sealed,
+            ),
+            Err(ReplayError::Descriptor(name)) if name == "indices"
+        ));
+        assert_eq!(sealed.last_module_dispatch_counts(), (0, 0));
+        assert_eq!(whole_capture_input_validation_scan_count(), 0);
+        assert_eq!(sealed.workspace_stats().input_import_count, 0);
+        assert_eq!(sealed.workspace_stats().borrowed_external_input_bytes, 0);
+
+        let outside = BTreeMap::from([(
+            "indices".into(),
+            TensorData::from_storage([2], Storage::I64(vec![0, 2])).unwrap(),
+        )]);
+        assert!(matches!(
+            executor.execute_sealed_planned_native_items(&capture, &outside, &mut sealed),
+            Err(ReplayError::Execute(message)) if message.contains("IndexOutOfBounds")
+        ));
+        assert_eq!(sealed.last_module_dispatch_counts(), (0, 0));
+        assert_eq!(whole_capture_input_validation_scan_count(), 0);
+        assert_eq!(sealed.workspace_stats().input_import_count, 0);
+        assert_eq!(sealed.workspace_stats().borrowed_external_input_bytes, 0);
+
+        executor
+            .execute_sealed_planned_native_items(&capture, &valid, &mut sealed)
+            .unwrap();
+        assert_eq!(sealed.last_module_dispatch_counts(), (1, 1));
+        assert_eq!(whole_capture_input_validation_scan_count(), 0);
     }
 
     #[test]
@@ -2963,6 +3059,8 @@ mod tests {
         assert_eq!(prepared.sealed_prerequisite_slot_count, 1);
         assert_eq!(prepared.dispatch_metadata_build_count, 1);
         assert_eq!(prepared.binding_layout_build_count, 1);
+        assert_eq!(prepared.input_validation_layout_build_count, 1);
+        assert_eq!(prepared.sealed_input_validator_count, 0);
         assert!(prepared.sealed_pointer_count > 0);
         assert_eq!(
             prepared.sealed_pointer_count,
@@ -3073,6 +3171,10 @@ mod tests {
         assert_eq!(retried_deterministic_traffic, first_deterministic_traffic);
         assert_eq!(plan.workspace_stats().borrowed_external_input_bytes, 24);
         assert_eq!(plan.workspace_stats().dispatch_metadata_build_count, 1);
+        assert_eq!(
+            plan.workspace_stats().input_validation_layout_build_count,
+            1
+        );
         assert_eq!(plan.workspace_stats().binding_layout_build_count, 1);
         assert_eq!(
             plan.workspace_stats().last_borrowed_binding_count,
@@ -3151,12 +3253,8 @@ mod tests {
                 &mut borrowed,
                 Some(&selected),
                 |_workspace, _borrowed| Ok(()),
-                |input_ordinal, input, workspace, borrowed| {
-                    workspace.bind_external_input_at(
-                        input_ordinal,
-                        &bindings[&input.name],
-                        borrowed,
-                    )
+                |_input_ordinal, input, _workspace| {
+                    Ok(ResolvedNativeReplayInput::External(&bindings[&input.name]))
                 },
             )
             .unwrap();

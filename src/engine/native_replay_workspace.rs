@@ -43,6 +43,88 @@ struct WorkspaceInput {
     name: String,
     slot: usize,
     borrowed: Box<[(usize, crate::cpu_jit::NativeReplayBindingOrdinal)]>,
+    validation: PreparedReplayInputValidation,
+}
+
+#[derive(Clone, Debug)]
+enum PreparedReplayInputValidator {
+    QuantizedRowGather { plan: crate::QuantizedRowGatherPlan },
+}
+
+#[derive(Clone, Debug, Default)]
+struct PreparedReplayInputValidation {
+    validators: Box<[PreparedReplayInputValidator]>,
+}
+
+impl PreparedReplayInputValidation {
+    fn validate_one(&self, validator: usize, value: &TensorData) -> Result<(), ReplayError> {
+        match self.validators.get(validator).ok_or_else(|| {
+            ReplayError::Corrupt("native input validator ordinal is absent".into())
+        })? {
+            PreparedReplayInputValidator::QuantizedRowGather { plan, .. } => plan
+                .preflight_indices(value)
+                .map(|_| ())
+                .map_err(|error| ReplayError::Execute(error.to_string())),
+        }
+    }
+
+    #[cfg(test)]
+    fn quantized_row_counts(&self) -> Vec<usize> {
+        self.validators
+            .iter()
+            .map(|validator| match validator {
+                PreparedReplayInputValidator::QuantizedRowGather { plan, .. } => {
+                    plan.weight_desc.logical_shape.dims()[0]
+                }
+            })
+            .collect()
+    }
+}
+
+struct PreparedReplayInputValidations {
+    inputs: Vec<PreparedReplayInputValidation>,
+    source_order: Box<[(usize, usize)]>,
+}
+
+fn prepare_replay_input_validations(
+    capture: &CapturedSchedule,
+) -> Result<PreparedReplayInputValidations, ReplayError> {
+    let mut input_ordinals = BTreeMap::new();
+    for (ordinal, input) in capture.inputs.iter().enumerate() {
+        if input_ordinals.insert(input.node, ordinal).is_some() {
+            return Err(ReplayError::Corrupt(
+                "native replay input node repeats".into(),
+            ));
+        }
+    }
+    let mut validators = (0..capture.inputs.len())
+        .map(|_| Vec::new())
+        .collect::<Vec<_>>();
+    let mut source_order = Vec::new();
+    for item in &capture.items {
+        let crate::Operation::Movement(crate::MovementValue::QuantizedRowGather(plan)) =
+            item.kernel.operation()
+        else {
+            continue;
+        };
+        let input_ordinal = input_ordinals.get(&plan.indices).copied().ok_or_else(|| {
+            ReplayError::Corrupt("quantized gather indices are not an input".into())
+        })?;
+        let validator_ordinal = validators[input_ordinal].len();
+        validators[input_ordinal].push(PreparedReplayInputValidator::QuantizedRowGather {
+            plan: (**plan).clone(),
+        });
+        source_order.push((input_ordinal, validator_ordinal));
+    }
+    Ok(PreparedReplayInputValidations {
+        inputs: validators
+            .into_iter()
+            .map(|validators| PreparedReplayInputValidation {
+                validators: validators.into_boxed_slice(),
+            })
+            .collect(),
+        source_order: source_order.into_boxed_slice(),
+    })
 }
 
 struct WorkspaceItem {
@@ -168,6 +250,8 @@ pub(super) struct NativeReplayWorkspace {
     dispatch_scratch: crate::cpu_jit::JitScheduleDispatchScratch,
     owners: BTreeMap<u64, WorkspaceOwner>,
     inputs: Vec<WorkspaceInput>,
+    input_names: BTreeSet<String>,
+    input_validation_order: Box<[(usize, usize)]>,
     binding_ordinals: Arc<[Option<crate::cpu_jit::NativeReplayBindingOrdinal>]>,
     binding_count: usize,
     immutable: BTreeSet<usize>,
@@ -197,6 +281,8 @@ pub(super) struct NativeReplayWorkspace {
     #[cfg(test)]
     binding_layout_build_count: usize,
     #[cfg(test)]
+    input_validation_layout_build_count: usize,
+    #[cfg(test)]
     last_borrowed_binding_count: usize,
     #[cfg(test)]
     injected_dispatch_failure: Option<usize>,
@@ -204,6 +290,19 @@ pub(super) struct NativeReplayWorkspace {
 
 pub(super) struct NativeReplayBindings<'a> {
     slots: crate::cpu_jit::IndexedBorrowedJitBuffers<'a>,
+}
+
+pub(super) enum ResolvedNativeReplayInput<'a> {
+    External(&'a TensorData),
+    Recurrent(&'a TensorData),
+}
+
+impl ResolvedNativeReplayInput<'_> {
+    pub(super) fn value(&self) -> &TensorData {
+        match self {
+            Self::External(value) | Self::Recurrent(value) => value,
+        }
+    }
 }
 
 impl<'a> NativeReplayBindings<'a> {
@@ -239,6 +338,8 @@ pub(crate) struct NativeReplayWorkspaceStats {
     pub(crate) sealed_derived_materialization_count: usize,
     pub(crate) dispatch_metadata_build_count: usize,
     pub(crate) binding_layout_build_count: usize,
+    pub(crate) input_validation_layout_build_count: usize,
+    pub(crate) sealed_input_validator_count: usize,
     pub(crate) sealed_pointer_count: usize,
     pub(crate) sealed_dense_pointer_count: usize,
     pub(crate) sealed_quantized_pointer_count: usize,
@@ -268,6 +369,8 @@ impl NativeReplayWorkspace {
             dispatch_scratch: crate::cpu_jit::JitScheduleDispatchScratch::with_capacity(0, 0, 0, 0),
             owners: BTreeMap::new(),
             inputs: Vec::with_capacity(capture.inputs.len()),
+            input_names: BTreeSet::new(),
+            input_validation_order: Box::new([]),
             binding_ordinals: Arc::from([]),
             binding_count: 0,
             immutable: BTreeSet::new(),
@@ -297,12 +400,21 @@ impl NativeReplayWorkspace {
             #[cfg(test)]
             binding_layout_build_count: 0,
             #[cfg(test)]
+            input_validation_layout_build_count: 0,
+            #[cfg(test)]
             last_borrowed_binding_count: 0,
             #[cfg(test)]
             injected_dispatch_failure: None,
         };
 
-        for input in &capture.inputs {
+        let input_validations = prepare_replay_input_validations(capture)?;
+        workspace.input_validation_order = input_validations.source_order;
+        for (input, validation) in capture.inputs.iter().zip(input_validations.inputs) {
+            if !workspace.input_names.insert(input.name.clone()) {
+                return Err(ReplayError::Corrupt(
+                    "native replay input name repeats".into(),
+                ));
+            }
             let elements = input
                 .desc
                 .shape
@@ -314,7 +426,15 @@ impl NativeReplayWorkspace {
                 name: input.name.clone(),
                 slot,
                 borrowed: Box::new([]),
+                validation,
             });
+        }
+        #[cfg(test)]
+        {
+            workspace.input_validation_layout_build_count = workspace
+                .input_validation_layout_build_count
+                .checked_add(1)
+                .expect("native input validation layout count overflow");
         }
         for (buffer, value) in &capture.constants {
             let elements = value.len();
@@ -859,6 +979,57 @@ impl NativeReplayWorkspace {
             self.bind_external_input_at(ordinal, value, bindings)?;
         }
         self.finish_inputs()
+    }
+
+    pub(super) fn validate_provided_input_names(
+        &self,
+        provided: &BTreeMap<String, TensorData>,
+    ) -> Result<(), ReplayError> {
+        if let Some(name) = provided
+            .keys()
+            .find(|name| !self.input_names.contains(*name))
+        {
+            return Err(ReplayError::Extra(name.clone()));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_input_descriptor_at(
+        &self,
+        input_ordinal: usize,
+        value: &TensorData,
+    ) -> Result<(), ReplayError> {
+        let input = self
+            .inputs
+            .get(input_ordinal)
+            .ok_or_else(|| ReplayError::Corrupt("native input ordinal is absent".into()))?;
+        let descriptor = &self.slots[input.slot].key.descriptor;
+        if value.shape() != &descriptor.shape || value.dtype() != descriptor.dtype {
+            return Err(ReplayError::Descriptor(input.name.clone()));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_input_validators(
+        &self,
+        resolved: &[ResolvedNativeReplayInput<'_>],
+    ) -> Result<(), ReplayError> {
+        if resolved.len() != self.inputs.len() {
+            return Err(ReplayError::Corrupt(
+                "native resolved input cardinality mismatch".into(),
+            ));
+        }
+        for (input_ordinal, validator_ordinal) in self.input_validation_order.iter().copied() {
+            let input = self.inputs.get(input_ordinal).ok_or_else(|| {
+                ReplayError::Corrupt("native input validation order is invalid".into())
+            })?;
+            let value = resolved
+                .get(input_ordinal)
+                .ok_or_else(|| ReplayError::Corrupt("native input ordinal is absent".into()))?
+                .value();
+            input.validation.validate_one(validator_ordinal, value)?;
+        }
+        Ok(())
     }
 
     pub(super) fn begin_resolved(&mut self) {
@@ -1798,6 +1969,11 @@ impl NativeReplayWorkspace {
                 WorkspaceDispatchStep::PerItem(_) => None,
             })
             .sum();
+        let sealed_input_validator_count = self
+            .inputs
+            .iter()
+            .map(|input| input.validation.validators.len())
+            .sum();
         let sealed_pointer_count = self
             .dispatch_tape
             .iter()
@@ -1835,6 +2011,8 @@ impl NativeReplayWorkspace {
             sealed_derived_materialization_count,
             dispatch_metadata_build_count: self.dispatch_metadata_build_count,
             binding_layout_build_count: self.binding_layout_build_count,
+            input_validation_layout_build_count: self.input_validation_layout_build_count,
+            sealed_input_validator_count,
             sealed_pointer_count,
             sealed_dense_pointer_count,
             sealed_quantized_pointer_count,
@@ -2087,6 +2265,102 @@ fn two_buffers(
     } else {
         let (left, right) = buffers.split_at_mut(target);
         Ok((&mut right[0], &left[source]))
+    }
+}
+
+#[cfg(test)]
+mod input_validation_tests {
+    use super::prepare_replay_input_validations;
+    use crate::engine::capture::QuantizedCaptureBinding;
+    use crate::{CapturedSchedule, DType, GgmlType, Graph, QuantizedTensorData, Shape, Storage};
+
+    fn ordered_row_gather_capture() -> CapturedSchedule {
+        let mut graph = Graph::new();
+        let indices = graph.input_dtype("z_indices", [1, 2], DType::I32);
+        let other_indices = graph.input_dtype("a_indices", [1, 2], DType::I32);
+        let first_weight = graph.input("first_weight", [3, 32]);
+        let second_weight = graph.input("second_weight", [4, 32]);
+        let third_weight = graph.input("third_weight", [2, 32]);
+        let index = graph.reshape(indices, [1, 2, 1]).unwrap();
+        let index = graph.expand(index, [1, 2, 32]).unwrap();
+        let other_index = graph.reshape(other_indices, [1, 2, 1]).unwrap();
+        let other_index = graph.expand(other_index, [1, 2, 32]).unwrap();
+        let first_view = graph.reshape(first_weight, [1, 3, 32]).unwrap();
+        let second_view = graph.reshape(second_weight, [1, 4, 32]).unwrap();
+        let third_view = graph.reshape(third_weight, [1, 2, 32]).unwrap();
+        let first = graph.gather(first_view, index, 1).unwrap();
+        let second = graph.gather(second_view, other_index, 1).unwrap();
+        let third = graph.gather(third_view, index, 1).unwrap();
+        let schedule = crate::schedule_many(&graph, &[first, second, third]).unwrap();
+        let packed = |rows: usize| {
+            QuantizedTensorData::new(GgmlType::Q4_0, Shape::from([rows, 32]), vec![0; rows * 18])
+                .unwrap()
+        };
+        CapturedSchedule::capture_with_quantized_bindings(
+            &graph,
+            &schedule,
+            &[first, second, third],
+            &[
+                QuantizedCaptureBinding::RowGather {
+                    output: first,
+                    indices,
+                    weight: first_weight,
+                    value: packed(3),
+                },
+                QuantizedCaptureBinding::RowGather {
+                    output: second,
+                    indices: other_indices,
+                    weight: second_weight,
+                    value: packed(4),
+                },
+                QuantizedCaptureBinding::RowGather {
+                    output: third,
+                    indices,
+                    weight: third_weight,
+                    value: packed(2),
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn quantized_validators_are_attached_once_in_source_order() {
+        let mut capture = ordered_row_gather_capture();
+        let prepared = prepare_replay_input_validations(&capture).unwrap();
+        assert_eq!(prepared.inputs.len(), 2);
+        let shared = capture
+            .inputs
+            .iter()
+            .position(|input| input.name == "z_indices")
+            .unwrap();
+        let other = capture
+            .inputs
+            .iter()
+            .position(|input| input.name == "a_indices")
+            .unwrap();
+        assert_ne!(shared, other);
+        assert_eq!(prepared.inputs[shared].quantized_row_counts(), vec![3, 2]);
+        assert_eq!(prepared.inputs[other].quantized_row_counts(), vec![4]);
+        assert_eq!(
+            prepared.source_order.as_ref(),
+            &[(shared, 0), (other, 0), (shared, 1)]
+        );
+
+        let outside = crate::TensorData::from_storage([1, 2], Storage::I32(vec![0, 2])).unwrap();
+        assert!(prepared.inputs[shared].validate_one(0, &outside).is_ok());
+        assert!(matches!(
+            prepared.inputs[shared].validate_one(1, &outside),
+            Err(crate::ReplayError::Execute(message))
+                if message.contains("IndexOutOfBounds")
+        ));
+
+        capture.inputs.clear();
+        assert!(matches!(
+            prepare_replay_input_validations(&capture),
+            Err(crate::ReplayError::Corrupt(message))
+                if message == "quantized gather indices are not an input"
+        ));
     }
 }
 

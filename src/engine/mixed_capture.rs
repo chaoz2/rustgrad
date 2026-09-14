@@ -349,7 +349,7 @@ impl<'a> NativeReplayContext<'a> {
                             }
                             Ok(())
                         },
-                        |input_ordinal, input, workspace, borrowed| {
+                        |input_ordinal, input, _workspace| {
                             let binding =
                                 bank_layout.inputs.get(input_ordinal).ok_or_else(|| {
                                     ReplayError::Corrupt(
@@ -368,19 +368,18 @@ impl<'a> NativeReplayContext<'a> {
                                     .get(&input.name)
                                     .ok_or_else(|| ReplayError::Missing(input.name.clone()))?,
                             };
-                            super::captured_replay::validate_input_value(pure, input, value)?;
                             match binding.source {
-                                PreparedRecurrentInputSource::State { .. } => workspace
-                                    .borrow_recurrent_input_at(input_ordinal, value, borrowed)?,
-                                PreparedRecurrentInputSource::External => {
-                                    workspace.bind_external_input_at(
-                                        input_ordinal,
+                                PreparedRecurrentInputSource::State { .. } => Ok(
+                                    super::native_replay_workspace::ResolvedNativeReplayInput::Recurrent(
                                         value,
-                                        borrowed,
-                                    )?;
-                                }
+                                    ),
+                                ),
+                                PreparedRecurrentInputSource::External => Ok(
+                                    super::native_replay_workspace::ResolvedNativeReplayInput::External(
+                                        value,
+                                    ),
+                                ),
                             }
-                            Ok(())
                         },
                     );
                     let executor_wall_time = executor_started.elapsed();
@@ -3119,9 +3118,12 @@ mod recurrent_tests {
         assert_eq!(prepared.structure_validation_count(), 1);
         let prepared_workspace = prepared.workspace_stats();
         assert_eq!(prepared_workspace.binding_layout_build_count, 1);
+        assert_eq!(prepared_workspace.input_validation_layout_build_count, 1);
+        assert_eq!(prepared_workspace.sealed_input_validator_count, 0);
         assert!(prepared_workspace.sealed_pointer_count > 0);
         assert_eq!(prepared_workspace.last_borrowed_binding_count, 0);
         assert!(prepared_workspace.borrowed_binding_capacity > 0);
+        crate::engine::captured_replay::reset_whole_capture_input_validation_scan_count();
         let mut viewed = capture.clone();
         viewed.state_bindings[0].view = Some(crate::AffineView::identity(Shape::from([2])));
         assert!(matches!(
@@ -3173,6 +3175,10 @@ mod recurrent_tests {
         assert_eq!(runtime.recurrent_test_counts(), initial_runtime_counts);
         assert_eq!(frontier_values(&runtime, &cursor), initial_values);
         assert_eq!(prepared.structure_validation_count(), 1);
+        assert_eq!(
+            crate::engine::captured_replay::whole_capture_input_validation_scan_count(),
+            0
+        );
         assert_eq!(indexed_recurrent_bank_binding_count(), 1);
         let before = runtime.recurrent_test_counts();
         let replay_started = Instant::now();
@@ -3218,6 +3224,10 @@ mod recurrent_tests {
             "hot replay must not revalidate, rekey, or hash the sealed capture"
         );
         assert_eq!(prepared.structure_validation_count(), 1);
+        assert_eq!(
+            crate::engine::captured_replay::whole_capture_input_validation_scan_count(),
+            0
+        );
 
         let checkpoint = frontier_values(&runtime, &cursor);
         let failed_cursor = cursor.clone();
@@ -3301,6 +3311,11 @@ mod recurrent_tests {
             "only callbacks admitted by live runtime validation bind the sealed ordinal bank"
         );
         assert_eq!(prepared.structure_validation_count(), 1);
+        assert_eq!(
+            crate::engine::captured_replay::whole_capture_input_validation_scan_count(),
+            0,
+            "sealed success, failure, and retry must use only prepared input validators"
+        );
     }
 
     #[test]
