@@ -26,7 +26,10 @@ mod random;
 mod schedule_module;
 mod store_group;
 pub(crate) mod symbolic_runtime;
-pub(crate) use schedule_module::{NativeScheduleModuleBuildMode, schedule_module_cache_key};
+pub(crate) use schedule_module::{
+    NativeScheduleModuleBuildMode, schedule_module_cache_key,
+    schedule_module_translation_unit_evidence,
+};
 use schedule_module::{compile_cached_schedule_module_under_gate, schedule_module_entry_symbol};
 #[cfg(test)]
 use schedule_module::{
@@ -86,7 +89,7 @@ impl fmt::Display for JitError {
 }
 impl std::error::Error for JitError {}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct KernelAbi {
     pub version: u32,
     pub buffers: Vec<BufferAbi>,
@@ -94,24 +97,24 @@ pub struct KernelAbi {
     pub pointer_order: Vec<KernelPointerAbi>,
     pub symbol_count: usize,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BufferAbi {
     pub id: u64,
     pub dtype: DType,
     pub elements: usize,
     pub mutable: bool,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct QuantizedBufferAbi {
     pub id: u64,
     pub desc: crate::QuantizedBufferDesc,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum KernelPointerAbi {
     Dense(usize),
     Quantized(usize),
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct RenderedC {
     pub source: String,
     pub source_map: BTreeMap<usize, usize>,
@@ -128,7 +131,7 @@ pub(crate) enum NativeOutputInitialization {
     NeedsZero,
     FullyOverwritten,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct VectorPlan {
     pub lanes: usize,
     pub enabled: bool,
@@ -3018,14 +3021,14 @@ fn render_static_conv2d(plan: &crate::StaticConv2dPlan) -> Result<RenderedC, Jit
     })
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) enum NativeMatmulOperandLayout {
     #[default]
     Dense,
     Transpose2d,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) struct NativeMatmulLayouts {
     pub(crate) lhs: NativeMatmulOperandLayout,
     pub(crate) rhs: NativeMatmulOperandLayout,

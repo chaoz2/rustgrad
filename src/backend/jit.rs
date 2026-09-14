@@ -11,6 +11,7 @@ use crate::{
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
+    hash::{Hash, Hasher},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -88,6 +89,7 @@ struct PreparedNativeModuleEntry {
     dispatcher: Arc<JitScheduleDispatcher>,
 }
 
+#[derive(Hash)]
 struct RenderedScheduleEntry {
     logical_indices: Vec<usize>,
     native_layouts: Vec<NativeScheduleLayout>,
@@ -122,6 +124,105 @@ pub(crate) struct NativeScheduleModuleOverlap {
     pub(crate) additional_scattered_source_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NativeScheduleProgramPairOverlap {
+    pub(crate) source_program_index: usize,
+    pub(crate) target_program_index: usize,
+    pub(crate) contiguous_prefix_entry_count: usize,
+    pub(crate) contiguous_prefix_source_bytes: usize,
+    pub(crate) additional_scattered_entry_count: usize,
+    pub(crate) additional_scattered_source_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeScheduleTranslationUnit {
+    pub(crate) program_index: usize,
+    pub(crate) ordinal: usize,
+    pub(crate) identity: u64,
+    pub(crate) entry_count: usize,
+    pub(crate) rendered_source_bytes: usize,
+}
+
+struct NativeTranslationUnitHasher(u64);
+
+impl NativeTranslationUnitHasher {
+    fn new() -> Self {
+        let mut hasher = Self(0xcbf29ce484222325);
+        hasher.write(b"rustgrad-native-schedule-translation-unit-v1");
+        hasher
+    }
+}
+
+impl Hasher for NativeTranslationUnitHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i8(&mut self, value: i8) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i16(&mut self, value: i16) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_i128(&mut self, value: i128) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.write_i64(value as i64);
+    }
+}
+
+fn translation_unit_identity(
+    generated_source_identity: u64,
+    entries: &[RenderedScheduleEntry],
+) -> u64 {
+    let mut hasher = NativeTranslationUnitHasher::new();
+    generated_source_identity.hash(&mut hasher);
+    entries.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn rendered_source_bytes<'a>(
     entries: impl IntoIterator<Item = &'a RenderedScheduleEntry>,
 ) -> Result<usize, JitBackendError> {
@@ -134,44 +235,58 @@ fn rendered_source_bytes<'a>(
     })
 }
 
-fn exact_main_module_overlaps(
-    modules: &[RenderedScheduleModule],
-) -> Result<Vec<NativeScheduleModuleOverlap>, JitBackendError> {
-    let Some(main) = modules.first() else {
-        return Ok(Vec::new());
-    };
-    modules
+fn main_module_overlaps(
+    program_pair_overlaps: &[NativeScheduleProgramPairOverlap],
+) -> Vec<NativeScheduleModuleOverlap> {
+    program_pair_overlaps
         .iter()
-        .enumerate()
-        .skip(1)
-        .map(|(program_index, module)| {
-            let contiguous_prefix_entry_count = main
+        .filter(|overlap| overlap.source_program_index == 0)
+        .map(|overlap| NativeScheduleModuleOverlap {
+            program_index: overlap.target_program_index,
+            contiguous_prefix_entry_count: overlap.contiguous_prefix_entry_count,
+            contiguous_prefix_source_bytes: overlap.contiguous_prefix_source_bytes,
+            additional_scattered_entry_count: overlap.additional_scattered_entry_count,
+            additional_scattered_source_bytes: overlap.additional_scattered_source_bytes,
+        })
+        .collect()
+}
+
+fn exact_program_pair_overlaps(
+    modules: &[RenderedScheduleModule],
+) -> Result<Vec<NativeScheduleProgramPairOverlap>, JitBackendError> {
+    let mut overlaps = Vec::new();
+    for target_program_index in 1..modules.len() {
+        let target = &modules[target_program_index];
+        for (source_program_index, source) in modules[..target_program_index].iter().enumerate() {
+            let contiguous_prefix_entry_count = source
                 .entries
                 .iter()
-                .zip(&module.entries)
+                .zip(&target.entries)
                 .take_while(|(left, right)| exact_rendered_schedule_entry(left, right))
                 .count();
             // Deliberately reuse the full prefix-admission predicate for
             // scattered evidence. Source equality alone cannot authenticate
             // logical ownership, retained layouts, initialization, or ABI.
-            let prefix = &module.entries[..contiguous_prefix_entry_count];
-            let scattered = module.entries[contiguous_prefix_entry_count..]
+            let prefix = &target.entries[..contiguous_prefix_entry_count];
+            let scattered = target.entries[contiguous_prefix_entry_count..]
                 .iter()
                 .filter(|entry| {
-                    main.entries
+                    source
+                        .entries
                         .iter()
                         .any(|candidate| exact_rendered_schedule_entry(candidate, entry))
                 });
-            let additional_scattered_entry_count = scattered.clone().count();
-            Ok(NativeScheduleModuleOverlap {
-                program_index,
+            overlaps.push(NativeScheduleProgramPairOverlap {
+                source_program_index,
+                target_program_index,
                 contiguous_prefix_entry_count,
                 contiguous_prefix_source_bytes: rendered_source_bytes(prefix)?,
-                additional_scattered_entry_count,
+                additional_scattered_entry_count: scattered.clone().count(),
                 additional_scattered_source_bytes: rendered_source_bytes(scattered)?,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    Ok(overlaps)
 }
 
 fn exact_rendered_schedule_entry(
@@ -365,6 +480,8 @@ pub(crate) struct NativeScheduleCompilationBatch {
     pub(crate) max_parallel_compiler_process_count: usize,
     pub(crate) compiler_process_timings: Vec<NativeScheduleCompilerProcessTiming>,
     pub(crate) module_overlaps: Vec<NativeScheduleModuleOverlap>,
+    pub(crate) program_pair_overlaps: Vec<NativeScheduleProgramPairOverlap>,
+    pub(crate) translation_units: Vec<NativeScheduleTranslationUnit>,
 }
 
 const MAX_PARALLEL_NATIVE_RENDER_JOB_COUNT: usize = 2;
@@ -388,7 +505,7 @@ struct NativeScheduleRenderBatch {
     max_parallel_job_count: usize,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) struct NativeScheduleLayout {
     pub(crate) matmul: Option<crate::cpu_jit::NativeMatmulLayouts>,
     pub(crate) retained_matmul_sources: BTreeMap<u64, u64>,
@@ -1563,7 +1680,8 @@ impl CpuJitBackend {
             parallel_overlap_wall_time: parallel_render_overlap_wall_time,
             max_parallel_job_count: max_parallel_render_job_count,
         } = render_schedule_modules(self, &programs)?;
-        let module_overlaps = exact_main_module_overlaps(&rendered)?;
+        let program_pair_overlaps = exact_program_pair_overlaps(&rendered)?;
+        let module_overlaps = main_module_overlaps(&program_pair_overlaps);
         let mut prefix_reuses = Vec::with_capacity(rendered.len());
         for program in 0..rendered.len() {
             let standalone_sources = prefix_reuses
@@ -1580,6 +1698,47 @@ impl CpuJitBackend {
             .map(|(module, reuse)| {
                 native_schedule_wrapper_key(&module.entries[reuse.entry_count..])
             })
+            .collect::<Vec<_>>();
+        let translation_units = rendered
+            .iter()
+            .zip(&prefix_reuses)
+            .enumerate()
+            .map(|(program_index, (module, reuse))| {
+                let suffix = &module.entries[reuse.entry_count..];
+                let rendered_suffix = suffix
+                    .iter()
+                    .map(|entry| entry.rendered.clone())
+                    .collect::<Vec<_>>();
+                crate::cpu_jit::schedule_module_translation_unit_evidence(&rendered_suffix)
+                    .map_err(jit_error)
+                    .and_then(|units| {
+                        units
+                            .into_iter()
+                            .map(|unit| {
+                                let entries = suffix
+                                    .get(unit.entry_start..unit.entry_end)
+                                    .ok_or_else(|| {
+                                        JitBackendError::Binding(
+                                            "native translation-unit range is invalid".into(),
+                                        )
+                                    })?;
+                                Ok(NativeScheduleTranslationUnit {
+                                    program_index,
+                                    ordinal: unit.ordinal,
+                                    identity: translation_unit_identity(
+                                        unit.generated_source_identity,
+                                        entries,
+                                    ),
+                                    entry_count: unit.entry_count,
+                                    rendered_source_bytes: unit.rendered_source_bytes,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, JitBackendError>>()
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
         let cached = {
             let modules = self.schedule_modules.lock().map_err(|_| {
@@ -1724,6 +1883,8 @@ impl CpuJitBackend {
             max_parallel_compiler_process_count,
             compiler_process_timings,
             module_overlaps,
+            program_pair_overlaps,
+            translation_units,
         };
 
         // Resolve every worker result and authenticate every module ABI before
@@ -2523,7 +2684,7 @@ mod tests {
         ]);
         let expected_prefix_bytes = target.entries[0].rendered.source.len();
         let expected_scattered_bytes = target.entries[2].rendered.source.len();
-        let overlaps = exact_main_module_overlaps(&[main, target]).unwrap();
+        let overlaps = main_module_overlaps(&exact_program_pair_overlaps(&[main, target]).unwrap());
         assert_eq!(
             overlaps,
             vec![NativeScheduleModuleOverlap {
@@ -2537,15 +2698,58 @@ mod tests {
 
         let mut different_logical = rendered_entry("shared-later", vec![9]);
         different_logical.rendered = rendered_entry("shared-later", vec![2]).rendered;
-        let no_scattered = exact_main_module_overlaps(&[
-            rendered_module(vec![rendered_entry("shared-later", vec![2])]),
-            rendered_module(vec![
-                rendered_entry("different", vec![0]),
-                different_logical,
-            ]),
+        let no_scattered = main_module_overlaps(
+            &exact_program_pair_overlaps(&[
+                rendered_module(vec![rendered_entry("shared-later", vec![2])]),
+                rendered_module(vec![
+                    rendered_entry("different", vec![0]),
+                    different_logical,
+                ]),
+            ])
+            .unwrap(),
+        );
+        assert_eq!(no_scattered[0].additional_scattered_entry_count, 0);
+
+        let pairs = exact_program_pair_overlaps(&[
+            rendered_module(vec![rendered_entry("first", vec![0])]),
+            rendered_module(vec![rendered_entry("first", vec![0])]),
+            rendered_module(vec![rendered_entry("different", vec![1])]),
         ])
         .unwrap();
-        assert_eq!(no_scattered[0].additional_scattered_entry_count, 0);
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|pair| (pair.source_program_index, pair.target_program_index))
+                .collect::<Vec<_>>(),
+            [(0, 1), (0, 2), (1, 2)]
+        );
+        assert_eq!(pairs[0].contiguous_prefix_entry_count, 1);
+        assert_eq!(pairs[1].contiguous_prefix_entry_count, 0);
+        assert_eq!(pairs[2].contiguous_prefix_entry_count, 0);
+
+        let baseline = vec![rendered_entry("identity", vec![0])];
+        let baseline_identity = translation_unit_identity(17, &baseline);
+        let mut changed_layout = vec![rendered_entry("identity", vec![0])];
+        changed_layout[0].native_layouts[0].elided_output_source = Some(7);
+        assert_ne!(
+            translation_unit_identity(17, &changed_layout),
+            baseline_identity,
+            "translation-unit identity includes retained native layout"
+        );
+        let mut changed_initialization = vec![rendered_entry("identity", vec![0])];
+        changed_initialization[0].output_initialization =
+            crate::cpu_jit::NativeOutputInitialization::NeedsZero;
+        assert_ne!(
+            translation_unit_identity(17, &changed_initialization),
+            baseline_identity,
+            "translation-unit identity includes output initialization"
+        );
+        let changed_logical = vec![rendered_entry("identity", vec![1])];
+        assert_ne!(
+            translation_unit_identity(17, &changed_logical),
+            baseline_identity,
+            "translation-unit identity includes logical entry ownership"
+        );
     }
 
     #[test]
@@ -2616,6 +2820,19 @@ mod tests {
             compilation.module_overlaps[1].contiguous_prefix_entry_count,
             1
         );
+        assert_eq!(
+            compilation
+                .program_pair_overlaps
+                .iter()
+                .map(|overlap| (overlap.source_program_index, overlap.target_program_index))
+                .collect::<Vec<_>>(),
+            [(0, 1), (0, 2), (1, 2)]
+        );
+        assert_eq!(compilation.translation_units.len(), 2);
+        assert_eq!(compilation.translation_units[0].program_index, 0);
+        assert_eq!(compilation.translation_units[1].program_index, 1);
+        assert_eq!(compilation.translation_units[0].ordinal, 0);
+        assert_eq!(compilation.translation_units[1].ordinal, 0);
         let (prefix, prefix_work) = &programs[0];
         let (extended, extended_work) = &programs[1];
         let (fully_reused, fully_reused_work) = &programs[2];
@@ -2673,6 +2890,14 @@ mod tests {
         assert_eq!(
             warm_compilation.module_overlaps,
             compilation.module_overlaps
+        );
+        assert_eq!(
+            warm_compilation.program_pair_overlaps,
+            compilation.program_pair_overlaps
+        );
+        assert_eq!(
+            warm_compilation.translation_units,
+            compilation.translation_units
         );
         assert!(warm_compilation.max_parallel_render_job_count > 0);
         assert!(warm_compilation.max_parallel_render_job_count <= 2);

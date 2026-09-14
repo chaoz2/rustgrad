@@ -12,7 +12,10 @@ pub use step_phases::{
     NativeTrainingWarmStepReport,
 };
 
-use super::compiled_training::{NativeCpuCompilerProcessTiming, NativeCpuModuleOverlap};
+use super::compiled_training::{
+    NativeCpuCompilerProcessTiming, NativeCpuModuleOverlap, NativeCpuProgramPairOverlap,
+    NativeCpuTranslationUnitEvidence,
+};
 use super::{
     CompiledAdamWCheckpoint, NativeCpuCompiledAdamWPreparationReport,
     NativeCpuCompiledAdamWStepResult, NativeCpuDispatchSegmentation,
@@ -44,7 +47,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V16: u32 = 16;
 const NATIVE_TRAINING_REPORT_FORMAT_V17: u32 = 17;
 const NATIVE_TRAINING_REPORT_FORMAT_V18: u32 = 18;
 const NATIVE_TRAINING_REPORT_FORMAT_V19: u32 = 19;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 20;
+const NATIVE_TRAINING_REPORT_FORMAT_V20: u32 = 20;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 21;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 /// Compiler subprocess role in one cold native preparation batch.
@@ -258,6 +262,338 @@ fn validate_module_overlaps(
     Ok(())
 }
 
+/// Exact target-entry overlap for one ordered earlier-program/later-program
+/// pair. The evidence does not imply that either program reuses the other's
+/// compiled objects.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTrainingProgramPairOverlap {
+    source_program_index: u64,
+    source_native_identity: u64,
+    target_program_index: u64,
+    target_native_identity: u64,
+    evidence_identity: u64,
+    contiguous_prefix_entry_count: u64,
+    contiguous_prefix_source_bytes: u64,
+    additional_scattered_entry_count: u64,
+    additional_scattered_source_bytes: u64,
+}
+
+impl NativeTrainingProgramPairOverlap {
+    fn from_preparation(
+        overlap: &NativeCpuProgramPairOverlap,
+        programs: &[&NativeTrainingProgramReport],
+    ) -> Result<Self> {
+        let source = programs
+            .get(overlap.source_program_index())
+            .ok_or_else(|| invalid("native pair-overlap source program is absent"))?;
+        let target = programs
+            .get(overlap.target_program_index())
+            .ok_or_else(|| invalid("native pair-overlap target program is absent"))?;
+        Ok(Self {
+            source_program_index: count(
+                overlap.source_program_index(),
+                "native pair-overlap source program",
+            )?,
+            source_native_identity: source.native_identity(),
+            target_program_index: count(
+                overlap.target_program_index(),
+                "native pair-overlap target program",
+            )?,
+            target_native_identity: target.native_identity(),
+            evidence_identity: 0,
+            contiguous_prefix_entry_count: count(
+                overlap.contiguous_prefix_entry_count(),
+                "native pair-overlap prefix entry",
+            )?,
+            contiguous_prefix_source_bytes: count(
+                overlap.contiguous_prefix_source_bytes(),
+                "native pair-overlap prefix source byte",
+            )?,
+            additional_scattered_entry_count: count(
+                overlap.additional_scattered_entry_count(),
+                "native pair-overlap scattered entry",
+            )?,
+            additional_scattered_source_bytes: count(
+                overlap.additional_scattered_source_bytes(),
+                "native pair-overlap scattered source byte",
+            )?,
+        }
+        .with_evidence_identity())
+    }
+
+    fn with_evidence_identity(mut self) -> Self {
+        self.evidence_identity = self.expected_evidence_identity();
+        self
+    }
+
+    fn expected_evidence_identity(&self) -> u64 {
+        evidence_identity(
+            b"rustgrad-native-training-program-pair-overlap-v21",
+            &[
+                self.source_program_index,
+                self.source_native_identity,
+                self.target_program_index,
+                self.target_native_identity,
+                self.contiguous_prefix_entry_count,
+                self.contiguous_prefix_source_bytes,
+                self.additional_scattered_entry_count,
+                self.additional_scattered_source_bytes,
+            ],
+        )
+    }
+}
+
+/// One exact source unit in the immutable build plan for a program's unique
+/// suffix. Equal identities denote the same generated C and toolchain context;
+/// this report does not claim that the object was reused.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTrainingTranslationUnit {
+    program_index: u64,
+    native_identity: u64,
+    ordinal: u64,
+    translation_unit_identity: u64,
+    evidence_identity: u64,
+    entry_count: u64,
+    rendered_source_bytes: u64,
+}
+
+impl NativeTrainingTranslationUnit {
+    fn from_preparation(
+        unit: &NativeCpuTranslationUnitEvidence,
+        programs: &[&NativeTrainingProgramReport],
+    ) -> Result<Self> {
+        let program = programs
+            .get(unit.program_index())
+            .ok_or_else(|| invalid("native translation-unit program is absent"))?;
+        Ok(Self {
+            program_index: count(unit.program_index(), "native translation-unit program")?,
+            native_identity: program.native_identity(),
+            ordinal: count(unit.ordinal(), "native translation-unit ordinal")?,
+            translation_unit_identity: unit.identity(),
+            evidence_identity: 0,
+            entry_count: count(unit.entry_count(), "native translation-unit entry")?,
+            rendered_source_bytes: count(
+                unit.rendered_source_bytes(),
+                "native translation-unit rendered source byte",
+            )?,
+        }
+        .with_evidence_identity())
+    }
+
+    fn with_evidence_identity(mut self) -> Self {
+        self.evidence_identity = self.expected_evidence_identity();
+        self
+    }
+
+    fn expected_evidence_identity(&self) -> u64 {
+        evidence_identity(
+            b"rustgrad-native-training-translation-unit-v21",
+            &[
+                self.program_index,
+                self.native_identity,
+                self.ordinal,
+                self.translation_unit_identity,
+                self.entry_count,
+                self.rendered_source_bytes,
+            ],
+        )
+    }
+}
+
+fn evidence_identity(domain: &[u8], values: &[u64]) -> u64 {
+    let mut identity = 0xcbf29ce484222325u64;
+    for byte in domain {
+        identity = (identity ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+    }
+    for value in values {
+        for byte in value.to_le_bytes() {
+            identity = (identity ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    identity
+}
+
+fn validate_program_pair_overlaps(
+    overlaps: &[NativeTrainingProgramPairOverlap],
+    programs: &[&NativeTrainingProgramReport],
+    main_overlaps: &[NativeTrainingModuleOverlap],
+) -> Result<()> {
+    let expected_count = programs
+        .len()
+        .checked_mul(programs.len().saturating_sub(1))
+        .and_then(|count| count.checked_div(2))
+        .ok_or_else(|| invalid("native pair-overlap inventory overflows"))?;
+    if overlaps.len() != expected_count {
+        return Err(invalid("native pair-overlap inventory differs"));
+    }
+    let mut ordinal = 0usize;
+    for target_index in 1..programs.len() {
+        let target = programs[target_index];
+        let target_source_bytes = target
+            .rendered_source_bytes
+            .ok_or_else(|| invalid("native target rendered source bytes are absent"))?;
+        for (source_index, source) in programs[..target_index].iter().enumerate() {
+            let overlap = &overlaps[ordinal];
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or_else(|| invalid("native pair-overlap ordinal overflows"))?;
+            let source_source_bytes = source
+                .rendered_source_bytes
+                .ok_or_else(|| invalid("native source rendered source bytes are absent"))?;
+            let overlap_entries = overlap
+                .contiguous_prefix_entry_count
+                .checked_add(overlap.additional_scattered_entry_count)
+                .ok_or_else(|| invalid("native pair-overlap entry count overflows"))?;
+            let overlap_bytes = overlap
+                .contiguous_prefix_source_bytes
+                .checked_add(overlap.additional_scattered_source_bytes)
+                .ok_or_else(|| invalid("native pair-overlap source bytes overflow"))?;
+            if overlap.source_program_index
+                != count(source_index, "native pair-overlap source program")?
+                || overlap.source_native_identity != source.native_identity
+                || overlap.target_program_index
+                    != count(target_index, "native pair-overlap target program")?
+                || overlap.target_native_identity != target.native_identity
+                || overlap.evidence_identity != overlap.expected_evidence_identity()
+                || overlap.contiguous_prefix_entry_count > source.rendered_entry_count
+                || overlap.contiguous_prefix_entry_count > target.rendered_entry_count
+                || overlap.contiguous_prefix_source_bytes > source_source_bytes
+                || overlap.contiguous_prefix_source_bytes > target_source_bytes
+                || overlap.contiguous_prefix_source_bytes < overlap.contiguous_prefix_entry_count
+                || overlap_entries > target.rendered_entry_count
+                || overlap_bytes > target_source_bytes
+                || overlap.additional_scattered_source_bytes
+                    < overlap.additional_scattered_entry_count
+                || (overlap.contiguous_prefix_entry_count == 0)
+                    != (overlap.contiguous_prefix_source_bytes == 0)
+                || (overlap.additional_scattered_entry_count == 0)
+                    != (overlap.additional_scattered_source_bytes == 0)
+            {
+                return Err(invalid("native pair-overlap evidence differs"));
+            }
+            if target.shared_prefix_source_program_index == Some(overlap.source_program_index)
+                && (overlap.contiguous_prefix_entry_count != target.shared_prefix_entry_count()
+                    || Some(overlap.contiguous_prefix_source_bytes)
+                        != target.shared_prefix_source_bytes)
+            {
+                return Err(invalid("native pair-prefix overlap evidence differs"));
+            }
+            if source_index == 0 {
+                let main = &main_overlaps[target_index - 1];
+                if overlap.target_program_index != main.program_index
+                    || overlap.target_native_identity != main.native_identity
+                    || overlap.contiguous_prefix_entry_count != main.contiguous_prefix_entry_count
+                    || overlap.contiguous_prefix_source_bytes != main.contiguous_prefix_source_bytes
+                    || overlap.additional_scattered_entry_count
+                        != main.additional_scattered_entry_count
+                    || overlap.additional_scattered_source_bytes
+                        != main.additional_scattered_source_bytes
+                {
+                    return Err(invalid("native main overlap projections differ"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_translation_units(
+    units: &[NativeTrainingTranslationUnit],
+    programs: &[&NativeTrainingProgramReport],
+    compiler_processes: &[NativeTrainingCompilerProcessTiming],
+) -> Result<()> {
+    let mut unit_index = 0usize;
+    for (program_index, program) in programs.iter().enumerate() {
+        let program_index_wire = count(program_index, "native translation-unit program")?;
+        let unique_entries = program
+            .unique_rendered_entry_count
+            .ok_or_else(|| invalid("native unique rendered entry count is absent"))?;
+        let mode = crate::cpu_jit::NativeScheduleModuleBuildMode::for_unique_rendered_entry_count(
+            unique_entries,
+        );
+        let expected_units = mode.map_or(0, |mode| {
+            let (combined, objects, _) = mode.process_inventory();
+            combined + objects
+        });
+        let expected_units = usize::try_from(expected_units)
+            .map_err(|_| invalid("native translation-unit count overflows"))?;
+        let end = unit_index
+            .checked_add(expected_units)
+            .ok_or_else(|| invalid("native translation-unit inventory overflows"))?;
+        let program_units = units
+            .get(unit_index..end)
+            .ok_or_else(|| invalid("native translation-unit inventory differs"))?;
+        let mut entry_count = 0u64;
+        let mut source_bytes = 0u64;
+        for (ordinal, unit) in program_units.iter().enumerate() {
+            if unit.program_index != program_index_wire
+                || unit.native_identity != program.native_identity
+                || unit.ordinal != count(ordinal, "native translation-unit ordinal")?
+                || unit.evidence_identity != unit.expected_evidence_identity()
+                || unit.entry_count == 0
+                || unit.rendered_source_bytes < unit.entry_count
+            {
+                return Err(invalid("native translation-unit evidence differs"));
+            }
+            entry_count = entry_count
+                .checked_add(unit.entry_count)
+                .ok_or_else(|| invalid("native translation-unit entry count overflows"))?;
+            source_bytes = source_bytes
+                .checked_add(unit.rendered_source_bytes)
+                .ok_or_else(|| invalid("native translation-unit source bytes overflow"))?;
+        }
+        let unique_source_bytes = program
+            .rendered_source_bytes
+            .and_then(|rendered| {
+                program
+                    .shared_prefix_source_bytes
+                    .and_then(|shared| rendered.checked_sub(shared))
+            })
+            .ok_or_else(|| invalid("native unique rendered source bytes are invalid"))?;
+        if entry_count != unique_entries || source_bytes != unique_source_bytes {
+            return Err(invalid("native translation-unit partition differs"));
+        }
+        if program.durable_artifact_cache_miss_count != 0 {
+            let process_units = compiler_processes
+                .iter()
+                .filter(|timing| {
+                    timing.program_index == program_index_wire
+                        && !matches!(timing.process, NativeTrainingCompilerProcessKind::Link)
+                })
+                .collect::<Vec<_>>();
+            if process_units.len() != program_units.len()
+                || process_units
+                    .iter()
+                    .zip(program_units)
+                    .any(|(process, unit)| {
+                        process.rendered_source_bytes != Some(unit.rendered_source_bytes)
+                    })
+            {
+                return Err(invalid(
+                    "native translation-unit compiler process partition differs",
+                ));
+            }
+        }
+        unit_index = end;
+    }
+    if unit_index != units.len() {
+        return Err(invalid("native translation-unit inventory differs"));
+    }
+    for (index, unit) in units.iter().enumerate() {
+        for prior in &units[..index] {
+            if unit.translation_unit_identity == prior.translation_unit_identity
+                && (unit.entry_count != prior.entry_count
+                    || unit.rendered_source_bytes != prior.rendered_source_bytes)
+            {
+                return Err(invalid("native translation-unit identity payload differs"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Derived owner of the compiler subprocess that finishes last in the batch.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -351,7 +687,10 @@ fn validate_compiler_process_evidence(
         }
         match (format_version, timing.rendered_source_bytes) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V19, None) => {}
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(bytes)) => {
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V20 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(bytes),
+            ) => {
                 let expected_zero =
                     matches!(timing.process, NativeTrainingCompilerProcessKind::Link);
                 if (bytes == 0) != expected_zero {
@@ -419,7 +758,10 @@ fn validate_compiler_process_evidence(
         if actual != expected_kinds {
             return Err(invalid("native compiler process kind inventory differs"));
         }
-        if format_version == NATIVE_TRAINING_REPORT_FORMAT_VERSION {
+        if matches!(
+            format_version,
+            NATIVE_TRAINING_REPORT_FORMAT_V20 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
+        ) {
             let rendered = program
                 .rendered_source_bytes
                 .ok_or_else(|| invalid("native rendered source bytes are absent"))?;
@@ -608,6 +950,7 @@ impl NativeTrainingPreparationTiming {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(total),
                 Some(linker),
@@ -633,6 +976,7 @@ impl NativeTrainingPreparationTiming {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 _,
                 _,
@@ -1111,6 +1455,7 @@ impl NativeTrainingProgramReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self, format_version)?,
@@ -1462,6 +1807,10 @@ pub struct NativeTrainingReport {
     prepare_compiler_critical_tail: Option<NativeTrainingCompilerCriticalTail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepare_module_overlaps: Option<Vec<NativeTrainingModuleOverlap>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_program_pair_overlaps: Option<Vec<NativeTrainingProgramPairOverlap>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepare_translation_units: Option<Vec<NativeTrainingTranslationUnit>>,
     initial_replay_step: u64,
     successful_replay_count: u64,
     main: NativeTrainingProgramReport,
@@ -1702,6 +2051,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -1757,6 +2107,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 None,
                 None,
@@ -1788,6 +2139,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(program),
                 Some(traffic),
@@ -1848,6 +2200,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -1878,6 +2231,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
                     if traffic.materialized_egress_count() != 0
                         && traffic.materialized_egress_bytes() != 0 => {}
@@ -1891,6 +2245,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                     return Err(invalid("native CPU egress evidence is absent"));
                 }
@@ -1923,6 +2278,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
@@ -1967,13 +2323,43 @@ impl NativeTrainingReport {
         }
         match (self.format_version, &self.prepare_module_overlaps) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V19, None) => {}
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(overlaps)) => {
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V20 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(overlaps),
+            ) => {
                 validate_module_overlaps(overlaps, &prior_programs)?;
             }
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V19, Some(_)) => {
                 return Err(invalid("legacy native report has module overlap evidence"));
             }
             _ => return Err(invalid("native module overlap evidence is absent")),
+        }
+        match (
+            self.format_version,
+            &self.prepare_program_pair_overlaps,
+            &self.prepare_translation_units,
+        ) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V20, None, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(overlaps), Some(translation_units)) => {
+                validate_program_pair_overlaps(
+                    overlaps,
+                    &prior_programs,
+                    self.prepare_module_overlaps
+                        .as_deref()
+                        .ok_or_else(|| invalid("native main overlap evidence is absent"))?,
+                )?;
+                validate_translation_units(
+                    translation_units,
+                    &prior_programs,
+                    self.prepare_compiler_process_timings
+                        .as_deref()
+                        .ok_or_else(|| invalid("native compiler process evidence is absent"))?,
+                )?;
+            }
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V20, _, _) => {
+                return Err(invalid("legacy native report has v21 module evidence"));
+            }
+            _ => return Err(invalid("native v21 module evidence is absent")),
         }
         let parallel_evidence = match self.format_version {
             1..=NATIVE_TRAINING_REPORT_FORMAT_V7 => {
@@ -1999,6 +2385,7 @@ impl NativeTrainingReport {
             | NATIVE_TRAINING_REPORT_FORMAT_V17
             | NATIVE_TRAINING_REPORT_FORMAT_V18
             | NATIVE_TRAINING_REPORT_FORMAT_V19
+            | NATIVE_TRAINING_REPORT_FORMAT_V20
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
@@ -2062,7 +2449,9 @@ impl NativeTrainingReport {
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V18, None, None) => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V19 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timings),
                 claimed_tail,
             ) => {
@@ -2109,6 +2498,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overlap),
                 Some(max_parallel),
@@ -2162,6 +2552,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
@@ -2181,6 +2572,7 @@ impl NativeTrainingReport {
                         | NATIVE_TRAINING_REPORT_FORMAT_V17
                         | NATIVE_TRAINING_REPORT_FORMAT_V18
                         | NATIVE_TRAINING_REPORT_FORMAT_V19
+                        | NATIVE_TRAINING_REPORT_FORMAT_V20
                         | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                         Some(overlap),
                     ) => overlap
@@ -2280,6 +2672,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -2314,6 +2707,7 @@ impl NativeTrainingReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(native_dispatcher),
                 Some(executor_host),
@@ -2380,6 +2774,7 @@ impl NativeTrainingReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(phases),
             ) => phases.validate(
@@ -2405,6 +2800,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
+                | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 None,
             ) if self.accumulation.is_none() => {}
@@ -2472,6 +2868,8 @@ pub struct NativeTrainingScoreboard {
     prepare_compiler_process_timings: Vec<NativeTrainingCompilerProcessTiming>,
     prepare_compiler_critical_tail: Option<NativeTrainingCompilerCriticalTail>,
     prepare_module_overlaps: Vec<NativeTrainingModuleOverlap>,
+    prepare_program_pair_overlaps: Vec<NativeTrainingProgramPairOverlap>,
+    prepare_translation_units: Vec<NativeTrainingTranslationUnit>,
     inspection: CompiledAdamWInspection,
     main: NativeTrainingProgramReport,
     accumulation: Option<NativeTrainingProgramReport>,
@@ -2555,6 +2953,26 @@ impl NativeTrainingScoreboard {
             .map(|overlap| NativeTrainingModuleOverlap::from_preparation(overlap, &programs))
             .collect::<Result<Vec<_>>>()?;
         validate_module_overlaps(&prepare_module_overlaps, &programs)?;
+        let prepare_program_pair_overlaps = preparation
+            .program_pair_overlaps()
+            .iter()
+            .map(|overlap| NativeTrainingProgramPairOverlap::from_preparation(overlap, &programs))
+            .collect::<Result<Vec<_>>>()?;
+        let prepare_translation_units = preparation
+            .translation_units()
+            .iter()
+            .map(|unit| NativeTrainingTranslationUnit::from_preparation(unit, &programs))
+            .collect::<Result<Vec<_>>>()?;
+        validate_program_pair_overlaps(
+            &prepare_program_pair_overlaps,
+            &programs,
+            &prepare_module_overlaps,
+        )?;
+        validate_translation_units(
+            &prepare_translation_units,
+            &programs,
+            &prepare_compiler_process_timings,
+        )?;
         if inspection.recurrent_state_count != preparation.recurrent_state_count()
             || inspection.recurrent_state_bytes != preparation.recurrent_state_bytes()
         {
@@ -2607,6 +3025,8 @@ impl NativeTrainingScoreboard {
             prepare_compiler_process_timings,
             prepare_compiler_critical_tail,
             prepare_module_overlaps,
+            prepare_program_pair_overlaps,
+            prepare_translation_units,
             inspection,
             main,
             accumulation,
@@ -2902,6 +3322,8 @@ impl NativeTrainingScoreboard {
             prepare_compiler_process_timings: Some(self.prepare_compiler_process_timings.clone()),
             prepare_compiler_critical_tail: self.prepare_compiler_critical_tail.clone(),
             prepare_module_overlaps: Some(self.prepare_module_overlaps.clone()),
+            prepare_program_pair_overlaps: Some(self.prepare_program_pair_overlaps.clone()),
+            prepare_translation_units: Some(self.prepare_translation_units.clone()),
             initial_replay_step: self.inspection.initial_replay_step,
             successful_replay_count: self.replay_timings.len() as u64,
             main: self.main.clone(),
@@ -3229,6 +3651,8 @@ mod tests {
     fn remove_module_overlap_evidence(json: &mut serde_json::Value) {
         let report = json.as_object_mut().unwrap();
         report.remove("prepare_module_overlaps");
+        report.remove("prepare_program_pair_overlaps");
+        report.remove("prepare_translation_units");
         if let Some(timings) = report
             .get_mut("prepare_compiler_process_timings")
             .and_then(serde_json::Value::as_array_mut)
@@ -3255,6 +3679,12 @@ mod tests {
                 program.remove("shared_prefix_source_bytes");
             }
         }
+    }
+
+    fn remove_v21_module_evidence(json: &mut serde_json::Value) {
+        let report = json.as_object_mut().unwrap();
+        report.remove("prepare_program_pair_overlaps");
+        report.remove("prepare_translation_units");
     }
 
     fn remove_step_phases(json: &mut serde_json::Value) {
@@ -3368,6 +3798,8 @@ mod tests {
             prepare_compiler_process_timings: None,
             prepare_compiler_critical_tail: None,
             prepare_module_overlaps: None,
+            prepare_program_pair_overlaps: None,
+            prepare_translation_units: None,
             initial_replay_step: 0,
             successful_replay_count: 2,
             main: NativeTrainingProgramReport {
@@ -3589,6 +4021,42 @@ mod tests {
             }
             .with_evidence_identity(report.main.native_identity),
         ]);
+        report.prepare_program_pair_overlaps = Some(vec![
+            NativeTrainingProgramPairOverlap {
+                source_program_index: 0,
+                source_native_identity: report.main.native_identity,
+                target_program_index: 1,
+                target_native_identity: report.accumulation.as_ref().unwrap().native_identity,
+                evidence_identity: 0,
+                contiguous_prefix_entry_count: 1,
+                contiguous_prefix_source_bytes: 10,
+                additional_scattered_entry_count: 0,
+                additional_scattered_source_bytes: 0,
+            }
+            .with_evidence_identity(),
+        ]);
+        report.prepare_translation_units = Some(vec![
+            NativeTrainingTranslationUnit {
+                program_index: 0,
+                native_identity: report.main.native_identity,
+                ordinal: 0,
+                translation_unit_identity: 101,
+                evidence_identity: 0,
+                entry_count: 2,
+                rendered_source_bytes: 20,
+            }
+            .with_evidence_identity(),
+            NativeTrainingTranslationUnit {
+                program_index: 1,
+                native_identity: report.accumulation.as_ref().unwrap().native_identity,
+                ordinal: 0,
+                translation_unit_identity: 102,
+                evidence_identity: 0,
+                entry_count: 1,
+                rendered_source_bytes: 10,
+            }
+            .with_evidence_identity(),
+        ]);
         report
     }
 
@@ -3632,6 +4100,29 @@ mod tests {
                 },
             );
         }
+        let units = report.prepare_translation_units.as_mut().unwrap();
+        units.retain(|unit| unit.program_index != 0);
+        let unit_count = if count <= 512 { 1 } else { 2 };
+        let entries_per_unit = count / unit_count;
+        let entry_remainder = count % unit_count;
+        let bytes_per_unit = rendered_source_bytes / unit_count;
+        let byte_remainder = rendered_source_bytes % unit_count;
+        let mut main_units = (0..unit_count)
+            .map(|ordinal| {
+                NativeTrainingTranslationUnit {
+                    program_index: 0,
+                    native_identity: report.main.native_identity,
+                    ordinal,
+                    translation_unit_identity: 10_000 + ordinal,
+                    evidence_identity: 0,
+                    entry_count: entries_per_unit + u64::from(ordinal < entry_remainder),
+                    rendered_source_bytes: bytes_per_unit + u64::from(ordinal < byte_remainder),
+                }
+                .with_evidence_identity()
+            })
+            .collect::<Vec<_>>();
+        main_units.append(units);
+        *units = main_units;
     }
 
     #[test]
@@ -3669,6 +4160,22 @@ mod tests {
             }
             .with_evidence_identity(11)
         );
+        assert_eq!(
+            decoded.prepare_program_pair_overlaps.as_ref().unwrap()[0],
+            NativeTrainingProgramPairOverlap {
+                source_program_index: 0,
+                source_native_identity: 11,
+                target_program_index: 1,
+                target_native_identity: 12,
+                evidence_identity: 0,
+                contiguous_prefix_entry_count: 1,
+                contiguous_prefix_source_bytes: 10,
+                additional_scattered_entry_count: 0,
+                additional_scattered_source_bytes: 0,
+            }
+            .with_evidence_identity()
+        );
+        assert_eq!(decoded.prepare_translation_units.as_ref().unwrap().len(), 2);
         assert_eq!(
             decoded
                 .prepare_compiler_critical_tail
@@ -3714,6 +4221,24 @@ mod tests {
         );
 
         let mut json = serde_json::to_value(&report).unwrap();
+        json["prepare_program_pair_overlaps"][0]["additional_scattered_entry_count"] =
+            serde_json::json!(1);
+        json["prepare_program_pair_overlaps"][0]["additional_scattered_source_bytes"] =
+            serde_json::json!(1);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "the pair identity rejects an otherwise in-range count-and-byte tamper"
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["prepare_translation_units"][0]["entry_count"] = serde_json::json!(1);
+        json["prepare_translation_units"][0]["rendered_source_bytes"] = serde_json::json!(10);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "the translation-unit identity rejects a paired partition tamper"
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
         json["prepare_module_overlaps"][0]["additional_scattered_entry_count"] =
             serde_json::json!(2);
         assert!(
@@ -3736,6 +4261,15 @@ mod tests {
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
             "current overlap evidence must be complete"
         );
+
+        for field in ["prepare_program_pair_overlaps", "prepare_translation_units"] {
+            let mut json = serde_json::to_value(&report).unwrap();
+            json.as_object_mut().unwrap().remove(field);
+            assert!(
+                NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+                "current v21 module evidence must be complete: {field}"
+            );
+        }
 
         let mut json = serde_json::to_value(&report).unwrap();
         json["accumulation_schedule_cache_keys"] = serde_json::json!([23]);
@@ -3832,6 +4366,60 @@ mod tests {
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err()
         );
+    }
+
+    #[test]
+    fn program_pair_overlap_inventory_is_target_major_triangular() {
+        let report = phase_specialized_report();
+        let main = report.main.clone();
+        let accumulation = report.accumulation.clone().unwrap();
+        let mut later = accumulation.clone();
+        later.capture_identity = 9;
+        later.native_identity = 15;
+        later.execution_plan_identity = 16;
+        later.shared_prefix_source_native_identity = Some(main.native_identity);
+        let programs = vec![&main, &accumulation, &later];
+        let main_overlaps = vec![
+            NativeTrainingModuleOverlap {
+                program_index: 1,
+                native_identity: accumulation.native_identity,
+                evidence_identity: 0,
+                contiguous_prefix_entry_count: 1,
+                contiguous_prefix_source_bytes: 10,
+                additional_scattered_entry_count: 0,
+                additional_scattered_source_bytes: 0,
+            }
+            .with_evidence_identity(main.native_identity),
+            NativeTrainingModuleOverlap {
+                program_index: 2,
+                native_identity: later.native_identity,
+                evidence_identity: 0,
+                contiguous_prefix_entry_count: 1,
+                contiguous_prefix_source_bytes: 10,
+                additional_scattered_entry_count: 0,
+                additional_scattered_source_bytes: 0,
+            }
+            .with_evidence_identity(main.native_identity),
+        ];
+        let pair = |source: usize, target: usize| {
+            NativeTrainingProgramPairOverlap {
+                source_program_index: u64::try_from(source).unwrap(),
+                source_native_identity: programs[source].native_identity,
+                target_program_index: u64::try_from(target).unwrap(),
+                target_native_identity: programs[target].native_identity,
+                evidence_identity: 0,
+                contiguous_prefix_entry_count: 1,
+                contiguous_prefix_source_bytes: 10,
+                additional_scattered_entry_count: 0,
+                additional_scattered_source_bytes: 0,
+            }
+            .with_evidence_identity()
+        };
+        let overlaps = vec![pair(0, 1), pair(0, 2), pair(1, 2)];
+        assert!(validate_program_pair_overlaps(&overlaps, &programs, &main_overlaps).is_ok());
+        let mut reordered = overlaps.clone();
+        reordered.swap(1, 2);
+        assert!(validate_program_pair_overlaps(&reordered, &programs, &main_overlaps).is_err());
     }
 
     #[test]
@@ -4211,6 +4799,23 @@ mod tests {
     }
 
     #[test]
+    fn version_twenty_decodes_without_pair_and_translation_unit_evidence() {
+        let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V20);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "v20 cannot claim v21 pair or translation-unit evidence"
+        );
+        remove_v21_module_evidence(&mut json);
+        let decoded =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V20);
+        assert!(decoded.prepare_module_overlaps.is_some());
+        assert!(decoded.prepare_program_pair_overlaps.is_none());
+        assert!(decoded.prepare_translation_units.is_none());
+    }
+
+    #[test]
     fn current_report_attributes_an_auxiliary_post_main_compiler_tail() {
         let mut report = phase_specialized_report();
         report.prepare_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(3));
@@ -4262,7 +4867,7 @@ mod tests {
         report.prepare_compiler_process_timings = None;
         assert!(
             report.validate().is_err(),
-            "v20 preserves authenticated overlap with an empty warm-cache timing inventory"
+            "v21 preserves authenticated overlap with an empty warm-cache timing inventory"
         );
     }
 
@@ -4533,6 +5138,15 @@ mod tests {
         let overlap = &mut equal_identity.prepare_module_overlaps.as_mut().unwrap()[0];
         overlap.native_identity = main_native_identity;
         overlap.evidence_identity = overlap.expected_evidence_identity(main_native_identity);
+        let overlap = &mut equal_identity
+            .prepare_program_pair_overlaps
+            .as_mut()
+            .unwrap()[0];
+        overlap.target_native_identity = main_native_identity;
+        overlap.evidence_identity = overlap.expected_evidence_identity();
+        let unit = &mut equal_identity.prepare_translation_units.as_mut().unwrap()[1];
+        unit.native_identity = main_native_identity;
+        unit.evidence_identity = unit.expected_evidence_identity();
         assert!(
             equal_identity.validate().is_ok(),
             "the earlier program index disambiguates equal native identities"
@@ -4565,6 +5179,15 @@ mod tests {
         overlap.contiguous_prefix_entry_count = 2;
         overlap.contiguous_prefix_source_bytes = 20;
         overlap.evidence_identity = overlap.expected_evidence_identity(main_native_identity);
+        let overlap = &mut full_prefix.prepare_program_pair_overlaps.as_mut().unwrap()[0];
+        overlap.contiguous_prefix_entry_count = 2;
+        overlap.contiguous_prefix_source_bytes = 20;
+        overlap.evidence_identity = overlap.expected_evidence_identity();
+        full_prefix
+            .prepare_translation_units
+            .as_mut()
+            .unwrap()
+            .retain(|unit| unit.program_index == 0);
         assert!(
             full_prefix.validate().is_ok(),
             "a full exact prefix has no suffix compilation or module load"
