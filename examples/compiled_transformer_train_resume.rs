@@ -1883,6 +1883,12 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         EXPECTED_MAIN_RENDERED_ENTRIES
     );
     assert_eq!(main_preparation.work().shared_prefix_entry_count(), 0);
+    assert!(main_preparation.work().rendered_source_bytes() > 0);
+    assert_eq!(main_preparation.work().shared_prefix_source_bytes(), 0);
+    assert_eq!(
+        main_preparation.work().unique_rendered_source_bytes(),
+        main_preparation.work().rendered_source_bytes()
+    );
     assert!(main_preparation.work().compiler_invocation_count() <= 3);
     if main_preparation.work().compiler_invocation_count() != 0 {
         assert_eq!(main_preparation.work().combined_compile_link_count(), 0);
@@ -1917,6 +1923,14 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(
         accumulation_preparation.work().shared_prefix_entry_count(),
         EXPECTED_SHARED_ACCUMULATION_PREFIX
+    );
+    assert!(accumulation_preparation.work().shared_prefix_source_bytes() > 0);
+    assert_eq!(
+        accumulation_preparation.work().shared_prefix_source_bytes()
+            + accumulation_preparation
+                .work()
+                .unique_rendered_source_bytes(),
+        accumulation_preparation.work().rendered_source_bytes()
     );
     assert_eq!(
         accumulation_preparation.cache_hit_count(),
@@ -2589,6 +2603,53 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             .expect("current scoreboard reports bounded compiler process timings")
             .len(),
         usize::try_from(compiler_process_count)?
+    );
+    for timing in report_json["prepare_compiler_process_timings"]
+        .as_array()
+        .expect("current scoreboard reports bounded compiler process timings")
+    {
+        let source_bytes = timing["rendered_source_bytes"]
+            .as_u64()
+            .expect("current scoreboard reports translation-unit source bytes");
+        assert!((source_bytes == 0) == (timing["process"]["kind"] == "link"));
+    }
+    let overlaps = report_json["prepare_module_overlaps"]
+        .as_array()
+        .expect("current scoreboard reports ordered main-program overlaps");
+    assert!(
+        report_json["main"]["rendered_source_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert_eq!(report_json["main"]["shared_prefix_source_bytes"], 0);
+    assert_eq!(overlaps.len(), 3);
+    for (index, overlap) in overlaps.iter().enumerate() {
+        assert_eq!(
+            overlap["program_index"],
+            u64::try_from(
+                index
+                    .checked_add(1)
+                    .expect("program ordinal remains bounded")
+            )?
+        );
+        for field in [
+            "evidence_identity",
+            "contiguous_prefix_entry_count",
+            "contiguous_prefix_source_bytes",
+            "additional_scattered_entry_count",
+            "additional_scattered_source_bytes",
+        ] {
+            assert!(overlap[field].is_u64());
+        }
+    }
+    assert_eq!(
+        overlaps[0]["contiguous_prefix_entry_count"],
+        u64::try_from(EXPECTED_SHARED_ACCUMULATION_PREFIX)?
+    );
+    assert!(
+        overlaps[0]["contiguous_prefix_source_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0)
     );
     assert_eq!(
         report_json["prepare_compiler_critical_tail"].is_object(),

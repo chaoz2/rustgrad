@@ -1243,6 +1243,10 @@ pub(crate) enum NativeCompilerProcessKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NativeCompilerProcessObservation {
     pub(crate) kind: NativeCompilerProcessKind,
+    /// Sum of the authenticated rendered kernel sources assigned to this
+    /// translation unit. Link processes consume objects and therefore carry
+    /// zero rendered-source bytes.
+    pub(crate) rendered_source_bytes: usize,
     pub(crate) permit_requested: Instant,
     pub(crate) process_started: Instant,
     pub(crate) process_finished: Instant,
@@ -5404,6 +5408,7 @@ impl Drop for CompilerProcessPermit {
 fn run_compiler(
     command: &mut Command,
     kind: NativeCompilerProcessKind,
+    rendered_source_bytes: usize,
 ) -> std::io::Result<(std::process::Output, NativeCompilerProcessObservation)> {
     let permit_requested = Instant::now();
     let _permit = CompilerProcessPermit::acquire()?;
@@ -5413,6 +5418,7 @@ fn run_compiler(
             output,
             NativeCompilerProcessObservation {
                 kind,
+                rendered_source_bytes,
                 permit_requested,
                 process_started,
                 process_finished: Instant::now(),
@@ -5466,6 +5472,7 @@ fn compile_cached_under_gate(r: &RenderedC) -> Result<PathBuf, JitError> {
                 .arg(&temp)
                 .arg(&source),
             NativeCompilerProcessKind::Combined,
+            r.source.len(),
         )
         .map_err(|e| JitError::Compiler {
             status: None,

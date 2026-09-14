@@ -156,6 +156,10 @@ impl ScheduleModuleBuildEvidence {
             .iter()
             .filter(|observation| observation.kind == NativeCompilerProcessKind::Link)
             .collect::<Vec<_>>();
+        let rendered_source_bytes_are_valid = observations.iter().all(|observation| {
+            (observation.rendered_source_bytes == 0)
+                == matches!(observation.kind, NativeCompilerProcessKind::Link)
+        });
         let process_inventory = (
             u64::try_from(combined_compile_link_count)
                 .map_err(|_| JitError::Io("combined compiler count overflowed".into()))?,
@@ -164,7 +168,7 @@ impl ScheduleModuleBuildEvidence {
             u64::try_from(linker.len())
                 .map_err(|_| JitError::Io("linker count overflowed".into()))?,
         );
-        if mode.process_inventory() != process_inventory {
+        if mode.process_inventory() != process_inventory || !rendered_source_bytes_are_valid {
             return Err(JitError::Io(
                 "native schedule module compiler evidence differs".into(),
             ));
@@ -351,6 +355,7 @@ fn compile_translation_unit(
     ordinal: usize,
     source: &Path,
     object: &Path,
+    rendered_source_bytes: usize,
 ) -> Result<NativeCompilerProcessObservation, JitError> {
     run_checked_compiler(
         Command::new(C11_COMPILER_COMMAND)
@@ -359,12 +364,14 @@ fn compile_translation_unit(
             .arg(object)
             .arg(source),
         NativeCompilerProcessKind::Object(ordinal),
+        rendered_source_bytes,
     )
 }
 
 fn compile_combined_module(
     source: &Path,
     temporary: &Path,
+    rendered_source_bytes: usize,
 ) -> Result<NativeCompilerProcessObservation, JitError> {
     run_checked_compiler(
         Command::new(C11_COMPILER_COMMAND)
@@ -373,15 +380,17 @@ fn compile_combined_module(
             .arg(temporary)
             .arg(source),
         NativeCompilerProcessKind::Combined,
+        rendered_source_bytes,
     )
 }
 
 fn run_checked_compiler(
     command: &mut Command,
     kind: NativeCompilerProcessKind,
+    rendered_source_bytes: usize,
 ) -> Result<NativeCompilerProcessObservation, JitError> {
     let (output, observation) =
-        run_compiler(command, kind).map_err(|error| JitError::Compiler {
+        run_compiler(command, kind, rendered_source_bytes).map_err(|error| JitError::Compiler {
             status: None,
             stderr: error.to_string(),
         })?;
@@ -400,8 +409,12 @@ fn run_checked_compiler(
 fn compile_translation_units(
     sources: &[PathBuf],
     objects: &[PathBuf],
+    rendered_source_bytes: &[usize],
 ) -> Result<Vec<NativeCompilerProcessObservation>, JitError> {
-    if sources.len() != objects.len() || sources.is_empty() {
+    if sources.len() != objects.len()
+        || sources.len() != rendered_source_bytes.len()
+        || sources.is_empty()
+    {
         return Err(JitError::Io(
             "native schedule translation-unit inventory differs".into(),
         ));
@@ -410,11 +423,16 @@ fn compile_translation_units(
     thread::scope(|scope| {
         let mut handles = Vec::with_capacity(sources.len());
         let mut spawn_failure = None;
-        for (ordinal, (source, object)) in sources.iter().zip(objects).enumerate() {
+        for (ordinal, ((source, object), rendered_source_bytes)) in sources
+            .iter()
+            .zip(objects)
+            .zip(rendered_source_bytes)
+            .enumerate()
+        {
             match thread::Builder::new()
                 .name(format!("rustgrad-native-chunk-{ordinal}"))
                 .spawn_scoped(scope, move || {
-                    compile_translation_unit(ordinal, source, object)
+                    compile_translation_unit(ordinal, source, object, *rendered_source_bytes)
                 }) {
                 Ok(handle) => handles.push((ordinal, handle)),
                 Err(error) => {
@@ -476,6 +494,7 @@ fn link_schedule_module(
             .arg(temporary)
             .args(objects),
         NativeCompilerProcessKind::Link,
+        0,
     )
 }
 
@@ -556,10 +575,28 @@ pub(super) fn compile_cached_schedule_module_under_gate(
         )
         .map_err(|error| JitError::Io(error.to_string()))?;
     }
+    let rendered_source_bytes = plan
+        .chunks
+        .iter()
+        .map(|chunk| {
+            rendered[chunk.entries.clone()]
+                .iter()
+                .try_fold(0usize, |total, entry| {
+                    total.checked_add(entry.source.len()).ok_or_else(|| {
+                        JitError::Io("native rendered source byte count overflowed".into())
+                    })
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let observations = if plan.chunks.len() == 1 {
-        vec![compile_combined_module(&sources[0], &temporary)?]
+        vec![compile_combined_module(
+            &sources[0],
+            &temporary,
+            rendered_source_bytes[0],
+        )?]
     } else {
-        let mut observations = compile_translation_units(&sources, &objects)?;
+        let mut observations =
+            compile_translation_units(&sources, &objects, &rendered_source_bytes)?;
         observations.push(link_schedule_module(&objects, &temporary)?);
         observations
     };
@@ -624,6 +661,7 @@ mod tests {
     ) -> NativeCompilerProcessObservation {
         NativeCompilerProcessObservation {
             kind,
+            rendered_source_bytes: usize::from(!matches!(kind, NativeCompilerProcessKind::Link)),
             permit_requested: start,
             process_started: start,
             process_finished: start + Duration::from_nanos(nanos),
@@ -721,6 +759,15 @@ mod tests {
         assert!(
             ScheduleModuleBuildEvidence::new(NativeScheduleModuleBuildMode::Chunked, &observations)
                 .is_err()
+        );
+        let mut missing_source_bytes = observations;
+        missing_source_bytes[0].rendered_source_bytes = 0;
+        assert!(
+            ScheduleModuleBuildEvidence::new(
+                NativeScheduleModuleBuildMode::Combined,
+                &missing_source_bytes,
+            )
+            .is_err()
         );
     }
 
