@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:72d13d5c69a5ffd1",
+  "source_fingerprint": "fnv1a64:f0e1aec4c2ccb0ca",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -459,7 +459,7 @@
       "subject": "Compiled persistent-state training runtime",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CompiledAdamWPlan` compiles fixed-shape forward, objective, one reverse traversal, and AdamW recurrent state once for graph-free CPU, strict-native CPU, or the bounded strict-Metal target. Replay atomically preserves accumulation, partial flush, `zero_grad`, clipping and loss scaling, schedules and dropout, freezing and ties, evaluation and publication, and portable checkpoint semantics. A bounded `CompiledAdamWProgramArtifact`, paired with unchanged complete-module checkpoint bytes, restores the resource-free CPU plan without graph, autograd, schedule, or capture reconstruction; the maintained two-block Transformer covers exact in-process and different-initialization file continuation with decreasing loss, while artifact-restored Metal remains fail-closed. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership, artifacts, evidence, versioning, and backend limits; dynamic shapes, mixed-precision state, distributed or asynchronous training, broad optimizer construction, and unverified live-Metal performance remain outside this capability."
+        "Acceptance requirement": "`CompiledAdamWPlan` compiles fixed-shape forward, objective, one reverse traversal, and AdamW recurrent state once for graph-free CPU, strict-native CPU, or the bounded strict-Metal target. Replay atomically preserves accumulation, partial flush, `zero_grad`, clipping and loss scaling, schedules and dropout, freezing and ties, evaluation and publication, and portable checkpoint semantics. Prepared interpreter and strict-native CPU sessions may atomically restore an older authenticated checkpoint in place; strict-native restore retains prepared programs and lifetime evidence without claiming physical state-slot identity. A bounded `CompiledAdamWProgramArtifact`, paired with unchanged complete-module checkpoint bytes, restores the resource-free CPU plan without graph, autograd, schedule, or capture reconstruction; the maintained two-block Transformer covers exact in-process and different-initialization file continuation with decreasing loss. Artifact-restored Metal remains fail-closed, and Metal has no in-place restore implementation. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership, artifacts, evidence, versioning, and backend limits; dynamic shapes, mixed-precision state, distributed or asynchronous training, broad optimizer construction, and unverified live-Metal performance remain outside this capability."
       }
     },
     {

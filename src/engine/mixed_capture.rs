@@ -802,6 +802,10 @@ impl PreparedRecurrentReplacementPlan {
     }
 
     fn from_capture(capture: &CapturedMixedSchedule) -> Result<Self, ReplayError> {
+        // Prepared replacement metadata authenticates the capture's immutable
+        // version-zero descriptor floor, never the cursor used at preparation.
+        // The same sealed replay can therefore accept any matching resumed
+        // frontier whose versions remain at or above this canonical floor.
         let frontier = recurrent_initial_frontier(capture)?;
         let frontier_by_buffer = frontier
             .iter()
