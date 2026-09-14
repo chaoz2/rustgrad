@@ -33,6 +33,18 @@ struct WorkspaceSlot {
     source: Option<SlotSource>,
 }
 
+#[derive(Clone, Copy)]
+struct WorkspaceOwner {
+    slot: usize,
+    binding: Option<crate::cpu_jit::NativeReplayBindingOrdinal>,
+}
+
+struct WorkspaceInput {
+    name: String,
+    slot: usize,
+    borrowed: Box<[(usize, crate::cpu_jit::NativeReplayBindingOrdinal)]>,
+}
+
 struct WorkspaceItem {
     slots: Vec<usize>,
     output: usize,
@@ -154,8 +166,10 @@ pub(super) struct NativeReplayWorkspace {
     dispatch_tape: Arc<[WorkspaceDispatchStep]>,
     dispatch_segmentation: NativeDispatchSegmentation,
     dispatch_scratch: crate::cpu_jit::JitScheduleDispatchScratch,
-    owners: BTreeMap<u64, usize>,
-    inputs: Vec<(String, usize)>,
+    owners: BTreeMap<u64, WorkspaceOwner>,
+    inputs: Vec<WorkspaceInput>,
+    binding_ordinals: Arc<[Option<crate::cpu_jit::NativeReplayBindingOrdinal>]>,
+    binding_count: usize,
     immutable: BTreeSet<usize>,
     egress: Vec<(u64, usize, crate::Shape)>,
     valid: Vec<bool>,
@@ -181,17 +195,27 @@ pub(super) struct NativeReplayWorkspace {
     #[cfg(test)]
     dispatch_metadata_build_count: usize,
     #[cfg(test)]
+    binding_layout_build_count: usize,
+    #[cfg(test)]
+    last_borrowed_binding_count: usize,
+    #[cfg(test)]
     injected_dispatch_failure: Option<usize>,
 }
 
 pub(super) struct NativeReplayBindings<'a> {
-    slots: BTreeMap<usize, crate::cpu_jit::BorrowedJitBuffer<'a>>,
+    slots: crate::cpu_jit::IndexedBorrowedJitBuffers<'a>,
 }
 
 impl<'a> NativeReplayBindings<'a> {
-    pub(super) fn new() -> Self {
+    fn new(
+        slot_ordinals: Arc<[Option<crate::cpu_jit::NativeReplayBindingOrdinal>]>,
+        binding_count: usize,
+    ) -> Self {
         Self {
-            slots: BTreeMap::new(),
+            slots: crate::cpu_jit::IndexedBorrowedJitBuffers::with_layout(
+                slot_ordinals,
+                binding_count,
+            ),
         }
     }
 }
@@ -214,6 +238,12 @@ pub(crate) struct NativeReplayWorkspaceStats {
     pub(crate) sealed_prerequisite_slot_count: usize,
     pub(crate) sealed_derived_materialization_count: usize,
     pub(crate) dispatch_metadata_build_count: usize,
+    pub(crate) binding_layout_build_count: usize,
+    pub(crate) sealed_pointer_count: usize,
+    pub(crate) sealed_dense_pointer_count: usize,
+    pub(crate) sealed_quantized_pointer_count: usize,
+    pub(crate) last_borrowed_binding_count: usize,
+    pub(crate) borrowed_binding_capacity: usize,
     pub(crate) last_materialized_egress_count: u64,
     pub(crate) last_materialized_egress_bytes: u64,
     pub(crate) dispatch_scratch_capacity_growth_count: usize,
@@ -221,6 +251,10 @@ pub(crate) struct NativeReplayWorkspaceStats {
 }
 
 impl NativeReplayWorkspace {
+    pub(super) fn new_bindings<'a>(&self) -> NativeReplayBindings<'a> {
+        NativeReplayBindings::new(Arc::clone(&self.binding_ordinals), self.binding_count)
+    }
+
     pub(super) fn new(
         capture: &CapturedSchedule,
         items: &[PreparedNativeDispatch],
@@ -234,6 +268,8 @@ impl NativeReplayWorkspace {
             dispatch_scratch: crate::cpu_jit::JitScheduleDispatchScratch::with_capacity(0, 0, 0, 0),
             owners: BTreeMap::new(),
             inputs: Vec::with_capacity(capture.inputs.len()),
+            binding_ordinals: Arc::from([]),
+            binding_count: 0,
             immutable: BTreeSet::new(),
             egress: Vec::new(),
             valid: Vec::new(),
@@ -259,6 +295,10 @@ impl NativeReplayWorkspace {
             #[cfg(test)]
             dispatch_metadata_build_count: 0,
             #[cfg(test)]
+            binding_layout_build_count: 0,
+            #[cfg(test)]
+            last_borrowed_binding_count: 0,
+            #[cfg(test)]
             injected_dispatch_failure: None,
         };
 
@@ -270,7 +310,11 @@ impl NativeReplayWorkspace {
                 .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
             let slot =
                 workspace.add_canonical(input.desc.id, input.desc.clone(), elements, false)?;
-            workspace.inputs.push((input.name.clone(), slot));
+            workspace.inputs.push(WorkspaceInput {
+                name: input.name.clone(),
+                slot,
+                borrowed: Box::new([]),
+            });
         }
         for (buffer, value) in &capture.constants {
             let elements = value.len();
@@ -350,11 +394,12 @@ impl NativeReplayWorkspace {
                 "prepared native logical item is absent".into(),
             ));
         }
+        workspace.seal_binding_layout(&capture.requested)?;
         workspace.seal_dispatch_tape()?;
 
         workspace.valid.resize(workspace.buffers.len(), false);
         let immutable = workspace.immutable.iter().copied().collect::<Vec<_>>();
-        let borrowed = NativeReplayBindings::new();
+        let borrowed = workspace.new_bindings();
         for slot in immutable {
             if workspace.slots[slot].source.is_none() {
                 workspace.valid[slot] = true;
@@ -415,9 +460,14 @@ impl NativeReplayWorkspace {
             .numel()
             .map_err(|error| ReplayError::Descriptor(error.to_string()))?;
         if let Some(source_buffer) = prepared.elided_output_source(item).map_err(backend_error)? {
-            let source = self.owners.get(&source_buffer).copied().ok_or_else(|| {
-                ReplayError::Corrupt("elided native transpose source is absent".into())
-            })?;
+            let source = self
+                .owners
+                .get(&source_buffer)
+                .copied()
+                .ok_or_else(|| {
+                    ReplayError::Corrupt("elided native transpose source is absent".into())
+                })?
+                .slot;
             let source_key = &self.slots[source].key;
             if source_key.elements != output_elements || source_key.descriptor.dtype != output.dtype
             {
@@ -425,7 +475,17 @@ impl NativeReplayWorkspace {
                     "elided native transpose descriptor mismatch".into(),
                 ));
             }
-            if self.owners.insert(output.id, source).is_some() {
+            if self
+                .owners
+                .insert(
+                    output.id,
+                    WorkspaceOwner {
+                        slot: source,
+                        binding: None,
+                    },
+                )
+                .is_some()
+            {
                 return Err(ReplayError::Corrupt(
                     "elided native transpose output has multiple owners".into(),
                 ));
@@ -510,9 +570,14 @@ impl NativeReplayWorkspace {
         let mut slots = Vec::with_capacity(group.abi().buffers.len());
         for abi in &group.abi().buffers {
             if abi.mutable {
-                let slot = self.owners.get(&abi.id).copied().ok_or_else(|| {
-                    ReplayError::Corrupt("native store group output owner is absent".into())
-                })?;
+                let slot = self
+                    .owners
+                    .get(&abi.id)
+                    .copied()
+                    .ok_or_else(|| {
+                        ReplayError::Corrupt("native store group output owner is absent".into())
+                    })?
+                    .slot;
                 if !group
                     .members
                     .iter()
@@ -611,11 +676,16 @@ impl NativeReplayWorkspace {
                 ReplayError::Corrupt(format!("native workspace input {} has no binding", abi.id))
             })?;
         if let Some(source_buffer) = retained_source {
-            let source = self.owners.get(&source_buffer).copied().ok_or_else(|| {
-                ReplayError::Corrupt(format!(
-                    "retained native matmul source {source_buffer} is absent"
-                ))
-            })?;
+            let source = self
+                .owners
+                .get(&source_buffer)
+                .copied()
+                .ok_or_else(|| {
+                    ReplayError::Corrupt(format!(
+                        "retained native matmul source {source_buffer} is absent"
+                    ))
+                })?
+                .slot;
             let source_key = &self.slots[source].key;
             if abi.dtype != binding.desc.dtype
                 || abi.elements != source_key.elements
@@ -725,7 +795,13 @@ impl NativeReplayWorkspace {
             mutable,
             None,
         );
-        self.owners.insert(buffer, slot);
+        self.owners.insert(
+            buffer,
+            WorkspaceOwner {
+                slot,
+                binding: None,
+            },
+        );
         Ok(slot)
     }
 
@@ -757,10 +833,12 @@ impl NativeReplayWorkspace {
             if alias_outputs.contains(&buffer) && !self.owners.contains_key(&buffer) {
                 continue;
             }
-            let slot =
-                self.owners.get(&buffer).copied().ok_or_else(|| {
-                    ReplayError::Missing(format!("native workspace egress {buffer}"))
-                })?;
+            let slot = self
+                .owners
+                .get(&buffer)
+                .copied()
+                .ok_or_else(|| ReplayError::Missing(format!("native workspace egress {buffer}")))?
+                .slot;
             let shape = self.slots[slot].key.descriptor.shape.clone();
             self.egress.push((buffer, slot, shape));
         }
@@ -773,8 +851,12 @@ impl NativeReplayWorkspace {
         bindings: &mut NativeReplayBindings<'a>,
     ) -> Result<(), ReplayError> {
         self.begin_resolved();
-        for (name, value) in provided {
-            self.bind_external_input(name, value, bindings)?;
+        for ordinal in 0..self.inputs.len() {
+            let name = self.inputs[ordinal].name.clone();
+            let value = provided
+                .get(&name)
+                .ok_or_else(|| ReplayError::Missing(name.clone()))?;
+            self.bind_external_input_at(ordinal, value, bindings)?;
         }
         self.finish_inputs()
     }
@@ -785,18 +867,113 @@ impl NativeReplayWorkspace {
         for slot in &self.immutable {
             self.valid[*slot] = true;
         }
+        #[cfg(test)]
+        {
+            self.last_borrowed_binding_count = 0;
+        }
     }
 
-    pub(super) fn import_input(
+    fn seal_binding_layout(&mut self, requested: &[u64]) -> Result<(), ReplayError> {
+        fn assign_binding(
+            ordinals: &mut [Option<crate::cpu_jit::NativeReplayBindingOrdinal>],
+            binding_count: &mut usize,
+            slot: usize,
+        ) -> Result<crate::cpu_jit::NativeReplayBindingOrdinal, ReplayError> {
+            let binding = ordinals.get_mut(slot).ok_or_else(|| {
+                ReplayError::Corrupt("native workspace borrowed slot is out of range".into())
+            })?;
+            if let Some(binding) = binding {
+                return Ok(*binding);
+            }
+            let ordinal = crate::cpu_jit::NativeReplayBindingOrdinal::new(*binding_count);
+            *binding_count = binding_count.checked_add(1).ok_or_else(|| {
+                ReplayError::Descriptor("native borrowed binding count overflows".into())
+            })?;
+            *binding = Some(ordinal);
+            Ok(ordinal)
+        }
+
+        let mut layouts = Vec::with_capacity(self.inputs.len());
+        let mut input_claimed = BTreeSet::new();
+        let mut ordinals = vec![None; self.buffers.len()];
+        let mut binding_count = 0usize;
+        for input in &self.inputs {
+            let mut bound = BTreeSet::from([input.slot]);
+            loop {
+                let previous = bound.len();
+                for (alias, planned) in self.slots.iter().enumerate() {
+                    if matches!(planned.source, Some(SlotSource::Copy(source)) if bound.contains(&source))
+                    {
+                        bound.insert(alias);
+                    }
+                }
+                if bound.len() == previous {
+                    break;
+                }
+            }
+            if bound.iter().any(|slot| !input_claimed.insert(*slot)) {
+                return Err(ReplayError::Corrupt(
+                    "native workspace borrowed input layouts overlap".into(),
+                ));
+            }
+            let bindings = bound
+                .into_iter()
+                .map(|slot| {
+                    assign_binding(&mut ordinals, &mut binding_count, slot)
+                        .map(|binding| (slot, binding))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            layouts.push(bindings.into_boxed_slice());
+        }
+        for (input, layout) in self.inputs.iter_mut().zip(layouts) {
+            input.borrowed = layout;
+        }
+        for buffer in requested {
+            let Some(owner) = self.owners.get_mut(buffer) else {
+                // Requested passthrough aliases have no independent producer.
+                continue;
+            };
+            if !self
+                .buffers
+                .get(owner.slot)
+                .is_some_and(|buffer| buffer.mutable)
+            {
+                continue;
+            }
+            if input_claimed.contains(&owner.slot) {
+                return Err(ReplayError::Corrupt(
+                    "native workspace borrowed input/output bindings overlap".into(),
+                ));
+            }
+            owner.binding = Some(assign_binding(
+                &mut ordinals,
+                &mut binding_count,
+                owner.slot,
+            )?);
+        }
+        self.binding_ordinals = Arc::from(ordinals);
+        self.binding_count = binding_count;
+        #[cfg(test)]
+        {
+            self.binding_layout_build_count = self
+                .binding_layout_build_count
+                .checked_add(1)
+                .expect("native workspace binding layout count overflow");
+        }
+        Ok(())
+    }
+
+    fn import_input_at(
         &mut self,
-        name: &str,
+        input_ordinal: usize,
         value: &TensorData,
     ) -> Result<(), ReplayError> {
-        let slot = self
+        let input = self
             .inputs
-            .iter()
-            .find_map(|(input, slot)| (input == name).then_some(*slot))
-            .ok_or_else(|| ReplayError::Extra(name.to_owned()))?;
+            .get(input_ordinal)
+            .ok_or_else(|| ReplayError::Corrupt("native input ordinal is absent".into()))?;
+        let slot = input.slot;
+        let name = &input.name;
         if self.valid[slot] {
             return Err(ReplayError::Corrupt(format!(
                 "native workspace input {name:?} was imported twice"
@@ -825,18 +1002,18 @@ impl NativeReplayWorkspace {
 
     /// Borrows the dense storage families used by fixed-shape CPU training
     /// batches. Other storage keeps the established owned-import fallback.
-    pub(super) fn bind_external_input<'a>(
+    pub(super) fn bind_external_input_at<'a>(
         &mut self,
-        name: &str,
+        input_ordinal: usize,
         value: &'a TensorData,
         bindings: &mut NativeReplayBindings<'a>,
     ) -> Result<(), ReplayError> {
         if !matches!(value.dtype(), crate::DType::F32 | crate::DType::I32)
             || value.native_dense_ptr().is_none()
         {
-            return self.import_input(name, value);
+            return self.import_input_at(input_ordinal, value);
         }
-        self.bind_read_input(name, value, bindings, "external")?;
+        self.bind_read_input_at(input_ordinal, value, bindings, "external")?;
         #[cfg(test)]
         {
             self.borrowed_external_input_bytes = self
@@ -846,13 +1023,13 @@ impl NativeReplayWorkspace {
         Ok(())
     }
 
-    pub(super) fn borrow_recurrent_input<'a>(
+    pub(super) fn borrow_recurrent_input_at<'a>(
         &mut self,
-        name: &str,
+        input_ordinal: usize,
         value: &'a TensorData,
         bindings: &mut NativeReplayBindings<'a>,
     ) -> Result<(), ReplayError> {
-        self.bind_read_input(name, value, bindings, "recurrent")?;
+        self.bind_read_input_at(input_ordinal, value, bindings, "recurrent")?;
         self.current_traffic.borrowed_recurrent_input_bytes = self
             .current_traffic
             .borrowed_recurrent_input_bytes
@@ -869,19 +1046,20 @@ impl NativeReplayWorkspace {
         Ok(())
     }
 
-    fn bind_read_input<'a>(
+    fn bind_read_input_at<'a>(
         &mut self,
-        name: &str,
+        input_ordinal: usize,
         value: &'a TensorData,
         bindings: &mut NativeReplayBindings<'a>,
         kind: &str,
     ) -> Result<(), ReplayError> {
-        let slot = self
+        let input = self
             .inputs
-            .iter()
-            .find_map(|(input, slot)| (input == name).then_some(*slot))
-            .ok_or_else(|| ReplayError::Extra(name.to_owned()))?;
-        if self.valid[slot] || bindings.slots.contains_key(&slot) {
+            .get(input_ordinal)
+            .ok_or_else(|| ReplayError::Corrupt("native input ordinal is absent".into()))?;
+        let slot = input.slot;
+        let name = &input.name;
+        if self.valid[slot] || bindings.slots.contains_slot(slot) {
             return Err(ReplayError::Corrupt(format!(
                 "native workspace input {name:?} was bound twice"
             )));
@@ -896,35 +1074,26 @@ impl NativeReplayWorkspace {
                 "native workspace borrowed {kind} input {name:?} descriptor mismatch"
             )));
         }
-        bindings
-            .slots
-            .insert(slot, crate::cpu_jit::BorrowedJitBuffer::Read(value));
-        self.valid[slot] = true;
-        let mut bound_slots = BTreeSet::from([slot]);
-        loop {
-            let aliases = self
-                .slots
-                .iter()
-                .enumerate()
-                .filter_map(|(alias, planned)| match planned.source {
-                    Some(SlotSource::Copy(source))
-                        if bound_slots.contains(&source) && !self.valid[alias] =>
-                    {
-                        Some(alias)
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if aliases.is_empty() {
-                break;
-            }
-            for alias in aliases {
-                bindings
+        if input
+            .borrowed
+            .binary_search_by_key(&slot, |(slot, _)| *slot)
+            .is_err()
+        {
+            return Err(ReplayError::Corrupt(
+                "native workspace borrowed input root is absent".into(),
+            ));
+        }
+        for (borrowed_slot, binding) in input.borrowed.iter().copied() {
+            if self.valid[borrowed_slot]
+                || !bindings
                     .slots
-                    .insert(alias, crate::cpu_jit::BorrowedJitBuffer::Read(value));
-                self.valid[alias] = true;
-                bound_slots.insert(alias);
+                    .insert(binding, crate::cpu_jit::BorrowedJitBuffer::Read(value))
+            {
+                return Err(ReplayError::Corrupt(
+                    "native workspace borrowed input layout overlaps".into(),
+                ));
             }
+            self.valid[borrowed_slot] = true;
         }
         Ok(())
     }
@@ -935,12 +1104,18 @@ impl NativeReplayWorkspace {
         value: &'a mut TensorData,
         borrowed: &mut NativeReplayBindings<'a>,
     ) -> Result<(), ReplayError> {
-        let slot = self
+        let owner = self
             .owners
             .get(&buffer)
             .copied()
             .ok_or_else(|| ReplayError::Missing(format!("native workspace output {buffer}")))?;
-        if borrowed.slots.contains_key(&slot) {
+        let slot = owner.slot;
+        let binding = owner.binding.ok_or_else(|| {
+            ReplayError::Corrupt(format!(
+                "native workspace output {buffer} has no sealed binding"
+            ))
+        })?;
+        if borrowed.slots.get(binding).is_some() {
             return Err(ReplayError::Corrupt(format!(
                 "native workspace output {buffer} was bound twice"
             )));
@@ -968,9 +1143,14 @@ impl NativeReplayWorkspace {
         let test_bytes = usize::try_from(bytes).map_err(|_| {
             ReplayError::Descriptor("native test traffic bytes exceed usize".into())
         })?;
-        borrowed
+        if !borrowed
             .slots
-            .insert(slot, crate::cpu_jit::BorrowedJitBuffer::Write(value));
+            .insert(binding, crate::cpu_jit::BorrowedJitBuffer::Write(value))
+        {
+            return Err(ReplayError::Corrupt(
+                "native workspace borrowed output slot is absent".into(),
+            ));
+        }
         self.current_traffic.borrowed_recurrent_output_bytes = next_traffic_bytes;
         #[cfg(test)]
         {
@@ -982,8 +1162,8 @@ impl NativeReplayWorkspace {
     }
 
     pub(super) fn finish_inputs(&self) -> Result<(), ReplayError> {
-        if let Some((name, _)) = self.inputs.iter().find(|(_, slot)| !self.valid[*slot]) {
-            return Err(ReplayError::Missing(name.clone()));
+        if let Some(input) = self.inputs.iter().find(|input| !self.valid[input.slot]) {
+            return Err(ReplayError::Missing(input.name.clone()));
         }
         Ok(())
     }
@@ -1011,7 +1191,7 @@ impl NativeReplayWorkspace {
         }
         #[cfg(test)]
         let affine = matches!(&source, SlotSource::Affine { .. });
-        let copied = match borrowed.slots.get(&source_slot) {
+        let copied = match borrowed.slots.get_slot(source_slot) {
             Some(binding) => {
                 let target = self.buffers.get_mut(slot).ok_or_else(|| {
                     ReplayError::Corrupt("native workspace target is absent".into())
@@ -1150,7 +1330,7 @@ impl NativeReplayWorkspace {
         }
         for offset in 0..output_count {
             let output = self.items[index].outputs[offset];
-            match borrowed.slots.get_mut(&output) {
+            match borrowed.slots.get_slot_mut(output) {
                 Some(binding) => binding
                     .clear()
                     .map_err(|error| ReplayError::Backend(error.to_string()))?,
@@ -1189,7 +1369,7 @@ impl NativeReplayWorkspace {
             self.output_clear_count = self.output_clear_count.saturating_add(1);
         }
         for output in &action.outputs {
-            match borrowed.slots.get_mut(output) {
+            match borrowed.slots.get_slot_mut(*output) {
                 Some(binding) => binding
                     .clear()
                     .map_err(|error| ReplayError::Backend(error.to_string()))?,
@@ -1348,6 +1528,10 @@ impl NativeReplayWorkspace {
                 other => other,
             })?;
         }
+        #[cfg(test)]
+        {
+            self.last_borrowed_binding_count = borrowed.slots.bound_count();
+        }
         Ok(())
     }
 
@@ -1374,7 +1558,7 @@ impl NativeReplayWorkspace {
                     "native workspace egress {buffer} is unavailable"
                 )));
             }
-            let value = match borrowed.slots.get(slot) {
+            let value = match borrowed.slots.get_slot(*slot) {
                 Some(binding) => binding.tensor().clone(),
                 None => self.buffers[*slot]
                     .to_tensor(shape.clone())
@@ -1481,6 +1665,7 @@ impl NativeReplayWorkspace {
                     steps.push(WorkspaceDispatchStep::Segment(seal_workspace_segment(
                         &self.items,
                         &self.slots,
+                        &self.binding_ordinals,
                         std::mem::take(&mut segment),
                     )?));
                     segmentation.record(NativeDispatchSegmentEnd::NonDispatchBoundary);
@@ -1521,6 +1706,7 @@ impl NativeReplayWorkspace {
                 steps.push(WorkspaceDispatchStep::Segment(seal_workspace_segment(
                     &self.items,
                     &self.slots,
+                    &self.binding_ordinals,
                     std::mem::take(&mut segment),
                 )?));
                 segmentation.record(split);
@@ -1533,6 +1719,7 @@ impl NativeReplayWorkspace {
             steps.push(WorkspaceDispatchStep::Segment(seal_workspace_segment(
                 &self.items,
                 &self.slots,
+                &self.binding_ordinals,
                 segment,
             )?));
             segmentation.record(NativeDispatchSegmentEnd::Terminal);
@@ -1611,6 +1798,26 @@ impl NativeReplayWorkspace {
                 WorkspaceDispatchStep::PerItem(_) => None,
             })
             .sum();
+        let sealed_pointer_count = self
+            .dispatch_tape
+            .iter()
+            .filter_map(|step| match step {
+                WorkspaceDispatchStep::Segment(segment) => Some(segment.dispatch.pointer_count()),
+                WorkspaceDispatchStep::PerItem(_) => None,
+            })
+            .sum();
+        let (sealed_dense_pointer_count, sealed_quantized_pointer_count) = self
+            .dispatch_tape
+            .iter()
+            .filter_map(|step| match step {
+                WorkspaceDispatchStep::Segment(segment) => {
+                    Some(segment.dispatch.pointer_source_counts())
+                }
+                WorkspaceDispatchStep::PerItem(_) => None,
+            })
+            .fold((0usize, 0usize), |(dense, quantized), next| {
+                (dense + next.0, quantized + next.1)
+            });
         NativeReplayWorkspaceStats {
             allocation_count: self.buffers.len(),
             input_import_count: self.input_import_count,
@@ -1627,6 +1834,12 @@ impl NativeReplayWorkspace {
             sealed_prerequisite_slot_count,
             sealed_derived_materialization_count,
             dispatch_metadata_build_count: self.dispatch_metadata_build_count,
+            binding_layout_build_count: self.binding_layout_build_count,
+            sealed_pointer_count,
+            sealed_dense_pointer_count,
+            sealed_quantized_pointer_count,
+            last_borrowed_binding_count: self.last_borrowed_binding_count,
+            borrowed_binding_capacity: self.new_bindings().slots.capacity(),
             last_materialized_egress_count: self.current_traffic.materialized_egress_count,
             last_materialized_egress_bytes: self.current_traffic.materialized_egress_bytes,
             dispatch_scratch_capacity_growth_count: self.dispatch_scratch.capacity_growth_count(),
@@ -1638,6 +1851,7 @@ impl NativeReplayWorkspace {
 fn seal_workspace_segment(
     items: &[WorkspaceItem],
     slots: &[WorkspaceSlot],
+    binding_ordinals: &[Option<crate::cpu_jit::NativeReplayBindingOrdinal>],
     indices: Vec<usize>,
 ) -> Result<WorkspaceDispatchSegment, ReplayError> {
     if indices.is_empty() {
@@ -1656,7 +1870,8 @@ fn seal_workspace_segment(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let dispatch = PreparedScheduleDispatch::seal_segment(&dispatches).map_err(backend_error)?;
+    let dispatch = PreparedScheduleDispatch::seal_segment(&dispatches, binding_ordinals)
+        .map_err(backend_error)?;
     let mut produced = BTreeSet::new();
     let mut materialized = BTreeSet::new();
     let mut seen_prerequisites = BTreeSet::new();

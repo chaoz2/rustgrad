@@ -310,8 +310,7 @@ impl<'a> NativeReplayContext<'a> {
                     INDEXED_RECURRENT_BANK_BINDINGS.with(|count| {
                         count.set(count.get().saturating_add(bank_count));
                     });
-                    let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
-                    let mut input_ordinal = 0usize;
+                    let mut borrowed = plan.new_bindings();
                     let executor_started = Instant::now();
                     let executed = executor.execute_sealed_planned_native_items_resolved(
                         pure,
@@ -350,18 +349,13 @@ impl<'a> NativeReplayContext<'a> {
                             }
                             Ok(())
                         },
-                        |input, workspace, borrowed| {
+                        |input_ordinal, input, workspace, borrowed| {
                             let binding =
                                 bank_layout.inputs.get(input_ordinal).ok_or_else(|| {
                                     ReplayError::Corrupt(
                                         "prepared recurrent input ordinal is absent".into(),
                                     )
                                 })?;
-                            input_ordinal = input_ordinal.checked_add(1).ok_or_else(|| {
-                                ReplayError::Corrupt(
-                                    "prepared recurrent input ordinal overflow".into(),
-                                )
-                            })?;
                             let value = match binding.source {
                                 PreparedRecurrentInputSource::State { ordinal } => {
                                     active.get(ordinal).copied().ok_or_else(|| {
@@ -377,9 +371,13 @@ impl<'a> NativeReplayContext<'a> {
                             super::captured_replay::validate_input_value(pure, input, value)?;
                             match binding.source {
                                 PreparedRecurrentInputSource::State { .. } => workspace
-                                    .borrow_recurrent_input(&input.name, value, borrowed)?,
+                                    .borrow_recurrent_input_at(input_ordinal, value, borrowed)?,
                                 PreparedRecurrentInputSource::External => {
-                                    workspace.bind_external_input(&input.name, value, borrowed)?;
+                                    workspace.bind_external_input_at(
+                                        input_ordinal,
+                                        value,
+                                        borrowed,
+                                    )?;
                                 }
                             }
                             Ok(())
@@ -387,11 +385,6 @@ impl<'a> NativeReplayContext<'a> {
                     );
                     let executor_wall_time = executor_started.elapsed();
                     let (values, traffic) = executed?;
-                    if input_ordinal != bank_layout.inputs.len() {
-                        return Err(ReplayError::Corrupt(
-                            "prepared recurrent input cardinality mismatch".into(),
-                        ));
-                    }
                     (values, traffic, executor_wall_time)
                 };
                 let outputs = requested
@@ -3124,6 +3117,11 @@ mod recurrent_tests {
         assert_eq!(layout.retained, vec![false]);
         assert_eq!((layout.retained_count, layout.retained_bytes), (0, 0));
         assert_eq!(prepared.structure_validation_count(), 1);
+        let prepared_workspace = prepared.workspace_stats();
+        assert_eq!(prepared_workspace.binding_layout_build_count, 1);
+        assert!(prepared_workspace.sealed_pointer_count > 0);
+        assert_eq!(prepared_workspace.last_borrowed_binding_count, 0);
+        assert!(prepared_workspace.borrowed_binding_capacity > 0);
         let mut viewed = capture.clone();
         viewed.state_bindings[0].view = Some(crate::AffineView::identity(Shape::from([2])));
         assert!(matches!(
@@ -3206,6 +3204,13 @@ mod recurrent_tests {
         assert_eq!(replay.traffic.borrowed_recurrent_output_bytes, 8);
         assert!(replay.traffic.native_dispatcher_wall_time <= replay.executor_wall_time);
         assert_eq!(indexed_recurrent_bank_binding_count(), 2);
+        let replay_workspace = prepared.workspace_stats();
+        assert_eq!(replay_workspace.binding_layout_build_count, 1);
+        assert!(replay_workspace.last_borrowed_binding_count > 0);
+        assert_eq!(
+            replay_workspace.borrowed_binding_capacity,
+            prepared_workspace.borrowed_binding_capacity
+        );
         let expected_traffic = replay.traffic;
         assert_eq!(
             prepared_replay_validation_counts(),
@@ -3233,6 +3238,10 @@ mod recurrent_tests {
         assert_eq!(after_failure.0, before_failure.0);
         assert_eq!(after_failure.1, before_failure.1);
         assert_eq!(frontier_values(&runtime, &cursor), checkpoint);
+        assert_eq!(
+            prepared.workspace_stats().borrowed_binding_capacity,
+            prepared_workspace.borrowed_binding_capacity
+        );
 
         let before_injected = runtime.recurrent_test_counts();
         NativeReplayContext::new(&executor, &mut prepared)
@@ -3254,6 +3263,14 @@ mod recurrent_tests {
         assert_eq!(
             retried_deterministic_traffic,
             expected_deterministic_traffic
+        );
+        assert_eq!(
+            prepared.workspace_stats().last_borrowed_binding_count,
+            replay_workspace.last_borrowed_binding_count
+        );
+        assert_eq!(
+            prepared.workspace_stats().borrowed_binding_capacity,
+            prepared_workspace.borrowed_binding_capacity
         );
         assert_eq!(
             retried.replay.outputs[0].storage(),

@@ -155,6 +155,112 @@ pub(crate) enum BorrowedJitBuffer<'a> {
     Write(&'a mut crate::TensorData),
 }
 
+/// Compact ordinal into one prepared replay's eligible borrowed bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeReplayBindingOrdinal(usize);
+
+impl NativeReplayBindingOrdinal {
+    pub(crate) const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    const fn index(self) -> usize {
+        self.0
+    }
+}
+
+/// Call-scoped borrowed replay bindings indexed by compact sealed ordinals.
+///
+/// The immutable workspace-slot map contains no live storage. Tensor references
+/// are installed after the current invocation's descriptor and recurrent-bank
+/// validation and are dropped when that invocation returns.
+pub(crate) struct IndexedBorrowedJitBuffers<'a> {
+    slot_ordinals: Arc<[Option<NativeReplayBindingOrdinal>]>,
+    slots: Vec<Option<BorrowedJitBuffer<'a>>>,
+    bound: usize,
+}
+
+impl<'a> IndexedBorrowedJitBuffers<'a> {
+    pub(crate) fn with_layout(
+        slot_ordinals: Arc<[Option<NativeReplayBindingOrdinal>]>,
+        binding_count: usize,
+    ) -> Self {
+        Self {
+            slot_ordinals,
+            slots: std::iter::repeat_with(|| None)
+                .take(binding_count)
+                .collect(),
+            bound: 0,
+        }
+    }
+
+    fn ordinal_for_slot(&self, slot: usize) -> Option<NativeReplayBindingOrdinal> {
+        self.slot_ordinals.get(slot).copied().flatten()
+    }
+
+    pub(crate) fn contains_slot(&self, slot: usize) -> bool {
+        self.ordinal_for_slot(slot)
+            .is_some_and(|ordinal| self.get(ordinal).is_some())
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        ordinal: NativeReplayBindingOrdinal,
+        value: BorrowedJitBuffer<'a>,
+    ) -> bool {
+        let Some(next_bound) = self.bound.checked_add(1) else {
+            return false;
+        };
+        let Some(binding) = self.slots.get_mut(ordinal.index()) else {
+            return false;
+        };
+        if binding.is_some() {
+            return false;
+        }
+        *binding = Some(value);
+        self.bound = next_bound;
+        true
+    }
+
+    pub(crate) fn get(
+        &self,
+        ordinal: NativeReplayBindingOrdinal,
+    ) -> Option<&BorrowedJitBuffer<'a>> {
+        self.slots.get(ordinal.index()).and_then(Option::as_ref)
+    }
+
+    pub(crate) fn get_mut(
+        &mut self,
+        ordinal: NativeReplayBindingOrdinal,
+    ) -> Option<&mut BorrowedJitBuffer<'a>> {
+        self.slots.get_mut(ordinal.index()).and_then(Option::as_mut)
+    }
+
+    pub(crate) fn get_slot(&self, slot: usize) -> Option<&BorrowedJitBuffer<'a>> {
+        self.ordinal_for_slot(slot)
+            .and_then(|ordinal| self.get(ordinal))
+    }
+
+    pub(crate) fn get_slot_mut(&mut self, slot: usize) -> Option<&mut BorrowedJitBuffer<'a>> {
+        self.ordinal_for_slot(slot)
+            .and_then(|ordinal| self.get_mut(ordinal))
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.bound == 0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn bound_count(&self) -> usize {
+        self.bound
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+}
+
 impl BorrowedJitBuffer<'_> {
     pub(crate) fn tensor(&self) -> &crate::TensorData {
         match self {
@@ -715,23 +821,39 @@ pub(crate) enum NativeDispatchMaterialization {
     },
 }
 
+/// One pointer source in the exact flattened ABI order sealed for a native
+/// schedule-module segment. It contains ordinals only; every raw pointer is
+/// reconstructed from the current call's arena, resources, and live bindings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeSchedulePointerSource {
+    Dense {
+        entry: usize,
+        arena_slot: usize,
+        binding: Option<NativeReplayBindingOrdinal>,
+    },
+    Quantized {
+        entry: usize,
+        ordinal: usize,
+    },
+}
+
 /// One sealed logical-entry, pointer, and pre-entry-action inventory for a
 /// synchronous native schedule dispatch.
 pub(crate) struct NativeScheduleDispatchPlan<'a> {
     entry_count: usize,
-    pointer_count: usize,
+    pointers: &'a [NativeSchedulePointerSource],
     materializations: &'a [NativeDispatchMaterialization],
 }
 
 impl<'a> NativeScheduleDispatchPlan<'a> {
     pub(crate) const fn new(
         entry_count: usize,
-        pointer_count: usize,
+        pointers: &'a [NativeSchedulePointerSource],
         materializations: &'a [NativeDispatchMaterialization],
     ) -> Self {
         Self {
             entry_count,
-            pointer_count,
+            pointers,
             materializations,
         }
     }
@@ -824,7 +946,7 @@ impl NativeDispatchMaterialization {
     fn append_native(
         &self,
         arena: &mut [JitBuffer],
-        mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
+        mut borrowed: Option<&mut IndexedBorrowedJitBuffers<'_>>,
         axes: &mut Vec<NativeScheduleDispatchAffineAxis>,
         actions: &mut Vec<NativeScheduleDispatchAction>,
     ) -> Result<(), JitError> {
@@ -854,7 +976,7 @@ impl NativeDispatchMaterialization {
         if source == target
             || borrowed
                 .as_ref()
-                .is_some_and(|bindings| bindings.contains_key(&target))
+                .is_some_and(|bindings| bindings.contains_slot(target))
         {
             return Err(JitError::InvalidBuffer(
                 "native dispatch action target is not private".into(),
@@ -871,7 +993,7 @@ impl NativeDispatchMaterialization {
         let target_pointer = target_buffer.bytes.as_mut_ptr().cast();
         let source_pointer = match borrowed
             .as_mut()
-            .and_then(|bindings| bindings.get_mut(&source))
+            .and_then(|bindings| bindings.get_slot_mut(source))
         {
             Some(binding) => {
                 binding.validate_dispatch_layout(dtype, source_elements)?;
@@ -1057,7 +1179,7 @@ impl JitScheduleDispatchScratch {
         &mut self,
         action: &NativeDispatchMaterialization,
         arena: &mut [JitBuffer],
-        borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
+        borrowed: Option<&mut IndexedBorrowedJitBuffers<'_>>,
     ) -> Result<(), JitError> {
         action.append_native(arena, borrowed, &mut self.affine_axes, &mut self.actions)
     }
@@ -1430,7 +1552,7 @@ impl JitKernel {
         &self,
         arena: &mut [JitBuffer],
         slots: &[usize],
-        borrowed: &mut BTreeMap<usize, BorrowedJitBuffer<'_>>,
+        borrowed: &mut IndexedBorrowedJitBuffers<'_>,
         quantized: &[&crate::QuantizedTensorData],
     ) -> Result<(), JitError> {
         if slots.len() != self.abi.buffers.len()
@@ -1447,7 +1569,7 @@ impl JitKernel {
                     "borrowed replay-workspace slot aliases within one kernel".into(),
                 ));
             }
-            if let Some(binding) = borrowed.get(&slot) {
+            if let Some(binding) = borrowed.get_slot(slot) {
                 binding.validate(want)?;
             } else {
                 let buffer = arena.get(slot).ok_or_else(|| {
@@ -1477,7 +1599,7 @@ impl JitKernel {
             let pointer = match entry {
                 KernelPointerAbi::Dense(index) => {
                     let slot = slots[*index];
-                    match borrowed.get_mut(&slot) {
+                    match borrowed.get_slot_mut(slot) {
                         Some(binding) => binding.pointer()?,
                         None => arena[slot].bytes.as_mut_ptr().cast(),
                     }
@@ -1489,38 +1611,6 @@ impl JitKernel {
             ptrs.push(pointer);
         }
         self.invoke(&mut ptrs, &[])
-    }
-
-    fn append_indexed_authenticated_pointers<'a, F>(
-        &self,
-        arena: &mut [JitBuffer],
-        slots: &[usize],
-        mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
-        mut quantized: F,
-        pointers: &mut Vec<*mut c_void>,
-    ) -> Result<(), JitError>
-    where
-        F: FnMut(usize) -> &'a crate::QuantizedTensorData,
-    {
-        for entry in &self.abi.pointer_order {
-            let pointer = match entry {
-                KernelPointerAbi::Dense(index) => {
-                    let slot = slots[*index];
-                    match borrowed
-                        .as_mut()
-                        .and_then(|bindings| bindings.get_mut(&slot))
-                    {
-                        Some(binding) => binding.pointer()?,
-                        None => arena[slot].bytes.as_mut_ptr().cast(),
-                    }
-                }
-                KernelPointerAbi::Quantized(index) => {
-                    quantized(*index).bytes().as_ptr().cast_mut().cast()
-                }
-            };
-            pointers.push(pointer);
-        }
-        Ok(())
     }
 
     /// Native kernels may detect a domain failure after earlier loop iterations
@@ -1581,7 +1671,7 @@ impl JitScheduleDispatcher {
         &self,
         plan: NativeScheduleDispatchPlan<'_>,
         arena: &mut [JitBuffer],
-        mut borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
+        mut borrowed: Option<&mut IndexedBorrowedJitBuffers<'_>>,
         scratch: &mut JitScheduleDispatchScratch,
         mut entry: F,
     ) -> Result<NativeDispatchTiming, (usize, JitError)>
@@ -1597,9 +1687,10 @@ impl JitScheduleDispatcher {
     {
         let NativeScheduleDispatchPlan {
             entry_count,
-            pointer_count,
+            pointers,
             materializations,
         } = plan;
+        let pointer_count = pointers.len();
         let affine_axis_count = materializations.iter().try_fold(0usize, |count, action| {
             count.checked_add(action.affine_axis_count()).ok_or((
                 action.before_entry(),
@@ -1613,8 +1704,9 @@ impl JitScheduleDispatcher {
             affine_axis_count,
         );
         (|| {
+            let mut pointer_ordinal = 0usize;
             for index in 0..entry_count {
-                let (kernel, slots, quantized, offset) = entry(index);
+                let (_, _, quantized, offset) = entry(index);
                 if scratch.pointers.len() != offset {
                     return Err((
                         index,
@@ -1623,15 +1715,93 @@ impl JitScheduleDispatcher {
                         ),
                     ));
                 }
-                kernel
-                    .append_indexed_authenticated_pointers(
-                        arena,
-                        slots,
-                        borrowed.as_deref_mut(),
-                        |index| &quantized[index],
-                        &mut scratch.pointers,
-                    )
-                    .map_err(|error| (index, error))?;
+                while let Some(source) = pointers.get(pointer_ordinal) {
+                    let source_entry = match *source {
+                        NativeSchedulePointerSource::Dense { entry, .. }
+                        | NativeSchedulePointerSource::Quantized { entry, .. } => entry,
+                    };
+                    if source_entry != index {
+                        if source_entry < index || source_entry >= entry_count {
+                            return Err((
+                                index,
+                                JitError::InvalidBuffer(
+                                    "prepared schedule pointer entry order differs".into(),
+                                ),
+                            ));
+                        }
+                        break;
+                    }
+                    let pointer = match *source {
+                        NativeSchedulePointerSource::Dense {
+                            entry: _,
+                            arena_slot,
+                            binding,
+                        } => match binding.and_then(|ordinal| {
+                            borrowed
+                                .as_mut()
+                                .and_then(|bindings| bindings.get_mut(ordinal))
+                        }) {
+                            Some(binding) => binding.pointer().map_err(|error| (index, error))?,
+                            None => arena
+                                .get_mut(arena_slot)
+                                .ok_or_else(|| {
+                                    (
+                                        index,
+                                        JitError::InvalidBuffer(
+                                            "prepared schedule dense slot is absent".into(),
+                                        ),
+                                    )
+                                })?
+                                .bytes
+                                .as_mut_ptr()
+                                .cast(),
+                        },
+                        NativeSchedulePointerSource::Quantized { entry: _, ordinal } => quantized
+                            .get(ordinal)
+                            .ok_or_else(|| {
+                                (
+                                    index,
+                                    JitError::InvalidBuffer(
+                                        "prepared schedule quantized ordinal is absent".into(),
+                                    ),
+                                )
+                            })?
+                            .bytes()
+                            .as_ptr()
+                            .cast_mut()
+                            .cast(),
+                    };
+                    scratch.pointers.push(pointer);
+                    pointer_ordinal = pointer_ordinal.checked_add(1).ok_or((
+                        index,
+                        JitError::InvalidBuffer(
+                            "prepared schedule pointer ordinal overflows".into(),
+                        ),
+                    ))?;
+                }
+            }
+            if pointer_ordinal != pointers.len() {
+                return Err((
+                    entry_count.saturating_sub(1),
+                    JitError::InvalidBuffer(
+                        "prepared schedule pointer entry is out of range".into(),
+                    ),
+                ));
+            }
+            if let Some(last) = entry_count.checked_sub(1) {
+                let (kernel, _, _, offset) = entry(last);
+                let expected = offset.checked_add(kernel.abi.pointer_order.len()).ok_or((
+                    last,
+                    JitError::InvalidBuffer("prepared schedule pointer count overflows".into()),
+                ))?;
+                if pointers.len() != expected {
+                    return Err((
+                        last,
+                        JitError::InvalidBuffer(
+                            "prepared schedule pointer inventory is incomplete".into(),
+                        ),
+                    ));
+                }
             }
             if scratch.pointers.len() != pointer_count {
                 return Err((
@@ -1715,21 +1885,37 @@ impl JitScheduleDispatcher {
         &self,
         entries: &[(&JitKernel, &[usize], Vec<&crate::QuantizedTensorData>)],
         arena: &mut [JitBuffer],
-        borrowed: Option<&mut BTreeMap<usize, BorrowedJitBuffer<'_>>>,
+        mut borrowed: Option<&mut IndexedBorrowedJitBuffers<'_>>,
     ) -> Result<(), (usize, JitError)> {
-        let mut borrowed = borrowed;
         let mut pointers = Vec::with_capacity(entries.len());
         for (entry, slots, quantized) in entries {
             let mut pointers_for_entry = Vec::with_capacity(entry.abi.pointer_order.len());
-            entry
-                .append_indexed_authenticated_pointers(
-                    arena,
-                    slots,
-                    borrowed.as_deref_mut(),
-                    |index| quantized[index],
-                    &mut pointers_for_entry,
-                )
+            for source in &entry.abi.pointer_order {
+                let pointer = match source {
+                    KernelPointerAbi::Dense(index) => {
+                        let slot = slots[*index];
+                        match borrowed
+                            .as_mut()
+                            .and_then(|bindings| bindings.get_slot_mut(slot))
+                        {
+                            Some(binding) => binding.pointer(),
+                            None => arena
+                                .get_mut(slot)
+                                .map(|buffer| buffer.bytes.as_mut_ptr().cast())
+                                .ok_or_else(|| {
+                                    JitError::InvalidBuffer(
+                                        "test schedule dense slot is absent".into(),
+                                    )
+                                }),
+                        }
+                    }
+                    KernelPointerAbi::Quantized(index) => {
+                        Ok(quantized[*index].bytes().as_ptr().cast_mut().cast())
+                    }
+                }
                 .map_err(|error| (pointers.len(), error))?;
+                pointers_for_entry.push(pointer);
+            }
             pointers.push(pointers_for_entry);
         }
         let mut calls = entries
@@ -7012,11 +7198,33 @@ mod tests {
                 2,
             ),
         ];
+        let chained_pointers = [
+            NativeSchedulePointerSource::Dense {
+                entry: 0,
+                arena_slot: 0,
+                binding: None,
+            },
+            NativeSchedulePointerSource::Dense {
+                entry: 0,
+                arena_slot: 1,
+                binding: None,
+            },
+            NativeSchedulePointerSource::Dense {
+                entry: 1,
+                arena_slot: 2,
+                binding: None,
+            },
+            NativeSchedulePointerSource::Dense {
+                entry: 1,
+                arena_slot: 3,
+                binding: None,
+            },
+        ];
         let dense = NativeDispatchMaterialization::copy(1, 1, 2, DType::F32, 1).unwrap();
         let mut scratch = JitScheduleDispatchScratch::with_capacity(2, 4, 1, 0);
         let timing = dispatcher
             .call_prepared(
-                NativeScheduleDispatchPlan::new(2, 4, &[dense]),
+                NativeScheduleDispatchPlan::new(2, &chained_pointers, &[dense]),
                 &mut chained_arena,
                 None,
                 &mut scratch,
@@ -7025,9 +7233,26 @@ mod tests {
             .unwrap();
         assert_eq!(dispatcher.invocation_count(), 2);
         assert!(scratch.is_empty());
+        assert!(
+            dispatcher
+                .call_prepared(
+                    NativeScheduleDispatchPlan::new(
+                        2,
+                        &chained_pointers[..chained_pointers.len() - 1],
+                        &[],
+                    ),
+                    &mut chained_arena,
+                    None,
+                    &mut scratch,
+                    |index| entries[index],
+                )
+                .is_err()
+        );
+        assert_eq!(dispatcher.invocation_count(), 2);
+        assert!(scratch.is_empty());
         let empty_timing = dispatcher
             .call_prepared(
-                NativeScheduleDispatchPlan::new(0, 0, &[]),
+                NativeScheduleDispatchPlan::new(0, &[], &[]),
                 &mut chained_arena,
                 None,
                 &mut scratch,
@@ -7070,9 +7295,21 @@ mod tests {
             no_packed.as_slice(),
             0,
         )];
+        let single_pointers = [
+            NativeSchedulePointerSource::Dense {
+                entry: 0,
+                arena_slot: 2,
+                binding: None,
+            },
+            NativeSchedulePointerSource::Dense {
+                entry: 0,
+                arena_slot: 3,
+                binding: None,
+            },
+        ];
         dispatcher
             .call_prepared(
-                NativeScheduleDispatchPlan::new(1, 2, &[affine]),
+                NativeScheduleDispatchPlan::new(1, &single_pointers, &[affine]),
                 &mut chained_arena,
                 None,
                 &mut scratch,
@@ -7086,7 +7323,7 @@ mod tests {
         assert!(
             dispatcher
                 .call_prepared(
-                    NativeScheduleDispatchPlan::new(1, 2, &[malformed]),
+                    NativeScheduleDispatchPlan::new(1, &single_pointers, &[malformed]),
                     &mut chained_arena,
                     None,
                     &mut scratch,
@@ -7182,11 +7419,43 @@ mod tests {
                 3,
             ),
         ];
+        let pointers = [
+            NativeSchedulePointerSource::Dense {
+                entry: 0,
+                arena_slot: 0,
+                binding: None,
+            },
+            NativeSchedulePointerSource::Dense {
+                entry: 0,
+                arena_slot: 1,
+                binding: None,
+            },
+            NativeSchedulePointerSource::Dense {
+                entry: 0,
+                arena_slot: 2,
+                binding: None,
+            },
+            NativeSchedulePointerSource::Dense {
+                entry: 1,
+                arena_slot: 3,
+                binding: None,
+            },
+            NativeSchedulePointerSource::Dense {
+                entry: 1,
+                arena_slot: 4,
+                binding: None,
+            },
+            NativeSchedulePointerSource::Dense {
+                entry: 1,
+                arena_slot: 5,
+                binding: None,
+            },
+        ];
         let action = NativeDispatchMaterialization::copy(1, 2, 3, DType::I64, 1).unwrap();
         let mut scratch = JitScheduleDispatchScratch::with_capacity(2, 6, 1, 0);
         assert_eq!(
             dispatcher.call_prepared(
-                NativeScheduleDispatchPlan::new(2, 6, std::slice::from_ref(&action)),
+                NativeScheduleDispatchPlan::new(2, &pointers, std::slice::from_ref(&action)),
                 &mut arena,
                 None,
                 &mut scratch,
@@ -7199,7 +7468,7 @@ mod tests {
         arena[4].bytes_mut().copy_from_slice(&1i64.to_ne_bytes());
         dispatcher
             .call_prepared(
-                NativeScheduleDispatchPlan::new(2, 6, &[action]),
+                NativeScheduleDispatchPlan::new(2, &pointers, &[action]),
                 &mut arena,
                 None,
                 &mut scratch,
