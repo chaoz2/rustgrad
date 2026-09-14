@@ -373,6 +373,92 @@ impl EffectRuntime {
         Ok(value)
     }
 
+    /// Runs the sealed native full frontier in canonical buffer order. Request
+    /// capabilities borrow the live runtime leases for this call only; the host
+    /// pool retains its generic map/sort fallback for noncanonical physical
+    /// layouts such as zero-byte sentinels.
+    pub(crate) fn transact_recurrent_native_full_frontier<T, E>(
+        &mut self,
+        current: &[BufferState],
+        next: &[BufferState],
+        modes: &[RecurrentBankMode],
+        stage: impl FnOnce(&mut [HostBufferBank<'_>]) -> Result<T, E>,
+    ) -> Result<T, RecurrentTransactionError<E>> {
+        if current.is_empty() || current.len() != next.len() || current.len() != modes.len() {
+            return Err(RecurrentTransactionError::Contract(
+                "recurrent replacement frontier cardinality mismatch",
+            ));
+        }
+        let canonical_full_frontier = current.len() == self.slots.len()
+            && current
+                .iter()
+                .map(|state| state.buffer)
+                .eq(self.slots.keys().copied());
+        if !canonical_full_frontier {
+            return self.transact_recurrent_native_banks_retaining(current, next, modes, stage);
+        }
+        let mut requests = Vec::with_capacity(current.len());
+        for (((current, next), mode), (buffer, slot)) in
+            current.iter().zip(next).zip(modes).zip(self.slots.iter())
+        {
+            debug_assert_eq!(current.buffer, *buffer);
+            super::validate_buffer_state(current)
+                .map_err(RuntimeError::Effect)
+                .map_err(RecurrentTransactionError::Runtime)?;
+            super::validate_buffer_state(next)
+                .map_err(RuntimeError::Effect)
+                .map_err(RecurrentTransactionError::Runtime)?;
+            if current.buffer != next.buffer
+                || current.shape != next.shape
+                || current.dtype != next.dtype
+                || current.bytes != next.bytes
+                || current.version.checked_add(1) != Some(next.version)
+            {
+                return Err(RecurrentTransactionError::Contract(
+                    "recurrent replacement state mismatch",
+                ));
+            }
+            if slot.state != *current {
+                return Err(RecurrentTransactionError::Runtime(
+                    RuntimeError::StaleState {
+                        buffer: current.buffer,
+                        version: current.version,
+                    },
+                ));
+            }
+            requests.push(
+                slot.lease
+                    .borrowed_bank_request(matches!(*mode, RecurrentBankMode::Retain)),
+            );
+        }
+
+        let staged = self.pool.transact_ordered_inactive_banks(&requests, stage);
+        let value = match staged {
+            Ok(value) => value,
+            Err(HostBufferBankTransactionError::Host(error)) => {
+                return Err(RecurrentTransactionError::Runtime(RuntimeError::Host(
+                    error,
+                )));
+            }
+            Err(HostBufferBankTransactionError::Stage(error)) => {
+                return Err(RecurrentTransactionError::Stage(error));
+            }
+        };
+        drop(requests);
+        for (slot, state) in self.slots.values_mut().zip(next) {
+            debug_assert_eq!(slot.state.buffer, state.buffer);
+            debug_assert_eq!(slot.state.shape, state.shape);
+            debug_assert_eq!(slot.state.dtype, state.dtype);
+            debug_assert_eq!(slot.state.bytes, state.bytes);
+            slot.state.version = state.version;
+        }
+        #[cfg(test)]
+        {
+            self.recurrent_commit_count += 1;
+        }
+        Ok(value)
+    }
+
     #[cfg(test)]
     pub(crate) fn recurrent_test_counts(&self) -> (usize, usize) {
         (self.snapshot_count.get(), self.recurrent_commit_count)
@@ -1014,6 +1100,8 @@ mod tests {
         ];
         let stats = runtime.stats().unwrap();
         let current = vec![left.clone(), right.clone()];
+        assert_eq!(identities.map(|identity| identity.slot), [41, 42]);
+        crate::host_buffer::reset_host_bank_transaction_test_counts();
         let next = current
             .iter()
             .cloned()
@@ -1026,7 +1114,7 @@ mod tests {
         skipped[0].version += 1;
         let staged = std::cell::Cell::new(false);
         assert!(matches!(
-            runtime.transact_recurrent_native_banks_retaining(
+            runtime.transact_recurrent_native_full_frontier(
                 &current,
                 &skipped,
                 &[RecurrentBankMode::Replace; 2],
@@ -1041,7 +1129,7 @@ mod tests {
         ));
         assert!(!staged.get());
         assert!(matches!(
-            runtime.transact_recurrent_native_banks_retaining(
+            runtime.transact_recurrent_native_full_frontier(
                 &current,
                 &next[..1],
                 &[RecurrentBankMode::Replace; 2],
@@ -1056,7 +1144,7 @@ mod tests {
         ));
         assert!(!staged.get());
         assert!(matches!(
-            runtime.transact_recurrent_native_banks_retaining(
+            runtime.transact_recurrent_native_full_frontier(
                 &current,
                 &next,
                 &[RecurrentBankMode::Replace],
@@ -1071,7 +1159,7 @@ mod tests {
         ));
         assert!(!staged.get());
         let observed = runtime
-            .transact_recurrent_native_banks_retaining(
+            .transact_recurrent_native_full_frontier(
                 &current,
                 &next,
                 &[RecurrentBankMode::Replace; 2],
@@ -1119,7 +1207,7 @@ mod tests {
             runtime.snapshot(&next[1]).unwrap(),
         ];
         assert!(matches!(
-            runtime.transact_recurrent_native_banks_retaining(
+            runtime.transact_recurrent_native_full_frontier(
                 &next,
                 &second,
                 &[RecurrentBankMode::Replace; 2],
@@ -1140,7 +1228,7 @@ mod tests {
             before[1].tensor()
         );
         runtime
-            .transact_recurrent_native_banks_retaining(
+            .transact_recurrent_native_full_frontier(
                 &next,
                 &second,
                 &[RecurrentBankMode::Replace; 2],
@@ -1179,7 +1267,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         runtime
-            .transact_recurrent_native_banks_retaining(
+            .transact_recurrent_native_full_frontier(
                 &second,
                 &third,
                 &[RecurrentBankMode::Replace, RecurrentBankMode::Retain],
@@ -1201,6 +1289,14 @@ mod tests {
         assert_eq!(
             runtime.snapshot(&third[1]).unwrap().tensor(),
             &data([], Storage::U64(vec![11]))
+        );
+        assert_eq!(
+            crate::host_buffer::host_bank_transaction_test_counts(),
+            crate::host_buffer::HostBankTransactionTestCounts {
+                ordered_full_frontier_transactions: 4,
+                request_map_builds: 0,
+                ordinal_sorts: 0,
+            }
         );
     }
 

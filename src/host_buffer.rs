@@ -6,6 +6,37 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(test)]
+thread_local! {
+    static ORDERED_BANK_TRANSACTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BANK_REQUEST_MAP_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BANK_ORDINAL_SORT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HostBankTransactionTestCounts {
+    pub(crate) ordered_full_frontier_transactions: usize,
+    pub(crate) request_map_builds: usize,
+    pub(crate) ordinal_sorts: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn reset_host_bank_transaction_test_counts() {
+    ORDERED_BANK_TRANSACTION_COUNT.set(0);
+    BANK_REQUEST_MAP_BUILD_COUNT.set(0);
+    BANK_ORDINAL_SORT_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn host_bank_transaction_test_counts() -> HostBankTransactionTestCounts {
+    HostBankTransactionTestCounts {
+        ordered_full_frontier_transactions: ORDERED_BANK_TRANSACTION_COUNT.get(),
+        request_map_builds: BANK_REQUEST_MAP_BUILD_COUNT.get(),
+        ordinal_sorts: BANK_ORDINAL_SORT_COUNT.get(),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostBufferDesc {
     pub buffer_id: u64,
@@ -233,41 +264,84 @@ impl HostSlotPool {
         requests: &[HostBufferBankRequest],
         stage: impl FnOnce(&mut [HostBufferBank<'_>]) -> Result<T, E>,
     ) -> Result<T, HostBufferBankTransactionError<E>> {
+        self.transact_inactive_banks_impl(requests, false, stage)
+    }
+
+    /// Uses canonical full-frontier order when the live pool layout permits it.
+    /// The borrowed capabilities are call-scoped; zero-byte sentinels or any
+    /// other physical-order mismatch retain the generic map/sort path.
+    pub(crate) fn transact_ordered_inactive_banks<T, E>(
+        &self,
+        requests: &[BorrowedHostBufferBankRequest<'_>],
+        stage: impl FnOnce(&mut [HostBufferBank<'_>]) -> Result<T, E>,
+    ) -> Result<T, HostBufferBankTransactionError<E>> {
+        self.transact_inactive_banks_impl(requests, true, stage)
+    }
+
+    fn transact_inactive_banks_impl<T, E, R>(
+        &self,
+        requests: &[R],
+        prefer_ordered_full_frontier: bool,
+        stage: impl FnOnce(&mut [HostBufferBank<'_>]) -> Result<T, E>,
+    ) -> Result<T, HostBufferBankTransactionError<E>>
+    where
+        R: HostBufferBankRequestLike,
+    {
         let mut state = self
             .inner
             .lock()
             .map_err(|_| HostBufferBankTransactionError::Host(HostBufferError::OwnerMismatch))?;
-        let mut requested = BTreeMap::new();
+        let ordered_full_frontier = prefer_ordered_full_frontier
+            && requests.len() == state.slots.len()
+            && requests
+                .iter()
+                .all(|request| request.descriptor().bytes != 0)
+            && requests
+                .iter()
+                .zip(state.slots.keys())
+                .all(|(request, slot)| request.slot() == *slot);
+        let mut requested = (!ordered_full_frontier).then(BTreeMap::new);
+        #[cfg(test)]
+        if ordered_full_frontier {
+            ORDERED_BANK_TRANSACTION_COUNT
+                .set(ORDERED_BANK_TRANSACTION_COUNT.get().saturating_add(1));
+        } else {
+            BANK_REQUEST_MAP_BUILD_COUNT.set(BANK_REQUEST_MAP_BUILD_COUNT.get().saturating_add(1));
+        }
         for (ordinal, request) in requests.iter().enumerate() {
-            if !Arc::ptr_eq(&self.inner, &request.inner)
-                || requested.insert(request.slot, ordinal).is_some()
+            if !Arc::ptr_eq(&self.inner, request.inner())
+                || requested
+                    .as_mut()
+                    .is_some_and(|requested| requested.insert(request.slot(), ordinal).is_some())
             {
                 return Err(HostBufferBankTransactionError::Host(
                     HostBufferError::OwnerMismatch,
                 ));
             }
-            let slot = live_slot(&mut state, request.slot, request.generation)
+            let slot = live_slot(&mut state, request.slot(), request.generation())
                 .map_err(HostBufferBankTransactionError::Host)?;
             if slot.views != 0 || slot.mutable_window {
                 return Err(HostBufferBankTransactionError::Host(
-                    HostBufferError::OutstandingBorrow { slot: request.slot },
+                    HostBufferError::OutstandingBorrow {
+                        slot: request.slot(),
+                    },
                 ));
             }
-            if slot.descriptor.as_ref() != Some(&request.descriptor) {
+            if slot.descriptor.as_ref() != Some(request.descriptor()) {
                 return Err(HostBufferBankTransactionError::Host(
                     HostBufferError::IncompatibleDescriptor,
                 ));
             }
             let inactive = 1 - slot.active;
-            if !request.retain_active
+            if !request.retain_active()
                 && slot.values[inactive]
                     .as_ref()
-                    .is_none_or(|value| !tensor_matches_descriptor(value, &request.descriptor))
+                    .is_none_or(|value| !tensor_matches_descriptor(value, request.descriptor()))
             {
                 slot.values[inactive] = Some(
                     TensorData::zeros_with_dtype(
-                        request.descriptor.shape.clone(),
-                        request.descriptor.dtype,
+                        request.descriptor().shape.clone(),
+                        request.descriptor().dtype,
                     )
                     .map_err(|_| {
                         HostBufferBankTransactionError::Host(
@@ -280,14 +354,25 @@ impl HostSlotPool {
 
         let mut banks = Vec::with_capacity(requests.len());
         for (slot_id, slot) in &mut state.slots {
-            let Some(ordinal) = requested.get(slot_id).copied() else {
-                continue;
+            let ordinal = if ordered_full_frontier {
+                banks.len()
+            } else {
+                let Some(ordinal) = requested
+                    .as_ref()
+                    .expect("generic bank transaction owns its request map")
+                    .get(slot_id)
+                    .copied()
+                else {
+                    continue;
+                };
+                ordinal
             };
+            let request = &requests[ordinal];
             let (active, inactive) = if slot.active == 0 {
                 let (active, inactive) = slot.values.split_at_mut(1);
                 (
                     active[0].as_ref(),
-                    (!requests[ordinal].retain_active)
+                    (!request.retain_active())
                         .then(|| inactive[0].as_mut())
                         .flatten(),
                 )
@@ -295,17 +380,17 @@ impl HostSlotPool {
                 let (inactive, active) = slot.values.split_at_mut(1);
                 (
                     active[0].as_ref(),
-                    (!requests[ordinal].retain_active)
+                    (!request.retain_active())
                         .then(|| inactive[0].as_mut())
                         .flatten(),
                 )
             };
             banks.push(HostBufferBank {
                 ordinal,
-                buffer_id: requests[ordinal].descriptor.buffer_id,
+                buffer_id: request.descriptor().buffer_id,
                 active: active.ok_or_else(|| {
                     HostBufferBankTransactionError::Host(HostBufferError::MissingValue(
-                        requests[ordinal].descriptor.buffer_id,
+                        request.descriptor().buffer_id,
                     ))
                 })?,
                 inactive,
@@ -316,20 +401,24 @@ impl HostSlotPool {
                 HostBufferError::OwnerMismatch,
             ));
         }
-        banks.sort_by_key(|bank| bank.ordinal);
+        if !ordered_full_frontier {
+            banks.sort_by_key(|bank| bank.ordinal);
+            #[cfg(test)]
+            BANK_ORDINAL_SORT_COUNT.set(BANK_ORDINAL_SORT_COUNT.get().saturating_add(1));
+        }
         let value = stage(&mut banks).map_err(HostBufferBankTransactionError::Stage)?;
         if banks.iter().any(|bank| {
-            !tensor_matches_descriptor(bank.successor(), &requests[bank.ordinal].descriptor)
+            !tensor_matches_descriptor(bank.successor(), requests[bank.ordinal].descriptor())
         }) {
             return Err(HostBufferBankTransactionError::Host(
                 HostBufferError::IncompatibleDescriptor,
             ));
         }
         drop(banks);
-        for request in requests.iter().filter(|request| !request.retain_active) {
+        for request in requests.iter().filter(|request| !request.retain_active()) {
             let slot = state
                 .slots
-                .get_mut(&request.slot)
+                .get_mut(&request.slot())
                 .expect("validated inactive persistent bank remains live");
             slot.active = 1 - slot.active;
         }
@@ -462,6 +551,66 @@ pub(crate) struct HostBufferBankRequest {
     retain_active: bool,
 }
 
+pub(crate) struct BorrowedHostBufferBankRequest<'a> {
+    inner: &'a Arc<Mutex<PoolState>>,
+    slot: u64,
+    generation: u64,
+    descriptor: &'a HostBufferDesc,
+    retain_active: bool,
+}
+
+trait HostBufferBankRequestLike {
+    fn inner(&self) -> &Arc<Mutex<PoolState>>;
+    fn slot(&self) -> u64;
+    fn generation(&self) -> u64;
+    fn descriptor(&self) -> &HostBufferDesc;
+    fn retain_active(&self) -> bool;
+}
+
+impl HostBufferBankRequestLike for HostBufferBankRequest {
+    fn inner(&self) -> &Arc<Mutex<PoolState>> {
+        &self.inner
+    }
+
+    fn slot(&self) -> u64 {
+        self.slot
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn descriptor(&self) -> &HostBufferDesc {
+        &self.descriptor
+    }
+
+    fn retain_active(&self) -> bool {
+        self.retain_active
+    }
+}
+
+impl HostBufferBankRequestLike for BorrowedHostBufferBankRequest<'_> {
+    fn inner(&self) -> &Arc<Mutex<PoolState>> {
+        self.inner
+    }
+
+    fn slot(&self) -> u64 {
+        self.slot
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn descriptor(&self) -> &HostBufferDesc {
+        self.descriptor
+    }
+
+    fn retain_active(&self) -> bool {
+        self.retain_active
+    }
+}
+
 pub(crate) struct HostBufferBank<'a> {
     ordinal: usize,
     buffer_id: u64,
@@ -570,6 +719,19 @@ impl HostBufferLease {
             generation: self.generation,
             descriptor: self.descriptor.clone(),
             retain_active: true,
+        }
+    }
+
+    pub(crate) fn borrowed_bank_request(
+        &self,
+        retain_active: bool,
+    ) -> BorrowedHostBufferBankRequest<'_> {
+        BorrowedHostBufferBankRequest {
+            inner: &self.inner,
+            slot: self.slot,
+            generation: self.generation,
+            descriptor: &self.descriptor,
+            retain_active,
         }
     }
 
@@ -961,6 +1123,78 @@ mod tests {
         assert_eq!(
             lease.view().unwrap().tensor().unwrap().to_vec_f64(),
             vec![5.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn ordered_bank_transaction_uses_canonical_full_frontier_without_map_or_sort() {
+        let pool = HostSlotPool::new();
+        let first = pool.lease(Some(7), desc(7, [2])).unwrap();
+        let second = pool.lease(Some(9), desc(9, [2])).unwrap();
+        first
+            .write(TensorData::new([2], vec![1.0, 2.0]).unwrap())
+            .unwrap();
+        second
+            .write(TensorData::new([2], vec![3.0, 4.0]).unwrap())
+            .unwrap();
+        let requests = [
+            first.borrowed_bank_request(false),
+            second.borrowed_bank_request(true),
+        ];
+        reset_host_bank_transaction_test_counts();
+        pool.transact_ordered_inactive_banks(&requests, |banks| {
+            assert_eq!(banks.len(), 2);
+            assert_eq!((banks[0].ordinal(), banks[0].buffer_id()), (0, 7));
+            assert_eq!((banks[1].ordinal(), banks[1].buffer_id()), (1, 9));
+            assert!(!banks[0].is_retained());
+            assert!(banks[1].is_retained());
+            let (_, successor) = banks[0].tensors();
+            *successor = TensorData::new([2], vec![5.0, 6.0]).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(
+            first.view().unwrap().tensor().unwrap().to_vec_f64(),
+            vec![5.0, 6.0]
+        );
+        assert_eq!(
+            second.view().unwrap().tensor().unwrap().to_vec_f64(),
+            vec![3.0, 4.0]
+        );
+        assert_eq!(
+            host_bank_transaction_test_counts(),
+            HostBankTransactionTestCounts {
+                ordered_full_frontier_transactions: 1,
+                request_map_builds: 0,
+                ordinal_sorts: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn ordered_bank_transaction_falls_back_for_zero_byte_sentinel() {
+        let pool = HostSlotPool::new();
+        let zero = pool.lease(None, desc(7, [0])).unwrap();
+        zero.write(TensorData::zeros_with_dtype(Shape::from([0]), DType::F32).unwrap())
+            .unwrap();
+        let requests = [zero.borrowed_bank_request(false)];
+        reset_host_bank_transaction_test_counts();
+        pool.transact_ordered_inactive_banks(&requests, |banks| {
+            assert_eq!(banks.len(), 1);
+            assert_eq!((banks[0].ordinal(), banks[0].buffer_id()), (0, 7));
+            let (active, successor) = banks[0].tensors();
+            assert_eq!(active.len(), 0);
+            assert_eq!(successor.len(), 0);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(
+            host_bank_transaction_test_counts(),
+            HostBankTransactionTestCounts {
+                ordered_full_frontier_transactions: 0,
+                request_map_builds: 1,
+                ordinal_sorts: 1,
+            }
         );
     }
 
