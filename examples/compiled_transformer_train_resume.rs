@@ -2578,7 +2578,23 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             .expect("the scoreboard recorded successful accumulation replays")
     );
 
-    print!("{}", String::from_utf8(report.to_json_bytes()?)?);
+    let report_bytes = report.to_json_bytes()?;
+    let report_json: serde_json::Value = serde_json::from_slice(&report_bytes)?;
+    let compiler_process_count = report_json["prepare_compiler_process_count"]
+        .as_u64()
+        .expect("current scoreboard reports compiler process count");
+    assert_eq!(
+        report_json["prepare_compiler_process_timings"]
+            .as_array()
+            .expect("current scoreboard reports bounded compiler process timings")
+            .len(),
+        usize::try_from(compiler_process_count)?
+    );
+    assert_eq!(
+        report_json["prepare_compiler_critical_tail"].is_object(),
+        compiler_process_count != 0
+    );
+    print!("{}", String::from_utf8(report_bytes)?);
     Ok(())
 }
 

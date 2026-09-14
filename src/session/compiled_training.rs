@@ -1806,6 +1806,49 @@ pub struct NativeCpuProgramPreparationReport {
     wall_time: Duration,
 }
 
+/// One compiler subprocess interval normalized to the common native
+/// preparation-batch origin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeCpuCompilerProcessTiming {
+    program_index: usize,
+    kind: crate::cpu_jit::NativeCompilerProcessKind,
+    permit_request_offset: Duration,
+    permit_wait_time: Duration,
+    process_wall_time: Duration,
+}
+
+impl NativeCpuCompilerProcessTiming {
+    fn from_native(timing: crate::backend::NativeScheduleCompilerProcessTiming) -> Self {
+        Self {
+            program_index: timing.program_index,
+            kind: timing.kind,
+            permit_request_offset: timing.permit_request_offset,
+            permit_wait_time: timing.permit_wait_time,
+            process_wall_time: timing.process_wall_time,
+        }
+    }
+
+    pub(crate) const fn program_index(&self) -> usize {
+        self.program_index
+    }
+
+    pub(crate) const fn kind(&self) -> crate::cpu_jit::NativeCompilerProcessKind {
+        self.kind
+    }
+
+    pub(crate) const fn permit_request_offset(&self) -> Duration {
+        self.permit_request_offset
+    }
+
+    pub(crate) const fn permit_wait_time(&self) -> Duration {
+        self.permit_wait_time
+    }
+
+    pub(crate) const fn process_wall_time(&self) -> Duration {
+        self.process_wall_time
+    }
+}
+
 impl NativeCpuProgramPreparationReport {
     fn validate_work(&self) -> Result<()> {
         self.work.validate(self.native_item_count)?;
@@ -1890,6 +1933,7 @@ pub struct NativeCpuCompiledAdamWPreparationReport {
     compiler_process_overlap_wall_time: Duration,
     compiler_process_count: usize,
     max_parallel_compiler_process_count: usize,
+    compiler_process_timings: Vec<NativeCpuCompilerProcessTiming>,
 }
 
 impl NativeCpuCompiledAdamWPreparationReport {
@@ -1952,6 +1996,13 @@ impl NativeCpuCompiledAdamWPreparationReport {
 
     pub const fn max_parallel_compiler_process_count(&self) -> usize {
         self.max_parallel_compiler_process_count
+    }
+
+    /// Ordered compiler subprocess evidence normalized to one preparation
+    /// batch origin. Warm durable-cache and full-prefix programs contribute no
+    /// process records.
+    pub(crate) fn compiler_process_timings(&self) -> &[NativeCpuCompilerProcessTiming] {
+        &self.compiler_process_timings
     }
 }
 
@@ -11127,6 +11178,11 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 compiler_process_count: compilation.compiler_process_count,
                 max_parallel_compiler_process_count: compilation
                     .max_parallel_compiler_process_count,
+                compiler_process_timings: compilation
+                    .compiler_process_timings
+                    .into_iter()
+                    .map(NativeCpuCompilerProcessTiming::from_native)
+                    .collect(),
             },
             successful_steps: 0,
             successful_flushes: 0,

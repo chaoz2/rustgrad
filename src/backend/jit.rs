@@ -281,7 +281,16 @@ pub(crate) struct NativeScheduleModulePreparation {
     pub(crate) residual_wall_time: Duration,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeScheduleCompilerProcessTiming {
+    pub(crate) program_index: usize,
+    pub(crate) kind: crate::cpu_jit::NativeCompilerProcessKind,
+    pub(crate) permit_request_offset: Duration,
+    pub(crate) permit_wait_time: Duration,
+    pub(crate) process_wall_time: Duration,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeScheduleCompilationBatch {
     pub(crate) parallel_render_overlap_wall_time: Duration,
     pub(crate) max_parallel_render_job_count: usize,
@@ -289,6 +298,7 @@ pub(crate) struct NativeScheduleCompilationBatch {
     pub(crate) compiler_process_overlap_wall_time: Duration,
     pub(crate) compiler_process_count: usize,
     pub(crate) max_parallel_compiler_process_count: usize,
+    pub(crate) compiler_process_timings: Vec<NativeScheduleCompilerProcessTiming>,
 }
 
 const MAX_PARALLEL_NATIVE_RENDER_JOB_COUNT: usize = 2;
@@ -1481,6 +1491,7 @@ impl CpuJitBackend {
             Vec<NativeStoreGroup>,
         )>,
     ) -> Result<PreparedNativeScheduleModules, JitBackendError> {
+        let batch_origin = Instant::now();
         let NativeScheduleRenderBatch {
             rendered,
             parallel_overlap_wall_time: parallel_render_overlap_wall_time,
@@ -1578,16 +1589,56 @@ impl CpuJitBackend {
                 compiled.insert(index, (result, interval));
             }
         }
-        let compiler_intervals = compiled
-            .values()
-            .flat_map(|(result, _)| {
-                result
-                    .as_ref()
-                    .ok()
-                    .into_iter()
-                    .flat_map(|(_, load)| load.compiler_process_intervals.iter().copied())
+        let compiler_observations = compiled
+            .iter()
+            .flat_map(|(program_index, (result, _))| {
+                result.as_ref().ok().into_iter().flat_map(move |(_, load)| {
+                    load.compiler_process_observations
+                        .iter()
+                        .map(move |observation| (*program_index, *observation))
+                })
             })
             .collect::<Vec<_>>();
+        let compiler_intervals = compiler_observations
+            .iter()
+            .map(|(_, observation)| (observation.process_started, observation.process_finished))
+            .collect::<Vec<_>>();
+        let compiler_process_timings = compiler_observations
+            .iter()
+            .map(|(program_index, observation)| {
+                let permit_request_offset = observation
+                    .permit_requested
+                    .checked_duration_since(batch_origin)
+                    .ok_or_else(|| {
+                        JitBackendError::Native(
+                            "native compiler permit request precedes preparation batch".into(),
+                        )
+                    })?;
+                let permit_wait_time = observation
+                    .process_started
+                    .checked_duration_since(observation.permit_requested)
+                    .ok_or_else(|| {
+                        JitBackendError::Native(
+                            "native compiler process precedes its permit request".into(),
+                        )
+                    })?;
+                let process_wall_time = observation
+                    .process_finished
+                    .checked_duration_since(observation.process_started)
+                    .ok_or_else(|| {
+                        JitBackendError::Native(
+                            "native compiler process interval is reversed".into(),
+                        )
+                    })?;
+                Ok(NativeScheduleCompilerProcessTiming {
+                    program_index: *program_index,
+                    kind: observation.kind,
+                    permit_request_offset,
+                    permit_wait_time,
+                    process_wall_time,
+                })
+            })
+            .collect::<Result<Vec<_>, JitBackendError>>()?;
         let work_intervals = compiled
             .values()
             .map(|(_, interval)| *interval)
@@ -1603,6 +1654,7 @@ impl CpuJitBackend {
             compiler_process_overlap_wall_time,
             compiler_process_count: compiler_intervals.len(),
             max_parallel_compiler_process_count,
+            compiler_process_timings,
         };
 
         // Resolve every worker result and authenticate every module ABI before
@@ -2407,6 +2459,25 @@ mod tests {
         assert!(compilation.max_parallel_render_job_count > 0);
         assert!(compilation.max_parallel_render_job_count <= 2);
         assert!(compilation.compiler_process_count <= 2);
+        assert_eq!(
+            compilation.compiler_process_timings.len(),
+            compilation.compiler_process_count
+        );
+        assert!(
+            compilation
+                .compiler_process_timings
+                .windows(2)
+                .all(|pair| pair[0].program_index <= pair[1].program_index),
+            "compiler process observations retain canonical program order"
+        );
+        for timing in &compilation.compiler_process_timings {
+            assert!(timing.program_index < 2);
+            timing
+                .permit_request_offset
+                .checked_add(timing.permit_wait_time)
+                .and_then(|started| started.checked_add(timing.process_wall_time))
+                .expect("normalized compiler timing arithmetic remains bounded");
+        }
         let (prefix, prefix_work) = &programs[0];
         let (extended, extended_work) = &programs[1];
         let (fully_reused, fully_reused_work) = &programs[2];
@@ -2460,6 +2531,7 @@ mod tests {
             .unwrap();
         assert_eq!(warm_programs.len(), programs.len());
         assert_eq!(warm_compilation.compiler_process_count, 0);
+        assert!(warm_compilation.compiler_process_timings.is_empty());
         assert!(warm_compilation.max_parallel_render_job_count > 0);
         assert!(warm_compilation.max_parallel_render_job_count <= 2);
     }
