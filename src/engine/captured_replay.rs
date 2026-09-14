@@ -1221,6 +1221,12 @@ impl PlannedNativeItems {
 }
 
 impl SealedPlannedNativeItems {
+    pub(super) fn new_bindings<'a>(
+        &self,
+    ) -> super::native_replay_workspace::NativeReplayBindings<'a> {
+        self.plan.workspace.new_bindings()
+    }
+
     pub(super) fn item_count(&self) -> usize {
         self.plan.item_count()
     }
@@ -1976,7 +1982,7 @@ impl CapturedReplayExecutor {
         plan: &mut PlannedNativeItems,
     ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
         plan.validate_replay(capture, provided)?;
-        let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
+        let mut borrowed = plan.workspace.new_bindings();
         plan.workspace.begin(provided, &mut borrowed)?;
         plan.workspace.execute_items(
             capture,
@@ -2000,7 +2006,7 @@ impl CapturedReplayExecutor {
         recurrent: &BTreeMap<String, &'a TensorData>,
         plan: &mut PlannedNativeItems,
     ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
-        let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
+        let mut borrowed = plan.workspace.new_bindings();
         let public = capture.requested.iter().copied().collect::<BTreeSet<_>>();
         self.execute_planned_native_items_resolved(
             capture,
@@ -2008,16 +2014,16 @@ impl CapturedReplayExecutor {
             &mut borrowed,
             Some(&public),
             |_workspace, _borrowed| Ok(()),
-            |input, workspace, borrowed| {
+            |input_ordinal, input, workspace, borrowed| {
                 if let Some(value) = recurrent.get(&input.name).copied() {
                     validate_input_value(capture, input, value)?;
-                    workspace.borrow_recurrent_input(&input.name, value, borrowed)
+                    workspace.borrow_recurrent_input_at(input_ordinal, value, borrowed)
                 } else {
                     let value = external
                         .get(&input.name)
                         .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
                     validate_input_value(capture, input, value)?;
-                    workspace.bind_external_input(&input.name, value, borrowed)
+                    workspace.bind_external_input_at(input_ordinal, value, borrowed)
                 }
             },
         )
@@ -2034,6 +2040,7 @@ impl CapturedReplayExecutor {
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         ) -> Result<(), ReplayError>,
         import: impl FnMut(
+            usize,
             &crate::ReplayInput,
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
@@ -2056,6 +2063,7 @@ impl CapturedReplayExecutor {
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         ) -> Result<(), ReplayError>,
         import: impl FnMut(
+            usize,
             &crate::ReplayInput,
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
@@ -2078,18 +2086,18 @@ impl CapturedReplayExecutor {
         plan: &mut SealedPlannedNativeItems,
     ) -> Result<ReplayValues, ReplayError> {
         validate_inputs(capture, provided)?;
-        let mut borrowed = super::native_replay_workspace::NativeReplayBindings::new();
+        let mut borrowed = plan.plan.workspace.new_bindings();
         self.execute_authenticated_native_items_resolved(
             capture,
             &mut plan.plan,
             &mut borrowed,
             None,
             |_workspace, _borrowed| Ok(()),
-            |input, workspace, borrowed| {
+            |input_ordinal, input, workspace, borrowed| {
                 let value = provided
                     .get(&input.name)
                     .ok_or_else(|| ReplayError::Missing(input.name.clone()))?;
-                workspace.bind_external_input(&input.name, value, borrowed)
+                workspace.bind_external_input_at(input_ordinal, value, borrowed)
             },
         )
         .map(|(values, _)| values)
@@ -2106,6 +2114,7 @@ impl CapturedReplayExecutor {
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
         ) -> Result<(), ReplayError>,
         mut import: impl FnMut(
+            usize,
             &crate::ReplayInput,
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
@@ -2114,8 +2123,8 @@ impl CapturedReplayExecutor {
         validate_quantized_index_inputs(capture)?;
         plan.workspace.begin_resolved();
         setup(&mut plan.workspace, borrowed)?;
-        for input in &capture.inputs {
-            import(input, &mut plan.workspace, borrowed)?;
+        for (input_ordinal, input) in capture.inputs.iter().enumerate() {
+            import(input_ordinal, input, &mut plan.workspace, borrowed)?;
         }
         plan.workspace.finish_inputs()?;
         plan.workspace.execute_items(
@@ -2880,6 +2889,50 @@ mod tests {
     }
 
     #[test]
+    fn prepared_borrowed_binding_capacity_excludes_nonborrowable_intermediates() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2]);
+        let intermediate = graph.square(input).unwrap();
+        let intermediate = graph.contiguous(intermediate).unwrap();
+        let output = graph.relu(intermediate).unwrap();
+        let capture = captured(&graph, &[output]);
+        let bindings = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([2], vec![-1.0, 2.0]).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let prepared = plan.workspace_stats();
+        assert_eq!(prepared.borrowed_binding_capacity, 2);
+        assert!(prepared.borrowed_binding_capacity < prepared.allocation_count);
+
+        executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(
+            plan.workspace_stats().borrowed_binding_capacity,
+            prepared.borrowed_binding_capacity
+        );
+        plan.inject_dispatch_failure(capture.items.len() - 1);
+        executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap_err();
+        assert_eq!(
+            plan.workspace_stats().borrowed_binding_capacity,
+            prepared.borrowed_binding_capacity
+        );
+        executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(
+            plan.workspace_stats().borrowed_binding_capacity,
+            prepared.borrowed_binding_capacity
+        );
+    }
+
+    #[test]
     fn planned_native_items_reuse_current_bindings_and_reject_truncated_plans() {
         let mut graph = Graph::new();
         let input = graph.input("input", [2]);
@@ -2909,6 +2962,15 @@ mod tests {
         assert_eq!(segmentation.derived_slot_dependency_count, 0);
         assert_eq!(prepared.sealed_prerequisite_slot_count, 1);
         assert_eq!(prepared.dispatch_metadata_build_count, 1);
+        assert_eq!(prepared.binding_layout_build_count, 1);
+        assert!(prepared.sealed_pointer_count > 0);
+        assert_eq!(
+            prepared.sealed_pointer_count,
+            prepared.sealed_dense_pointer_count
+        );
+        assert_eq!(prepared.sealed_quantized_pointer_count, 0);
+        assert_eq!(prepared.last_borrowed_binding_count, 0);
+        assert!(prepared.borrowed_binding_capacity > 0);
         assert_eq!(prepared.dispatch_scratch_capacity_growth_count, 0);
         assert!(prepared.dispatch_scratch_is_empty);
         plan.poison_outputs(0xa5);
@@ -2939,6 +3001,16 @@ mod tests {
         assert_eq!(first_stats.output_clear_count, 0);
         assert_eq!(first_stats.skipped_output_clear_count, 1);
         assert_eq!(first_stats.dispatch_metadata_build_count, 1);
+        assert_eq!(first_stats.binding_layout_build_count, 1);
+        assert_eq!(
+            first_stats.sealed_pointer_count,
+            prepared.sealed_pointer_count
+        );
+        assert!(first_stats.last_borrowed_binding_count > 0);
+        assert_eq!(
+            first_stats.borrowed_binding_capacity,
+            prepared.borrowed_binding_capacity
+        );
         assert_eq!(first_stats.dispatch_scratch_capacity_growth_count, 0);
         assert!(first_stats.dispatch_scratch_is_empty);
         assert_eq!(bindings["input"], input_value);
@@ -2961,9 +3033,17 @@ mod tests {
         assert_eq!(second_deterministic_traffic, first_deterministic_traffic);
         let second_stats = plan.workspace_stats();
         assert_eq!(second_stats.allocation_count, prepared.allocation_count);
+        assert_eq!(
+            second_stats.borrowed_binding_capacity,
+            prepared.borrowed_binding_capacity
+        );
         assert_eq!(second_stats.input_import_count, 0);
         assert_eq!(second_stats.borrowed_external_input_bytes, 16);
         assert_eq!(second_stats.intermediate_materialization_count, 0);
+        assert_eq!(
+            second_stats.last_borrowed_binding_count,
+            first_stats.last_borrowed_binding_count
+        );
         assert_ne!(
             first.requested(&capture.requested).unwrap(),
             second.requested(&capture.requested).unwrap()
@@ -2993,6 +3073,11 @@ mod tests {
         assert_eq!(retried_deterministic_traffic, first_deterministic_traffic);
         assert_eq!(plan.workspace_stats().borrowed_external_input_bytes, 24);
         assert_eq!(plan.workspace_stats().dispatch_metadata_build_count, 1);
+        assert_eq!(plan.workspace_stats().binding_layout_build_count, 1);
+        assert_eq!(
+            plan.workspace_stats().last_borrowed_binding_count,
+            first_stats.last_borrowed_binding_count
+        );
         assert_eq!(
             plan.workspace_stats()
                 .dispatch_scratch_capacity_growth_count,
@@ -3058,7 +3143,7 @@ mod tests {
         assert_eq!(traffic.materialized_egress_bytes, 24);
 
         let selected = BTreeSet::from([source.index() as u64]);
-        let mut borrowed = super::super::native_replay_workspace::NativeReplayBindings::new();
+        let mut borrowed = plan.workspace.new_bindings();
         let (_, selected_traffic) = executor
             .execute_planned_native_items_resolved(
                 &capture,
@@ -3066,8 +3151,12 @@ mod tests {
                 &mut borrowed,
                 Some(&selected),
                 |_workspace, _borrowed| Ok(()),
-                |input, workspace, borrowed| {
-                    workspace.bind_external_input(&input.name, &bindings[&input.name], borrowed)
+                |input_ordinal, input, workspace, borrowed| {
+                    workspace.bind_external_input_at(
+                        input_ordinal,
+                        &bindings[&input.name],
+                        borrowed,
+                    )
                 },
             )
             .unwrap();
@@ -3322,6 +3411,12 @@ mod tests {
         let id = weight.index() as u64;
         let prepared = plan.workspace_stats();
         assert_eq!(prepared.dispatch_metadata_build_count, 1);
+        assert!(prepared.sealed_dense_pointer_count > 0);
+        assert!(prepared.sealed_quantized_pointer_count > 0);
+        assert_eq!(
+            prepared.sealed_pointer_count,
+            prepared.sealed_dense_pointer_count + prepared.sealed_quantized_pointer_count
+        );
         assert_eq!(prepared.dispatch_scratch_capacity_growth_count, 0);
         assert!(prepared.dispatch_scratch_is_empty);
         let mut changed_bytes = vec![0; 36];
@@ -3451,6 +3546,8 @@ mod tests {
         let stats = plan.workspace_stats();
         assert_eq!(stats.input_import_count, 1);
         assert_eq!(stats.borrowed_external_input_bytes, 0);
+        assert_eq!(stats.binding_layout_build_count, 1);
+        assert_eq!(stats.last_borrowed_binding_count, 0);
     }
 
     #[test]
@@ -3479,6 +3576,8 @@ mod tests {
         let stats = plan.workspace_stats();
         assert_eq!(stats.input_import_count, 0);
         assert_eq!(stats.borrowed_external_input_bytes, 12);
+        assert_eq!(stats.binding_layout_build_count, 1);
+        assert!(stats.last_borrowed_binding_count > 0);
     }
 
     #[test]

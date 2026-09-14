@@ -255,7 +255,7 @@ struct PreparedScheduleSegmentEntry {
 pub(crate) struct PreparedScheduleSegment {
     dispatcher: Arc<JitScheduleDispatcher>,
     entries: Vec<PreparedScheduleSegmentEntry>,
-    pointer_count: usize,
+    pointers: Box<[crate::cpu_jit::NativeSchedulePointerSource]>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -780,6 +780,7 @@ impl PreparedScheduleDispatch {
 
     pub(crate) fn seal_segment(
         entries: &[&Self],
+        binding_ordinals: &[Option<crate::cpu_jit::NativeReplayBindingOrdinal>],
     ) -> Result<PreparedScheduleSegment, JitBackendError> {
         let Some(first) = entries.first() else {
             return Err(JitBackendError::Binding(
@@ -794,18 +795,57 @@ impl PreparedScheduleDispatch {
                 "native schedule segment spans multiple modules".into(),
             ));
         }
-        let mut pointer_count = 0_usize;
+        let mut pointers = Vec::new();
         let entries = entries
             .iter()
-            .map(|prepared| {
-                let pointer_offset = pointer_count;
-                pointer_count = pointer_count
+            .enumerate()
+            .map(|(entry, prepared)| {
+                let pointer_offset = pointers.len();
+                let next_pointer_count = pointer_offset
                     .checked_add(prepared.kernel.abi().pointer_order.len())
                     .ok_or_else(|| {
                         JitBackendError::Binding(
                             "native schedule segment pointer count overflows".into(),
                         )
                     })?;
+                for source in &prepared.kernel.abi().pointer_order {
+                    let source = match *source {
+                        crate::cpu_jit::KernelPointerAbi::Dense(ordinal) => {
+                            let slot = prepared.slots.get(ordinal).copied().ok_or_else(|| {
+                                JitBackendError::Binding(
+                                    "native schedule dense pointer ordinal is absent".into(),
+                                )
+                            })?;
+                            let binding = binding_ordinals.get(slot).copied().ok_or_else(|| {
+                                JitBackendError::Binding(
+                                    "native schedule dense binding slot is absent".into(),
+                                )
+                            })?;
+                            crate::cpu_jit::NativeSchedulePointerSource::Dense {
+                                entry,
+                                arena_slot: slot,
+                                binding,
+                            }
+                        }
+                        crate::cpu_jit::KernelPointerAbi::Quantized(ordinal) => {
+                            if prepared.quantized.get(ordinal).is_none() {
+                                return Err(JitBackendError::Binding(
+                                    "native schedule quantized pointer ordinal is absent".into(),
+                                ));
+                            }
+                            crate::cpu_jit::NativeSchedulePointerSource::Quantized {
+                                entry,
+                                ordinal,
+                            }
+                        }
+                    };
+                    pointers.push(source);
+                }
+                if pointers.len() != next_pointer_count {
+                    return Err(JitBackendError::Binding(
+                        "native schedule segment pointer count mismatch".into(),
+                    ));
+                }
                 Ok(PreparedScheduleSegmentEntry {
                     kernel: prepared.kernel.clone(),
                     slots: prepared.slots.clone(),
@@ -822,7 +862,7 @@ impl PreparedScheduleDispatch {
         Ok(PreparedScheduleSegment {
             dispatcher: first.dispatcher.clone(),
             entries,
-            pointer_count,
+            pointers: pointers.into_boxed_slice(),
         })
     }
 }
@@ -833,7 +873,19 @@ impl PreparedScheduleSegment {
     }
 
     pub(crate) const fn pointer_count(&self) -> usize {
-        self.pointer_count
+        self.pointers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pointer_source_counts(&self) -> (usize, usize) {
+        self.pointers
+            .iter()
+            .fold((0, 0), |(dense, quantized), source| match source {
+                crate::cpu_jit::NativeSchedulePointerSource::Dense { .. } => (dense + 1, quantized),
+                crate::cpu_jit::NativeSchedulePointerSource::Quantized { .. } => {
+                    (dense, quantized + 1)
+                }
+            })
     }
 
     pub(crate) fn authenticate(
@@ -867,14 +919,14 @@ impl PreparedScheduleSegment {
         &self,
         materializations: &[crate::cpu_jit::NativeDispatchMaterialization],
         buffers: &mut [JitBuffer],
-        borrowed: Option<&mut BTreeMap<usize, crate::cpu_jit::BorrowedJitBuffer<'_>>>,
+        borrowed: Option<&mut crate::cpu_jit::IndexedBorrowedJitBuffers<'_>>,
         scratch: &mut crate::cpu_jit::JitScheduleDispatchScratch,
     ) -> Result<crate::cpu_jit::NativeDispatchTiming, PreparedScheduleDispatchFailure> {
         self.dispatcher
             .call_prepared(
                 crate::cpu_jit::NativeScheduleDispatchPlan::new(
                     self.entries.len(),
-                    self.pointer_count,
+                    &self.pointers,
                     materializations,
                 ),
                 buffers,
@@ -1964,7 +2016,7 @@ impl CpuJitBackend {
         item: &ScheduleItem,
         buffers: &mut [JitBuffer],
         slots: &[usize],
-        borrowed: Option<&mut BTreeMap<usize, crate::cpu_jit::BorrowedJitBuffer<'_>>>,
+        borrowed: Option<&mut crate::cpu_jit::IndexedBorrowedJitBuffers<'_>>,
         quantized_values: &BTreeMap<u64, crate::QuantizedTensorData>,
         prepared: &PreparedScheduleItem,
     ) -> Result<JitExecution, JitBackendError> {
