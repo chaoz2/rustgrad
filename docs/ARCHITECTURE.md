@@ -1314,6 +1314,20 @@ and capture identity. `EffectRuntime` and `MixedReplayCursor` restore logical
 versions only after full schema validation. No executable graph, schedule,
 runtime slot, or host pointer is serialized.
 
+##### Prepared CPU restore
+
+- `CompiledCheckpointRestoreRuntime` restores an authenticated checkpoint into
+  an already prepared interpreter or strict-native CPU AdamW session.
+- Restore builds and prepares a detached candidate before one publication.
+  Decode, policy, schema, descriptor, or non-finite-state failure leaves the
+  live runtime unchanged and retryable.
+- The interpreter replaces its complete runtime. Strict-native CPU replaces
+  only its logical inner state, retaining prepared programs, preparation
+  evidence, workspaces, and lifetime invocation counters. This does not claim
+  that recurrent storage slots keep the same physical identity.
+- Owned-module sessions delegate the same transaction and retain their sealed
+  module for later publication. Metal has no in-place restore implementation.
+
 - Dropout-bearing v4 adds the current block counter to AdamW tensors and
   progress. The key and reservation topology remain capture-authenticated.
 - Ordinary restore rejects a dropout checkpoint; the dedicated path validates

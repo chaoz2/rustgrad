@@ -4810,6 +4810,14 @@ pub trait CompiledCheckpointRuntime: CompiledTrainingRuntime {
     fn checkpoint(&self) -> Result<Self::Checkpoint>;
 }
 
+/// In-place checkpoint restoration for an already prepared training runtime.
+///
+/// Implementations validate and prepare a detached candidate before replacing
+/// live state. A failed restore leaves the runtime unchanged.
+pub trait CompiledCheckpointRestoreRuntime: CompiledCheckpointRuntime {
+    fn restore_checkpoint_in_place(&mut self, checkpoint: &Self::Checkpoint) -> Result<()>;
+}
+
 /// AdamW-specific policy and recurrent-state inspection.
 ///
 /// CPU and Metal AdamW sessions share this extension and the same checkpoint
@@ -10618,10 +10626,7 @@ impl CpuCompiledAdamW {
             .adamw_state_versions(AdamWParameterState::SecondMoment)
     }
 
-    /// Renders the identical loss/backward/AdamW capture for Metal, seeded
-    /// from this session's currently committed recurrent state. Planning is
-    /// resource-free; unsupported kernels fail before a device is touched.
-    pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
+    fn snapshot_plan(&self) -> Result<CompiledAdamWPlan> {
         let inner = self.inner.plan()?;
         let partial_flush = self
             .partial_flush
@@ -10633,7 +10638,7 @@ impl CpuCompiledAdamW {
             .clone()
             .map(|transition| transition.with_frontier(&inner.state_values))
             .transpose()?;
-        CompiledAdamWPlan {
+        Ok(CompiledAdamWPlan {
             inner,
             partial_flush,
             zero_grad,
@@ -10655,8 +10660,20 @@ impl CpuCompiledAdamW {
                 .map(|evaluation| evaluation.plan.clone()),
             learning_rate: self.learning_rate.clone(),
             adamw_policy: self.adamw_policy.clone(),
-        }
-        .metal_plan(renderer)
+        })
+    }
+
+    fn restored_candidate(&self, checkpoint: &CompiledAdamWCheckpoint) -> Result<Self> {
+        self.snapshot_plan()?
+            .restore_checkpoint(checkpoint)?
+            .prepare_cpu_with_non_finite_policy(self.non_finite_policy)
+    }
+
+    /// Renders the identical loss/backward/AdamW capture for Metal, seeded
+    /// from this session's currently committed recurrent state. Planning is
+    /// resource-free; unsupported kernels fail before a device is touched.
+    pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
+        self.snapshot_plan()?.metal_plan(renderer)
     }
 
     /// Captures parameter values, both moment sets, the graph-owned optimizer
@@ -11516,6 +11533,14 @@ impl CompiledCheckpointRuntime for CpuCompiledAdamW {
     }
 }
 
+impl CompiledCheckpointRestoreRuntime for CpuCompiledAdamW {
+    fn restore_checkpoint_in_place(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+        let restored = self.restored_candidate(checkpoint)?;
+        *self = restored;
+        Ok(())
+    }
+}
+
 impl CompiledAdamWRuntime for CpuCompiledAdamW {
     fn gradient_accumulation_steps(&self) -> u64 {
         CpuCompiledAdamW::gradient_accumulation_steps(self)
@@ -11664,6 +11689,14 @@ impl CompiledCheckpointRuntime for NativeCpuCompiledAdamW<'_> {
     }
 }
 
+impl CompiledCheckpointRestoreRuntime for NativeCpuCompiledAdamW<'_> {
+    fn restore_checkpoint_in_place(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+        let restored = self.inner.restored_candidate(checkpoint)?;
+        self.inner = restored;
+        Ok(())
+    }
+}
+
 impl CompiledAdamWRuntime for NativeCpuCompiledAdamW<'_> {
     fn gradient_accumulation_steps(&self) -> u64 {
         self.inner.gradient_accumulation_steps()
@@ -11690,7 +11723,7 @@ impl CompiledAdamWRuntime for NativeCpuCompiledAdamW<'_> {
     }
 
     fn zero_grad(&mut self) -> Result<CompiledAdamWZeroGradResult> {
-        self.inner.zero_grad()
+        NativeCpuCompiledAdamW::zero_grad(self)
     }
 
     fn zero_grad_capture_identity(&self) -> Option<u64> {
@@ -11796,6 +11829,15 @@ where
 
     fn checkpoint(&self) -> Result<Self::Checkpoint> {
         self.runtime.checkpoint()
+    }
+}
+
+impl<M, R> CompiledCheckpointRestoreRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledCheckpointRestoreRuntime,
+{
+    fn restore_checkpoint_in_place(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+        self.runtime.restore_checkpoint_in_place(checkpoint)
     }
 }
 
@@ -15085,6 +15127,34 @@ mod tests {
                 .to_string()
                 .contains("non-finite prepared recurrent state")
         );
+
+        let mut interpreted = plan.prepare(&rejecting_cpu_target()).unwrap();
+        let before = interpreted.checkpoint().unwrap();
+        assert!(
+            interpreted
+                .restore_checkpoint_in_place(&propagating.checkpoint().unwrap())
+                .is_err()
+        );
+        assert_eq!(interpreted.checkpoint().unwrap(), before);
+        interpreted.restore_checkpoint_in_place(&before).unwrap();
+        assert_eq!(interpreted.checkpoint().unwrap(), before);
+
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor)
+            .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+        let mut native = plan.prepare(&target).unwrap();
+        let before = native.checkpoint().unwrap();
+        let plan_count = executor.native_item_plan_count();
+        assert!(
+            native
+                .restore_checkpoint_in_place(&propagating.checkpoint().unwrap())
+                .is_err()
+        );
+        assert_eq!(native.checkpoint().unwrap(), before);
+        assert_eq!(executor.native_item_plan_count(), plan_count);
+        native.restore_checkpoint_in_place(&before).unwrap();
+        assert_eq!(native.checkpoint().unwrap(), before);
+        assert_eq!(executor.native_item_plan_count(), plan_count);
     }
 
     #[test]
@@ -19285,6 +19355,268 @@ mod tests {
     }
 
     #[test]
+    fn prepared_native_checkpoint_restore_reuses_programs_and_lifetime_counters() {
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let batch = || token_evaluation_batch([1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+        let preparation_identity = |runtime: &NativeCpuCompiledAdamW<'_>| {
+            let preparation = runtime.preparation_report();
+            std::iter::once(preparation.main())
+                .chain(preparation.accumulation())
+                .chain(preparation.partial_flush())
+                .chain(preparation.zero_grad())
+                .chain(preparation.evaluation())
+                .map(|program| {
+                    (
+                        program.capture_identity(),
+                        program.native_identity(),
+                        program.native_item_count(),
+                        program.cache_hit_count(),
+                        program.cache_miss_count(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut runtime = compile_token_evaluation_plan().prepare(&target).unwrap();
+        let preparation = preparation_identity(&runtime.runtime);
+        let native_plan_count = executor.native_item_plan_count();
+        let evaluated = runtime.evaluate(batch()).unwrap();
+        assert_eq!(evaluated.report().successful_invocation(), 1);
+        let first = runtime.step(batch(), TensorData::scalar(0.01)).unwrap();
+        assert!(!first.did_update());
+        let pending = runtime.checkpoint().unwrap();
+        assert!(
+            runtime
+                .step(batch(), TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        assert!(
+            !runtime
+                .step(batch(), TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        assert!(runtime.zero_grad().unwrap().did_discard());
+        assert_eq!(runtime.runtime.successful_steps, 3);
+        assert_eq!(runtime.runtime.successful_zero_grads, 1);
+
+        runtime.restore_checkpoint_in_place(&pending).unwrap();
+        assert_eq!(runtime.checkpoint().unwrap(), pending);
+        assert_eq!(preparation_identity(&runtime.runtime), preparation);
+        assert_eq!(executor.native_item_plan_count(), native_plan_count);
+        assert_eq!(runtime.runtime.successful_steps, 3);
+        assert_eq!(runtime.runtime.successful_zero_grads, 1);
+        assert_eq!(runtime.runtime.successful_evaluations, 1);
+
+        let mut reference = compile_token_evaluation_plan()
+            .restore_checkpoint(&pending)
+            .unwrap()
+            .prepare(&target)
+            .unwrap();
+        let actual_evaluation = runtime.evaluate(batch()).unwrap();
+        let expected_evaluation = reference.evaluate(batch()).unwrap();
+        assert_eq!(actual_evaluation.loss(), expected_evaluation.loss());
+        assert_eq!(actual_evaluation.outputs(), expected_evaluation.outputs());
+        assert_eq!(actual_evaluation.report().successful_invocation(), 2);
+        assert_eq!(expected_evaluation.report().successful_invocation(), 1);
+
+        let actual_flush = runtime
+            .flush_partial_window(TensorData::scalar(0.01))
+            .unwrap();
+        let expected_flush = reference
+            .flush_partial_window(TensorData::scalar(0.01))
+            .unwrap();
+        assert!(actual_flush.did_update());
+        assert_eq!(
+            actual_flush.optimizer_step(),
+            expected_flush.optimizer_step()
+        );
+        assert_eq!(
+            runtime.checkpoint().unwrap(),
+            reference.checkpoint().unwrap()
+        );
+
+        let actual = runtime.step(batch(), TensorData::scalar(0.01)).unwrap();
+        let expected = reference.step(batch(), TensorData::scalar(0.01)).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(actual.report().successful_invocation(), 4);
+        assert_eq!(expected.report().successful_invocation(), 1);
+        assert_eq!(
+            runtime.checkpoint().unwrap(),
+            reference.checkpoint().unwrap()
+        );
+
+        let checkpoint = runtime.checkpoint().unwrap();
+        let expected_weight = decode_adamw_checkpoint(checkpoint.as_bytes())
+            .unwrap()
+            .parameters["weight"]
+            .clone();
+        let module = runtime.finish().unwrap();
+        assert_eq!(module.weight.value().unwrap(), expected_weight);
+    }
+
+    #[test]
+    fn prepared_native_restore_accepts_frontiers_older_than_preparation() {
+        let batch = || token_evaluation_batch([1.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+        let mut source = compile_token_evaluation_plan()
+            .prepare(&CpuSessionTarget)
+            .unwrap();
+        assert!(
+            !source
+                .step(batch(), TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        let older = source.checkpoint().unwrap();
+        assert_eq!(older.info().replay_step(), 1);
+        assert_eq!(older.info().optimizer_step(), 0);
+        assert_eq!(older.info().accumulation_index(), 1);
+        assert!(
+            source
+                .step(batch(), TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        assert!(
+            !source
+                .step(batch(), TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        assert!(source.zero_grad().unwrap().did_discard());
+        assert!(
+            !source
+                .step(batch(), TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        assert!(
+            source
+                .flush_partial_window(TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        let newer = source.checkpoint().unwrap();
+        assert_eq!(newer.info().replay_step(), 4);
+        assert_eq!(newer.info().optimizer_step(), 2);
+        assert_eq!(newer.info().accumulation_index(), 0);
+        assert_eq!(newer.info().reset_transition_count(), 1);
+        assert_eq!(newer.info().flushed_window_count(), 1);
+
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut runtime = compile_token_evaluation_plan()
+            .restore_checkpoint(&newer)
+            .unwrap()
+            .prepare(&target)
+            .unwrap();
+        let preparation = format!("{:?}", runtime.runtime.preparation_report());
+        let native_plan_count = executor.native_item_plan_count();
+        let workspace_stats = |runtime: &NativeCpuCompiledAdamW<'_>| {
+            std::iter::once(runtime.main_replay.workspace_stats())
+                .chain(
+                    runtime
+                        .accumulation_replay
+                        .iter()
+                        .map(PreparedRecurrentNativeReplay::workspace_stats),
+                )
+                .chain(
+                    runtime
+                        .partial_flush_replay
+                        .iter()
+                        .map(PreparedRecurrentNativeReplay::workspace_stats),
+                )
+                .chain(
+                    runtime
+                        .zero_grad_replay
+                        .iter()
+                        .map(PreparedRecurrentNativeReplay::workspace_stats),
+                )
+                .chain(
+                    runtime
+                        .evaluation_replay
+                        .iter()
+                        .map(|evaluation| evaluation.plan.workspace_stats()),
+                )
+                .collect::<Vec<_>>()
+        };
+        runtime.evaluate(batch()).unwrap();
+        runtime.step(batch(), TensorData::scalar(0.01)).unwrap();
+        let workspaces = workspace_stats(&runtime.runtime);
+
+        runtime.restore_checkpoint_in_place(&older).unwrap();
+        assert_eq!(runtime.checkpoint().unwrap(), older);
+        assert_eq!(
+            format!("{:?}", runtime.runtime.preparation_report()),
+            preparation
+        );
+        assert_eq!(workspace_stats(&runtime.runtime), workspaces);
+        assert_eq!(executor.native_item_plan_count(), native_plan_count);
+        assert_eq!(runtime.runtime.successful_steps, 1);
+        assert_eq!(runtime.runtime.successful_evaluations, 1);
+
+        assert!(runtime.zero_grad().unwrap().did_discard());
+        let reset_replay = runtime.runtime.zero_grad_replay.as_ref().unwrap();
+        assert!(reset_replay.last_executed_native_item_count() > 0);
+        let reset_dispatch = reset_replay.last_module_dispatch_counts();
+        assert!(reset_dispatch.0 > 0);
+        assert_eq!(
+            reset_dispatch.1,
+            reset_replay.last_executed_native_item_count()
+        );
+        runtime.restore_checkpoint_in_place(&older).unwrap();
+        assert!(
+            runtime
+                .flush_partial_window(TensorData::scalar(0.01))
+                .unwrap()
+                .did_update()
+        );
+        runtime.restore_checkpoint_in_place(&older).unwrap();
+        assert_eq!(runtime.runtime.successful_zero_grads, 1);
+        assert_eq!(runtime.runtime.successful_flushes, 1);
+        assert_eq!(executor.native_item_plan_count(), native_plan_count);
+
+        let mut reference = compile_token_evaluation_plan()
+            .restore_checkpoint(&older)
+            .unwrap()
+            .prepare(&target)
+            .unwrap();
+        let actual_evaluation = runtime.evaluate(batch()).unwrap();
+        let expected_evaluation = reference.evaluate(batch()).unwrap();
+        assert_eq!(actual_evaluation.loss(), expected_evaluation.loss());
+        assert_eq!(actual_evaluation.outputs(), expected_evaluation.outputs());
+
+        let actual_main = runtime.step(batch(), TensorData::scalar(0.01)).unwrap();
+        let expected_main = reference.step(batch(), TensorData::scalar(0.01)).unwrap();
+        assert!(actual_main.did_update());
+        assert_eq!(actual_main.loss(), expected_main.loss());
+        assert_eq!(actual_main.outputs(), expected_main.outputs());
+        assert_eq!(
+            runtime.checkpoint().unwrap(),
+            reference.checkpoint().unwrap()
+        );
+
+        let actual_accumulation = runtime.step(batch(), TensorData::scalar(0.01)).unwrap();
+        let expected_accumulation = reference.step(batch(), TensorData::scalar(0.01)).unwrap();
+        assert!(!actual_accumulation.did_update());
+        assert_eq!(actual_accumulation.loss(), expected_accumulation.loss());
+        assert_eq!(
+            actual_accumulation.outputs(),
+            expected_accumulation.outputs()
+        );
+        assert_eq!(
+            runtime.checkpoint().unwrap(),
+            reference.checkpoint().unwrap()
+        );
+        assert_eq!(runtime.runtime.successful_steps, 3);
+        assert_eq!(runtime.runtime.successful_evaluations, 2);
+        assert_eq!(executor.native_item_plan_count(), native_plan_count * 2);
+    }
+
+    #[test]
     fn legacy_scalar_evaluation_keeps_unit_weight() {
         let legacy = CompiledModuleAdamWPlan::compile(
             module_config(),
@@ -20657,6 +20989,13 @@ mod tests {
         };
         assert!(error.to_string().contains("state descriptor mismatch"));
         assert_eq!(plan.prepare_cpu().unwrap().checkpoint().unwrap(), initial);
+
+        let before = runtime.checkpoint().unwrap();
+        let error = runtime.restore_checkpoint_in_place(&malformed).unwrap_err();
+        assert!(error.to_string().contains("state descriptor mismatch"));
+        assert_eq!(runtime.checkpoint().unwrap(), before);
+        runtime.restore_checkpoint_in_place(&before).unwrap();
+        assert_eq!(runtime.checkpoint().unwrap(), before);
     }
 
     #[test]
@@ -22756,9 +23095,26 @@ mod tests {
             .unwrap()
             .with_input("target", [4], DType::I64)
             .unwrap();
+        let wrong_checkpoint =
+            CompiledAdamWPlan::compile(wrong.clone(), initial_parameters(), build_tinybob)
+                .unwrap()
+                .prepare_cpu()
+                .unwrap()
+                .checkpoint()
+                .unwrap();
         assert!(
             CpuCompiledAdamW::compile_from_checkpoint(wrong, &checkpoint, build_tinybob).is_err()
         );
+        let mut runtime = compiled_adamw();
+        let before = runtime.checkpoint().unwrap();
+        assert!(
+            runtime
+                .restore_checkpoint_in_place(&wrong_checkpoint)
+                .is_err()
+        );
+        assert_eq!(runtime.checkpoint().unwrap(), before);
+        runtime.restore_checkpoint_in_place(&before).unwrap();
+        assert_eq!(runtime.checkpoint().unwrap(), before);
         let clipped = adamw_config().with_max_gradient_norm(1.0).unwrap();
         assert!(
             CpuCompiledAdamW::compile_from_checkpoint(clipped, &checkpoint, build_tinybob).is_err()

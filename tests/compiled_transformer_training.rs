@@ -12,16 +12,16 @@ use rustgrad::{
     CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWIgnoreIndexContext,
     CompiledAdamWObjective, CompiledAdamWPlan, CompiledAdamWProgramArtifact, CompiledAdamWRuntime,
     CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWWindowLossReport,
-    CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation,
-    CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
-    CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan, CompiledModuleAdamWSession,
-    CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
-    CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph, LossOptions,
-    MetalCompiledAdamWPlan, Module, NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeCpuCompiledAdamW,
-    NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget, NativeTrainingReport,
-    NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result, Scalar, Shape, TensorData,
-    TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy, load_safetensors,
-    save_safetensors, schedule_many, sparse_categorical_cross_entropy,
+    CompiledCheckpointRestoreRuntime, CompiledCheckpointRuntime, CompiledDropoutConfig,
+    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
+    CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
+    CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep,
+    CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph,
+    LossOptions, MetalCompiledAdamWPlan, Module, NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget,
+    NativeTrainingReport, NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result,
+    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy,
+    load_safetensors, save_safetensors, schedule_many, sparse_categorical_cross_entropy,
 };
 use serde::Deserialize;
 use std::cell::Cell;
@@ -2564,6 +2564,27 @@ fn assert_native_policy_preparation(runtime: &NativeCpuCompiledAdamW<'_>) {
         assert_eq!(program.fallback_count(), 0, "{phase} fallback");
     }
     assert!(preparation.evaluation().is_none());
+}
+
+fn native_policy_preparation_identity(
+    runtime: &NativeCpuCompiledAdamW<'_>,
+) -> Vec<(u64, u64, usize, usize, usize)> {
+    let preparation = runtime.preparation_report();
+    std::iter::once(preparation.main())
+        .chain(preparation.accumulation())
+        .chain(preparation.partial_flush())
+        .chain(preparation.zero_grad())
+        .chain(preparation.evaluation())
+        .map(|program| {
+            (
+                program.capture_identity(),
+                program.native_identity(),
+                program.native_item_count(),
+                program.cache_hit_count(),
+                program.cache_miss_count(),
+            )
+        })
+        .collect()
 }
 
 fn assert_native_policy_progress(
@@ -9578,6 +9599,23 @@ fn compiled_two_block_policy_frontier_matches_pytorch_on_strict_native_cpu() {
         f64::from(pending.loss_numerator),
     );
 
+    // Advance both ordinary and reset-transition versions, then roll the same
+    // prepared native runtime back without preparing another native program.
+    let preparation_before_restore = native_policy_preparation_identity(&uninterrupted);
+    let discarded = uninterrupted
+        .step_scheduled(policy_frontier_batch(5))
+        .unwrap();
+    assert_eq!(discarded.report().successful_invocation(), 5);
+    assert!(uninterrupted.zero_grad().unwrap().did_discard());
+    uninterrupted
+        .restore_checkpoint_in_place(&pending_checkpoint)
+        .unwrap();
+    assert_eq!(uninterrupted.checkpoint().unwrap(), pending_checkpoint);
+    assert_eq!(
+        native_policy_preparation_identity(&uninterrupted),
+        preparation_before_restore
+    );
+
     let restored_plan = plan.restore_checkpoint(&pending_checkpoint).unwrap();
     assert_eq!(restored_plan.capture_identity(), plan.capture_identity());
     assert_eq!(compile_count.get(), 1);
@@ -9592,6 +9630,8 @@ fn compiled_two_block_policy_frontier_matches_pytorch_on_strict_native_cpu() {
     assert!(!fifth.did_update());
     assert_native_policy_step(&fifth, &policy.replays[4]);
     assert_native_policy_step(&resumed_fifth, &policy.replays[4]);
+    assert_eq!(fifth.report().successful_invocation(), 6);
+    assert_eq!(resumed_fifth.report().successful_invocation(), 1);
     assert_compiled_adamw_steps_exact(
         "strict-native policy replay 5 resume",
         &resumed_fifth,
@@ -9809,7 +9849,13 @@ fn compiled_two_block_evaluation_loss_trajectory_matches_pytorch_without_state_c
         &evaluation.points[1],
         &executor,
     );
-    for replay in 4..=6 {
+    session.step_scheduled(policy_frontier_batch(4)).unwrap();
+    let pending = session.checkpoint().unwrap();
+    session.step_scheduled(policy_frontier_batch(5)).unwrap();
+    assert!(session.zero_grad().unwrap().did_discard());
+    session.restore_checkpoint_in_place(&pending).unwrap();
+    assert_eq!(session.checkpoint().unwrap(), pending);
+    for replay in 5..=6 {
         session
             .step_scheduled(policy_frontier_batch(replay))
             .unwrap();
