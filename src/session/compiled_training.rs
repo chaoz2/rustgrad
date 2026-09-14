@@ -16627,11 +16627,42 @@ mod tests {
             .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
         let mut native = target.prepare(&plan).unwrap();
         assert_eq!(executor.native_item_plan_count(), 4);
+        let expected_recurrent_state_count = plan.inspection().unwrap().recurrent_state_count();
+        let main_layout = native.main_replay.recurrent_bank_layout_evidence();
+        let main_buffers = main_layout.buffers;
+        let main_inputs = main_layout.input_ordinals;
+        assert_eq!(main_buffers.len(), expected_recurrent_state_count);
+        assert!(
+            main_buffers
+                .windows(2)
+                .all(|buffers| buffers[0] < buffers[1])
+        );
+        let mut sorted_main_inputs = main_inputs.clone();
+        sorted_main_inputs.sort_unstable();
+        assert_eq!(
+            sorted_main_inputs,
+            (0..expected_recurrent_state_count).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            main_layout.retained,
+            vec![false; expected_recurrent_state_count]
+        );
+        assert_eq!(
+            (main_layout.retained_count, main_layout.retained_bytes),
+            (0, 0)
+        );
         let accumulation_workspace = native
             .accumulation_replay
             .as_ref()
             .unwrap()
             .workspace_stats();
+        let accumulation_layout = native
+            .accumulation_replay
+            .as_ref()
+            .unwrap()
+            .recurrent_bank_layout_evidence();
+        assert_eq!(accumulation_layout.buffers, main_buffers);
+        assert_eq!(accumulation_layout.input_ordinals, main_inputs);
         let expected_retained_buffers = accumulation_transition
             .state_buffers
             .iter()
@@ -16643,6 +16674,19 @@ mod tests {
             expected_retained_buffers.len(),
             initial_parameters().len() * 3 + 1
         );
+        assert_eq!(
+            main_buffers
+                .iter()
+                .zip(accumulation_layout.retained)
+                .filter_map(|(buffer, retained)| retained.then_some(*buffer))
+                .collect::<BTreeSet<_>>(),
+            expected_retained_buffers
+        );
+        assert_eq!(
+            accumulation_layout.retained_count,
+            u64::try_from(expected_retained_buffers.len()).unwrap()
+        );
+        assert!(accumulation_layout.retained_bytes > 0);
         assert_eq!(
             native
                 .accumulation_replay
