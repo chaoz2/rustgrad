@@ -3,12 +3,13 @@
 mod adamw_checkpoint;
 mod module_adamw_checkpoint;
 mod program_artifact;
+mod resume_bundle;
 mod state_schema;
 
 #[cfg(test)]
 use self::adamw_checkpoint::{
     ADAMW_CHECKPOINT_FORMAT_V1, ADAMW_CHECKPOINT_FORMAT_V2, ADAMW_CHECKPOINT_FORMAT_V3,
-    ADAMW_CHECKPOINT_FORMAT_V4, ADAMW_CHECKPOINT_FORMAT_V9,
+    ADAMW_CHECKPOINT_FORMAT_V4, ADAMW_CHECKPOINT_FORMAT_V8, ADAMW_CHECKPOINT_FORMAT_V9,
 };
 use self::adamw_checkpoint::{
     AdamWCheckpointProgress, AdamWCheckpointTensors, decode_adamw_checkpoint,
@@ -24,6 +25,7 @@ pub use self::program_artifact::{
     CompiledAdamWProgramArtifact, CompiledAdamWProgramArtifactFileError,
     CompiledAdamWProgramArtifactInfo, CompiledModuleAdamWArtifactRestoreError,
 };
+pub use self::resume_bundle::{CompiledAdamWResumeBundle, CompiledAdamWResumeBundleFileError};
 use self::state_schema::{
     AdamWGlobalState, AdamWParameterState, INTERNAL_PREFIX, RecurrentStateKey, StateSpec,
 };
@@ -22379,6 +22381,246 @@ mod tests {
     }
 
     #[test]
+    fn compiled_resume_bundle_preserves_exact_inner_bytes_and_atomic_file_boundary() {
+        let config = module_config()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_window_loss_report();
+        let plan = CompiledModuleAdamWPlan::compile_graph(
+            config,
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap();
+        let artifact = plan.program_artifact().unwrap();
+        let checkpoint = plan
+            .prepare(&CpuSessionTarget::new())
+            .unwrap()
+            .module_checkpoint()
+            .unwrap();
+        let bundle = CompiledAdamWResumeBundle::new(artifact.clone(), checkpoint.clone()).unwrap();
+        assert_eq!(bundle.format_version(), 1);
+        assert_eq!(bundle.program_artifact().as_bytes(), artifact.as_bytes());
+        assert_eq!(bundle.checkpoint().as_bytes(), checkpoint.as_bytes());
+        assert_eq!(
+            CompiledAdamWResumeBundle::new(artifact.clone(), checkpoint.clone()).unwrap(),
+            bundle
+        );
+        assert_eq!(
+            CompiledAdamWResumeBundle::from_bytes(bundle.as_bytes().to_vec()).unwrap(),
+            bundle
+        );
+
+        let mut unsupported = bundle.as_bytes().to_vec();
+        unsupported[4] = 2;
+        assert!(CompiledAdamWResumeBundle::from_bytes(unsupported).is_err());
+        let mut corrupt = bundle.as_bytes().to_vec();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(CompiledAdamWResumeBundle::from_bytes(corrupt).is_err());
+        let mut truncated = bundle.as_bytes().to_vec();
+        truncated.pop();
+        assert!(CompiledAdamWResumeBundle::from_bytes(truncated).is_err());
+        let mut overflowing = bundle.as_bytes().to_vec();
+        overflowing[5..13].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(CompiledAdamWResumeBundle::from_bytes(overflowing).is_err());
+
+        let (legacy_tensors, mut legacy_metadata) =
+            load_safetensors(checkpoint.optimizer_checkpoint().as_bytes()).unwrap();
+        assert_eq!(legacy_metadata["format"], ADAMW_CHECKPOINT_FORMAT_V9);
+        legacy_metadata.insert("format".into(), ADAMW_CHECKPOINT_FORMAT_V8.into());
+        assert!(
+            legacy_metadata
+                .remove("accumulation_capture_identity")
+                .is_some()
+        );
+        let legacy_optimizer = CompiledAdamWCheckpoint::from_bytes(
+            save_safetensors(&legacy_tensors, &legacy_metadata).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_optimizer.info().accumulation_capture_identity(),
+            None
+        );
+        let decoded_module = decode_module_adamw_checkpoint(checkpoint.as_bytes()).unwrap();
+        let legacy_checkpoint = encode_module_adamw_checkpoint(
+            &legacy_optimizer,
+            decoded_module.evaluation_capture_identity,
+            &decoded_module.states,
+            &decoded_module.visits,
+        )
+        .unwrap();
+        let legacy_bundle =
+            CompiledAdamWResumeBundle::new(artifact.clone(), legacy_checkpoint).unwrap();
+        assert_eq!(
+            legacy_bundle
+                .checkpoint()
+                .optimizer_checkpoint()
+                .info()
+                .accumulation_capture_identity(),
+            None
+        );
+
+        let evaluated_plan = CompiledModuleAdamWPlan::compile_graph(
+            module_config()
+                .with_gradient_accumulation(2)
+                .unwrap()
+                .with_window_loss_report(),
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap()
+        .with_evaluation_graph(|module, graph, inputs| {
+            let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+            Ok(CompiledAdamWGraph::scalar(loss, outputs))
+        })
+        .unwrap();
+        let evaluated_checkpoint = evaluated_plan
+            .prepare(&CpuSessionTarget::new())
+            .unwrap()
+            .module_checkpoint()
+            .unwrap();
+        assert!(CompiledAdamWResumeBundle::new(artifact.clone(), evaluated_checkpoint).is_err());
+
+        let foreign_module_plan = compile_token_training_owner();
+        let foreign_module_checkpoint = foreign_module_plan
+            .prepare(&CpuSessionTarget::new())
+            .unwrap()
+            .module_checkpoint()
+            .unwrap();
+        assert!(
+            CompiledAdamWResumeBundle::new(artifact.clone(), foreign_module_checkpoint).is_err()
+        );
+
+        let foreign_plan = CompiledModuleAdamWPlan::compile_graph(
+            module_config().with_gradient_accumulation(3).unwrap(),
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap();
+        assert!(
+            CompiledAdamWResumeBundle::new(foreign_plan.program_artifact().unwrap(), checkpoint)
+                .is_err()
+        );
+
+        let alternative_artifact = foreign_plan.program_artifact().unwrap();
+        let alternative_checkpoint = foreign_plan
+            .prepare(&CpuSessionTarget::new())
+            .unwrap()
+            .module_checkpoint()
+            .unwrap();
+        let alternative =
+            CompiledAdamWResumeBundle::new(alternative_artifact, alternative_checkpoint).unwrap();
+        assert_ne!(bundle, alternative);
+
+        let directory = TemporaryCheckpointDirectory::new("compiled-resume-bundle-file");
+        let path = directory.path().join("resume.rgab");
+        bundle.save_file(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bundle.as_bytes());
+        assert_eq!(CompiledAdamWResumeBundle::load_file(&path).unwrap(), bundle);
+        assert_eq!(
+            CompiledAdamWResumeBundle::load_file_with_byte_limit(&path, bundle.as_bytes().len())
+                .unwrap(),
+            bundle
+        );
+        assert!(matches!(
+            CompiledAdamWResumeBundle::load_file_with_byte_limit(
+                &path,
+                bundle.as_bytes().len() - 1
+            ),
+            Err(CompiledAdamWResumeBundleFileError::Limit { .. })
+        ));
+        let oversized = directory.path().join("oversized.rgab");
+        fs::File::create(&oversized)
+            .unwrap()
+            .set_len(u64::try_from(resume_bundle::MAX_BUNDLE_BYTES).unwrap() + 1)
+            .unwrap();
+        assert!(matches!(
+            CompiledAdamWResumeBundle::load_file_with_byte_limit(&oversized, usize::MAX),
+            Err(CompiledAdamWResumeBundleFileError::Limit { actual, maximum })
+                if actual == u64::try_from(resume_bundle::MAX_BUNDLE_BYTES).unwrap() + 1
+                    && maximum == resume_bundle::MAX_BUNDLE_BYTES
+        ));
+
+        let preserved = bundle.as_bytes().to_vec();
+        for attempt in 0..128u16 {
+            fs::write(
+                directory.path().join(format!(
+                    ".resume.rgab.rustgrad-{}-{attempt}.tmp",
+                    std::process::id()
+                )),
+                b"another writer",
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            bundle.save_file(&path),
+            Err(CompiledAdamWResumeBundleFileError::Io {
+                operation: "create unique staging file",
+                ..
+            })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), preserved);
+
+        let failed_target = directory.path().join("directory.rgab");
+        fs::create_dir(&failed_target).unwrap();
+        let occupied = directory.path().join(format!(
+            ".directory.rgab.rustgrad-{}-0.tmp",
+            std::process::id()
+        ));
+        fs::write(&occupied, b"another writer").unwrap();
+        assert!(matches!(
+            bundle.save_file(&failed_target),
+            Err(CompiledAdamWResumeBundleFileError::Io {
+                operation: "replace destination",
+                ..
+            })
+        ));
+        assert!(failed_target.is_dir());
+        assert_eq!(fs::read(&occupied).unwrap(), b"another writer");
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.starts_with(".directory.rgab.rustgrad-"))
+                .collect::<Vec<_>>(),
+            vec![format!(
+                ".directory.rgab.rustgrad-{}-0.tmp",
+                std::process::id()
+            )]
+        );
+
+        let concurrent_path = directory.path().join("concurrent.rgab");
+        let first = bundle.clone();
+        let first_path = concurrent_path.clone();
+        let first_writer = std::thread::spawn(move || first.save_file(first_path));
+        let second = alternative.clone();
+        let second_path = concurrent_path.clone();
+        let second_writer = std::thread::spawn(move || second.save_file(second_path));
+        first_writer.join().unwrap().unwrap();
+        second_writer.join().unwrap().unwrap();
+        let concurrent = CompiledAdamWResumeBundle::load_file(&concurrent_path).unwrap();
+        assert!(concurrent == bundle || concurrent == alternative);
+        assert!(
+            fs::read_dir(directory.path())
+                .unwrap()
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .all(|name| !name.starts_with(".concurrent.rgab.rustgrad-"))
+        );
+    }
+
+    #[test]
     fn complete_module_checkpoint_restores_constants_without_mutating_destination() {
         let config = module_config().with_gradient_accumulation(2).unwrap();
         let source = TiedFrozenModule::new([1.0, -1.0]);
@@ -22415,12 +22657,32 @@ mod tests {
             program_artifact.info().capture_identity(),
             checkpoint.optimizer_checkpoint().info().capture_identity()
         );
+        let resume_bundle =
+            CompiledAdamWResumeBundle::new(program_artifact.clone(), checkpoint.clone()).unwrap();
+        let mismatched_destination = TiedFrozenModule {
+            shared: Parameter::new(TensorData::new([3], vec![9.0, 10.0, 11.0]).unwrap(), true),
+            frozen: Parameter::new(TensorData::new([2], vec![9.0, 10.0]).unwrap(), false),
+            buffer: Parameter::new(TensorData::scalar(3.0), false),
+        };
+        let mismatched_identity = mismatched_destination.shared.id();
+        let mismatched_before = mismatched_destination.shared.snapshot().unwrap();
+        let mismatched_destination = match CompiledModuleAdamWPlan::restore_from_resume_bundle(
+            mismatched_destination,
+            &resume_bundle,
+        ) {
+            Ok(_) => panic!("resume bundle restored into mismatched module topology"),
+            Err(error) => error.into_module(),
+        };
+        assert_parameter_snapshot_eq(
+            &mismatched_destination.shared.snapshot().unwrap(),
+            &mismatched_before,
+        );
+        assert_eq!(mismatched_destination.shared.id(), mismatched_identity);
         let artifact_destination = TiedFrozenModule::new([9.0, 10.0]);
         let artifact_destination_before = artifact_destination.shared.snapshot().unwrap();
-        let restored = CompiledModuleAdamWPlan::restore_from_program_artifact(
+        let restored = CompiledModuleAdamWPlan::restore_from_resume_bundle(
             artifact_destination,
-            &program_artifact,
-            &checkpoint,
+            &resume_bundle,
         )
         .unwrap();
         let restored_inspection = restored.inspection().unwrap();

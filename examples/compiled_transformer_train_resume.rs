@@ -57,16 +57,16 @@ use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
     Backend, CapturedReplayExecutor, CompiledAdamWCheckpoint, CompiledAdamWConfig,
     CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWGraph,
-    CompiledAdamWIgnoreIndexContext, CompiledAdamWPlan, CompiledAdamWProgramArtifact,
+    CompiledAdamWIgnoreIndexContext, CompiledAdamWPlan, CompiledAdamWResumeBundle,
     CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig,
     CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
-    CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
-    CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledScheduledAdamWRuntime,
-    CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend, CpuCompiledAdamW,
-    CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, LossOptions, MetalSessionTarget, Module,
-    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuCompiledEvaluationResult,
-    NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Parameter, Reduction, Result, Scalar,
-    Shape, TensorData, TrainingDropoutProvider, TransformerBlock, sparse_categorical_cross_entropy,
+    CompiledInputSpec, CompiledModuleAdamWPlan, CompiledModuleAdamWSession, CompiledMultiStepLr,
+    CompiledScheduledAdamWRuntime, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
+    CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, LossOptions,
+    MetalSessionTarget, Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult,
+    NativeCpuCompiledEvaluationResult, NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId,
+    Parameter, Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider,
+    TransformerBlock, sparse_categorical_cross_entropy,
 };
 use std::{
     cell::Cell,
@@ -837,7 +837,7 @@ impl TemporaryCheckpointFile {
     fn new() -> std::result::Result<Self, Box<dyn Error>> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path = env::temp_dir().join(format!(
-            "rustgrad-compiled-module-resume-{}-{nonce}.safetensors",
+            "rustgrad-compiled-module-resume-{}-{nonce}.rgab",
             std::process::id()
         ));
         Ok(Self { path })
@@ -1481,9 +1481,6 @@ where
         .evaluation_capture_identity()
         .expect("the compiler-owned token-mean evaluator is attached");
     let program_artifact = source_plan.program_artifact()?;
-    let artifact_file = TemporaryCheckpointFile::new()?;
-    program_artifact.save_file(artifact_file.path())?;
-    let program_artifact = CompiledAdamWProgramArtifact::load_file(artifact_file.path())?;
     assert_eq!(source_plan.captured_multi_step_lr(), Some(&schedule));
     let mut uninterrupted = prepare(source_plan)?;
     validate_preparation(&uninterrupted);
@@ -1540,9 +1537,12 @@ where
             .accumulated_token_count(),
         Some(5)
     );
-    let checkpoint_file = TemporaryCheckpointFile::new()?;
-    checkpoint.save_file(checkpoint_file.path())?;
-    let decoded = CompiledModuleAdamWCheckpoint::load_file(checkpoint_file.path())?;
+    let resume_bundle = CompiledAdamWResumeBundle::new(program_artifact, checkpoint.clone())?;
+    let resume_file = TemporaryCheckpointFile::new()?;
+    resume_bundle.save_file(resume_file.path())?;
+    let resume_bundle = CompiledAdamWResumeBundle::load_file(resume_file.path())?;
+    assert_eq!(resume_bundle.checkpoint(), &checkpoint);
+    let decoded = resume_bundle.checkpoint().clone();
     assert_eq!(decoded, checkpoint);
     assert!(
         decoded
@@ -1588,12 +1588,9 @@ where
     let tied_alias = tied_alias.expect("the destination exposes the tied output head");
     assert_eq!(tied_alias.id(), destination_tied_identity);
 
-    let restored_plan = CompiledModuleAdamWPlan::restore_from_program_artifact(
-        destination,
-        &program_artifact,
-        &decoded,
-    )
-    .map_err(|error| error.into_parts().1)?;
+    let restored_plan =
+        CompiledModuleAdamWPlan::restore_from_resume_bundle(destination, &resume_bundle)
+            .map_err(|error| error.into_parts().1)?;
     assert_eq!(restored_plan.capture_identity(), capture_identity);
     assert_eq!(
         restored_plan.evaluation_capture_identity(),

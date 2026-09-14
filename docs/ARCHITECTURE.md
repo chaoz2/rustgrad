@@ -1065,10 +1065,11 @@ The artifact supplies immutable executable structure. The unchanged checkpoint
 supplies the current parameter, optimizer, accumulation, loss/token, and
 dropout frontier; neither can substitute for the other.
 
-RGAP file loading bounds allocation before parsing and defends against growth
-during the read. Saving syncs a unique same-directory staging file before
-atomic replacement. The checkpoint remains a separately atomic file: this is
-not a two-file transaction, and it does not claim parent-directory durability.
+`CompiledAdamWResumeBundle` preserves those two validated byte streams unchanged
+inside one bounded, checksummed envelope. Loading authenticates the complete
+pair before restore, and saving syncs one unique same-directory staging file
+before atomic replacement. The constituent files remain independently usable;
+none of these APIs claims parent-directory durability across a system crash.
 
 #### Compile and replay contract
 
