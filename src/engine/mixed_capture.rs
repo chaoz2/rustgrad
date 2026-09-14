@@ -25,11 +25,13 @@ const MAX_BINDINGS: usize = 1 << 16;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct PreparedReplayValidationCounts {
-    mixed_capture_validations: usize,
-    schedule_rekeys: usize,
-    identity_serializations: usize,
-    recurrent_bank_layouts: usize,
+pub(crate) struct PreparedReplayValidationCounts {
+    pub(crate) mixed_capture_validations: usize,
+    pub(crate) schedule_rekeys: usize,
+    pub(crate) identity_serializations: usize,
+    pub(crate) recurrent_frontier_plans: usize,
+    pub(crate) cursor_projection_preparations: usize,
+    pub(crate) recurrent_bank_layouts: usize,
 }
 
 #[cfg(test)]
@@ -40,6 +42,8 @@ std::thread_local! {
                 mixed_capture_validations: 0,
                 schedule_rekeys: 0,
                 identity_serializations: 0,
+                recurrent_frontier_plans: 0,
+                cursor_projection_preparations: 0,
                 recurrent_bank_layouts: 0,
             })
         };
@@ -62,13 +66,13 @@ fn record_prepared_replay_validation(update: impl FnOnce(&mut PreparedReplayVali
 }
 
 #[cfg(test)]
-fn reset_prepared_replay_validation_counts() {
+pub(crate) fn reset_prepared_replay_validation_counts() {
     PREPARED_REPLAY_VALIDATION_COUNTS.with(|counts| counts.set(Default::default()));
     INDEXED_RECURRENT_BANK_BINDINGS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
-fn prepared_replay_validation_counts() -> PreparedReplayValidationCounts {
+pub(crate) fn prepared_replay_validation_counts() -> PreparedReplayValidationCounts {
     PREPARED_REPLAY_VALIDATION_COUNTS.with(std::cell::Cell::get)
 }
 
@@ -190,6 +194,183 @@ impl MixedReplayCursor {
     /// Canonical buffer-ordered persistent descriptors at the next replay.
     pub fn frontier(&self) -> &[BufferState] {
         &self.frontier
+    }
+}
+
+/// Preparation-time proof that one recurrent capture is an exact descriptor-
+/// preserving projection of another capture's canonical frontier. Runtime
+/// tensor ownership, leases, generations, and pointers deliberately remain
+/// outside this witness.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedRecurrentCursorProjection {
+    source_capture_identity: u64,
+    target_capture_identity: u64,
+    source_schema: Box<[BufferState]>,
+    target_schema: Box<[BufferState]>,
+    target_to_source: Box<[usize]>,
+}
+
+/// One call-local projected cursor plus the prevalidated source-version
+/// updates to publish after the target replay commits successfully.
+pub(crate) struct ProjectedRecurrentCursor {
+    cursor: MixedReplayCursor,
+    source_updates: Box<[(usize, u64)]>,
+}
+
+/// Runtime projection failures whose session-facing compatibility differs
+/// from general capture corruption. The witness remains engine-private while
+/// callers can preserve their established error contract without inspecting
+/// error strings.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum RecurrentCursorProjectionError {
+    IncompleteSourceFrontier,
+    VersionOverflow,
+    InvalidSource(ReplayError),
+}
+
+impl PreparedRecurrentCursorProjection {
+    pub(crate) fn prepare(
+        source: &CapturedMixedSchedule,
+        target: &CapturedMixedSchedule,
+        target_buffers: impl IntoIterator<Item = u64>,
+    ) -> Result<Self, ReplayError> {
+        #[cfg(test)]
+        record_prepared_replay_validation(|counts| counts.cursor_projection_preparations += 1);
+        validate(source, true)?;
+        validate(target, true)?;
+        let source_capture_identity = identity(source)?;
+        let target_capture_identity = identity(target)?;
+        let source_schema = recurrent_initial_frontier(source)?;
+        let target_schema = recurrent_initial_frontier(target)?;
+        let mut target_buffer_set = BTreeSet::new();
+        for buffer in target_buffers {
+            if !target_buffer_set.insert(buffer) {
+                return Err(ReplayError::Descriptor(
+                    "prepared recurrent cursor projection target buffer repeats".into(),
+                ));
+            }
+        }
+        if target_buffer_set.len() != target_schema.len()
+            || target_schema
+                .iter()
+                .any(|state| !target_buffer_set.contains(&state.buffer))
+        {
+            return Err(ReplayError::Descriptor(
+                "prepared recurrent cursor projection target frontier mismatch".into(),
+            ));
+        }
+        let mut target_to_source = Vec::with_capacity(target_schema.len());
+        for target_state in &target_schema {
+            let source_ordinal = source_schema
+                .binary_search_by_key(&target_state.buffer, |state| state.buffer)
+                .map_err(|_| {
+                    ReplayError::Descriptor(
+                        "prepared recurrent cursor projection source state is absent".into(),
+                    )
+                })?;
+            let source_state = &source_schema[source_ordinal];
+            if source_state.shape != target_state.shape
+                || source_state.dtype != target_state.dtype
+                || source_state.bytes != target_state.bytes
+            {
+                return Err(ReplayError::Descriptor(
+                    "prepared recurrent cursor projection descriptor mismatch".into(),
+                ));
+            }
+            target_to_source.push(source_ordinal);
+        }
+        Ok(Self {
+            source_capture_identity,
+            target_capture_identity,
+            source_schema: source_schema.into_boxed_slice(),
+            target_schema: target_schema.into_boxed_slice(),
+            target_to_source: target_to_source.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) const fn target_capture_identity(&self) -> u64 {
+        self.target_capture_identity
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source_ordinals(&self) -> &[usize] {
+        &self.target_to_source
+    }
+
+    pub(crate) fn project(
+        &self,
+        source: &MixedReplayCursor,
+    ) -> Result<ProjectedRecurrentCursor, RecurrentCursorProjectionError> {
+        if source.frontier.len() != self.source_schema.len() {
+            return Err(RecurrentCursorProjectionError::IncompleteSourceFrontier);
+        }
+        if source.capture_identity != self.source_capture_identity {
+            return Err(RecurrentCursorProjectionError::InvalidSource(
+                ReplayError::Descriptor(
+                    "prepared recurrent cursor projection source frontier mismatch".into(),
+                ),
+            ));
+        }
+        for (actual, expected) in source.frontier.iter().zip(self.source_schema.iter()) {
+            if actual.buffer != expected.buffer
+                || actual.version < expected.version
+                || actual.shape != expected.shape
+                || actual.dtype != expected.dtype
+                || actual.bytes != expected.bytes
+            {
+                return Err(RecurrentCursorProjectionError::InvalidSource(
+                    ReplayError::Descriptor(
+                        "prepared recurrent cursor projection source descriptor mismatch".into(),
+                    ),
+                ));
+            }
+        }
+
+        let mut frontier = Vec::with_capacity(self.target_schema.len());
+        let mut source_updates = Vec::with_capacity(self.target_schema.len());
+        for (target_state, source_ordinal) in
+            self.target_schema.iter().zip(self.target_to_source.iter())
+        {
+            let projected = source.frontier[*source_ordinal].clone();
+            debug_assert_eq!(projected.buffer, target_state.buffer);
+            let next_version = projected
+                .version
+                .checked_add(1)
+                .ok_or(RecurrentCursorProjectionError::VersionOverflow)?;
+            source_updates.push((*source_ordinal, next_version));
+            frontier.push(projected);
+        }
+        Ok(ProjectedRecurrentCursor {
+            cursor: MixedReplayCursor {
+                capture_identity: self.target_capture_identity,
+                frontier,
+            },
+            source_updates: source_updates.into_boxed_slice(),
+        })
+    }
+}
+
+impl ProjectedRecurrentCursor {
+    pub(crate) fn cursor(&self) -> &MixedReplayCursor {
+        &self.cursor
+    }
+
+    pub(crate) fn cursor_mut(&mut self) -> &mut MixedReplayCursor {
+        &mut self.cursor
+    }
+
+    /// Publishes only prevalidated version words after the target runtime bank
+    /// transaction has committed. This is deliberately infallible.
+    pub(crate) fn publish(self, source: &mut MixedReplayCursor) {
+        for ((source_ordinal, next_version), target) in self
+            .source_updates
+            .iter()
+            .copied()
+            .zip(&self.cursor.frontier)
+        {
+            debug_assert_eq!(target.version, next_version);
+            source.frontier[source_ordinal].version = next_version;
+        }
     }
 }
 
@@ -2509,6 +2690,8 @@ fn canonical_frontier(
 fn recurrent_initial_frontier(
     capture: &CapturedMixedSchedule,
 ) -> Result<Vec<BufferState>, ReplayError> {
+    #[cfg(test)]
+    record_prepared_replay_validation(|counts| counts.recurrent_frontier_plans += 1);
     let schedule = Schedule {
         items: capture.schedule.items.clone(),
         requested_materializations: requested_materializations(&capture.schedule),
@@ -3138,6 +3321,7 @@ mod recurrent_tests {
             Err(ReplayError::Unsupported(message))
                 if message == "prepared recurrent native effect is not pure-sourced"
         ));
+        let hot_replay_validation_counts = prepared_replay_validation_counts();
         let initial_cursor = cursor.clone();
         let initial_values = frontier_values(&runtime, &cursor);
         let initial_runtime_counts = runtime.recurrent_test_counts();
@@ -3220,7 +3404,7 @@ mod recurrent_tests {
         let expected_traffic = replay.traffic;
         assert_eq!(
             prepared_replay_validation_counts(),
-            sealed_validation_counts,
+            hot_replay_validation_counts,
             "hot replay must not revalidate, rekey, or hash the sealed capture"
         );
         assert_eq!(prepared.structure_validation_count(), 1);
@@ -3302,7 +3486,7 @@ mod recurrent_tests {
         assert_eq!(frontier_values(&runtime, &cursor), current_values);
         assert_eq!(
             prepared_replay_validation_counts(),
-            sealed_validation_counts,
+            hot_replay_validation_counts,
             "failure and retry must retain the prepared immutable seal"
         );
         assert_eq!(
@@ -3360,6 +3544,75 @@ mod recurrent_tests {
             Err(ReplayError::Corrupt(message))
                 if message == "prepared recurrent bank binding mismatch"
         ));
+    }
+
+    #[test]
+    fn prepared_cursor_projection_reuses_authenticated_schema_without_capture_work() {
+        let (capture, _runtime) = fixture(331);
+        let mut source = capture.initial_recurrent_cursor().unwrap();
+        reset_prepared_replay_validation_counts();
+        let projection =
+            PreparedRecurrentCursorProjection::prepare(&capture, &capture, [331]).unwrap();
+        let preparation = prepared_replay_validation_counts();
+        assert_eq!(preparation.cursor_projection_preparations, 1);
+        assert!(preparation.mixed_capture_validations > 0);
+        assert!(preparation.schedule_rekeys > 0);
+        assert!(preparation.identity_serializations > 0);
+        assert!(preparation.recurrent_frontier_plans > 0);
+        assert!(matches!(
+            PreparedRecurrentCursorProjection::prepare(&capture, &capture, [331, 331]),
+            Err(ReplayError::Descriptor(message))
+                if message == "prepared recurrent cursor projection target buffer repeats"
+        ));
+        reset_prepared_replay_validation_counts();
+
+        source.frontier[0].version = 53;
+        let mut first = projection.project(&source).unwrap();
+        assert_eq!(first.cursor().capture_identity(), source.capture_identity());
+        assert_eq!(first.cursor().frontier()[0].version, 53);
+        assert_eq!(prepared_replay_validation_counts(), Default::default());
+        first.cursor.frontier[0].version = 54;
+        first.publish(&mut source);
+        assert_eq!(source.frontier()[0].version, 54);
+
+        // The witness stores only descriptor/ordinal relationships, not a
+        // current version floor, so restoring an older valid checkpoint does
+        // not require rebuilding the prepared projection.
+        source.frontier[0].version = 17;
+        let mut second = projection.project(&source).unwrap();
+        assert_eq!(second.cursor().frontier()[0].version, 17);
+        assert_eq!(prepared_replay_validation_counts(), Default::default());
+        second.cursor.frontier[0].version = 18;
+        second.publish(&mut source);
+        assert_eq!(source.frontier()[0].version, 18);
+
+        let mut malformed = source.clone();
+        malformed.frontier[0].bytes += 4;
+        assert!(matches!(
+            projection.project(&malformed),
+            Err(RecurrentCursorProjectionError::InvalidSource(
+                ReplayError::Descriptor(message)
+            ))
+                if message == "prepared recurrent cursor projection source descriptor mismatch"
+        ));
+        assert_eq!(source.frontier()[0].version, 18);
+
+        let mut incomplete = source.clone();
+        incomplete.frontier.clear();
+        assert!(matches!(
+            projection.project(&incomplete),
+            Err(RecurrentCursorProjectionError::IncompleteSourceFrontier)
+        ));
+        assert_eq!(source.frontier()[0].version, 18);
+
+        let mut overflow = source.clone();
+        overflow.frontier[0].version = u64::MAX;
+        assert!(matches!(
+            projection.project(&overflow),
+            Err(RecurrentCursorProjectionError::VersionOverflow)
+        ));
+        assert_eq!(source.frontier()[0].version, 18);
+        assert_eq!(prepared_replay_validation_counts(), Default::default());
     }
 }
 

@@ -34,7 +34,8 @@ use super::target::{
 };
 use crate::effects::runtime::RecurrentTransactionError;
 use crate::engine::mixed_capture::{
-    NativeReplayContext, PreparedRecurrentNativeReplay, RecurrentNativePreparation,
+    NativeReplayContext, PreparedRecurrentCursorProjection, PreparedRecurrentNativeReplay,
+    ProjectedRecurrentCursor, RecurrentCursorProjectionError, RecurrentNativePreparation,
 };
 use crate::engine::{NativeReplayTraffic, PlannedNativeItems};
 use crate::nn::{
@@ -5126,6 +5127,7 @@ struct CompiledTrainingSiblingPlan {
     capture: CapturedMixedSchedule,
     recurrent_capture: CompiledRecurrentCapture,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
+    cursor_projection: PreparedRecurrentCursorProjection,
     capture_identity: u64,
 }
 
@@ -5134,6 +5136,7 @@ struct CompiledAdamWAuxiliaryPlan {
     capture: CapturedMixedSchedule,
     recurrent_capture: CompiledRecurrentCapture,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
+    cursor_projection: PreparedRecurrentCursorProjection,
     state_input_keys: BTreeMap<String, RecurrentStateKey>,
     recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
     capture_identity: u64,
@@ -5319,8 +5322,7 @@ struct CpuCompiledTrainingProgram {
 }
 
 struct CpuAuxiliaryReplay {
-    cursor: MixedReplayCursor,
-    next_main_cursor: MixedReplayCursor,
+    cursor: ProjectedRecurrentCursor,
     provided: BTreeMap<String, TensorData>,
 }
 
@@ -5880,17 +5882,20 @@ impl CompiledTrainingPlan {
                         materialize_state_passthroughs: true,
                     },
                 )?;
-                let capture_identity = phase
-                    .capture
-                    .initial_recurrent_cursor()
-                    .map_err(replay_error)?
-                    .capture_identity();
+                let cursor_projection = PreparedRecurrentCursorProjection::prepare(
+                    &main.capture,
+                    &phase.capture,
+                    phase.state_buffers.values().copied(),
+                )
+                .map_err(replay_error)?;
+                let capture_identity = cursor_projection.target_capture_identity();
                 Ok::<_, Error>(CompiledTrainingSiblingPlan {
                     capture: phase.capture,
                     recurrent_capture: CompiledRecurrentCapture::from_stateful(
                         phase.recurrent_capture,
                     ),
                     state_buffers: phase.state_buffers,
+                    cursor_projection,
                     capture_identity,
                 })
             })
@@ -6403,10 +6408,13 @@ impl CompiledAdamWAuxiliaryPlan {
         let capture = CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
             .map_err(replay_error)?;
         validate_external_binding_ownership(&capture, std::iter::empty::<&String>())?;
-        let capture_identity = capture
-            .initial_recurrent_cursor()
-            .map_err(replay_error)?
-            .capture_identity();
+        let cursor_projection = PreparedRecurrentCursorProjection::prepare(
+            &training_plan.capture,
+            &capture,
+            state_buffers.values().copied(),
+        )
+        .map_err(replay_error)?;
+        let capture_identity = cursor_projection.target_capture_identity();
         let recurrent_store_groups = resolve_recurrent_store_groups(
             &adamw_recurrent_store_group_specs(parameters.keys(), true),
             &updates,
@@ -6416,6 +6424,7 @@ impl CompiledAdamWAuxiliaryPlan {
             capture,
             recurrent_capture: CompiledRecurrentCapture::from_stateful(recurrent_capture),
             state_buffers,
+            cursor_projection,
             state_input_keys: specs
                 .into_iter()
                 .map(|(input, key, ..)| (input, key))
@@ -6547,14 +6556,18 @@ impl CompiledAdamWAuxiliaryPlan {
         let capture = CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
             .map_err(replay_error)?;
         validate_external_binding_ownership(&capture, std::iter::empty::<&String>())?;
-        let capture_identity = capture
-            .initial_recurrent_cursor()
-            .map_err(replay_error)?
-            .capture_identity();
+        let cursor_projection = PreparedRecurrentCursorProjection::prepare(
+            &training_plan.capture,
+            &capture,
+            state_buffers.values().copied(),
+        )
+        .map_err(replay_error)?;
+        let capture_identity = cursor_projection.target_capture_identity();
         Ok(Self {
             capture,
             recurrent_capture: CompiledRecurrentCapture::from_stateful(recurrent_capture),
             state_buffers,
+            cursor_projection,
             state_input_keys: specs
                 .into_iter()
                 .map(|(input, key, ..)| (input, key))
@@ -7499,15 +7512,14 @@ impl CpuCompiledTrainingProgram {
             .step
             .checked_add(1)
             .ok_or_else(|| training("compiled training step overflow"))?;
-        let mut prepared =
-            self.prepare_phase_replay(&transition.capture, &transition.state_buffers, inputs)?;
+        let mut prepared = self.prepare_phase_replay(&transition.cursor_projection, inputs)?;
         let selected_requested =
             self.selected_step_outputs(&transition.capture, selection, false)?;
         let replay = transition
             .capture
             .replay_recurrent_selected_checked(
                 &mut self.runtime,
-                &mut prepared.cursor,
+                prepared.cursor.cursor_mut(),
                 &prepared.provided,
                 selected_requested.as_deref(),
                 injected_failure,
@@ -7520,7 +7532,7 @@ impl CpuCompiledTrainingProgram {
             * self.phase_outputs.named_outputs.len();
         debug_assert_eq!(replay.outputs.len(), 1 + named_output_count);
         let outputs = self.phase_outputs.take(replay.outputs, selection, false);
-        self.cursor = prepared.next_main_cursor;
+        prepared.cursor.publish(&mut self.cursor);
         self.step = next_step;
         Ok(CompiledTrainingStepResult {
             loss: outputs.loss,
@@ -7552,15 +7564,14 @@ impl CpuCompiledTrainingProgram {
             .step
             .checked_add(1)
             .ok_or_else(|| training("compiled training step overflow"))?;
-        let mut prepared =
-            self.prepare_phase_replay(&transition.capture, &transition.state_buffers, inputs)?;
         let started = Instant::now();
+        let mut prepared = self.prepare_phase_replay(&transition.cursor_projection, inputs)?;
         let selected_requested =
             self.selected_step_outputs(&transition.capture, selection, false)?;
         let replay = native
             .replay_recurrent_selected_checked(
                 &mut self.runtime,
-                &mut prepared.cursor,
+                prepared.cursor.cursor_mut(),
                 &prepared.provided,
                 selected_requested.as_deref(),
                 injected_failure,
@@ -7593,7 +7604,7 @@ impl CpuCompiledTrainingProgram {
             0,
             started.elapsed(),
         );
-        self.cursor = prepared.next_main_cursor;
+        prepared.cursor.publish(&mut self.cursor);
         self.step = next_step;
         Ok((
             CompiledTrainingStepResult {
@@ -7837,47 +7848,18 @@ impl CpuCompiledTrainingProgram {
         if let Some(learning_rate) = learning_rate {
             provided.insert(LEARNING_RATE_INPUT.to_owned(), learning_rate);
         }
-        self.prepare_phase_replay(&transition.capture, &transition.state_buffers, provided)
+        self.prepare_phase_replay(&transition.cursor_projection, provided)
     }
 
     fn prepare_phase_replay(
         &self,
-        capture: &CapturedMixedSchedule,
-        state_buffers: &BTreeMap<RecurrentStateKey, u64>,
+        projection: &PreparedRecurrentCursorProjection,
         provided: BTreeMap<String, TensorData>,
     ) -> Result<CpuAuxiliaryReplay> {
-        let selected_buffers = state_buffers.values().copied().collect::<BTreeSet<_>>();
-        let selected_frontier = self
-            .cursor
-            .frontier()
-            .iter()
-            .filter(|state| selected_buffers.contains(&state.buffer))
-            .cloned()
-            .collect::<Vec<_>>();
-        if selected_frontier.len() != selected_buffers.len() {
-            return Err(training("compiled auxiliary state frontier is incomplete"));
-        }
-        let cursor = MixedReplayCursor::resume(capture, selected_frontier).map_err(replay_error)?;
-        let next_frontier = self
-            .cursor
-            .frontier()
-            .iter()
-            .cloned()
-            .map(|mut state| {
-                if selected_buffers.contains(&state.buffer) {
-                    state.version = state.version.checked_add(1).ok_or_else(|| {
-                        training("compiled auxiliary state version would overflow")
-                    })?;
-                }
-                Ok(state)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let next_main_cursor =
-            MixedReplayCursor::resume(&self.capture, next_frontier).map_err(replay_error)?;
-
         Ok(CpuAuxiliaryReplay {
-            cursor,
-            next_main_cursor,
+            cursor: projection
+                .project(&self.cursor)
+                .map_err(cursor_projection_error)?,
             provided,
         })
     }
@@ -7896,7 +7878,7 @@ impl CpuCompiledTrainingProgram {
             .capture
             .replay_recurrent_checked(
                 &mut self.runtime,
-                &mut prepared.cursor,
+                prepared.cursor.cursor_mut(),
                 &prepared.provided,
                 injected_failure,
                 |outputs, successors| {
@@ -7911,9 +7893,9 @@ impl CpuCompiledTrainingProgram {
         {
             let mut committed = _replay.committed.clone();
             committed.sort_by_key(|state| state.buffer);
-            debug_assert_eq!(committed, prepared.cursor.frontier());
+            debug_assert_eq!(committed, prepared.cursor.cursor().frontier());
         }
-        self.cursor = prepared.next_main_cursor;
+        prepared.cursor.publish(&mut self.cursor);
         Ok(reports)
     }
 
@@ -7932,7 +7914,7 @@ impl CpuCompiledTrainingProgram {
             .capture
             .preflight_recurrent_native(
                 &self.runtime,
-                &prepared.cursor,
+                prepared.cursor.cursor(),
                 &prepared.provided,
                 vectorized,
             )
@@ -7946,16 +7928,13 @@ impl CpuCompiledTrainingProgram {
         vectorized: bool,
     ) -> Result<(RecurrentNativePreparation, Duration)> {
         let started = Instant::now();
-        let prepared = self.prepare_phase_replay(
-            &transition.capture,
-            &transition.state_buffers,
-            zero_inputs(&self.inputs)?,
-        )?;
+        let prepared =
+            self.prepare_phase_replay(&transition.cursor_projection, zero_inputs(&self.inputs)?)?;
         let preparation = transition
             .capture
             .preflight_recurrent_native_retaining_unchanged(
                 &self.runtime,
-                &prepared.cursor,
+                prepared.cursor.cursor(),
                 &prepared.provided,
                 vectorized,
             )
@@ -8030,14 +8009,14 @@ impl CpuCompiledTrainingProgram {
         successful_invocation: u64,
         injected_failure: Option<u64>,
     ) -> Result<(CompiledAdamWAuxiliaryReports, NativeCpuRunReport)> {
-        let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
         let started = Instant::now();
+        let mut prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
         let output_schema = transition.outputs.clone();
         let mut reports = None;
         let replay = native
             .replay_recurrent_checked(
                 &mut self.runtime,
-                &mut prepared.cursor,
+                prepared.cursor.cursor_mut(),
                 &prepared.provided,
                 injected_failure,
                 |outputs, successors| {
@@ -8072,9 +8051,9 @@ impl CpuCompiledTrainingProgram {
         {
             let mut committed = replay.committed.clone();
             committed.sort_by_key(|state| state.buffer);
-            debug_assert_eq!(committed, prepared.cursor.frontier());
+            debug_assert_eq!(committed, prepared.cursor.cursor().frontier());
         }
-        self.cursor = prepared.next_main_cursor;
+        prepared.cursor.publish(&mut self.cursor);
         Ok((reports, report))
     }
 
@@ -14020,6 +13999,18 @@ fn replay_error(error: ReplayError) -> Error {
     training(format!("compiled replay: {error:?}"))
 }
 
+fn cursor_projection_error(error: RecurrentCursorProjectionError) -> Error {
+    match error {
+        RecurrentCursorProjectionError::IncompleteSourceFrontier => {
+            training("compiled auxiliary state frontier is incomplete")
+        }
+        RecurrentCursorProjectionError::VersionOverflow => {
+            training("compiled auxiliary state version would overflow")
+        }
+        RecurrentCursorProjectionError::InvalidSource(error) => replay_error(error),
+    }
+}
+
 fn captured_inference_error(error: impl std::fmt::Debug) -> Error {
     training(format!("compiled recurrent capture: {error:?}"))
 }
@@ -15914,6 +15905,15 @@ mod tests {
         );
     }
 
+    fn assert_no_hot_phase_capture_work() {
+        let counts = crate::engine::mixed_capture::prepared_replay_validation_counts();
+        assert_eq!(counts.cursor_projection_preparations, 0);
+        assert_eq!(counts.mixed_capture_validations, 0);
+        assert_eq!(counts.schedule_rekeys, 0);
+        assert_eq!(counts.identity_serializations, 0);
+        assert_eq!(counts.recurrent_frontier_plans, 0);
+    }
+
     #[test]
     fn native_cpu_adamw_prepares_strictly_reuses_cache_and_commits_atomically() {
         let plan = CompiledAdamWPlan::compile(adamw_config(), initial_parameters(), build_tinybob)
@@ -16658,6 +16658,40 @@ mod tests {
                 .keys()
                 .all(RecurrentStateKey::is_accumulation_reset_state)
         );
+        let mut overflow = plan.prepare_cpu().unwrap();
+        overflow.step(batch(), lr()).unwrap();
+        let overflow_frontier = overflow.inner.plan().unwrap();
+        let mut overflow_versions = overflow_frontier.state_versions.clone();
+        for key in reset_transition.state_buffers.keys() {
+            overflow_versions.insert(key.clone(), u64::MAX);
+        }
+        overflow
+            .inner
+            .restore_frontier(
+                overflow_frontier.step,
+                &overflow_frontier.state_values,
+                &overflow_versions,
+            )
+            .unwrap();
+        let before_overflow_cursor = overflow.inner.cursor.clone();
+        let before_overflow_progress = overflow.progress;
+        let before_overflow_runtime = overflow.inner.runtime.recurrent_test_counts();
+        let overflow_error = match overflow.zero_grad() {
+            Ok(_) => panic!("overflowing zero-grad transition was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            overflow_error,
+            Error::SessionTraining {
+                reason: "compiled auxiliary state version would overflow".into(),
+            }
+        );
+        assert_eq!(overflow.inner.cursor, before_overflow_cursor);
+        assert_eq!(overflow.progress, before_overflow_progress);
+        assert_eq!(
+            overflow.inner.runtime.recurrent_test_counts(),
+            before_overflow_runtime
+        );
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor)
             .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
@@ -16672,6 +16706,26 @@ mod tests {
             main_buffers
                 .windows(2)
                 .all(|buffers| buffers[0] < buffers[1])
+        );
+        let reset_buffers = reset_transition
+            .state_buffers
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let expected_reset_source_ordinals = main_buffers
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, buffer)| reset_buffers.contains(buffer).then_some(ordinal))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reset_transition.cursor_projection.source_ordinals(),
+            expected_reset_source_ordinals.as_slice()
+        );
+        assert!(
+            expected_reset_source_ordinals
+                .windows(2)
+                .any(|ordinals| ordinals[1] > ordinals[0] + 1),
+            "zero-grad must exercise noncontiguous source frontier ordinals"
         );
         let mut sorted_main_inputs = main_inputs.clone();
         sorted_main_inputs.sort_unstable();
@@ -16861,7 +16915,9 @@ mod tests {
         let first_moments = native.first_moment_snapshots().unwrap();
         let second_moments = native.second_moment_snapshots().unwrap();
         let state_versions = native.inner.inner.plan().unwrap().state_versions;
+        crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
         let actual = native.step(batch(), lr()).unwrap();
+        assert_no_hot_phase_capture_work();
         let expected = interpreted.step(batch(), lr()).unwrap();
         assert!(!actual.did_update());
         assert_eq!(actual.capture_identity(), plan.capture_identity());
@@ -16901,17 +16957,19 @@ mod tests {
         let before_failed_reset = native.checkpoint().unwrap();
         let before_failed_reset_counts = native_recurrent_test_counts(&native);
         assert_eq!(native.successful_zero_grads, 0);
+        crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
         assert!(native.zero_grad_with_injected_failure(0).is_err());
+        assert_no_hot_phase_capture_work();
         let after_failed_reset_counts = native_recurrent_test_counts(&native);
         assert_eq!(after_failed_reset_counts.0, before_failed_reset_counts.0);
         assert_eq!(after_failed_reset_counts.1, before_failed_reset_counts.1);
         assert_eq!(native.checkpoint().unwrap(), before_failed_reset);
         assert_eq!(native.successful_zero_grads, 0);
         let before_reset = native_recurrent_test_counts(&native);
-        assert_eq!(
-            native.zero_grad().unwrap(),
-            interpreted.zero_grad().unwrap()
-        );
+        crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
+        let native_reset = native.zero_grad().unwrap();
+        assert_no_hot_phase_capture_work();
+        assert_eq!(native_reset, interpreted.zero_grad().unwrap());
         let after_reset = native_recurrent_test_counts(&native);
         assert_eq!(after_reset.0, before_reset.0);
         assert_eq!(after_reset.1, before_reset.1 + 1);
@@ -16973,18 +17031,22 @@ mod tests {
         let before_failed_flush = native.checkpoint().unwrap();
         let before_failed_flush_counts = native_recurrent_test_counts(&native);
         assert_eq!(native.successful_flushes, 0);
+        crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
         assert!(
             native
                 .flush_partial_window_with_injected_failure(lr(), 0)
                 .is_err()
         );
+        assert_no_hot_phase_capture_work();
         let after_failed_flush_counts = native_recurrent_test_counts(&native);
         assert_eq!(after_failed_flush_counts.0, before_failed_flush_counts.0);
         assert_eq!(after_failed_flush_counts.1, before_failed_flush_counts.1);
         assert_eq!(native.checkpoint().unwrap(), before_failed_flush);
         assert_eq!(native.successful_flushes, 0);
         let before_flush = native_recurrent_test_counts(&native);
+        crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
         let actual = native.flush_partial_window(lr()).unwrap();
+        assert_no_hot_phase_capture_work();
         let after_flush = native_recurrent_test_counts(&native);
         assert_eq!(after_flush.0, before_flush.0);
         assert_eq!(after_flush.1, before_flush.1 + 1);
