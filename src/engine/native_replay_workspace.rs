@@ -8,6 +8,7 @@ use crate::backend::{
 use crate::{CpuJitBackend, ScheduleItem, TensorData};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BufferKey {
@@ -128,6 +129,18 @@ pub(crate) struct NativeReplayTraffic {
     pub(crate) module_dispatch_count: usize,
     pub(crate) module_dispatched_native_item_count: usize,
     pub(crate) skipped_output_clear_count: usize,
+    pub(crate) native_dispatcher_wall_time: Duration,
+}
+
+impl NativeReplayTraffic {
+    fn checked_native_dispatcher_total(
+        &self,
+        dispatcher_wall_time: Duration,
+    ) -> Result<Duration, ReplayError> {
+        self.native_dispatcher_wall_time
+            .checked_add(dispatcher_wall_time)
+            .ok_or_else(|| ReplayError::Descriptor("native dispatcher duration overflows".into()))
+    }
 }
 
 /// Private scratch owned by one authenticated prepared native program.
@@ -1246,14 +1259,12 @@ impl NativeReplayWorkspace {
             (!borrowed.slots.is_empty()).then_some(&mut borrowed.slots),
             &mut self.dispatch_scratch,
         );
-        if let Err(failure) = execution {
-            return Err(map_dispatch_failure(
-                &self.items,
-                &segment.indices,
-                capture,
-                failure,
-            ));
-        }
+        let timing = execution.map_err(|failure| {
+            map_dispatch_failure(&self.items, &segment.indices, capture, failure)
+        })?;
+        let next_dispatcher_wall_time = self
+            .current_traffic
+            .checked_native_dispatcher_total(timing.dispatcher_wall_time())?;
         for action in &segment.outputs {
             for output in &action.outputs {
                 self.valid[*output] = true;
@@ -1265,6 +1276,7 @@ impl NativeReplayWorkspace {
         self.current_traffic.module_dispatch_count = next_dispatch_count;
         self.current_traffic.module_dispatched_native_item_count = next_dispatched_items;
         self.current_traffic.executed_native_item_count = next_executed_items;
+        self.current_traffic.native_dispatcher_wall_time = next_dispatcher_wall_time;
         Ok(())
     }
 
@@ -1866,11 +1878,12 @@ fn two_buffers(
 #[cfg(test)]
 mod dispatch_segmentation_tests {
     use super::{
-        BufferKey, NativeDispatchSegmentEnd, SlotSource, WorkspaceSlot,
+        BufferKey, NativeDispatchSegmentEnd, NativeReplayTraffic, SlotSource, WorkspaceSlot,
         append_segment_materializations, derived_slot_depends_on_outputs, dispatch_segment_split,
     };
     use crate::{AffineView, BufferDesc, DType, Shape};
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
     #[test]
     fn split_causes_are_mutually_exclusive_in_runtime_precedence_order() {
@@ -2021,6 +2034,25 @@ mod dispatch_segmentation_tests {
         ));
         assert!(
             crate::cpu_jit::NativeDispatchMaterialization::copy(2, 0, 1, DType::F32, 5,).is_ok()
+        );
+    }
+
+    #[test]
+    fn native_dispatcher_timing_accumulates_segments_and_rejects_overflow() {
+        let mut traffic = NativeReplayTraffic::default();
+        assert_eq!(traffic.native_dispatcher_wall_time, Duration::ZERO);
+        traffic.native_dispatcher_wall_time = traffic
+            .checked_native_dispatcher_total(Duration::from_nanos(3))
+            .unwrap();
+        traffic.native_dispatcher_wall_time = traffic
+            .checked_native_dispatcher_total(Duration::from_nanos(5))
+            .unwrap();
+        assert_eq!(traffic.native_dispatcher_wall_time, Duration::from_nanos(8));
+        traffic.native_dispatcher_wall_time = Duration::MAX;
+        assert!(
+            traffic
+                .checked_native_dispatcher_total(Duration::from_nanos(1))
+                .is_err()
         );
     }
 }

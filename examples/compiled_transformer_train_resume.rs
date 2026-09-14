@@ -2286,6 +2286,22 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     );
     assert_eq!(
         step_phases
+            .first()
+            .native_dispatcher_wall_time()
+            .expect("first phase reports native dispatcher time")
+            .to_duration()?
+            .checked_add(
+                step_phases
+                    .first()
+                    .executor_host_wall_time()
+                    .expect("first phase reports executor host time")
+                    .to_duration()?
+            )
+            .expect("first classified executor durations fit"),
+        step_phases.first().executor_wall_time().to_duration()?
+    );
+    assert_eq!(
+        step_phases
             .warm_accumulation_only()
             .expect("the second replay remains accumulation-only")
             .sample_count(),
@@ -2307,6 +2323,20 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     {
         assert_eq!(
             phase
+                .native_dispatcher_total_wall_time()
+                .expect("current phase reports native dispatcher time")
+                .to_duration()?
+                .checked_add(
+                    phase
+                        .executor_host_total_wall_time()
+                        .expect("current phase reports executor host time")
+                        .to_duration()?
+                )
+                .expect("classified executor phase durations fit"),
+            phase.executor_total_wall_time().to_duration()?
+        );
+        assert_eq!(
+            phase
                 .executor_total_wall_time()
                 .to_duration()?
                 .checked_add(phase.recurrent_overhead_total_wall_time().to_duration()?)
@@ -2317,9 +2347,31 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let executor_timing = report
         .main_replay_executor_wall_time()
         .expect("current native CPU scoreboard reports sealed executor timing");
+    let dispatcher_timing = report
+        .main_replay_native_dispatcher_wall_time()
+        .expect("current native CPU scoreboard reports native dispatcher timing");
+    let executor_host_timing = report
+        .main_replay_executor_host_wall_time()
+        .expect("current native CPU scoreboard reports executor host timing");
     let overhead_timing = report
         .main_replay_recurrent_overhead_wall_time()
         .expect("current native CPU scoreboard reports recurrent overhead timing");
+    assert_eq!(
+        dispatcher_timing
+            .first()
+            .to_duration()?
+            .checked_add(executor_host_timing.first().to_duration()?)
+            .expect("first executor phase durations fit"),
+        executor_timing.first().to_duration()?
+    );
+    assert_eq!(
+        dispatcher_timing
+            .steady_total()
+            .to_duration()?
+            .checked_add(executor_host_timing.steady_total().to_duration()?)
+            .expect("steady executor phase durations fit"),
+        executor_timing.steady_total().to_duration()?
+    );
     assert_eq!(
         executor_timing
             .first()

@@ -6,6 +6,7 @@
 
 mod step_phases;
 
+use step_phases::ReplayTimingPartition;
 pub use step_phases::{
     NativeTrainingFirstStepReport, NativeTrainingStepPhase, NativeTrainingStepPhaseReport,
     NativeTrainingWarmStepReport,
@@ -38,7 +39,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V13: u32 = 13;
 const NATIVE_TRAINING_REPORT_FORMAT_V14: u32 = 14;
 const NATIVE_TRAINING_REPORT_FORMAT_V15: u32 = 15;
 const NATIVE_TRAINING_REPORT_FORMAT_V16: u32 = 16;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 17;
+const NATIVE_TRAINING_REPORT_FORMAT_V17: u32 = 17;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 18;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,6 +123,7 @@ impl NativeTrainingPreparationTiming {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(total),
                 Some(linker),
@@ -143,6 +146,7 @@ impl NativeTrainingPreparationTiming {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 _,
                 _,
@@ -579,6 +583,7 @@ impl NativeTrainingProgramReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self, format_version)?,
@@ -891,6 +896,8 @@ impl NativeTrainingReplayTiming {
 struct ReplayTiming {
     total: Duration,
     executor: Duration,
+    native_dispatcher: Duration,
+    executor_host: Duration,
     overhead: Duration,
 }
 
@@ -943,6 +950,10 @@ pub struct NativeTrainingReport {
     accumulation_replay_executed_native_item_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     main_replay_executor_wall_time: Option<NativeTrainingReplayTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    main_replay_native_dispatcher_wall_time: Option<NativeTrainingReplayTiming>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    main_replay_executor_host_wall_time: Option<NativeTrainingReplayTiming>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     main_replay_recurrent_overhead_wall_time: Option<NativeTrainingReplayTiming>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1083,6 +1094,19 @@ impl NativeTrainingReport {
         self.main_replay_executor_wall_time.as_ref()
     }
 
+    /// Time inside authenticated native schedule-module dispatcher calls.
+    pub const fn main_replay_native_dispatcher_wall_time(
+        &self,
+    ) -> Option<&NativeTrainingReplayTiming> {
+        self.main_replay_native_dispatcher_wall_time.as_ref()
+    }
+
+    /// Checked executor remainder outside native dispatcher calls, including
+    /// workspace work and any conservative per-entry execution.
+    pub const fn main_replay_executor_host_wall_time(&self) -> Option<&NativeTrainingReplayTiming> {
+        self.main_replay_executor_host_wall_time.as_ref()
+    }
+
     /// Checked end-to-end remainder outside the sealed native executor across
     /// the authenticated phase-specific programs. This covers recurrent
     /// staging, validation, and atomic commit/publication.
@@ -1142,6 +1166,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -1194,6 +1219,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 None,
                 None,
@@ -1222,6 +1248,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(program),
                 Some(traffic),
@@ -1279,6 +1306,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -1306,6 +1334,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
                     if traffic.materialized_egress_count() != 0
                         && traffic.materialized_egress_bytes() != 0 => {}
@@ -1316,6 +1345,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                     return Err(invalid("native CPU egress evidence is absent"));
                 }
@@ -1345,6 +1375,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
@@ -1408,6 +1439,7 @@ impl NativeTrainingReport {
             | NATIVE_TRAINING_REPORT_FORMAT_V14
             | NATIVE_TRAINING_REPORT_FORMAT_V15
             | NATIVE_TRAINING_REPORT_FORMAT_V16
+            | NATIVE_TRAINING_REPORT_FORMAT_V17
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
@@ -1471,7 +1503,9 @@ impl NativeTrainingReport {
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V15, None, None) => 0,
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V16 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overlap),
                 Some(max_parallel),
             ) => {
@@ -1521,6 +1555,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
@@ -1537,6 +1572,7 @@ impl NativeTrainingReport {
                         | NATIVE_TRAINING_REPORT_FORMAT_V14
                         | NATIVE_TRAINING_REPORT_FORMAT_V15
                         | NATIVE_TRAINING_REPORT_FORMAT_V16
+                        | NATIVE_TRAINING_REPORT_FORMAT_V17
                         | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                         Some(overlap),
                     ) => overlap
@@ -1633,6 +1669,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V14
                 | NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -1658,6 +1695,44 @@ impl NativeTrainingReport {
             }
             _ => return Err(invalid("native training replay phases differ")),
         }
+        match (
+            self.format_version,
+            &self.main_replay_native_dispatcher_wall_time,
+            &self.main_replay_executor_host_wall_time,
+        ) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V17, None, None) => {}
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(native_dispatcher),
+                Some(executor_host),
+            ) => {
+                let steady_count = self.successful_replay_count - 1;
+                native_dispatcher.validate(steady_count)?;
+                executor_host.validate(steady_count)?;
+                let executor = self
+                    .main_replay_executor_wall_time
+                    .as_ref()
+                    .ok_or_else(|| invalid("native replay executor timing is absent"))?;
+                validate_phase_partition(
+                    executor.first,
+                    native_dispatcher.first,
+                    executor_host.first,
+                    "first replay executor",
+                )?;
+                validate_phase_partition(
+                    executor.steady_total,
+                    native_dispatcher.steady_total,
+                    executor_host.steady_total,
+                    "steady replay executor",
+                )?;
+            }
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V17, _, _) => {
+                return Err(invalid(
+                    "legacy native training report has dispatcher timing",
+                ));
+            }
+            _ => return Err(invalid("native training dispatcher timing differs")),
+        }
         match (self.format_version, &self.step_phases) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V9, None) => {}
             (
@@ -1665,41 +1740,52 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V11
                 | NATIVE_TRAINING_REPORT_FORMAT_V12
                 | NATIVE_TRAINING_REPORT_FORMAT_V13
-                | NATIVE_TRAINING_REPORT_FORMAT_V14,
+                | NATIVE_TRAINING_REPORT_FORMAT_V14
+                | NATIVE_TRAINING_REPORT_FORMAT_V15
+                | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17,
                 Some(phases),
             ) => phases.validate(
                 self.successful_replay_count,
                 self.first_replay_wall_time,
                 self.steady_replay_total_wall_time,
-                self.main_replay_executor_wall_time
-                    .as_ref()
-                    .ok_or_else(|| invalid("classified replay executor timing is absent"))?,
-                self.main_replay_recurrent_overhead_wall_time
-                    .as_ref()
-                    .ok_or_else(|| invalid("classified replay overhead timing is absent"))?,
+                ReplayTimingPartition {
+                    executor: self
+                        .main_replay_executor_wall_time
+                        .as_ref()
+                        .ok_or_else(|| invalid("classified replay executor timing is absent"))?,
+                    native_dispatcher: None,
+                    executor_host: None,
+                    overhead: self
+                        .main_replay_recurrent_overhead_wall_time
+                        .as_ref()
+                        .ok_or_else(|| invalid("classified replay overhead timing is absent"))?,
+                },
             )?,
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V9, Some(_)) => {
                 return Err(invalid("legacy native training report has step phases"));
             }
-            (
-                NATIVE_TRAINING_REPORT_FORMAT_V15
-                | NATIVE_TRAINING_REPORT_FORMAT_V16
-                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
-                Some(phases),
-            ) => phases.validate(
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(phases)) => phases.validate(
                 self.successful_replay_count,
                 self.first_replay_wall_time,
                 self.steady_replay_total_wall_time,
-                self.main_replay_executor_wall_time
-                    .as_ref()
-                    .ok_or_else(|| invalid("classified replay executor timing is absent"))?,
-                self.main_replay_recurrent_overhead_wall_time
-                    .as_ref()
-                    .ok_or_else(|| invalid("classified replay overhead timing is absent"))?,
+                ReplayTimingPartition {
+                    executor: self
+                        .main_replay_executor_wall_time
+                        .as_ref()
+                        .ok_or_else(|| invalid("classified replay executor timing is absent"))?,
+                    native_dispatcher: self.main_replay_native_dispatcher_wall_time.as_ref(),
+                    executor_host: self.main_replay_executor_host_wall_time.as_ref(),
+                    overhead: self
+                        .main_replay_recurrent_overhead_wall_time
+                        .as_ref()
+                        .ok_or_else(|| invalid("classified replay overhead timing is absent"))?,
+                },
             )?,
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V15
                 | NATIVE_TRAINING_REPORT_FORMAT_V16
+                | NATIVE_TRAINING_REPORT_FORMAT_V17
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 None,
             ) if self.accumulation.is_none() => {}
@@ -2037,6 +2123,10 @@ impl NativeTrainingScoreboard {
         }
         let total = report.wall_time();
         let executor = report.executor_wall_time();
+        let native_dispatcher = report.native_dispatcher_wall_time();
+        let executor_host = executor
+            .checked_sub(native_dispatcher)
+            .ok_or_else(|| invalid("native dispatcher time exceeds executor time"))?;
         let overhead = total
             .checked_sub(executor)
             .ok_or_else(|| invalid("native executor time exceeds replay time"))?;
@@ -2044,6 +2134,8 @@ impl NativeTrainingScoreboard {
             ReplayTiming {
                 total,
                 executor,
+                native_dispatcher,
+                executor_host,
                 overhead,
             },
             executed,
@@ -2128,6 +2220,14 @@ impl NativeTrainingScoreboard {
             .iter()
             .map(|timing| timing.overhead)
             .collect::<Vec<_>>();
+        let native_dispatchers = steady
+            .iter()
+            .map(|timing| timing.native_dispatcher)
+            .collect::<Vec<_>>();
+        let executor_hosts = steady
+            .iter()
+            .map(|timing| timing.executor_host)
+            .collect::<Vec<_>>();
         let (steady_replay_total_wall_time, steady_microbatches_per_second) = rate(&totals)?;
         let step_phases = match self.recording_mode {
             ReplayRecordingMode::Raw => None,
@@ -2183,6 +2283,16 @@ impl NativeTrainingScoreboard {
             main_replay_executor_wall_time: Some(NativeTrainingReplayTiming::from_durations(
                 first.executor,
                 &executors,
+            )?),
+            main_replay_native_dispatcher_wall_time: Some(
+                NativeTrainingReplayTiming::from_durations(
+                    first.native_dispatcher,
+                    &native_dispatchers,
+                )?,
+            ),
+            main_replay_executor_host_wall_time: Some(NativeTrainingReplayTiming::from_durations(
+                first.executor_host,
+                &executor_hosts,
             )?),
             main_replay_recurrent_overhead_wall_time: Some(
                 NativeTrainingReplayTiming::from_durations(first.overhead, &overheads)?,
@@ -2338,17 +2448,21 @@ mod tests {
         BenchmarkDuration::from_duration(Duration::ZERO)
     }
 
+    fn zero_latency_summary() -> BenchmarkLatencySummary {
+        BenchmarkLatencySummary {
+            sample_count: 1,
+            min: zero_duration(),
+            nearest_rank_p50: zero_duration(),
+            nearest_rank_p95: zero_duration(),
+            max: zero_duration(),
+        }
+    }
+
     fn zero_replay_timing() -> NativeTrainingReplayTiming {
         NativeTrainingReplayTiming {
             first: zero_duration(),
             steady_total: zero_duration(),
-            steady: BenchmarkLatencySummary {
-                sample_count: 1,
-                min: zero_duration(),
-                nearest_rank_p50: zero_duration(),
-                nearest_rank_p95: zero_duration(),
-                max: zero_duration(),
-            },
+            steady: zero_latency_summary(),
         }
     }
 
@@ -2423,6 +2537,44 @@ mod tests {
         json.as_object_mut()
             .unwrap()
             .remove("main_replay_recurrent_overhead_wall_time");
+    }
+
+    fn remove_dispatcher_timing(json: &mut serde_json::Value) {
+        for field in [
+            "main_replay_native_dispatcher_wall_time",
+            "main_replay_executor_host_wall_time",
+        ] {
+            json.as_object_mut().unwrap().remove(field);
+        }
+        let Some(phases) = json
+            .get_mut("step_phases")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return;
+        };
+        if let Some(first) = phases
+            .get_mut("first")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            first.remove("native_dispatcher_wall_time");
+            first.remove("executor_host_wall_time");
+        }
+        for phase in ["warm_accumulation_only", "warm_optimizer_commit"] {
+            let Some(warm) = phases
+                .get_mut(phase)
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            for field in [
+                "native_dispatcher_total_wall_time",
+                "native_dispatcher_wall_time",
+                "executor_host_total_wall_time",
+                "executor_host_wall_time",
+            ] {
+                warm.remove(field);
+            }
+        }
     }
 
     fn remove_step_phases(json: &mut serde_json::Value) {
@@ -2573,12 +2725,16 @@ mod tests {
             accumulation_replay_traffic: None,
             accumulation_replay_executed_native_item_count: None,
             main_replay_executor_wall_time: Some(zero_replay_timing()),
+            main_replay_native_dispatcher_wall_time: None,
+            main_replay_executor_host_wall_time: None,
             main_replay_recurrent_overhead_wall_time: Some(zero_replay_timing()),
             step_phases: Some(NativeTrainingStepPhaseReport {
                 first: NativeTrainingFirstStepReport {
                     phase: NativeTrainingStepPhase::AccumulationOnly,
                     total_wall_time: zero_duration(),
                     executor_wall_time: zero_duration(),
+                    native_dispatcher_wall_time: None,
+                    executor_host_wall_time: None,
                     recurrent_overhead_wall_time: zero_duration(),
                 },
                 warm_accumulation_only: None,
@@ -2600,6 +2756,10 @@ mod tests {
                         nearest_rank_p95: zero_duration(),
                         max: zero_duration(),
                     },
+                    native_dispatcher_total_wall_time: None,
+                    native_dispatcher_wall_time: None,
+                    executor_host_total_wall_time: None,
+                    executor_host_wall_time: None,
                     recurrent_overhead_total_wall_time: zero_duration(),
                     recurrent_overhead_wall_time: BenchmarkLatencySummary {
                         sample_count: 1,
@@ -2641,6 +2801,16 @@ mod tests {
         report.format_version = NATIVE_TRAINING_REPORT_FORMAT_VERSION;
         report.prepare_parallel_render_overlap_wall_time = Some(zero_duration());
         report.prepare_max_parallel_render_job_count = Some(1);
+        report.main_replay_native_dispatcher_wall_time = Some(zero_replay_timing());
+        report.main_replay_executor_host_wall_time = Some(zero_replay_timing());
+        let phases = report.step_phases.as_mut().unwrap();
+        phases.first.native_dispatcher_wall_time = Some(zero_duration());
+        phases.first.executor_host_wall_time = Some(zero_duration());
+        let warm = phases.warm_optimizer_commit.as_mut().unwrap();
+        warm.native_dispatcher_total_wall_time = Some(zero_duration());
+        warm.native_dispatcher_wall_time = Some(zero_latency_summary());
+        warm.executor_host_total_wall_time = Some(zero_duration());
+        warm.executor_host_wall_time = Some(zero_latency_summary());
         report.main_replay_traffic = report
             .main_replay_traffic
             .map(|traffic| traffic.with_materialized_egress(5, 24));
@@ -2720,6 +2890,8 @@ mod tests {
         );
         assert_eq!(decoded.accumulation().unwrap().capture_identity(), 8);
         assert_eq!(decoded.accumulation_schedule_cache_keys(), [23, 29]);
+        assert!(decoded.main_replay_native_dispatcher_wall_time().is_some());
+        assert!(decoded.main_replay_executor_host_wall_time().is_some());
 
         let mut json = serde_json::to_value(&report).unwrap();
         json["accumulation_schedule_cache_keys"] = serde_json::json!([23]);
@@ -2785,6 +2957,7 @@ mod tests {
         let report = phase_specialized_report();
         let mut json = serde_json::to_value(report).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V11);
+        remove_dispatcher_timing(&mut json);
         remove_dispatch_segmentation_evidence(&mut json);
         remove_parallel_render_evidence(&mut json);
         remove_prefix_module_evidence(&mut json);
@@ -2816,6 +2989,7 @@ mod tests {
     fn phase_specialized_v12_report_decodes_without_egress_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V12);
+        remove_dispatcher_timing(&mut json);
         remove_dispatch_segmentation_evidence(&mut json);
         remove_parallel_render_evidence(&mut json);
         remove_prefix_module_evidence(&mut json);
@@ -2848,6 +3022,7 @@ mod tests {
     fn version_thirteen_report_decodes_without_prefix_module_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V13);
+        remove_dispatcher_timing(&mut json);
         remove_dispatch_segmentation_evidence(&mut json);
         remove_parallel_render_evidence(&mut json);
         assert!(
@@ -2890,6 +3065,7 @@ mod tests {
     fn version_fourteen_preserves_prefix_evidence_and_rejects_v15_compiler_fields() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V14);
+        remove_dispatcher_timing(&mut json);
         remove_dispatch_segmentation_evidence(&mut json);
         remove_parallel_render_evidence(&mut json);
         assert!(
@@ -2996,6 +3172,7 @@ mod tests {
     fn version_fifteen_decodes_without_parallel_render_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V15);
+        remove_dispatcher_timing(&mut json);
         remove_dispatch_segmentation_evidence(&mut json);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
@@ -3017,6 +3194,7 @@ mod tests {
     fn version_sixteen_rejects_dispatch_segmentation_even_when_zero() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V16);
+        remove_dispatcher_timing(&mut json);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
             "v16 cannot claim v17 dispatch segmentation evidence"
@@ -3041,6 +3219,75 @@ mod tests {
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
         assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V16);
         assert!(decoded.main().dispatch_segmentation().is_none());
+    }
+
+    #[test]
+    fn version_seventeen_decodes_without_dispatcher_timing() {
+        let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
+        json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V17);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "v17 cannot claim v18 dispatcher timing"
+        );
+        remove_dispatcher_timing(&mut json);
+        let decoded =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V17);
+        assert!(decoded.main_replay_native_dispatcher_wall_time().is_none());
+        assert!(decoded.main_replay_executor_host_wall_time().is_none());
+        assert!(
+            decoded
+                .step_phases()
+                .unwrap()
+                .first()
+                .native_dispatcher_wall_time()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn current_report_authenticates_dispatcher_executor_partition() {
+        let report = phase_specialized_report();
+        assert!(report.validate().is_ok());
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("main_replay_executor_host_wall_time");
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "v18 requires both sides of the executor partition"
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["main_replay_native_dispatcher_wall_time"]["first"]["nanos"] = serde_json::json!(1);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "dispatcher and executor-host time must partition executor time"
+        );
+
+        let mut json = serde_json::to_value(&report).unwrap();
+        json["step_phases"]["first"]["executor_host_wall_time"]["nanos"] = serde_json::json!(1);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "classified phase timing must match the global partition"
+        );
+
+        let mut json = serde_json::to_value(report).unwrap();
+        json["main_replay_native_dispatcher_wall_time"]["steady_total"]["secs"] =
+            serde_json::json!(u64::MAX);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
+            "out-of-range dispatcher partitions fail closed"
+        );
+        assert!(
+            NativeTrainingReplayTiming::from_durations(
+                Duration::ZERO,
+                &[Duration::MAX, Duration::from_nanos(1)],
+            )
+            .is_err(),
+            "steady dispatcher duration aggregation rejects overflow"
+        );
     }
 
     #[test]

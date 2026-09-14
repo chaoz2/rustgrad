@@ -6224,6 +6224,28 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         rustgrad::NativeTrainingStepPhase::AccumulationOnly
     );
     assert_eq!(
+        step_phases
+            .first()
+            .native_dispatcher_wall_time()
+            .unwrap()
+            .to_duration()
+            .unwrap()
+            .checked_add(
+                step_phases
+                    .first()
+                    .executor_host_wall_time()
+                    .unwrap()
+                    .to_duration()
+                    .unwrap()
+            )
+            .unwrap(),
+        step_phases
+            .first()
+            .executor_wall_time()
+            .to_duration()
+            .unwrap()
+    );
+    assert_eq!(
         step_phases.warm_accumulation_only().unwrap().sample_count(),
         1
     );
@@ -6437,11 +6459,37 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let executor_timing = report
         .main_replay_executor_wall_time()
         .expect("current scoreboard reports sealed executor timing");
+    let dispatcher_timing = report
+        .main_replay_native_dispatcher_wall_time()
+        .expect("current scoreboard reports native dispatcher timing");
+    let executor_host_timing = report
+        .main_replay_executor_host_wall_time()
+        .expect("current scoreboard reports executor host timing");
     let overhead_timing = report
         .main_replay_recurrent_overhead_wall_time()
         .expect("current scoreboard reports recurrent replay overhead");
     assert_eq!(executor_timing.steady().sample_count, 2);
+    assert_eq!(dispatcher_timing.steady().sample_count, 2);
+    assert_eq!(executor_host_timing.steady().sample_count, 2);
     assert_eq!(overhead_timing.steady().sample_count, 2);
+    assert_eq!(
+        dispatcher_timing
+            .first()
+            .to_duration()
+            .unwrap()
+            .checked_add(executor_host_timing.first().to_duration().unwrap())
+            .unwrap(),
+        executor_timing.first().to_duration().unwrap()
+    );
+    assert_eq!(
+        dispatcher_timing
+            .steady_total()
+            .to_duration()
+            .unwrap()
+            .checked_add(executor_host_timing.steady_total().to_duration().unwrap())
+            .unwrap(),
+        executor_timing.steady_total().to_duration().unwrap()
+    );
     assert_eq!(
         executor_timing
             .first()
@@ -6499,6 +6547,8 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         executed_native_item_count
     );
     assert!(json["main_replay_executor_wall_time"].is_object());
+    assert!(json["main_replay_native_dispatcher_wall_time"].is_object());
+    assert!(json["main_replay_executor_host_wall_time"].is_object());
     assert!(json["main_replay_recurrent_overhead_wall_time"].is_object());
     assert_eq!(
         json["format_version"],

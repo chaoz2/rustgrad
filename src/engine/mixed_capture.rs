@@ -3204,6 +3204,7 @@ mod recurrent_tests {
         assert_eq!(replay.traffic.external_input_import_bytes, 0);
         assert_eq!(replay.traffic.borrowed_recurrent_input_bytes, 8);
         assert_eq!(replay.traffic.borrowed_recurrent_output_bytes, 8);
+        assert!(replay.traffic.native_dispatcher_wall_time <= replay.executor_wall_time);
         assert_eq!(indexed_recurrent_bank_binding_count(), 2);
         let expected_traffic = replay.traffic;
         assert_eq!(
@@ -3245,7 +3246,15 @@ mod recurrent_tests {
         let retried = NativeReplayContext::new(&executor, &mut prepared)
             .replay_recurrent_checked(&mut runtime, &mut cursor, &inputs, None, |_, _| Ok(()))
             .unwrap();
-        assert_eq!(retried.traffic, expected_traffic);
+        assert!(retried.traffic.native_dispatcher_wall_time <= retried.executor_wall_time);
+        let mut expected_deterministic_traffic = expected_traffic;
+        expected_deterministic_traffic.native_dispatcher_wall_time = Duration::ZERO;
+        let mut retried_deterministic_traffic = retried.traffic;
+        retried_deterministic_traffic.native_dispatcher_wall_time = Duration::ZERO;
+        assert_eq!(
+            retried_deterministic_traffic,
+            expected_deterministic_traffic
+        );
         assert_eq!(
             retried.replay.outputs[0].storage(),
             &Storage::F32(vec![2.0, 2.0])
