@@ -55,6 +55,30 @@ const POLICY_FROZEN_PARAMETER: &str = "positions.weight";
 // cancels that gauge direction, so cross-engine AdamW successors are
 // ill-conditioned around epsilon even though each backend's recurrence is exact.
 const POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS: [&str; 2] = ["first.key.1", "second.key.1"];
+const TWO_BLOCK_WEIGHT_DECAY_EXCLUSIONS: [&str; 22] = [
+    "first.ff1.1",
+    "first.ff2.1",
+    "first.key.1",
+    "first.ln1.0",
+    "first.ln1.1",
+    "first.ln2.0",
+    "first.ln2.1",
+    "first.out.1",
+    "first.query.1",
+    "first.value.1",
+    "norm.bias",
+    "norm.weight",
+    "second.ff1.1",
+    "second.ff2.1",
+    "second.key.1",
+    "second.ln1.0",
+    "second.ln1.1",
+    "second.ln2.0",
+    "second.ln2.1",
+    "second.out.1",
+    "second.query.1",
+    "second.value.1",
+];
 const WEIGHT_DECAY_EXCLUSIONS: [&str; 12] = [
     "block.ff1.1",
     "block.ff2.1",
@@ -438,7 +462,11 @@ struct TwoBlockPositionalGeluGpt {
 
 impl TwoBlockPositionalGeluGpt {
     fn new(seed: u64) -> Result<Self> {
-        Ok(Self {
+        Self::new_with_dropout(seed, 0.0)
+    }
+
+    fn new_with_dropout(seed: u64, dropout_probability: f64) -> Result<Self> {
+        let model = Self {
             tokens: Embedding::new_static(MULTI_HEAD_VOCAB, MULTI_HEAD_EMBEDDING, None, seed)?,
             positions: Embedding::new_static(
                 TIME,
@@ -451,29 +479,67 @@ impl TwoBlockPositionalGeluGpt {
                 2,
                 MULTI_HEAD_FEED_FORWARD,
                 true,
-                0.0,
+                dropout_probability,
                 seed.wrapping_add(2),
                 GELU::tanh(),
             )?
-            .with_causal_attention(true),
+            .with_causal_attention(true)
+            .with_attention_dropout(dropout_probability)?,
             second: TransformerBlock::new_static_with_activation(
                 MULTI_HEAD_EMBEDDING,
                 2,
                 MULTI_HEAD_FEED_FORWARD,
                 true,
-                0.0,
+                dropout_probability,
                 seed.wrapping_add(3),
                 GELU::tanh(),
             )?
-            .with_causal_attention(true),
+            .with_causal_attention(true)
+            .with_attention_dropout(dropout_probability)?,
             norm: LayerNorm::new_static([MULTI_HEAD_EMBEDDING], 1e-5, true)?,
-        })
+        };
+        let feed_forward_bias = TensorData::new(
+            [MULTI_HEAD_FEED_FORWARD],
+            vec![2.0, -2.0, 2.25, -2.25, 2.5, -2.5, 2.75, -2.75],
+        )?;
+        for path in ["first.ff1.1", "second.ff1.1"] {
+            let mut parameter = None;
+            model.visit("", &mut |name, candidate, _| {
+                if name == path {
+                    parameter = Some(candidate.clone());
+                }
+            });
+            parameter
+                .unwrap_or_else(|| panic!("two-block GELU GPT must expose {path}"))
+                .replace(feed_forward_bias.clone())?;
+        }
+        Ok(model)
     }
 
     fn forward(
         &self,
         graph: &mut Graph,
         tokens: NodeId,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<NodeId> {
+        self.forward_with_optional_attention_mask(graph, tokens, None, dropout)
+    }
+
+    fn forward_with_attention_mask(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        attention_mask: NodeId,
+        dropout: &mut dyn TrainingDropoutProvider,
+    ) -> Result<NodeId> {
+        self.forward_with_optional_attention_mask(graph, tokens, Some(attention_mask), dropout)
+    }
+
+    fn forward_with_optional_attention_mask(
+        &self,
+        graph: &mut Graph,
+        tokens: NodeId,
+        attention_mask: Option<NodeId>,
         dropout: &mut dyn TrainingDropoutProvider,
     ) -> Result<NodeId> {
         let token_hidden = self.tokens.forward(graph, tokens)?;
@@ -484,12 +550,22 @@ impl TwoBlockPositionalGeluGpt {
         )?);
         let position_hidden = self.positions.forward(graph, positions)?;
         let hidden = graph.add(token_hidden, position_hidden)?;
-        let hidden = self
-            .first
-            .forward_training_with_dropout(graph, hidden, dropout)?;
-        let hidden = self
-            .second
-            .forward_training_with_dropout(graph, hidden, dropout)?;
+        let hidden = match attention_mask {
+            Some(mask) => self
+                .first
+                .forward_training_with_dropout_and_attention_mask(graph, hidden, mask, dropout)?,
+            None => self
+                .first
+                .forward_training_with_dropout(graph, hidden, dropout)?,
+        };
+        let hidden = match attention_mask {
+            Some(mask) => self
+                .second
+                .forward_training_with_dropout_and_attention_mask(graph, hidden, mask, dropout)?,
+            None => self
+                .second
+                .forward_training_with_dropout(graph, hidden, dropout)?,
+        };
         let hidden = self.norm.forward(graph, hidden)?;
         let tied_weight = self.tokens.weight.bind(graph)?;
         let tied_weight = graph.permute(tied_weight, [1, 0])?;
@@ -620,6 +696,12 @@ fn two_block_gelu_config() -> CompiledAdamWConfig {
         .with_input(LOSS_MASK, [BATCH, TIME], DType::F32)
         .unwrap()
         .with_token_weighted_gradient_accumulation(LOSS_MASK)
+        .unwrap()
+}
+
+fn two_block_gelu_policy_config() -> CompiledAdamWConfig {
+    two_block_policy_frontier_config()
+        .with_weight_decay_exclusions(TWO_BLOCK_WEIGHT_DECAY_EXCLUSIONS)
         .unwrap()
 }
 
@@ -968,6 +1050,38 @@ fn build_two_block_policy_frontier(
     Ok(CompiledAdamWGraph::token_mean(losses, outputs))
 }
 
+fn build_two_block_gelu_policy_frontier(
+    model: &TwoBlockPositionalGeluGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    ignore_index: CompiledAdamWIgnoreIndexContext,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<CompiledAdamWGraph> {
+    let attention_keep_mask =
+        graph.reshape(ignore_index.validity(), POLICY_ATTENTION_KEEP_MASK_SHAPE)?;
+    let (logits, outputs) = forward_two_block_gelu_with_attention_dropout(
+        model,
+        graph,
+        inputs,
+        attention_keep_mask,
+        dropout,
+    )?;
+    let losses = sparse_categorical_cross_entropy(
+        graph,
+        logits,
+        inputs["targets"],
+        LossOptions {
+            reduction: Reduction::None,
+            class_axis: 2,
+            ignore_index: Some(i64::from(POLICY_IGNORE_INDEX)),
+            label_smoothing: 0.0,
+        },
+    )?;
+    let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
+    let losses = graph.add(losses, guard)?;
+    Ok(CompiledAdamWGraph::token_mean(losses, outputs))
+}
+
 fn build_two_block_policy_evaluation(
     model: &TwoBlockPositionalGpt,
     graph: &mut Graph,
@@ -1011,6 +1125,33 @@ fn forward_two_block_with_attention_dropout(
         }
         None => model.forward(graph, inputs["tokens"], &mut observed)?,
     };
+    observed_two_block_outputs(logits, observed)
+}
+
+fn forward_two_block_gelu_with_attention_dropout(
+    model: &TwoBlockPositionalGeluGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    attention_mask: NodeId,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let mut observed = ObservedTwoBlockDropout {
+        inner: dropout,
+        sites: Vec::new(),
+    };
+    let logits = model.forward_with_attention_mask(
+        graph,
+        inputs["tokens"],
+        attention_mask,
+        &mut observed,
+    )?;
+    observed_two_block_outputs(logits, observed)
+}
+
+fn observed_two_block_outputs(
+    logits: NodeId,
+    observed: ObservedTwoBlockDropout<'_>,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
     let expected = [
         TwoBlockDropoutSite::AttentionProbabilities,
         TwoBlockDropoutSite::Residual,
@@ -1976,6 +2117,28 @@ struct PyTorchPolicyFrontierFixture {
 }
 
 #[derive(Deserialize)]
+struct PyTorchGeluPolicyWindowFixture {
+    rustgrad_base: String,
+    approximation: String,
+    weight_decay: f32,
+    weight_decay_exclusions: Vec<String>,
+    loss_scale: f32,
+    accumulation_steps: u64,
+    max_gradient_norm: f32,
+    ignore_index: i32,
+    learning_rate: f32,
+    active_parameter_count: usize,
+    active_coordinate_count: usize,
+    analytic_gauge_null_parameters: Vec<String>,
+    frozen_parameter_name: String,
+    frozen_parameter: PyTorchTensorFixture,
+    initial_parameters: BTreeMap<String, PyTorchTensorFixture>,
+    replays: Vec<PyTorchReplayFixture>,
+    pending_checkpoint: PyTorchPolicyPendingCheckpointFixture,
+    commit: PyTorchPolicyAdamWWindowFixture,
+}
+
+#[derive(Deserialize)]
 struct PyTorchFixtureProvenance {
     generator: String,
     rustgrad_base: String,
@@ -1999,6 +2162,7 @@ struct TwoBlockPyTorchFixture {
     windows: Vec<PyTorchAdamWWindowFixture>,
     partial_flush: PyTorchAdamWWindowFixture,
     policy_frontier: PyTorchPolicyFrontierFixture,
+    gelu_policy_window: PyTorchGeluPolicyWindowFixture,
 }
 
 fn two_block_pytorch_fixture() -> TwoBlockPyTorchFixture {
@@ -2996,6 +3160,42 @@ fn assert_pytorch_gradient_family_evidence(
         );
     }
     assert_eq!(coordinates.into_iter().sum::<usize>(), 384);
+}
+
+fn assert_pytorch_active_gradient_family_evidence(
+    actual: &BTreeMap<String, TensorData>,
+    expected: &BTreeMap<String, PyTorchTensorFixture>,
+) {
+    const ACTIVE_COORDINATES: [usize; 9] = [20, 0, 80, 16, 76, 80, 16, 76, 8];
+
+    assert!(actual.keys().eq(expected.keys()));
+    let mut coordinates = [0; TWO_BLOCK_GRADIENT_FAMILIES.len()];
+    let mut actual_nonzero = [false; TWO_BLOCK_GRADIENT_FAMILIES.len()];
+    let mut expected_nonzero = [false; TWO_BLOCK_GRADIENT_FAMILIES.len()];
+    for (name, actual) in actual {
+        let family = two_block_gradient_family(name);
+        let expected = expected[name].tensor();
+        assert_eq!(actual.shape(), expected.shape());
+        coordinates[family] += actual.len();
+        actual_nonzero[family] |= actual.to_vec_f64().into_iter().any(|value| value != 0.0);
+        expected_nonzero[family] |= expected.to_vec_f64().into_iter().any(|value| value != 0.0);
+    }
+    assert_eq!(coordinates, ACTIVE_COORDINATES);
+    for (family, ((label, _), active_coordinates)) in TWO_BLOCK_GRADIENT_FAMILIES
+        .into_iter()
+        .zip(ACTIVE_COORDINATES)
+        .enumerate()
+    {
+        if active_coordinates == 0 {
+            assert!(!actual_nonzero[family] && !expected_nonzero[family]);
+        } else {
+            assert!(
+                actual_nonzero[family] && expected_nonzero[family],
+                "{label} must carry nonzero GELU gradients"
+            );
+        }
+    }
+    assert_eq!(coordinates.into_iter().sum::<usize>(), 372);
 }
 
 fn observed_dropout_masks(outputs: &BTreeMap<String, TensorData>) -> [TensorData; 2] {
@@ -8350,6 +8550,386 @@ fn compiled_two_block_gelu_autograd_matches_paired_finite_differences_and_native
     assert_eq!(model.state_dict().unwrap(), state_before);
     assert_eq!(module_parameter_state(&model), parameter_state_before);
     assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_gelu_adamw_window_matches_pytorch_across_checkpoint() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+
+    let fixture = two_block_pytorch_fixture();
+    let expected = &fixture.gelu_policy_window;
+    assert_eq!(
+        expected.rustgrad_base,
+        "89bd150e01eb35068b8bdba05b264e49bb30616e"
+    );
+    assert_eq!(expected.approximation, "tanh");
+    assert_eq!(expected.weight_decay.to_bits(), 0.01f32.to_bits());
+    assert_eq!(expected.loss_scale.to_bits(), 128.0f32.to_bits());
+    assert_eq!(expected.accumulation_steps, 3);
+    assert_eq!(expected.max_gradient_norm.to_bits(), 0.25f32.to_bits());
+    assert_eq!(expected.ignore_index, POLICY_IGNORE_INDEX);
+    assert_eq!(expected.learning_rate.to_bits(), 1e-3f32.to_bits());
+    assert_eq!(expected.active_parameter_count, 35);
+    assert_eq!(expected.active_coordinate_count, 372);
+    assert_eq!(expected.replays.len(), 3);
+    assert_eq!(
+        expected
+            .replays
+            .iter()
+            .map(|replay| replay.valid_token_count)
+            .collect::<Vec<_>>(),
+        [5, 3, 3]
+    );
+    assert_eq!(expected.commit.adamw.optimizer_step, 1);
+    assert_eq!(expected.commit.adamw.valid_token_count, 11);
+    assert_eq!(expected.commit.microbatch_count, 3);
+    assert_eq!(
+        expected.commit.learning_rate.to_bits(),
+        expected.learning_rate.to_bits()
+    );
+    assert_eq!(expected.frozen_parameter_name, POLICY_FROZEN_PARAMETER);
+    assert_eq!(expected.frozen_parameter.tensor().len(), 12);
+
+    let expected_exclusions = TWO_BLOCK_WEIGHT_DECAY_EXCLUSIONS
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(expected.weight_decay_exclusions, expected_exclusions);
+    let analytic_gauge_null_parameters = expected
+        .analytic_gauge_null_parameters
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        analytic_gauge_null_parameters,
+        POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+
+    let model = TwoBlockPositionalGeluGpt::new_with_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    assert_eq!(
+        model.first.activation().approximation(),
+        rustgrad::nn::GeluApproximation::Tanh
+    );
+    assert_eq!(
+        model.second.activation().approximation(),
+        rustgrad::nn::GeluApproximation::Tanh
+    );
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    assert_eq!(
+        &state_before.tensors()[POLICY_FROZEN_PARAMETER],
+        &expected.frozen_parameter.tensor()
+    );
+    let mut traversal = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        assert!(traversal.insert(name, parameter.id()).is_none());
+    });
+    assert_eq!(traversal.len(), 37);
+    assert_eq!(traversal["tokens.weight"], traversal["lm_head.weight"]);
+
+    let optimizer = two_block_gelu_policy_config();
+    assert_eq!(
+        optimizer.weight_decay_exclusions().collect::<Vec<_>>(),
+        TWO_BLOCK_WEIGHT_DECAY_EXCLUSIONS.to_vec()
+    );
+    assert_eq!(
+        optimizer.frozen_parameters().collect::<Vec<_>>(),
+        [POLICY_FROZEN_PARAMETER]
+    );
+    assert_eq!(
+        optimizer.loss_scale().to_bits(),
+        expected.loss_scale.to_bits()
+    );
+    assert_eq!(
+        optimizer.max_gradient_norm(),
+        Some(expected.max_gradient_norm)
+    );
+    assert_eq!(
+        optimizer.captured_multi_step_lr(),
+        Some(&CompiledMultiStepLr::new(1e-3, 0.5, [1]).unwrap())
+    );
+
+    let compile_count = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_module_graph_with_dropout_and_ignore_index(
+        optimizer.clone(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, ignore_index, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_gelu_policy_frontier(model, graph, inputs, ignore_index, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(plan.dropout_blocks_per_replay(), Some(84));
+    assert_eq!(
+        plan.gradient_accumulation_steps(),
+        expected.accumulation_steps
+    );
+    assert_eq!(plan.loss_scale().to_bits(), expected.loss_scale.to_bits());
+    assert_eq!(plan.max_gradient_norm(), Some(expected.max_gradient_norm));
+    assert_eq!(
+        plan.captured_multi_step_lr(),
+        Some(&CompiledMultiStepLr::new(1e-3, 0.5, [1]).unwrap())
+    );
+    assert!(plan.clip_report_enabled());
+    assert!(plan.window_loss_report_enabled());
+    assert_eq!(
+        plan.token_weighted_ignore_index(),
+        Some(("targets", POLICY_IGNORE_INDEX))
+    );
+    assert_eq!(plan.token_weighted_gradient_accumulation_mask(), None);
+
+    let mut uninterrupted = plan.prepare_cpu().unwrap();
+    let initial_parameters = uninterrupted.parameter_snapshots().unwrap();
+    assert_eq!(initial_parameters.len(), expected.active_parameter_count);
+    assert_eq!(
+        initial_parameters
+            .values()
+            .map(TensorData::len)
+            .sum::<usize>(),
+        expected.active_coordinate_count
+    );
+    assert_eq!(
+        initial_parameters,
+        fixture_tensor_map(&expected.initial_parameters)
+    );
+    assert!(initial_parameters.contains_key("tokens.weight"));
+    assert!(!initial_parameters.contains_key("lm_head.weight"));
+    assert!(!initial_parameters.contains_key(POLICY_FROZEN_PARAMETER));
+
+    // Reset only the independent accumulator oracle between replays. Replay and
+    // dropout progress remain monotonic, so each isolated snapshot observes the
+    // exact source-ordered mask and numerator gradient used by the real window.
+    let mut isolated = plan.prepare_cpu().unwrap();
+    for (index, replay) in expected.replays.iter().enumerate() {
+        let step = isolated
+            .step_scheduled(policy_frontier_batch(replay.replay))
+            .unwrap();
+        assert!(!step.did_update());
+        assert_policy_frontier_replay(&step, replay);
+        let gradients = isolated.gradient_accumulator_snapshots().unwrap();
+        assert_pytorch_tensor_map_close(
+            &format!("GELU replay {} numerator gradient", replay.replay),
+            &gradients,
+            &replay.numerator_gradients,
+        );
+        assert_pytorch_active_gradient_family_evidence(&gradients, &replay.numerator_gradients);
+        if index + 1 != expected.replays.len() {
+            let reset = isolated.zero_grad().unwrap();
+            assert!(reset.did_discard());
+            assert_eq!(reset.discarded_microbatches(), 1);
+        }
+    }
+
+    let first = uninterrupted
+        .step_scheduled(policy_frontier_batch(1))
+        .unwrap();
+    assert!(!first.did_update());
+    assert_policy_frontier_replay(&first, &expected.replays[0]);
+    let second = uninterrupted
+        .step_scheduled(policy_frontier_batch(2))
+        .unwrap();
+    assert!(!second.did_update());
+    assert_policy_frontier_replay(&second, &expected.replays[1]);
+    let pending_checkpoint = uninterrupted.checkpoint().unwrap();
+    let pending = &expected.pending_checkpoint;
+    assert_eq!(pending_checkpoint.info().replay_step(), pending.replay_step);
+    assert_eq!(
+        pending_checkpoint.info().optimizer_step(),
+        pending.optimizer_step
+    );
+    assert_eq!(
+        pending_checkpoint.info().accumulation_index(),
+        pending.accumulation_index
+    );
+    assert_eq!(
+        pending_checkpoint.info().accumulated_token_count(),
+        Some(pending.valid_token_count)
+    );
+    assert_eq!(
+        pending_checkpoint.info().dropout_block_counter(),
+        Some(pending.dropout_counter)
+    );
+    assert_pytorch_scalar_close(
+        "GELU pending loss numerator",
+        f64::from(
+            pending_checkpoint
+                .info()
+                .accumulated_loss_numerator()
+                .unwrap(),
+        ),
+        f64::from(pending.loss_numerator),
+    );
+
+    let restored_plan = plan.restore_checkpoint(&pending_checkpoint).unwrap();
+    assert_eq!(restored_plan.capture_identity(), plan.capture_identity());
+    assert_eq!(compile_count.get(), 1);
+    let mut resumed = restored_plan.prepare_cpu().unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), pending_checkpoint);
+    let third = uninterrupted
+        .step_scheduled(policy_frontier_batch(3))
+        .unwrap();
+    let resumed_third = resumed.step_scheduled(policy_frontier_batch(3)).unwrap();
+    assert!(third.did_update());
+    assert_policy_frontier_replay(&third, &expected.replays[2]);
+    assert_compiled_adamw_steps_exact("GELU replay 3 restore", &resumed_third, &third);
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+
+    let parameters = uninterrupted.parameter_snapshots().unwrap();
+    let first_moments = uninterrupted.first_moment_snapshots().unwrap();
+    let second_moments = uninterrupted.second_moment_snapshots().unwrap();
+    assert_pytorch_adamw_window_for_frontier(
+        "GELU first window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 1,
+            clip_report: third.clip_report().unwrap(),
+            actual_initial: &initial_parameters,
+            actual_first_moments: &first_moments,
+            actual_second_moments: &second_moments,
+            actual_successors: &parameters,
+            expected_initial: &expected.initial_parameters,
+            expected: &expected.commit.adamw,
+        },
+        expected.commit.microbatch_count,
+        expected.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: expected.learning_rate,
+            recurrence_ulp_tolerance: 0,
+        },
+    );
+    assert_policy_window_report(
+        "GELU first window",
+        third.window_loss_report().unwrap(),
+        &expected.commit,
+    );
+    assert_policy_accumulators_are_positive_zero(&uninterrupted);
+    let committed = uninterrupted.checkpoint().unwrap();
+    assert_eq!(committed.info().replay_step(), 3);
+    assert_eq!(committed.info().optimizer_step(), 1);
+    assert_eq!(committed.info().accumulation_index(), 0);
+    assert_eq!(committed.info().accumulated_token_count(), Some(0));
+    assert_eq!(committed.info().dropout_block_counter(), Some(252));
+
+    let executor = CapturedReplayExecutor::default();
+    let native_target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let mut native = plan.prepare(&native_target).unwrap();
+    assert_native_policy_preparation(&native);
+    let native_initial_parameters = native.parameter_snapshots().unwrap();
+    assert_eq!(native_initial_parameters, initial_parameters);
+
+    let native_first = native.step_scheduled(policy_frontier_batch(1)).unwrap();
+    assert!(!native_first.did_update());
+    assert_native_policy_step(&native_first, &expected.replays[0]);
+    assert_eq!(native_first.report().successful_invocation(), 1);
+    assert_native_policy_progress(&native, 1, 0, 1, 5);
+    assert_pytorch_tensor_map_close(
+        "strict-native GELU replay 1 numerator gradient",
+        &native.gradient_accumulator_snapshots().unwrap(),
+        &expected.replays[0].numerator_gradients,
+    );
+
+    let native_second = native.step_scheduled(policy_frontier_batch(2)).unwrap();
+    assert!(!native_second.did_update());
+    assert_native_policy_step(&native_second, &expected.replays[1]);
+    assert_eq!(native_second.report().successful_invocation(), 2);
+    assert_native_policy_progress(&native, 2, 0, 2, 8);
+    let native_pending_checkpoint = native.checkpoint().unwrap();
+    assert_eq!(
+        native_pending_checkpoint.info().replay_step(),
+        pending.replay_step
+    );
+    assert_eq!(
+        native_pending_checkpoint.info().optimizer_step(),
+        pending.optimizer_step
+    );
+    assert_eq!(
+        native_pending_checkpoint.info().accumulation_index(),
+        pending.accumulation_index
+    );
+    assert_eq!(
+        native_pending_checkpoint.info().accumulated_token_count(),
+        Some(pending.valid_token_count)
+    );
+    assert_eq!(
+        native_pending_checkpoint.info().dropout_block_counter(),
+        Some(pending.dropout_counter)
+    );
+
+    let native_restored_plan = plan.restore_checkpoint(&native_pending_checkpoint).unwrap();
+    assert_eq!(
+        native_restored_plan.capture_identity(),
+        plan.capture_identity()
+    );
+    assert_eq!(compile_count.get(), 1);
+    let mut native_resumed = native_restored_plan.prepare(&native_target).unwrap();
+    assert_native_policy_preparation(&native_resumed);
+    assert_eq!(
+        native_resumed.checkpoint().unwrap(),
+        native_pending_checkpoint
+    );
+
+    let native_third = native.step_scheduled(policy_frontier_batch(3)).unwrap();
+    let native_resumed_third = native_resumed
+        .step_scheduled(policy_frontier_batch(3))
+        .unwrap();
+    for step in [&native_third, &native_resumed_third] {
+        assert!(step.did_update());
+        assert_native_policy_step(step, &expected.replays[2]);
+    }
+    assert_eq!(native_third.report().successful_invocation(), 3);
+    assert_eq!(native_resumed_third.report().successful_invocation(), 1);
+    assert_compiled_adamw_steps_exact(
+        "strict-native GELU replay 3 restore",
+        &native_resumed_third,
+        &native_third,
+    );
+    assert_native_policy_progress(&native, 3, 1, 0, 0);
+    assert_native_policy_progress(&native_resumed, 3, 1, 0, 0);
+    assert_eq!(
+        native_resumed.checkpoint().unwrap(),
+        native.checkpoint().unwrap()
+    );
+    assert_policy_accumulators_are_positive_zero(&native);
+    assert_policy_accumulators_are_positive_zero(&native_resumed);
+
+    assert_pytorch_adamw_window_for_frontier(
+        "strict-native GELU first window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 1,
+            clip_report: native_third.clip_report().unwrap(),
+            actual_initial: &native_initial_parameters,
+            actual_first_moments: &native.first_moment_snapshots().unwrap(),
+            actual_second_moments: &native.second_moment_snapshots().unwrap(),
+            actual_successors: &native.parameter_snapshots().unwrap(),
+            expected_initial: &expected.initial_parameters,
+            expected: &expected.commit.adamw,
+        },
+        expected.commit.microbatch_count,
+        expected.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: expected.learning_rate,
+            recurrence_ulp_tolerance: 2,
+        },
+    );
+    assert_policy_window_report(
+        "strict-native GELU first window",
+        native_third.window_loss_report().unwrap(),
+        &expected.commit,
+    );
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
 }
 
 #[test]

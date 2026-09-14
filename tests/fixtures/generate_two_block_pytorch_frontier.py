@@ -46,6 +46,30 @@ POLICY_FROZEN_PARAMETER = "positions.weight"
 # Key bias shifts every key score equally for one query/head and is therefore a
 # topology-derived softmax gauge direction, independent of observed values.
 POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS = ("first.key.1", "second.key.1")
+GELU_WEIGHT_DECAY_EXCLUSIONS = (
+    "first.ff1.1",
+    "first.ff2.1",
+    "first.key.1",
+    "first.ln1.0",
+    "first.ln1.1",
+    "first.ln2.0",
+    "first.ln2.1",
+    "first.out.1",
+    "first.query.1",
+    "first.value.1",
+    "norm.bias",
+    "norm.weight",
+    "second.ff1.1",
+    "second.ff2.1",
+    "second.key.1",
+    "second.ln1.0",
+    "second.ln1.1",
+    "second.ln2.0",
+    "second.ln2.1",
+    "second.out.1",
+    "second.query.1",
+    "second.value.1",
+)
 POLICY_VALID_LENGTHS = ((3, 2), (2, 1), (3, 0))
 MASKS = (
     (
@@ -226,6 +250,7 @@ def block_forward(
     effective_mask: torch.Tensor,
     row_valid: torch.Tensor,
     masks: list[torch.Tensor],
+    activation: str = "relu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     normalized = layer_norm(value, params, f"{prefix}.ln1")
     heads = []
@@ -245,7 +270,13 @@ def block_forward(
     attended = linear(attended, params, f"{prefix}.out")
     residual = value + apply_dropout(attended, masks[1])
     ff_input = linear(layer_norm(residual, params, f"{prefix}.ln2"), params, f"{prefix}.ff1")
-    ff_output = linear(torch.relu(ff_input), params, f"{prefix}.ff2")
+    if activation == "relu":
+        activated = torch.relu(ff_input)
+    elif activation == "gelu_tanh":
+        activated = torch.nn.functional.gelu(ff_input, approximate="tanh")
+    else:
+        raise ValueError(f"unsupported activation: {activation}")
+    ff_output = linear(activated, params, f"{prefix}.ff2")
     return residual + apply_dropout(ff_output, masks[2]), probabilities, ff_input
 
 
@@ -285,15 +316,16 @@ def forward_inputs(
     effective_mask: torch.Tensor,
     row_valid: torch.Tensor,
     ignore_index: int | None,
+    activation: str = "relu",
 ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     masks = replay_masks(replay)
     positions = torch.tensor(POSITIONS, dtype=torch.int64).reshape(BATCH, TIME)
     value = params["tokens.weight"][tokens] + params["positions.weight"][positions]
     value, first_probabilities, first_relu_input = block_forward(
-        value, params, "first", effective_mask, row_valid, masks[:3]
+        value, params, "first", effective_mask, row_valid, masks[:3], activation
     )
     value, second_probabilities, second_relu_input = block_forward(
-        value, params, "second", effective_mask, row_valid, masks[3:]
+        value, params, "second", effective_mask, row_valid, masks[3:], activation
     )
     value = layer_norm(value, params, "norm")
     logits = value @ params["tokens.weight"].transpose(0, 1)
@@ -366,7 +398,7 @@ def policy_batch(replay: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
 
 
 def policy_forward(
-    params: OrderedDict[str, torch.Tensor], replay: int
+    params: OrderedDict[str, torch.Tensor], replay: int, activation: str = "relu"
 ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     tokens, targets, loss_mask, caller = policy_batch(replay)
     effective_mask, row_valid = apply_causal_attention_mask(caller)
@@ -379,6 +411,7 @@ def policy_forward(
         effective_mask,
         row_valid,
         POLICY_IGNORE_INDEX,
+        activation,
     )
 
 
@@ -480,9 +513,9 @@ def replay_fixture(
 
 
 def policy_replay_fixture(
-    params: OrderedDict[str, torch.Tensor], replay: int
+    params: OrderedDict[str, torch.Tensor], replay: int, activation: str = "relu"
 ) -> tuple[OrderedDict[str, torch.Tensor], dict[str, object], float]:
-    result = policy_forward(params, replay)
+    result = policy_forward(params, replay, activation)
     active_params = OrderedDict(
         (name, parameter)
         for name, parameter in params.items()
@@ -538,6 +571,7 @@ def adamw_window(
     max_gradient_norm: float = MAX_GRADIENT_NORM,
     learning_rate: float = LEARNING_RATE,
     weight_decay: float = 0.0,
+    weight_decay_exclusions: frozenset[str] = frozenset(),
 ) -> tuple[
     OrderedDict[str, torch.Tensor],
     OrderedDict[str, torch.Tensor],
@@ -586,8 +620,8 @@ def adamw_window(
     for name, parameter in params.items():
         first = next_first_moments[name] / first_correction
         second = next_second_moments[name] / second_correction
-        if weight_decay.item() == 0.0:
-            successor = parameter - LEARNING_RATE * first / (torch.sqrt(second) + EPSILON)
+        if weight_decay.item() == 0.0 or name in weight_decay_exclusions:
+            successor = parameter - learning_rate * first / (torch.sqrt(second) + EPSILON)
         else:
             normalized = first / (torch.sqrt(second) + EPSILON)
             successor = parameter * decay_factor - learning_rate * normalized
@@ -771,6 +805,93 @@ def generate_policy_frontier() -> dict[str, object]:
     }
 
 
+def generate_gelu_policy_window() -> dict[str, object]:
+    params = make_parameters()
+    frozen_parameter = params[POLICY_FROZEN_PARAMETER].detach().clone()
+    active_params = OrderedDict(
+        (name, parameter)
+        for name, parameter in params.items()
+        if name != POLICY_FROZEN_PARAMETER
+    )
+    initial_parameters = OrderedDict(
+        (name, parameter.detach().clone()) for name, parameter in active_params.items()
+    )
+    first_moments = OrderedDict(
+        (name, torch.zeros_like(parameter)) for name, parameter in active_params.items()
+    )
+    second_moments = OrderedDict(
+        (name, torch.zeros_like(parameter)) for name, parameter in active_params.items()
+    )
+    exclusions = frozenset(GELU_WEIGHT_DECAY_EXCLUSIONS)
+    assert exclusions < set(active_params)
+
+    replays = []
+    gradients_by_replay = []
+    numerators = []
+    for replay in range(1, 4):
+        gradients, fixture, numerator = policy_replay_fixture(
+            params, replay, "gelu_tanh"
+        )
+        gradients_by_replay.append(gradients)
+        replays.append(fixture)
+        numerators.append(numerator)
+
+    pending_loss_numerator = f32(f32(0.0) + numerators[0])
+    pending_loss_numerator = f32(pending_loss_numerator + numerators[1])
+    _, next_first_moments, next_second_moments, commit = adamw_window(
+        active_params,
+        first_moments,
+        second_moments,
+        gradients_by_replay,
+        1,
+        11,
+        max_gradient_norm=POLICY_MAX_GRADIENT_NORM,
+        learning_rate=1.0e-3,
+        weight_decay=POLICY_WEIGHT_DECAY,
+        weight_decay_exclusions=exclusions,
+    )
+    assert all(torch.isfinite(value).all() for value in next_first_moments.values())
+    assert all(torch.isfinite(value).all() for value in next_second_moments.values())
+    window_loss_numerator = f32(pending_loss_numerator + numerators[2])
+    commit.update(
+        {
+            "learning_rate": 1.0e-3,
+            "mean_loss": f32(window_loss_numerator / f32(11.0)),
+            "microbatch_count": 3,
+        }
+    )
+    assert torch.equal(params[POLICY_FROZEN_PARAMETER], frozen_parameter)
+    return {
+        "rustgrad_base": "89bd150e01eb35068b8bdba05b264e49bb30616e",
+        "approximation": "tanh",
+        "weight_decay": POLICY_WEIGHT_DECAY,
+        "weight_decay_exclusions": list(GELU_WEIGHT_DECAY_EXCLUSIONS),
+        "loss_scale": POLICY_LOSS_SCALE,
+        "accumulation_steps": 3,
+        "max_gradient_norm": POLICY_MAX_GRADIENT_NORM,
+        "ignore_index": POLICY_IGNORE_INDEX,
+        "learning_rate": 1.0e-3,
+        "active_parameter_count": len(active_params),
+        "active_coordinate_count": sum(
+            parameter.numel() for parameter in active_params.values()
+        ),
+        "analytic_gauge_null_parameters": list(POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS),
+        "frozen_parameter_name": POLICY_FROZEN_PARAMETER,
+        "frozen_parameter": tensor(frozen_parameter),
+        "initial_parameters": tensor_map(initial_parameters),
+        "replays": replays,
+        "pending_checkpoint": {
+            "replay_step": 2,
+            "optimizer_step": 0,
+            "accumulation_index": 2,
+            "valid_token_count": 8,
+            "dropout_counter": 2 * 84,
+            "loss_numerator": pending_loss_numerator,
+        },
+        "commit": commit,
+    }
+
+
 def main(output: Path) -> None:
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
@@ -833,6 +954,7 @@ def main(output: Path) -> None:
         "windows": windows,
         "partial_flush": partial_flush,
         "policy_frontier": generate_policy_frontier(),
+        "gelu_policy_window": generate_gelu_policy_window(),
     }
     output.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
 
