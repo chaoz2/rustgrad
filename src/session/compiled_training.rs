@@ -1,6 +1,7 @@
 //! Graph-free CPU replay for static training programs with recurrent state.
 
 mod adamw_checkpoint;
+mod adamw_contract;
 mod module_adamw_checkpoint;
 mod program_artifact;
 mod resume_bundle;
@@ -16,6 +17,7 @@ use self::adamw_checkpoint::{
     encode_adamw_checkpoint,
 };
 pub use self::adamw_checkpoint::{CompiledAdamWCheckpoint, CompiledAdamWCheckpointInfo};
+use self::adamw_contract::{CompiledAdamWContract, MetalAdamWContract};
 pub use self::module_adamw_checkpoint::CompiledModuleAdamWCheckpoint;
 use self::module_adamw_checkpoint::{
     DecodedModuleAdamWCheckpoint, ModuleCheckpointState, ModuleCheckpointStateKind,
@@ -4230,41 +4232,9 @@ pub struct CompiledAdamWPlan {
     partial_flush: Option<CompiledAdamWAuxiliaryPlan>,
     zero_grad: Option<CompiledAdamWAuxiliaryPlan>,
     program_identity: u64,
-    gradient_accumulation_steps: u64,
-    token_weight_policy: Option<CompiledTokenWeightPolicy>,
-    allow_zero_valid_token_microbatches: bool,
-    max_gradient_norm: Option<f32>,
-    clip_report: bool,
-    window_loss_report: bool,
-    loss_scale: f32,
+    contract: CompiledAdamWContract,
     progress: AdamWProgress,
-    dropout: Option<CompiledDropoutState>,
-    host_token_inputs: BTreeMap<String, Shape>,
-    frozen_parameters: BTreeSet<String>,
     evaluation: Option<CompiledEvaluationPlan>,
-    learning_rate: CompiledLearningRatePolicy,
-    adamw_policy: CompiledAdamWPolicy,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct CompiledAdamWPolicy {
-    beta1: f32,
-    beta2: f32,
-    eps: f32,
-    weight_decay: f32,
-    weight_decay_exclusions: BTreeSet<String>,
-}
-
-impl CompiledAdamWPolicy {
-    fn from_config(config: &CompiledAdamWConfig) -> Self {
-        Self {
-            beta1: config.beta1,
-            beta2: config.beta2,
-            eps: config.eps,
-            weight_decay: config.weight_decay,
-            weight_decay_exclusions: config.weight_decay_exclusions.clone(),
-        }
-    }
 }
 
 /// Explicit scalar or token-mean objective returned by a compiled module
@@ -4641,21 +4611,10 @@ pub struct CpuCompiledAdamW {
     inner: CpuCompiledTrainingProgram,
     partial_flush: Option<CompiledAdamWAuxiliaryPlan>,
     zero_grad: Option<CompiledAdamWAuxiliaryPlan>,
-    gradient_accumulation_steps: u64,
-    token_weight_policy: Option<CompiledTokenWeightPolicy>,
-    allow_zero_valid_token_microbatches: bool,
-    max_gradient_norm: Option<f32>,
-    clip_report: bool,
-    window_loss_report: bool,
-    loss_scale: f32,
+    contract: CompiledAdamWContract,
     progress: AdamWProgress,
-    dropout: Option<CompiledDropoutState>,
-    host_token_inputs: BTreeMap<String, Shape>,
-    frozen_parameters: BTreeSet<String>,
     evaluation: Option<CpuCompiledEvaluation>,
-    learning_rate: CompiledLearningRatePolicy,
     non_finite_policy: CpuNonFinitePolicy,
-    adamw_policy: CompiledAdamWPolicy,
 }
 
 /// Strict-native CPU AdamW session prepared from the same authenticated plan
@@ -4686,11 +4645,7 @@ pub struct MetalCompiledAdamWPlan {
     partial_flush: Option<MetalFixedStateTransitionPlan>,
     progress: AdamWProgress,
     flush_capture_identity: Option<u64>,
-    gradient_accumulation_steps: u64,
-    max_gradient_norm: Option<f32>,
-    loss_scale: f32,
-    dropout: Option<CompiledDropoutState>,
-    frozen_parameters: BTreeSet<String>,
+    contract: MetalAdamWContract,
 }
 
 /// Optimizer-neutral strict-Metal rendering of one compiled training program.
@@ -4716,11 +4671,7 @@ pub struct MetalCompiledAdamW {
     partial_flush: Option<MetalFixedStateTransitionSession>,
     progress: AdamWProgress,
     flush_capture_identity: Option<u64>,
-    gradient_accumulation_steps: u64,
-    max_gradient_norm: Option<f32>,
-    loss_scale: f32,
-    dropout: Option<CompiledDropoutState>,
-    frozen_parameters: BTreeSet<String>,
+    contract: MetalAdamWContract,
 }
 
 /// Optimizer-neutral owner of one prepared strict-Metal training program.
@@ -6654,16 +6605,16 @@ impl CompiledEvaluationPlan {
                 let loss_weight_policy = match objective {
                     CompiledAdamWObjective::Scalar(_) => None,
                     CompiledAdamWObjective::TokenMean(_) => {
-                        training_plan.token_weight_policy.clone()
+                        training_plan.contract.token_weight_policy.clone()
                     }
                 };
                 let loss = lower_compiled_adamw_objective_for_policy(
                     graph,
                     inputs,
                     objective,
-                    training_plan.token_weight_policy.as_ref(),
+                    training_plan.contract.token_weight_policy.as_ref(),
                     &training_plan.inner.inputs,
-                    training_plan.allow_zero_valid_token_microbatches,
+                    training_plan.contract.allow_zero_valid_token_microbatches,
                 )?;
                 Ok((loss, outputs, loss_weight_policy))
             },
@@ -6691,7 +6642,7 @@ impl CompiledEvaluationPlan {
             parameter_plan,
             |module, graph, inputs| {
                 let nodes = lower_ignore_index_nodes_for_policy(
-                    training_plan.token_weight_policy.as_ref(),
+                    training_plan.contract.token_weight_policy.as_ref(),
                     &training_plan.inner.inputs,
                     graph,
                     inputs,
@@ -6701,11 +6652,15 @@ impl CompiledEvaluationPlan {
                     graph,
                     objective,
                     nodes,
-                    training_plan.token_weight_policy.as_ref(),
+                    training_plan.contract.token_weight_policy.as_ref(),
                     &training_plan.inner.inputs,
-                    training_plan.allow_zero_valid_token_microbatches,
+                    training_plan.contract.allow_zero_valid_token_microbatches,
                 )?;
-                Ok((loss, outputs, training_plan.token_weight_policy.clone()))
+                Ok((
+                    loss,
+                    outputs,
+                    training_plan.contract.token_weight_policy.clone(),
+                ))
             },
         )
     }
@@ -6790,7 +6745,7 @@ impl CompiledEvaluationPlan {
         let inference =
             crate::CapturedInference::from_graph_residents(&graph, &requested, residents, &[])
                 .map_err(captured_inference_error)?
-                .with_authenticated_fixed_host_gathers(&training_plan.host_token_inputs)
+                .with_authenticated_fixed_host_gathers(&training_plan.contract.host_token_inputs)
                 .map_err(captured_inference_error)?;
         let transient_names = inference
             .transient_inputs()
@@ -6814,7 +6769,9 @@ impl CompiledEvaluationPlan {
             output_names: outputs.keys().cloned().collect(),
             parameter_inputs,
             loss_weight_policy,
-            allow_zero_valid_token_microbatches: training_plan.allow_zero_valid_token_microbatches,
+            allow_zero_valid_token_microbatches: training_plan
+                .contract
+                .allow_zero_valid_token_microbatches,
             capture_identity,
         })
     }
@@ -8274,16 +8231,6 @@ impl CompiledAdamWPlan {
         inner: CompiledTrainingPlan,
     ) -> Result<Self> {
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
-        let token_weight_policy = config.token_weight_policy.clone();
-        let allow_zero_valid_token_microbatches = config.allow_zero_valid_token_microbatches;
-        let max_gradient_norm = config.max_gradient_norm;
-        let clip_report = config.clip_report;
-        let window_loss_report = config.window_loss_report;
-        let loss_scale = config.loss_scale;
-        let host_token_inputs = config.host_token_inputs.clone();
-        let frozen_parameters = config.frozen_parameters.clone();
-        let learning_rate = config.learning_rate.clone();
-        let adamw_policy = CompiledAdamWPolicy::from_config(&config);
         let partial_flush = (gradient_accumulation_steps > 1)
             .then(|| CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config))
             .transpose()?;
@@ -8296,20 +8243,9 @@ impl CompiledAdamWPlan {
             partial_flush,
             zero_grad,
             program_identity,
-            gradient_accumulation_steps,
-            token_weight_policy,
-            allow_zero_valid_token_microbatches,
-            max_gradient_norm,
-            clip_report,
-            window_loss_report,
-            loss_scale,
+            contract: CompiledAdamWContract::from_config(&config, None),
             progress: AdamWProgress::INITIAL,
-            dropout: None,
-            host_token_inputs,
-            frozen_parameters,
             evaluation: None,
-            learning_rate,
-            adamw_policy,
         })
     }
 
@@ -8677,16 +8613,6 @@ impl CompiledAdamWPlan {
     {
         parameter_plan.validate_weight_decay_exclusions(&config)?;
         let gradient_accumulation_steps = config.gradient_accumulation_steps;
-        let token_weight_policy = config.token_weight_policy.clone();
-        let allow_zero_valid_token_microbatches = config.allow_zero_valid_token_microbatches;
-        let max_gradient_norm = config.max_gradient_norm;
-        let clip_report = config.clip_report;
-        let window_loss_report = config.window_loss_report;
-        let loss_scale = config.loss_scale;
-        let host_token_inputs = config.host_token_inputs.clone();
-        let frozen_parameters = config.frozen_parameters.clone();
-        let learning_rate = config.learning_rate.clone();
-        let adamw_policy = CompiledAdamWPolicy::from_config(&config);
         let workload = StateSpec::dropout_counter()?;
         let mut dropout_state = None;
         let mut frozen_parameter_nodes = BTreeSet::new();
@@ -8727,20 +8653,9 @@ impl CompiledAdamWPlan {
             partial_flush,
             zero_grad,
             program_identity,
-            gradient_accumulation_steps,
-            token_weight_policy,
-            allow_zero_valid_token_microbatches,
-            max_gradient_norm,
-            clip_report,
-            window_loss_report,
-            loss_scale,
+            contract: CompiledAdamWContract::from_config(&config, Some(dropout)),
             progress: AdamWProgress::INITIAL,
-            dropout: Some(dropout),
-            host_token_inputs,
-            frozen_parameters,
             evaluation: None,
-            learning_rate,
-            adamw_policy,
         })
     }
 
@@ -8756,18 +8671,18 @@ impl CompiledAdamWPlan {
     /// independently.
     pub fn restore_checkpoint(&self, checkpoint: &CompiledAdamWCheckpoint) -> Result<Self> {
         let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
-        if self.gradient_accumulation_steps != decoded.accumulation_steps {
+        if self.contract.gradient_accumulation_steps != decoded.accumulation_steps {
             return Err(training(
                 "compiled AdamW checkpoint accumulation policy mismatch",
             ));
         }
-        if self.window_loss_report != decoded.window_loss_report {
+        if self.contract.window_loss_report != decoded.window_loss_report {
             return Err(training(
                 "compiled AdamW checkpoint window-loss reporting policy mismatch",
             ));
         }
         match (
-            self.token_weight_policy.as_ref(),
+            self.contract.token_weight_policy.as_ref(),
             decoded.accumulated_token_count,
         ) {
             (Some(mask_input), Some(count)) => validate_retained_token_count(
@@ -8775,7 +8690,7 @@ impl CompiledAdamWPlan {
                 mask_input,
                 decoded.accumulation_index,
                 count,
-                self.allow_zero_valid_token_microbatches,
+                self.contract.allow_zero_valid_token_microbatches,
             )?,
             (None, None) => {}
             _ => {
@@ -8810,7 +8725,7 @@ impl CompiledAdamWPlan {
                 "compiled AdamW checkpoint zero-grad capture identity mismatch",
             ));
         }
-        match (self.dropout, decoded.dropout_block_counter) {
+        match (self.contract.dropout, decoded.dropout_block_counter) {
             (None, None) => {}
             (None, Some(_)) => {
                 return Err(training(
@@ -9047,13 +8962,14 @@ impl CompiledAdamWPlan {
     ) -> Result<CpuCompiledAdamW> {
         validate_adamw_observation_schema(
             &self.inner.phase_outputs.observations,
-            self.clip_report,
-            self.window_loss_report,
+            self.contract.clip_report,
+            self.contract.window_loss_report,
         )?;
         if let Some(partial_flush) = &self.partial_flush {
-            partial_flush
-                .outputs
-                .validate_report_flags(self.clip_report, self.window_loss_report)?;
+            partial_flush.outputs.validate_report_flags(
+                self.contract.clip_report,
+                self.contract.window_loss_report,
+            )?;
         }
         if let Some(zero_grad) = &self.zero_grad {
             zero_grad.outputs.validate_report_flags(false, false)?;
@@ -9064,23 +8980,12 @@ impl CompiledAdamWPlan {
                 .prepare_cpu_with_non_finite_policy(non_finite_policy)?,
             partial_flush: self.partial_flush.clone(),
             zero_grad: self.zero_grad.clone(),
-            gradient_accumulation_steps: self.gradient_accumulation_steps,
-            token_weight_policy: self.token_weight_policy.clone(),
-            allow_zero_valid_token_microbatches: self.allow_zero_valid_token_microbatches,
-            max_gradient_norm: self.max_gradient_norm,
-            clip_report: self.clip_report,
-            window_loss_report: self.window_loss_report,
-            loss_scale: self.loss_scale,
+            contract: self.contract.clone(),
             progress: self.progress,
-            dropout: self.dropout,
-            host_token_inputs: self.host_token_inputs.clone(),
-            frozen_parameters: self.frozen_parameters.clone(),
             evaluation: self
                 .evaluation
                 .clone()
                 .map(|plan| CpuCompiledEvaluation { plan }),
-            learning_rate: self.learning_rate.clone(),
-            adamw_policy: self.adamw_policy.clone(),
             non_finite_policy,
         })
     }
@@ -9116,32 +9021,10 @@ impl CompiledAdamWPlan {
     /// Renders the compiled program for strict Metal admission without
     /// creating device resources.
     pub fn metal_plan(&self, renderer: MetalRenderer) -> Result<MetalCompiledAdamWPlan> {
-        if self.clip_report {
-            return Err(training(
-                "compiled AdamW clip reporting is currently CPU-only",
-            ));
-        }
-        if self.window_loss_report {
-            return Err(training(
-                "compiled AdamW window-loss reporting is currently CPU-only",
-            ));
-        }
-        if self.token_weight_policy.is_some() {
-            return Err(training(
-                "compiled AdamW token-weighted accumulation is currently CPU-only",
-            ));
-        }
-        if matches!(
-            &self.learning_rate,
-            CompiledLearningRatePolicy::MultiStep(_)
-        ) {
-            return Err(training(
-                "compiled MultiStep learning-rate policy is currently CPU-only",
-            ));
-        }
+        let contract = self.contract.metal()?;
         let inner = self.inner.metal_plan(
             renderer.clone(),
-            &self.host_token_inputs,
+            &self.contract.host_token_inputs,
             self.evaluation.clone(),
         )?;
         let partial_flush = self
@@ -9162,11 +9045,7 @@ impl CompiledAdamWPlan {
             partial_flush,
             progress: self.progress,
             flush_capture_identity: self.flush_capture_identity(),
-            gradient_accumulation_steps: self.gradient_accumulation_steps,
-            max_gradient_norm: self.max_gradient_norm,
-            loss_scale: self.loss_scale,
-            dropout: self.dropout,
-            frozen_parameters: self.frozen_parameters.clone(),
+            contract,
         })
     }
 
@@ -9179,11 +9058,11 @@ impl CompiledAdamWPlan {
     }
 
     pub fn gradient_accumulation_steps(&self) -> u64 {
-        self.gradient_accumulation_steps
+        self.contract.gradient_accumulation_steps
     }
 
     pub fn token_weighted_gradient_accumulation_mask(&self) -> Option<&str> {
-        match &self.token_weight_policy {
+        match &self.contract.token_weight_policy {
             Some(CompiledTokenWeightPolicy::ExplicitMask(name)) => Some(name),
             _ => None,
         }
@@ -9191,7 +9070,7 @@ impl CompiledAdamWPlan {
 
     /// I32 target input and sentinel used for compiler-owned token weighting.
     pub fn token_weighted_ignore_index(&self) -> Option<(&str, i32)> {
-        match &self.token_weight_policy {
+        match &self.contract.token_weight_policy {
             Some(CompiledTokenWeightPolicy::IgnoreIndex {
                 target_input,
                 value,
@@ -9201,28 +9080,28 @@ impl CompiledAdamWPlan {
     }
 
     pub fn zero_valid_token_microbatches_enabled(&self) -> bool {
-        self.allow_zero_valid_token_microbatches
+        self.contract.allow_zero_valid_token_microbatches
     }
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
-        self.max_gradient_norm
+        self.contract.max_gradient_norm
     }
 
     pub fn clip_report_enabled(&self) -> bool {
-        self.clip_report
+        self.contract.clip_report
     }
 
     /// Whether completed-window loss aggregation is captured and reported.
     pub fn window_loss_report_enabled(&self) -> bool {
-        self.window_loss_report
+        self.contract.window_loss_report
     }
 
     pub fn loss_scale(&self) -> f32 {
-        self.loss_scale
+        self.contract.loss_scale
     }
 
     pub fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
-        match &self.learning_rate {
+        match &self.contract.learning_rate {
             CompiledLearningRatePolicy::External => None,
             CompiledLearningRatePolicy::MultiStep(schedule) => Some(schedule),
         }
@@ -9279,12 +9158,14 @@ impl CompiledAdamWPlan {
 
     /// Returns the explicit compiled dropout policy, when present.
     pub fn dropout_config(&self) -> Option<CompiledDropoutConfig> {
-        self.dropout.map(|dropout| dropout.config)
+        self.contract.dropout.map(|dropout| dropout.config)
     }
 
     /// Number of Threefry U64 blocks reserved by each successful replay.
     pub fn dropout_blocks_per_replay(&self) -> Option<u64> {
-        self.dropout.map(|dropout| dropout.blocks_per_replay)
+        self.contract
+            .dropout
+            .map(|dropout| dropout.blocks_per_replay)
     }
 
     /// Stable identity of the private accumulation-only sibling capture.
@@ -10268,14 +10149,14 @@ impl CpuCompiledAdamW {
         validate_training_inputs(&self.inner.inputs, &inputs)?;
         let loss_weight = validate_token_weight(
             &inputs,
-            self.token_weight_policy.as_ref(),
-            self.allow_zero_valid_token_microbatches,
+            self.contract.token_weight_policy.as_ref(),
+            self.contract.allow_zero_valid_token_microbatches,
         )?;
         let next_progress = self
             .progress
-            .advance_replay(self.gradient_accumulation_steps)?;
+            .advance_replay(self.contract.gradient_accumulation_steps)?;
         self.validate_completed_token_window(next_progress, loss_weight)?;
-        if let Some(dropout) = self.dropout {
+        if let Some(dropout) = self.contract.dropout {
             expected_dropout_counter(dropout, next_progress.replay_step)?;
         }
         Ok(PendingAdamWStep {
@@ -10303,15 +10184,15 @@ impl CpuCompiledAdamW {
             result,
             next_progress,
             loss_weight,
-            self.gradient_accumulation_steps,
-            self.clip_report,
-            self.window_loss_report,
+            self.contract.gradient_accumulation_steps,
+            self.contract.clip_report,
+            self.contract.window_loss_report,
         )
     }
 
     fn validate_completed_token_window(&self, next: AdamWProgress, loss_weight: u64) -> Result<()> {
-        if !self.allow_zero_valid_token_microbatches
-            || self.token_weight_policy.is_none()
+        if !self.contract.allow_zero_valid_token_microbatches
+            || self.contract.token_weight_policy.is_none()
             || next.accumulation_index != 0
         {
             return Ok(());
@@ -10333,7 +10214,9 @@ impl CpuCompiledAdamW {
     }
 
     fn validate_partial_token_window(&self) -> Result<()> {
-        if !self.allow_zero_valid_token_microbatches || self.token_weight_policy.is_none() {
+        if !self.contract.allow_zero_valid_token_microbatches
+            || self.contract.token_weight_policy.is_none()
+        {
             return Ok(());
         }
         let retained = self
@@ -10431,7 +10314,7 @@ impl CpuCompiledAdamW {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<CompiledAdamWStepResult> {
-        self.learning_rate.require_external()?;
+        self.contract.learning_rate.require_external()?;
         self.step_with_learning_rate(
             inputs,
             Some(learning_rate),
@@ -10450,7 +10333,7 @@ impl CpuCompiledAdamW {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<CompiledAdamWStepResult> {
-        self.learning_rate.require_external()?;
+        self.contract.learning_rate.require_external()?;
         self.step_with_learning_rate(
             inputs,
             Some(learning_rate),
@@ -10465,7 +10348,7 @@ impl CpuCompiledAdamW {
         &mut self,
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<CompiledAdamWStepResult> {
-        self.learning_rate.require_scheduled()?;
+        self.contract.learning_rate.require_scheduled()?;
         self.step_with_learning_rate(inputs, None, CompiledStepOutputSelection::All, None)
     }
 
@@ -10474,7 +10357,7 @@ impl CpuCompiledAdamW {
         &mut self,
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<CompiledAdamWStepResult> {
-        self.learning_rate.require_scheduled()?;
+        self.contract.learning_rate.require_scheduled()?;
         self.step_with_learning_rate(inputs, None, CompiledStepOutputSelection::CommitOnly, None)
     }
 
@@ -10559,11 +10442,11 @@ impl CpuCompiledAdamW {
     }
 
     pub fn gradient_accumulation_steps(&self) -> u64 {
-        self.gradient_accumulation_steps
+        self.contract.gradient_accumulation_steps
     }
 
     pub fn token_weighted_gradient_accumulation_mask(&self) -> Option<&str> {
-        match &self.token_weight_policy {
+        match &self.contract.token_weight_policy {
             Some(CompiledTokenWeightPolicy::ExplicitMask(name)) => Some(name),
             _ => None,
         }
@@ -10571,7 +10454,7 @@ impl CpuCompiledAdamW {
 
     /// I32 target input and sentinel used for compiler-owned token weighting.
     pub fn token_weighted_ignore_index(&self) -> Option<(&str, i32)> {
-        match &self.token_weight_policy {
+        match &self.contract.token_weight_policy {
             Some(CompiledTokenWeightPolicy::IgnoreIndex {
                 target_input,
                 value,
@@ -10581,28 +10464,28 @@ impl CpuCompiledAdamW {
     }
 
     pub fn zero_valid_token_microbatches_enabled(&self) -> bool {
-        self.allow_zero_valid_token_microbatches
+        self.contract.allow_zero_valid_token_microbatches
     }
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
-        self.max_gradient_norm
+        self.contract.max_gradient_norm
     }
 
     pub fn clip_report_enabled(&self) -> bool {
-        self.clip_report
+        self.contract.clip_report
     }
 
     /// Whether completed-window loss aggregation is captured and reported.
     pub fn window_loss_report_enabled(&self) -> bool {
-        self.window_loss_report
+        self.contract.window_loss_report
     }
 
     pub fn loss_scale(&self) -> f32 {
-        self.loss_scale
+        self.contract.loss_scale
     }
 
     pub fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
-        match &self.learning_rate {
+        match &self.contract.learning_rate {
             CompiledLearningRatePolicy::External => None,
             CompiledLearningRatePolicy::MultiStep(schedule) => Some(schedule),
         }
@@ -10615,7 +10498,8 @@ impl CpuCompiledAdamW {
 
     /// Explicit diagnostic snapshot of the recurrent dropout counter.
     pub fn dropout_block_counter(&self) -> Result<Option<u64>> {
-        self.dropout
+        self.contract
+            .dropout
             .map(|_| {
                 Ok(self
                     .inner
@@ -10670,7 +10554,9 @@ impl CpuCompiledAdamW {
         &mut self,
         injected_failure: Option<u64>,
     ) -> Result<CompiledAdamWZeroGradResult> {
-        let (next, result) = self.progress.cancel(self.gradient_accumulation_steps)?;
+        let (next, result) = self
+            .progress
+            .cancel(self.contract.gradient_accumulation_steps)?;
         if !result.did_discard() {
             return Ok(result);
         }
@@ -10706,12 +10592,12 @@ impl CpuCompiledAdamW {
         &mut self,
         learning_rate: TensorData,
     ) -> Result<CompiledAdamWFlushResult> {
-        self.learning_rate.require_external()?;
+        self.contract.learning_rate.require_external()?;
         self.flush_partial_window_with_learning_rate(Some(learning_rate), None)
     }
 
     pub fn flush_partial_window_scheduled(&mut self) -> Result<CompiledAdamWFlushResult> {
-        self.learning_rate.require_scheduled()?;
+        self.contract.learning_rate.require_scheduled()?;
         self.flush_partial_window_with_learning_rate(None, None)
     }
 
@@ -10725,7 +10611,7 @@ impl CpuCompiledAdamW {
         }
         let (next, mut result) = self
             .progress
-            .flush_partial(self.gradient_accumulation_steps)?;
+            .flush_partial(self.contract.gradient_accumulation_steps)?;
         if !result.did_update() {
             return Ok(result);
         }
@@ -10796,23 +10682,12 @@ impl CpuCompiledAdamW {
             partial_flush,
             zero_grad,
             program_identity: self.capture_identity(),
-            gradient_accumulation_steps: self.gradient_accumulation_steps,
-            token_weight_policy: self.token_weight_policy.clone(),
-            allow_zero_valid_token_microbatches: self.allow_zero_valid_token_microbatches,
-            max_gradient_norm: self.max_gradient_norm,
-            clip_report: self.clip_report,
-            window_loss_report: self.window_loss_report,
-            loss_scale: self.loss_scale,
+            contract: self.contract.clone(),
             progress: self.progress,
-            dropout: self.dropout,
-            host_token_inputs: self.host_token_inputs.clone(),
-            frozen_parameters: self.frozen_parameters.clone(),
             evaluation: self
                 .evaluation
                 .as_ref()
                 .map(|evaluation| evaluation.plan.clone()),
-            learning_rate: self.learning_rate.clone(),
-            adamw_policy: self.adamw_policy.clone(),
         })
     }
 
@@ -10832,9 +10707,14 @@ impl CpuCompiledAdamW {
     /// Captures parameter values, both moment sets, the graph-owned optimizer
     /// step, and the exact compiled capture identity into deterministic bytes.
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
-        validate_adamw_progress(self.progress, self.gradient_accumulation_steps)?;
-        validate_cpu_adamw_state(&self.inner, self.progress, self.gradient_accumulation_steps)?;
+        validate_adamw_progress(self.progress, self.contract.gradient_accumulation_steps)?;
+        validate_cpu_adamw_state(
+            &self.inner,
+            self.progress,
+            self.contract.gradient_accumulation_steps,
+        )?;
         let dropout_block_counter = self
+            .contract
             .dropout
             .map(|dropout| {
                 let counter = self
@@ -10851,6 +10731,7 @@ impl CpuCompiledAdamW {
             })
             .transpose()?;
         let accumulated_token_count = self
+            .contract
             .token_weight_policy
             .as_ref()
             .map(|_| {
@@ -10861,18 +10742,20 @@ impl CpuCompiledAdamW {
                     .as_u64())
             })
             .transpose()?;
-        if let (Some(policy), Some(count)) =
-            (self.token_weight_policy.as_ref(), accumulated_token_count)
-        {
+        if let (Some(policy), Some(count)) = (
+            self.contract.token_weight_policy.as_ref(),
+            accumulated_token_count,
+        ) {
             validate_retained_token_count(
                 &self.inner.inputs,
                 policy,
                 self.progress.accumulation_index,
                 count,
-                self.allow_zero_valid_token_microbatches,
+                self.contract.allow_zero_valid_token_microbatches,
             )?;
         }
         let accumulated_loss_numerator = self
+            .contract
             .window_loss_report
             .then(|| {
                 self.inner
@@ -10889,7 +10772,7 @@ impl CpuCompiledAdamW {
                     .map(|transition| transition.capture_identity),
                 replay_step: self.progress.replay_step,
                 optimizer_step: self.progress.optimizer_step,
-                accumulation_steps: self.gradient_accumulation_steps,
+                accumulation_steps: self.contract.gradient_accumulation_steps,
                 accumulation_index: self.progress.accumulation_index,
                 discarded_microbatches: self.progress.discarded_microbatches,
                 flushed_window_count: self.progress.flushed_window_count,
@@ -10897,7 +10780,7 @@ impl CpuCompiledAdamW {
                 flush_capture_identity: self.flush_capture_identity(),
                 dropout_block_counter,
                 accumulated_token_count,
-                window_loss_report: self.window_loss_report,
+                window_loss_report: self.contract.window_loss_report,
                 reset_transition_count: self.progress.reset_transition_count,
                 reset_capture_identity: (self.progress.reset_transition_count != 0)
                     .then(|| self.zero_grad_capture_identity())
@@ -10960,8 +10843,10 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         executor: &'a CapturedReplayExecutor,
         vectorized: bool,
     ) -> Result<Self> {
-        let external_learning_rate =
-            matches!(&inner.learning_rate, CompiledLearningRatePolicy::External);
+        let external_learning_rate = matches!(
+            &inner.contract.learning_rate,
+            CompiledLearningRatePolicy::External
+        );
         let mut drafts = Vec::with_capacity(
             1 + usize::from(inner.inner.accumulation.is_some())
                 + usize::from(inner.partial_flush.is_some())
@@ -11259,7 +11144,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
-        self.inner.learning_rate.require_external()?;
+        self.inner.contract.learning_rate.require_external()?;
         self.step_with_learning_rate(
             inputs,
             Some(learning_rate),
@@ -11276,7 +11161,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
-        self.inner.learning_rate.require_external()?;
+        self.inner.contract.learning_rate.require_external()?;
         self.step_with_learning_rate(
             inputs,
             Some(learning_rate),
@@ -11289,7 +11174,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         &mut self,
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
-        self.inner.learning_rate.require_scheduled()?;
+        self.inner.contract.learning_rate.require_scheduled()?;
         self.step_with_learning_rate(inputs, None, CompiledStepOutputSelection::All, None)
     }
 
@@ -11297,7 +11182,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         &mut self,
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<NativeCpuCompiledAdamWStepResult> {
-        self.inner.learning_rate.require_scheduled()?;
+        self.inner.contract.learning_rate.require_scheduled()?;
         self.step_with_learning_rate(inputs, None, CompiledStepOutputSelection::CommitOnly, None)
     }
 
@@ -11466,12 +11351,12 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         &mut self,
         learning_rate: TensorData,
     ) -> Result<NativeCpuCompiledAdamWFlushResult> {
-        self.inner.learning_rate.require_external()?;
+        self.inner.contract.learning_rate.require_external()?;
         self.flush_partial_window_impl(Some(learning_rate), None)
     }
 
     pub fn flush_partial_window_scheduled(&mut self) -> Result<NativeCpuCompiledAdamWFlushResult> {
-        self.inner.learning_rate.require_scheduled()?;
+        self.inner.contract.learning_rate.require_scheduled()?;
         self.flush_partial_window_impl(None, None)
     }
 
@@ -11486,7 +11371,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         let (next, mut result) = self
             .inner
             .progress
-            .flush_partial(self.inner.gradient_accumulation_steps)?;
+            .flush_partial(self.inner.contract.gradient_accumulation_steps)?;
         if !result.did_update() {
             return Ok(NativeCpuCompiledAdamWFlushResult {
                 inner: result,
@@ -11592,7 +11477,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         let (next, result) = self
             .inner
             .progress
-            .cancel(self.inner.gradient_accumulation_steps)?;
+            .cancel(self.inner.contract.gradient_accumulation_steps)?;
         if !result.did_discard() {
             return Ok(result);
         }
@@ -11661,7 +11546,7 @@ impl CompiledTrainingRuntime for CpuCompiledAdamW {
         publish_parameters_with_freeze_policy(
             module,
             self.parameter_snapshots()?,
-            &self.frozen_parameters,
+            &self.contract.frozen_parameters,
         )
     }
 }
@@ -11817,7 +11702,7 @@ impl CompiledTrainingRuntime for NativeCpuCompiledAdamW<'_> {
         publish_parameters_with_freeze_policy(
             module,
             self.inner.parameter_snapshots()?,
-            &self.inner.frozen_parameters,
+            &self.inner.contract.frozen_parameters,
         )
     }
 }
@@ -12358,23 +12243,25 @@ impl MetalCompiledAdamWPlan {
     }
 
     pub fn gradient_accumulation_steps(&self) -> u64 {
-        self.gradient_accumulation_steps
+        self.contract.gradient_accumulation_steps
     }
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
-        self.max_gradient_norm
+        self.contract.max_gradient_norm
     }
 
     pub fn loss_scale(&self) -> f32 {
-        self.loss_scale
+        self.contract.loss_scale
     }
 
     pub fn dropout_config(&self) -> Option<CompiledDropoutConfig> {
-        self.dropout.map(|dropout| dropout.config)
+        self.contract.dropout.map(|dropout| dropout.config)
     }
 
     pub fn dropout_blocks_per_replay(&self) -> Option<u64> {
-        self.dropout.map(|dropout| dropout.blocks_per_replay)
+        self.contract
+            .dropout
+            .map(|dropout| dropout.blocks_per_replay)
     }
 
     pub fn summary(&self) -> &MetalDeviceSessionSummary {
@@ -12421,11 +12308,7 @@ impl MetalCompiledAdamWPlan {
             partial_flush,
             progress: self.progress,
             flush_capture_identity: self.flush_capture_identity,
-            gradient_accumulation_steps: self.gradient_accumulation_steps,
-            max_gradient_norm: self.max_gradient_norm,
-            loss_scale: self.loss_scale,
-            dropout: self.dropout,
-            frozen_parameters: self.frozen_parameters,
+            contract: self.contract,
         })
     }
 }
@@ -12627,8 +12510,8 @@ impl MetalCompiledAdamW {
         let inputs = self.inner.prepare_inputs(inputs, learning_rate)?;
         let next = self
             .progress
-            .advance_replay(self.gradient_accumulation_steps)?;
-        if let Some(dropout) = self.dropout {
+            .advance_replay(self.contract.gradient_accumulation_steps)?;
+        if let Some(dropout) = self.contract.dropout {
             expected_dropout_counter(dropout, next.replay_step)?;
         }
         Ok((next, inputs))
@@ -12656,7 +12539,7 @@ impl MetalCompiledAdamW {
             },
             self.progress,
             1,
-            self.gradient_accumulation_steps,
+            self.contract.gradient_accumulation_steps,
             false,
             false,
         );
@@ -12718,15 +12601,15 @@ impl MetalCompiledAdamW {
     }
 
     pub fn gradient_accumulation_steps(&self) -> u64 {
-        self.gradient_accumulation_steps
+        self.contract.gradient_accumulation_steps
     }
 
     pub fn max_gradient_norm(&self) -> Option<f32> {
-        self.max_gradient_norm
+        self.contract.max_gradient_norm
     }
 
     pub fn loss_scale(&self) -> f32 {
-        self.loss_scale
+        self.contract.loss_scale
     }
 
     pub fn capture_identity(&self) -> u64 {
@@ -12797,7 +12680,8 @@ impl MetalCompiledAdamW {
 
     /// Explicit diagnostic download of the recurrent dropout counter.
     pub fn dropout_block_counter(&self) -> Result<Option<u64>> {
-        self.dropout
+        self.contract
+            .dropout
             .map(|_| {
                 Ok(self
                     .state_snapshots()?
@@ -12812,7 +12696,9 @@ impl MetalCompiledAdamW {
     /// Clears a retained partial window entirely inside the epoch-swapped
     /// device frontier. No training run or host gradient download is performed.
     pub fn zero_grad(&mut self) -> Result<CompiledAdamWZeroGradResult> {
-        let (next, result) = self.progress.cancel(self.gradient_accumulation_steps)?;
+        let (next, result) = self
+            .progress
+            .cancel(self.contract.gradient_accumulation_steps)?;
         if !result.did_discard() {
             return Ok(result);
         }
@@ -12865,7 +12751,7 @@ impl MetalCompiledAdamW {
         validate_step_inputs(&BTreeMap::new(), &BTreeMap::new(), &learning_rate)?;
         let (next, result) = self
             .progress
-            .flush_partial(self.gradient_accumulation_steps)?;
+            .flush_partial(self.contract.gradient_accumulation_steps)?;
         if !result.did_update() {
             return Ok(MetalCompiledAdamWFlushResult {
                 inner: result,
@@ -12913,7 +12799,7 @@ impl MetalCompiledAdamW {
             .ok_or_else(|| training("compiled Metal optimizer step is absent"))?
             .scalar_at(0)
             .as_u64();
-        let accumulation_index = if self.gradient_accumulation_steps == 1 {
+        let accumulation_index = if self.contract.gradient_accumulation_steps == 1 {
             0
         } else {
             states
@@ -12924,13 +12810,14 @@ impl MetalCompiledAdamW {
                 .scalar_at(0)
                 .as_u64()
         };
-        validate_adamw_progress(self.progress, self.gradient_accumulation_steps)?;
+        validate_adamw_progress(self.progress, self.contract.gradient_accumulation_steps)?;
         if optimizer_step != self.progress.optimizer_step
             || accumulation_index != self.progress.accumulation_index
         {
             return Err(training("compiled Metal AdamW progress state mismatch"));
         }
         let dropout_block_counter = self
+            .contract
             .dropout
             .map(|dropout| {
                 let counter = states
@@ -12959,7 +12846,7 @@ impl MetalCompiledAdamW {
                 accumulation_capture_identity: self.accumulation_capture_identity,
                 replay_step: self.progress.replay_step,
                 optimizer_step: self.progress.optimizer_step,
-                accumulation_steps: self.gradient_accumulation_steps,
+                accumulation_steps: self.contract.gradient_accumulation_steps,
                 accumulation_index: self.progress.accumulation_index,
                 discarded_microbatches: self.progress.discarded_microbatches,
                 flushed_window_count: self.progress.flushed_window_count,
@@ -13009,7 +12896,7 @@ impl CompiledTrainingRuntime for MetalCompiledAdamW {
         publish_parameters_with_freeze_policy(
             module,
             self.parameter_snapshots()?,
-            &self.frozen_parameters,
+            &self.contract.frozen_parameters,
         )
     }
 }
@@ -15196,6 +15083,15 @@ mod tests {
             Ok((loss, BTreeMap::new()))
         })
         .unwrap()
+    }
+
+    #[test]
+    fn compiled_adamw_contract_is_cloned_across_cpu_preparation_and_snapshot() {
+        let plan = non_finite_plan(3);
+        let expected = plan.contract.clone();
+        let runtime = plan.prepare_cpu().unwrap();
+        assert_eq!(runtime.contract, expected);
+        assert_eq!(runtime.snapshot_plan().unwrap().contract, expected);
     }
 
     fn scalar_batch(value: f32) -> BTreeMap<String, TensorData> {
@@ -22637,6 +22533,7 @@ mod tests {
         .unwrap();
         let capture_identity = source_plan.capture_identity();
         let source_inspection = source_plan.inspection().unwrap();
+        let source_contract = source_plan.plan.contract.clone();
         let program_artifact = source_plan.program_artifact().unwrap();
         assert_eq!(source_plan.program_artifact().unwrap(), program_artifact);
         let artifact_file = TemporaryCheckpointPath::new("compiled-adamw-program-artifact");
@@ -22685,6 +22582,12 @@ mod tests {
             &resume_bundle,
         )
         .unwrap();
+        assert_eq!(restored.plan.contract, source_contract);
+        assert_eq!(
+            restored.program_artifact().unwrap().as_bytes(),
+            program_artifact.as_bytes(),
+            "flat RGAP bytes must survive the private contract adapter"
+        );
         let restored_inspection = restored.inspection().unwrap();
         assert_eq!(source_inspection.initial_replay_step(), 0);
         assert_eq!(
