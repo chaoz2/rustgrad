@@ -3268,13 +3268,13 @@ impl CompiledAdamWStep for NativeCpuCompiledAdamWStepResult {
     }
 }
 
-/// Outcome of explicitly discarding a compiled AdamW partial gradient window.
+/// Outcome of explicitly discarding a compiled partial gradient window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CompiledAdamWZeroGradResult {
+pub struct CompiledTrainingWindowReset {
     discarded_microbatches: u64,
 }
 
-impl CompiledAdamWZeroGradResult {
+impl CompiledTrainingWindowReset {
     /// Number of previously retained microbatches removed by this call.
     pub fn discarded_microbatches(&self) -> u64 {
         self.discarded_microbatches
@@ -3285,6 +3285,9 @@ impl CompiledAdamWZeroGradResult {
         self.discarded_microbatches != 0
     }
 }
+
+/// AdamW compatibility name for [`CompiledTrainingWindowReset`].
+pub type CompiledAdamWZeroGradResult = CompiledTrainingWindowReset;
 
 /// Outcome of explicitly committing a non-full compiled AdamW window on CPU.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3424,23 +3427,6 @@ struct CompiledTrainingWindowProgress {
     flushed_window_count: u64,
     flushed_microbatch_count: u64,
     reset_transition_count: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CompiledTrainingWindowReset {
-    discarded_microbatches: u64,
-}
-
-impl CompiledTrainingWindowReset {
-    const fn did_reset(self) -> bool {
-        self.discarded_microbatches != 0
-    }
-
-    const fn into_adamw_result(self) -> CompiledAdamWZeroGradResult {
-        CompiledAdamWZeroGradResult {
-            discarded_microbatches: self.discarded_microbatches,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5556,6 +5542,34 @@ pub trait CompiledAdamWRuntime:
     fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
 
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
+}
+
+/// Optimizer-neutral capability for discarding a retained gradient window.
+///
+/// A reset preserves successful replay progress and optimizer state. Empty
+/// windows are exact no-ops. The distinct method names keep this capability
+/// unambiguous beside the source-compatible AdamW extension.
+pub trait CompiledTrainingWindowResetRuntime: CompiledTrainingRuntime {
+    fn reset_gradient_window(&mut self) -> Result<CompiledTrainingWindowReset>;
+
+    /// Stable identity of a separately captured state-reset transition.
+    /// Runtimes with no distinct captured transition return `None`.
+    fn gradient_window_reset_capture_identity(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl<R> CompiledTrainingWindowResetRuntime for R
+where
+    R: CompiledAdamWRuntime + ?Sized,
+{
+    fn reset_gradient_window(&mut self) -> Result<CompiledTrainingWindowReset> {
+        CompiledAdamWRuntime::zero_grad(self)
+    }
+
+    fn gradient_window_reset_capture_identity(&self) -> Option<u64> {
+        CompiledAdamWRuntime::zero_grad_capture_identity(self)
+    }
 }
 
 /// Optimizer-neutral capability for committing replay state without returning
@@ -11390,8 +11404,8 @@ impl CpuCompiledAdamW {
             self.progress
                 .cancel(self.contract.gradient_accumulation_steps),
         )?;
-        if !reset.did_reset() {
-            return Ok(reset.into_adamw_result());
+        if !reset.did_discard() {
+            return Ok(reset);
         }
         let next = adamw_window_progress(next.record_reset_transition())?;
         let transition = self
@@ -11407,7 +11421,7 @@ impl CpuCompiledAdamW {
         debug_assert!(reports.clip_report.is_none());
         debug_assert!(reports.window_loss.is_none());
         self.progress = next;
-        Ok(reset.into_adamw_result())
+        Ok(reset)
     }
 
     #[cfg(test)]
@@ -12331,8 +12345,8 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 .progress
                 .cancel(self.inner.contract.gradient_accumulation_steps),
         )?;
-        if !reset.did_reset() {
-            return Ok(reset.into_adamw_result());
+        if !reset.did_discard() {
+            return Ok(reset);
         }
         let next = adamw_window_progress(next.record_reset_transition())?;
         let successful_invocation = self
@@ -12360,7 +12374,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         debug_assert!(reports.window_loss.is_none());
         self.inner.progress = next;
         self.successful_zero_grads = successful_invocation;
-        Ok(reset.into_adamw_result())
+        Ok(reset)
     }
 
     #[cfg(test)]
@@ -13588,8 +13602,8 @@ impl MetalCompiledAdamW {
             self.progress
                 .cancel(self.contract.gradient_accumulation_steps),
         )?;
-        if !reset.did_reset() {
-            return Ok(reset.into_adamw_result());
+        if !reset.did_discard() {
+            return Ok(reset);
         }
         let state_inputs = self
             .inner
@@ -13628,7 +13642,7 @@ impl MetalCompiledAdamW {
             .replace_fixed_state(replacements)
             .map_err(metal_training_error)?;
         self.progress = next;
-        Ok(reset.into_adamw_result())
+        Ok(reset)
     }
 
     /// Commits a retained partial window through the separately rendered
@@ -18004,6 +18018,16 @@ mod tests {
         let mut interpreted = plan
             .prepare_cpu_with_non_finite_policy(CpuNonFinitePolicy::RejectTransition)
             .unwrap();
+        assert_eq!(
+            CompiledTrainingWindowResetRuntime::gradient_window_reset_capture_identity(&native),
+            native.zero_grad_capture_identity()
+        );
+        assert_eq!(
+            CompiledTrainingWindowResetRuntime::gradient_window_reset_capture_identity(
+                &interpreted
+            ),
+            interpreted.zero_grad_capture_identity()
+        );
         assert!(native.preparation_report().partial_flush().is_some());
         assert!(native.preparation_report().zero_grad().is_some());
         let accumulation_preparation = native.preparation_report().accumulation().unwrap();
@@ -18138,9 +18162,12 @@ mod tests {
         assert_eq!(native.successful_zero_grads, 0);
         let before_reset = native_recurrent_test_counts(&native);
         crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
-        let native_reset = native.zero_grad().unwrap();
+        let native_reset = reset_core_training_window(&mut native);
         assert_no_hot_phase_capture_work();
-        assert_eq!(native_reset, interpreted.zero_grad().unwrap());
+        assert_eq!(
+            native_reset,
+            reset_adamw_window_compatibility(&mut interpreted)
+        );
         let after_reset = native_recurrent_test_counts(&native);
         assert_eq!(after_reset.0, before_reset.0);
         assert_eq!(after_reset.1, before_reset.1 + 1);
@@ -18179,7 +18206,7 @@ mod tests {
         let before_empty_reset_counts = native_recurrent_test_counts(&native);
         let before_empty_reset_workspace =
             native.zero_grad_replay.as_ref().unwrap().workspace_stats();
-        assert!(!native.zero_grad().unwrap().did_discard());
+        assert!(!reset_core_training_window(&mut native).did_discard());
         assert_eq!(
             native_recurrent_test_counts(&native),
             before_empty_reset_counts
@@ -18632,6 +18659,18 @@ mod tests {
         assert_eq!(runtime.capture_identity(), identity);
         assert_ne!(runtime.parameter_snapshots().unwrap(), before);
         step.loss().clone()
+    }
+
+    fn reset_core_training_window<R: CompiledTrainingWindowResetRuntime>(
+        runtime: &mut R,
+    ) -> CompiledTrainingWindowReset {
+        runtime.reset_gradient_window().unwrap()
+    }
+
+    fn reset_adamw_window_compatibility<R: CompiledAdamWRuntime>(
+        runtime: &mut R,
+    ) -> CompiledAdamWZeroGradResult {
+        runtime.zero_grad().unwrap()
     }
 
     fn run_adamw_commit_only_compatibility<R: CompiledAdamWCommitOnlyRuntime>(runtime: &mut R) {
