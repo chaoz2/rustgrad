@@ -1,6 +1,6 @@
 use super::{
-    AdamWProgress, MAX_EXACT_F32_INTEGER_COUNT, checked_bytes, training, validate_adamw_progress,
-    validate_user_name,
+    AdamWProgress, CompiledAdamWWindowTopology, MAX_EXACT_F32_INTEGER_COUNT, checked_bytes,
+    training, validate_adamw_progress, validate_user_name,
 };
 use crate::safetensors::{read_safetensors_file_bytes_with_limits, save_safetensors_file_bytes};
 use crate::{
@@ -317,7 +317,12 @@ pub(super) fn encode_adamw_checkpoint(
         },
         accumulation_steps,
     )?;
-    if accumulation_steps == 1 {
+    let topology = CompiledAdamWWindowTopology::from_validated_parts(
+        accumulation_steps,
+        accumulated_token_count.is_some(),
+        window_loss_report,
+    );
+    if !topology.accumulating() {
         if !gradient_accumulators.is_empty() || accumulation_capture_identity.is_some() {
             return Err(training(
                 "compiled AdamW checkpoint has unexpected gradient accumulators",
@@ -340,7 +345,7 @@ pub(super) fn encode_adamw_checkpoint(
         }
     }
     if let Some(count) = accumulated_token_count {
-        if accumulation_steps <= 1
+        if !topology.retains_token_count()
             || count > MAX_EXACT_F32_INTEGER_COUNT
             || (accumulation_index == 0 && count != 0)
         {
@@ -354,7 +359,10 @@ pub(super) fn encode_adamw_checkpoint(
             ));
         }
     }
-    match (window_loss_report, &accumulated_loss_numerator) {
+    match (
+        topology.retains_window_numerator(),
+        &accumulated_loss_numerator,
+    ) {
         (false, None) => {}
         (true, Some(value)) if value.shape() == &Shape::from([]) && value.dtype() == DType::F32 => {
             checked_bytes(value)?;
@@ -388,7 +396,7 @@ pub(super) fn encode_adamw_checkpoint(
             format!("second_moment.{ordinal}"),
             second_moments[name].clone(),
         );
-        if accumulation_steps > 1 {
+        if topology.accumulating() {
             tensors.insert(
                 format!("gradient_accumulator.{ordinal}"),
                 gradient_accumulators[name].clone(),
@@ -474,7 +482,7 @@ pub(super) fn encode_adamw_checkpoint(
             ("parameter_names".into(), parameter_names),
         ])
     } else if window_loss_report {
-        let flush_identity_present = accumulation_steps > 1;
+        let flush_identity_present = topology.accumulating();
         let authenticated_flush_identity = if flush_identity_present {
             Some(flush_capture_identity.ok_or_else(|| {
                 training("compiled AdamW window-loss checkpoint flush identity is absent")
@@ -700,7 +708,7 @@ pub(super) fn encode_adamw_checkpoint(
             ),
             ("parameter_names".into(), parameter_names),
         ])
-    } else if accumulation_steps == 1 {
+    } else if !topology.accumulating() {
         Metadata::from([
             ("format".into(), ADAMW_CHECKPOINT_FORMAT_V1.into()),
             ("capture_identity".into(), capture_identity.to_string()),
@@ -1085,6 +1093,11 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
     } else {
         format == ADAMW_CHECKPOINT_FORMAT_V6
     };
+    let topology = CompiledAdamWWindowTopology::from_validated_parts(
+        accumulation_steps,
+        has_accumulated_token_count,
+        false,
+    );
     let accumulated_token_count = if has_accumulated_token_count {
         let count = tensors
             .remove("accumulated_token_count")
@@ -1095,7 +1108,7 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
             ));
         }
         let count = count.scalar_at(0).as_u64();
-        if accumulation_steps <= 1
+        if !topology.retains_token_count()
             || count > MAX_EXACT_F32_INTEGER_COUNT
             || (accumulation_index == 0 && count != 0)
         {
@@ -1123,6 +1136,11 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
     } else {
         false
     };
+    let topology = CompiledAdamWWindowTopology::from_validated_parts(
+        accumulation_steps,
+        has_accumulated_token_count,
+        window_loss_report,
+    );
     let accumulated_loss_numerator = if window_loss_report {
         let numerator = tensors
             .remove("accumulated_loss_numerator")
@@ -1138,9 +1156,9 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
         None
     };
     let expects_flush_identity = if format == ADAMW_CHECKPOINT_FORMAT_V9 {
-        accumulation_steps > 1
+        topology.accumulating()
     } else {
-        (window_loss_report && accumulation_steps > 1)
+        (topology.retains_window_numerator() && topology.accumulating())
             || accumulated_token_count.is_some()
             || flushed_window_count != 0
     };
@@ -1167,7 +1185,7 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
         let second = tensors
             .remove(&format!("second_moment.{ordinal}"))
             .ok_or_else(|| training("compiled AdamW checkpoint second moment is absent"))?;
-        let accumulator = if accumulation_steps > 1 {
+        let accumulator = if topology.accumulating() {
             Some(
                 tensors
                     .remove(&format!("gradient_accumulator.{ordinal}"))
@@ -1189,14 +1207,14 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
         return Err(training("compiled AdamW checkpoint tensor set mismatch"));
     }
     validate_adamw_checkpoint_maps(&parameters, &first_moments, &second_moments)?;
-    if accumulation_steps > 1 {
+    if topology.accumulating() {
         validate_gradient_accumulators(&parameters, &gradient_accumulators)?;
     }
     let accumulation_capture_identity = (format == ADAMW_CHECKPOINT_FORMAT_V9)
         .then(|| parse_checkpoint_u64(&metadata, "accumulation_capture_identity"))
         .transpose()?;
     if format == ADAMW_CHECKPOINT_FORMAT_V9 {
-        if accumulation_steps <= 1 || accumulation_capture_identity.is_none() {
+        if !topology.accumulating() || accumulation_capture_identity.is_none() {
             return Err(training(
                 "compiled AdamW v9 checkpoint accumulation identity differs",
             ));

@@ -67,6 +67,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    num::NonZeroU64,
     time::{Duration, Instant},
 };
 
@@ -955,6 +956,56 @@ impl CompiledTokenWeightPolicy {
                 training("compiled AdamW ignore-index target must name an existing input")
             }
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompiledAdamWWindowTopology {
+    accumulation_steps: NonZeroU64,
+    token_weighted: bool,
+    window_loss_report: bool,
+}
+
+impl CompiledAdamWWindowTopology {
+    fn from_validated_parts(
+        accumulation_steps: u64,
+        token_weighted: bool,
+        window_loss_report: bool,
+    ) -> Self {
+        Self {
+            accumulation_steps: NonZeroU64::new(accumulation_steps)
+                .expect("compiled AdamW accumulation steps were validated"),
+            token_weighted,
+            window_loss_report,
+        }
+    }
+
+    fn from_config(config: &CompiledAdamWConfig) -> Self {
+        Self::from_validated_parts(
+            config.gradient_accumulation_steps,
+            config.token_weight_policy.is_some(),
+            config.window_loss_report,
+        )
+    }
+
+    fn from_contract(contract: &CompiledAdamWContract) -> Self {
+        Self::from_validated_parts(
+            contract.gradient_accumulation_steps,
+            contract.token_weight_policy.is_some(),
+            contract.window_loss_report,
+        )
+    }
+
+    const fn accumulating(self) -> bool {
+        self.accumulation_steps.get() > 1
+    }
+
+    const fn retains_token_count(self) -> bool {
+        self.accumulating() && self.token_weighted
+    }
+
+    const fn retains_window_numerator(self) -> bool {
+        self.window_loss_report
     }
 }
 
@@ -3878,9 +3929,9 @@ struct RecurrentStoreGroupSpec {
 
 fn adamw_recurrent_store_group_specs<'a>(
     parameters: impl Iterator<Item = &'a String>,
-    accumulating: bool,
+    topology: CompiledAdamWWindowTopology,
 ) -> Vec<RecurrentStoreGroupSpec> {
-    if !accumulating {
+    if !topology.accumulating() {
         return Vec::new();
     }
     parameters
@@ -3971,15 +4022,14 @@ impl CompiledOptimizerProgram for AdamWProgram {
     }
 
     fn state_specs(&self, parameters: &BTreeMap<String, TensorData>) -> Result<Vec<StateSpec>> {
-        let accumulating = self.config.gradient_accumulation_steps > 1;
-        let retains_token_count = accumulating && self.config.token_weight_policy.is_some();
-        let per_parameter = if accumulating { 4 } else { 3 };
+        let topology = CompiledAdamWWindowTopology::from_config(&self.config);
+        let per_parameter = if topology.accumulating() { 4 } else { 3 };
         let mut specs = Vec::with_capacity(
             parameters.len() * per_parameter
                 + 1
-                + accumulating as usize
-                + retains_token_count as usize
-                + self.config.window_loss_report as usize,
+                + topology.accumulating() as usize
+                + topology.retains_token_count() as usize
+                + topology.retains_window_numerator() as usize,
         );
         for (ordinal, (name, value)) in parameters.iter().enumerate() {
             specs.push(StateSpec::parameter(ordinal, name, value.clone()));
@@ -3989,7 +4039,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
             ] {
                 specs.push(StateSpec::adamw_parameter(ordinal, name, value, state)?);
             }
-            if accumulating {
+            if topology.accumulating() {
                 specs.push(StateSpec::adamw_parameter(
                     ordinal,
                     name,
@@ -3999,17 +4049,17 @@ impl CompiledOptimizerProgram for AdamWProgram {
             }
         }
         specs.push(StateSpec::adamw_global(AdamWGlobalState::Step)?);
-        if accumulating {
+        if topology.accumulating() {
             specs.push(StateSpec::adamw_global(
                 AdamWGlobalState::AccumulationIndex,
             )?);
         }
-        if retains_token_count {
+        if topology.retains_token_count() {
             specs.push(StateSpec::adamw_global(
                 AdamWGlobalState::AccumulatedTokenCount,
             )?);
         }
-        if self.config.window_loss_report {
+        if topology.retains_window_numerator() {
             specs.push(StateSpec::adamw_global(
                 AdamWGlobalState::AccumulatedLossNumerator,
             )?);
@@ -4050,7 +4100,8 @@ impl CompiledOptimizerProgram for AdamWProgram {
             states,
         } = context;
         let learning_rate = lower_adamw_learning_rate(&self.config, graph, learning_rate, states)?;
-        if self.config.gradient_accumulation_steps == 1 {
+        let topology = CompiledAdamWWindowTopology::from_config(&self.config);
+        if !topology.accumulating() {
             let token_count = self
                 .config
                 .window_loss_report
@@ -4089,7 +4140,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
                     }
                     None => {
                         let numerator = graph.add(states[&numerator_key], loss)?;
-                        let zero = scalar_f32(graph, 0.0)?;
+                        let zero = state_dependent_zero(graph, states[&numerator_key])?;
                         updates.insert(numerator_key, zero);
                         Some(CompiledAdamWWindowLossNodes {
                             mean_loss: numerator,
@@ -4265,7 +4316,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
         Ok(CompiledOptimizerLowering {
             updates,
             sibling_updates: Some(accumulation_updates),
-            recurrent_store_groups: adamw_recurrent_store_group_specs(parameters.keys(), true),
+            recurrent_store_groups: adamw_recurrent_store_group_specs(parameters.keys(), topology),
             observations,
         })
     }
@@ -6379,7 +6430,8 @@ impl CompiledAdamWAuxiliaryPlan {
         training_plan: &CompiledTrainingPlan,
         config: &CompiledAdamWConfig,
     ) -> Result<Self> {
-        if config.gradient_accumulation_steps <= 1 {
+        let topology = CompiledAdamWWindowTopology::from_config(config);
+        if !topology.accumulating() {
             return Err(training(
                 "compiled AdamW partial flush requires gradient accumulation",
             ));
@@ -6442,10 +6494,12 @@ impl CompiledAdamWAuxiliaryPlan {
             .get(&accumulation_index_key)
             .copied()
             .ok_or_else(|| training("compiled partial flush accumulation index is absent"))?;
-        let token_count_key = config
-            .token_weight_policy
-            .as_ref()
-            .map(|_| RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedTokenCount));
+        let token_count_key =
+            topology
+                .retains_token_count()
+                .then_some(RecurrentStateKey::adamw_global(
+                    AdamWGlobalState::AccumulatedTokenCount,
+                ));
         let divisor = match &token_count_key {
             Some(key) => {
                 let count = state_nodes.get(key).copied().ok_or_else(|| {
@@ -6635,7 +6689,7 @@ impl CompiledAdamWAuxiliaryPlan {
         .map_err(replay_error)?;
         let capture_identity = cursor_projection.target_capture_identity();
         let recurrent_store_groups = resolve_recurrent_store_groups(
-            &adamw_recurrent_store_group_specs(parameters.keys(), true),
+            &adamw_recurrent_store_group_specs(parameters.keys(), topology),
             &updates,
             &state_buffers,
         )?;
@@ -6654,7 +6708,15 @@ impl CompiledAdamWAuxiliaryPlan {
         })
     }
 
-    fn compile_zero_grad(training_plan: &CompiledTrainingPlan) -> Result<Self> {
+    fn compile_zero_grad(
+        training_plan: &CompiledTrainingPlan,
+        topology: CompiledAdamWWindowTopology,
+    ) -> Result<Self> {
+        if !topology.accumulating() {
+            return Err(training(
+                "compiled AdamW zero-grad requires gradient accumulation",
+            ));
+        }
         let state_buffers = training_plan
             .optimizer_buffers
             .iter()
@@ -8496,12 +8558,14 @@ impl CompiledAdamWPlan {
         config: CompiledAdamWConfig,
         inner: CompiledTrainingPlan,
     ) -> Result<Self> {
-        let gradient_accumulation_steps = config.gradient_accumulation_steps;
-        let partial_flush = (gradient_accumulation_steps > 1)
+        let topology = CompiledAdamWWindowTopology::from_config(&config);
+        let partial_flush = topology
+            .accumulating()
             .then(|| CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config))
             .transpose()?;
-        let zero_grad = (gradient_accumulation_steps > 1)
-            .then(|| CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner))
+        let zero_grad = topology
+            .accumulating()
+            .then(|| CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner, topology))
             .transpose()?;
         let program_identity = inner.capture_identity()?;
         Ok(Self {
@@ -8878,7 +8942,7 @@ impl CompiledAdamWPlan {
         ) -> Result<(NodeId, BTreeMap<String, NodeId>, Option<NodeId>)>,
     {
         parameter_plan.validate_weight_decay_exclusions(&config)?;
-        let gradient_accumulation_steps = config.gradient_accumulation_steps;
+        let topology = CompiledAdamWWindowTopology::from_config(&config);
         let workload = StateSpec::dropout_counter()?;
         let mut dropout_state = None;
         let mut frozen_parameter_nodes = BTreeSet::new();
@@ -8907,11 +8971,13 @@ impl CompiledAdamWPlan {
         inner.frozen_parameter_nodes = frozen_parameter_nodes;
         let dropout = dropout_state
             .ok_or_else(|| training("compiled dropout configuration produced no state"))?;
-        let partial_flush = (gradient_accumulation_steps > 1)
+        let partial_flush = topology
+            .accumulating()
             .then(|| CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config))
             .transpose()?;
-        let zero_grad = (gradient_accumulation_steps > 1)
-            .then(|| CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner))
+        let zero_grad = topology
+            .accumulating()
+            .then(|| CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner, topology))
             .transpose()?;
         let program_identity = inner.capture_identity()?;
         Ok(Self {
@@ -8937,6 +9003,7 @@ impl CompiledAdamWPlan {
     /// independently.
     pub fn restore_checkpoint(&self, checkpoint: &CompiledAdamWCheckpoint) -> Result<Self> {
         let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
+        let topology = CompiledAdamWWindowTopology::from_contract(&self.contract);
         if self.contract.gradient_accumulation_steps != decoded.accumulation_steps {
             return Err(training(
                 "compiled AdamW checkpoint accumulation policy mismatch",
@@ -8947,9 +9014,10 @@ impl CompiledAdamWPlan {
                 "compiled AdamW checkpoint window-loss reporting policy mismatch",
             ));
         }
-        let retains_token_count = self.contract.gradient_accumulation_steps > 1
-            && self.contract.token_weight_policy.is_some();
-        match (retains_token_count, decoded.accumulated_token_count) {
+        match (
+            topology.retains_token_count(),
+            decoded.accumulated_token_count,
+        ) {
             (true, Some(count)) => validate_retained_token_count(
                 &self.inner.inputs,
                 self.contract
@@ -9049,7 +9117,7 @@ impl CompiledAdamWPlan {
                 [Scalar::U(decoded.optimizer_step)],
             )?,
         );
-        if decoded.accumulation_steps > 1 {
+        if topology.accumulating() {
             values.insert(
                 RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
                 TensorData::from_scalars(
@@ -10465,7 +10533,8 @@ impl CpuCompiledAdamW {
         {
             return Ok(());
         }
-        let retained = if self.contract.gradient_accumulation_steps > 1 {
+        let topology = CompiledAdamWWindowTopology::from_contract(&self.contract);
+        let retained = if topology.retains_token_count() {
             self.inner
                 .global_snapshot(AdamWGlobalState::AccumulatedTokenCount)?
                 .scalar_at(0)
@@ -10978,6 +11047,7 @@ impl CpuCompiledAdamW {
     /// Captures parameter values, both moment sets, the graph-owned optimizer
     /// step, and the exact compiled capture identity into deterministic bytes.
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
+        let topology = CompiledAdamWWindowTopology::from_contract(&self.contract);
         validate_adamw_progress(self.progress, self.contract.gradient_accumulation_steps)?;
         validate_cpu_adamw_state(
             &self.inner,
@@ -11001,9 +11071,9 @@ impl CpuCompiledAdamW {
                 Ok(counter)
             })
             .transpose()?;
-        let accumulated_token_count = (self.contract.gradient_accumulation_steps > 1)
-            .then_some(self.contract.token_weight_policy.as_ref())
-            .flatten()
+        let accumulated_token_count = topology
+            .retains_token_count()
+            .then_some(())
             .map(|_| {
                 Ok(self
                     .inner
@@ -11024,9 +11094,8 @@ impl CpuCompiledAdamW {
                 self.contract.allow_zero_valid_token_microbatches,
             )?;
         }
-        let accumulated_loss_numerator = self
-            .contract
-            .window_loss_report
+        let accumulated_loss_numerator = topology
+            .retains_window_numerator()
             .then(|| {
                 self.inner
                     .global_snapshot(AdamWGlobalState::AccumulatedLossNumerator)
@@ -13084,12 +13153,17 @@ impl MetalCompiledAdamW {
     /// checkpoint format accepted by [`CpuCompiledAdamW::compile_from_checkpoint`].
     pub fn checkpoint(&self) -> Result<CompiledAdamWCheckpoint> {
         let states = self.state_snapshots()?;
+        let topology = CompiledAdamWWindowTopology::from_validated_parts(
+            self.contract.gradient_accumulation_steps,
+            false,
+            false,
+        );
         let optimizer_step = states
             .get(&RecurrentStateKey::adamw_global(AdamWGlobalState::Step))
             .ok_or_else(|| training("compiled Metal optimizer step is absent"))?
             .scalar_at(0)
             .as_u64();
-        let accumulation_index = if self.contract.gradient_accumulation_steps == 1 {
+        let accumulation_index = if !topology.accumulating() {
             0
         } else {
             states
@@ -13296,12 +13370,19 @@ fn validate_adamw_progress(progress: AdamWProgress, accumulation_steps: u64) -> 
         flushed_microbatch_count,
         reset_transition_count,
     } = progress;
-    if accumulation_steps == 0 || accumulation_index >= accumulation_steps {
+    if accumulation_steps == 0 {
         return Err(training(
             "compiled AdamW checkpoint accumulation progress is invalid",
         ));
     }
-    if accumulation_steps == 1
+    let topology =
+        CompiledAdamWWindowTopology::from_validated_parts(accumulation_steps, false, false);
+    if accumulation_index >= accumulation_steps {
+        return Err(training(
+            "compiled AdamW checkpoint accumulation progress is invalid",
+        ));
+    }
+    if !topology.accumulating()
         && (discarded_microbatches != 0
             || flushed_window_count != 0
             || flushed_microbatch_count != 0
@@ -13357,7 +13438,9 @@ fn validate_cpu_adamw_state(
         .global_snapshot(AdamWGlobalState::Step)?
         .scalar_at(0)
         .as_u64();
-    let accumulation_index = if accumulation_steps == 1 {
+    let topology =
+        CompiledAdamWWindowTopology::from_validated_parts(accumulation_steps, false, false);
+    let accumulation_index = if !topology.accumulating() {
         0
     } else {
         inner
@@ -16485,8 +16568,12 @@ mod tests {
 
     #[test]
     fn adamw_lowering_resolves_ordered_recurrent_store_keys() {
-        assert!(adamw_recurrent_store_group_specs(["weight".to_string()].iter(), false).is_empty());
-        let specs = adamw_recurrent_store_group_specs(["weight".to_string()].iter(), true);
+        let single = CompiledAdamWWindowTopology::from_validated_parts(1, false, false);
+        let accumulating = CompiledAdamWWindowTopology::from_validated_parts(3, false, false);
+        assert!(
+            adamw_recurrent_store_group_specs(["weight".to_string()].iter(), single).is_empty()
+        );
+        let specs = adamw_recurrent_store_group_specs(["weight".to_string()].iter(), accumulating);
         let expected_keys = vec![
             RecurrentStateKey::parameter("weight"),
             RecurrentStateKey::adamw_parameter("weight", AdamWParameterState::FirstMoment),
@@ -16537,6 +16624,197 @@ mod tests {
                 .to_string()
                 .contains("recurrent store state is absent")
         );
+    }
+
+    #[test]
+    fn adamw_window_topology_matrix_matches_state_phases_checkpoint_and_artifact() {
+        #[derive(Clone, Copy, Debug)]
+        enum TokenPolicy {
+            None,
+            ExplicitMask,
+            IgnoreIndex,
+        }
+
+        for accumulation_steps in [1, 3] {
+            for token_policy in [
+                TokenPolicy::None,
+                TokenPolicy::ExplicitMask,
+                TokenPolicy::IgnoreIndex,
+            ] {
+                for window_loss_report in [false, true] {
+                    let mut config = CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.0)
+                        .unwrap()
+                        .with_gradient_accumulation(accumulation_steps)
+                        .unwrap();
+                    config = match token_policy {
+                        TokenPolicy::None => config,
+                        TokenPolicy::ExplicitMask => config
+                            .with_input("features", [3], DType::F32)
+                            .unwrap()
+                            .with_input("mask", [3], DType::F32)
+                            .unwrap()
+                            .with_token_weighted_gradient_accumulation("mask")
+                            .unwrap(),
+                        TokenPolicy::IgnoreIndex => config
+                            .with_input("features", [3], DType::F32)
+                            .unwrap()
+                            .with_input("targets", [3], DType::I32)
+                            .unwrap()
+                            .with_token_weighted_ignore_index("targets", -100)
+                            .unwrap(),
+                    };
+                    if window_loss_report {
+                        config = config.with_window_loss_report();
+                    }
+                    let topology = CompiledAdamWWindowTopology::from_config(&config);
+                    let accumulating = accumulation_steps > 1;
+                    let token_weighted = !matches!(token_policy, TokenPolicy::None);
+                    assert_eq!(topology.accumulating(), accumulating);
+                    assert_eq!(
+                        topology.retains_token_count(),
+                        accumulating && token_weighted
+                    );
+                    assert_eq!(topology.retains_window_numerator(), window_loss_report);
+
+                    let owner = CompiledModuleAdamWPlan::compile_graph(
+                        config,
+                        TokenMeanModule::new(),
+                        |module, graph, inputs| {
+                            let weight = module.weight.bind(graph)?;
+                            match token_policy {
+                                TokenPolicy::None => Ok(CompiledAdamWGraph::scalar(
+                                    graph.square(weight)?,
+                                    BTreeMap::new(),
+                                )),
+                                TokenPolicy::ExplicitMask | TokenPolicy::IgnoreIndex => {
+                                    let losses = graph.mul(weight, inputs["features"])?;
+                                    Ok(CompiledAdamWGraph::token_mean(losses, BTreeMap::new()))
+                                }
+                            }
+                        },
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "topology matrix failed for steps={accumulation_steps}, policy={token_policy:?}, report={window_loss_report}: {error}"
+                        )
+                    });
+                    let has_state =
+                        |key: RecurrentStateKey| owner.plan.inner.state_values.contains_key(&key);
+                    assert!(has_state(RecurrentStateKey::parameter("weight")));
+                    assert!(has_state(RecurrentStateKey::adamw_parameter(
+                        "weight",
+                        AdamWParameterState::FirstMoment,
+                    )));
+                    assert!(has_state(RecurrentStateKey::adamw_parameter(
+                        "weight",
+                        AdamWParameterState::SecondMoment,
+                    )));
+                    assert_eq!(
+                        has_state(RecurrentStateKey::adamw_parameter(
+                            "weight",
+                            AdamWParameterState::GradientAccumulator,
+                        )),
+                        accumulating
+                    );
+                    assert!(has_state(RecurrentStateKey::adamw_global(
+                        AdamWGlobalState::Step,
+                    )));
+                    assert_eq!(
+                        has_state(RecurrentStateKey::adamw_global(
+                            AdamWGlobalState::AccumulationIndex,
+                        )),
+                        accumulating
+                    );
+                    assert_eq!(
+                        has_state(RecurrentStateKey::adamw_global(
+                            AdamWGlobalState::AccumulatedTokenCount,
+                        )),
+                        accumulating && token_weighted
+                    );
+                    assert_eq!(
+                        has_state(RecurrentStateKey::adamw_global(
+                            AdamWGlobalState::AccumulatedLossNumerator,
+                        )),
+                        window_loss_report
+                    );
+                    assert_eq!(owner.plan.inner.accumulation.is_some(), accumulating);
+                    assert_eq!(owner.plan.partial_flush.is_some(), accumulating);
+                    assert_eq!(owner.plan.zero_grad.is_some(), accumulating);
+                    assert_eq!(
+                        owner.plan.inner.recurrent_store_groups.len(),
+                        accumulating as usize
+                    );
+                    assert_eq!(
+                        owner
+                            .plan
+                            .partial_flush
+                            .as_ref()
+                            .map_or(0, |phase| phase.recurrent_store_groups.len()),
+                        accumulating as usize
+                    );
+                    assert_eq!(
+                        owner
+                            .plan
+                            .zero_grad
+                            .as_ref()
+                            .map_or(0, |phase| phase.recurrent_store_groups.len()),
+                        0
+                    );
+
+                    let checkpoint = owner.plan.prepare_cpu().unwrap().checkpoint().unwrap();
+                    let decoded = decode_adamw_checkpoint(checkpoint.as_bytes()).unwrap();
+                    assert_eq!(decoded.gradient_accumulators.is_empty(), !accumulating);
+                    assert_eq!(
+                        decoded.accumulated_token_count.is_some(),
+                        accumulating && token_weighted
+                    );
+                    assert_eq!(
+                        decoded.accumulated_loss_numerator.is_some(),
+                        window_loss_report
+                    );
+                    assert_eq!(
+                        decoded.accumulation_capture_identity.is_some(),
+                        accumulating
+                    );
+                    assert_eq!(decoded.flush_capture_identity.is_some(), accumulating);
+
+                    let artifact = owner.program_artifact().unwrap();
+                    program_artifact::rewrite_json_for_test(&artifact, |json| {
+                        assert_eq!(json["accumulation"].is_null(), !accumulating);
+                        assert_eq!(json["partial_flush"].is_null(), !accumulating);
+                        assert_eq!(json["zero_grad"].is_null(), !accumulating);
+                        assert_eq!(
+                            json["main"]["phase"]["adamw_native_updates"]
+                                .as_array()
+                                .unwrap()
+                                .len(),
+                            accumulating as usize
+                        );
+                        if accumulating {
+                            assert_eq!(
+                                json["partial_flush"]["adamw_native_updates"]
+                                    .as_array()
+                                    .unwrap()
+                                    .len(),
+                                1
+                            );
+                            assert!(
+                                json["accumulation"]["adamw_native_updates"]
+                                    .as_array()
+                                    .unwrap()
+                                    .is_empty()
+                            );
+                            assert!(
+                                json["zero_grad"]["adamw_native_updates"]
+                                    .as_array()
+                                    .unwrap()
+                                    .is_empty()
+                            );
+                        }
+                    });
+                }
+            }
+        }
     }
 
     #[test]
