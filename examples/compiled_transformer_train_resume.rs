@@ -1,52 +1,55 @@
 //! Compile, train, checkpoint, and authentically recompile a fresh owned tiny
 //! Transformer for portable resume on CPU or strict Metal.
 //!
-//! Same-process callers may instead retain one `CompiledAdamWPlan` and call
-//! `restore_checkpoint` without rebuilding its graph or captures. That CPU
-//! path uses fixed-capacity right-padded batches; compilation derives token
+//! The example uses fixed-capacity right-padded batches. Compilation derives
 //! validity from ignore-index targets, owns the token-mean loss, and weights
-//! each gradient by its valid-token count across an accumulation window.
+//! gradients by valid-token count across each accumulation window.
 //!
-//! Run that compile-once, same-process CPU path:
+//! ## CPU resume modes
+//!
+//! Same-process restore retains one compiled plan and rebuilds no graph or
+//! capture:
 //!
 //! ```text
 //! cargo run --example compiled_transformer_train_resume -- cpu-reuse
 //! ```
 //!
-//! Run a complete module checkpoint through a file and recompile a deliberately
-//! different initialization before exact CPU continuation:
+//! File restore recompiles a deliberately different initialization from a
+//! complete module checkpoint:
 //!
 //! ```text
 //! cargo run --example compiled_transformer_train_resume -- cpu-file-resume
 //! ```
 //!
-//! Run that complete-module file-resume lifecycle through strict native CPU JIT
-//! replay with no fallback:
+//! The same file lifecycle also runs through strict-native CPU JIT with no
+//! fallback:
 //!
 //! ```text
 //! cargo run --release --example compiled_transformer_train_resume -- native-cpu-file-resume
 //! ```
 //!
-//! Emit a bounded strict-native CPU training scoreboard from that same
-//! compile-once path:
+//! ## Replay and evidence modes
+//!
+//! Emit the bounded strict-native CPU scoreboard:
 //!
 //! ```text
 //! cargo run --release --example compiled_transformer_train_resume -- native-cpu-scoreboard
 //! ```
 //!
-//! Run on the graph-free CPU replay target:
+//! Run graph-free interpreter CPU replay:
 //!
 //! ```text
 //! cargo run --example compiled_transformer_train_resume -- cpu
 //! ```
 //!
-//! Run the identical capture through strict native CPU JIT replay:
+//! Run the same capture through strict-native CPU JIT:
 //!
 //! ```text
 //! cargo run --release --example compiled_transformer_train_resume -- native-cpu
 //! ```
 //!
-//! Run the identical capture on the first visible Metal device, with no CPU fallback:
+//! Run the same capture on the first visible Metal device, with no CPU
+//! fallback:
 //!
 //! ```text
 //! cargo run --release --example compiled_transformer_train_resume -- metal
