@@ -1628,9 +1628,12 @@ through a three-replay window with a finite global norm limit.
   rate, and `evaluate_batch` reuses the domain batch. Conversion cannot access
   recurrent state; exact-map APIs remain intact.
 - `CompiledCheckpointRuntime` is the separate persistence capability.
-  `CompiledAdamWRuntime` and `CompiledAdamWStep` add accumulation, clipping,
-  loss scaling, moments, and optimizer-step inspection. Metal results retain
-  exact device reports.
+  `CompiledTrainingWindowResetRuntime` separately exposes atomic cancellation
+  of a retained gradient window. `CompiledAdamWRuntime` keeps its compatible
+  `zero_grad` surface and adds accumulation progress, clipping, loss scaling,
+  moments, and optimizer-step inspection; partial flush remains
+  optimizer-specific because it publishes an update. Metal results retain exact
+  device reports.
 
 ##### Output and parameter ownership
 
