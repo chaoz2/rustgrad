@@ -494,11 +494,17 @@ impl ProgramWire {
     }
 
     fn validate_policy(&self, info: &CompiledAdamWProgramArtifactInfo) -> Result<()> {
-        if info.capture_identity == 0
-            || self.gradient_accumulation_steps == 0
-            || (self.gradient_accumulation_steps > 1) != self.accumulation.is_some()
-            || (self.gradient_accumulation_steps > 1) != self.partial_flush.is_some()
-            || (self.gradient_accumulation_steps > 1) != self.zero_grad.is_some()
+        if info.capture_identity == 0 || self.gradient_accumulation_steps == 0 {
+            return Err(training("compiled program artifact policy is inconsistent"));
+        }
+        let topology = CompiledAdamWWindowTopology::from_validated_parts(
+            self.gradient_accumulation_steps,
+            self.token_weight_policy.is_some(),
+            self.window_loss_report,
+        );
+        if topology.accumulating() != self.accumulation.is_some()
+            || topology.accumulating() != self.partial_flush.is_some()
+            || topology.accumulating() != self.zero_grad.is_some()
             || self.allow_zero_valid_token_microbatches && self.token_weight_policy.is_none()
             || self.loss_scale_bits == 0
             || !f32::from_bits(self.loss_scale_bits).is_finite()
@@ -644,7 +650,12 @@ impl ProgramWire {
                 self.gradient_accumulation_steps,
             )?;
         }
-        let native_manifests = if self.gradient_accumulation_steps > 1 {
+        let topology = CompiledAdamWWindowTopology::from_validated_parts(
+            self.gradient_accumulation_steps,
+            self.token_weight_policy.is_some(),
+            self.window_loss_report,
+        );
+        let native_manifests = if topology.accumulating() {
             NativeManifestExpectation::AdamW {
                 parameters: &self.main.parameter_buffers,
                 states: &expected_main_states,
@@ -1474,11 +1485,15 @@ fn decode_admitted_artifact_checkpoint_pair(
         ));
     }
     let checkpoint_info = checkpoint.optimizer_checkpoint().info();
+    let topology = CompiledAdamWWindowTopology::from_validated_parts(
+        wire.gradient_accumulation_steps,
+        wire.token_weight_policy.is_some(),
+        wire.window_loss_report,
+    );
     if checkpoint_info.capture_identity() != artifact_info.capture_identity
         || checkpoint_info.gradient_accumulation_steps() != wire.gradient_accumulation_steps
         || checkpoint_info.window_loss_report_enabled() != wire.window_loss_report
-        || (wire.token_weight_policy.is_some() && wire.gradient_accumulation_steps > 1)
-            != checkpoint_info.accumulated_token_count().is_some()
+        || topology.retains_token_count() != checkpoint_info.accumulated_token_count().is_some()
         || wire.dropout.is_some() != checkpoint_info.dropout_block_counter().is_some()
     {
         return Err(training(
