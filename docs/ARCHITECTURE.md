@@ -940,11 +940,11 @@ from the shared execution machinery:
 | Contract | Architectural owner |
 |---|---|
 | [Compile and replay](#compile-and-replay-contract) | One fixed graph, reverse traversal, optimizer program, and authenticated capture are prepared before repeated execution. |
-| [State ownership](#state-ownership-and-atomicity) | CPU `EffectRuntime` owns host recurrent bytes, while Metal owns epoch-swapped device banks; each cursor authenticates its frontier before atomic publication. |
-| [Resume](#resume-modes-and-module-ownership) | In-process plan restore, optimizer checkpoints, complete-module checkpoints, and bounded files remain distinct modes. |
-| [Program artifacts](#compiled-adamw-program-artifacts) | CPU executable captures and policy schemas persist separately from checkpoint tensors and native resources. |
-| [Evidence](#native-cpu-scoreboard-evidence) | Reports describe successful CPU preparation and replay without changing execution identities or imposing timing thresholds. |
-| [Backends](#compiled-training-backend-boundaries) | CPU interpreter, strict-native CPU, and the bounded strict-Metal path share capture/state contracts without hidden fallback. |
+| [Recurrent state and atomicity](#state-ownership-and-atomicity) | CPU `EffectRuntime` owns host recurrent bytes, while Metal owns epoch-swapped device banks; each cursor authenticates its frontier before atomic publication. |
+| [Accumulation and `zero_grad`](#accumulation-and-reset) | Private phase captures retain or replace the exact frontier for non-commit replay, partial flush, and reset. |
+| [Checkpoint and resume](#resume-modes-and-module-ownership) | In-process plan restore, optimizer checkpoints, complete-module checkpoints, program artifacts, and bounded files remain distinct modes. |
+| [Native CPU evidence](#native-cpu-scoreboard-evidence) | Reports describe successful preparation and replay without changing execution identities or imposing timing thresholds. |
+| [Strict Metal boundary](#compiled-training-backend-boundaries) | The bounded Metal path shares capture and state contracts while unsupported CPU policies fail closed. |
 
 #### Program and state model
 
@@ -977,6 +977,12 @@ interpreter fallback disabled.
 AdamW keeps one authoritative main capture. Narrowly scoped phase and auxiliary
 captures handle accumulation-only replay, partial flush, `zero_grad`, and
 attached evaluation without replacing that main program.
+
+###### Accumulation and reset
+
+The accumulation sibling retains pass-through state; partial flush and
+`zero_grad` replace their selected recurrent state. All three authenticate a
+projection from the authoritative main frontier before execution.
 
 ###### Accumulation-only replay
 
@@ -1020,6 +1026,17 @@ attached evaluation without replacing that main program.
 - Flush and flushed-microbatch counts reconstruct optimizer/workload logical
   versions on restore. This semantic path does not claim a live Apple-hardware
   flush result.
+
+###### `zero_grad`
+
+- A nonempty CPU reset uses a compile-once transition for gradient
+  accumulators, accumulation index, optional token count, and optional loss
+  numerator. A state-dependent false predicate selects typed zeros, clearing
+  NaN/Inf without `x - x`.
+- CPU republishes a validated candidate frontier. Strict Metal copies the
+  complete successor into its inactive epoch bank and flips only after success.
+- Reset discards the pending window without replaying a batch or advancing
+  replay/dropout progress. An empty window is an exact no-op.
 
 #### Inputs, optimizer policies, and observations
 
@@ -1153,10 +1170,6 @@ snapshot and calls `Module::load_trainable_parameters_exact`.
   a pending count. V7 authenticates reset history and its capture identity while
   keeping v1--v6 decoding and bytes unchanged. V9 additionally authenticates
   the private accumulation-only capture; compatible v1--v8 remain readable.
-- Nonempty CPU `zero_grad` uses a compile-once transition containing gradient
-  accumulators, accumulation index, and optional token count. A state-dependent
-  false predicate selects typed zeros, clearing NaN/Inf without `x - x`; empty
-  windows are exact no-ops.
 - Interpreter and strict-native CPU preflight finite, binary, nonempty inputs
   without moving the batch-owned padding rule into runtime. Metal rejects this
   CPU-first policy before resource planning.

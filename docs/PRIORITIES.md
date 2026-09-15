@@ -68,176 +68,49 @@ Delivered boundaries:
 
 ### 2. P0 — tiny Transformer training and exact resume
 
-#### User outcome
+The maintained example compiles one fixed-shape, two-block causal Transformer
+from deterministic random initialization. Its capture includes embedding,
+causal attention, LayerNorm, tied output weights, sparse causal negative log
+likelihood, one batched reverse traversal, and AdamW. The same resource-free
+plan prepares for interpreter CPU, strict-native CPU, or explicitly selected
+strict Metal without a backend dispatcher enum.
 
-The maintained example and protected acceptance compile one tiny causal
-Transformer from deterministic random initialization through embedding, causal
-attention, LayerNorm, tied output weights, sparse causal negative log
-likelihood, one batched reverse traversal, and AdamW. A resource-free
-`CompiledAdamWPlan` prepares for interpreter CPU, strict native CPU, or
-explicitly selected strict Metal; the optimizer-neutral loop does not dispatch
-through a backend enum.
+#### Delivered contract
 
-The detailed contracts live in
-[Compile and replay](ARCHITECTURE.md#compile-and-replay-contract),
-[State ownership](ARCHITECTURE.md#state-ownership-and-atomicity),
-[Resume modes](ARCHITECTURE.md#resume-modes-and-module-ownership),
-[Training inputs and policies](ARCHITECTURE.md#training-inputs-and-optimizer-policies),
-[Native CPU evidence](ARCHITECTURE.md#native-cpu-scoreboard-evidence), and
-[Backend boundaries](ARCHITECTURE.md#compiled-training-backend-boundaries).
+| Area | User-visible guarantee | Detailed contract |
+| --- | --- | --- |
+| Compile and replay | One authenticated forward/loss/backward/AdamW program replays new fixed-shape batches without rebuilding the graph. Native CPU prepares every attached phase before exposing mutable state and fails closed without interpreter fallback. | [Compile and replay](ARCHITECTURE.md#compile-and-replay-contract) |
+| Recurrent state and atomicity | Parameters, moments, optimizer step, optional gradient sums and loss/token totals, accumulation cursor, and dropout counter advance as one validated frontier. Failed validation or execution leaves that frontier retryable. | [State ownership](ARCHITECTURE.md#state-ownership-and-atomicity) and [failure publication](ARCHITECTURE.md#failure-publication) |
+| Accumulation and `zero_grad` | Full windows average once and apply configured clipping before one update; partial flush commits a shorter nonempty window; `zero_grad` discards a pending window without a dummy replay. Empty flush and reset are exact no-ops. | [Accumulation and reset](ARCHITECTURE.md#accumulation-and-reset) |
+| Checkpoint and resume | In-process restore, checkpoint-only recompilation, complete-module checkpoints, and RGAP artifact restore are distinct authenticated modes. Ties, frozen state, buffers, dropout, pending windows, and optimizer progress remain exact. | [Resume modes](ARCHITECTURE.md#resume-modes-and-module-ownership) |
+| Native CPU evidence | The opt-in scoreboard authenticates preparation, replay, cache, recurrent-state, logical egress, and timing partitions. CPU egress is logical host materialization, not a device transfer, and protected tests impose no speed threshold. | [Native CPU evidence](ARCHITECTURE.md#native-cpu-scoreboard-evidence) |
+| Strict Metal boundary | Strict Metal shares the bounded capture/checkpoint/flush contract and epoch-swapped publication, but CPU-only token weighting remains fail-closed. Output suppression is synchronous and is not a throughput claim. | [Backend boundaries](ARCHITECTURE.md#compiled-training-backend-boundaries) |
 
-#### Runtime responsibilities
+#### Maintained proof
 
-| Area | Delivered contract |
-| --- | --- |
-| Compile and replay | Native CPU prepares the main replay, private accumulation-only sibling, partial-flush, zero-grad, and evaluation programs before mutable replay and exposes typed cache, work, and state evidence. Unsupported items fail closed without interpreter fallback. |
-| Persistent state | Parameters, first and second moments, optimizer step, optional F32 gradient sums, accumulation cursor, and dropout counter share one atomic frontier. Full windows average once, update once, and reset sums in-capture. |
-| Failure boundary | Opt-in `CpuNonFinitePolicy::RejectTransition` admits only a finite scalar loss and fully applied final F32 successors before one effect commit. Invalid external rates reject before staging; deterministic captured MultiStep overflow rejects at construction. Either failure preserves checkpoint, dropout, progress, capture identity, and wire identity for retry. |
-| Outputs and evaluation | Ordinary replay can detach named outputs; commit-only replay omits them while retaining required validation/report scalars. Before publication, evaluation observes the live parameter frontier without changing replay, optimizer, dropout, accumulation, checkpoint, or scoreboard state, including after a `zero_grad` bank flip. Interpreter CPU binds detached snapshots, strict-native CPU borrows its authenticated active host bank, and strict Metal aliases the active device parameter bank without transfer. |
+- Seven distinct `[2,3]` CPU microbatches cover a three-replay window,
+  finite global clipping, nonempty and empty `zero_grad`, partial flush, a
+  second optimizer update, exact checkpoint continuation, and publication into
+  a differently initialized matching module.
+- The dedicated native CPU proof uses a borrowed plan, captured MultiStep
+  learning rate, fixed-capacity sentinel-padded batches, and a checkpoint with
+  a retained partial window. It proves exact continuation without turning
+  observational timings into a performance gate.
+- The two-block workload uses `attention_dropout = 0.25` at six source-ordered
+  attention-weight and residual sites. Its immutable Threefry key and recurrent
+  U64 block counter advance atomically with AdamW.
+- Compiler-owned ignore-index weighting supplies both the compact attention
+  validity mask and exact token weight. The explicit F32-mask route remains
+  compatibility-covered; all-ignored single-step training rejects before
+  replay, while read-only evaluation may return zero weight without mutation.
+- Compile-time freezing, tied canonical ownership, AdamW decay exclusions,
+  static loss scaling, and global clipping remain capture-authenticated.
+  Dynamic freezing, runtime policy changes, label smoothing, and general
+  random-operation parity are not claimed.
 
-#### Resume modes and module ownership
-
-- Checkpoints preserve partial accumulation windows exactly. The CPU
-  borrowed-plan path restores by cloning an already compiled plan, without a
-  second builder call, and crosses a captured MultiStep boundary while matching
-  loss, outputs, parameters, moments, accumulators, dropout, and complete bytes
-  after every replay.
-- Checkpoint-only portable restore into a fresh owned module recompiles and
-  authenticates its topology because checkpoint bytes deliberately contain no
-  executable capture. Publication into a differently initialized but matching
-  module preserves tied, policy-frozen, inherently frozen, and buffered state
-  after aligning the capture-owned frozen constant.
-- The bounded RGAP program artifact paired with that checkpoint instead restores
-  the resource-free CPU compiled plan into a fresh matching owned module without
-  rerunning the workload builder, `Graph`, autograd, schedule, capture, or
-  evaluator construction. Native machine resources remain ephemeral, and an
-  artifact-restored plan fails closed for Metal.
-- `CompiledModuleAdamWPlan<M>` seals the compiled module and transfers it into a
-  target-selected `CompiledModuleAdamWSession<M, R>`. Recoverable compile,
-  prepare, or finish errors retain the intact owner; abort returns it without
-  publication.
-- CPU and strict-Metal owned sessions expose the same runtime, checkpoint, and
-  AdamW capabilities. The Metal facade adds read-only device-session and
-  scoreboard evidence without exposing the runtime or module, so no detached
-  lifecycle is silently abandoned.
-- Consuming `finish` validates topology and raw state, holds every unique module
-  state lock, publishes the live canonical trainable snapshot only into a fresh
-  or existing module with the exact schema, and advances each unique
-  `Parameter` version once. It preserves ties, frozen parameters, and buffers
-  without changing runtime progress or checkpoint state.
-  `finish_with_checkpoint` returns the module and the exact validated
-  optimizer/dropout/progress snapshot without a second parameter-only device
-  read.
-
-#### Batching, loss, and optimizer policy
-
-- Fixed nonempty rank-two `[B, T]` I32 token and target inputs support two
-  deterministic rows per maintained replay. Causal loss gathers one log
-  probability per target with a raw axis-one Gather before negation and mean,
-  avoiding a dense
-  `[B*T, V]` one-hot without changing the general cross-entropy helper.
-- Compiler-owned ignore-index weighting derives both the token keep tensor and
-  exact U64 valid-token count from sentinel targets. Its opt-in typed builder
-  context exposes the exact Bool validity and F32 weight nodes; the maintained
-  file-resume workload reshapes that Bool node into its compact broadcast
-  attention mask, while the compiler reuses the F32 node for weighting.
-  Fixed-shape per-token F32 loss must match the target descriptor exactly, and
-  its weighted mean is the sole public and differentiation scalar.
-- The CPU policy re-sums valid tokens in-capture and weights each normalized
-  microbatch gradient before the window divide when `N>1`. At `N=1`, the
-  already normalized gradient goes directly to clipping and AdamW, with no
-  gradient-accumulator or token-count state or auxiliary captures. Interpreter
-  and strict-native results expose the same exact batch count as the normalized
-  loss weight and reject an all-ignored single-step training batch before
-  replay. Read-only evaluation may return zero weight state-neutrally. The
-  explicit F32-mask path remains compatibility-covered; token weighting fails
-  closed on arbitrary scalar-loss constructors.
-- Global L2 clipping covers the complete ordered gradient set once after window
-  averaging. Static loss scaling changes only the differentiation root, returns
-  the original loss, and unscales all F32 gradients before accumulation and
-  clipping.
-- Compile-time freezing removes selected canonical module identities from
-  reverse-mode, optimizer, recurrent, checkpoint, and publication state while
-  retaining tied capture constants and leaving host trainable flags unchanged.
-  Dynamic freezing and runtime policy changes remain unsupported.
-- AdamW decay exclusions are validated before graph construction. The workload
-  decays embedding/projection matrices but excludes projection biases and
-  LayerNorm affine state; exclusions change only decay, not gradients,
-  accumulation, clipping, moments, checkpoints, or publication. Policy mismatch
-  rejects checkpoint restoration through capture authentication.
-
-#### Lifecycle acceptance
-
-- CPU and strict Metal implement the backend-neutral
-  `CompiledAdamWFlushRuntime`.
-- Seven distinct `[2,3]` CPU microbatches exercise a three-replay accumulation
-  window and finite global clipping. A nonempty `zero_grad` after replay two
-  discards the partial window without advancing replay/dropout progress. A later
-  checkpoint restores into a fresh owned module, flushes a two-microbatch
-  window, and reaches a second full update at replay seven with exact outputs
-  and recurrent parameter/moment/accumulator state versus uninterrupted replay.
-- A nonempty `k < N` partial flush averages by `k`, clips once, and commits a
-  separately authenticated state-only capture without replaying a batch or
-  advancing replay, dropout, or training-scoreboard progress. Empty flush and
-  empty public compiled-AdamW `zero_grad` calls are exact no-ops.
-- Checkpoint schemas authenticate discarded-window, dropout, and partial-flush
-  history. The canonical version map is maintained in
-  [Training inputs and optimizer policies](ARCHITECTURE.md#training-inputs-and-optimizer-policies):
-  v6 adds pending token count, v7 reset history, v8 the window-loss numerator,
-  and v9 the private CPU accumulation capture identity. v1--v8 remain readable
-  for compatible legacy restore.
-- The maintained two-block workload uses `attention_dropout = 0.25` and six
-  source-ordered fixed-shape F32 attention-weight and residual dropout sites.
-  One immutable two-word Threefry key and a device-resident U64 block counter
-  advance atomically with AdamW. This proves a bounded Transformer stream, not
-  general random-operation parity.
-
-#### Native CPU evidence
-
-- The opt-in scoreboard authenticates immutable plan inspection against
-  preparation and committed replay reports. It separates first and steady
-  samples and records caller-observed compile, prepare, and checkpoint time plus
-  logical work, cache, state, and CPU egress facts.
-- Logical CPU output materialization is not host/device transfer evidence.
-  Kernel launches, transfers, and physical-memory measurements remain absent,
-  and protected tests impose no latency or throughput threshold.
-- The shared CPU/Metal acceptance uses the historical propagation target and external
-  learning rate. A dedicated CPU proof instead uses a borrowed plan, captured
-  MultiStep learning rate, fixed-capacity tokens, sentinel targets, and padded
-  final rows. It checkpoints after update one with a retained partial window,
-  proves exact continuation, and publishes into a different matching
-  initialization.
-
-#### Metal boundary
-
-- Strict Metal uses the same compiled AdamW runtime/checkpoint/flush contracts,
-  aliases the active parameter bank for evaluation, and retains typed
-  output-suppressed commit. Partial flush writes the complete successor into the
-  inactive epoch bank, flips only after success, downloads no gradients or
-  outputs, and does not advance replay, dropout, or scoreboard state. It imports
-  the existing banks and queue without a second state upload and submits
-  preservation copies plus updates in one synchronous command buffer.
-- CPU `zero_grad` republishes a validated candidate frontier; strict Metal
-  copies the complete successor into its inactive epoch bank. Both discard a
-  nonempty partial window without a dummy replay and make empty windows exact
-  no-ops.
-- Indexed admission reauthenticates either the recorded Gather/first-order
-  ScatterAdd relation or the maintained frozen embedding's disjoint forward-only
-  Gather proof. Target selection authenticates its data target, F32-zero base,
-  flattened `[B*T, 1]` index, axis/domain, and update cotangent. Host validation
-  checks every lane before driver work, leaves no transactional/indexed owner in
-  the maintained workload, and reduces each prepared replay to one submission
-  and one wait. Ordinary untrusted indexing remains guarded, with no recurrent
-  or checkpoint-format change.
-- The public example retains strict-Metal zero-fallback preflight and the
-  protected workload exercises the same program with exact checkpoint
-  continuation. Semantic mock flush coverage is present, but live
-  Apple-hardware flush evidence is not claimed until the pending schema-v7
-  protected job is green.
-- Target-derived ignore weighting is CPU-only; Metal fails closed for it. The
-  default scalar-loss CPU/native/Metal path still reports weight one. Label
-  smoothing remains outside this workload-specific composition, and named
-  outputs and Metal behavior are otherwise unchanged.
+The Architecture guide retains the phase inventory, error ordering, checkpoint
+version history, publication rules, native preparation pipeline, scoreboard
+wire versions, protected-CI provenance, and exact Metal admission limits.
 
 ### 3. P1 — lower the identical training capture to Metal
 
