@@ -1620,8 +1620,9 @@ through a three-replay window with a finite global norm limit.
   preserve established captures and behavior.
 - `CompiledTrainingRuntime` and `CompiledTrainingStep` are implemented by CPU
   momentum-SGD, CPU AdamW, and Metal AdamW. One optimizer-neutral loop observes
-  loss, named outputs, capture identity, replay progress, and parameter
-  snapshots or publishes them into an exact module schema.
+  loss plus its exact cross-batch aggregation weight, named outputs, capture
+  identity, replay progress, and parameter snapshots or publishes them into an
+  exact module schema.
 - `CompiledInputBatch` couples a fixed external schema with binding conversion.
   `with_input_batch` registers it, `step_batch` supplies scalar F32 learning
   rate, and `evaluate_batch` reuses the domain batch. Conversion cannot access
