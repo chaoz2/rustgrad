@@ -1624,9 +1624,12 @@ through a three-replay window with a finite global norm limit.
   identity, replay progress, and parameter snapshots or publishes them into an
   exact module schema.
 - `CompiledInputBatch` couples a fixed external schema with binding conversion.
-  `with_input_batch` registers it, `step_batch` supplies scalar F32 learning
-  rate, and `evaluate_batch` reuses the domain batch. Conversion cannot access
-  recurrent state; exact-map APIs remain intact.
+  `with_input_batch` registers it, `step_batch` supplies an external scalar F32
+  learning rate, and `evaluate_batch` reuses the domain batch. Conversion
+  cannot access recurrent state; exact-map APIs remain intact.
+- `CompiledTrainingRatePolicyRuntime` submits the same batch without a host
+  rate when the compiled runtime owns that policy. Its commit-only counterpart
+  suppresses only named outputs. External-rate replay remains the base contract.
 - `CompiledCheckpointRuntime` is the separate persistence capability.
   `CompiledTrainingWindowRuntime` and `CompiledTrainingWindowStep` separately
   expose window size, pending microbatches, closure, and atomic cancellation.

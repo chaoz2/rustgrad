@@ -5690,6 +5690,40 @@ pub trait CompiledAdamWFlushRuntime: CompiledAdamWRuntime {
     fn flush_capture_identity(&self) -> Option<u64>;
 }
 
+/// Optimizer-neutral replay driven by a runtime-owned learning-rate policy.
+///
+/// The configured policy supplies the rate, so each call binds only the
+/// workload inputs. External-rate replay remains available through
+/// [`CompiledTrainingRuntime`].
+pub trait CompiledTrainingRatePolicyRuntime: CompiledTrainingRuntime {
+    fn step_with_rate_policy(&mut self, inputs: BTreeMap<String, TensorData>)
+    -> Result<Self::Step>;
+
+    fn step_batch_with_rate_policy<B>(&mut self, batch: B) -> Result<Self::Step>
+    where
+        Self: Sized,
+        B: CompiledInputBatch,
+    {
+        self.step_with_rate_policy(batch.into_compiled_inputs()?)
+    }
+}
+
+/// Commit-only replay driven by a runtime-owned learning-rate policy.
+pub trait CompiledTrainingRatePolicyCommitOnlyRuntime: CompiledTrainingRatePolicyRuntime {
+    fn commit_step_with_rate_policy(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step>;
+
+    fn commit_step_batch_with_rate_policy<B>(&mut self, batch: B) -> Result<Self::Step>
+    where
+        Self: Sized,
+        B: CompiledInputBatch,
+    {
+        self.commit_step_with_rate_policy(batch.into_compiled_inputs()?)
+    }
+}
+
 /// CPU capability for replaying AdamW with a captured learning-rate policy.
 ///
 /// Metal deliberately does not implement this capability until it can admit
@@ -5727,6 +5761,30 @@ pub trait CompiledScheduledAdamWCommitOnlyRuntime:
         B: CompiledInputBatch,
     {
         self.step_commit_only_scheduled(batch.into_compiled_inputs()?)
+    }
+}
+
+impl<R> CompiledTrainingRatePolicyRuntime for R
+where
+    R: CompiledScheduledAdamWRuntime + ?Sized,
+{
+    fn step_with_rate_policy(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step> {
+        CompiledScheduledAdamWRuntime::step_scheduled(self, inputs)
+    }
+}
+
+impl<R> CompiledTrainingRatePolicyCommitOnlyRuntime for R
+where
+    R: CompiledScheduledAdamWCommitOnlyRuntime + ?Sized,
+{
+    fn commit_step_with_rate_policy(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step> {
+        CompiledScheduledAdamWCommitOnlyRuntime::step_commit_only_scheduled(self, inputs)
     }
 }
 
@@ -18415,9 +18473,15 @@ mod tests {
         let before = native.checkpoint().unwrap();
         assert!(native.step(batch(), lr()).is_err());
         assert_eq!(native.checkpoint().unwrap(), before);
+        assert!(
+            native
+                .step_with_learning_rate(batch(), None, CompiledStepOutputSelection::All, Some(0),)
+                .is_err()
+        );
+        assert_eq!(native.checkpoint().unwrap(), before);
         for _ in 0..2 {
-            let actual = native.step_scheduled(batch()).unwrap();
-            let expected = interpreted.step_scheduled(batch()).unwrap();
+            let actual = run_core_rate_policy_step(&mut native);
+            let expected = run_core_rate_policy_step(&mut interpreted);
             assert_cross_engine_tensor_close("scheduled loss", actual.loss(), expected.loss());
             assert_cross_engine_tensor_maps_close(
                 "scheduled outputs",
@@ -18441,7 +18505,7 @@ mod tests {
                 .unwrap()
                 .workspace_stats()
                 .borrowed_external_input_bytes,
-            64
+            96
         );
         let actual = native.flush_partial_window_scheduled().unwrap();
         let expected = interpreted.flush_partial_window_scheduled().unwrap();
@@ -18735,6 +18799,20 @@ mod tests {
         assert_eq!(runtime.capture_identity(), identity);
         assert_ne!(runtime.parameter_snapshots().unwrap(), before);
         step.loss().clone()
+    }
+
+    fn run_core_rate_policy_step<R: CompiledTrainingRatePolicyRuntime>(runtime: &mut R) -> R::Step {
+        runtime
+            .step_batch_with_rate_policy(TinyBobBatch(batch()))
+            .unwrap()
+    }
+
+    fn run_core_rate_policy_commit_only_step<R: CompiledTrainingRatePolicyCommitOnlyRuntime>(
+        runtime: &mut R,
+    ) -> R::Step {
+        runtime
+            .commit_step_batch_with_rate_policy(TinyBobBatch(batch()))
+            .unwrap()
     }
 
     fn reset_core_training_window<R: CompiledTrainingWindowRuntime>(
@@ -25546,11 +25624,14 @@ mod tests {
         assert!(scheduled.step(batch(), TensorData::scalar(0.05)).is_err());
         assert_eq!(scheduled.checkpoint().unwrap(), scheduled_before);
         let external_before = external.checkpoint().unwrap();
-        assert!(external.step_scheduled(batch()).is_err());
+        assert!(
+            CompiledTrainingRatePolicyRuntime::step_with_rate_policy(&mut external, batch())
+                .is_err()
+        );
         assert_eq!(external.checkpoint().unwrap(), external_before);
 
         for external_rate in [0.05, 0.05, 0.025] {
-            let actual = scheduled.step_scheduled(batch()).unwrap();
+            let actual = run_core_rate_policy_step(&mut scheduled);
             let expected = external
                 .step(batch(), TensorData::scalar(external_rate))
                 .unwrap();
@@ -25595,8 +25676,8 @@ mod tests {
         )
         .unwrap();
         for _ in 0..2 {
-            let expected = scheduled.step_scheduled(batch()).unwrap();
-            let actual = resumed.step_scheduled(batch()).unwrap();
+            let expected = run_core_rate_policy_step(&mut scheduled);
+            let actual = run_core_rate_policy_step(&mut resumed);
             assert_eq!(actual.loss(), expected.loss());
             assert_eq!(actual.outputs(), expected.outputs());
         }
@@ -25625,8 +25706,15 @@ mod tests {
         assert_eq!(scheduled_plan.captured_multi_step_lr(), Some(&schedule));
         let mut observed = scheduled_plan.prepare_cpu().unwrap();
         let mut commit_only = scheduled_plan.prepare_cpu().unwrap();
-        let expected = observed.step_scheduled(batch()).unwrap();
-        let actual = commit_only.step_commit_only_scheduled(batch()).unwrap();
+        let before_rejected = commit_only.checkpoint().unwrap();
+        assert!(
+            commit_only
+                .commit_step_batch_with_rate_policy(RejectedBatch)
+                .is_err()
+        );
+        assert_eq!(commit_only.checkpoint().unwrap(), before_rejected);
+        let expected = run_core_rate_policy_step(&mut observed);
+        let actual = run_core_rate_policy_commit_only_step(&mut commit_only);
         assert_eq!(actual.loss(), expected.loss());
         assert!(actual.outputs().is_empty());
         assert_eq!(
@@ -25637,8 +25725,15 @@ mod tests {
         let target = NativeCpuSessionTarget::new(&executor);
         let mut observed = target.prepare(&scheduled_plan).unwrap();
         let mut commit_only = target.prepare(&scheduled_plan).unwrap();
-        let expected = observed.step_scheduled(batch()).unwrap();
-        let actual = commit_only.step_commit_only_scheduled(batch()).unwrap();
+        let before_rejected = commit_only.checkpoint().unwrap();
+        assert!(
+            commit_only
+                .commit_step_batch_with_rate_policy(RejectedBatch)
+                .is_err()
+        );
+        assert_eq!(commit_only.checkpoint().unwrap(), before_rejected);
+        let expected = run_core_rate_policy_step(&mut observed);
+        let actual = run_core_rate_policy_commit_only_step(&mut commit_only);
         assert_eq!(actual.loss(), expected.loss());
         assert!(actual.outputs().is_empty());
         assert_eq!(
