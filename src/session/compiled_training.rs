@@ -4943,6 +4943,138 @@ pub struct NativeCpuCompiledAdamW<'a> {
     successful_evaluations: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum NativeCpuTrainingProgramRole {
+    Main,
+    Accumulation,
+    PartialFlush,
+    ZeroGrad,
+    Evaluation,
+}
+
+impl NativeCpuTrainingProgramRole {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Accumulation => "accumulation",
+            Self::PartialFlush => "partial-flush",
+            Self::ZeroGrad => "zero-grad",
+            Self::Evaluation => "evaluation",
+        }
+    }
+}
+
+struct NativeCpuTrainingProgramDrafts<D> {
+    by_role: BTreeMap<NativeCpuTrainingProgramRole, D>,
+}
+
+impl<D> NativeCpuTrainingProgramDrafts<D> {
+    fn new() -> Self {
+        Self {
+            by_role: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, role: NativeCpuTrainingProgramRole, draft: D) -> Result<()> {
+        if self.by_role.insert(role, draft).is_some() {
+            return Err(training(format!(
+                "compiled native CPU {} planning draft is duplicated",
+                role.name()
+            )));
+        }
+        Ok(())
+    }
+
+    fn take(&mut self, role: NativeCpuTrainingProgramRole) -> Result<D> {
+        self.by_role.remove(&role).ok_or_else(|| {
+            training(format!(
+                "compiled native CPU {} planning draft is absent",
+                role.name()
+            ))
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_role.is_empty()
+    }
+}
+
+struct NativeCpuTrainingProgramBatch<C, D> {
+    programs: Vec<(NativeCpuTrainingProgramRole, C, D)>,
+}
+
+impl<C, D> NativeCpuTrainingProgramBatch<C, D> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            programs: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, role: NativeCpuTrainingProgramRole, capture: C, draft: D) -> Result<()> {
+        match self.programs.last() {
+            None if role != NativeCpuTrainingProgramRole::Main => {
+                return Err(training("compiled native CPU main program is absent"));
+            }
+            Some((previous, _, _)) if *previous >= role => {
+                return Err(training("compiled native CPU program role order differs"));
+            }
+            _ => {}
+        }
+        self.programs.push((role, capture, draft));
+        Ok(())
+    }
+
+    fn into_planning_inputs(self) -> (Vec<NativeCpuTrainingProgramRole>, Vec<(C, D)>) {
+        let mut roles = Vec::with_capacity(self.programs.len());
+        let mut programs = Vec::with_capacity(self.programs.len());
+        for (role, capture, draft) in self.programs {
+            roles.push(role);
+            programs.push((capture, draft));
+        }
+        (roles, programs)
+    }
+}
+
+struct NativeCpuTrainingPrograms<P> {
+    main: P,
+    accumulation: Option<P>,
+    partial_flush: Option<P>,
+    zero_grad: Option<P>,
+    evaluation: Option<P>,
+}
+
+impl<P> NativeCpuTrainingPrograms<P> {
+    fn from_ordered(roles: Vec<NativeCpuTrainingProgramRole>, plans: Vec<P>) -> Result<Self> {
+        if roles.len() != plans.len() {
+            return Err(training("compiled native CPU plan inventory differs"));
+        }
+        let mut main = None;
+        let mut accumulation = None;
+        let mut partial_flush = None;
+        let mut zero_grad = None;
+        let mut evaluation = None;
+        for (role, plan) in roles.into_iter().zip(plans) {
+            let slot = match role {
+                NativeCpuTrainingProgramRole::Main => &mut main,
+                NativeCpuTrainingProgramRole::Accumulation => &mut accumulation,
+                NativeCpuTrainingProgramRole::PartialFlush => &mut partial_flush,
+                NativeCpuTrainingProgramRole::ZeroGrad => &mut zero_grad,
+                NativeCpuTrainingProgramRole::Evaluation => &mut evaluation,
+            };
+            if slot.replace(plan).is_some() {
+                return Err(training("compiled native CPU program role is duplicated"));
+            }
+        }
+        Ok(Self {
+            main: main.ok_or_else(|| training("compiled native CPU main plan is absent"))?,
+            accumulation,
+            partial_flush,
+            zero_grad,
+            evaluation,
+        })
+    }
+}
+
 /// Resource-free Metal rendering of one compiled AdamW plan. Preparing it
 /// uploads the plan's parameter, moment, and optimizer-step frontier into the
 /// existing epoch-swapped Metal runtime.
@@ -11295,26 +11427,25 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             &inner.contract.learning_rate,
             CompiledLearningRatePolicy::External
         );
-        let mut drafts = Vec::with_capacity(
-            1 + usize::from(inner.inner.accumulation.is_some())
-                + usize::from(inner.partial_flush.is_some())
-                + usize::from(inner.zero_grad.is_some())
-                + usize::from(inner.evaluation.is_some()),
-        );
+        let program_count = 1
+            + usize::from(inner.inner.accumulation.is_some())
+            + usize::from(inner.partial_flush.is_some())
+            + usize::from(inner.zero_grad.is_some())
+            + usize::from(inner.evaluation.is_some());
+        let mut drafts = NativeCpuTrainingProgramDrafts::new();
         let (mut main_preparation, main_residual) = inner
             .inner
             .preflight_native(vectorized, external_learning_rate)?;
         {
             let (pure, inputs) = main_preparation.pure_and_inputs();
-            drafts.push(
-                executor
-                    .preflight_native_items_with_store_groups(
-                        pure,
-                        inputs,
-                        &inner.inner.recurrent_store_groups,
-                    )
-                    .map_err(replay_error)?,
-            );
+            let draft = executor
+                .preflight_native_items_with_store_groups(
+                    pure,
+                    inputs,
+                    &inner.inner.recurrent_store_groups,
+                )
+                .map_err(replay_error)?;
+            drafts.insert(NativeCpuTrainingProgramRole::Main, draft)?;
         }
         main_preparation.release_input_witnesses();
         let accumulation_preparation = match inner.inner.accumulation.as_ref() {
@@ -11324,15 +11455,14 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     .preflight_native_accumulation(transition, vectorized)?;
                 {
                     let (pure, inputs) = preparation.pure_and_inputs();
-                    drafts.push(
-                        executor
-                            .preflight_native_items_with_recurrent_retention(
-                                pure,
-                                inputs,
-                                preparation.retained_recurrent_states(),
-                            )
-                            .map_err(replay_error)?,
-                    );
+                    let draft = executor
+                        .preflight_native_items_with_recurrent_retention(
+                            pure,
+                            inputs,
+                            preparation.retained_recurrent_states(),
+                        )
+                        .map_err(replay_error)?;
+                    drafts.insert(NativeCpuTrainingProgramRole::Accumulation, draft)?;
                 }
                 preparation.release_input_witnesses();
                 Some((preparation, residual))
@@ -11349,15 +11479,14 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     )?;
                 {
                     let (pure, inputs) = preparation.pure_and_inputs();
-                    drafts.push(
-                        executor
-                            .preflight_native_items_with_store_groups(
-                                pure,
-                                inputs,
-                                &transition.recurrent_store_groups,
-                            )
-                            .map_err(replay_error)?,
-                    );
+                    let draft = executor
+                        .preflight_native_items_with_store_groups(
+                            pure,
+                            inputs,
+                            &transition.recurrent_store_groups,
+                        )
+                        .map_err(replay_error)?;
+                    drafts.insert(NativeCpuTrainingProgramRole::PartialFlush, draft)?;
                 }
                 preparation.release_input_witnesses();
                 Some((preparation, residual))
@@ -11371,11 +11500,10 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     .preflight_native_auxiliary_transition(transition, vectorized, false)?;
                 {
                     let (pure, inputs) = preparation.pure_and_inputs();
-                    drafts.push(
-                        executor
-                            .preflight_native_items(pure, inputs)
-                            .map_err(replay_error)?,
-                    );
+                    let draft = executor
+                        .preflight_native_items(pure, inputs)
+                        .map_err(replay_error)?;
+                    drafts.insert(NativeCpuTrainingProgramRole::ZeroGrad, draft)?;
                 }
                 preparation.release_input_witnesses();
                 Some((preparation, residual))
@@ -11388,148 +11516,148 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     inner.parameter_snapshots()?,
                     &inner.inner.parameter_buffers,
                 )?;
-                drafts.push(
-                    executor
-                        .preflight_native_items(
-                            evaluation.plan.inference.capture(),
-                            preparation
-                                .inputs
-                                .as_ref()
-                                .expect("native evaluation input witnesses are present"),
-                        )
-                        .map_err(replay_error)?,
-                );
+                let draft = executor
+                    .preflight_native_items(
+                        evaluation.plan.inference.capture(),
+                        preparation
+                            .inputs
+                            .as_ref()
+                            .expect("native evaluation input witnesses are present"),
+                    )
+                    .map_err(replay_error)?;
+                drafts.insert(NativeCpuTrainingProgramRole::Evaluation, draft)?;
                 preparation.inputs = None;
                 Some(preparation)
             }
             None => None,
         };
-        let mut programs = Vec::with_capacity(drafts.len());
-        let mut drafts = drafts.into_iter();
-        programs.push((
+        let mut programs = NativeCpuTrainingProgramBatch::with_capacity(program_count);
+        programs.push(
+            NativeCpuTrainingProgramRole::Main,
             main_preparation.pure(),
-            drafts
-                .next()
-                .expect("native main planning draft is present"),
-        ));
+            drafts.take(NativeCpuTrainingProgramRole::Main)?,
+        )?;
         if let Some((preparation, _)) = &accumulation_preparation {
-            programs.push((
+            programs.push(
+                NativeCpuTrainingProgramRole::Accumulation,
                 preparation.pure(),
-                drafts
-                    .next()
-                    .expect("native accumulation planning draft is present"),
-            ));
+                drafts.take(NativeCpuTrainingProgramRole::Accumulation)?,
+            )?;
         }
         if let Some((preparation, _)) = &partial_flush_preparation {
-            programs.push((
+            programs.push(
+                NativeCpuTrainingProgramRole::PartialFlush,
                 preparation.pure(),
-                drafts
-                    .next()
-                    .expect("native partial-flush planning draft is present"),
-            ));
+                drafts.take(NativeCpuTrainingProgramRole::PartialFlush)?,
+            )?;
         }
         if let Some((preparation, _)) = &zero_grad_preparation {
-            programs.push((
+            programs.push(
+                NativeCpuTrainingProgramRole::ZeroGrad,
                 preparation.pure(),
-                drafts
-                    .next()
-                    .expect("native zero-grad planning draft is present"),
-            ));
+                drafts.take(NativeCpuTrainingProgramRole::ZeroGrad)?,
+            )?;
         }
         if let Some(evaluation) = inner.evaluation.as_ref() {
-            programs.push((
+            programs.push(
+                NativeCpuTrainingProgramRole::Evaluation,
                 evaluation.plan.inference.capture(),
-                drafts
-                    .next()
-                    .expect("native evaluation planning draft is present"),
+                drafts.take(NativeCpuTrainingProgramRole::Evaluation)?,
+            )?;
+        }
+        if !drafts.is_empty() {
+            return Err(training(
+                "compiled native CPU planning draft inventory is excessive",
             ));
         }
-        debug_assert!(drafts.next().is_none());
+        let (roles, programs) = programs.into_planning_inputs();
         let (plans, compilation) = executor
             .plan_native_item_drafts(programs, vectorized)
             .map_err(replay_error)?;
-        let mut plans = plans.into_iter();
-        let main = inner.inner.finish_native(
-            main_preparation,
-            plans
-                .next()
-                .ok_or_else(|| training("compiled native CPU main plan is absent"))?,
-            main_residual,
-        )?;
-        let accumulation = match (inner.inner.accumulation.as_ref(), accumulation_preparation) {
-            (Some(transition), Some((preparation, residual))) => {
-                Some(inner.inner.finish_native_accumulation(
-                    transition,
-                    preparation,
-                    plans.next().ok_or_else(|| {
-                        training("compiled native CPU accumulation plan is absent")
-                    })?,
-                    residual,
-                )?)
-            }
-            (None, None) => None,
+        let NativeCpuTrainingPrograms {
+            main: main_plan,
+            accumulation: accumulation_plan,
+            partial_flush: partial_flush_plan,
+            zero_grad: zero_grad_plan,
+            evaluation: evaluation_plan,
+        } = NativeCpuTrainingPrograms::from_ordered(roles, plans)?;
+        let main = inner
+            .inner
+            .finish_native(main_preparation, main_plan, main_residual)?;
+        let accumulation = match (
+            inner.inner.accumulation.as_ref(),
+            accumulation_preparation,
+            accumulation_plan,
+        ) {
+            (Some(transition), Some((preparation, residual)), Some(plan)) => Some(
+                inner
+                    .inner
+                    .finish_native_accumulation(transition, preparation, plan, residual)?,
+            ),
+            (None, None, None) => None,
             _ => {
                 return Err(training(
                     "compiled native CPU accumulation preparation differs",
                 ));
             }
         };
-        let partial_flush = match (inner.partial_flush.as_ref(), partial_flush_preparation) {
-            (Some(transition), Some((preparation, residual))) => {
+        let partial_flush = match (
+            inner.partial_flush.as_ref(),
+            partial_flush_preparation,
+            partial_flush_plan,
+        ) {
+            (Some(transition), Some((preparation, residual)), Some(plan)) => {
                 Some(inner.inner.finish_native_auxiliary_transition(
                     transition,
                     preparation,
-                    plans.next().ok_or_else(|| {
-                        training("compiled native CPU partial-flush plan is absent")
-                    })?,
+                    plan,
                     residual,
                 )?)
             }
-            (None, None) => None,
+            (None, None, None) => None,
             _ => {
                 return Err(training(
                     "compiled native CPU partial-flush preparation differs",
                 ));
             }
         };
-        let zero_grad = match (inner.zero_grad.as_ref(), zero_grad_preparation) {
-            (Some(transition), Some((preparation, residual))) => Some(
-                inner.inner.finish_native_auxiliary_transition(
+        let zero_grad = match (
+            inner.zero_grad.as_ref(),
+            zero_grad_preparation,
+            zero_grad_plan,
+        ) {
+            (Some(transition), Some((preparation, residual)), Some(plan)) => {
+                Some(inner.inner.finish_native_auxiliary_transition(
                     transition,
                     preparation,
-                    plans
-                        .next()
-                        .ok_or_else(|| training("compiled native CPU zero-grad plan is absent"))?,
+                    plan,
                     residual,
-                )?,
-            ),
-            (None, None) => None,
+                )?)
+            }
+            (None, None, None) => None,
             _ => {
                 return Err(training(
                     "compiled native CPU zero-grad preparation differs",
                 ));
             }
         };
-        let evaluation = match (inner.evaluation.as_ref(), evaluation_preparation) {
-            (Some(evaluation), Some(preparation)) => Some(
-                evaluation.plan.finish_native(
-                    preparation,
-                    &inner.inner.parameter_buffers,
-                    plans
-                        .next()
-                        .ok_or_else(|| training("compiled native CPU evaluation plan is absent"))?,
-                )?,
+        let evaluation = match (
+            inner.evaluation.as_ref(),
+            evaluation_preparation,
+            evaluation_plan,
+        ) {
+            (Some(evaluation), Some(preparation), Some(plan)) => Some(
+                evaluation
+                    .plan
+                    .finish_native(preparation, &inner.inner.parameter_buffers, plan)?,
             ),
-            (None, None) => None,
+            (None, None, None) => None,
             _ => {
                 return Err(training(
                     "compiled native CPU evaluation preparation differs",
                 ));
             }
         };
-        if plans.next().is_some() {
-            return Err(training("compiled native CPU plan inventory is excessive"));
-        }
         let (recurrent_state_count, recurrent_state_bytes) = checked_recurrent_state_extent(
             inner
                 .inner
@@ -14523,6 +14651,51 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn native_training_program_roles_authenticate_batch_and_plan_assignment() {
+        use NativeCpuTrainingProgramRole::{
+            Accumulation, Evaluation, Main, PartialFlush, ZeroGrad,
+        };
+
+        let mut batch = NativeCpuTrainingProgramBatch::with_capacity(5);
+        batch.push(Main, "main", 10).unwrap();
+        batch.push(Accumulation, "accumulation", 20).unwrap();
+        batch.push(PartialFlush, "partial_flush", 30).unwrap();
+        batch.push(ZeroGrad, "zero_grad", 40).unwrap();
+        batch.push(Evaluation, "evaluation", 50).unwrap();
+        let (roles, programs) = batch.into_planning_inputs();
+        assert_eq!(
+            roles,
+            [Main, Accumulation, PartialFlush, ZeroGrad, Evaluation]
+        );
+        assert_eq!(
+            programs,
+            [
+                ("main", 10),
+                ("accumulation", 20),
+                ("partial_flush", 30),
+                ("zero_grad", 40),
+                ("evaluation", 50),
+            ]
+        );
+
+        let plans = NativeCpuTrainingPrograms::from_ordered(roles, vec![1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(plans.main, 1);
+        assert_eq!(plans.accumulation, Some(2));
+        assert_eq!(plans.partial_flush, Some(3));
+        assert_eq!(plans.zero_grad, Some(4));
+        assert_eq!(plans.evaluation, Some(5));
+
+        let mut missing_main = NativeCpuTrainingProgramBatch::with_capacity(1);
+        assert!(missing_main.push(Evaluation, (), ()).is_err());
+        let mut reordered = NativeCpuTrainingProgramBatch::with_capacity(3);
+        reordered.push(Main, (), ()).unwrap();
+        reordered.push(PartialFlush, (), ()).unwrap();
+        assert!(reordered.push(Accumulation, (), ()).is_err());
+        assert!(NativeCpuTrainingPrograms::from_ordered(vec![Main], Vec::<u8>::new()).is_err());
+        assert!(NativeCpuTrainingPrograms::from_ordered(vec![Main, Main], vec![1_u8, 2]).is_err());
     }
 
     #[test]
