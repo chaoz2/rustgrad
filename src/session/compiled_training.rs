@@ -1418,6 +1418,7 @@ impl CompiledAdamWConfig {
 #[derive(Clone, Debug)]
 pub struct CompiledTrainingStepResult {
     loss: TensorData,
+    loss_aggregation_weight: u64,
     outputs: BTreeMap<String, TensorData>,
     step: u64,
     capture_identity: u64,
@@ -2853,6 +2854,11 @@ impl CompiledTrainingStepResult {
         &self.loss
     }
 
+    /// Exact weight of this normalized loss when aggregating across batches.
+    pub fn loss_aggregation_weight(&self) -> u64 {
+        self.loss_aggregation_weight
+    }
+
     pub fn outputs(&self) -> &BTreeMap<String, TensorData> {
         &self.outputs
     }
@@ -2876,10 +2882,20 @@ pub type CompiledMomentumSgdStepResult = CompiledTrainingStepResult;
 ///
 /// Concrete optimizer results may expose additional progress, while device
 /// results may retain execution reports. Generic training loops can still
-/// consume loss, named outputs, replay progress, and capture identity without
-/// selecting either concern through an enum.
+/// consume loss plus its exact aggregation weight, named outputs, replay
+/// progress, and capture identity without selecting either concern through an
+/// enum.
 pub trait CompiledTrainingStep {
     fn loss(&self) -> &TensorData;
+
+    /// Exact weight of this normalized loss when aggregating across batches.
+    ///
+    /// Ordinary scalar objectives use one. Compiler-owned token-mean
+    /// objectives override this with their validated number of contributing
+    /// tokens, independently of the optimizer that consumed the objective.
+    fn loss_aggregation_weight(&self) -> u64 {
+        1
+    }
 
     fn outputs(&self) -> &BTreeMap<String, TensorData>;
 
@@ -2895,6 +2911,10 @@ pub trait CompiledTrainingStep {
 impl CompiledTrainingStep for CompiledTrainingStepResult {
     fn loss(&self) -> &TensorData {
         CompiledTrainingStepResult::loss(self)
+    }
+
+    fn loss_aggregation_weight(&self) -> u64 {
+        CompiledTrainingStepResult::loss_aggregation_weight(self)
     }
 
     fn outputs(&self) -> &BTreeMap<String, TensorData> {
@@ -2922,7 +2942,6 @@ pub struct CompiledAdamWStepResult {
     inner: CompiledTrainingStepResult,
     optimizer_step: u64,
     accumulation_index: u64,
-    loss_weight: u64,
     clip_report: Option<CompiledAdamWClipReport>,
     window_loss_report: Option<CompiledAdamWWindowLossReport>,
 }
@@ -3047,7 +3066,7 @@ impl CompiledAdamWStepResult {
     /// Ordinary scalar-loss programs use one. Compiler-owned token-mean
     /// programs use the validated number of non-padding tokens in this replay.
     pub fn loss_weight(&self) -> u64 {
-        self.loss_weight
+        self.inner.loss_aggregation_weight()
     }
 
     /// Completed-window clipping evidence when reporting was requested.
@@ -3106,6 +3125,10 @@ pub trait CompiledAdamWStep: CompiledTrainingStep {
 impl CompiledTrainingStep for CompiledAdamWStepResult {
     fn loss(&self) -> &TensorData {
         CompiledAdamWStepResult::loss(self)
+    }
+
+    fn loss_aggregation_weight(&self) -> u64 {
+        CompiledAdamWStepResult::loss_weight(self)
     }
 
     fn outputs(&self) -> &BTreeMap<String, TensorData> {
@@ -3203,6 +3226,10 @@ impl NativeCpuCompiledAdamWStepResult {
 impl CompiledTrainingStep for NativeCpuCompiledAdamWStepResult {
     fn loss(&self) -> &TensorData {
         self.inner.loss()
+    }
+
+    fn loss_aggregation_weight(&self) -> u64 {
+        self.inner.loss_weight()
     }
 
     fn outputs(&self) -> &BTreeMap<String, TensorData> {
@@ -5374,6 +5401,10 @@ impl MetalCompiledAdamWStepResult {
 impl CompiledTrainingStep for MetalCompiledAdamWStepResult {
     fn loss(&self) -> &TensorData {
         MetalCompiledAdamWStepResult::loss(self)
+    }
+
+    fn loss_aggregation_weight(&self) -> u64 {
+        MetalCompiledAdamWStepResult::loss_weight(self)
     }
 
     fn outputs(&self) -> &BTreeMap<String, TensorData> {
@@ -8064,6 +8095,7 @@ impl CpuCompiledTrainingProgram {
         self.step = next_step;
         Ok(CompiledTrainingStepResult {
             loss: outputs.loss,
+            loss_aggregation_weight: 1,
             outputs: outputs.named_outputs,
             step: self.step,
             capture_identity: self.cursor.capture_identity(),
@@ -8150,6 +8182,7 @@ impl CpuCompiledTrainingProgram {
         Ok((
             CompiledTrainingStepResult {
                 loss: outputs.loss,
+                loss_aggregation_weight: 1,
                 outputs: outputs.named_outputs,
                 step: self.step,
                 capture_identity: self.cursor.capture_identity(),
@@ -8205,6 +8238,7 @@ impl CpuCompiledTrainingProgram {
         self.step = next_step;
         Ok(CompiledTrainingStepResult {
             loss: outputs.loss,
+            loss_aggregation_weight: 1,
             outputs: outputs.named_outputs,
             step: self.step,
             capture_identity: self.capture_identity(),
@@ -8279,6 +8313,7 @@ impl CpuCompiledTrainingProgram {
         Ok((
             CompiledTrainingStepResult {
                 loss: outputs.loss,
+                loss_aggregation_weight: 1,
                 outputs: outputs.named_outputs,
                 step: self.step,
                 capture_identity: self.capture_identity(),
@@ -12861,6 +12896,7 @@ fn adamw_step_result(
     clip_report_enabled: bool,
     window_loss_report_enabled: bool,
 ) -> CompiledAdamWStepResult {
+    inner.loss_aggregation_weight = loss_weight;
     let expected = if progress.accumulation_index == 0 {
         adamw_observation_schema(clip_report_enabled, window_loss_report_enabled)
     } else {
@@ -12897,7 +12933,6 @@ fn adamw_step_result(
         inner,
         optimizer_step: progress.optimizer_step,
         accumulation_index: progress.accumulation_index,
-        loss_weight,
         clip_report,
         window_loss_report,
     }
@@ -13384,6 +13419,7 @@ impl MetalCompiledAdamW {
         let inner = adamw_step_result(
             CompiledTrainingStepResult {
                 loss,
+                loss_aggregation_weight: 1,
                 outputs,
                 step: self.progress.replay_step,
                 capture_identity: self.inner.program_identity,
@@ -18560,6 +18596,10 @@ mod tests {
         assert_eq!(plan.step_count(), 0);
     }
 
+    fn assert_core_loss_aggregation_weight(step: &impl CompiledTrainingStep, expected: u64) {
+        assert_eq!(step.loss_aggregation_weight(), expected);
+    }
+
     fn run_core_training_step<R: CompiledTrainingRuntime>(
         runtime: &mut R,
     ) -> (TensorData, BTreeMap<String, TensorData>) {
@@ -18567,6 +18607,7 @@ mod tests {
         let before = runtime.parameter_snapshots().unwrap();
         let step = runtime.step_batch(TinyBobBatch(batch()), 0.05).unwrap();
         assert_eq!(step.step(), 1);
+        assert_core_loss_aggregation_weight(&step, 1);
         assert_eq!(step.capture_identity(), identity);
         assert_eq!(step.output("logits"), step.outputs().get("logits"));
         assert_eq!(runtime.step_count(), 1);
@@ -18584,6 +18625,7 @@ mod tests {
             .commit_step_batch(TinyBobBatch(batch()), 0.05)
             .unwrap();
         assert_eq!(step.step(), 1);
+        assert_core_loss_aggregation_weight(&step, 1);
         assert_eq!(step.capture_identity(), identity);
         assert!(step.outputs().is_empty());
         assert_eq!(runtime.step_count(), 1);
@@ -18754,6 +18796,7 @@ mod tests {
         let value = |key, value| CompiledTrainingObservationValue { key, value };
         let inner = |observations| CompiledTrainingStepResult {
             loss: TensorData::scalar(1.0),
+            loss_aggregation_weight: 1,
             outputs: BTreeMap::new(),
             step: 1,
             capture_identity: 7,
@@ -20070,6 +20113,7 @@ mod tests {
         assert!(first.did_update());
         assert_eq!(first.accumulation_index(), 0);
         assert_eq!(first.loss_weight(), 2);
+        assert_core_loss_aggregation_weight(&first, 2);
         assert_eq!(first.loss().scalar_at(0).as_f64(), 4.0);
         let window = first.window_loss_report().unwrap();
         assert_eq!(f64::from(window.mean_loss()), 4.0);
@@ -20141,6 +20185,7 @@ mod tests {
         let native_step = native.step(valid(), TensorData::scalar(0.1)).unwrap();
         assert!(native_step.did_update());
         assert_eq!(native_step.loss_weight(), 2);
+        assert_core_loss_aggregation_weight(&native_step, 2);
         assert_eq!(native_step.window_loss_report().unwrap().loss_weight(), 2);
         assert_eq!(native_step.report().fallback_count(), 0);
     }
@@ -20888,6 +20933,8 @@ mod tests {
         let native_first = native.step(nonempty(), TensorData::scalar(0.1)).unwrap();
         assert_eq!(interpreted_first.loss_weight(), 2);
         assert_eq!(native_first.loss_weight(), 2);
+        assert_core_loss_aggregation_weight(&interpreted_first, 2);
+        assert_core_loss_aggregation_weight(&native_first, 2);
         assert!(!interpreted_first.did_update());
         assert!(!native_first.did_update());
         let interpreted_accumulators = interpreted.gradient_accumulator_snapshots().unwrap();
@@ -20898,6 +20945,8 @@ mod tests {
         assert_eq!(native_empty.loss().scalar_at(0).as_f64(), 0.0);
         assert_eq!(interpreted_empty.loss_weight(), 0);
         assert_eq!(native_empty.loss_weight(), 0);
+        assert_core_loss_aggregation_weight(&interpreted_empty, 0);
+        assert_core_loss_aggregation_weight(&native_empty, 0);
         assert!(!interpreted_empty.did_update());
         assert!(!native_empty.did_update());
         assert_eq!(
