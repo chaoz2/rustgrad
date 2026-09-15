@@ -5277,6 +5277,31 @@ pub trait CompiledAdamWRuntime:
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
 }
 
+/// Optimizer-neutral capability for committing replay state without returning
+/// graph-named outputs.
+///
+/// Loss and enabled diagnostic reports remain part of the result and retain
+/// their ordinary transition validation. This capability changes observation
+/// only; it does not define a distinct capture or checkpoint identity.
+pub trait CompiledTrainingCommitOnlyRuntime: CompiledTrainingRuntime {
+    fn commit_step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step>;
+
+    fn commit_step_batch<B>(&mut self, batch: B, learning_rate: f32) -> Result<Self::Step>
+    where
+        Self: Sized,
+        B: CompiledInputBatch,
+    {
+        self.commit_step(
+            batch.into_compiled_inputs()?,
+            TensorData::scalar(learning_rate),
+        )
+    }
+}
+
 /// CPU AdamW capability for committing replay state without returning
 /// graph-named outputs.
 ///
@@ -7615,12 +7640,49 @@ impl CpuCompiledTrainingProgram {
         learning_rate: TensorData,
         injected_failure: Option<u64>,
     ) -> Result<CompiledTrainingStepResult> {
+        self.step_with_output_selection(
+            inputs,
+            learning_rate,
+            CompiledStepOutputSelection::All,
+            injected_failure,
+        )
+    }
+
+    fn step_commit_only(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<CompiledTrainingStepResult> {
+        self.step_commit_only_inner(inputs, learning_rate, None)
+    }
+
+    fn step_commit_only_inner(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledTrainingStepResult> {
+        self.step_with_output_selection(
+            inputs,
+            learning_rate,
+            CompiledStepOutputSelection::CommitOnly,
+            injected_failure,
+        )
+    }
+
+    fn step_with_output_selection(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        output_selection: CompiledStepOutputSelection,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledTrainingStepResult> {
         self.step_inner_with_learning_rate(
             CompiledStepReplayRequest {
                 inputs,
                 learning_rate: Some(learning_rate),
                 non_finite_policy: CpuNonFinitePolicy::Propagate,
-                output_selection: CompiledStepOutputSelection::All,
+                output_selection,
                 injected_failure,
             },
             true,
@@ -8403,6 +8465,15 @@ impl CpuCompiledMomentumSgd {
         self.inner.step(inputs, learning_rate)
     }
 
+    /// Commits one replay while omitting only graph-named outputs.
+    pub fn commit_step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<CompiledMomentumSgdStepResult> {
+        self.inner.step_commit_only(inputs, learning_rate)
+    }
+
     pub fn step_count(&self) -> u64 {
         self.inner.step_count()
     }
@@ -8437,6 +8508,17 @@ impl CpuCompiledMomentumSgd {
         self.inner
             .step_inner(inputs, learning_rate, injected_failure)
     }
+
+    #[cfg(test)]
+    fn commit_step_inner(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledMomentumSgdStepResult> {
+        self.inner
+            .step_commit_only_inner(inputs, learning_rate, injected_failure)
+    }
 }
 
 impl CompiledTrainingRuntime for CpuCompiledMomentumSgd {
@@ -8460,6 +8542,16 @@ impl CompiledTrainingRuntime for CpuCompiledMomentumSgd {
 
     fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         CpuCompiledMomentumSgd::parameter_snapshots(self)
+    }
+}
+
+impl CompiledTrainingCommitOnlyRuntime for CpuCompiledMomentumSgd {
+    fn commit_step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        CpuCompiledMomentumSgd::commit_step(self, inputs, learning_rate)
     }
 }
 
@@ -10217,6 +10309,23 @@ impl<M: Module, R: CompiledAdamWCommitOnlyRuntime> CompiledModuleAdamWSession<M,
         B: CompiledInputBatch,
     {
         self.runtime.step_batch_commit_only(batch, learning_rate)
+    }
+}
+
+impl<M: Module, R: CompiledTrainingCommitOnlyRuntime> CompiledModuleAdamWSession<M, R> {
+    pub fn commit_step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<R::Step> {
+        self.runtime.commit_step(inputs, learning_rate)
+    }
+
+    pub fn commit_step_batch<B>(&mut self, batch: B, learning_rate: f32) -> Result<R::Step>
+    where
+        B: CompiledInputBatch,
+    {
+        self.runtime.commit_step_batch(batch, learning_rate)
     }
 }
 
@@ -11994,6 +12103,16 @@ impl CompiledAdamWCommitOnlyRuntime for CpuCompiledAdamW {
     }
 }
 
+impl CompiledTrainingCommitOnlyRuntime for CpuCompiledAdamW {
+    fn commit_step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        CpuCompiledAdamW::step_commit_only(self, inputs, learning_rate)
+    }
+}
+
 impl CompiledAdamWFlushRuntime for CpuCompiledAdamW {
     type Flush = CompiledAdamWFlushResult;
 
@@ -12142,6 +12261,16 @@ impl CompiledAdamWRuntime for NativeCpuCompiledAdamW<'_> {
 
 impl CompiledAdamWCommitOnlyRuntime for NativeCpuCompiledAdamW<'_> {
     fn step_commit_only(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        NativeCpuCompiledAdamW::step_commit_only(self, inputs, learning_rate)
+    }
+}
+
+impl CompiledTrainingCommitOnlyRuntime for NativeCpuCompiledAdamW<'_> {
+    fn commit_step(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
@@ -12312,6 +12441,19 @@ where
         learning_rate: TensorData,
     ) -> Result<Self::Step> {
         self.runtime.step_commit_only(inputs, learning_rate)
+    }
+}
+
+impl<M, R> CompiledTrainingCommitOnlyRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledTrainingCommitOnlyRuntime,
+{
+    fn commit_step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        self.runtime.commit_step(inputs, learning_rate)
     }
 }
 
@@ -17946,6 +18088,32 @@ mod tests {
         (step.loss().clone(), step.outputs().clone())
     }
 
+    fn run_core_commit_only_step<R: CompiledTrainingCommitOnlyRuntime>(
+        runtime: &mut R,
+    ) -> TensorData {
+        let identity = runtime.capture_identity();
+        let before = runtime.parameter_snapshots().unwrap();
+        let step = runtime
+            .commit_step_batch(TinyBobBatch(batch()), 0.05)
+            .unwrap();
+        assert_eq!(step.step(), 1);
+        assert_eq!(step.capture_identity(), identity);
+        assert!(step.outputs().is_empty());
+        assert_eq!(runtime.step_count(), 1);
+        assert_eq!(runtime.capture_identity(), identity);
+        assert_ne!(runtime.parameter_snapshots().unwrap(), before);
+        step.loss().clone()
+    }
+
+    fn run_adamw_commit_only_compatibility<R: CompiledAdamWCommitOnlyRuntime>(runtime: &mut R) {
+        assert_eq!(runtime.gradient_accumulation_steps(), 1);
+        let step = runtime
+            .step_batch_commit_only(TinyBobBatch(batch()), 0.05)
+            .unwrap();
+        assert_eq!(step.optimizer_step(), 1);
+        assert!(step.outputs().is_empty());
+    }
+
     struct TinyBobBatch(BTreeMap<String, TensorData>);
 
     impl TinyBobBatch {
@@ -18007,6 +18175,86 @@ mod tests {
                 .unwrap()
                 .capture_identity,
             adamw.capture_identity()
+        );
+
+        let momentum_loss = run_core_commit_only_step(&mut compiled());
+        let adamw_loss = run_core_commit_only_step(&mut compiled_adamw());
+        assert_eq!(momentum_loss.shape(), adamw_loss.shape());
+        run_adamw_commit_only_compatibility(&mut compiled_adamw());
+    }
+
+    #[test]
+    fn momentum_commit_only_matches_ordinary_replay_and_retries_atomically() {
+        let mut ordinary = compiled();
+        let mut committed = compiled();
+        let identity = ordinary.capture_identity();
+        let ordinary_step = ordinary.step(batch(), lr()).unwrap();
+        let committed_step = committed
+            .commit_step_batch(TinyBobBatch(batch()), 0.05)
+            .unwrap();
+        assert_eq!(ordinary_step.loss(), committed_step.loss());
+        assert_eq!(ordinary_step.step(), committed_step.step());
+        assert_eq!(ordinary_step.capture_identity(), identity);
+        assert_eq!(committed_step.capture_identity(), identity);
+        assert!(ordinary_step.output("logits").is_some());
+        assert!(committed_step.outputs().is_empty());
+        assert_eq!(
+            ordinary.parameter_snapshots().unwrap(),
+            committed.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            ordinary.momentum_snapshots().unwrap(),
+            committed.momentum_snapshots().unwrap()
+        );
+        assert_eq!(
+            ordinary.parameter_versions().unwrap(),
+            committed.parameter_versions().unwrap()
+        );
+        assert_eq!(
+            ordinary.momentum_versions().unwrap(),
+            committed.momentum_versions().unwrap()
+        );
+
+        let mut retry = compiled();
+        let initial_parameters = retry.parameter_snapshots().unwrap();
+        let initial_momentum = retry.momentum_snapshots().unwrap();
+        let initial_parameter_versions = retry.parameter_versions().unwrap();
+        let initial_momentum_versions = retry.momentum_versions().unwrap();
+        let mut missing = batch();
+        missing.remove("target");
+        assert!(retry.commit_step(missing, lr()).is_err());
+        assert!(retry.commit_step_inner(batch(), lr(), Some(0)).is_err());
+        assert_eq!(retry.step_count(), 0);
+        assert_eq!(retry.parameter_snapshots().unwrap(), initial_parameters);
+        assert_eq!(retry.momentum_snapshots().unwrap(), initial_momentum);
+        assert_eq!(
+            retry.parameter_versions().unwrap(),
+            initial_parameter_versions
+        );
+        assert_eq!(
+            retry.momentum_versions().unwrap(),
+            initial_momentum_versions
+        );
+
+        let actual = retry.commit_step(batch(), lr()).unwrap();
+        let mut expected = compiled();
+        let expected_step = expected.commit_step(batch(), lr()).unwrap();
+        assert_eq!(actual.loss(), expected_step.loss());
+        assert_eq!(
+            retry.parameter_snapshots().unwrap(),
+            expected.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            retry.momentum_snapshots().unwrap(),
+            expected.momentum_snapshots().unwrap()
+        );
+        assert_eq!(
+            retry.parameter_versions().unwrap(),
+            expected.parameter_versions().unwrap()
+        );
+        assert_eq!(
+            retry.momentum_versions().unwrap(),
+            expected.momentum_versions().unwrap()
         );
     }
 
