@@ -1033,8 +1033,13 @@ Token-mean training has two mutually exclusive input policies:
 | Ignore index | `with_token_weighted_ignore_index` accepts one fixed nonempty I32 target input and derives the keep tensor as `target != ignore_index` inside the graph. Runtime admission counts the authenticated I32 lanes before replay. |
 | Typed builder context | The opt-in context exposes the exact target, Bool validity, and F32 weight nodes before the model callback. The compiler reuses that F32 node for the objective and optimizer window. |
 
-The keep tensor drives loss normalization, token counting, gradient weighting,
-accumulation, clipping, and window-loss reporting in both modes.
+The keep tensor drives loss normalization, token counting, clipping, and
+window-loss reporting in both modes. A single-step (`N=1`) program sends its
+already normalized gradients directly to clipping and AdamW, reports the
+current batch's exact token count, and adds no gradient-accumulator or
+token-count state or auxiliary captures. Multi-step programs additionally
+weight normalized microbatch gradients by their token counts before the
+window divide.
 
 The maintained file-resume Transformer reshapes the compiler-owned Bool node
 for broadcast attention rather than accepting a second host-derived mask.
@@ -1045,9 +1050,13 @@ Legacy-builder captures and checkpoint bytes remain unchanged.
 - By default, token-mean training rejects a zero-valid-token batch.
 - `CompiledAdamWConfig::with_zero_valid_token_microbatches` masks invalid loss
   lanes with exact graph zeros and divides by `count > 0 ? count : 1`.
-- An empty fixed-shape replay contributes zero loss numerator, token weight, and
-  gradient while still advancing authenticated replay and dropout state. Mixed
-  windows retain the ordinary token-weighted mean.
+- In a multi-step window, an empty fixed-shape replay contributes zero loss
+  numerator, token weight, and gradient while still advancing authenticated
+  replay and dropout state. Mixed windows retain the ordinary token-weighted
+  mean.
+- Every `N=1` replay closes its window, so an empty training batch rejects
+  before replay or AdamW state changes. Read-only evaluation may return its
+  zero loss and weight without changing recurrent state.
 - A full window or nonempty partial flush with an accumulated token count of
   zero rejects before recurrent replay, progress, report, or checkpoint
   publication. The same frontier can be retried with a nonempty mask or

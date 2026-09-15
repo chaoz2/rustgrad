@@ -747,6 +747,32 @@ fn two_block_policy_frontier_config() -> CompiledAdamWConfig {
         .with_window_loss_report()
 }
 
+fn two_block_single_step_policy_config() -> CompiledAdamWConfig {
+    CompiledAdamWConfig::new(0.9, 0.999, 1e-8, 0.01)
+        .unwrap()
+        .with_weight_decay_exclusions(TWO_BLOCK_WEIGHT_DECAY_EXCLUSIONS)
+        .unwrap()
+        .with_loss_scale(128.0)
+        .unwrap()
+        .with_max_gradient_norm(0.25)
+        .unwrap()
+        .with_host_token_input("tokens", [BATCH, TIME])
+        .unwrap()
+        .with_input("targets", [BATCH, TIME], DType::I32)
+        .unwrap()
+        .with_input(ATTENTION_DROPOUT_TRANSITION_GUARD, [], DType::F32)
+        .unwrap()
+        .with_token_weighted_ignore_index("targets", POLICY_IGNORE_INDEX)
+        .unwrap()
+        .with_zero_valid_token_microbatches()
+        .unwrap()
+        .with_frozen_parameters([POLICY_FROZEN_PARAMETER])
+        .unwrap()
+        .with_captured_multi_step_lr(CompiledMultiStepLr::new(1e-3, 0.5, [1]).unwrap())
+        .with_clip_report()
+        .with_window_loss_report()
+}
+
 fn sparse_causal_losses(graph: &mut Graph, logits: NodeId, targets: NodeId) -> Result<NodeId> {
     let flat_logits = graph.reshape(logits, [TOKEN_COUNT, VOCAB])?;
     let log_probabilities = graph.log_softmax(flat_logits, 1, None)?;
@@ -10382,6 +10408,189 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
     assert_eq!(model.state_dict().unwrap(), state_before);
     assert_eq!(module_parameter_state(&model), parameter_state_before);
     assert_eq!(compile_count.get(), 1);
+}
+
+#[test]
+fn compiled_two_block_single_step_ignore_index_is_native_and_resumable() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+
+    let model =
+        TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    let compile_count = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_module_graph_with_dropout_and_ignore_index(
+        two_block_single_step_policy_config(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, ignore_index, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_policy_frontier(model, graph, inputs, ignore_index, dropout)
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(plan.gradient_accumulation_steps(), 1);
+    assert_eq!(plan.accumulation_capture_identity(), None);
+    assert_eq!(plan.flush_capture_identity(), None);
+    assert_eq!(plan.zero_grad_capture_identity(), None);
+    let inspection = plan.inspection().unwrap();
+    assert!(inspection.accumulation().is_none());
+    assert!(inspection.partial_flush().is_none());
+    assert!(inspection.zero_grad().is_none());
+
+    let executor = CapturedReplayExecutor::default();
+    let native_target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let mut interpreted = plan.prepare(&CpuSessionTarget).unwrap();
+    let mut native = plan.prepare(&native_target).unwrap();
+    assert!(native.preparation_report().accumulation().is_none());
+    assert!(native.preparation_report().partial_flush().is_none());
+    assert!(native.preparation_report().zero_grad().is_none());
+    assert_eq!(native.preparation_report().main().fallback_count(), 0);
+    let initial_parameters = interpreted.parameter_snapshots().unwrap();
+    assert_eq!(initial_parameters.len(), 35);
+    assert!(!initial_parameters.contains_key(POLICY_FROZEN_PARAMETER));
+    assert!(initial_parameters.contains_key("tokens.weight"));
+    assert!(!initial_parameters.contains_key("lm_head.weight"));
+
+    let mut all_ignored = policy_frontier_batch(1);
+    all_ignored.insert(
+        "targets".into(),
+        token_tensor([POLICY_IGNORE_INDEX; TOKEN_COUNT]),
+    );
+    let interpreted_before = interpreted.checkpoint().unwrap();
+    let native_before = native.checkpoint().unwrap();
+    let error = match interpreted.step_scheduled(all_ignored.clone()) {
+        Ok(_) => panic!("all-ignored single-step Transformer replay succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("completed token window must contain at least one valid token")
+    );
+    let error = match native.step_scheduled(all_ignored) {
+        Ok(_) => panic!("all-ignored native single-step Transformer replay succeeded"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("completed token window must contain at least one valid token")
+    );
+    assert_eq!(interpreted.checkpoint().unwrap(), interpreted_before);
+    assert_eq!(native.checkpoint().unwrap(), native_before);
+
+    let interpreted_first = interpreted
+        .step_scheduled(policy_frontier_batch(1))
+        .unwrap();
+    let native_first = native.step_scheduled(policy_frontier_batch(1)).unwrap();
+    assert!(interpreted_first.did_update());
+    assert!(native_first.did_update());
+    assert_eq!(interpreted_first.accumulation_index(), 0);
+    assert_eq!(native_first.accumulation_index(), 0);
+    assert_eq!(interpreted_first.loss_weight(), 5);
+    assert_eq!(native_first.loss_weight(), 5);
+    assert_eq!(
+        interpreted_first
+            .window_loss_report()
+            .unwrap()
+            .loss_weight(),
+        5
+    );
+    assert_eq!(native_first.window_loss_report().unwrap().loss_weight(), 5);
+    assert!(
+        interpreted
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(native.gradient_accumulator_snapshots().unwrap().is_empty());
+    assert_eq!(native_first.report().fallback_count(), 0);
+    assert_two_block_step_close(1, &interpreted_first, &native_first);
+    assert_two_block_tensor_maps_close(
+        "single-step parameters",
+        &interpreted.parameter_snapshots().unwrap(),
+        &native.parameter_snapshots().unwrap(),
+    );
+    assert_two_block_tensor_maps_close(
+        "single-step first moments",
+        &interpreted.first_moment_snapshots().unwrap(),
+        &native.first_moment_snapshots().unwrap(),
+    );
+    assert_two_block_tensor_maps_close(
+        "single-step second moments",
+        &interpreted.second_moment_snapshots().unwrap(),
+        &native.second_moment_snapshots().unwrap(),
+    );
+
+    let interpreted_checkpoint = interpreted.checkpoint().unwrap();
+    let native_checkpoint = native.checkpoint().unwrap();
+    assert_eq!(
+        interpreted_checkpoint.info().accumulated_token_count(),
+        None
+    );
+    assert_eq!(native_checkpoint.info().accumulated_token_count(), None);
+    let mut interpreted_restored = plan
+        .restore_checkpoint(&interpreted_checkpoint)
+        .unwrap()
+        .prepare(&CpuSessionTarget)
+        .unwrap();
+    let mut native_restored = plan
+        .restore_checkpoint(&native_checkpoint)
+        .unwrap()
+        .prepare(&native_target)
+        .unwrap();
+    let interpreted_second = interpreted
+        .step_scheduled(policy_frontier_batch(2))
+        .unwrap();
+    let restored_second = interpreted_restored
+        .step_scheduled(policy_frontier_batch(2))
+        .unwrap();
+    assert_eq!(restored_second.loss(), interpreted_second.loss());
+    assert_eq!(restored_second.outputs(), interpreted_second.outputs());
+    assert_eq!(
+        restored_second.loss_weight(),
+        interpreted_second.loss_weight()
+    );
+    assert_eq!(
+        restored_second.clip_report(),
+        interpreted_second.clip_report()
+    );
+    assert_eq!(
+        restored_second.window_loss_report(),
+        interpreted_second.window_loss_report()
+    );
+    assert_eq!(
+        interpreted_restored.checkpoint().unwrap(),
+        interpreted.checkpoint().unwrap()
+    );
+    let native_second = native.step_scheduled(policy_frontier_batch(2)).unwrap();
+    let native_restored_second = native_restored
+        .step_scheduled(policy_frontier_batch(2))
+        .unwrap();
+    assert_eq!(native_restored_second.loss(), native_second.loss());
+    assert_eq!(native_restored_second.outputs(), native_second.outputs());
+    assert_eq!(
+        native_restored_second.loss_weight(),
+        native_second.loss_weight()
+    );
+    assert_eq!(
+        native_restored_second.clip_report(),
+        native_second.clip_report()
+    );
+    assert_eq!(
+        native_restored_second.window_loss_report(),
+        native_second.window_loss_report()
+    );
+    assert_eq!(native_restored_second.report().fallback_count(), 0);
+    assert_eq!(
+        native_restored.checkpoint().unwrap(),
+        native.checkpoint().unwrap()
+    );
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
 }
 
 #[test]

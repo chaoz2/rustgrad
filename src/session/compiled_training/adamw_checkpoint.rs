@@ -31,11 +31,12 @@ pub(super) const ADAMW_CHECKPOINT_FORMAT_V9: &str = "rustgrad-compiled-adamw-v9"
 /// never serializes executable code, graphs, runtime slots, or host pointers.
 /// Dropout-bearing v4 adds its recurrent U64 block counter. A v5 checkpoint
 /// records progress consumed by explicit CPU partial-window flushes and
-/// whether that same counter is present. Opt-in token-weighted accumulation
-/// uses v6 for its recurrent valid-token count. A v7 checkpoint records
-/// captured zero-grad transition history and its auxiliary capture identity;
-/// opt-in window-loss reporting uses v8 for its recurrent F32 numerator. A v9
-/// checkpoint authenticates the private accumulation-only sibling capture.
+/// whether that same counter is present. Multi-step token weighting uses v6
+/// for its recurrent valid-token count; `N=1` has no retained count. A v7
+/// checkpoint records captured zero-grad transition history and its auxiliary
+/// capture identity; opt-in window-loss reporting uses v8 for its recurrent
+/// F32 numerator. A v9 checkpoint authenticates the private accumulation-only
+/// sibling capture.
 /// Legacy v1--v8 bytes remain accepted unchanged.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledAdamWCheckpoint {

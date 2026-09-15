@@ -638,18 +638,21 @@ impl ProgramWire {
         }
         if let Some(policy) = &self.token_weight_policy {
             let policy = CompiledTokenWeightPolicy::from(policy);
-            validate_token_weighted_accumulation(
+            validate_token_weight_policy(
                 &self.main.inputs,
                 &policy,
                 self.gradient_accumulation_steps,
             )?;
         }
-        validate_native_manifests(
-            &self.main.phase,
-            &main_capture,
-            &self.main.parameter_buffers,
-            &expected_main_states,
-        )?;
+        let native_manifests = if self.gradient_accumulation_steps > 1 {
+            NativeManifestExpectation::AdamW {
+                parameters: &self.main.parameter_buffers,
+                states: &expected_main_states,
+            }
+        } else {
+            NativeManifestExpectation::None
+        };
+        validate_native_manifests(&self.main.phase, &main_capture, native_manifests)?;
         Ok(ValidatedMain {
             capture: main_capture,
             states: expected_main_states,
@@ -672,7 +675,7 @@ impl ProgramWire {
                     "compiled accumulation artifact frontier differs from main",
                 ));
             }
-            validate_native_manifests(phase, &capture, &BTreeMap::new(), &BTreeMap::new())?;
+            validate_native_manifests(phase, &capture, NativeManifestExpectation::None)?;
         }
         if let Some(phase) = &self.zero_grad {
             let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
@@ -695,7 +698,7 @@ impl ProgramWire {
             {
                 return Err(training("compiled zero-grad artifact state schema differs"));
             }
-            validate_native_manifests(phase, &capture, &BTreeMap::new(), &BTreeMap::new())?;
+            validate_native_manifests(phase, &capture, NativeManifestExpectation::None)?;
         }
         if let Some(phase) = &self.partial_flush {
             let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
@@ -717,7 +720,14 @@ impl ProgramWire {
             {
                 return Err(training("compiled flush artifact state schema differs"));
             }
-            validate_native_manifests(phase, &capture, &self.main.parameter_buffers, &states)?;
+            validate_native_manifests(
+                phase,
+                &capture,
+                NativeManifestExpectation::AdamW {
+                    parameters: &self.main.parameter_buffers,
+                    states: &states,
+                },
+            )?;
         }
         Ok(())
     }
@@ -852,20 +862,27 @@ fn phase_external_inputs<'a>(
         .map(|input| input.name.clone())
 }
 
+enum NativeManifestExpectation<'a> {
+    None,
+    AdamW {
+        parameters: &'a BTreeMap<String, u64>,
+        states: &'a BTreeMap<RecurrentStateKey, u64>,
+    },
+}
+
 fn validate_native_manifests(
     phase: &PhaseWire,
     capture: &CapturedMixedSchedule,
-    parameters: &BTreeMap<String, u64>,
-    states: &BTreeMap<RecurrentStateKey, u64>,
+    expectation: NativeManifestExpectation<'_>,
 ) -> Result<()> {
-    if parameters.is_empty() {
+    let NativeManifestExpectation::AdamW { parameters, states } = expectation else {
         if !phase.adamw_native_updates.is_empty() {
             return Err(training(
                 "compiled program artifact has unexpected native updates",
             ));
         }
         return Ok(());
-    }
+    };
     if phase.adamw_native_updates.len() != parameters.len() {
         return Err(training(
             "compiled program artifact native update count differs",
@@ -1460,7 +1477,8 @@ fn decode_admitted_artifact_checkpoint_pair(
     if checkpoint_info.capture_identity() != artifact_info.capture_identity
         || checkpoint_info.gradient_accumulation_steps() != wire.gradient_accumulation_steps
         || checkpoint_info.window_loss_report_enabled() != wire.window_loss_report
-        || wire.token_weight_policy.is_some() != checkpoint_info.accumulated_token_count().is_some()
+        || (wire.token_weight_policy.is_some() && wire.gradient_accumulation_steps > 1)
+            != checkpoint_info.accumulated_token_count().is_some()
         || wire.dropout.is_some() != checkpoint_info.dropout_block_counter().is_some()
     {
         return Err(training(

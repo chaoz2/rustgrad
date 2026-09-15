@@ -144,11 +144,14 @@ The detailed contracts live in
   Fixed-shape per-token F32 loss must match the target descriptor exactly, and
   its weighted mean is the sole public and differentiation scalar.
 - The CPU policy re-sums valid tokens in-capture and weights each normalized
-  microbatch gradient before the window divide, clipping, and AdamW update.
-  Interpreter and strict-native results expose the same count as the normalized
-  loss weight and reject malformed weighting before staging with zero fallback.
-  The explicit F32-mask path remains compatibility-covered; token weighting
-  fails closed on arbitrary scalar-loss constructors.
+  microbatch gradient before the window divide when `N>1`. At `N=1`, the
+  already normalized gradient goes directly to clipping and AdamW, with no
+  gradient-accumulator or token-count state or auxiliary captures. Interpreter
+  and strict-native results expose the same exact batch count as the normalized
+  loss weight and reject an all-ignored single-step training batch before
+  replay. Read-only evaluation may return zero weight state-neutrally. The
+  explicit F32-mask path remains compatibility-covered; token weighting fails
+  closed on arbitrary scalar-loss constructors.
 - Global L2 clipping covers the complete ordered gradient set once after window
   averaging. Static loss scaling changes only the differentiation root, returns
   the original loss, and unscales all F32 gradients before accumulation and
