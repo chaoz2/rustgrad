@@ -3454,6 +3454,148 @@ fn graph_f32_sqrt(value: f32) -> f32 {
     f64::from(value).sqrt() as f32
 }
 
+fn summed_pytorch_numerator_gradients(
+    replays: &[PyTorchReplayFixture],
+) -> BTreeMap<String, PyTorchTensorFixture> {
+    assert!(!replays.is_empty());
+    let names = replays[0].numerator_gradients.keys().collect::<Vec<_>>();
+    for replay in replays.iter().skip(1) {
+        assert_eq!(replay.numerator_gradients.keys().collect::<Vec<_>>(), names);
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let descriptor = &replays[0].numerator_gradients[name];
+            assert!(descriptor.bool_values.is_empty());
+            for replay in replays.iter().skip(1) {
+                let contribution = &replay.numerator_gradients[name];
+                assert_eq!(contribution.shape, descriptor.shape);
+                assert_eq!(contribution.values.len(), descriptor.values.len());
+                assert!(contribution.bool_values.is_empty());
+            }
+            let values = (0..descriptor.values.len())
+                .map(|coordinate| {
+                    replays.iter().fold(0.0f32, |total, replay| {
+                        graph_f32_add(total, replay.numerator_gradients[name].values[coordinate])
+                    })
+                })
+                .collect();
+            (
+                name.clone(),
+                PyTorchTensorFixture {
+                    shape: descriptor.shape.clone(),
+                    values,
+                    bool_values: Vec::new(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn assert_pytorch_unequal_token_weighted_window(
+    replays: &[PyTorchReplayFixture],
+    expected: &PyTorchPolicyAdamWWindowFixture,
+    optimizer: &CompiledAdamWConfig,
+    expected_coordinates: usize,
+) {
+    const EXPECTED_VALID_TOKEN_COUNTS: [u64; 3] = [5, 3, 3];
+    const EXPECTED_COUNTERFACTUAL_DIFFERENCES: usize = 372;
+
+    assert_eq!(replays.len(), EXPECTED_VALID_TOKEN_COUNTS.len());
+    assert_eq!(
+        replays
+            .iter()
+            .map(|replay| replay.valid_token_count)
+            .collect::<Vec<_>>(),
+        EXPECTED_VALID_TOKEN_COUNTS
+    );
+    let total_valid_tokens = EXPECTED_VALID_TOKEN_COUNTS.into_iter().sum::<u64>();
+    assert_eq!(total_valid_tokens, 11);
+    assert_eq!(expected.adamw.optimizer_step, 1);
+    assert_eq!(expected.adamw.valid_token_count, total_valid_tokens);
+    assert_eq!(expected.microbatch_count, replays.len() as u64);
+    assert!(expected.adamw.clip_scale.is_finite());
+    assert!(expected.adamw.clip_scale > 0.0 && expected.adamw.clip_scale < 1.0);
+
+    let names = replays[0].numerator_gradients.keys().collect::<Vec<_>>();
+    assert_eq!(
+        expected.adamw.first_moments.keys().collect::<Vec<_>>(),
+        names
+    );
+    assert_eq!(
+        expected.adamw.second_moments.keys().collect::<Vec<_>>(),
+        names
+    );
+    for replay in replays.iter().skip(1) {
+        assert_eq!(replay.numerator_gradients.keys().collect::<Vec<_>>(), names);
+    }
+
+    assert_eq!(optimizer.beta1().to_bits(), 0.9f32.to_bits());
+    assert_eq!(optimizer.beta2().to_bits(), 0.999f32.to_bits());
+    // The offline generator evaluates `1.0 - beta` as a Python binary64
+    // scalar before constructing the F32 Torch tensor. Keep that independent
+    // ordering here instead of subtracting the already-rounded F32 beta.
+    let pytorch_one_minus_beta1 = 0.1f32;
+    let pytorch_one_minus_beta2 = 0.001f32;
+    let mut coordinates = 0usize;
+    let mut equal_microbatch_counterfactual_differences = 0usize;
+    for name in names {
+        let first = &expected.adamw.first_moments[name];
+        let second = &expected.adamw.second_moments[name];
+        let descriptor = &replays[0].numerator_gradients[name];
+        assert_eq!(first.shape, descriptor.shape);
+        assert_eq!(second.shape, descriptor.shape);
+        assert_eq!(first.values.len(), descriptor.values.len());
+        assert_eq!(second.values.len(), descriptor.values.len());
+        for coordinate in 0..descriptor.values.len() {
+            let contributions: [f32; 3] = std::array::from_fn(|replay| {
+                replays[replay].numerator_gradients[name].values[coordinate]
+            });
+            // The independent fixture stores each n_i * mean-gradient
+            // numerator. Preserve the source-ordered F32 recurrent additions,
+            // divide once by sum(n_i), then apply the one global clip scale.
+            let numerator = graph_f32_add(
+                graph_f32_add(contributions[0], contributions[1]),
+                contributions[2],
+            );
+            let weighted = graph_f32_div(numerator, total_valid_tokens as f32);
+            let equal_microbatch_mean = graph_f32_div(
+                graph_f32_add(
+                    graph_f32_add(
+                        graph_f32_div(contributions[0], EXPECTED_VALID_TOKEN_COUNTS[0] as f32),
+                        graph_f32_div(contributions[1], EXPECTED_VALID_TOKEN_COUNTS[1] as f32),
+                    ),
+                    graph_f32_div(contributions[2], EXPECTED_VALID_TOKEN_COUNTS[2] as f32),
+                ),
+                replays.len() as f32,
+            );
+            equal_microbatch_counterfactual_differences +=
+                usize::from(weighted.to_bits() != equal_microbatch_mean.to_bits());
+
+            let clipped = graph_f32_mul(weighted, expected.adamw.clip_scale);
+            let expected_first = graph_f32_mul(pytorch_one_minus_beta1, clipped);
+            let expected_second =
+                graph_f32_mul(graph_f32_mul(pytorch_one_minus_beta2, clipped), clipped);
+            assert_eq!(
+                first.values[coordinate].to_bits(),
+                expected_first.to_bits(),
+                "{name}[{coordinate}] first moment must come from the token-weighted clipped gradient"
+            );
+            assert_eq!(
+                second.values[coordinate].to_bits(),
+                expected_second.to_bits(),
+                "{name}[{coordinate}] second moment must come from the token-weighted clipped gradient"
+            );
+            coordinates += 1;
+        }
+    }
+    assert_eq!(coordinates, expected_coordinates);
+    assert_eq!(
+        equal_microbatch_counterfactual_differences, EXPECTED_COUNTERFACTUAL_DIFFERENCES,
+        "every active lane in the unequal-length fixture must distinguish token weighting from biased microbatch averaging"
+    );
+}
+
 fn normalize_gradient_window(
     contributions: &[BTreeMap<String, TensorData>],
     divisor: f32,
@@ -8767,6 +8909,12 @@ fn compiled_two_block_gelu_adamw_windows_match_pytorch_across_checkpoint() {
         optimizer.captured_multi_step_lr(),
         Some(&CompiledMultiStepLr::new(1e-3, 0.5, [1]).unwrap())
     );
+    assert_pytorch_unequal_token_weighted_window(
+        &expected.replays[..3],
+        first_commit,
+        &optimizer,
+        expected.active_coordinate_count,
+    );
 
     let compile_count = Cell::new(0);
     let plan = CompiledAdamWPlan::compile_module_graph_with_dropout_and_ignore_index(
@@ -8846,11 +8994,25 @@ fn compiled_two_block_gelu_adamw_windows_match_pytorch_across_checkpoint() {
         .unwrap();
     assert!(!first.did_update());
     assert_policy_frontier_replay(&first, &expected.replays[0]);
+    assert_pytorch_tensor_map_close(
+        "GELU live replay 1 numerator gradient",
+        &uninterrupted.gradient_accumulator_snapshots().unwrap(),
+        &expected.replays[0].numerator_gradients,
+    );
+    let first_pending = uninterrupted.checkpoint().unwrap();
+    assert_eq!(first_pending.info().accumulation_index(), 1);
+    assert_eq!(first_pending.info().accumulated_token_count(), Some(5));
     let second = uninterrupted
         .step_scheduled(policy_frontier_batch(2))
         .unwrap();
     assert!(!second.did_update());
     assert_policy_frontier_replay(&second, &expected.replays[1]);
+    let expected_two_replay_numerator = summed_pytorch_numerator_gradients(&expected.replays[..2]);
+    assert_pytorch_tensor_map_close(
+        "GELU live replays 1+2 numerator gradient",
+        &uninterrupted.gradient_accumulator_snapshots().unwrap(),
+        &expected_two_replay_numerator,
+    );
     let pending_checkpoint = uninterrupted.checkpoint().unwrap();
     let pending = &expected.first_pending_checkpoint;
     assert_policy_pending_checkpoint("GELU replay 2 pending", &pending_checkpoint, pending);
