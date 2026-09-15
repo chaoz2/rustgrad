@@ -497,7 +497,7 @@ impl ProgramWire {
         if info.capture_identity == 0 || self.gradient_accumulation_steps == 0 {
             return Err(training("compiled program artifact policy is inconsistent"));
         }
-        let topology = CompiledAdamWWindowTopology::from_validated_parts(
+        let topology = CompiledTrainingWindowTopology::from_validated_parts(
             self.gradient_accumulation_steps,
             self.token_weight_policy.is_some(),
             self.window_loss_report,
@@ -650,7 +650,7 @@ impl ProgramWire {
                 self.gradient_accumulation_steps,
             )?;
         }
-        let topology = CompiledAdamWWindowTopology::from_validated_parts(
+        let topology = CompiledTrainingWindowTopology::from_validated_parts(
             self.gradient_accumulation_steps,
             self.token_weight_policy.is_some(),
             self.window_loss_report,
@@ -1137,10 +1137,10 @@ fn auxiliary_wire(plan: &CompiledAdamWAuxiliaryPlan) -> Result<PhaseWire> {
         .report_flags()
         .ok_or_else(|| training("compiled AdamW auxiliary observation schema is not canonical"))?;
     phase_wire(
-        &plan.capture,
-        &plan.state_buffers,
+        &plan.phase().capture,
+        &plan.phase().state_buffers,
         &plan.state_input_keys,
-        &plan.recurrent_store_groups,
+        plan.phase().store_groups(),
         clip_report,
         window_loss_report,
     )
@@ -1209,8 +1209,8 @@ fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
         .as_ref()
         .map(|phase| {
             phase_wire(
-                &phase.capture,
-                &phase.state_buffers,
+                &phase.phase().capture,
+                &phase.phase().state_buffers,
                 &main.state_input_keys,
                 &[],
                 false,
@@ -1408,17 +1408,21 @@ fn decode_auxiliary(
     let capture_identity = cursor_projection.target_capture_identity();
     let recurrent_capture = CompiledRecurrentCapture::from_artifact(&capture)?;
     Ok(CompiledAdamWAuxiliaryPlan {
-        capture,
-        recurrent_capture,
-        state_buffers,
-        cursor_projection,
+        phase: CompiledRecurrentPhasePlan {
+            capture,
+            recurrent_capture,
+            state_buffers,
+            cursor_projection,
+            capture_identity,
+            admission: CompiledRecurrentPhaseAdmission::Replace {
+                store_groups: wire
+                    .adamw_native_updates
+                    .iter()
+                    .map(decode_manifest)
+                    .collect::<Result<_>>()?,
+            },
+        },
         state_input_keys: decode_input_key_map(&wire.state_input_keys)?,
-        recurrent_store_groups: wire
-            .adamw_native_updates
-            .iter()
-            .map(decode_manifest)
-            .collect::<Result<_>>()?,
-        capture_identity,
         outputs,
     })
 }
@@ -1485,7 +1489,7 @@ fn decode_admitted_artifact_checkpoint_pair(
         ));
     }
     let checkpoint_info = checkpoint.optimizer_checkpoint().info();
-    let topology = CompiledAdamWWindowTopology::from_validated_parts(
+    let topology = CompiledTrainingWindowTopology::from_validated_parts(
         wire.gradient_accumulation_steps,
         wire.token_weight_policy.is_some(),
         wire.window_loss_report,
@@ -1618,11 +1622,14 @@ fn restore_owner<M: Module>(
             .map_err(replay_error)?;
             let capture_identity = cursor_projection.target_capture_identity();
             Ok(CompiledTrainingSiblingPlan {
-                recurrent_capture: CompiledRecurrentCapture::from_artifact(&phase_capture)?,
-                capture: phase_capture,
-                state_buffers,
-                cursor_projection,
-                capture_identity,
+                phase: CompiledRecurrentPhasePlan {
+                    recurrent_capture: CompiledRecurrentCapture::from_artifact(&phase_capture)?,
+                    capture: phase_capture,
+                    state_buffers,
+                    cursor_projection,
+                    capture_identity,
+                    admission: CompiledRecurrentPhaseAdmission::RetainUnchanged,
+                },
             })
         })
         .transpose()?;
@@ -1736,7 +1743,7 @@ fn restore_owner<M: Module>(
                 weight_decay_exclusions: wire.adamw.weight_decay_exclusions.clone(),
             },
         },
-        progress: AdamWProgress::INITIAL,
+        progress: CompiledTrainingWindowProgress::INITIAL,
         evaluation,
     }
     .restore_checkpoint(checkpoint.optimizer_checkpoint())?;
