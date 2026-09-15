@@ -2930,6 +2930,17 @@ impl CompiledTrainingStep for CompiledTrainingStepResult {
     }
 }
 
+/// Optimizer-neutral accumulation-window progress after one committed replay.
+pub trait CompiledTrainingWindowStep: CompiledTrainingStep {
+    /// Microbatches retained toward the next complete gradient window.
+    fn pending_microbatch_count(&self) -> u64;
+
+    /// Whether this replay closed its gradient window.
+    fn did_close_gradient_window(&self) -> bool {
+        self.pending_microbatch_count() == 0
+    }
+}
+
 /// One committed replay of a compiled AdamW program.
 ///
 /// `step` counts microbatch replays. `optimizer_step` advances only when the
@@ -3119,6 +3130,15 @@ pub trait CompiledAdamWStep: CompiledTrainingStep {
 
     fn did_update(&self) -> bool {
         self.accumulation_index() == 0
+    }
+}
+
+impl<S> CompiledTrainingWindowStep for S
+where
+    S: CompiledAdamWStep + ?Sized,
+{
+    fn pending_microbatch_count(&self) -> u64 {
+        CompiledAdamWStep::accumulation_index(self)
     }
 }
 
@@ -5569,6 +5589,34 @@ where
 
     fn gradient_window_reset_capture_identity(&self) -> Option<u64> {
         CompiledAdamWRuntime::zero_grad_capture_identity(self)
+    }
+}
+
+/// Optimizer-neutral accumulation-window configuration and live progress.
+///
+/// The reset supertrait makes cancellation part of the same structural
+/// capability without coupling the loop to optimizer policy or checkpointing.
+pub trait CompiledTrainingWindowRuntime:
+    CompiledTrainingWindowResetRuntime<Step: CompiledTrainingWindowStep>
+{
+    /// Positive number of microbatches in one complete gradient window.
+    fn gradient_window_size(&self) -> u64;
+
+    /// Microbatches currently retained toward the next complete window.
+    fn pending_microbatch_count(&self) -> Result<u64>;
+}
+
+impl<R> CompiledTrainingWindowRuntime for R
+where
+    R: CompiledAdamWRuntime + ?Sized,
+    R::Step: CompiledTrainingWindowStep,
+{
+    fn gradient_window_size(&self) -> u64 {
+        CompiledAdamWRuntime::gradient_accumulation_steps(self)
+    }
+
+    fn pending_microbatch_count(&self) -> Result<u64> {
+        CompiledAdamWRuntime::accumulation_index(self)
     }
 }
 
@@ -18114,6 +18162,10 @@ mod tests {
             }
         );
         let expected = interpreted.step(batch(), lr()).unwrap();
+        assert_core_training_window_step(&actual, 1, false);
+        assert_core_training_window_step(&expected, 1, false);
+        assert_core_training_window(&native, 3, 1);
+        assert_core_training_window(&interpreted, 3, 1);
         assert!(!actual.did_update());
         assert_eq!(actual.capture_identity(), plan.capture_identity());
         assert!(actual.clip_report().is_none());
@@ -18160,6 +18212,7 @@ mod tests {
         assert_eq!(after_failed_reset_counts.1, before_failed_reset_counts.1);
         assert_eq!(native.checkpoint().unwrap(), before_failed_reset);
         assert_eq!(native.successful_zero_grads, 0);
+        assert_core_training_window(&native, 3, 1);
         let before_reset = native_recurrent_test_counts(&native);
         crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
         let native_reset = reset_core_training_window(&mut native);
@@ -18168,6 +18221,8 @@ mod tests {
             native_reset,
             reset_adamw_window_compatibility(&mut interpreted)
         );
+        assert_core_training_window(&native, 3, 0);
+        assert_core_training_window(&interpreted, 3, 0);
         let after_reset = native_recurrent_test_counts(&native);
         assert_eq!(after_reset.0, before_reset.0);
         assert_eq!(after_reset.1, before_reset.1 + 1);
@@ -18627,6 +18682,27 @@ mod tests {
         assert_eq!(step.loss_aggregation_weight(), expected);
     }
 
+    fn assert_core_training_window_step(
+        step: &impl CompiledTrainingWindowStep,
+        pending_microbatches: u64,
+        did_close: bool,
+    ) {
+        assert_eq!(step.pending_microbatch_count(), pending_microbatches);
+        assert_eq!(step.did_close_gradient_window(), did_close);
+    }
+
+    fn assert_core_training_window<R: CompiledTrainingWindowRuntime>(
+        runtime: &R,
+        window_size: u64,
+        pending_microbatches: u64,
+    ) {
+        assert_eq!(runtime.gradient_window_size(), window_size);
+        assert_eq!(
+            runtime.pending_microbatch_count().unwrap(),
+            pending_microbatches
+        );
+    }
+
     fn run_core_training_step<R: CompiledTrainingRuntime>(
         runtime: &mut R,
     ) -> (TensorData, BTreeMap<String, TensorData>) {
@@ -18661,7 +18737,7 @@ mod tests {
         step.loss().clone()
     }
 
-    fn reset_core_training_window<R: CompiledTrainingWindowResetRuntime>(
+    fn reset_core_training_window<R: CompiledTrainingWindowRuntime>(
         runtime: &mut R,
     ) -> CompiledTrainingWindowReset {
         runtime.reset_gradient_window().unwrap()
@@ -20135,6 +20211,7 @@ mod tests {
         let valid = || token_weighted_batch([1.0, 100.0, 3.0], [1.0, 0.0, 1.0]);
         let empty = || token_weighted_batch([7.0, 11.0, 13.0], [0.0; 3]);
         let mut interpreted = plan.prepare_cpu().unwrap();
+        assert_core_training_window(&interpreted, 1, 0);
         let initial = interpreted.checkpoint().unwrap();
         assert_eq!(initial.info().accumulated_token_count(), None);
         let error = match interpreted.step(empty(), TensorData::scalar(0.1)) {
@@ -20151,6 +20228,8 @@ mod tests {
         let first = interpreted.step(valid(), TensorData::scalar(0.1)).unwrap();
         assert!(first.did_update());
         assert_eq!(first.accumulation_index(), 0);
+        assert_core_training_window_step(&first, 0, true);
+        assert_core_training_window(&interpreted, 1, 0);
         assert_eq!(first.loss_weight(), 2);
         assert_core_loss_aggregation_weight(&first, 2);
         assert_eq!(first.loss().scalar_at(0).as_f64(), 4.0);
@@ -20207,6 +20286,7 @@ mod tests {
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor);
         let mut native = plan.prepare(&target).unwrap();
+        assert_core_training_window(&native, 1, 0);
         assert!(native.preparation_report().accumulation().is_none());
         assert!(native.preparation_report().partial_flush().is_none());
         assert!(native.preparation_report().zero_grad().is_none());
@@ -20223,6 +20303,8 @@ mod tests {
         assert_eq!(native.checkpoint().unwrap(), native_initial);
         let native_step = native.step(valid(), TensorData::scalar(0.1)).unwrap();
         assert!(native_step.did_update());
+        assert_core_training_window_step(&native_step, 0, true);
+        assert_core_training_window(&native, 1, 0);
         assert_eq!(native_step.loss_weight(), 2);
         assert_core_loss_aggregation_weight(&native_step, 2);
         assert_eq!(native_step.window_loss_report().unwrap().loss_weight(), 2);
@@ -20963,6 +21045,8 @@ mod tests {
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor);
         let mut native = plan.prepare(&target).unwrap();
+        assert_core_training_window(&interpreted, 3, 0);
+        assert_core_training_window(&native, 3, 0);
 
         let nonempty = || ignore_index_batch([1.0, 100.0, 3.0], [0, -100, 1]);
         let empty = || ignore_index_batch([100.0, 200.0, 300.0], [-100; 3]);
@@ -20974,6 +21058,10 @@ mod tests {
         assert_eq!(native_first.loss_weight(), 2);
         assert_core_loss_aggregation_weight(&interpreted_first, 2);
         assert_core_loss_aggregation_weight(&native_first, 2);
+        assert_core_training_window_step(&interpreted_first, 1, false);
+        assert_core_training_window_step(&native_first, 1, false);
+        assert_core_training_window(&interpreted, 3, 1);
+        assert_core_training_window(&native, 3, 1);
         assert!(!interpreted_first.did_update());
         assert!(!native_first.did_update());
         let interpreted_accumulators = interpreted.gradient_accumulator_snapshots().unwrap();
@@ -20986,6 +21074,10 @@ mod tests {
         assert_eq!(native_empty.loss_weight(), 0);
         assert_core_loss_aggregation_weight(&interpreted_empty, 0);
         assert_core_loss_aggregation_weight(&native_empty, 0);
+        assert_core_training_window_step(&interpreted_empty, 2, false);
+        assert_core_training_window_step(&native_empty, 2, false);
+        assert_core_training_window(&interpreted, 3, 2);
+        assert_core_training_window(&native, 3, 2);
         assert!(!interpreted_empty.did_update());
         assert!(!native_empty.did_update());
         assert_eq!(
@@ -21019,6 +21111,12 @@ mod tests {
             .unwrap();
         assert!(interpreted_step.did_update());
         assert!(native_step.did_update());
+        assert_core_training_window_step(&interpreted_step, 0, true);
+        assert_core_training_window_step(&restored_step, 0, true);
+        assert_core_training_window_step(&native_step, 0, true);
+        assert_core_training_window(&interpreted, 3, 0);
+        assert_core_training_window(&restored, 3, 0);
+        assert_core_training_window(&native, 3, 0);
         assert_eq!(interpreted_step.loss_weight(), 1);
         assert_eq!(native_step.loss_weight(), 1);
         assert_eq!(restored_step.loss(), interpreted_step.loss());
@@ -21033,12 +21131,11 @@ mod tests {
         let before = rejected.checkpoint().unwrap();
         assert!(rejected.step(empty(), TensorData::scalar(0.1)).is_err());
         assert_eq!(rejected.checkpoint().unwrap(), before);
-        assert!(
-            rejected
-                .step(nonempty(), TensorData::scalar(0.1))
-                .unwrap()
-                .did_update()
-        );
+        assert_core_training_window(&rejected, 3, 2);
+        let retried = rejected.step(nonempty(), TensorData::scalar(0.1)).unwrap();
+        assert!(retried.did_update());
+        assert_core_training_window_step(&retried, 0, true);
+        assert_core_training_window(&rejected, 3, 0);
 
         let mut native_rejected = compile_ignore_index_plan().prepare(&target).unwrap();
         native_rejected
@@ -21054,12 +21151,13 @@ mod tests {
                 .is_err()
         );
         assert_eq!(native_rejected.checkpoint().unwrap(), before);
-        assert!(
-            native_rejected
-                .step(nonempty(), TensorData::scalar(0.1))
-                .unwrap()
-                .did_update()
-        );
+        assert_core_training_window(&native_rejected, 3, 2);
+        let native_retried = native_rejected
+            .step(nonempty(), TensorData::scalar(0.1))
+            .unwrap();
+        assert!(native_retried.did_update());
+        assert_core_training_window_step(&native_retried, 0, true);
+        assert_core_training_window(&native_rejected, 3, 0);
     }
 
     #[test]
