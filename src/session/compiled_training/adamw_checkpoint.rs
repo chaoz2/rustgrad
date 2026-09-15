@@ -1,6 +1,6 @@
 use super::{
-    AdamWProgress, CompiledAdamWWindowTopology, MAX_EXACT_F32_INTEGER_COUNT, checked_bytes,
-    training, validate_adamw_progress, validate_user_name,
+    CompiledTrainingWindowProgress, CompiledTrainingWindowTopology, MAX_EXACT_F32_INTEGER_COUNT,
+    checked_bytes, training, validate_adamw_progress, validate_user_name,
 };
 use crate::safetensors::{read_safetensors_file_bytes_with_limits, save_safetensors_file_bytes};
 use crate::{
@@ -306,7 +306,7 @@ pub(super) fn encode_adamw_checkpoint(
     } = tensors;
     validate_adamw_checkpoint_maps(&parameters, &first_moments, &second_moments)?;
     validate_adamw_progress(
-        AdamWProgress {
+        CompiledTrainingWindowProgress {
             replay_step,
             optimizer_step,
             accumulation_index,
@@ -317,7 +317,7 @@ pub(super) fn encode_adamw_checkpoint(
         },
         accumulation_steps,
     )?;
-    let topology = CompiledAdamWWindowTopology::from_validated_parts(
+    let topology = CompiledTrainingWindowTopology::from_validated_parts(
         accumulation_steps,
         accumulated_token_count.is_some(),
         window_loss_report,
@@ -1019,7 +1019,7 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
         }
     }
     validate_adamw_progress(
-        AdamWProgress {
+        CompiledTrainingWindowProgress {
             replay_step,
             optimizer_step,
             accumulation_index,
@@ -1093,7 +1093,7 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
     } else {
         format == ADAMW_CHECKPOINT_FORMAT_V6
     };
-    let topology = CompiledAdamWWindowTopology::from_validated_parts(
+    let topology = CompiledTrainingWindowTopology::from_validated_parts(
         accumulation_steps,
         has_accumulated_token_count,
         false,
@@ -1136,7 +1136,7 @@ pub(super) fn decode_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedAdamWCheckp
     } else {
         false
     };
-    let topology = CompiledAdamWWindowTopology::from_validated_parts(
+    let topology = CompiledTrainingWindowTopology::from_validated_parts(
         accumulation_steps,
         has_accumulated_token_count,
         window_loss_report,
