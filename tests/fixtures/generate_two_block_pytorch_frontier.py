@@ -46,7 +46,7 @@ POLICY_FROZEN_PARAMETER = "positions.weight"
 # Key bias shifts every key score equally for one query/head and is therefore a
 # topology-derived softmax gauge direction, independent of observed values.
 POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS = ("first.key.1", "second.key.1")
-GELU_WEIGHT_DECAY_EXCLUSIONS = (
+POLICY_WEIGHT_DECAY_EXCLUSIONS = (
     "first.ff1.1",
     "first.ff2.1",
     "first.key.1",
@@ -639,6 +639,63 @@ def adamw_window(
     return successors, next_first_moments, next_second_moments, fixture
 
 
+def generate_single_step_policy() -> dict[str, object]:
+    """Generate the independent N=1 token-mean AdamW successor frontier."""
+    params = make_parameters()
+    frozen_parameter = params[POLICY_FROZEN_PARAMETER].detach().clone()
+    active_params = OrderedDict(
+        (name, parameter)
+        for name, parameter in params.items()
+        if name != POLICY_FROZEN_PARAMETER
+    )
+    first_moments = OrderedDict(
+        (name, torch.zeros_like(parameter)) for name, parameter in active_params.items()
+    )
+    second_moments = OrderedDict(
+        (name, torch.zeros_like(parameter)) for name, parameter in active_params.items()
+    )
+    gradients, replay, numerator = policy_replay_fixture(params, 1)
+    exclusions = frozenset(POLICY_WEIGHT_DECAY_EXCLUSIONS)
+    _, _, _, commit = adamw_window(
+        active_params,
+        first_moments,
+        second_moments,
+        [gradients],
+        1,
+        replay["valid_token_count"],
+        max_gradient_norm=POLICY_MAX_GRADIENT_NORM,
+        learning_rate=1.0e-3,
+        weight_decay=POLICY_WEIGHT_DECAY,
+        weight_decay_exclusions=exclusions,
+    )
+    commit.update(
+        {
+            "learning_rate": 1.0e-3,
+            "mean_loss": f32(numerator / f32(float(replay["valid_token_count"]))),
+            "microbatch_count": 1,
+        }
+    )
+    assert torch.equal(params[POLICY_FROZEN_PARAMETER], frozen_parameter)
+    return {
+        "rustgrad_base": "62d8c246e9e5d7d62baf3ebf57261b8f3efdc6ab",
+        "source_replay": 1,
+        "weight_decay": POLICY_WEIGHT_DECAY,
+        "weight_decay_exclusions": list(POLICY_WEIGHT_DECAY_EXCLUSIONS),
+        "loss_scale": POLICY_LOSS_SCALE,
+        "accumulation_steps": 1,
+        "max_gradient_norm": POLICY_MAX_GRADIENT_NORM,
+        "ignore_index": POLICY_IGNORE_INDEX,
+        "learning_rate": 1.0e-3,
+        "active_parameter_count": len(active_params),
+        "active_coordinate_count": sum(
+            parameter.numel() for parameter in active_params.values()
+        ),
+        "analytic_gauge_null_parameters": list(POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS),
+        "frozen_parameter_name": POLICY_FROZEN_PARAMETER,
+        "commit": commit,
+    }
+
+
 def generate_policy_frontier() -> dict[str, object]:
     params = make_parameters()
     frozen_parameter = params[POLICY_FROZEN_PARAMETER].detach().clone()
@@ -822,7 +879,7 @@ def generate_gelu_policy_window() -> dict[str, object]:
     second_moments = OrderedDict(
         (name, torch.zeros_like(parameter)) for name, parameter in active_params.items()
     )
-    exclusions = frozenset(GELU_WEIGHT_DECAY_EXCLUSIONS)
+    exclusions = frozenset(POLICY_WEIGHT_DECAY_EXCLUSIONS)
     assert exclusions < set(active_params)
 
     replays = []
@@ -913,7 +970,7 @@ def generate_gelu_policy_window() -> dict[str, object]:
         "rustgrad_base": "1b00de2a586b9d0493acfe6438d357c0cf4fcb1f",
         "approximation": "tanh",
         "weight_decay": POLICY_WEIGHT_DECAY,
-        "weight_decay_exclusions": list(GELU_WEIGHT_DECAY_EXCLUSIONS),
+        "weight_decay_exclusions": list(POLICY_WEIGHT_DECAY_EXCLUSIONS),
         "loss_scale": POLICY_LOSS_SCALE,
         "accumulation_steps": 3,
         "max_gradient_norm": POLICY_MAX_GRADIENT_NORM,
@@ -1002,6 +1059,7 @@ def main(output: Path) -> None:
         "replays": replays,
         "windows": windows,
         "partial_flush": partial_flush,
+        "single_step_policy": generate_single_step_policy(),
         "policy_frontier": generate_policy_frontier(),
         "gelu_policy_window": generate_gelu_policy_window(),
     }

@@ -2166,6 +2166,24 @@ struct PyTorchGeluPolicyWindowFixture {
 }
 
 #[derive(Deserialize)]
+struct PyTorchSingleStepPolicyFixture {
+    rustgrad_base: String,
+    source_replay: u64,
+    weight_decay: f32,
+    weight_decay_exclusions: Vec<String>,
+    loss_scale: f32,
+    accumulation_steps: u64,
+    max_gradient_norm: f32,
+    ignore_index: i32,
+    learning_rate: f32,
+    active_parameter_count: usize,
+    active_coordinate_count: usize,
+    analytic_gauge_null_parameters: Vec<String>,
+    frozen_parameter_name: String,
+    commit: PyTorchPolicyAdamWWindowFixture,
+}
+
+#[derive(Deserialize)]
 struct PyTorchFixtureProvenance {
     generator: String,
     rustgrad_base: String,
@@ -2188,6 +2206,7 @@ struct TwoBlockPyTorchFixture {
     replays: Vec<PyTorchReplayFixture>,
     windows: Vec<PyTorchAdamWWindowFixture>,
     partial_flush: PyTorchAdamWWindowFixture,
+    single_step_policy: PyTorchSingleStepPolicyFixture,
     policy_frontier: PyTorchPolicyFrontierFixture,
     gelu_policy_window: PyTorchGeluPolicyWindowFixture,
 }
@@ -10414,13 +10433,76 @@ fn compiled_two_block_attention_mask_matches_pytorch_training_frontier() {
 fn compiled_two_block_single_step_ignore_index_is_native_and_resumable() {
     const ATTENTION_DROPOUT: f64 = 0.25;
 
+    let fixture = two_block_pytorch_fixture();
+    let expected = &fixture.single_step_policy;
+    assert_eq!(
+        expected.rustgrad_base,
+        "62d8c246e9e5d7d62baf3ebf57261b8f3efdc6ab"
+    );
+    assert_eq!(expected.source_replay, 1);
+    assert_eq!(expected.weight_decay.to_bits(), 0.01f32.to_bits());
+    assert_eq!(expected.loss_scale.to_bits(), 128.0f32.to_bits());
+    assert_eq!(expected.accumulation_steps, 1);
+    assert_eq!(expected.max_gradient_norm.to_bits(), 0.25f32.to_bits());
+    assert_eq!(expected.ignore_index, POLICY_IGNORE_INDEX);
+    assert_eq!(expected.learning_rate.to_bits(), 1e-3f32.to_bits());
+    assert_eq!(expected.active_parameter_count, 35);
+    assert_eq!(expected.active_coordinate_count, 372);
+    assert_eq!(expected.frozen_parameter_name, POLICY_FROZEN_PARAMETER);
+    assert_eq!(expected.commit.adamw.optimizer_step, 1);
+    assert_eq!(expected.commit.adamw.valid_token_count, 5);
+    assert_eq!(expected.commit.microbatch_count, 1);
+    assert_eq!(expected.commit.learning_rate.to_bits(), 1e-3f32.to_bits());
+    let expected_replay = &fixture.policy_frontier.replays[0];
+    assert_eq!(expected_replay.replay, expected.source_replay);
+    let analytic_gauge_null_parameters = expected
+        .analytic_gauge_null_parameters
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        analytic_gauge_null_parameters,
+        POLICY_ANALYTIC_GAUGE_NULL_PARAMETERS
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        expected.weight_decay_exclusions,
+        TWO_BLOCK_WEIGHT_DECAY_EXCLUSIONS
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    );
+
     let model =
         TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, ATTENTION_DROPOUT).unwrap();
     let state_before = model.state_dict().unwrap();
     let parameter_state_before = module_parameter_state(&model);
+    let mut traversal = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        assert!(traversal.insert(name, parameter.id()).is_none());
+    });
+    assert_eq!(traversal.len(), fixture.traversal_name_count);
+    assert_eq!(
+        traversal.values().copied().collect::<BTreeSet<_>>().len(),
+        fixture.canonical_parameter_count
+    );
+    let tied_id = traversal[fixture.tied_names[0].as_str()];
+    assert_eq!(tied_id, traversal[fixture.tied_names[1].as_str()]);
+    assert_eq!(traversal.values().filter(|id| **id == tied_id).count(), 2);
+    assert_eq!(
+        &state_before.tensors()[POLICY_FROZEN_PARAMETER],
+        &fixture.policy_frontier.frozen_parameter.tensor()
+    );
+    let optimizer = two_block_single_step_policy_config();
+    assert_eq!(
+        optimizer.weight_decay_exclusions().collect::<Vec<_>>(),
+        TWO_BLOCK_WEIGHT_DECAY_EXCLUSIONS.to_vec()
+    );
     let compile_count = Cell::new(0);
     let plan = CompiledAdamWPlan::compile_module_graph_with_dropout_and_ignore_index(
-        two_block_single_step_policy_config(),
+        optimizer.clone(),
         dropout_config(),
         &model,
         |model, graph, inputs, ignore_index, dropout| {
@@ -10448,7 +10530,18 @@ fn compiled_two_block_single_step_ignore_index_is_native_and_resumable() {
     assert!(native.preparation_report().zero_grad().is_none());
     assert_eq!(native.preparation_report().main().fallback_count(), 0);
     let initial_parameters = interpreted.parameter_snapshots().unwrap();
-    assert_eq!(initial_parameters.len(), 35);
+    assert_eq!(initial_parameters.len(), expected.active_parameter_count);
+    assert_eq!(
+        initial_parameters
+            .values()
+            .map(TensorData::len)
+            .sum::<usize>(),
+        expected.active_coordinate_count
+    );
+    assert_eq!(
+        initial_parameters,
+        fixture_tensor_map(&fixture.policy_frontier.initial_parameters)
+    );
     assert!(!initial_parameters.contains_key(POLICY_FROZEN_PARAMETER));
     assert!(initial_parameters.contains_key("tokens.weight"));
     assert!(!initial_parameters.contains_key("lm_head.weight"));
@@ -10487,6 +10580,8 @@ fn compiled_two_block_single_step_ignore_index_is_native_and_resumable() {
     let native_first = native.step_scheduled(policy_frontier_batch(1)).unwrap();
     assert!(interpreted_first.did_update());
     assert!(native_first.did_update());
+    assert_policy_frontier_replay(&interpreted_first, expected_replay);
+    assert_native_policy_step(&native_first, expected_replay);
     assert_eq!(interpreted_first.accumulation_index(), 0);
     assert_eq!(native_first.accumulation_index(), 0);
     assert_eq!(interpreted_first.loss_weight(), 5);
@@ -10506,22 +10601,83 @@ fn compiled_two_block_single_step_ignore_index_is_native_and_resumable() {
             .is_empty()
     );
     assert!(native.gradient_accumulator_snapshots().unwrap().is_empty());
-    assert_eq!(native_first.report().fallback_count(), 0);
     assert_two_block_step_close(1, &interpreted_first, &native_first);
+    assert_policy_window_report(
+        "single-step interpreted window",
+        interpreted_first.window_loss_report().unwrap(),
+        &expected.commit,
+    );
+    assert_policy_window_report(
+        "single-step native window",
+        native_first.window_loss_report().unwrap(),
+        &expected.commit,
+    );
+    let interpreted_parameters = interpreted.parameter_snapshots().unwrap();
+    let interpreted_first_moments = interpreted.first_moment_snapshots().unwrap();
+    let interpreted_second_moments = interpreted.second_moment_snapshots().unwrap();
+    let native_parameters = native.parameter_snapshots().unwrap();
+    let native_first_moments = native.first_moment_snapshots().unwrap();
+    let native_second_moments = native.second_moment_snapshots().unwrap();
+    assert_pytorch_adamw_window_for_frontier(
+        "single-step interpreted window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 1,
+            clip_report: interpreted_first.clip_report().unwrap(),
+            actual_initial: &initial_parameters,
+            actual_first_moments: &interpreted_first_moments,
+            actual_second_moments: &interpreted_second_moments,
+            actual_successors: &interpreted_parameters,
+            expected_initial: &fixture.policy_frontier.initial_parameters,
+            expected: &expected.commit.adamw,
+        },
+        expected.commit.microbatch_count,
+        expected.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: expected.learning_rate,
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::Exact,
+        },
+    );
+    assert_pytorch_adamw_window_for_frontier(
+        "single-step native window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 1,
+            clip_report: native_first.clip_report().unwrap(),
+            actual_initial: &initial_parameters,
+            actual_first_moments: &native_first_moments,
+            actual_second_moments: &native_second_moments,
+            actual_successors: &native_parameters,
+            expected_initial: &fixture.policy_frontier.initial_parameters,
+            expected: &expected.commit.adamw,
+        },
+        expected.commit.microbatch_count,
+        expected.active_coordinate_count,
+        PyTorchSuccessorOracle::WithAnalyticGaugeNulls {
+            parameter_names: &analytic_gauge_null_parameters,
+            optimizer: &optimizer,
+            learning_rate: expected.learning_rate,
+            recurrence_tolerance: GaugeNullRecurrenceTolerance::SuccessorUlps(2),
+        },
+    );
+    assert_pytorch_active_gradient_family_evidence(
+        &interpreted_first_moments,
+        &expected.commit.adamw.first_moments,
+    );
     assert_two_block_tensor_maps_close(
         "single-step parameters",
-        &interpreted.parameter_snapshots().unwrap(),
-        &native.parameter_snapshots().unwrap(),
+        &interpreted_parameters,
+        &native_parameters,
     );
     assert_two_block_tensor_maps_close(
         "single-step first moments",
-        &interpreted.first_moment_snapshots().unwrap(),
-        &native.first_moment_snapshots().unwrap(),
+        &interpreted_first_moments,
+        &native_first_moments,
     );
     assert_two_block_tensor_maps_close(
         "single-step second moments",
-        &interpreted.second_moment_snapshots().unwrap(),
-        &native.second_moment_snapshots().unwrap(),
+        &interpreted_second_moments,
+        &native_second_moments,
     );
 
     let interpreted_checkpoint = interpreted.checkpoint().unwrap();
@@ -10531,6 +10687,12 @@ fn compiled_two_block_single_step_ignore_index_is_native_and_resumable() {
         None
     );
     assert_eq!(native_checkpoint.info().accumulated_token_count(), None);
+    for checkpoint in [&interpreted_checkpoint, &native_checkpoint] {
+        assert_eq!(checkpoint.info().replay_step(), 1);
+        assert_eq!(checkpoint.info().optimizer_step(), 1);
+        assert_eq!(checkpoint.info().accumulation_index(), 0);
+        assert_eq!(checkpoint.info().dropout_block_counter(), Some(84));
+    }
     let mut interpreted_restored = plan
         .restore_checkpoint(&interpreted_checkpoint)
         .unwrap()
