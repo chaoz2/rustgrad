@@ -3309,6 +3309,22 @@ impl CompiledTrainingWindowReset {
 /// AdamW compatibility name for [`CompiledTrainingWindowReset`].
 pub type CompiledAdamWZeroGradResult = CompiledTrainingWindowReset;
 
+/// Optimizer-neutral outcome of committing a retained partial gradient window.
+///
+/// Concrete optimizer and backend results may expose additional update or
+/// execution evidence. A generic training loop only needs to know how many
+/// retained microbatches were committed and whether the call published a new
+/// recurrent frontier. Empty windows are exact no-ops.
+pub trait CompiledTrainingWindowCommit {
+    /// Number of retained microbatches committed by this call.
+    fn committed_microbatches(&self) -> u64;
+
+    /// Whether this call published a new recurrent frontier.
+    fn did_commit_window(&self) -> bool {
+        self.committed_microbatches() != 0
+    }
+}
+
 /// Outcome of explicitly committing a non-full compiled AdamW window on CPU.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompiledAdamWFlushResult {
@@ -3358,6 +3374,15 @@ pub trait CompiledAdamWFlush {
 
     fn window_loss_report(&self) -> Option<&CompiledAdamWWindowLossReport> {
         None
+    }
+}
+
+impl<T> CompiledTrainingWindowCommit for T
+where
+    T: CompiledAdamWFlush + ?Sized,
+{
+    fn committed_microbatches(&self) -> u64 {
+        self.flushed_microbatches()
     }
 }
 
@@ -5620,6 +5645,22 @@ where
     }
 }
 
+/// Optimizer-neutral capability for committing a retained partial gradient
+/// window with an external learning rate.
+///
+/// The transition consumes no workload batch and leaves replay/dropout progress
+/// unchanged. A nonempty call commits the retained window atomically; an empty
+/// call is an exact no-op. Optimizer-specific extensions may expose additional
+/// update, clipping, loss, or backend execution evidence on the result.
+pub trait CompiledTrainingWindowCommitRuntime: CompiledTrainingWindowRuntime {
+    type WindowCommit: CompiledTrainingWindowCommit;
+
+    fn commit_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::WindowCommit>;
+
+    /// Stable identity of the separately captured partial-window transition.
+    fn partial_window_commit_capture_identity(&self) -> Option<u64>;
+}
+
 /// Optimizer-neutral capability for committing replay state without returning
 /// graph-named outputs.
 ///
@@ -5670,14 +5711,16 @@ pub trait CompiledAdamWCommitOnlyRuntime: CompiledAdamWRuntime {
     }
 }
 
-/// Optional extension for committing an incomplete compiled AdamW window.
+/// AdamW compatibility extension for committing an incomplete gradient window.
 ///
 /// The transition consumes only the live parameter, moment, accumulator, and
 /// optimizer-cursor frontier plus the explicit learning rate. It cannot reach
 /// a training batch, forward/backward graph, or recurrent dropout state.
 /// CPU executes the exact retained mixed capture. Strict Metal reuses its
 /// authenticated state-only projection against the live epoch banks without
-/// changing user code or staging gradients through the host.
+/// changing user code or staging gradients through the host. Generic loops use
+/// [`CompiledTrainingWindowCommitRuntime`]; this extension retains AdamW update,
+/// clipping, and window-loss diagnostics.
 pub trait CompiledAdamWFlushRuntime: CompiledAdamWRuntime {
     type Flush: CompiledAdamWFlush;
 
@@ -5706,6 +5749,17 @@ pub trait CompiledTrainingRatePolicyRuntime: CompiledTrainingRuntime {
     {
         self.step_with_rate_policy(batch.into_compiled_inputs()?)
     }
+}
+
+/// Partial-window commit driven by the same runtime-owned learning-rate policy
+/// as [`CompiledTrainingRatePolicyRuntime`].
+///
+/// This is intentionally separate from external-rate window commit so a backend
+/// can support one policy boundary without claiming the other.
+pub trait CompiledTrainingRatePolicyWindowCommitRuntime:
+    CompiledTrainingRatePolicyRuntime + CompiledTrainingWindowCommitRuntime
+{
+    fn commit_partial_window_with_rate_policy(&mut self) -> Result<Self::WindowCommit>;
 }
 
 /// Commit-only replay driven by a runtime-owned learning-rate policy.
@@ -12618,6 +12672,18 @@ impl CompiledTrainingCommitOnlyRuntime for CpuCompiledAdamW {
     }
 }
 
+impl CompiledTrainingWindowCommitRuntime for CpuCompiledAdamW {
+    type WindowCommit = CompiledAdamWFlushResult;
+
+    fn commit_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::WindowCommit> {
+        CpuCompiledAdamW::flush_partial_window(self, learning_rate)
+    }
+
+    fn partial_window_commit_capture_identity(&self) -> Option<u64> {
+        CpuCompiledAdamW::flush_capture_identity(self)
+    }
+}
+
 impl CompiledAdamWFlushRuntime for CpuCompiledAdamW {
     type Flush = CompiledAdamWFlushResult;
 
@@ -12625,11 +12691,17 @@ impl CompiledAdamWFlushRuntime for CpuCompiledAdamW {
         &mut self,
         learning_rate: TensorData,
     ) -> Result<CompiledAdamWFlushResult> {
-        CpuCompiledAdamW::flush_partial_window(self, learning_rate)
+        CompiledTrainingWindowCommitRuntime::commit_partial_window(self, learning_rate)
     }
 
     fn flush_capture_identity(&self) -> Option<u64> {
         CpuCompiledAdamW::flush_capture_identity(self)
+    }
+}
+
+impl CompiledTrainingRatePolicyWindowCommitRuntime for CpuCompiledAdamW {
+    fn commit_partial_window_with_rate_policy(&mut self) -> Result<Self::WindowCommit> {
+        CpuCompiledAdamW::flush_partial_window_scheduled(self)
     }
 }
 
@@ -12784,15 +12856,33 @@ impl CompiledTrainingCommitOnlyRuntime for NativeCpuCompiledAdamW<'_> {
     }
 }
 
+impl CompiledTrainingWindowCommitRuntime for NativeCpuCompiledAdamW<'_> {
+    type WindowCommit = NativeCpuCompiledAdamWFlushResult;
+
+    fn commit_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::WindowCommit> {
+        NativeCpuCompiledAdamW::flush_partial_window(self, learning_rate)
+    }
+
+    fn partial_window_commit_capture_identity(&self) -> Option<u64> {
+        self.inner.flush_capture_identity()
+    }
+}
+
 impl CompiledAdamWFlushRuntime for NativeCpuCompiledAdamW<'_> {
     type Flush = NativeCpuCompiledAdamWFlushResult;
 
     fn flush_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::Flush> {
-        NativeCpuCompiledAdamW::flush_partial_window(self, learning_rate)
+        CompiledTrainingWindowCommitRuntime::commit_partial_window(self, learning_rate)
     }
 
     fn flush_capture_identity(&self) -> Option<u64> {
         self.inner.flush_capture_identity()
+    }
+}
+
+impl CompiledTrainingRatePolicyWindowCommitRuntime for NativeCpuCompiledAdamW<'_> {
+    fn commit_partial_window_with_rate_policy(&mut self) -> Result<Self::WindowCommit> {
+        NativeCpuCompiledAdamW::flush_partial_window_scheduled(self)
     }
 }
 
@@ -12962,6 +13052,21 @@ where
     }
 }
 
+impl<M, R> CompiledTrainingWindowCommitRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledTrainingWindowCommitRuntime + CompiledAdamWRuntime,
+{
+    type WindowCommit = R::WindowCommit;
+
+    fn commit_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::WindowCommit> {
+        self.runtime.commit_partial_window(learning_rate)
+    }
+
+    fn partial_window_commit_capture_identity(&self) -> Option<u64> {
+        self.runtime.partial_window_commit_capture_identity()
+    }
+}
+
 impl<M, R> CompiledAdamWFlushRuntime for CompiledModuleAdamWSession<M, R>
 where
     R: CompiledAdamWFlushRuntime,
@@ -12974,6 +13079,15 @@ where
 
     fn flush_capture_identity(&self) -> Option<u64> {
         self.runtime.flush_capture_identity()
+    }
+}
+
+impl<M, R> CompiledTrainingRatePolicyWindowCommitRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledTrainingRatePolicyWindowCommitRuntime + CompiledScheduledAdamWRuntime,
+{
+    fn commit_partial_window_with_rate_policy(&mut self) -> Result<Self::WindowCommit> {
+        self.runtime.commit_partial_window_with_rate_policy()
     }
 }
 
@@ -13975,11 +14089,23 @@ impl CompiledAdamWRuntime for MetalCompiledAdamW {
     }
 }
 
+impl CompiledTrainingWindowCommitRuntime for MetalCompiledAdamW {
+    type WindowCommit = MetalCompiledAdamWFlushResult;
+
+    fn commit_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::WindowCommit> {
+        MetalCompiledAdamW::flush_partial_window(self, learning_rate)
+    }
+
+    fn partial_window_commit_capture_identity(&self) -> Option<u64> {
+        MetalCompiledAdamW::flush_capture_identity(self)
+    }
+}
+
 impl CompiledAdamWFlushRuntime for MetalCompiledAdamW {
     type Flush = MetalCompiledAdamWFlushResult;
 
     fn flush_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::Flush> {
-        MetalCompiledAdamW::flush_partial_window(self, learning_rate)
+        CompiledTrainingWindowCommitRuntime::commit_partial_window(self, learning_rate)
     }
 
     fn flush_capture_identity(&self) -> Option<u64> {
@@ -18356,12 +18482,14 @@ mod tests {
         assert_eq!(native.successful_flushes, 0);
         let before_flush = native_recurrent_test_counts(&native);
         crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
-        let actual = native.flush_partial_window(lr()).unwrap();
+        let actual = commit_core_training_window(&mut native);
         assert_no_hot_phase_capture_work();
         let after_flush = native_recurrent_test_counts(&native);
         assert_eq!(after_flush.0, before_flush.0);
         assert_eq!(after_flush.1, before_flush.1 + 1);
         let expected = interpreted.flush_partial_window(lr()).unwrap();
+        assert_eq!(actual.committed_microbatches(), 1);
+        assert!(actual.did_commit_window());
         assert_eq!(
             actual.flushed_microbatches(),
             expected.flushed_microbatches()
@@ -18405,8 +18533,10 @@ mod tests {
             .workspace_stats();
         let before_empty_flush_plan_count = executor.native_item_plan_count();
         let before_empty_flush_counts = native_recurrent_test_counts(&native);
-        let empty = native.flush_partial_window(lr()).unwrap();
+        let empty = commit_core_training_window(&mut native);
         assert!(!empty.did_update());
+        assert_eq!(empty.committed_microbatches(), 0);
+        assert!(!empty.did_commit_window());
         assert!(empty.report().is_none());
         assert_eq!(
             native_recurrent_test_counts(&native),
@@ -18507,7 +18637,7 @@ mod tests {
                 .borrowed_external_input_bytes,
             96
         );
-        let actual = native.flush_partial_window_scheduled().unwrap();
+        let actual = commit_core_rate_policy_training_window(&mut native);
         let expected = interpreted.flush_partial_window_scheduled().unwrap();
         assert_eq!(
             actual.flushed_microbatches(),
@@ -18819,6 +18949,18 @@ mod tests {
         runtime: &mut R,
     ) -> CompiledTrainingWindowReset {
         runtime.reset_gradient_window().unwrap()
+    }
+
+    fn commit_core_training_window<R: CompiledTrainingWindowCommitRuntime>(
+        runtime: &mut R,
+    ) -> R::WindowCommit {
+        runtime.commit_partial_window(lr()).unwrap()
+    }
+
+    fn commit_core_rate_policy_training_window<R: CompiledTrainingRatePolicyWindowCommitRuntime>(
+        runtime: &mut R,
+    ) -> R::WindowCommit {
+        runtime.commit_partial_window_with_rate_policy().unwrap()
     }
 
     fn reset_adamw_window_compatibility<R: CompiledAdamWRuntime>(
@@ -25641,18 +25783,22 @@ mod tests {
         }
         let scheduled_before_wrong_flush = scheduled.checkpoint().unwrap();
         assert!(
-            scheduled
-                .flush_partial_window(TensorData::scalar(0.025))
-                .is_err()
+            CompiledTrainingWindowCommitRuntime::commit_partial_window(
+                &mut scheduled,
+                TensorData::scalar(0.025),
+            )
+            .is_err()
         );
         assert_eq!(
             scheduled.checkpoint().unwrap(),
             scheduled_before_wrong_flush
         );
-        let actual = scheduled.flush_partial_window_scheduled().unwrap();
-        let expected = external
-            .flush_partial_window(TensorData::scalar(0.025))
-            .unwrap();
+        let actual = commit_core_rate_policy_training_window(&mut scheduled);
+        let expected = CompiledTrainingWindowCommitRuntime::commit_partial_window(
+            &mut external,
+            TensorData::scalar(0.025),
+        )
+        .unwrap();
         assert_eq!(actual, expected);
         assert_eq!(scheduled.checkpoint().unwrap().info().optimizer_step(), 2);
         assert_eq!(

@@ -1633,10 +1633,13 @@ through a three-replay window with a finite global norm limit.
 - `CompiledCheckpointRuntime` is the separate persistence capability.
   `CompiledTrainingWindowRuntime` and `CompiledTrainingWindowStep` separately
   expose window size, pending microbatches, closure, and atomic cancellation.
+  `CompiledTrainingWindowCommitRuntime` commits an incomplete retained window
+  with an external rate; its rate-policy counterpart uses the captured policy.
+  Optimizer extensions retain additional update, clipping, and backend reports.
   `CompiledAdamWRuntime` keeps its compatible accumulation and `zero_grad`
   surface while adding clipping, loss scaling, moments, and optimizer-step
-  inspection; partial flush remains optimizer-specific because it publishes an
-  update. Metal results retain exact device reports.
+  inspection; its flush compatibility surface retains the AdamW reports. Metal
+  results retain exact device reports.
 
 ##### Output and parameter ownership
 
