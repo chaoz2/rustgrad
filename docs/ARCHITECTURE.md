@@ -1313,15 +1313,15 @@ times. Wall times do not participate in identity.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional accumulation/flush/zero-grad/evaluation programs plus
 checked logical recurrent state bytes without preparing a target or exposing a
-capture. The separate `NativeTrainingScoreboard` v20 authenticates
+capture. The separate `NativeTrainingScoreboard` v21 authenticates
 strict-native preparation and successful training-step reports, then emits
 bounded versioned JSON.
 
 | Evidence | Meaning |
 |---|---|
 | Preparation phases | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions, including bounded render concurrency and overlap. |
-| Compiler work | Combined/object/link inventories, cumulative versus effective wall time, bounded per-program process intervals/permit waits, and rendered-source bytes assigned to each translation unit. The derived last-finishing process identifies any post-main auxiliary tail without claiming a speedup. |
-| Module reuse | Referenced modules, the unique/shared-prefix entry partition, and exact main-to-auxiliary content overlap split into contiguous prefix and additional scattered entries/source bytes. This is evidence for future reuse, not object reuse today. |
+| Compiler work | Combined/object/link inventories, cumulative versus effective wall time, bounded per-program process intervals/permit waits, and build-plan-aligned translation-unit identity/count/source-byte records. Equal unit identities identify link-compatible generated content; no object reuse occurs. The derived last-finishing process identifies any post-main auxiliary tail without claiming a speedup. |
+| Module reuse | Referenced modules, the unique/shared-prefix entry partition, and exact overlap for every ordered earlier-program/later-program pair, split into contiguous prefix and additional scattered target entries/source bytes. This is evidence for future reuse, not object reuse today. |
 | Execution | Logical schedule/cache inventory, physical rendered/executed entries, actual module-dispatch calls, and mutually exclusive reasons each sealed dispatch segment ends. |
 | Replay traffic | Owned external imports, borrowed/retained/replaced recurrent bytes, and logical CPU egress materialization count/bytes. CPU egress is not a device transfer. |
 | Timing | Caller-observed compile, prepare, and checkpoint time plus bounded first/steady replay, executor/recurrent-overhead, and native-dispatcher/executor-host partitions. No threshold or speedup is claimed. |
@@ -1337,7 +1337,7 @@ themselves add dispatch segments or reached-module evidence.
 
 ##### Replay phases and wire versions
 
-V1-v19 JSON remains readable. The current wire additions are:
+V1-v20 JSON remains readable. The current wire additions are:
 
 | Version | Added contract |
 |---|---|
@@ -1349,8 +1349,9 @@ V1-v19 JSON remains readable. The current wire additions are:
 | V18 | Time inside authenticated native dispatcher calls and the checked executor-host remainder, both globally and for classified first/warm accumulation and commit phases. |
 | V19 | Bounded normalized compiler-process timing, permit waits, ordered program/native identity, and a re-derived last-finishing critical-tail owner. |
 | V20 | Exact main-to-auxiliary rendered-entry/source-byte overlap and per-translation-unit rendered-source bytes. |
+| V21 | Authenticated triangular earlier-to-later program overlap and exact build-plan translation-unit identities/counts/source bytes. V20 fields remain unchanged. |
 
-V20 is emitted for raw and classified recording. Classified steps use only
+V21 is emitted for raw and classified recording. Classified steps use only
 `did_update`; the first replay stays separate, and warm accumulation-only and
 optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
 classification. A scoreboard rejects mixed recording modes without consuming a

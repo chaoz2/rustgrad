@@ -91,6 +91,61 @@ impl ScheduleModuleBuildPlan {
     }
 }
 
+/// Generated-source identity, range, and exact payload size for one translation
+/// unit in the immutable schedule-module build plan. The backend binds this to
+/// its logical/layout metadata before reporting the full reuse identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeScheduleTranslationUnitEvidence {
+    pub(crate) ordinal: usize,
+    pub(crate) generated_source_identity: u64,
+    pub(crate) entry_start: usize,
+    pub(crate) entry_end: usize,
+    pub(crate) entry_count: usize,
+    pub(crate) rendered_source_bytes: usize,
+}
+
+pub(crate) fn schedule_module_translation_unit_evidence(
+    rendered: &[RenderedC],
+) -> Result<Vec<NativeScheduleTranslationUnitEvidence>, JitError> {
+    if rendered.is_empty() {
+        return Ok(Vec::new());
+    }
+    let plan = ScheduleModuleBuildPlan::new(rendered)?;
+    plan.chunks
+        .iter()
+        .map(|chunk| {
+            let include_dispatcher = chunk.ordinal + 1 == plan.chunks.len();
+            let source =
+                render_schedule_module_chunk(rendered, chunk.entries.clone(), include_dispatcher);
+            let identity_source = format!(
+                "{}\u{1f}{}\u{1f}{}",
+                C11_TRANSLATION_UNIT_FLAGS.join("\u{1e}"),
+                C11_LINK_FLAGS.join("\u{1e}"),
+                source
+            );
+            let generated_source_identity = u64::from_str_radix(
+                &native_cache_key("schedule-module-translation-unit-v1", &identity_source),
+                16,
+            )
+            .map_err(|_| JitError::Io("native translation-unit identity is invalid".into()))?;
+            let entries = &rendered[chunk.entries.clone()];
+            let rendered_source_bytes = entries.iter().try_fold(0usize, |total, entry| {
+                total
+                    .checked_add(entry.source.len())
+                    .ok_or_else(|| JitError::Io("native schedule source size overflowed".into()))
+            })?;
+            Ok(NativeScheduleTranslationUnitEvidence {
+                ordinal: chunk.ordinal,
+                generated_source_identity,
+                entry_start: chunk.entries.start,
+                entry_end: chunk.entries.end,
+                entry_count: entries.len(),
+                rendered_source_bytes,
+            })
+        })
+        .collect()
+}
+
 fn balanced_split(rendered: &[RenderedC]) -> Result<usize, JitError> {
     let total = rendered.iter().try_fold(0usize, |total, entry| {
         total
@@ -690,6 +745,38 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(weights[0].abs_diff(weights[1]) <= 3);
+
+        let units = schedule_module_translation_unit_evidence(&rendered).unwrap();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].ordinal, 0);
+        assert_eq!(units[1].ordinal, 1);
+        assert_eq!(
+            units.iter().map(|unit| unit.entry_count).sum::<usize>(),
+            513
+        );
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| unit.rendered_source_bytes)
+                .sum::<usize>(),
+            rendered
+                .iter()
+                .map(|entry| entry.source.len())
+                .sum::<usize>()
+        );
+        assert_eq!(
+            units,
+            schedule_module_translation_unit_evidence(&rendered).unwrap(),
+            "translation-unit identities are deterministic"
+        );
+        let mut changed = rendered.clone();
+        changed[0].source.push('y');
+        assert_ne!(
+            units[0].generated_source_identity,
+            schedule_module_translation_unit_evidence(&changed).unwrap()[0]
+                .generated_source_identity,
+            "the identity covers exact generated source"
+        );
     }
 
     #[test]

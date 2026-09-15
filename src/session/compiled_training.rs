@@ -1894,6 +1894,94 @@ pub(crate) struct NativeCpuModuleOverlap {
     additional_scattered_source_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeCpuProgramPairOverlap {
+    source_program_index: usize,
+    target_program_index: usize,
+    contiguous_prefix_entry_count: usize,
+    contiguous_prefix_source_bytes: usize,
+    additional_scattered_entry_count: usize,
+    additional_scattered_source_bytes: usize,
+}
+
+impl NativeCpuProgramPairOverlap {
+    fn from_native(overlap: crate::backend::NativeScheduleProgramPairOverlap) -> Self {
+        Self {
+            source_program_index: overlap.source_program_index,
+            target_program_index: overlap.target_program_index,
+            contiguous_prefix_entry_count: overlap.contiguous_prefix_entry_count,
+            contiguous_prefix_source_bytes: overlap.contiguous_prefix_source_bytes,
+            additional_scattered_entry_count: overlap.additional_scattered_entry_count,
+            additional_scattered_source_bytes: overlap.additional_scattered_source_bytes,
+        }
+    }
+
+    pub(crate) const fn source_program_index(&self) -> usize {
+        self.source_program_index
+    }
+
+    pub(crate) const fn target_program_index(&self) -> usize {
+        self.target_program_index
+    }
+
+    pub(crate) const fn contiguous_prefix_entry_count(&self) -> usize {
+        self.contiguous_prefix_entry_count
+    }
+
+    pub(crate) const fn contiguous_prefix_source_bytes(&self) -> usize {
+        self.contiguous_prefix_source_bytes
+    }
+
+    pub(crate) const fn additional_scattered_entry_count(&self) -> usize {
+        self.additional_scattered_entry_count
+    }
+
+    pub(crate) const fn additional_scattered_source_bytes(&self) -> usize {
+        self.additional_scattered_source_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeCpuTranslationUnitEvidence {
+    program_index: usize,
+    ordinal: usize,
+    identity: u64,
+    entry_count: usize,
+    rendered_source_bytes: usize,
+}
+
+impl NativeCpuTranslationUnitEvidence {
+    fn from_native(unit: crate::backend::NativeScheduleTranslationUnit) -> Self {
+        Self {
+            program_index: unit.program_index,
+            ordinal: unit.ordinal,
+            identity: unit.identity,
+            entry_count: unit.entry_count,
+            rendered_source_bytes: unit.rendered_source_bytes,
+        }
+    }
+
+    pub(crate) const fn program_index(&self) -> usize {
+        self.program_index
+    }
+
+    pub(crate) const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    pub(crate) const fn identity(&self) -> u64 {
+        self.identity
+    }
+
+    pub(crate) const fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    pub(crate) const fn rendered_source_bytes(&self) -> usize {
+        self.rendered_source_bytes
+    }
+}
+
 impl NativeCpuModuleOverlap {
     fn from_native(overlap: crate::backend::NativeScheduleModuleOverlap) -> Self {
         Self {
@@ -2012,6 +2100,8 @@ pub struct NativeCpuCompiledAdamWPreparationReport {
     max_parallel_compiler_process_count: usize,
     compiler_process_timings: Vec<NativeCpuCompilerProcessTiming>,
     module_overlaps: Vec<NativeCpuModuleOverlap>,
+    program_pair_overlaps: Vec<NativeCpuProgramPairOverlap>,
+    translation_units: Vec<NativeCpuTranslationUnitEvidence>,
 }
 
 impl NativeCpuCompiledAdamWPreparationReport {
@@ -2085,6 +2175,14 @@ impl NativeCpuCompiledAdamWPreparationReport {
 
     pub(crate) fn module_overlaps(&self) -> &[NativeCpuModuleOverlap] {
         &self.module_overlaps
+    }
+
+    pub(crate) fn program_pair_overlaps(&self) -> &[NativeCpuProgramPairOverlap] {
+        &self.program_pair_overlaps
+    }
+
+    pub(crate) fn translation_units(&self) -> &[NativeCpuTranslationUnitEvidence] {
+        &self.translation_units
     }
 }
 
@@ -11269,6 +11367,16 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     .module_overlaps
                     .into_iter()
                     .map(NativeCpuModuleOverlap::from_native)
+                    .collect(),
+                program_pair_overlaps: compilation
+                    .program_pair_overlaps
+                    .into_iter()
+                    .map(NativeCpuProgramPairOverlap::from_native)
+                    .collect(),
+                translation_units: compilation
+                    .translation_units
+                    .into_iter()
+                    .map(NativeCpuTranslationUnitEvidence::from_native)
                     .collect(),
             },
             successful_steps: 0,

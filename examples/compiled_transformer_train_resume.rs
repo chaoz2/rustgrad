@@ -2651,6 +2651,48 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
             .as_u64()
             .is_some_and(|bytes| bytes > 0)
     );
+    let pair_overlaps = report_json["prepare_program_pair_overlaps"]
+        .as_array()
+        .expect("current scoreboard reports every ordered earlier/later program pair");
+    assert_eq!(pair_overlaps.len(), 6);
+    assert_eq!(
+        pair_overlaps
+            .iter()
+            .map(|overlap| (
+                overlap["source_program_index"].as_u64().unwrap(),
+                overlap["target_program_index"].as_u64().unwrap(),
+            ))
+            .collect::<Vec<_>>(),
+        [(0, 1), (0, 2), (1, 2), (0, 3), (1, 3), (2, 3)]
+    );
+    for (overlap, main_overlap) in pair_overlaps
+        .iter()
+        .filter(|overlap| overlap["source_program_index"] == 0)
+        .zip(overlaps)
+    {
+        assert_eq!(
+            overlap["contiguous_prefix_entry_count"],
+            main_overlap["contiguous_prefix_entry_count"]
+        );
+        assert_eq!(
+            overlap["additional_scattered_entry_count"],
+            main_overlap["additional_scattered_entry_count"]
+        );
+    }
+    let translation_units = report_json["prepare_translation_units"]
+        .as_array()
+        .expect("current scoreboard reports the exact translation-unit build plan");
+    assert_eq!(translation_units.len(), 5);
+    for unit in translation_units {
+        assert!(unit["translation_unit_identity"].is_u64());
+        assert!(unit["evidence_identity"].is_u64());
+        assert!(unit["entry_count"].as_u64().is_some_and(|count| count > 0));
+        assert!(
+            unit["rendered_source_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0)
+        );
+    }
     assert_eq!(
         report_json["prepare_compiler_critical_tail"].is_object(),
         compiler_process_count != 0
