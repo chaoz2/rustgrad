@@ -59,13 +59,15 @@ use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
     Backend, CapturedReplayExecutor, CompiledAdamWCheckpoint, CompiledAdamWConfig,
-    CompiledAdamWFlush, CompiledAdamWFlushRuntime, CompiledAdamWGraph,
-    CompiledAdamWIgnoreIndexContext, CompiledAdamWPlan, CompiledAdamWResumeBundle,
-    CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime, CompiledDropoutConfig,
-    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
-    CompiledInputSpec, CompiledModuleAdamWPlan, CompiledModuleAdamWSession, CompiledMultiStepLr,
-    CompiledScheduledAdamWRuntime, CompiledTrainingRuntime, CompiledTrainingStep, CpuBackend,
-    CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, LossOptions,
+    CompiledAdamWGraph, CompiledAdamWIgnoreIndexContext, CompiledAdamWPlan,
+    CompiledAdamWResumeBundle, CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
+    CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan, CompiledModuleAdamWSession,
+    CompiledMultiStepLr, CompiledScheduledAdamWRuntime, CompiledTrainingRatePolicyRuntime,
+    CompiledTrainingRatePolicyWindowCommitRuntime, CompiledTrainingRuntime, CompiledTrainingStep,
+    CompiledTrainingWindowCommit, CompiledTrainingWindowCommitRuntime,
+    CompiledTrainingWindowResetRuntime, CompiledTrainingWindowRuntime, CompiledTrainingWindowStep,
+    CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, LossOptions,
     MetalSessionTarget, Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult,
     NativeCpuCompiledEvaluationResult, NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId,
     Parameter, Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider,
@@ -859,7 +861,7 @@ impl Drop for TemporaryCheckpointFile {
 
 fn run_exact_resume<R, P>(target_name: &str, mut prepare: P) -> Result<()>
 where
-    R: CompiledAdamWRuntime + CompiledAdamWFlushRuntime + CompiledEvaluationRuntime,
+    R: CompiledAdamWRuntime + CompiledTrainingWindowCommitRuntime + CompiledEvaluationRuntime,
     P: FnMut(
         CompiledModuleAdamWPlan<TinyCausalTransformer>,
     ) -> Result<CompiledModuleAdamWSession<TinyCausalTransformer, R>>,
@@ -881,10 +883,7 @@ where
         !parameters.contains_key("lm_head.weight"),
         "the tied output head must share the embedding's recurrent state"
     );
-    assert_eq!(
-        uninterrupted.gradient_accumulation_steps(),
-        ACCUMULATION_STEPS
-    );
+    assert_eq!(uninterrupted.gradient_window_size(), ACCUMULATION_STEPS);
     assert_eq!(uninterrupted.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
     let initial_parameters = uninterrupted.parameter_snapshots()?;
     let initial_first_moments = uninterrupted.first_moment_snapshots()?;
@@ -896,6 +895,8 @@ where
         assert_eq!(step.optimizer_step(), 0);
         assert_eq!(step.accumulation_index(), replay);
         assert!(!step.did_update());
+        assert_eq!(step.pending_microbatch_count(), replay);
+        assert!(!step.did_close_gradient_window());
     }
     assert_ne!(
         uninterrupted.gradient_accumulator_snapshots()?,
@@ -910,7 +911,12 @@ where
         uninterrupted.second_moment_snapshots()?,
         initial_second_moments
     );
-    assert_eq!(uninterrupted.zero_grad()?.discarded_microbatches(), 2);
+    assert_eq!(
+        uninterrupted
+            .reset_gradient_window()?
+            .discarded_microbatches(),
+        2
+    );
     assert_eq!(uninterrupted.step_count(), 2);
     assert_eq!(uninterrupted.optimizer_step()?, 0);
     assert_eq!(uninterrupted.accumulation_index()?, 0);
@@ -919,7 +925,12 @@ where
         empty_accumulators
     );
     let after_reset = uninterrupted.checkpoint()?;
-    assert_eq!(uninterrupted.zero_grad()?.discarded_microbatches(), 0);
+    assert_eq!(
+        uninterrupted
+            .reset_gradient_window()?
+            .discarded_microbatches(),
+        0
+    );
     assert_eq!(uninterrupted.checkpoint()?, after_reset);
 
     for replay in 3..=INITIAL_STEPS as u64 {
@@ -948,7 +959,7 @@ where
         Some(flush_capture_identity)
     );
     assert_eq!(
-        uninterrupted.flush_capture_identity(),
+        uninterrupted.partial_window_commit_capture_identity(),
         Some(flush_capture_identity)
     );
     assert_eq!(checkpoint_info.dropout_block_counter(), Some(48));
@@ -983,6 +994,14 @@ where
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
         assert_eq!(actual.accumulation_index(), expected.accumulation_index());
         assert_eq!(actual.did_update(), expected.did_update());
+        assert_eq!(
+            actual.pending_microbatch_count(),
+            expected.pending_microbatch_count()
+        );
+        assert_eq!(
+            actual.did_close_gradient_window(),
+            expected.did_close_gradient_window()
+        );
         let (optimizer_step, accumulation_index, did_update) = match replay {
             5 => (1, 0, true),
             6 => (1, 1, false),
@@ -993,18 +1012,23 @@ where
         assert_eq!(actual.accumulation_index(), accumulation_index);
         assert_eq!(actual.did_update(), did_update);
     }
-    let expected_flush = uninterrupted.flush_partial_window(TensorData::scalar(0.05))?;
-    let actual_flush = resumed.flush_partial_window(TensorData::scalar(0.05))?;
-    assert_eq!(actual_flush.flushed_microbatches(), 2);
+    let expected_flush = uninterrupted.commit_partial_window(TensorData::scalar(0.05))?;
+    let actual_flush = resumed.commit_partial_window(TensorData::scalar(0.05))?;
+    assert_eq!(actual_flush.committed_microbatches(), 2);
     assert_eq!(
-        actual_flush.flushed_microbatches(),
-        expected_flush.flushed_microbatches()
+        actual_flush.committed_microbatches(),
+        expected_flush.committed_microbatches()
     );
     assert_eq!(
-        actual_flush.optimizer_step(),
-        expected_flush.optimizer_step()
+        actual_flush.did_commit_window(),
+        expected_flush.did_commit_window()
     );
-    assert_eq!(actual_flush.did_update(), expected_flush.did_update());
+    assert!(actual_flush.did_commit_window());
+    let after_flush = resumed.checkpoint()?;
+    let empty_flush = resumed.commit_partial_window(TensorData::scalar(0.05))?;
+    assert_eq!(empty_flush.committed_microbatches(), 0);
+    assert!(!empty_flush.did_commit_window());
+    assert_eq!(resumed.checkpoint()?, after_flush);
     assert_eq!(resumed.optimizer_step()?, 2);
     assert_eq!(resumed.accumulation_index()?, 0);
 
@@ -1437,7 +1461,9 @@ fn run_file_resume<R, P, V, S, E>(
     mut validate_evaluation: E,
 ) -> std::result::Result<(), Box<dyn Error>>
 where
-    R: CompiledScheduledAdamWRuntime + CompiledEvaluationRuntime,
+    R: CompiledScheduledAdamWRuntime
+        + CompiledTrainingRatePolicyWindowCommitRuntime
+        + CompiledEvaluationRuntime,
     P: FnMut(
         CompiledModuleAdamWPlan<FileResumeTransformer>,
     ) -> Result<CompiledModuleAdamWSession<FileResumeTransformer, R>>,
@@ -1494,7 +1520,7 @@ where
     for replay in 1..=4 {
         let batch = file_resume_batch(replay)?;
         let loss_weight = loss_mask_weight(batch.loss_mask());
-        let step = uninterrupted.step_batch_scheduled(batch)?;
+        let step = uninterrupted.step_batch_with_rate_policy(batch)?;
         validate_step(&step);
         assert_eq!(step.loss_weight(), loss_weight);
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
@@ -1619,8 +1645,8 @@ where
         Some(saved_dropout_cursor)
     );
     for replay in 5..=LAST_REPLAY {
-        let expected = uninterrupted.step_batch_scheduled(file_resume_batch(replay)?)?;
-        let actual = resumed.step_batch_scheduled(file_resume_batch(replay)?)?;
+        let expected = uninterrupted.step_batch_with_rate_policy(file_resume_batch(replay)?)?;
+        let actual = resumed.step_batch_with_rate_policy(file_resume_batch(replay)?)?;
         validate_step(&expected);
         validate_step(&actual);
         assert_eq!(actual.loss(), expected.loss());
@@ -1658,28 +1684,27 @@ where
         );
         assert_eq!(actual_checkpoint, expected_checkpoint);
     }
-    let expected_partial = uninterrupted.step_batch_scheduled(file_resume_batch(10)?)?;
-    let actual_partial = resumed.step_batch_scheduled(file_resume_batch(10)?)?;
+    let expected_partial = uninterrupted.step_batch_with_rate_policy(file_resume_batch(10)?)?;
+    let actual_partial = resumed.step_batch_with_rate_policy(file_resume_batch(10)?)?;
     validate_step(&expected_partial);
     validate_step(&actual_partial);
     assert_eq!(actual_partial.loss(), expected_partial.loss());
     assert_eq!(actual_partial.outputs(), expected_partial.outputs());
-    let expected_flush = uninterrupted.flush_partial_window_scheduled()?;
-    let actual_flush = resumed.flush_partial_window_scheduled()?;
-    assert_eq!(actual_flush.did_update(), expected_flush.did_update());
+    let expected_flush = uninterrupted.commit_partial_window_with_rate_policy()?;
+    let actual_flush = resumed.commit_partial_window_with_rate_policy()?;
     assert_eq!(
-        actual_flush.optimizer_step(),
-        expected_flush.optimizer_step()
+        actual_flush.did_commit_window(),
+        expected_flush.did_commit_window()
     );
-    assert_eq!(actual_flush.flushed_microbatches(), 1);
-    let expected_discard = uninterrupted.step_batch_scheduled(file_resume_batch(11)?)?;
-    let actual_discard = resumed.step_batch_scheduled(file_resume_batch(11)?)?;
+    assert_eq!(actual_flush.committed_microbatches(), 1);
+    let expected_discard = uninterrupted.step_batch_with_rate_policy(file_resume_batch(11)?)?;
+    let actual_discard = resumed.step_batch_with_rate_policy(file_resume_batch(11)?)?;
     validate_step(&expected_discard);
     validate_step(&actual_discard);
     assert_eq!(actual_discard.loss(), expected_discard.loss());
     assert_eq!(actual_discard.outputs(), expected_discard.outputs());
-    let expected_reset = uninterrupted.zero_grad()?;
-    let actual_reset = resumed.zero_grad()?;
+    let expected_reset = uninterrupted.reset_gradient_window()?;
+    let actual_reset = resumed.reset_gradient_window()?;
     assert_eq!(actual_reset, expected_reset);
     assert_eq!(actual_reset.discarded_microbatches(), 1);
     assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);

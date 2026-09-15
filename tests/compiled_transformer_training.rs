@@ -9,13 +9,14 @@ use rustgrad::runtime::metal::{
 use rustgrad::{
     Backend, BinaryOp, CapturedReplayExecutor, CapturedReplayOptions, CapturedSchedule, CompareOp,
     CompiledAdamWCheckpoint, CompiledAdamWClipReport, CompiledAdamWConfig, CompiledAdamWFlush,
-    CompiledAdamWFlushRuntime, CompiledAdamWGraph, CompiledAdamWIgnoreIndexContext,
-    CompiledAdamWObjective, CompiledAdamWPlan, CompiledAdamWProgramArtifact, CompiledAdamWRuntime,
-    CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWWindowLossReport,
-    CompiledCheckpointRestoreRuntime, CompiledCheckpointRuntime, CompiledDropoutConfig,
-    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
-    CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
+    CompiledAdamWGraph, CompiledAdamWIgnoreIndexContext, CompiledAdamWObjective, CompiledAdamWPlan,
+    CompiledAdamWProgramArtifact, CompiledAdamWRuntime, CompiledAdamWStep, CompiledAdamWStepResult,
+    CompiledAdamWWindowLossReport, CompiledCheckpointRestoreRuntime, CompiledCheckpointRuntime,
+    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
+    CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
     CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep,
+    CompiledTrainingWindowCommit, CompiledTrainingWindowCommitRuntime,
+    CompiledTrainingWindowResetRuntime, CompiledTrainingWindowRuntime, CompiledTrainingWindowStep,
     CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Error, Graph,
     LossOptions, MetalCompiledAdamWPlan, Module, NATIVE_TRAINING_REPORT_FORMAT_VERSION,
     NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget,
@@ -5842,7 +5843,7 @@ fn owned_compiled_transformer(
 
 fn run_exact_resume<R, P>(evaluation_tolerance: f64, mut prepare: P) -> ExactResumeEvaluation
 where
-    R: CompiledAdamWRuntime + CompiledAdamWFlushRuntime + CompiledEvaluationRuntime,
+    R: CompiledAdamWRuntime + CompiledTrainingWindowCommitRuntime + CompiledEvaluationRuntime,
     P: FnMut(
         CompiledModuleAdamWPlan<TinyCausalTransformer>,
     ) -> Result<rustgrad::CompiledModuleAdamWSession<TinyCausalTransformer, R>>,
@@ -5875,10 +5876,7 @@ where
             .contains_key("lm_head.weight"),
         "the tied output head must share the embedding's recurrent state"
     );
-    assert_eq!(
-        uninterrupted.gradient_accumulation_steps(),
-        ACCUMULATION_STEPS
-    );
+    assert_eq!(uninterrupted.gradient_window_size(), ACCUMULATION_STEPS);
     assert_eq!(uninterrupted.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
     let initial_parameters = uninterrupted.parameter_snapshots().unwrap();
     let initial_first_moments = uninterrupted.first_moment_snapshots().unwrap();
@@ -5891,6 +5889,8 @@ where
         assert_eq!(step.optimizer_step(), 0);
         assert_eq!(step.accumulation_index(), replay);
         assert!(!step.did_update());
+        assert_eq!(step.pending_microbatch_count(), replay);
+        assert!(!step.did_close_gradient_window());
     }
     assert_ne!(
         uninterrupted.gradient_accumulator_snapshots().unwrap(),
@@ -5909,7 +5909,7 @@ where
         uninterrupted.second_moment_snapshots().unwrap(),
         initial_second_moments
     );
-    let reset = uninterrupted.zero_grad().unwrap();
+    let reset = uninterrupted.reset_gradient_window().unwrap();
     assert_eq!(reset.discarded_microbatches(), 2);
     assert_eq!(uninterrupted.step_count(), 2);
     assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
@@ -5920,7 +5920,10 @@ where
     );
     let after_reset = uninterrupted.checkpoint().unwrap();
     assert_eq!(
-        uninterrupted.zero_grad().unwrap().discarded_microbatches(),
+        uninterrupted
+            .reset_gradient_window()
+            .unwrap()
+            .discarded_microbatches(),
         0
     );
     assert_eq!(uninterrupted.checkpoint().unwrap(), after_reset);
@@ -5959,7 +5962,7 @@ where
         Some(flush_capture_identity)
     );
     assert_eq!(
-        uninterrupted.flush_capture_identity(),
+        uninterrupted.partial_window_commit_capture_identity(),
         Some(flush_capture_identity)
     );
     assert_eq!(checkpoint_info.dropout_block_counter(), Some(48));
@@ -6004,6 +6007,14 @@ where
         assert_eq!(actual.optimizer_step(), expected.optimizer_step());
         assert_eq!(actual.accumulation_index(), expected.accumulation_index());
         assert_eq!(actual.did_update(), expected.did_update());
+        assert_eq!(
+            actual.pending_microbatch_count(),
+            expected.pending_microbatch_count()
+        );
+        assert_eq!(
+            actual.did_close_gradient_window(),
+            expected.did_close_gradient_window()
+        );
         let (optimizer_step, accumulation_index, did_update) = match replay {
             5 => (1, 0, true),
             6 => (1, 1, false),
@@ -6014,19 +6025,32 @@ where
         assert_eq!(actual.accumulation_index(), accumulation_index);
         assert_eq!(actual.did_update(), did_update);
     }
-    let expected_flush = uninterrupted.flush_partial_window(learning_rate()).unwrap();
-    let actual_flush = resumed.flush_partial_window(learning_rate()).unwrap();
-    assert_eq!(actual_flush.flushed_microbatches(), 2);
+    let before_rejected_commit = resumed.checkpoint().unwrap();
+    assert!(
+        resumed
+            .commit_partial_window(TensorData::new([1], vec![0.05]).unwrap())
+            .is_err()
+    );
+    assert_eq!(resumed.checkpoint().unwrap(), before_rejected_commit);
+    let expected_flush = uninterrupted
+        .commit_partial_window(learning_rate())
+        .unwrap();
+    let actual_flush = resumed.commit_partial_window(learning_rate()).unwrap();
+    assert_eq!(actual_flush.committed_microbatches(), 2);
     assert_eq!(
-        actual_flush.flushed_microbatches(),
-        expected_flush.flushed_microbatches()
+        actual_flush.committed_microbatches(),
+        expected_flush.committed_microbatches()
     );
     assert_eq!(
-        actual_flush.optimizer_step(),
-        expected_flush.optimizer_step()
+        actual_flush.did_commit_window(),
+        expected_flush.did_commit_window()
     );
-    assert_eq!(actual_flush.did_update(), expected_flush.did_update());
-    assert!(actual_flush.did_update());
+    assert!(actual_flush.did_commit_window());
+    let after_flush = resumed.checkpoint().unwrap();
+    let empty_flush = resumed.commit_partial_window(learning_rate()).unwrap();
+    assert_eq!(empty_flush.committed_microbatches(), 0);
+    assert!(!empty_flush.did_commit_window());
+    assert_eq!(resumed.checkpoint().unwrap(), after_flush);
 
     assert_eq!(resumed.step_count(), 7);
     assert_eq!(resumed.optimizer_step().unwrap(), 2);
@@ -6065,7 +6089,7 @@ where
     assert_eq!(final_info.flushed_microbatch_count(), 2);
     assert_eq!(
         final_info.flush_capture_identity(),
-        resumed.flush_capture_identity()
+        resumed.partial_window_commit_capture_identity()
     );
     assert_eq!(final_info.dropout_block_counter(), Some(84));
     let before_evaluation = resumed.checkpoint().unwrap();
@@ -13470,7 +13494,9 @@ fn owned_compiled_transformer_flushes_a_partial_window_and_resumes_exactly() {
         24
     );
     assert_eq!(session.parameter_snapshots().unwrap(), initial_parameters);
-    let flush = session.flush_partial_window(learning_rate()).unwrap();
+    let flush =
+        rustgrad::CompiledAdamWFlushRuntime::flush_partial_window(&mut session, learning_rate())
+            .unwrap();
     assert!(flush.did_update());
     assert_eq!(flush.flushed_microbatches(), 2);
     assert_eq!(flush.optimizer_step(), 1);
@@ -14499,24 +14525,30 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     let scoreboard_before_flush = resumed.execution_scoreboard_report().unwrap().unwrap();
     let epoch_before_flush = resumed.metal_session().state_epoch();
     let dropout_before_flush = checkpoint_dropout_block_counter(&resumed.checkpoint().unwrap());
-    let flush_capture_identity = resumed.flush_capture_identity().unwrap();
+    let flush_capture_identity = resumed.partial_window_commit_capture_identity().unwrap();
     assert_eq!(
-        cpu_resumed.flush_capture_identity(),
+        cpu_resumed.partial_window_commit_capture_identity(),
         Some(flush_capture_identity)
     );
     assert_eq!(
-        cpu_primary.flush_capture_identity(),
+        cpu_primary.partial_window_commit_capture_identity(),
         Some(flush_capture_identity)
     );
-    let cpu_primary_flush = cpu_primary.flush_partial_window(learning_rate()).unwrap();
-    let cpu_flush = cpu_resumed.flush_partial_window(learning_rate()).unwrap();
-    let metal_flush = resumed.flush_partial_window(learning_rate()).unwrap();
+    let cpu_primary_flush = cpu_primary.commit_partial_window(learning_rate()).unwrap();
+    let cpu_flush = cpu_resumed.commit_partial_window(learning_rate()).unwrap();
+    let metal_flush = resumed.commit_partial_window(learning_rate()).unwrap();
     assert!(cpu_primary_flush.did_update());
     assert!(cpu_flush.did_update());
     assert!(metal_flush.did_update());
+    assert!(cpu_primary_flush.did_commit_window());
+    assert!(cpu_flush.did_commit_window());
+    assert!(metal_flush.did_commit_window());
     assert_eq!(cpu_primary_flush.flushed_microbatches(), 2);
     assert_eq!(cpu_flush.flushed_microbatches(), 2);
     assert_eq!(metal_flush.flushed_microbatches(), 2);
+    assert_eq!(cpu_primary_flush.committed_microbatches(), 2);
+    assert_eq!(cpu_flush.committed_microbatches(), 2);
+    assert_eq!(metal_flush.committed_microbatches(), 2);
     assert_eq!(cpu_flush.optimizer_step(), 1);
     assert_eq!(metal_flush.optimizer_step(), 1);
     let flush_report = metal_flush.report().unwrap().clone();
@@ -14600,12 +14632,14 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_frozen_embedding_checkpoint_inventory(&checkpoint_after_flush, &initial_parameters, 48);
     let epoch_after_flush = resumed.metal_session().state_epoch();
     let scoreboard_after_flush = resumed.execution_scoreboard_report().unwrap().unwrap();
-    let empty_metal_flush = resumed.flush_partial_window(learning_rate()).unwrap();
-    let empty_cpu_primary_flush = cpu_primary.flush_partial_window(learning_rate()).unwrap();
-    let empty_cpu_flush = cpu_resumed.flush_partial_window(learning_rate()).unwrap();
+    let empty_metal_flush = resumed.commit_partial_window(learning_rate()).unwrap();
+    let empty_cpu_primary_flush = cpu_primary.commit_partial_window(learning_rate()).unwrap();
+    let empty_cpu_flush = cpu_resumed.commit_partial_window(learning_rate()).unwrap();
     assert!(!empty_metal_flush.did_update());
+    assert!(!empty_metal_flush.did_commit_window());
     assert!(empty_metal_flush.report().is_none());
     assert!(!empty_cpu_flush.did_update());
+    assert!(!empty_cpu_flush.did_commit_window());
     assert!(!empty_cpu_primary_flush.did_update());
     assert_eq!(resumed.metal_session().state_epoch(), epoch_after_flush);
     assert_eq!(resumed.checkpoint().unwrap(), checkpoint_after_flush);
