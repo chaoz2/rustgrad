@@ -859,6 +859,21 @@ impl Drop for TemporaryCheckpointFile {
     }
 }
 
+fn replay_prepared_transformer<R>(runtime: &mut R, replay: u64) -> Result<R::Step>
+where
+    R: CompiledTrainingWindowRuntime,
+{
+    runtime.step_batch(batch(replay)?, 0.05)
+}
+
+fn replay_prepared_policy_batch<R, B>(runtime: &mut R, batch: B) -> Result<R::Step>
+where
+    R: CompiledTrainingRatePolicyRuntime,
+    B: CompiledInputBatch,
+{
+    runtime.step_batch_with_rate_policy(batch)
+}
+
 fn run_exact_resume<R, P>(target_name: &str, mut prepare: P) -> Result<()>
 where
     R: CompiledAdamWRuntime + CompiledTrainingWindowCommitRuntime + CompiledEvaluationRuntime,
@@ -873,7 +888,7 @@ where
     let flush_capture_identity = plan
         .flush_capture_identity()
         .expect("three-step accumulation exposes a partial-flush capture");
-    let mut uninterrupted = prepare(plan)?;
+    let mut uninterrupted = prepare(plan)?.into_training_session();
     let evaluation_identity = uninterrupted
         .evaluation_capture_identity()
         .expect("evaluation was attached before preparation");
@@ -884,14 +899,17 @@ where
         "the tied output head must share the embedding's recurrent state"
     );
     assert_eq!(uninterrupted.gradient_window_size(), ACCUMULATION_STEPS);
-    assert_eq!(uninterrupted.max_gradient_norm(), Some(MAX_GRADIENT_NORM));
+    assert_eq!(
+        uninterrupted.runtime().max_gradient_norm(),
+        Some(MAX_GRADIENT_NORM)
+    );
     let initial_parameters = uninterrupted.parameter_snapshots()?;
-    let initial_first_moments = uninterrupted.first_moment_snapshots()?;
-    let initial_second_moments = uninterrupted.second_moment_snapshots()?;
-    let empty_accumulators = uninterrupted.gradient_accumulator_snapshots()?;
+    let initial_first_moments = uninterrupted.runtime().first_moment_snapshots()?;
+    let initial_second_moments = uninterrupted.runtime().second_moment_snapshots()?;
+    let empty_accumulators = uninterrupted.runtime().gradient_accumulator_snapshots()?;
 
     for replay in 1..=2 {
-        let step = uninterrupted.step_batch(batch(replay)?, 0.05)?;
+        let step = replay_prepared_transformer(&mut uninterrupted, replay)?;
         assert_eq!(step.optimizer_step(), 0);
         assert_eq!(step.accumulation_index(), replay);
         assert!(!step.did_update());
@@ -899,16 +917,16 @@ where
         assert!(!step.did_close_gradient_window());
     }
     assert_ne!(
-        uninterrupted.gradient_accumulator_snapshots()?,
+        uninterrupted.runtime().gradient_accumulator_snapshots()?,
         empty_accumulators
     );
     assert_eq!(uninterrupted.parameter_snapshots()?, initial_parameters);
     assert_eq!(
-        uninterrupted.first_moment_snapshots()?,
+        uninterrupted.runtime().first_moment_snapshots()?,
         initial_first_moments
     );
     assert_eq!(
-        uninterrupted.second_moment_snapshots()?,
+        uninterrupted.runtime().second_moment_snapshots()?,
         initial_second_moments
     );
     assert_eq!(
@@ -918,10 +936,10 @@ where
         2
     );
     assert_eq!(uninterrupted.step_count(), 2);
-    assert_eq!(uninterrupted.optimizer_step()?, 0);
-    assert_eq!(uninterrupted.accumulation_index()?, 0);
+    assert_eq!(uninterrupted.runtime().optimizer_step()?, 0);
+    assert_eq!(uninterrupted.runtime().accumulation_index()?, 0);
     assert_eq!(
-        uninterrupted.gradient_accumulator_snapshots()?,
+        uninterrupted.runtime().gradient_accumulator_snapshots()?,
         empty_accumulators
     );
     let after_reset = uninterrupted.checkpoint()?;
@@ -934,7 +952,7 @@ where
     assert_eq!(uninterrupted.checkpoint()?, after_reset);
 
     for replay in 3..=INITIAL_STEPS as u64 {
-        let step = uninterrupted.step_batch(batch(replay)?, 0.05)?;
+        let step = replay_prepared_transformer(&mut uninterrupted, replay)?;
         assert_eq!(step.optimizer_step(), 0);
         assert_eq!(step.accumulation_index(), replay - 2);
         assert!(!step.did_update());
@@ -980,14 +998,14 @@ where
     .map_err(|error| error.into_parts().1)?;
     assert_eq!(restored_plan.capture_identity(), capture_identity);
     assert_eq!(restored_plan.step_count(), INITIAL_STEPS as u64);
-    let mut resumed = prepare(restored_plan)?;
-    assert_eq!(resumed.optimizer_step()?, 0);
-    assert_eq!(resumed.accumulation_index()?, 2);
+    let mut resumed = prepare(restored_plan)?.into_training_session();
+    assert_eq!(resumed.runtime().optimizer_step()?, 0);
+    assert_eq!(resumed.runtime().accumulation_index()?, 2);
     assert_eq!(resumed.checkpoint()?, checkpoint);
 
     for replay in resumed_first_replay..=resumed_last_replay {
-        let expected = uninterrupted.step_batch(batch(replay)?, 0.05)?;
-        let actual = resumed.step_batch(batch(replay)?, 0.05)?;
+        let expected = replay_prepared_transformer(&mut uninterrupted, replay)?;
+        let actual = replay_prepared_transformer(&mut resumed, replay)?;
         assert_eq!(actual.loss(), expected.loss());
         assert_eq!(actual.outputs(), expected.outputs());
         assert_eq!(actual.step(), expected.step());
@@ -1029,27 +1047,27 @@ where
     assert_eq!(empty_flush.committed_microbatches(), 0);
     assert!(!empty_flush.did_commit_window());
     assert_eq!(resumed.checkpoint()?, after_flush);
-    assert_eq!(resumed.optimizer_step()?, 2);
-    assert_eq!(resumed.accumulation_index()?, 0);
+    assert_eq!(resumed.runtime().optimizer_step()?, 2);
+    assert_eq!(resumed.runtime().accumulation_index()?, 0);
 
     assert_eq!(
         resumed.parameter_snapshots()?,
         uninterrupted.parameter_snapshots()?
     );
     assert_eq!(
-        resumed.first_moment_snapshots()?,
-        uninterrupted.first_moment_snapshots()?
+        resumed.runtime().first_moment_snapshots()?,
+        uninterrupted.runtime().first_moment_snapshots()?
     );
     assert_eq!(
-        resumed.second_moment_snapshots()?,
-        uninterrupted.second_moment_snapshots()?
+        resumed.runtime().second_moment_snapshots()?,
+        uninterrupted.runtime().second_moment_snapshots()?
     );
     assert_eq!(
-        resumed.gradient_accumulator_snapshots()?,
-        uninterrupted.gradient_accumulator_snapshots()?
+        resumed.runtime().gradient_accumulator_snapshots()?,
+        uninterrupted.runtime().gradient_accumulator_snapshots()?
     );
     assert_eq!(
-        resumed.gradient_accumulator_snapshots()?,
+        resumed.runtime().gradient_accumulator_snapshots()?,
         empty_accumulators
     );
     assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
@@ -1520,7 +1538,7 @@ where
     for replay in 1..=4 {
         let batch = file_resume_batch(replay)?;
         let loss_weight = loss_mask_weight(batch.loss_mask());
-        let step = uninterrupted.step_batch_with_rate_policy(batch)?;
+        let step = replay_prepared_policy_batch(&mut uninterrupted, batch)?;
         validate_step(&step);
         assert_eq!(step.loss_weight(), loss_weight);
         assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
@@ -1645,8 +1663,9 @@ where
         Some(saved_dropout_cursor)
     );
     for replay in 5..=LAST_REPLAY {
-        let expected = uninterrupted.step_batch_with_rate_policy(file_resume_batch(replay)?)?;
-        let actual = resumed.step_batch_with_rate_policy(file_resume_batch(replay)?)?;
+        let expected =
+            replay_prepared_policy_batch(&mut uninterrupted, file_resume_batch(replay)?)?;
+        let actual = replay_prepared_policy_batch(&mut resumed, file_resume_batch(replay)?)?;
         validate_step(&expected);
         validate_step(&actual);
         assert_eq!(actual.loss(), expected.loss());
@@ -1684,8 +1703,9 @@ where
         );
         assert_eq!(actual_checkpoint, expected_checkpoint);
     }
-    let expected_partial = uninterrupted.step_batch_with_rate_policy(file_resume_batch(10)?)?;
-    let actual_partial = resumed.step_batch_with_rate_policy(file_resume_batch(10)?)?;
+    let expected_partial =
+        replay_prepared_policy_batch(&mut uninterrupted, file_resume_batch(10)?)?;
+    let actual_partial = replay_prepared_policy_batch(&mut resumed, file_resume_batch(10)?)?;
     validate_step(&expected_partial);
     validate_step(&actual_partial);
     assert_eq!(actual_partial.loss(), expected_partial.loss());
@@ -1697,8 +1717,9 @@ where
         expected_flush.did_commit_window()
     );
     assert_eq!(actual_flush.committed_microbatches(), 1);
-    let expected_discard = uninterrupted.step_batch_with_rate_policy(file_resume_batch(11)?)?;
-    let actual_discard = resumed.step_batch_with_rate_policy(file_resume_batch(11)?)?;
+    let expected_discard =
+        replay_prepared_policy_batch(&mut uninterrupted, file_resume_batch(11)?)?;
+    let actual_discard = replay_prepared_policy_batch(&mut resumed, file_resume_batch(11)?)?;
     validate_step(&expected_discard);
     validate_step(&actual_discard);
     assert_eq!(actual_discard.loss(), expected_discard.loss());
