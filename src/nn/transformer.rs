@@ -52,6 +52,54 @@ pub trait TrainingDropoutProvider {
     }
 }
 
+/// Storage policy for the mixed-precision Transformer training route.
+///
+/// Parameters, normalization, attention, and dropout remain F32. The selected
+/// dtype applies only to projection, feed-forward, and residual activation
+/// storage; callers retain responsibility for constructing the final loss in
+/// F32.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TransformerPrecision {
+    storage_dtype: DType,
+}
+
+impl TransformerPrecision {
+    /// Stores projection, feed-forward, and residual activations in F32.
+    pub const F32: Self = Self {
+        storage_dtype: DType::F32,
+    };
+    /// Stores projection, feed-forward, and residual activations in F16.
+    pub const F16: Self = Self {
+        storage_dtype: DType::F16,
+    };
+    /// Stores projection, feed-forward, and residual activations in BF16.
+    pub const BF16: Self = Self {
+        storage_dtype: DType::BF16,
+    };
+
+    /// Validates the bounded Transformer storage inventory.
+    pub fn new(storage_dtype: DType) -> Result<Self> {
+        if !matches!(storage_dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return Err(Error::InvalidElementwiseDType {
+                op: "Transformer precision storage",
+                actual: storage_dtype,
+            });
+        }
+        Ok(Self { storage_dtype })
+    }
+
+    /// Returns the selected activation-storage dtype.
+    pub const fn storage_dtype(self) -> DType {
+        self.storage_dtype
+    }
+}
+
+impl Default for TransformerPrecision {
+    fn default() -> Self {
+        Self::F32
+    }
+}
+
 struct IdentityTrainingDropout;
 
 impl TrainingDropoutProvider for IdentityTrainingDropout {
@@ -85,6 +133,15 @@ impl TransformerProjection {
     }
 
     fn forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
+        self.forward_with_precision(graph, input, TransformerPrecision::F32)
+    }
+
+    fn forward_with_precision(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        precision: TransformerPrecision,
+    ) -> Result<NodeId> {
         if graph.shape(input)?.dims().last().copied() != Some(self.input) {
             return Err(Error::InvalidMatmul {
                 lhs: graph.shape(input)?.clone(),
@@ -93,7 +150,8 @@ impl TransformerProjection {
         }
         let weight = self.weight.bind(graph)?;
         let bias = self.bias.bind(graph)?;
-        graph.linear(input, weight, Some(bias), None)
+        let dtype = (precision != TransformerPrecision::F32).then_some(precision.storage_dtype());
+        graph.linear(input, weight, Some(bias), dtype)
     }
 }
 
@@ -373,6 +431,35 @@ impl<A: ModuleForward> TransformerBlock<A> {
         Ok((query, key, value))
     }
 
+    fn cast_if_needed(graph: &mut Graph, input: NodeId, dtype: DType) -> Result<NodeId> {
+        if graph.dtype(input)? == dtype {
+            Ok(input)
+        } else {
+            graph.cast(input, dtype)
+        }
+    }
+
+    fn attention_heads_with_precision(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        batch: usize,
+        time: usize,
+        precision: TransformerPrecision,
+    ) -> Result<(NodeId, NodeId, NodeId)> {
+        let heads = |graph: &mut Graph, projection: &TransformerProjection| -> Result<NodeId> {
+            let projected = projection.forward_with_precision(graph, input, precision)?;
+            let projected = Self::cast_if_needed(graph, projected, DType::F32)?;
+            let projected =
+                graph.reshape(projected, [batch, time, self.num_heads, self.head_size])?;
+            graph.permute(projected, vec![0, 2, 1, 3])
+        };
+        let query = heads(graph, &self.query)?;
+        let key = heads(graph, &self.key)?;
+        let value = heads(graph, &self.value)?;
+        Ok((query, key, value))
+    }
+
     fn finish_attention(
         &self,
         graph: &mut Graph,
@@ -388,6 +475,20 @@ impl<A: ModuleForward> TransformerBlock<A> {
         let attended = graph.contiguous(attended)?;
         let attended = graph.reshape(attended, [batch, time, self.embedding_dim])?;
         self.out.forward(graph, attended)
+    }
+
+    fn finish_attention_with_precision(
+        &self,
+        graph: &mut Graph,
+        attended: NodeId,
+        batch: usize,
+        time: usize,
+        precision: TransformerPrecision,
+    ) -> Result<NodeId> {
+        let attended = graph.permute(attended, vec![0, 2, 1, 3])?;
+        let attended = graph.contiguous(attended)?;
+        let attended = graph.reshape(attended, [batch, time, self.embedding_dim])?;
+        self.out.forward_with_precision(graph, attended, precision)
     }
 
     fn zero_invalid_attention_rows(
@@ -525,10 +626,179 @@ impl<A: ModuleForward> TransformerBlock<A> {
         self.finish_attention(graph, attended, plan.batch, plan.time)
     }
 
+    fn attention_with_precision<P: TrainingDropoutProvider + ?Sized>(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: Option<(NodeId, &AttentionKeepMaskPlan)>,
+        precision: TransformerPrecision,
+        provider: &mut P,
+    ) -> Result<NodeId> {
+        let (batch, time) = match attention_mask {
+            Some((_, plan)) => (plan.batch, plan.time),
+            None => self.geometry(graph, input)?,
+        };
+        let (query, key, value) =
+            self.attention_heads_with_precision(graph, input, batch, time, precision)?;
+        let lowered = attention_mask
+            .map(|(mask, plan)| self.lower_attention_keep_mask(graph, mask, plan))
+            .transpose()?;
+        let attended = graph.scaled_dot_product_attention_with_dropout(
+            query,
+            key,
+            value,
+            lowered.map(|mask| mask.safe_mask),
+            AttentionOptions {
+                is_causal: self.is_causal && lowered.is_none(),
+                dropout_p: self.attention_dropout,
+                training: true,
+                ..AttentionOptions::default()
+            },
+            |graph, probabilities, probability| {
+                let probabilities = if let Some(mask) = lowered {
+                    Self::zero_invalid_attention_rows(graph, probabilities, mask.row_valid)?
+                } else {
+                    probabilities
+                };
+                if self.attention_dropout == 0.0 {
+                    return Ok(probabilities);
+                }
+                let dropped = provider.attention_dropout(graph, probabilities, probability)?;
+                if graph.dtype(dropped)? != DType::F32 {
+                    return Err(Error::InvalidElementwiseDType {
+                        op: "Transformer attention dropout output",
+                        actual: graph.dtype(dropped)?,
+                    });
+                }
+                if graph.shape(dropped)? != graph.shape(probabilities)? {
+                    return Err(Error::ShapeMismatch {
+                        op: "Transformer attention dropout output",
+                        lhs: graph.shape(dropped)?.clone(),
+                        rhs: graph.shape(probabilities)?.clone(),
+                    });
+                }
+                Ok(dropped)
+            },
+        )?;
+        self.finish_attention_with_precision(graph, attended, batch, time, precision)
+    }
+
     fn feed_forward(&self, graph: &mut Graph, input: NodeId) -> Result<NodeId> {
         let hidden = self.ff1.forward(graph, input)?;
         let hidden = self.activation.forward(graph, hidden)?;
         self.ff2.forward(graph, hidden)
+    }
+
+    fn feed_forward_with_precision(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        precision: TransformerPrecision,
+    ) -> Result<NodeId> {
+        let hidden = self.ff1.forward_with_precision(graph, input, precision)?;
+        let hidden = self.activation.forward(graph, hidden)?;
+        let hidden = Self::cast_if_needed(graph, hidden, precision.storage_dtype())?;
+        self.ff2.forward_with_precision(graph, hidden, precision)
+    }
+
+    fn provider_dropout_with_precision<P: TrainingDropoutProvider + ?Sized>(
+        graph: &mut Graph,
+        input: NodeId,
+        probability: f64,
+        precision: TransformerPrecision,
+        provider: &mut P,
+    ) -> Result<NodeId> {
+        let input_f32 = Self::cast_if_needed(graph, input, DType::F32)?;
+        let dropped = provider.dropout(graph, input_f32, probability)?;
+        if graph.dtype(dropped)? != DType::F32 {
+            return Err(Error::InvalidElementwiseDType {
+                op: "Transformer residual dropout output",
+                actual: graph.dtype(dropped)?,
+            });
+        }
+        if graph.shape(dropped)? != graph.shape(input_f32)? {
+            return Err(Error::ShapeMismatch {
+                op: "Transformer residual dropout output",
+                lhs: graph.shape(dropped)?.clone(),
+                rhs: graph.shape(input_f32)?.clone(),
+            });
+        }
+        Self::cast_if_needed(graph, dropped, precision.storage_dtype())
+    }
+
+    fn normalize_f32(graph: &mut Graph, input: NodeId, norm: &LayerNorm) -> Result<NodeId> {
+        let input = Self::cast_if_needed(graph, input, DType::F32)?;
+        let output = norm.forward(graph, input)?;
+        Self::cast_if_needed(graph, output, DType::F32)
+    }
+
+    fn lower_with_precision<P: TrainingDropoutProvider + ?Sized>(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: Option<(NodeId, &AttentionKeepMaskPlan)>,
+        precision: TransformerPrecision,
+        provider: &mut P,
+    ) -> Result<NodeId> {
+        if !graph.dtype(input)?.is_float() {
+            return Err(Error::InvalidElementwiseDType {
+                op: "Transformer precision input",
+                actual: graph.dtype(input)?,
+            });
+        }
+        let input = Self::cast_if_needed(graph, input, precision.storage_dtype())?;
+        if self.prenorm {
+            let normalized = Self::normalize_f32(graph, input, &self.ln1)?;
+            let attended = self.attention_with_precision(
+                graph,
+                normalized,
+                attention_mask,
+                precision,
+                provider,
+            )?;
+            let attended = Self::provider_dropout_with_precision(
+                graph,
+                attended,
+                self.dropout,
+                precision,
+                provider,
+            )?;
+            let residual = graph.add(input, attended)?;
+            let normalized = Self::normalize_f32(graph, residual, &self.ln2)?;
+            let feed_forward = self.feed_forward_with_precision(graph, normalized, precision)?;
+            let feed_forward = Self::provider_dropout_with_precision(
+                graph,
+                feed_forward,
+                self.dropout,
+                precision,
+                provider,
+            )?;
+            graph.add(residual, feed_forward)
+        } else {
+            let attended =
+                self.attention_with_precision(graph, input, attention_mask, precision, provider)?;
+            let attended = Self::provider_dropout_with_precision(
+                graph,
+                attended,
+                self.dropout,
+                precision,
+                provider,
+            )?;
+            let residual = graph.add(input, attended)?;
+            let residual = Self::normalize_f32(graph, residual, &self.ln1)?;
+            let residual = Self::cast_if_needed(graph, residual, precision.storage_dtype())?;
+            let feed_forward = self.feed_forward_with_precision(graph, residual, precision)?;
+            let feed_forward = Self::provider_dropout_with_precision(
+                graph,
+                feed_forward,
+                self.dropout,
+                precision,
+                provider,
+            )?;
+            let output = graph.add(residual, feed_forward)?;
+            let output = Self::normalize_f32(graph, output, &self.ln2)?;
+            Self::cast_if_needed(graph, output, precision.storage_dtype())
+        }
     }
 
     fn apply_dropout(
@@ -715,6 +985,40 @@ impl<A: ModuleForward> TransformerBlock<A> {
         self.lower_with_dropout(graph, input, &mut |graph, input, _branch| {
             provider.dropout(graph, input, self.dropout)
         })
+    }
+
+    /// Lowers one training block with F32 state and arithmetic islands around
+    /// normalization, attention, and dropout while storing projections,
+    /// feed-forward activations, residuals, and the returned output in the
+    /// selected precision.
+    ///
+    /// `attention_mask`, when present, follows the same Bool keep-mask
+    /// contract as [`Self::forward_training_with_dropout_and_attention_mask`].
+    /// Built-in descriptor and lowering failures are clone-rehearsed before
+    /// the caller's provider is invoked or the graph is changed. Provider
+    /// failures retain the ordinary provider-backed prefix behavior.
+    pub fn forward_training_with_precision<P: TrainingDropoutProvider + ?Sized>(
+        &self,
+        graph: &mut Graph,
+        input: NodeId,
+        attention_mask: Option<NodeId>,
+        precision: TransformerPrecision,
+        provider: &mut P,
+    ) -> Result<NodeId> {
+        let plan = attention_mask
+            .map(|mask| self.attention_keep_mask_plan(graph, input, mask))
+            .transpose()?;
+        let planned_mask = attention_mask.zip(plan.as_ref());
+        let mut candidate = graph.clone();
+        let mut rehearsal_provider = IdentityTrainingDropout;
+        self.lower_with_precision(
+            &mut candidate,
+            input,
+            planned_mask,
+            precision,
+            &mut rehearsal_provider,
+        )?;
+        self.lower_with_precision(graph, input, planned_mask, precision, provider)
     }
 
     /// Lowers provider-backed training with a caller-supplied Bool attention
@@ -1077,6 +1381,246 @@ mod tests {
         assert!((0..narrow_graph.node_count()).all(|index| {
             !matches!(narrow_graph.op(NodeId(index)).unwrap(), Op::Matmul { .. })
         }));
+    }
+
+    #[test]
+    fn transformer_precision_keeps_f32_state_attention_and_dropout_around_narrow_storage() {
+        #[derive(Default)]
+        struct BoundaryDropout {
+            inputs: Vec<NodeId>,
+        }
+
+        impl TrainingDropoutProvider for BoundaryDropout {
+            fn dropout(
+                &mut self,
+                _graph: &mut Graph,
+                input: NodeId,
+                _probability: f64,
+            ) -> Result<NodeId> {
+                self.inputs.push(input);
+                Ok(input)
+            }
+        }
+
+        assert_eq!(TransformerPrecision::default(), TransformerPrecision::F32);
+        assert_eq!(
+            TransformerPrecision::new(DType::F16).unwrap(),
+            TransformerPrecision::F16
+        );
+        assert_eq!(
+            TransformerPrecision::new(DType::BF16).unwrap(),
+            TransformerPrecision::BF16
+        );
+        assert!(matches!(
+            TransformerPrecision::new(DType::F64),
+            Err(Error::InvalidElementwiseDType {
+                op: "Transformer precision storage",
+                actual: DType::F64,
+            })
+        ));
+
+        for precision in [TransformerPrecision::F16, TransformerPrecision::BF16] {
+            let storage = precision.storage_dtype();
+            let block = TransformerBlock::new_static(4, 2, 8, true, 0.25, 5)
+                .unwrap()
+                .with_causal_attention(true)
+                .with_attention_dropout(0.25)
+                .unwrap();
+            let mut graph = Graph::new();
+            let input = graph.input("input", [1, 3, 4]);
+            let attention_mask = graph.input_dtype("attention_mask", [1, 1, 3, 3], DType::Bool);
+            let mut parameter_nodes = Vec::new();
+            block.visit("", &mut |_, parameter, kind| {
+                if kind == StateKind::Parameter {
+                    parameter_nodes.push(parameter.bind(&mut graph).unwrap());
+                }
+            });
+            assert_eq!(parameter_nodes.len(), 16);
+            assert!(
+                parameter_nodes
+                    .iter()
+                    .all(|node| graph.dtype(*node).unwrap() == DType::F32)
+            );
+
+            let mut dropout = BoundaryDropout::default();
+            let output = block
+                .forward_training_with_precision(
+                    &mut graph,
+                    input,
+                    Some(attention_mask),
+                    precision,
+                    &mut dropout,
+                )
+                .unwrap();
+            assert_eq!(graph.dtype(output).unwrap(), storage);
+            assert_eq!(dropout.inputs.len(), 3);
+            assert!(
+                dropout
+                    .inputs
+                    .iter()
+                    .all(|node| graph.dtype(*node).unwrap() == DType::F32)
+            );
+            for residual_dropout in &dropout.inputs[1..] {
+                let Op::Cast {
+                    input: narrow,
+                    dtype: DType::F32,
+                } = graph.op(*residual_dropout).unwrap()
+                else {
+                    panic!("residual dropout must enter through an F32 cast")
+                };
+                assert_eq!(graph.dtype(*narrow).unwrap(), storage);
+            }
+
+            let raw_matmuls = (0..graph.node_count())
+                .map(NodeId)
+                .filter_map(|node| match graph.op(node).unwrap() {
+                    Op::Matmul { lhs, rhs } => Some((node, *lhs, *rhs)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(raw_matmuls.len(), 2);
+            assert!(raw_matmuls.iter().all(|(output, lhs, rhs)| {
+                [*output, *lhs, *rhs]
+                    .into_iter()
+                    .all(|node| graph.dtype(node).unwrap() == DType::F32)
+            }));
+            assert!((0..graph.node_count()).map(NodeId).any(|node| {
+                let Ok(Op::Cast { input, dtype }) = graph.op(node) else {
+                    return false;
+                };
+                *dtype == storage
+                    && matches!(
+                        graph.op(*input),
+                        Ok(Op::Reduce {
+                            accumulator: DType::F32,
+                            ..
+                        })
+                    )
+            }));
+
+            let output_f32 = graph.cast(output, DType::F32).unwrap();
+            let loss = graph.sum_all(output_f32).unwrap();
+            assert_eq!(graph.dtype(loss).unwrap(), DType::F32);
+            let gradients = graph.gradient_default(loss, &parameter_nodes).unwrap();
+            assert_eq!(gradients.len(), parameter_nodes.len());
+            assert!(
+                gradients
+                    .iter()
+                    .all(|gradient| graph.dtype(*gradient).unwrap() == DType::F32)
+            );
+        }
+    }
+
+    #[test]
+    fn transformer_precision_clone_rehearses_before_graph_or_provider_publication() {
+        #[derive(Default)]
+        struct CountingDropout(usize);
+
+        impl TrainingDropoutProvider for CountingDropout {
+            fn dropout(
+                &mut self,
+                _graph: &mut Graph,
+                input: NodeId,
+                _probability: f64,
+            ) -> Result<NodeId> {
+                self.0 += 1;
+                Ok(input)
+            }
+        }
+
+        let block = TransformerBlock::new_static_with_activation(
+            4,
+            2,
+            8,
+            true,
+            0.25,
+            7,
+            ActivationFn::new(|graph: &mut Graph, input| -> Result<NodeId> {
+                let _published_only_to_candidate = graph.square(input)?;
+                Err(Error::InvalidAttention {
+                    reason: "precision rehearsal failure",
+                })
+            }),
+        )
+        .unwrap()
+        .with_causal_attention(true)
+        .with_attention_dropout(0.25)
+        .unwrap();
+        let mut graph = Graph::new();
+        let input = graph.input("input", [1, 3, 4]);
+        let before = graph.node_count();
+        let mut provider = CountingDropout::default();
+        assert_eq!(
+            block.forward_training_with_precision(
+                &mut graph,
+                input,
+                None,
+                TransformerPrecision::F16,
+                &mut provider,
+            ),
+            Err(Error::InvalidAttention {
+                reason: "precision rehearsal failure",
+            })
+        );
+        assert_eq!(graph.node_count(), before);
+        assert_eq!(provider.0, 0);
+    }
+
+    #[test]
+    fn transformer_f32_precision_preserves_the_legacy_training_graph() {
+        #[derive(Default)]
+        struct IdentityDropout;
+
+        impl TrainingDropoutProvider for IdentityDropout {
+            fn dropout(
+                &mut self,
+                _graph: &mut Graph,
+                input: NodeId,
+                _probability: f64,
+            ) -> Result<NodeId> {
+                Ok(input)
+            }
+        }
+
+        let block = TransformerBlock::new_static(4, 2, 8, true, 0.25, 11)
+            .unwrap()
+            .with_causal_attention(true)
+            .with_attention_dropout(0.25)
+            .unwrap();
+        let lower_legacy = |precision: Option<TransformerPrecision>| {
+            let mut graph = Graph::new();
+            let input = graph.input("input", [1, 3, 4]);
+            let mut dropout = IdentityDropout;
+            let output = match precision {
+                Some(precision) => block
+                    .forward_training_with_precision(
+                        &mut graph,
+                        input,
+                        None,
+                        precision,
+                        &mut dropout,
+                    )
+                    .unwrap(),
+                None => block
+                    .forward_training_with_dropout(&mut graph, input, &mut dropout)
+                    .unwrap(),
+            };
+            let nodes = (0..graph.node_count())
+                .map(|index| {
+                    let node = NodeId(index);
+                    (
+                        format!("{:?}", graph.op(node).unwrap()),
+                        graph.shape(node).unwrap().clone(),
+                        graph.dtype(node).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (output, nodes)
+        };
+        assert_eq!(
+            lower_legacy(None),
+            lower_legacy(Some(TransformerPrecision::F32))
+        );
     }
 
     #[test]
