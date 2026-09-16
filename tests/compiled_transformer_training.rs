@@ -10,10 +10,11 @@ use rustgrad::{
     Backend, BinaryOp, CapturedReplayExecutor, CapturedReplayOptions, CapturedSchedule, CompareOp,
     CompiledAdamWCheckpoint, CompiledAdamWClipReport, CompiledAdamWConfig, CompiledAdamWFlush,
     CompiledAdamWGraph, CompiledAdamWIgnoreIndexContext, CompiledAdamWObjective, CompiledAdamWPlan,
-    CompiledAdamWProgramArtifact, CompiledAdamWRuntime, CompiledAdamWStep, CompiledAdamWStepResult,
-    CompiledAdamWWindowLossReport, CompiledCheckpointRestoreRuntime, CompiledCheckpointRuntime,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
-    CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
+    CompiledAdamWProgramArtifact, CompiledAdamWResumeBundle, CompiledAdamWRuntime,
+    CompiledAdamWStep, CompiledAdamWStepResult, CompiledAdamWWindowLossReport,
+    CompiledCheckpointRestoreRuntime, CompiledCheckpointRuntime, CompiledDropoutConfig,
+    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
+    CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
     CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledTrainingRuntime, CompiledTrainingStep,
     CompiledTrainingWindowCommit, CompiledTrainingWindowCommitRuntime,
     CompiledTrainingWindowResetRuntime, CompiledTrainingWindowRuntime, CompiledTrainingWindowStep,
@@ -451,6 +452,62 @@ impl Module for TwoBlockPositionalGpt {
             &self.tokens.weight,
             StateKind::Parameter,
         );
+    }
+}
+
+struct BufferedTwoBlockPositionalGpt {
+    transformer: TwoBlockPositionalGpt,
+    running_marker: Parameter,
+}
+
+impl BufferedTwoBlockPositionalGpt {
+    fn new(seed: u64, attention_dropout: f64) -> Result<Self> {
+        Ok(Self {
+            transformer: TwoBlockPositionalGpt::new_with_attention_dropout(
+                seed,
+                attention_dropout,
+            )?,
+            running_marker: Parameter::new(TensorData::scalar(3.0), false),
+        })
+    }
+}
+
+impl Module for BufferedTwoBlockPositionalGpt {
+    fn visit(&self, prefix: &str, visitor: &mut dyn FnMut(String, &Parameter, StateKind)) {
+        self.transformer.visit(prefix, visitor);
+        let name = if prefix.is_empty() {
+            "running_marker".to_owned()
+        } else {
+            format!("{prefix}.running_marker")
+        };
+        visitor(name, &self.running_marker, StateKind::Buffer);
+    }
+}
+
+struct TemporaryResumeBundleFile {
+    path: std::path::PathBuf,
+}
+
+impl TemporaryResumeBundleFile {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            path: std::env::temp_dir().join(format!(
+                "rustgrad-owned-bf16-transformer-resume-{}-{ordinal}.rgab",
+                std::process::id()
+            )),
+        }
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryResumeBundleFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -3041,6 +3098,33 @@ fn assert_native_policy_preparation(runtime: &NativeCpuCompiledAdamW<'_>) {
         assert_eq!(program.fallback_count(), 0, "{phase} fallback");
     }
     assert!(preparation.evaluation().is_none());
+}
+
+fn assert_native_policy_frontier_is_f32(
+    runtime: &NativeCpuCompiledAdamW<'_>,
+    expected_parameter_count: usize,
+    expected_coordinate_count: usize,
+) {
+    for (label, state) in [
+        ("parameters", runtime.parameter_snapshots().unwrap()),
+        ("first moments", runtime.first_moment_snapshots().unwrap()),
+        ("second moments", runtime.second_moment_snapshots().unwrap()),
+        (
+            "gradient accumulators",
+            runtime.gradient_accumulator_snapshots().unwrap(),
+        ),
+    ] {
+        assert_eq!(state.len(), expected_parameter_count, "{label} count");
+        assert_eq!(
+            state.values().map(TensorData::len).sum::<usize>(),
+            expected_coordinate_count,
+            "{label} coordinate count"
+        );
+        assert!(
+            state.values().all(|tensor| tensor.dtype() == DType::F32),
+            "{label} must remain F32"
+        );
+    }
 }
 
 fn native_policy_preparation_identity(
@@ -9919,6 +10003,288 @@ fn compiled_two_block_bf16_adamw_window_matches_pytorch_across_checkpoint() {
     assert_eq!(compile_count.get(), 1);
     assert_eq!(model.state_dict().unwrap(), state_before);
     assert_eq!(module_parameter_state(&model), parameter_state_before);
+}
+
+#[test]
+fn owned_bf16_two_block_transformer_resumes_from_file_on_strict_native() {
+    const ATTENTION_DROPOUT: f64 = 0.25;
+
+    let fixture = two_block_pytorch_fixture();
+    let expected = &fixture.mixed_precision_policy_window;
+    assert_eq!(expected.storage_dtype, "bfloat16");
+    assert_eq!(expected.accumulation_steps, 3);
+    assert_eq!(expected.active_parameter_count, 35);
+    assert_eq!(expected.active_coordinate_count, 372);
+
+    let source = BufferedTwoBlockPositionalGpt::new(0x5678, ATTENTION_DROPOUT).unwrap();
+    let source_initial = source.state_dict().unwrap();
+    let training_builds = Cell::new(0);
+    let evaluation_builds = Cell::new(0);
+    let source_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout_and_ignore_index(
+        two_block_mixed_precision_policy_config(),
+        dropout_config(),
+        source,
+        |module, graph, inputs, ignore_index, dropout| {
+            training_builds.set(training_builds.get() + 1);
+            build_two_block_mixed_precision_policy_frontier(
+                &module.transformer,
+                graph,
+                inputs,
+                ignore_index,
+                dropout,
+            )
+        },
+    )
+    .unwrap()
+    .with_evaluation_graph_and_ignore_index(|module, graph, inputs, ignore_index| {
+        evaluation_builds.set(evaluation_builds.get() + 1);
+        build_two_block_policy_evaluation(&module.transformer, graph, inputs, ignore_index)
+    })
+    .unwrap();
+    assert_eq!(training_builds.get(), 1);
+    assert_eq!(evaluation_builds.get(), 1);
+    let capture_identity = source_plan.capture_identity();
+    let evaluation_capture_identity = source_plan.evaluation_capture_identity();
+    let program_artifact = source_plan.program_artifact().unwrap();
+
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor)
+        .vectorized(true)
+        .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut uninterrupted = source_plan.prepare(&target).unwrap();
+    let preparation = uninterrupted.native_cpu_preparation_report();
+    for (phase, program) in [
+        ("main", Some(preparation.main())),
+        ("accumulation", preparation.accumulation()),
+        ("partial flush", preparation.partial_flush()),
+        ("zero grad", preparation.zero_grad()),
+        ("evaluation", preparation.evaluation()),
+    ] {
+        let program = program.unwrap_or_else(|| panic!("{phase} was not prepared"));
+        assert_eq!(program.fallback_count(), 0, "{phase} fallback");
+        assert!(
+            program.work().rendered_entry_count() > 0,
+            "{phase} must retain physical native work"
+        );
+    }
+
+    let first = uninterrupted
+        .step_scheduled(policy_frontier_batch(1))
+        .unwrap();
+    let second = uninterrupted
+        .step_scheduled(policy_frontier_batch(2))
+        .unwrap();
+    for (step, replay) in [(&first, 0), (&second, 1)] {
+        assert_native_policy_step(step, &expected.replays[replay]);
+        assert_eq!(step.loss().dtype(), DType::F32);
+        assert!(!step.did_update());
+    }
+    assert_eq!(uninterrupted.accumulation_index().unwrap(), 2);
+    assert_native_policy_frontier_is_f32(
+        uninterrupted.runtime(),
+        expected.active_parameter_count,
+        expected.active_coordinate_count,
+    );
+    assert!(
+        uninterrupted
+            .gradient_accumulator_snapshots()
+            .unwrap()
+            .values()
+            .flat_map(TensorData::to_vec_f64)
+            .any(|value| value != 0.0)
+    );
+
+    let pending_checkpoint = uninterrupted.checkpoint().unwrap();
+    assert_policy_pending_checkpoint(
+        "owned BF16 pending window",
+        &pending_checkpoint,
+        &expected.pending_checkpoint,
+    );
+    let module_checkpoint = uninterrupted.module_checkpoint().unwrap();
+    assert_eq!(
+        module_checkpoint.optimizer_checkpoint(),
+        &pending_checkpoint
+    );
+    assert_eq!(
+        module_checkpoint.evaluation_capture_identity(),
+        evaluation_capture_identity
+    );
+    let saved_resume_bundle =
+        CompiledAdamWResumeBundle::new(program_artifact, module_checkpoint.clone()).unwrap();
+    let resume_file = TemporaryResumeBundleFile::new();
+    saved_resume_bundle.save_file(resume_file.path()).unwrap();
+    let resume_bundle = CompiledAdamWResumeBundle::load_file(resume_file.path()).unwrap();
+    assert_eq!(resume_bundle, saved_resume_bundle);
+    assert_eq!(resume_bundle.checkpoint(), &module_checkpoint);
+
+    let destination = BufferedTwoBlockPositionalGpt::new(0x9abc, ATTENTION_DROPOUT).unwrap();
+    destination
+        .running_marker
+        .replace(TensorData::scalar(29.0))
+        .unwrap();
+    let destination_initial = destination.state_dict().unwrap();
+    assert_ne!(destination_initial.tensors(), source_initial.tensors());
+    let destination_tied_identity = destination.transformer.tokens.weight.id();
+    let mut destination_states = Vec::new();
+    destination.visit("", &mut |name, parameter, kind| {
+        destination_states.push((name, parameter.clone(), kind, parameter.snapshot().unwrap()));
+    });
+    let restored_plan =
+        CompiledModuleAdamWPlan::restore_from_resume_bundle(destination, &resume_bundle).unwrap();
+    assert_eq!(
+        training_builds.get(),
+        1,
+        "resume rebuilt the training graph"
+    );
+    assert_eq!(evaluation_builds.get(), 1, "resume rebuilt the evaluator");
+    assert_eq!(restored_plan.capture_identity(), capture_identity);
+    assert_eq!(
+        restored_plan.evaluation_capture_identity(),
+        evaluation_capture_identity
+    );
+    let mut resumed = restored_plan.prepare(&target).unwrap();
+    let resumed_preparation = resumed.native_cpu_preparation_report();
+    for (phase, program) in [
+        ("main", Some(resumed_preparation.main())),
+        ("accumulation", resumed_preparation.accumulation()),
+        ("partial flush", resumed_preparation.partial_flush()),
+        ("zero grad", resumed_preparation.zero_grad()),
+        ("evaluation", resumed_preparation.evaluation()),
+    ] {
+        assert_eq!(
+            program
+                .unwrap_or_else(|| panic!("restored {phase} was not prepared"))
+                .fallback_count(),
+            0,
+            "restored {phase} fallback"
+        );
+    }
+    assert_eq!(resumed.checkpoint().unwrap(), pending_checkpoint);
+    assert_eq!(resumed.module_checkpoint().unwrap(), module_checkpoint);
+    assert_native_policy_frontier_is_f32(
+        resumed.runtime(),
+        expected.active_parameter_count,
+        expected.active_coordinate_count,
+    );
+    for (_, parameter, _, before) in &destination_states {
+        let after = parameter.snapshot().unwrap();
+        assert_eq!(after.data, before.data);
+        assert_eq!(after.shape, before.shape);
+        assert_eq!(after.dtype, before.dtype);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.trainable, before.trainable);
+        assert_eq!(after.input_name, before.input_name);
+    }
+
+    let evaluation_inputs = policy_frontier_batch(1);
+    let uninterrupted_before_evaluation = uninterrupted.checkpoint().unwrap();
+    let resumed_before_evaluation = resumed.checkpoint().unwrap();
+    let expected_evaluation = uninterrupted.evaluate(evaluation_inputs.clone()).unwrap();
+    let actual_evaluation = resumed.evaluate(evaluation_inputs).unwrap();
+    assert_eq!(expected_evaluation.report().fallback_count(), 0);
+    assert_eq!(actual_evaluation.report().fallback_count(), 0);
+    assert_eq!(actual_evaluation.loss(), expected_evaluation.loss());
+    assert_eq!(actual_evaluation.loss().dtype(), DType::F32);
+    assert_eq!(actual_evaluation.outputs(), expected_evaluation.outputs());
+    assert_eq!(
+        actual_evaluation.loss_weight(),
+        expected_evaluation.loss_weight()
+    );
+    assert_eq!(
+        actual_evaluation.capture_identity(),
+        evaluation_capture_identity.unwrap()
+    );
+    assert_eq!(
+        uninterrupted.checkpoint().unwrap(),
+        uninterrupted_before_evaluation
+    );
+    assert_eq!(resumed.checkpoint().unwrap(), resumed_before_evaluation);
+
+    let expected_third = uninterrupted
+        .step_scheduled(policy_frontier_batch(3))
+        .unwrap();
+    let actual_third = resumed.step_scheduled(policy_frontier_batch(3)).unwrap();
+    assert_native_policy_step(&expected_third, &expected.replays[2]);
+    assert_native_policy_step(&actual_third, &expected.replays[2]);
+    assert_eq!(expected_third.loss().dtype(), DType::F32);
+    assert_eq!(actual_third.loss().dtype(), DType::F32);
+    assert_compiled_adamw_steps_exact(
+        "owned strict-native BF16 resumed commit",
+        &actual_third,
+        &expected_third,
+    );
+    assert_eq!(
+        resumed.checkpoint().unwrap(),
+        uninterrupted.checkpoint().unwrap()
+    );
+    assert_native_policy_frontier_is_f32(
+        resumed.runtime(),
+        expected.active_parameter_count,
+        expected.active_coordinate_count,
+    );
+    assert_policy_accumulators_are_positive_zero(resumed.runtime());
+
+    let final_checkpoint = resumed.checkpoint().unwrap();
+    let (expected_model, expected_module_checkpoint) =
+        uninterrupted.finish_with_module_checkpoint().unwrap();
+    let (actual_model, actual_checkpoint) = resumed.finish_with_checkpoint().unwrap();
+    assert_eq!(actual_checkpoint, final_checkpoint);
+    assert_eq!(
+        &actual_checkpoint,
+        expected_module_checkpoint.optimizer_checkpoint()
+    );
+    assert_eq!(
+        actual_model.state_dict().unwrap(),
+        expected_model.state_dict().unwrap()
+    );
+
+    let mut actual_states = Vec::new();
+    actual_model.visit("", &mut |name, parameter, kind| {
+        actual_states.push((name, kind, parameter.snapshot().unwrap()));
+    });
+    let mut expected_states = Vec::new();
+    expected_model.visit("", &mut |name, parameter, kind| {
+        expected_states.push((name, kind, parameter.snapshot().unwrap()));
+    });
+    assert_eq!(actual_states.len(), destination_states.len());
+    assert_eq!(actual_states.len(), expected_states.len());
+    for (
+        ((name, _, kind, before), (actual_name, actual_kind, actual)),
+        (expected_name, expected_kind, expected),
+    ) in destination_states
+        .iter()
+        .zip(&actual_states)
+        .zip(&expected_states)
+    {
+        assert_eq!(actual_name, name);
+        assert_eq!(expected_name, name);
+        assert_eq!(actual_kind, kind);
+        assert_eq!(expected_kind, kind);
+        assert_eq!(actual.data, expected.data);
+        assert_eq!(actual.identity, before.identity);
+        assert_eq!(actual.trainable, before.trainable);
+        assert_eq!(actual.version, before.version.checked_add(1).unwrap());
+    }
+    assert_eq!(
+        actual_model.transformer.tokens.weight.id(),
+        destination_tied_identity
+    );
+    let mut tied_alias_identity = None;
+    actual_model.visit("", &mut |name, parameter, _| {
+        if name == "lm_head.weight" {
+            tied_alias_identity = Some(parameter.id());
+        }
+    });
+    assert_eq!(tied_alias_identity, Some(destination_tied_identity));
+    assert_eq!(
+        actual_model.transformer.positions.weight.value().unwrap(),
+        expected_model.transformer.positions.weight.value().unwrap()
+    );
+    assert_eq!(
+        actual_model.running_marker.value().unwrap(),
+        expected_model.running_marker.value().unwrap()
+    );
 }
 
 #[test]
