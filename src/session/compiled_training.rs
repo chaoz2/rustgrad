@@ -292,7 +292,7 @@ struct SealedModuleState {
 /// Complete host-module state retained while an owned compiled session runs.
 ///
 /// The seal is deliberately private: it is meaningful only together with the
-/// exact module value consumed by [`CompiledModuleAdamWPlan`].
+/// exact module value retained by its compiled module plan or prepared session.
 #[derive(Clone, Debug)]
 struct CompiledModuleSeal {
     visits: Vec<SealedModuleVisit>,
@@ -4832,13 +4832,22 @@ pub struct CompiledModuleAdamWPlan<M> {
     required_evaluation_capture_identity: Option<u64>,
 }
 
-/// Prepared compiled AdamW session that owns its source module for the complete
-/// replay lifecycle.
-pub struct CompiledModuleAdamWSession<M, R> {
+/// Prepared compiled training session that owns its source module for the
+/// complete replay lifecycle.
+///
+/// Optimizer policy remains on `R`. This owner only seals the source module,
+/// forwards the runtime's supported capabilities, and publishes one exact
+/// detached parameter frontier when the session finishes.
+pub struct CompiledModuleTrainingSession<M, R> {
     module: M,
     runtime: R,
     seal: CompiledModuleSeal,
     evaluation_capture_identity: Option<u64>,
+}
+
+/// Source-compatible compiled AdamW owner around the optimizer-neutral session.
+pub struct CompiledModuleAdamWSession<M, R> {
+    training: CompiledModuleTrainingSession<M, R>,
 }
 
 /// Recoverable compilation failure retaining the exact uncompiled module.
@@ -5029,14 +5038,63 @@ impl<M, E: std::error::Error + 'static> std::error::Error
 
 /// Finalization failure retaining the intact owned module/session pair.
 ///
-/// This covers both parameter-only [`CompiledModuleAdamWSession::finish`] and
-/// checkpointed [`CompiledModuleAdamWSession::finish_with_checkpoint`] and
-/// [`CompiledModuleAdamWSession::finish_with_module_checkpoint`] finalization.
+/// This covers both parameter-only [`CompiledModuleTrainingSession::finish`] and
+/// checkpointed [`CompiledModuleTrainingSession::finish_with_checkpoint`]
+/// finalization.
 /// The retained session remains available for inspection, retry, or recovery
 /// without publication.
+pub struct CompiledModuleTrainingFinishError<M, R> {
+    session: Box<CompiledModuleTrainingSession<M, R>>,
+    source: Error,
+}
+
+/// Compiled AdamW compatibility failure retaining its intact owned session.
 pub struct CompiledModuleAdamWFinishError<M, R> {
     session: Box<CompiledModuleAdamWSession<M, R>>,
     source: Error,
+}
+
+impl<M, R> CompiledModuleTrainingFinishError<M, R> {
+    pub fn source_error(&self) -> &Error {
+        &self.source
+    }
+
+    pub fn session(&self) -> &CompiledModuleTrainingSession<M, R> {
+        &self.session
+    }
+
+    pub fn into_session(self) -> CompiledModuleTrainingSession<M, R> {
+        *self.session
+    }
+
+    pub fn into_parts(self) -> (CompiledModuleTrainingSession<M, R>, Error) {
+        (*self.session, self.source)
+    }
+
+    /// Discards the failed runtime frontier and returns the sealed host module
+    /// exactly as it currently exists, without attempting publication again.
+    pub fn into_module_without_publication(self) -> M {
+        (*self.session).into_module_without_publication()
+    }
+}
+
+impl<M, R> fmt::Debug for CompiledModuleTrainingFinishError<M, R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledModuleTrainingFinishError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M, R> fmt::Display for CompiledModuleTrainingFinishError<M, R> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "owned compiled training finalization failed: {}",
+            self.source
+        )
+    }
 }
 
 impl<M, R> CompiledModuleAdamWFinishError<M, R> {
@@ -5083,6 +5141,12 @@ impl<M, R> fmt::Display for CompiledModuleAdamWFinishError<M, R> {
 }
 
 impl<M, R> std::error::Error for CompiledModuleAdamWFinishError<M, R> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl<M, R> std::error::Error for CompiledModuleTrainingFinishError<M, R> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
@@ -5535,6 +5599,22 @@ pub trait CompiledCheckpointRuntime: CompiledTrainingRuntime {
     type Checkpoint;
 
     fn checkpoint(&self) -> Result<Self::Checkpoint>;
+}
+
+/// Authenticated trainable-parameter frontier carried by one checkpoint value.
+///
+/// Owned module finalization uses this capability after taking exactly one
+/// checkpoint. The parameters must be decoded from that same immutable snapshot;
+/// implementations may not read a second live runtime frontier.
+pub trait CompiledCheckpointParameterSnapshot {
+    /// Returns the canonical trainable parameter map embedded in this snapshot.
+    fn checkpoint_parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
+}
+
+impl CompiledCheckpointParameterSnapshot for CompiledAdamWCheckpoint {
+    fn checkpoint_parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        Ok(decode_adamw_checkpoint(self.as_bytes())?.parameters)
+    }
 }
 
 /// In-place checkpoint restoration for an already prepared training runtime.
@@ -10818,7 +10898,13 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
     }
 }
 
-impl<M, R> CompiledModuleAdamWSession<M, R> {
+impl<M, R> CompiledModuleTrainingSession<M, R> {
+    /// Read-only access to optimizer- or backend-specific diagnostics while the
+    /// neutral owner retains exclusive control of module publication.
+    pub fn runtime(&self) -> &R {
+        &self.runtime
+    }
+
     /// Discards the compiled runtime frontier and returns the sealed host
     /// module without publishing any trained parameter values.
     pub fn into_module_without_publication(self) -> M {
@@ -10826,24 +10912,41 @@ impl<M, R> CompiledModuleAdamWSession<M, R> {
     }
 }
 
+impl<M, R> CompiledModuleAdamWSession<M, R> {
+    /// Read-only access to the retained AdamW runtime for diagnostics.
+    pub fn runtime(&self) -> &R {
+        self.training.runtime()
+    }
+
+    /// Removes the AdamW compatibility surface while retaining the exact owned
+    /// module, runtime, seal, and prepared-session frontier.
+    pub fn into_training_session(self) -> CompiledModuleTrainingSession<M, R> {
+        self.training
+    }
+
+    pub fn into_module_without_publication(self) -> M {
+        self.training.into_module_without_publication()
+    }
+}
+
 impl<M: Module, R: CompiledScheduledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
     pub fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
-        self.runtime.captured_multi_step_lr()
+        self.training.runtime.captured_multi_step_lr()
     }
 
     pub fn step_scheduled(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<R::Step> {
-        self.runtime.step_scheduled(inputs)
+        self.training.runtime.step_scheduled(inputs)
     }
 
     pub fn step_batch_scheduled<B>(&mut self, batch: B) -> Result<R::Step>
     where
         B: CompiledInputBatch,
     {
-        self.runtime.step_batch_scheduled(batch)
+        self.training.runtime.step_batch_scheduled(batch)
     }
 
     pub fn flush_partial_window_scheduled(&mut self) -> Result<R::ScheduledFlush> {
-        self.runtime.flush_partial_window_scheduled()
+        self.training.runtime.flush_partial_window_scheduled()
     }
 }
 
@@ -10853,18 +10956,22 @@ impl<M: Module, R: CompiledAdamWCommitOnlyRuntime> CompiledModuleAdamWSession<M,
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<R::Step> {
-        self.runtime.step_commit_only(inputs, learning_rate)
+        self.training
+            .runtime
+            .step_commit_only(inputs, learning_rate)
     }
 
     pub fn step_batch_commit_only<B>(&mut self, batch: B, learning_rate: f32) -> Result<R::Step>
     where
         B: CompiledInputBatch,
     {
-        self.runtime.step_batch_commit_only(batch, learning_rate)
+        self.training
+            .runtime
+            .step_batch_commit_only(batch, learning_rate)
     }
 }
 
-impl<M: Module, R: CompiledTrainingCommitOnlyRuntime> CompiledModuleAdamWSession<M, R> {
+impl<M: Module, R: CompiledTrainingCommitOnlyRuntime> CompiledModuleTrainingSession<M, R> {
     pub fn commit_step(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
@@ -10881,31 +10988,52 @@ impl<M: Module, R: CompiledTrainingCommitOnlyRuntime> CompiledModuleAdamWSession
     }
 }
 
+impl<M: Module, R: CompiledTrainingCommitOnlyRuntime> CompiledModuleAdamWSession<M, R> {
+    pub fn commit_step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<R::Step> {
+        self.training.runtime.commit_step(inputs, learning_rate)
+    }
+
+    pub fn commit_step_batch<B>(&mut self, batch: B, learning_rate: f32) -> Result<R::Step>
+    where
+        B: CompiledInputBatch,
+    {
+        self.training
+            .runtime
+            .commit_step_batch(batch, learning_rate)
+    }
+}
+
 impl<M: Module, R: CompiledScheduledAdamWCommitOnlyRuntime> CompiledModuleAdamWSession<M, R> {
     pub fn step_commit_only_scheduled(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<R::Step> {
-        self.runtime.step_commit_only_scheduled(inputs)
+        self.training.runtime.step_commit_only_scheduled(inputs)
     }
 
     pub fn step_batch_commit_only_scheduled<B>(&mut self, batch: B) -> Result<R::Step>
     where
         B: CompiledInputBatch,
     {
-        self.runtime.step_batch_commit_only_scheduled(batch)
+        self.training
+            .runtime
+            .step_batch_commit_only_scheduled(batch)
     }
 }
 
-impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleAdamWSession<M, R> {
+impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleTrainingSession<M, R> {
     /// Atomically publishes the runtime's exact trainable frontier and returns
     /// the owned module. The complete module topology, identities, versions,
     /// descriptors, and frozen/buffer bytes must still match the compile seal.
     /// A failure retains the intact session and can be recovered with
-    /// [`CompiledModuleAdamWFinishError::into_session`].
-    pub fn finish(self) -> std::result::Result<M, CompiledModuleAdamWFinishError<M, R>> {
+    /// [`CompiledModuleTrainingFinishError::into_session`].
+    pub fn finish(self) -> std::result::Result<M, CompiledModuleTrainingFinishError<M, R>> {
         if let Err(source) = self.seal.validate_unchanged(&self.module) {
-            return Err(CompiledModuleAdamWFinishError {
+            return Err(CompiledModuleTrainingFinishError {
                 session: Box::new(self),
                 source,
             });
@@ -10913,20 +11041,105 @@ impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleAdamWSession<M, R> {
         let parameters = match self.runtime.parameter_snapshots() {
             Ok(parameters) => parameters,
             Err(source) => {
-                return Err(CompiledModuleAdamWFinishError {
+                return Err(CompiledModuleTrainingFinishError {
                     session: Box::new(self),
                     source,
                 });
             }
         };
         if let Err(source) = self.seal.publish(&self.module, &parameters) {
-            return Err(CompiledModuleAdamWFinishError {
+            return Err(CompiledModuleTrainingFinishError {
                 session: Box::new(self),
                 source,
             });
         }
         let Self { module, .. } = self;
         Ok(module)
+    }
+}
+
+impl<M: Module, R> CompiledModuleTrainingSession<M, R>
+where
+    R: CompiledCheckpointRuntime,
+    R::Checkpoint: CompiledCheckpointParameterSnapshot,
+{
+    /// Atomically publishes and returns the exact checkpointed training
+    /// frontier.
+    ///
+    /// The module seal is validated before snapshot work. One coherent
+    /// checkpoint snapshot supplies both the returned resumable state and the
+    /// parameter values published into the owned module, so a backend never
+    /// performs a second parameter-only read. A checkpoint, decode, or
+    /// publication failure retains the intact session for inspection or retry.
+    pub fn finish_with_checkpoint(
+        self,
+    ) -> std::result::Result<(M, R::Checkpoint), CompiledModuleTrainingFinishError<M, R>> {
+        if let Err(source) = self.seal.validate_unchanged(&self.module) {
+            return Err(CompiledModuleTrainingFinishError {
+                session: Box::new(self),
+                source,
+            });
+        }
+        let checkpoint = match self.runtime.checkpoint() {
+            Ok(checkpoint) => checkpoint,
+            Err(source) => {
+                return Err(CompiledModuleTrainingFinishError {
+                    session: Box::new(self),
+                    source,
+                });
+            }
+        };
+        let parameters = match checkpoint.checkpoint_parameter_snapshots() {
+            Ok(parameters) => parameters,
+            Err(source) => {
+                return Err(CompiledModuleTrainingFinishError {
+                    session: Box::new(self),
+                    source,
+                });
+            }
+        };
+        if let Err(source) = self.seal.publish(&self.module, &parameters) {
+            return Err(CompiledModuleTrainingFinishError {
+                session: Box::new(self),
+                source,
+            });
+        }
+        let Self { module, .. } = self;
+        Ok((module, checkpoint))
+    }
+}
+
+impl<M: Module, R: CompiledTrainingRuntime> CompiledModuleAdamWSession<M, R> {
+    pub fn finish(self) -> std::result::Result<M, CompiledModuleAdamWFinishError<M, R>> {
+        match self.training.finish() {
+            Ok(module) => Ok(module),
+            Err(error) => {
+                let (training, source) = error.into_parts();
+                Err(CompiledModuleAdamWFinishError {
+                    session: Box::new(Self { training }),
+                    source,
+                })
+            }
+        }
+    }
+}
+
+impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
+    /// Source-compatible AdamW finalization over the optimizer-neutral owner.
+    pub fn finish_with_checkpoint(
+        self,
+    ) -> std::result::Result<(M, CompiledAdamWCheckpoint), CompiledModuleAdamWFinishError<M, R>>
+    {
+        match self.training.finish_with_checkpoint() {
+            Ok(finished) => Ok(finished),
+            Err(error) => {
+                let (training, source) = error.into_parts();
+                Err(CompiledModuleAdamWFinishError {
+                    session: Box::new(Self { training }),
+                    source,
+                })
+            }
+        }
     }
 }
 
@@ -10941,63 +11154,20 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
     /// remains v1 when no evaluator is attached and uses v2 only to authenticate
     /// an attached evaluator's capture identity.
     pub fn module_checkpoint(&self) -> Result<CompiledModuleAdamWCheckpoint> {
-        self.seal.validate_unchanged(&self.module)?;
-        let optimizer = self.runtime.checkpoint()?;
-        self.seal.validate_unchanged(&self.module)?;
-        let (states, visits) = self.seal.checkpoint_inventory();
+        self.training
+            .seal
+            .validate_unchanged(&self.training.module)?;
+        let optimizer = self.training.runtime.checkpoint()?;
+        self.training
+            .seal
+            .validate_unchanged(&self.training.module)?;
+        let (states, visits) = self.training.seal.checkpoint_inventory();
         encode_module_adamw_checkpoint(
             &optimizer,
-            self.evaluation_capture_identity,
+            self.training.evaluation_capture_identity,
             &states,
             &visits,
         )
-    }
-
-    /// Atomically publishes and returns the exact checkpointed AdamW frontier.
-    ///
-    /// The module seal is validated before snapshot work. One coherent
-    /// checkpoint snapshot supplies both the returned resumable optimizer state
-    /// and the parameter values published into the owned module, so strict
-    /// device runtimes do not perform a second parameter-only read. Tied and
-    /// policy-frozen identities retain the same publication rules as
-    /// [`Self::finish`]. A checkpoint, decode, or publication failure retains
-    /// the intact session in [`CompiledModuleAdamWFinishError`].
-    pub fn finish_with_checkpoint(
-        self,
-    ) -> std::result::Result<(M, CompiledAdamWCheckpoint), CompiledModuleAdamWFinishError<M, R>>
-    {
-        if let Err(source) = self.seal.validate_unchanged(&self.module) {
-            return Err(CompiledModuleAdamWFinishError {
-                session: Box::new(self),
-                source,
-            });
-        }
-        let checkpoint = match self.runtime.checkpoint() {
-            Ok(checkpoint) => checkpoint,
-            Err(source) => {
-                return Err(CompiledModuleAdamWFinishError {
-                    session: Box::new(self),
-                    source,
-                });
-            }
-        };
-        let parameters = match decode_adamw_checkpoint(checkpoint.as_bytes()) {
-            Ok(decoded) => decoded.parameters,
-            Err(source) => {
-                return Err(CompiledModuleAdamWFinishError {
-                    session: Box::new(self),
-                    source,
-                });
-            }
-        };
-        if let Err(source) = self.seal.publish(&self.module, &parameters) {
-            return Err(CompiledModuleAdamWFinishError {
-                session: Box::new(self),
-                source,
-            });
-        }
-        let Self { module, .. } = self;
-        Ok((module, checkpoint))
     }
 
     /// Atomically publishes and returns one complete module checkpoint built
@@ -11013,13 +11183,13 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
         self,
     ) -> std::result::Result<(M, CompiledModuleAdamWCheckpoint), CompiledModuleAdamWFinishError<M, R>>
     {
-        if let Err(source) = self.seal.validate_unchanged(&self.module) {
+        if let Err(source) = self.training.seal.validate_unchanged(&self.training.module) {
             return Err(CompiledModuleAdamWFinishError {
                 session: Box::new(self),
                 source,
             });
         }
-        let optimizer = match self.runtime.checkpoint() {
+        let optimizer = match self.training.runtime.checkpoint() {
             Ok(checkpoint) => checkpoint,
             Err(source) => {
                 return Err(CompiledModuleAdamWFinishError {
@@ -11028,10 +11198,10 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
                 });
             }
         };
-        let (states, visits) = self.seal.checkpoint_inventory();
+        let (states, visits) = self.training.seal.checkpoint_inventory();
         let checkpoint = match encode_module_adamw_checkpoint(
             &optimizer,
-            self.evaluation_capture_identity,
+            self.training.evaluation_capture_identity,
             &states,
             &visits,
         ) {
@@ -11052,13 +11222,18 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
                 });
             }
         };
-        if let Err(source) = self.seal.publish(&self.module, &parameters) {
+        if let Err(source) = self
+            .training
+            .seal
+            .publish(&self.training.module, &parameters)
+        {
             return Err(CompiledModuleAdamWFinishError {
                 session: Box::new(self),
                 source,
             });
         }
-        let Self { module, .. } = self;
+        let Self { training } = self;
+        let CompiledModuleTrainingSession { module, .. } = training;
         Ok((module, checkpoint))
     }
 }
@@ -11066,20 +11241,20 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleAdamWSession<M, R> {
 impl<M> CompiledModuleAdamWSession<M, CpuCompiledAdamW> {
     /// Explicit diagnostic snapshot of the recurrent dropout counter.
     pub fn dropout_block_counter(&self) -> Result<Option<u64>> {
-        self.runtime.dropout_block_counter()
+        self.training.runtime.dropout_block_counter()
     }
 }
 
 impl<'a, M> CompiledModuleAdamWSession<M, NativeCpuCompiledAdamW<'a>> {
     /// Explicit diagnostic snapshot of the recurrent dropout counter.
     pub fn dropout_block_counter(&self) -> Result<Option<u64>> {
-        self.runtime.dropout_block_counter()
+        self.training.runtime.dropout_block_counter()
     }
 
     /// Returns strict-native CPU preparation evidence without exposing the
     /// sealed module or mutable runtime internals.
     pub fn native_cpu_preparation_report(&self) -> &NativeCpuCompiledAdamWPreparationReport {
-        self.runtime.preparation_report()
+        self.training.runtime.preparation_report()
     }
 }
 
@@ -11091,33 +11266,34 @@ impl<M: Module> CompiledModuleAdamWSession<M, MetalCompiledAdamW> {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<MetalCompiledAdamWCommitResult> {
-        self.runtime
+        self.training
+            .runtime
             .step_without_host_outputs(inputs, learning_rate)
     }
 
     /// Returns the sealed runtime's read-only Metal session evidence without
     /// exposing the owned module or mutable backend internals.
     pub fn metal_session(&self) -> &MetalDeviceSession {
-        self.runtime.metal_session()
+        self.training.runtime.metal_session()
     }
 
     /// Returns the opt-in successful-step recorder attached during target
     /// preparation, when present.
     pub fn execution_scoreboard(&self) -> Option<&MetalSessionScoreboard> {
-        self.runtime.execution_scoreboard()
+        self.training.runtime.execution_scoreboard()
     }
 
     /// Snapshots the owned Metal runtime's successfully recorded prefix.
     pub fn execution_scoreboard_report(
         &self,
     ) -> std::result::Result<Option<MetalSessionScoreboardReport>, MetalScoreboardError> {
-        self.runtime.execution_scoreboard_report()
+        self.training.runtime.execution_scoreboard_report()
     }
 
     /// Returns the first fail-soft scoreboard recording error, when recording
     /// has frozen.
     pub fn scoreboard_recording_error(&self) -> Option<&MetalScoreboardError> {
-        self.runtime.scoreboard_recording_error()
+        self.training.runtime.scoreboard_recording_error()
     }
 
     /// Returns preparation evidence for the two read-only active-bank
@@ -11125,13 +11301,13 @@ impl<M: Module> CompiledModuleAdamWSession<M, MetalCompiledAdamW> {
     pub fn evaluation_preparation_reports(
         &self,
     ) -> Option<[&crate::runtime::metal::MetalDevicePreparationReport; 2]> {
-        self.runtime.evaluation_preparation_reports()
+        self.training.runtime.evaluation_preparation_reports()
     }
 
     /// Returns deterministic resource/execution summaries for both read-only
     /// physical-bank evaluators.
     pub fn evaluation_summaries(&self) -> Option<[&MetalDeviceSessionSummary; 2]> {
-        self.runtime.evaluation_summaries()
+        self.training.runtime.evaluation_summaries()
     }
 }
 
@@ -12911,7 +13087,7 @@ impl CompiledScheduledAdamWCommitOnlyRuntime for NativeCpuCompiledAdamW<'_> {
     }
 }
 
-impl<M, R> CompiledTrainingRuntime for CompiledModuleAdamWSession<M, R>
+impl<M, R> CompiledTrainingRuntime for CompiledModuleTrainingSession<M, R>
 where
     R: CompiledTrainingRuntime,
 {
@@ -12942,7 +13118,7 @@ where
     }
 }
 
-impl<M, R> CompiledCheckpointRuntime for CompiledModuleAdamWSession<M, R>
+impl<M, R> CompiledCheckpointRuntime for CompiledModuleTrainingSession<M, R>
 where
     R: CompiledCheckpointRuntime,
 {
@@ -12953,7 +13129,7 @@ where
     }
 }
 
-impl<M, R> CompiledCheckpointRestoreRuntime for CompiledModuleAdamWSession<M, R>
+impl<M, R> CompiledCheckpointRestoreRuntime for CompiledModuleTrainingSession<M, R>
 where
     R: CompiledCheckpointRestoreRuntime,
 {
@@ -12962,7 +13138,7 @@ where
     }
 }
 
-impl<M, R> CompiledEvaluationRuntime for CompiledModuleAdamWSession<M, R>
+impl<M, R> CompiledEvaluationRuntime for CompiledModuleTrainingSession<M, R>
 where
     R: CompiledEvaluationRuntime,
 {
@@ -12977,52 +13153,118 @@ where
     }
 }
 
+impl<M, R> CompiledTrainingRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledTrainingRuntime,
+{
+    type Step = R::Step;
+
+    fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        self.training.step(inputs, learning_rate)
+    }
+
+    fn step_count(&self) -> u64 {
+        self.training.step_count()
+    }
+
+    fn capture_identity(&self) -> u64 {
+        self.training.capture_identity()
+    }
+
+    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        self.training.parameter_snapshots()
+    }
+
+    fn publish_parameters(&self, module: &dyn Module) -> Result<LoadReport> {
+        self.training.publish_parameters(module)
+    }
+}
+
+impl<M, R> CompiledCheckpointRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledCheckpointRuntime,
+{
+    type Checkpoint = R::Checkpoint;
+
+    fn checkpoint(&self) -> Result<Self::Checkpoint> {
+        self.training.checkpoint()
+    }
+}
+
+impl<M, R> CompiledCheckpointRestoreRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledCheckpointRestoreRuntime,
+{
+    fn restore_checkpoint_in_place(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+        self.training.restore_checkpoint_in_place(checkpoint)
+    }
+}
+
+impl<M, R> CompiledEvaluationRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledEvaluationRuntime,
+{
+    type Evaluation = R::Evaluation;
+
+    fn evaluate(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Evaluation> {
+        self.training.evaluate(inputs)
+    }
+
+    fn evaluation_capture_identity(&self) -> Option<u64> {
+        self.training.evaluation_capture_identity()
+    }
+}
+
 impl<M, R> CompiledAdamWRuntime for CompiledModuleAdamWSession<M, R>
 where
     R: CompiledAdamWRuntime,
 {
     fn gradient_accumulation_steps(&self) -> u64 {
-        self.runtime.gradient_accumulation_steps()
+        self.training.runtime.gradient_accumulation_steps()
     }
 
     fn max_gradient_norm(&self) -> Option<f32> {
-        self.runtime.max_gradient_norm()
+        self.training.runtime.max_gradient_norm()
     }
 
     fn loss_scale(&self) -> f32 {
-        self.runtime.loss_scale()
+        self.training.runtime.loss_scale()
     }
 
     fn window_loss_report_enabled(&self) -> bool {
-        self.runtime.window_loss_report_enabled()
+        self.training.runtime.window_loss_report_enabled()
     }
 
     fn optimizer_step(&self) -> Result<u64> {
-        self.runtime.optimizer_step()
+        self.training.runtime.optimizer_step()
     }
 
     fn accumulation_index(&self) -> Result<u64> {
-        self.runtime.accumulation_index()
+        self.training.runtime.accumulation_index()
     }
 
     fn zero_grad(&mut self) -> Result<CompiledAdamWZeroGradResult> {
-        self.runtime.zero_grad()
+        self.training.runtime.zero_grad()
     }
 
     fn zero_grad_capture_identity(&self) -> Option<u64> {
-        self.runtime.zero_grad_capture_identity()
+        self.training.runtime.zero_grad_capture_identity()
     }
 
     fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.runtime.first_moment_snapshots()
+        self.training.runtime.first_moment_snapshots()
     }
 
     fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.runtime.second_moment_snapshots()
+        self.training.runtime.second_moment_snapshots()
     }
 
     fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.runtime.gradient_accumulator_snapshots()
+        self.training.runtime.gradient_accumulator_snapshots()
     }
 }
 
@@ -13035,11 +13277,13 @@ where
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<Self::Step> {
-        self.runtime.step_commit_only(inputs, learning_rate)
+        self.training
+            .runtime
+            .step_commit_only(inputs, learning_rate)
     }
 }
 
-impl<M, R> CompiledTrainingCommitOnlyRuntime for CompiledModuleAdamWSession<M, R>
+impl<M, R> CompiledTrainingCommitOnlyRuntime for CompiledModuleTrainingSession<M, R>
 where
     R: CompiledTrainingCommitOnlyRuntime,
 {
@@ -13052,9 +13296,35 @@ where
     }
 }
 
-impl<M, R> CompiledTrainingWindowCommitRuntime for CompiledModuleAdamWSession<M, R>
+impl<M, R> CompiledTrainingWindowResetRuntime for CompiledModuleTrainingSession<M, R>
 where
-    R: CompiledTrainingWindowCommitRuntime + CompiledAdamWRuntime,
+    R: CompiledTrainingWindowResetRuntime,
+{
+    fn reset_gradient_window(&mut self) -> Result<CompiledTrainingWindowReset> {
+        self.runtime.reset_gradient_window()
+    }
+
+    fn gradient_window_reset_capture_identity(&self) -> Option<u64> {
+        self.runtime.gradient_window_reset_capture_identity()
+    }
+}
+
+impl<M, R> CompiledTrainingWindowRuntime for CompiledModuleTrainingSession<M, R>
+where
+    R: CompiledTrainingWindowRuntime,
+{
+    fn gradient_window_size(&self) -> u64 {
+        self.runtime.gradient_window_size()
+    }
+
+    fn pending_microbatch_count(&self) -> Result<u64> {
+        self.runtime.pending_microbatch_count()
+    }
+}
+
+impl<M, R> CompiledTrainingWindowCommitRuntime for CompiledModuleTrainingSession<M, R>
+where
+    R: CompiledTrainingWindowCommitRuntime,
 {
     type WindowCommit = R::WindowCommit;
 
@@ -13067,6 +13337,69 @@ where
     }
 }
 
+impl<M, R> CompiledTrainingRatePolicyRuntime for CompiledModuleTrainingSession<M, R>
+where
+    R: CompiledTrainingRatePolicyRuntime,
+{
+    fn step_with_rate_policy(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step> {
+        self.runtime.step_with_rate_policy(inputs)
+    }
+}
+
+impl<M, R> CompiledTrainingRatePolicyCommitOnlyRuntime for CompiledModuleTrainingSession<M, R>
+where
+    R: CompiledTrainingRatePolicyCommitOnlyRuntime,
+{
+    fn commit_step_with_rate_policy(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step> {
+        self.runtime.commit_step_with_rate_policy(inputs)
+    }
+}
+
+impl<M, R> CompiledTrainingRatePolicyWindowCommitRuntime for CompiledModuleTrainingSession<M, R>
+where
+    R: CompiledTrainingRatePolicyWindowCommitRuntime,
+{
+    fn commit_partial_window_with_rate_policy(&mut self) -> Result<Self::WindowCommit> {
+        self.runtime.commit_partial_window_with_rate_policy()
+    }
+}
+
+impl<M, R> CompiledTrainingCommitOnlyRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledTrainingCommitOnlyRuntime,
+{
+    fn commit_step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        self.training.runtime.commit_step(inputs, learning_rate)
+    }
+}
+
+impl<M, R> CompiledTrainingWindowCommitRuntime for CompiledModuleAdamWSession<M, R>
+where
+    R: CompiledTrainingWindowCommitRuntime + CompiledAdamWRuntime,
+{
+    type WindowCommit = R::WindowCommit;
+
+    fn commit_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::WindowCommit> {
+        self.training.runtime.commit_partial_window(learning_rate)
+    }
+
+    fn partial_window_commit_capture_identity(&self) -> Option<u64> {
+        self.training
+            .runtime
+            .partial_window_commit_capture_identity()
+    }
+}
+
 impl<M, R> CompiledAdamWFlushRuntime for CompiledModuleAdamWSession<M, R>
 where
     R: CompiledAdamWFlushRuntime,
@@ -13074,11 +13407,11 @@ where
     type Flush = R::Flush;
 
     fn flush_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::Flush> {
-        self.runtime.flush_partial_window(learning_rate)
+        self.training.runtime.flush_partial_window(learning_rate)
     }
 
     fn flush_capture_identity(&self) -> Option<u64> {
-        self.runtime.flush_capture_identity()
+        self.training.runtime.flush_capture_identity()
     }
 }
 
@@ -13087,7 +13420,9 @@ where
     R: CompiledTrainingRatePolicyWindowCommitRuntime + CompiledScheduledAdamWRuntime,
 {
     fn commit_partial_window_with_rate_policy(&mut self) -> Result<Self::WindowCommit> {
-        self.runtime.commit_partial_window_with_rate_policy()
+        self.training
+            .runtime
+            .commit_partial_window_with_rate_policy()
     }
 }
 
@@ -13098,15 +13433,15 @@ where
     type ScheduledFlush = R::ScheduledFlush;
 
     fn captured_multi_step_lr(&self) -> Option<&CompiledMultiStepLr> {
-        self.runtime.captured_multi_step_lr()
+        self.training.runtime.captured_multi_step_lr()
     }
 
     fn step_scheduled(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Step> {
-        self.runtime.step_scheduled(inputs)
+        self.training.runtime.step_scheduled(inputs)
     }
 
     fn flush_partial_window_scheduled(&mut self) -> Result<Self::ScheduledFlush> {
-        self.runtime.flush_partial_window_scheduled()
+        self.training.runtime.flush_partial_window_scheduled()
     }
 }
 
@@ -13118,7 +13453,7 @@ where
         &mut self,
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<Self::Step> {
-        self.runtime.step_commit_only_scheduled(inputs)
+        self.training.runtime.step_commit_only_scheduled(inputs)
     }
 }
 
@@ -13237,10 +13572,12 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for CpuSessionTarget {
             required_evaluation_capture_identity: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
-            module,
-            runtime,
-            seal,
-            evaluation_capture_identity,
+            training: CompiledModuleTrainingSession {
+                module,
+                runtime,
+                seal,
+                evaluation_capture_identity,
+            },
         })
     }
 }
@@ -13271,10 +13608,12 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for ConfiguredCpuSessi
             required_evaluation_capture_identity: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
-            module,
-            runtime,
-            seal,
-            evaluation_capture_identity,
+            training: CompiledModuleTrainingSession {
+                module,
+                runtime,
+                seal,
+                evaluation_capture_identity,
+            },
         })
     }
 }
@@ -13304,10 +13643,12 @@ impl<'executor, M: Module> SessionTarget<CompiledModuleAdamWPlan<M>>
             required_evaluation_capture_identity: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
-            module,
-            runtime,
-            seal,
-            evaluation_capture_identity,
+            training: CompiledModuleTrainingSession {
+                module,
+                runtime,
+                seal,
+                evaluation_capture_identity,
+            },
         })
     }
 }
@@ -13335,10 +13676,12 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for MetalSessionTarget
             required_evaluation_capture_identity: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
-            module,
-            runtime,
-            seal,
-            evaluation_capture_identity,
+            training: CompiledModuleTrainingSession {
+                module,
+                runtime,
+                seal,
+                evaluation_capture_identity,
+            },
         })
     }
 }
@@ -15508,6 +15851,58 @@ mod tests {
     struct CheckpointCountingRuntime {
         inner: CpuCompiledAdamW,
         checkpoint_calls: Rc<Cell<u64>>,
+    }
+
+    #[derive(Clone)]
+    struct TestMomentumCheckpoint {
+        parameters: BTreeMap<String, TensorData>,
+    }
+
+    impl CompiledCheckpointParameterSnapshot for TestMomentumCheckpoint {
+        fn checkpoint_parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+            Ok(self.parameters.clone())
+        }
+    }
+
+    struct CheckpointedMomentumRuntime {
+        inner: CpuCompiledMomentumSgd,
+        checkpoint_calls: Rc<Cell<u64>>,
+    }
+
+    impl CompiledTrainingRuntime for CheckpointedMomentumRuntime {
+        type Step = CompiledMomentumSgdStepResult;
+
+        fn step(
+            &mut self,
+            inputs: BTreeMap<String, TensorData>,
+            learning_rate: TensorData,
+        ) -> Result<Self::Step> {
+            self.inner.step(inputs, learning_rate)
+        }
+
+        fn step_count(&self) -> u64 {
+            self.inner.step_count()
+        }
+
+        fn capture_identity(&self) -> u64 {
+            self.inner.capture_identity()
+        }
+
+        fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+            self.inner.parameter_snapshots()
+        }
+    }
+
+    impl CompiledCheckpointRuntime for CheckpointedMomentumRuntime {
+        type Checkpoint = TestMomentumCheckpoint;
+
+        fn checkpoint(&self) -> Result<Self::Checkpoint> {
+            self.checkpoint_calls
+                .set(self.checkpoint_calls.get().saturating_add(1));
+            Ok(TestMomentumCheckpoint {
+                parameters: self.inner.parameter_snapshots()?,
+            })
+        }
     }
 
     impl CompiledTrainingRuntime for CheckpointCountingRuntime {
@@ -18663,7 +19058,7 @@ mod tests {
         assert_eq!(executor.native_item_plan_count(), 2);
         let checkpoint = session.checkpoint().unwrap();
         let workspace = session
-            .runtime
+            .runtime()
             .evaluation_replay
             .as_ref()
             .unwrap()
@@ -18676,17 +19071,17 @@ mod tests {
         assert_eq!(workspace.dispatch_metadata_build_count, 1);
         assert_eq!(workspace.dispatch_scratch_capacity_growth_count, 0);
         assert!(workspace.dispatch_scratch_is_empty);
-        let before_invalid_counts = native_recurrent_test_counts(&session.runtime);
+        let before_invalid_counts = native_recurrent_test_counts(session.runtime());
 
         assert!(session.evaluate(BTreeMap::new()).is_err());
-        assert_eq!(session.runtime.successful_evaluations, 0);
+        assert_eq!(session.runtime().successful_evaluations, 0);
         assert_eq!(
-            native_recurrent_test_counts(&session.runtime),
+            native_recurrent_test_counts(session.runtime()),
             before_invalid_counts
         );
         assert_eq!(
             session
-                .runtime
+                .runtime()
                 .evaluation_replay
                 .as_ref()
                 .unwrap()
@@ -18695,13 +19090,14 @@ mod tests {
             workspace
         );
         let binding = session
-            .runtime
+            .runtime()
             .evaluation_replay
             .as_ref()
             .unwrap()
             .parameter_inputs[0]
             .clone();
         session
+            .training
             .runtime
             .evaluation_replay
             .as_mut()
@@ -18717,19 +19113,20 @@ mod tests {
                 .is_err()
         );
         session
+            .training
             .runtime
             .evaluation_replay
             .as_mut()
             .unwrap()
             .parameter_inputs[0] = binding;
-        assert_eq!(session.runtime.successful_evaluations, 0);
+        assert_eq!(session.runtime().successful_evaluations, 0);
         assert_eq!(
-            native_recurrent_test_counts(&session.runtime),
+            native_recurrent_test_counts(session.runtime()),
             before_invalid_counts
         );
         assert_eq!(
             session
-                .runtime
+                .runtime()
                 .evaluation_replay
                 .as_ref()
                 .unwrap()
@@ -18738,7 +19135,7 @@ mod tests {
             workspace
         );
         assert_eq!(session.checkpoint().unwrap(), checkpoint);
-        let before_evaluation_counts = native_recurrent_test_counts(&session.runtime);
+        let before_evaluation_counts = native_recurrent_test_counts(session.runtime());
 
         let evaluation = session
             .evaluate(BTreeMap::from([(
@@ -18783,14 +19180,14 @@ mod tests {
             0
         );
         assert_eq!(
-            native_recurrent_test_counts(&session.runtime),
+            native_recurrent_test_counts(session.runtime()),
             before_evaluation_counts
         );
         let first_output = evaluation.outputs()["output"].clone();
         assert_eq!(session.checkpoint().unwrap(), checkpoint);
         assert_eq!(executor.native_item_plan_count(), 2);
         let evaluated_workspace = session
-            .runtime
+            .runtime()
             .evaluation_replay
             .as_ref()
             .unwrap()
@@ -18819,7 +19216,7 @@ mod tests {
             )
             .unwrap();
         let updated = session.checkpoint().unwrap();
-        let before_updated_evaluation = native_recurrent_test_counts(&session.runtime);
+        let before_updated_evaluation = native_recurrent_test_counts(session.runtime());
         let updated_evaluation = session
             .evaluate(BTreeMap::from([(
                 "x".into(),
@@ -18833,12 +19230,12 @@ mod tests {
         );
         assert_ne!(updated_evaluation.outputs()["output"], first_output);
         assert_eq!(
-            native_recurrent_test_counts(&session.runtime),
+            native_recurrent_test_counts(session.runtime()),
             before_updated_evaluation
         );
         assert_eq!(session.checkpoint().unwrap(), updated);
         let updated_workspace = session
-            .runtime
+            .runtime()
             .evaluation_replay
             .as_ref()
             .unwrap()
@@ -21488,13 +21885,13 @@ mod tests {
         let interpreted_accumulators = interpreted.gradient_accumulator_snapshots().unwrap();
         let native_accumulators = native.gradient_accumulator_snapshots().unwrap();
         let native_evaluation_workspace = native
-            .runtime
+            .runtime()
             .evaluation_replay
             .as_ref()
             .unwrap()
             .plan
             .workspace_stats();
-        let native_recurrent_counts = native_recurrent_test_counts(&native.runtime);
+        let native_recurrent_counts = native_recurrent_test_counts(native.runtime());
 
         for mask in [
             [1.0, 1.0, 0.5, 0.0, 0.0, 0.0],
@@ -21503,14 +21900,14 @@ mod tests {
             assert!(interpreted.evaluate(token_evaluation_batch(mask)).is_err());
             assert!(native.evaluate(token_evaluation_batch(mask)).is_err());
         }
-        assert_eq!(native.runtime.successful_evaluations, 0);
+        assert_eq!(native.runtime().successful_evaluations, 0);
         assert_eq!(
-            native_recurrent_test_counts(&native.runtime),
+            native_recurrent_test_counts(native.runtime()),
             native_recurrent_counts
         );
         assert_eq!(
             native
-                .runtime
+                .runtime()
                 .evaluation_replay
                 .as_ref()
                 .unwrap()
@@ -21526,10 +21923,10 @@ mod tests {
         let mut total_weight = 0_u64;
         for (invocation, (mask, expected_weight)) in masks.into_iter().zip([5, 3, 3]).enumerate() {
             let expected = interpreted.evaluate(token_evaluation_batch(mask)).unwrap();
-            let before_native_evaluation = native_recurrent_test_counts(&native.runtime);
+            let before_native_evaluation = native_recurrent_test_counts(native.runtime());
             let actual = native.evaluate(token_evaluation_batch(mask)).unwrap();
             assert_eq!(
-                native_recurrent_test_counts(&native.runtime),
+                native_recurrent_test_counts(native.runtime()),
                 before_native_evaluation
             );
             assert_eq!(expected.loss_weight(), expected_weight);
@@ -21579,7 +21976,7 @@ mod tests {
         assert_eq!(interpreted.step_count(), 0);
         assert_eq!(native.step_count(), 0);
         let native_evaluation_workspace = native
-            .runtime
+            .runtime()
             .evaluation_replay
             .as_ref()
             .unwrap()
@@ -21624,8 +22021,11 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let mut runtime = compile_token_evaluation_plan().prepare(&target).unwrap();
-        let preparation = preparation_identity(&runtime.runtime);
+        let mut runtime = compile_token_evaluation_plan()
+            .prepare(&target)
+            .unwrap()
+            .into_training_session();
+        let preparation = preparation_identity(runtime.runtime());
         let native_plan_count = executor.native_item_plan_count();
         let evaluated = runtime.evaluate(batch()).unwrap();
         assert_eq!(evaluated.report().successful_invocation(), 1);
@@ -21644,23 +22044,24 @@ mod tests {
                 .unwrap()
                 .did_update()
         );
-        assert!(runtime.zero_grad().unwrap().did_discard());
-        assert_eq!(runtime.runtime.successful_steps, 3);
-        assert_eq!(runtime.runtime.successful_zero_grads, 1);
+        assert!(runtime.reset_gradient_window().unwrap().did_discard());
+        assert_eq!(runtime.runtime().successful_steps, 3);
+        assert_eq!(runtime.runtime().successful_zero_grads, 1);
 
         runtime.restore_checkpoint_in_place(&pending).unwrap();
         assert_eq!(runtime.checkpoint().unwrap(), pending);
-        assert_eq!(preparation_identity(&runtime.runtime), preparation);
+        assert_eq!(preparation_identity(runtime.runtime()), preparation);
         assert_eq!(executor.native_item_plan_count(), native_plan_count);
-        assert_eq!(runtime.runtime.successful_steps, 3);
-        assert_eq!(runtime.runtime.successful_zero_grads, 1);
-        assert_eq!(runtime.runtime.successful_evaluations, 1);
+        assert_eq!(runtime.runtime().successful_steps, 3);
+        assert_eq!(runtime.runtime().successful_zero_grads, 1);
+        assert_eq!(runtime.runtime().successful_evaluations, 1);
 
         let mut reference = compile_token_evaluation_plan()
             .restore_checkpoint(&pending)
             .unwrap()
             .prepare(&target)
-            .unwrap();
+            .unwrap()
+            .into_training_session();
         let actual_evaluation = runtime.evaluate(batch()).unwrap();
         let expected_evaluation = reference.evaluate(batch()).unwrap();
         assert_eq!(actual_evaluation.loss(), expected_evaluation.loss());
@@ -21669,10 +22070,10 @@ mod tests {
         assert_eq!(expected_evaluation.report().successful_invocation(), 1);
 
         let actual_flush = runtime
-            .flush_partial_window(TensorData::scalar(0.01))
+            .commit_partial_window(TensorData::scalar(0.01))
             .unwrap();
         let expected_flush = reference
-            .flush_partial_window(TensorData::scalar(0.01))
+            .commit_partial_window(TensorData::scalar(0.01))
             .unwrap();
         assert!(actual_flush.did_update());
         assert_eq!(
@@ -21759,7 +22160,7 @@ mod tests {
             .unwrap()
             .prepare(&target)
             .unwrap();
-        let preparation = format!("{:?}", runtime.runtime.preparation_report());
+        let preparation = format!("{:?}", runtime.runtime().preparation_report());
         let native_plan_count = executor.native_item_plan_count();
         let workspace_stats = |runtime: &NativeCpuCompiledAdamW<'_>| {
             std::iter::once(runtime.main_replay.workspace_stats())
@@ -21791,19 +22192,19 @@ mod tests {
         };
         runtime.evaluate(batch()).unwrap();
         runtime.step(batch(), TensorData::scalar(0.01)).unwrap();
-        let workspaces = workspace_stats(&runtime.runtime);
+        let workspaces = workspace_stats(runtime.runtime());
 
         runtime.restore_checkpoint_in_place(&older).unwrap();
         assert_eq!(runtime.checkpoint().unwrap(), older);
         crate::host_buffer::reset_host_bank_transaction_test_counts();
         assert_eq!(
-            format!("{:?}", runtime.runtime.preparation_report()),
+            format!("{:?}", runtime.runtime().preparation_report()),
             preparation
         );
-        assert_eq!(workspace_stats(&runtime.runtime), workspaces);
+        assert_eq!(workspace_stats(runtime.runtime()), workspaces);
         assert_eq!(executor.native_item_plan_count(), native_plan_count);
-        assert_eq!(runtime.runtime.successful_steps, 1);
-        assert_eq!(runtime.runtime.successful_evaluations, 1);
+        assert_eq!(runtime.runtime().successful_steps, 1);
+        assert_eq!(runtime.runtime().successful_evaluations, 1);
 
         assert!(runtime.zero_grad().unwrap().did_discard());
         assert_eq!(
@@ -21815,7 +22216,7 @@ mod tests {
             },
             "zero-grad projects only reset states and retains the generic subset transaction"
         );
-        let reset_replay = runtime.runtime.zero_grad_replay.as_ref().unwrap();
+        let reset_replay = runtime.runtime().zero_grad_replay.as_ref().unwrap();
         assert!(reset_replay.last_executed_native_item_count() > 0);
         let reset_dispatch = reset_replay.last_module_dispatch_counts();
         assert!(reset_dispatch.0 > 0);
@@ -21840,8 +22241,8 @@ mod tests {
             "partial flush uses the canonical full-frontier transaction"
         );
         runtime.restore_checkpoint_in_place(&older).unwrap();
-        assert_eq!(runtime.runtime.successful_zero_grads, 1);
-        assert_eq!(runtime.runtime.successful_flushes, 1);
+        assert_eq!(runtime.runtime().successful_zero_grads, 1);
+        assert_eq!(runtime.runtime().successful_flushes, 1);
         assert_eq!(executor.native_item_plan_count(), native_plan_count);
 
         let mut reference = compile_token_evaluation_plan()
@@ -21876,8 +22277,8 @@ mod tests {
             runtime.checkpoint().unwrap(),
             reference.checkpoint().unwrap()
         );
-        assert_eq!(runtime.runtime.successful_steps, 3);
-        assert_eq!(runtime.runtime.successful_evaluations, 2);
+        assert_eq!(runtime.runtime().successful_steps, 3);
+        assert_eq!(runtime.runtime().successful_evaluations, 2);
         assert_eq!(executor.native_item_plan_count(), native_plan_count * 2);
         assert_eq!(
             crate::host_buffer::host_bank_transaction_test_counts(),
@@ -23876,6 +24277,54 @@ mod tests {
     }
 
     #[test]
+    fn owned_module_training_session_finishes_non_adamw_checkpoint_once() {
+        let module = TiedFrozenModule::new([1.0, -1.0]);
+        let frozen_before = module.frozen.snapshot().unwrap();
+        let buffer_before = module.buffer.snapshot().unwrap();
+        let parameters = ModuleParameterPlan::new(&module, &BTreeSet::new())
+            .unwrap()
+            .initial_parameters()
+            .unwrap();
+        let seal = CompiledModuleSeal::capture(&module, &BTreeSet::new()).unwrap();
+        let runtime = CpuCompiledMomentumSgd::compile(
+            CompiledMomentumSgdConfig::new(0.9)
+                .unwrap()
+                .with_input("x", [2], DType::F32)
+                .unwrap(),
+            parameters,
+            |graph, inputs, parameters| {
+                let output = graph.mul(inputs["x"], parameters["shared"])?;
+                Ok((graph.sum_all(output)?, BTreeMap::new()))
+            },
+        )
+        .unwrap();
+        let checkpoint_calls = Rc::new(Cell::new(0));
+        let mut session = CompiledModuleTrainingSession {
+            module,
+            runtime: CheckpointedMomentumRuntime {
+                inner: runtime,
+                checkpoint_calls: Rc::clone(&checkpoint_calls),
+            },
+            seal,
+            evaluation_capture_identity: None,
+        };
+        session
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        let expected = session.parameter_snapshots().unwrap();
+        let (module, checkpoint) = session.finish_with_checkpoint().unwrap();
+
+        assert_eq!(checkpoint_calls.get(), 1);
+        assert_eq!(checkpoint.parameters, expected);
+        assert_eq!(module.shared.value().unwrap(), expected["shared"]);
+        assert_parameter_snapshot_eq(&module.frozen.snapshot().unwrap(), &frozen_before);
+        assert_parameter_snapshot_eq(&module.buffer.snapshot().unwrap(), &buffer_before);
+    }
+
+    #[test]
     fn owned_module_adamw_session_seals_replay_and_finishes_atomically() {
         let module = TiedFrozenModule::new([1.0, -1.0]);
         let shared = module.shared.clone();
@@ -24951,15 +25400,15 @@ mod tests {
         let mut resumed = restored_plan.prepare(&CpuSessionTarget::new()).unwrap();
         assert_eq!(resumed.module_checkpoint().unwrap(), partial);
         assert_parameter_snapshot_eq(
-            &resumed.module.shared.snapshot().unwrap(),
+            &resumed.training.module.shared.snapshot().unwrap(),
             &destination_shared,
         );
         assert_parameter_snapshot_eq(
-            &resumed.module.frozen.snapshot().unwrap(),
+            &resumed.training.module.frozen.snapshot().unwrap(),
             &destination_frozen,
         );
         assert_parameter_snapshot_eq(
-            &resumed.module.buffer.snapshot().unwrap(),
+            &resumed.training.module.buffer.snapshot().unwrap(),
             &destination_buffer,
         );
 
@@ -24984,21 +25433,24 @@ mod tests {
         let expected_complete = source.module_checkpoint().unwrap();
         assert_eq!(expected_optimizer.info().accumulation_index(), 1);
         assert_eq!(expected_optimizer.info().accumulated_token_count(), Some(1));
-        let CompiledModuleAdamWSession {
+        let CompiledModuleAdamWSession { training } = source;
+        let CompiledModuleTrainingSession {
             module,
             runtime,
             seal,
             evaluation_capture_identity,
-        } = source;
+        } = training;
         let checkpoint_calls = Rc::new(Cell::new(0));
         let source = CompiledModuleAdamWSession {
-            module,
-            runtime: CheckpointCountingRuntime {
-                inner: runtime,
-                checkpoint_calls: Rc::clone(&checkpoint_calls),
+            training: CompiledModuleTrainingSession {
+                module,
+                runtime: CheckpointCountingRuntime {
+                    inner: runtime,
+                    checkpoint_calls: Rc::clone(&checkpoint_calls),
+                },
+                seal,
+                evaluation_capture_identity,
             },
-            seal,
-            evaluation_capture_identity,
         };
         let (source_module, completed) = source.finish_with_module_checkpoint().unwrap();
         assert_eq!(checkpoint_calls.get(), 1);
@@ -25054,7 +25506,7 @@ mod tests {
             )
             .unwrap();
         let checkpoint = session.module_checkpoint().unwrap();
-        session.module.arm_finish_race();
+        session.training.module.arm_finish_race();
 
         let error = session.finish_with_module_checkpoint().unwrap_err();
         assert!(matches!(
