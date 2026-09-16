@@ -224,7 +224,8 @@ pub use nn::{
     PendingModeEffects, ReLU, RealizedBatchNormStats, ResNet, ResNetBlock, ResNetConfig,
     ResNetDepth, ResNetForwardOutput, ResNetMetalError, ResNetMetalPlan, ResNetMetalRun,
     ResNetMetalSession, ResNetOutput, StateDict as ModuleStateDict, StrictStateLoadLimits,
-    TrainingDropoutProvider, TransformerBlock, get_parameters, get_state_dict,
+    TrainingDropoutProvider, TransformerBlock, TransformerPrecision, get_parameters,
+    get_state_dict,
 };
 pub use onnx::{
     NativeOnnxInferenceResult, NativeOnnxInferenceTrace, OnnxModel, import_onnx,
