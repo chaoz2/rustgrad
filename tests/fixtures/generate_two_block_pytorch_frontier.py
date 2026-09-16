@@ -225,6 +225,84 @@ def linear(value: torch.Tensor, params: OrderedDict[str, torch.Tensor], prefix: 
     return value @ params[f"{prefix}.0"] + params[f"{prefix}.1"]
 
 
+def storage_linear(
+    value: torch.Tensor,
+    params: OrderedDict[str, torch.Tensor],
+    prefix: str,
+    storage_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Mirror RustGrad source-Linear's typed product/sum/storage boundaries."""
+    value = value.to(storage_dtype)
+    weight = params[f"{prefix}.0"].to(storage_dtype)
+    bias = params[f"{prefix}.1"].to(storage_dtype)
+    product = value.unsqueeze(-2) * weight.transpose(0, 1)
+    reduced = product.to(torch.float32).sum(dim=-1).to(storage_dtype)
+    return reduced + bias
+
+
+class SourceOrderedAttentionMatmul(torch.autograd.Function):
+    """Batched F32 matmul with RustGrad's row-major accumulation order."""
+
+    @staticmethod
+    def forward(ctx, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        assert lhs.dtype == rhs.dtype == torch.float32
+        assert lhs.ndim == rhs.ndim == 4
+        assert lhs.shape[:2] == rhs.shape[:2]
+        assert lhs.shape[3] == rhs.shape[2]
+        ctx.save_for_backward(lhs, rhs)
+        batch, heads, rows, inner = lhs.shape
+        columns = rhs.shape[3]
+        output = torch.empty(
+            (batch, heads, rows, columns), dtype=torch.float32
+        )
+        for batch_index in range(batch):
+            for head in range(heads):
+                for row in range(rows):
+                    for column in range(columns):
+                        accumulator = torch.tensor(0.0, dtype=torch.float32)
+                        for coordinate in range(inner):
+                            product = (
+                                lhs[batch_index, head, row, coordinate]
+                                * rhs[batch_index, head, coordinate, column]
+                            )
+                            accumulator = accumulator + product
+                        output[batch_index, head, row, column] = accumulator
+        return output
+
+    @staticmethod
+    def backward(
+        ctx, upstream: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        lhs, rhs = ctx.saved_tensors
+        lhs_gradient = torch.zeros_like(lhs)
+        rhs_gradient = torch.zeros_like(rhs)
+        batch, heads, rows, inner = lhs.shape
+        columns = rhs.shape[3]
+        for batch_index in range(batch):
+            for head in range(heads):
+                for row in range(rows):
+                    for column in range(columns):
+                        cotangent = upstream[batch_index, head, row, column]
+                        for coordinate in range(inner):
+                            lhs_gradient[batch_index, head, row, coordinate] = (
+                                lhs_gradient[batch_index, head, row, coordinate]
+                                + cotangent
+                                * rhs[batch_index, head, coordinate, column]
+                            )
+                            rhs_gradient[batch_index, head, coordinate, column] = (
+                                rhs_gradient[batch_index, head, coordinate, column]
+                                + cotangent
+                                * lhs[batch_index, head, row, coordinate]
+                            )
+        return lhs_gradient, rhs_gradient
+
+
+def source_ordered_attention_matmul(
+    lhs: torch.Tensor, rhs: torch.Tensor
+) -> torch.Tensor:
+    return SourceOrderedAttentionMatmul.apply(lhs, rhs)
+
+
 def apply_causal_attention_mask(caller: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     effective = caller.expand(BATCH, HEADS, TIME, TIME) & torch.tril(
         torch.ones(TIME, TIME, dtype=torch.bool)
@@ -278,6 +356,54 @@ def block_forward(
         raise ValueError(f"unsupported activation: {activation}")
     ff_output = linear(activated, params, f"{prefix}.ff2")
     return residual + apply_dropout(ff_output, masks[2]), probabilities, ff_input
+
+
+def mixed_precision_block_forward(
+    value: torch.Tensor,
+    params: OrderedDict[str, torch.Tensor],
+    prefix: str,
+    effective_mask: torch.Tensor,
+    row_valid: torch.Tensor,
+    masks: list[torch.Tensor],
+    storage_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    value = value.to(storage_dtype)
+    normalized = layer_norm(value.to(torch.float32), params, f"{prefix}.ln1")
+    heads = []
+    for projection_name in ("query", "key", "value"):
+        projected = storage_linear(
+            normalized, params, f"{prefix}.{projection_name}", storage_dtype
+        ).to(torch.float32)
+        heads.append(
+            projected.reshape(BATCH, TIME, HEADS, HEAD_SIZE).permute(0, 2, 1, 3)
+        )
+    query, key, projected_value = heads
+    scores = source_ordered_attention_matmul(
+        query, key.transpose(-1, -2)
+    ) / f32(math.sqrt(float(HEAD_SIZE)))
+    safe_mask = effective_mask | (~row_valid & torch.nn.functional.one_hot(
+        torch.zeros(BATCH, HEADS, TIME, dtype=torch.int64), TIME
+    ).to(torch.bool))
+    probabilities = torch.softmax(scores.masked_fill(~safe_mask, -math.inf), dim=-1)
+    probabilities = torch.where(row_valid, probabilities, torch.zeros((), dtype=torch.float32))
+    dropped_probabilities = apply_dropout(probabilities, masks[0])
+    attended = source_ordered_attention_matmul(
+        dropped_probabilities, projected_value
+    )
+    attended = attended.permute(0, 2, 1, 3).contiguous().reshape(BATCH, TIME, EMBEDDING)
+    attended = storage_linear(attended, params, f"{prefix}.out", storage_dtype)
+    attended = apply_dropout(attended.to(torch.float32), masks[1]).to(storage_dtype)
+    residual = value + attended
+    ff_input = storage_linear(
+        layer_norm(residual.to(torch.float32), params, f"{prefix}.ln2"),
+        params,
+        f"{prefix}.ff1",
+        storage_dtype,
+    )
+    activated = torch.relu(ff_input)
+    ff_output = storage_linear(activated, params, f"{prefix}.ff2", storage_dtype)
+    ff_output = apply_dropout(ff_output.to(torch.float32), masks[2]).to(storage_dtype)
+    return residual + ff_output, probabilities, ff_input
 
 
 def block_evaluation_forward(
@@ -415,6 +541,59 @@ def policy_forward(
     )
 
 
+def mixed_precision_policy_forward(
+    params: OrderedDict[str, torch.Tensor], replay: int
+) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+    tokens, targets, loss_mask, caller = policy_batch(replay)
+    effective_mask, row_valid = apply_causal_attention_mask(caller)
+    masks = replay_masks(replay)
+    positions = torch.tensor(POSITIONS, dtype=torch.int64).reshape(BATCH, TIME)
+    value = params["tokens.weight"][tokens] + params["positions.weight"][positions]
+    value, first_probabilities, first_relu_input = mixed_precision_block_forward(
+        value,
+        params,
+        "first",
+        effective_mask,
+        row_valid,
+        masks[:3],
+        torch.bfloat16,
+    )
+    value, second_probabilities, second_relu_input = mixed_precision_block_forward(
+        value,
+        params,
+        "second",
+        effective_mask,
+        row_valid,
+        masks[3:],
+        torch.bfloat16,
+    )
+    value = layer_norm(value.to(torch.float32), params, "norm")
+    logits = value @ params["tokens.weight"].transpose(0, 1)
+    gather_targets = torch.where(targets == POLICY_IGNORE_INDEX, 0, targets)
+    token_losses = -torch.log_softmax(logits.reshape(-1, VOCAB), dim=-1).gather(
+        1, gather_targets.reshape(-1, 1)
+    ).reshape(BATCH, TIME) + 1.0
+    token_losses = torch.where(
+        targets == POLICY_IGNORE_INDEX,
+        torch.zeros((), dtype=torch.float32),
+        token_losses,
+    )
+    numerator = (token_losses * loss_mask).sum()
+    valid_token_count = loss_mask.sum()
+    return {
+        "logits": logits,
+        "token_losses": token_losses,
+        "loss": numerator / valid_token_count,
+        "numerator": numerator,
+        "valid_token_count": valid_token_count,
+        "attention_probabilities": [first_probabilities, second_probabilities],
+        "relu_inputs": [first_relu_input, second_relu_input],
+        "dropout_masks": masks,
+        "effective_attention_mask": effective_mask,
+        "row_valid": row_valid,
+    }
+
+
 def policy_evaluation_forward(
     params: OrderedDict[str, torch.Tensor], replay: int
 ) -> dict[str, torch.Tensor]:
@@ -539,6 +718,63 @@ def policy_replay_fixture(
         assert torch.count_nonzero(probabilities[invalid_rows]).item() == 0
     if replay % len(POLICY_VALID_LENGTHS) == 0:
         assert not bool(result["row_valid"][1].any())
+    fixture = {
+        "replay": replay,
+        "tokens": tokens.reshape(-1).tolist(),
+        "targets": targets.reshape(-1).tolist(),
+        "attention_keep_mask": caller.reshape(-1).tolist(),
+        "loss_mask": loss_mask.reshape(-1).tolist(),
+        "effective_attention_mask": tensor(result["effective_attention_mask"]),
+        "row_valid": tensor(result["row_valid"]),
+        "dropout_masks": [tensor(mask) for mask in result["dropout_masks"]],
+        "attention_probabilities": [
+            tensor(probabilities) for probabilities in result["attention_probabilities"]
+        ],
+        "logits": tensor(result["logits"]),
+        "token_losses": tensor(result["token_losses"]),
+        "token_mean_loss": float(result["loss"].item()),
+        "valid_token_count": int(result["valid_token_count"].item()),
+        "numerator_gradients": tensor_map(gradient_map),
+    }
+    return gradient_map, fixture, float(result["numerator"].item())
+
+
+def mixed_precision_policy_replay_fixture(
+    params: OrderedDict[str, torch.Tensor], replay: int
+) -> tuple[OrderedDict[str, torch.Tensor], dict[str, object], float]:
+    result = mixed_precision_policy_forward(params, replay)
+    active_params = OrderedDict(
+        (name, parameter)
+        for name, parameter in params.items()
+        if name != POLICY_FROZEN_PARAMETER
+    )
+    tokens, targets, loss_mask, caller = policy_batch(replay)
+    expected_token_count = sum(
+        POLICY_VALID_LENGTHS[(replay - 1) % len(POLICY_VALID_LENGTHS)]
+    )
+    assert int(result["valid_token_count"].item()) == expected_token_count
+    # Mirror the compiled objective boundary: reverse the scaled token mean,
+    # unscale the F32 master gradient, then reconstruct its numerator lane.
+    # Scaling before the BF16 VJP is observably different from differentiating
+    # the numerator directly, even though both routes agree in real arithmetic.
+    scaled_loss = result["loss"] * f32(POLICY_LOSS_SCALE)
+    scaled_gradients = torch.autograd.grad(scaled_loss, tuple(active_params.values()))
+    gradients = tuple(
+        (gradient / f32(POLICY_LOSS_SCALE)) * f32(float(expected_token_count))
+        for gradient in scaled_gradients
+    )
+    gradient_map = OrderedDict(zip(active_params.keys(), gradients))
+    assert len(gradient_map) == 35
+    assert sum(gradient.numel() for gradient in gradient_map.values()) == 372
+    assert all(gradient.dtype == torch.float32 for gradient in gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert all(
+        torch.count_nonzero(relu_input).item() > 0 for relu_input in result["relu_inputs"]
+    )
+    for probabilities in result["attention_probabilities"]:
+        assert probabilities.dtype == torch.float32
+        invalid_rows = ~result["row_valid"].expand_as(probabilities)
+        assert torch.count_nonzero(probabilities[invalid_rows]).item() == 0
     fixture = {
         "replay": replay,
         "tokens": tokens.reshape(-1).tolist(),
@@ -998,6 +1234,101 @@ def generate_gelu_policy_window() -> dict[str, object]:
     }
 
 
+def generate_mixed_precision_policy_window() -> dict[str, object]:
+    """Generate one BF16-storage/F32-state token-weighted AdamW window."""
+    params = make_parameters()
+    frozen_parameter = params[POLICY_FROZEN_PARAMETER].detach().clone()
+    active_params = OrderedDict(
+        (name, parameter)
+        for name, parameter in params.items()
+        if name != POLICY_FROZEN_PARAMETER
+    )
+    initial_parameters = OrderedDict(
+        (name, parameter.detach().clone()) for name, parameter in active_params.items()
+    )
+    first_moments = OrderedDict(
+        (name, torch.zeros_like(parameter)) for name, parameter in active_params.items()
+    )
+    second_moments = OrderedDict(
+        (name, torch.zeros_like(parameter)) for name, parameter in active_params.items()
+    )
+    gradients_by_replay = []
+    replays = []
+    numerators = []
+    for replay in range(1, 4):
+        gradients, fixture, numerator = mixed_precision_policy_replay_fixture(params, replay)
+        gradients_by_replay.append(gradients)
+        replays.append(fixture)
+        numerators.append(numerator)
+
+    next_active, first_moments, second_moments, commit = adamw_window(
+        active_params,
+        first_moments,
+        second_moments,
+        gradients_by_replay,
+        1,
+        11,
+        max_gradient_norm=POLICY_MAX_GRADIENT_NORM,
+        learning_rate=1.0e-3,
+        weight_decay=POLICY_WEIGHT_DECAY,
+        weight_decay_exclusions=frozenset(POLICY_WEIGHT_DECAY_EXCLUSIONS),
+    )
+    window_numerator = f32(0.0)
+    for numerator in numerators:
+        window_numerator = f32(window_numerator + numerator)
+    commit.update(
+        {
+            "learning_rate": 1.0e-3,
+            "mean_loss": f32(window_numerator / f32(11.0)),
+            "microbatch_count": 3,
+        }
+    )
+    changed_coordinate_count = sum(
+        struct.pack("<f", float(successor.detach().reshape(-1)[coordinate].item()))
+        != struct.pack(
+            "<f", float(active_params[name].detach().reshape(-1)[coordinate].item())
+        )
+        for name, successor in next_active.items()
+        for coordinate in range(successor.numel())
+    )
+    assert changed_coordinate_count == 364
+    assert next_active.keys() == active_params.keys()
+    assert all(value.dtype == torch.float32 for value in first_moments.values())
+    assert all(value.dtype == torch.float32 for value in second_moments.values())
+    assert torch.equal(params[POLICY_FROZEN_PARAMETER], frozen_parameter)
+    first_pending_loss_numerator = f32(f32(0.0) + numerators[0])
+    first_pending_loss_numerator = f32(first_pending_loss_numerator + numerators[1])
+    return {
+        "rustgrad_base": "3991f3afcb9ecd7985e846cf1e60920d5c4a2e96",
+        "storage_dtype": "bfloat16",
+        "weight_decay": POLICY_WEIGHT_DECAY,
+        "weight_decay_exclusions": list(POLICY_WEIGHT_DECAY_EXCLUSIONS),
+        "loss_scale": POLICY_LOSS_SCALE,
+        "accumulation_steps": 3,
+        "max_gradient_norm": POLICY_MAX_GRADIENT_NORM,
+        "ignore_index": POLICY_IGNORE_INDEX,
+        "learning_rate": 1.0e-3,
+        "active_parameter_count": len(active_params),
+        "active_coordinate_count": sum(
+            parameter.numel() for parameter in active_params.values()
+        ),
+        "changed_coordinate_count": changed_coordinate_count,
+        "frozen_parameter_name": POLICY_FROZEN_PARAMETER,
+        "frozen_parameter": tensor(frozen_parameter),
+        "initial_parameters": tensor_map(initial_parameters),
+        "replays": replays,
+        "pending_checkpoint": {
+            "replay_step": 2,
+            "optimizer_step": 0,
+            "accumulation_index": 2,
+            "valid_token_count": 8,
+            "dropout_counter": 2 * 84,
+            "loss_numerator": first_pending_loss_numerator,
+        },
+        "commit": commit,
+    }
+
+
 def main(output: Path) -> None:
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
@@ -1062,6 +1393,7 @@ def main(output: Path) -> None:
         "single_step_policy": generate_single_step_policy(),
         "policy_frontier": generate_policy_frontier(),
         "gelu_policy_window": generate_gelu_policy_window(),
+        "mixed_precision_policy_window": generate_mixed_precision_policy_window(),
     }
     output.write_text(json.dumps(fixture, indent=2, sort_keys=True) + "\n")
 
