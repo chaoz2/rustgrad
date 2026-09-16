@@ -1267,22 +1267,14 @@ v1--v7 bytes.
 
 Preparation has one ordered, fail-closed pipeline:
 
-1. **Derive.** Capture and recurrent witnesses plus per-program layouts are
-   derived before rendering.
-2. **Render.** Attached programs enter one bounded parallel render batch.
-   Results return in canonical main, accumulation, partial-flush, `zero_grad`,
-   evaluation order. Every render must succeed before prefix reuse is resolved.
-3. **Resolve.** Reusable prefixes and wrapper/cache identities are authenticated.
-   Optional programs do not change another program's artifact key.
-4. **Compile or load.** Durable-cache gates serialize identical keys, including
-   damaged-cache recovery. Distinct misses share the process-wide two-permit
-   compiler pool.
-5. **Authenticate.** Every loaded module ABI and the immutable workspace tape
-   are checked before publication. The tape covers fixed ABI slots, derived
-   affine reads, typed output initialization, and quantized resources.
-6. **Publish.** Preparation authenticates and publishes the ordered referenced
-   module set. A unique target suffix, when present, contributes one
-   content-addressed module; full-prefix reuse needs no target-owned module.
+| Stage | Contract |
+|---|---|
+| Derive | Capture and recurrent witnesses plus per-program layouts are complete before rendering. |
+| Render | Attached programs share one bounded parallel batch. Results return in canonical main, accumulation, partial-flush, `zero_grad`, evaluation order, and every render succeeds before prefix resolution. |
+| Resolve | Reusable prefixes and wrapper/cache identities authenticate independently; an optional program cannot change another program's artifact key. |
+| Compile or load | Durable-cache gates serialize identical keys, including damaged-cache recovery. Distinct misses share the process-wide two-permit compiler pool. |
+| Authenticate | Every loaded module ABI and immutable workspace tape is checked before publication, including fixed ABI slots, derived affine reads, typed output initialization, and quantized resources. |
+| Publish | The ordered referenced-module set publishes together. A unique target suffix contributes one content-addressed module when present; full-prefix reuse needs no target-owned module. |
 
 ##### Replay execution
 
@@ -1597,14 +1589,12 @@ runtime slot, or host pointer is serialized.
 The owned tiny Transformer cycles three deterministic `[2,3]` microbatches
 through a three-replay window with a finite global norm limit.
 
-- Two initial microbatches are cancelled without rewinding replay or dropout;
-  an empty reset is exact.
-- The step-four checkpoint retains accumulation index two at optimizer step
-  zero. A fresh owned module restores, commits at replay five, and matches the
-  uninterrupted frontier through the second update at replay eight and
-  consuming publication.
-- This sequence is shared by CPU and strict-Metal acceptance, the maintained
-  example, and protected evidence.
+| Stage | Evidence |
+|---|---|
+| Reset | Two initial microbatches are cancelled without rewinding replay or dropout; an empty reset is exact. |
+| Resume | The step-four checkpoint retains accumulation index two at optimizer step zero. A fresh owned module restores, commits at replay five, and matches the uninterrupted frontier through the second update at replay eight and consuming publication. |
+| Backends | CPU and strict-Metal acceptance, the maintained example, and protected evidence share this sequence. |
+| Precision | The bounded `TransformerPrecision` route keeps parameters, LayerNorm, attention contractions and softmax, dropout, caller loss, gradients, moments, and AdamW updates in F32. Projection, feed-forward, and residual activation storage may be F16 or BF16. The maintained BF16 window authenticates all 35 active leaves and 372 coordinates, a pending checkpoint, exact resumed commit, full moments and successors, and interpreter/strict-native CPU zero-fallback agreement. |
 
 ##### Public plan and runtime contracts
 
@@ -1667,8 +1657,11 @@ plan-specific concrete session, error, and borrowed-versus-consumed ownership:
 
 This design keeps backend selection out of graph construction, optimizer, and
 persistence logic. It introduces no central dispatcher enum and does not hide
-device evidence. Mixed-precision and dynamic-shape training remain outside the
-contract.
+device evidence. The bounded Transformer activation-storage policy is proven
+only for CPU interpreter and strict-native replay; it does not imply mixed
+optimizer state, dynamic loss scaling, arbitrary mixed-precision graphs, or a
+strict-Metal mixed-precision training path. Dynamic-shape training also remains
+outside the contract.
 
 `session/classification.rs` is a pure post-evaluation helper for rank-two F32
 logits and integer targets; it owns deterministic first-tie predictions and

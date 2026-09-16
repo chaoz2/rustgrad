@@ -88,25 +88,14 @@ strict Metal without a backend dispatcher enum.
 
 #### Maintained proof
 
-- Seven distinct `[2,3]` CPU microbatches cover a three-replay window,
-  finite global clipping, nonempty and empty `zero_grad`, partial flush, a
-  second optimizer update, exact checkpoint continuation, and publication into
-  a differently initialized matching module.
-- The dedicated native CPU proof uses a borrowed plan, captured MultiStep
-  learning rate, fixed-capacity sentinel-padded batches, and a checkpoint with
-  a retained partial window. It proves exact continuation without turning
-  observational timings into a performance gate.
-- The two-block workload uses `attention_dropout = 0.25` at six source-ordered
-  attention-weight and residual sites. Its immutable Threefry key and recurrent
-  U64 block counter advance atomically with AdamW.
-- Compiler-owned ignore-index weighting supplies both the compact attention
-  validity mask and exact token weight. The explicit F32-mask route remains
-  compatibility-covered; all-ignored single-step training rejects before
-  replay, while read-only evaluation may return zero weight without mutation.
-- Compile-time freezing, tied canonical ownership, AdamW decay exclusions,
-  static loss scaling, and global clipping remain capture-authenticated.
-  Dynamic freezing, runtime policy changes, label smoothing, and general
-  random-operation parity are not claimed.
+| Proof | Maintained evidence |
+| --- | --- |
+| Lifecycle | Seven distinct `[2,3]` CPU microbatches cover a three-replay window, finite global clipping, nonempty and empty `zero_grad`, partial flush, a second optimizer update, exact checkpoint continuation, and publication into a differently initialized matching module. |
+| Native CPU | A borrowed plan combines captured MultiStep learning rate, fixed-capacity sentinel-padded batches, and a checkpoint with a retained partial window. Continuation is exact; observational timings are not a performance gate. |
+| Dropout | The two-block workload uses `attention_dropout = 0.25` at six source-ordered attention-weight and residual sites. Its immutable Threefry key and recurrent U64 block counter advance atomically with AdamW. |
+| Token weighting | Compiler-owned ignore-index weighting supplies the compact attention validity mask and exact token weight. The explicit F32-mask route remains compatibility-covered; all-ignored single-step training rejects before replay, while read-only evaluation may return zero weight without mutation. |
+| Precision | The bounded Transformer precision policy keeps parameters, LayerNorm, attention, dropout, the final loss, and optimizer state in F32 while storing projection, feed-forward, and residual activations in F16 or BF16. The maintained BF16 oracle covers the full two-block AdamW frontier, pending and committed checkpoint continuation, and exact interpreter/strict-native CPU agreement with zero fallback. |
+| Optimizer policy | Compile-time freezing, tied canonical ownership, AdamW decay exclusions, static loss scaling, and global clipping remain capture-authenticated. Dynamic freezing, runtime policy changes, dynamic loss scaling, label smoothing, and general random-operation parity are not claimed. |
 
 The Architecture guide retains the phase inventory, error ordering, checkpoint
 version history, publication rules, native preparation pipeline, scoreboard

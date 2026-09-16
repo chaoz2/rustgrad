@@ -1,59 +1,30 @@
-//! Compile, train, checkpoint, and authentically recompile a fresh owned tiny
-//! Transformer for portable resume on CPU or strict Metal.
+//! Compile, train, replay, checkpoint, and resume one owned fixed-shape tiny
+//! Transformer on CPU or explicitly selected strict Metal.
 //!
-//! The example uses fixed-capacity right-padded batches. Compilation derives
-//! validity from ignore-index targets, owns the token-mean loss, and weights
-//! gradients by valid-token count across each accumulation window.
+//! ## Contract
 //!
-//! ## CPU resume modes
+//! - Right-padded batches keep one static shape.
+//! - Ignore-index targets provide both attention validity and exact token-mean
+//!   gradient weights across each accumulation window.
+//! - Resume authenticates the compiled program, optimizer frontier, tied and
+//!   frozen module state, and replay progress before publication.
 //!
-//! Same-process restore retains one compiled plan and rebuilds no graph or
-//! capture:
+//! ## Resume modes
 //!
-//! ```text
-//! cargo run --example compiled_transformer_train_resume -- cpu-reuse
-//! ```
-//!
-//! File restore recompiles a deliberately different initialization from a
-//! complete module checkpoint:
-//!
-//! ```text
-//! cargo run --example compiled_transformer_train_resume -- cpu-file-resume
-//! ```
-//!
-//! The same file lifecycle also runs through strict-native CPU JIT with no
-//! fallback:
-//!
-//! ```text
-//! cargo run --release --example compiled_transformer_train_resume -- native-cpu-file-resume
-//! ```
+//! | Mode | Command | Boundary |
+//! |---|---|---|
+//! | Reuse one plan | `cargo run --example compiled_transformer_train_resume -- cpu-reuse` | Restores in process without rebuilding the graph or capture. |
+//! | Portable file | `cargo run --example compiled_transformer_train_resume -- cpu-file-resume` | Recompiles a deliberately different initialization from a complete module checkpoint. |
+//! | Strict-native file | `cargo run --release --example compiled_transformer_train_resume -- native-cpu-file-resume` | Runs the same file lifecycle through CPU JIT with no fallback. |
 //!
 //! ## Replay and evidence modes
 //!
-//! Emit the bounded strict-native CPU scoreboard:
-//!
-//! ```text
-//! cargo run --release --example compiled_transformer_train_resume -- native-cpu-scoreboard
-//! ```
-//!
-//! Run graph-free interpreter CPU replay:
-//!
-//! ```text
-//! cargo run --example compiled_transformer_train_resume -- cpu
-//! ```
-//!
-//! Run the same capture through strict-native CPU JIT:
-//!
-//! ```text
-//! cargo run --release --example compiled_transformer_train_resume -- native-cpu
-//! ```
-//!
-//! Run the same capture on the first visible Metal device, with no CPU
-//! fallback:
-//!
-//! ```text
-//! cargo run --release --example compiled_transformer_train_resume -- metal
-//! ```
+//! | Mode | Command | Boundary |
+//! |---|---|---|
+//! | Interpreter CPU | `cargo run --example compiled_transformer_train_resume -- cpu` | Replays graph-free on the host interpreter. |
+//! | Strict-native CPU | `cargo run --release --example compiled_transformer_train_resume -- native-cpu` | Replays the same capture through CPU JIT. |
+//! | CPU scoreboard | `cargo run --release --example compiled_transformer_train_resume -- native-cpu-scoreboard` | Emits the bounded strict-native evidence report. |
+//! | Strict Metal | `cargo run --release --example compiled_transformer_train_resume -- metal` | Uses the first visible Metal device with no CPU fallback. |
 
 use rustgrad::nn::{Embedding, LayerNorm, Mode, ModeModuleForward, StateKind};
 use rustgrad::runtime::metal::MetalRuntime;
