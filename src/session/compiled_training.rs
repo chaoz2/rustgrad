@@ -2878,6 +2878,48 @@ impl CompiledTrainingStepResult {
 
 pub type CompiledMomentumSgdStepResult = CompiledTrainingStepResult;
 
+/// Exact persistent frontier of one compiled CPU momentum-SGD program.
+///
+/// The checkpoint is independent of the runtime's host module identity. A
+/// matching program may validate it against a freshly initialized module,
+/// restore parameter and momentum values with their logical versions, and
+/// continue replay without publishing into that module until finalization.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledMomentumSgdCheckpoint {
+    capture_identity: u64,
+    step: u64,
+    parameters: BTreeMap<String, TensorData>,
+    momenta: BTreeMap<String, TensorData>,
+    parameter_versions: BTreeMap<String, u64>,
+    momentum_versions: BTreeMap<String, u64>,
+}
+
+impl CompiledMomentumSgdCheckpoint {
+    pub const fn capture_identity(&self) -> u64 {
+        self.capture_identity
+    }
+
+    pub const fn step(&self) -> u64 {
+        self.step
+    }
+
+    pub fn parameters(&self) -> &BTreeMap<String, TensorData> {
+        &self.parameters
+    }
+
+    pub fn momenta(&self) -> &BTreeMap<String, TensorData> {
+        &self.momenta
+    }
+
+    pub fn parameter_versions(&self) -> &BTreeMap<String, u64> {
+        &self.parameter_versions
+    }
+
+    pub fn momentum_versions(&self) -> &BTreeMap<String, u64> {
+        &self.momentum_versions
+    }
+}
+
 /// Backend- and optimizer-neutral view of one committed compiled training step.
 ///
 /// Concrete optimizer results may expose additional progress, while device
@@ -4832,6 +4874,54 @@ pub struct CompiledModuleAdamWPlan<M> {
     required_evaluation_capture_identity: Option<u64>,
 }
 
+/// Recoverable momentum-SGD owned-module compilation failure.
+///
+/// Compilation and checkpoint validation never publish into the supplied
+/// module. The unchanged module is returned to callers on every failure.
+pub struct CompiledModuleMomentumSgdCompileError<M> {
+    module: M,
+    source: Error,
+}
+
+impl<M> CompiledModuleMomentumSgdCompileError<M> {
+    pub fn source_error(&self) -> &Error {
+        &self.source
+    }
+
+    pub fn into_module(self) -> M {
+        self.module
+    }
+
+    pub fn into_parts(self) -> (M, Error) {
+        (self.module, self.source)
+    }
+}
+
+impl<M> fmt::Debug for CompiledModuleMomentumSgdCompileError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledModuleMomentumSgdCompileError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> fmt::Display for CompiledModuleMomentumSgdCompileError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "owned compiled momentum-SGD compilation failed: {}",
+            self.source
+        )
+    }
+}
+
+impl<M> std::error::Error for CompiledModuleMomentumSgdCompileError<M> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Prepared compiled training session that owns its source module for the
 /// complete replay lifecycle.
 ///
@@ -5614,6 +5704,12 @@ pub trait CompiledCheckpointParameterSnapshot {
 impl CompiledCheckpointParameterSnapshot for CompiledAdamWCheckpoint {
     fn checkpoint_parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         Ok(decode_adamw_checkpoint(self.as_bytes())?.parameters)
+    }
+}
+
+impl CompiledCheckpointParameterSnapshot for CompiledMomentumSgdCheckpoint {
+    fn checkpoint_parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        Ok(self.parameters.clone())
     }
 }
 
@@ -9124,6 +9220,97 @@ impl CpuCompiledMomentumSgd {
         })
     }
 
+    /// Compiles an ordinary module forward against optimizer-owned parameter
+    /// and momentum state without taking ownership of the host module.
+    pub fn compile_module<M, F>(
+        config: CompiledMomentumSgdConfig,
+        module: &M,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let parameter_plan = ModuleParameterPlan::new(module, &BTreeSet::new())?;
+        let parameters = parameter_plan.initial_parameters()?;
+        Self::compile(config, parameters, |graph, inputs, parameters| {
+            parameter_plan.lower(graph, parameters, |graph| build(module, graph, inputs))
+        })
+    }
+
+    /// Recompiles a matching program and restores its exact momentum frontier
+    /// before the fresh runtime is returned.
+    pub fn compile_from_checkpoint<F>(
+        config: CompiledMomentumSgdConfig,
+        checkpoint: &CompiledMomentumSgdCheckpoint,
+        build: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let parameters = checkpoint
+            .parameters
+            .iter()
+            .map(|(name, value)| TrainingParameterInit::new(name.clone(), value.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut runtime = Self::compile(config, parameters, build)?;
+        runtime.restore_checkpoint_in_place(checkpoint)?;
+        Ok(runtime)
+    }
+
+    /// Recompiles a module-bound program and restores its exact parameter and
+    /// momentum frontier without mutating the host module.
+    pub fn compile_module_from_checkpoint<M, F>(
+        config: CompiledMomentumSgdConfig,
+        module: &M,
+        checkpoint: &CompiledMomentumSgdCheckpoint,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let parameter_plan = ModuleParameterPlan::new(module, &BTreeSet::new())?;
+        let destination_parameters = parameter_plan.initial_parameters()?;
+        if destination_parameters.len() != checkpoint.parameters.len()
+            || destination_parameters.iter().any(|parameter| {
+                checkpoint
+                    .parameters
+                    .get(parameter.name())
+                    .is_none_or(|saved| {
+                        saved.shape() != parameter.value().shape()
+                            || saved.dtype() != parameter.value().dtype()
+                    })
+            })
+        {
+            return Err(training(
+                "compiled momentum-SGD checkpoint parameter schema mismatch",
+            ));
+        }
+        let parameters = checkpoint
+            .parameters
+            .iter()
+            .map(|(name, value)| TrainingParameterInit::new(name.clone(), value.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut runtime = Self::compile(config, parameters, |graph, inputs, parameters| {
+            parameter_plan.lower(graph, parameters, |graph| build(module, graph, inputs))
+        })?;
+        runtime.restore_checkpoint_in_place(checkpoint)?;
+        Ok(runtime)
+    }
+
     pub fn step(
         &mut self,
         inputs: BTreeMap<String, TensorData>,
@@ -9163,6 +9350,109 @@ impl CpuCompiledMomentumSgd {
 
     pub fn momentum_versions(&self) -> Result<BTreeMap<String, u64>> {
         self.inner.momentum_versions()
+    }
+
+    /// Snapshots the exact persistent parameter/momentum frontier once.
+    pub fn checkpoint(&self) -> Result<CompiledMomentumSgdCheckpoint> {
+        let plan = self.inner.plan()?;
+        let capture_identity = plan.capture_identity()?;
+        let step = plan.step;
+        let mut parameters = BTreeMap::new();
+        let mut momenta = BTreeMap::new();
+        let mut parameter_versions = BTreeMap::new();
+        let mut momentum_versions = BTreeMap::new();
+        for (key, value) in plan.state_values {
+            let version = plan.state_versions[&key];
+            if let Some(name) = key.parameter_name() {
+                parameters.insert(name.to_owned(), value);
+                parameter_versions.insert(name.to_owned(), version);
+            } else if let Some(name) = key.momentum_parameter_name() {
+                momenta.insert(name.to_owned(), value);
+                momentum_versions.insert(name.to_owned(), version);
+            } else {
+                return Err(training(
+                    "compiled momentum-SGD checkpoint contains unexpected state",
+                ));
+            }
+        }
+        if parameters.keys().ne(momenta.keys())
+            || parameters.keys().ne(parameter_versions.keys())
+            || parameters.keys().ne(momentum_versions.keys())
+        {
+            return Err(training(
+                "compiled momentum-SGD checkpoint state names mismatch",
+            ));
+        }
+        Ok(CompiledMomentumSgdCheckpoint {
+            capture_identity,
+            step,
+            parameters,
+            momenta,
+            parameter_versions,
+            momentum_versions,
+        })
+    }
+
+    fn restored_candidate(&self, checkpoint: &CompiledMomentumSgdCheckpoint) -> Result<Self> {
+        if self.capture_identity() != checkpoint.capture_identity {
+            return Err(training(
+                "compiled momentum-SGD checkpoint capture identity mismatch",
+            ));
+        }
+        if checkpoint.parameters.keys().ne(checkpoint.momenta.keys())
+            || checkpoint
+                .parameters
+                .keys()
+                .ne(checkpoint.parameter_versions.keys())
+            || checkpoint
+                .parameters
+                .keys()
+                .ne(checkpoint.momentum_versions.keys())
+        {
+            return Err(training(
+                "compiled momentum-SGD checkpoint state names mismatch",
+            ));
+        }
+        let values = checkpoint
+            .parameters
+            .iter()
+            .map(|(name, value)| (RecurrentStateKey::parameter(name), value.clone()))
+            .chain(
+                checkpoint
+                    .momenta
+                    .iter()
+                    .map(|(name, value)| (RecurrentStateKey::momentum(name), value.clone())),
+            )
+            .collect();
+        let versions = checkpoint
+            .parameter_versions
+            .iter()
+            .map(|(name, version)| (RecurrentStateKey::parameter(name), *version))
+            .chain(
+                checkpoint
+                    .momentum_versions
+                    .iter()
+                    .map(|(name, version)| (RecurrentStateKey::momentum(name), *version)),
+            )
+            .collect();
+        let plan =
+            self.inner
+                .plan()?
+                .restore_frontier_with_versions(checkpoint.step, values, versions)?;
+        Ok(Self {
+            inner: plan.prepare_cpu()?,
+        })
+    }
+
+    /// Validates and restores a checkpoint atomically. A rejected checkpoint
+    /// leaves the live parameter and momentum frontier unchanged.
+    pub fn restore_checkpoint_in_place(
+        &mut self,
+        checkpoint: &CompiledMomentumSgdCheckpoint,
+    ) -> Result<()> {
+        let restored = self.restored_candidate(checkpoint)?;
+        *self = restored;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -9219,6 +9509,20 @@ impl CompiledTrainingCommitOnlyRuntime for CpuCompiledMomentumSgd {
         learning_rate: TensorData,
     ) -> Result<Self::Step> {
         CpuCompiledMomentumSgd::commit_step(self, inputs, learning_rate)
+    }
+}
+
+impl CompiledCheckpointRuntime for CpuCompiledMomentumSgd {
+    type Checkpoint = CompiledMomentumSgdCheckpoint;
+
+    fn checkpoint(&self) -> Result<Self::Checkpoint> {
+        CpuCompiledMomentumSgd::checkpoint(self)
+    }
+}
+
+impl CompiledCheckpointRestoreRuntime for CpuCompiledMomentumSgd {
+    fn restore_checkpoint_in_place(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
+        CpuCompiledMomentumSgd::restore_checkpoint_in_place(self, checkpoint)
     }
 }
 
@@ -10956,6 +11260,73 @@ impl<M, R> CompiledModuleTrainingSession<M, R> {
     /// module without publishing any trained parameter values.
     pub fn into_module_without_publication(self) -> M {
         self.module
+    }
+}
+
+impl<M: Module> CompiledModuleTrainingSession<M, CpuCompiledMomentumSgd> {
+    fn compile_owned_momentum<F>(
+        module: M,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleMomentumSgdCompileError<M>>
+    where
+        F: FnOnce(&M) -> Result<CpuCompiledMomentumSgd>,
+    {
+        let result: Result<(CpuCompiledMomentumSgd, CompiledModuleSeal)> = (|| {
+            let seal = CompiledModuleSeal::capture(&module, &BTreeSet::new())?;
+            let runtime = build(&module)?;
+            seal.validate_unchanged(&module)?;
+            Ok((runtime, seal))
+        })();
+        match result {
+            Ok((runtime, seal)) => Ok(Self {
+                module,
+                runtime,
+                seal,
+                evaluation_capture_identity: None,
+            }),
+            Err(source) => Err(CompiledModuleMomentumSgdCompileError { module, source }),
+        }
+    }
+
+    /// Compiles CPU momentum-SGD while taking exclusive ownership of the
+    /// module for the complete replay and publication lifecycle.
+    pub fn compile_momentum_sgd<F>(
+        config: CompiledMomentumSgdConfig,
+        module: M,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleMomentumSgdCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Self::compile_owned_momentum(module, |module| {
+            CpuCompiledMomentumSgd::compile_module(config, module, build)
+        })
+    }
+
+    /// Compiles against a fresh module identity and restores an authenticated
+    /// parameter/momentum frontier before returning the owned session.
+    pub fn compile_momentum_sgd_from_checkpoint<F>(
+        config: CompiledMomentumSgdConfig,
+        module: M,
+        checkpoint: &CompiledMomentumSgdCheckpoint,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleMomentumSgdCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Self::compile_owned_momentum(module, |module| {
+            CpuCompiledMomentumSgd::compile_module_from_checkpoint(
+                config, module, checkpoint, build,
+            )
+        })
     }
 }
 
@@ -15898,58 +16269,6 @@ mod tests {
     struct CheckpointCountingRuntime {
         inner: CpuCompiledAdamW,
         checkpoint_calls: Rc<Cell<u64>>,
-    }
-
-    #[derive(Clone)]
-    struct TestMomentumCheckpoint {
-        parameters: BTreeMap<String, TensorData>,
-    }
-
-    impl CompiledCheckpointParameterSnapshot for TestMomentumCheckpoint {
-        fn checkpoint_parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-            Ok(self.parameters.clone())
-        }
-    }
-
-    struct CheckpointedMomentumRuntime {
-        inner: CpuCompiledMomentumSgd,
-        checkpoint_calls: Rc<Cell<u64>>,
-    }
-
-    impl CompiledTrainingRuntime for CheckpointedMomentumRuntime {
-        type Step = CompiledMomentumSgdStepResult;
-
-        fn step(
-            &mut self,
-            inputs: BTreeMap<String, TensorData>,
-            learning_rate: TensorData,
-        ) -> Result<Self::Step> {
-            self.inner.step(inputs, learning_rate)
-        }
-
-        fn step_count(&self) -> u64 {
-            self.inner.step_count()
-        }
-
-        fn capture_identity(&self) -> u64 {
-            self.inner.capture_identity()
-        }
-
-        fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-            self.inner.parameter_snapshots()
-        }
-    }
-
-    impl CompiledCheckpointRuntime for CheckpointedMomentumRuntime {
-        type Checkpoint = TestMomentumCheckpoint;
-
-        fn checkpoint(&self) -> Result<Self::Checkpoint> {
-            self.checkpoint_calls
-                .set(self.checkpoint_calls.get().saturating_add(1));
-            Ok(TestMomentumCheckpoint {
-                parameters: self.inner.parameter_snapshots()?,
-            })
-        }
     }
 
     impl CompiledTrainingRuntime for CheckpointCountingRuntime {
@@ -24471,51 +24790,111 @@ mod tests {
     }
 
     #[test]
-    fn owned_module_training_session_finishes_non_adamw_checkpoint_once() {
-        let module = TiedFrozenModule::new([1.0, -1.0]);
-        let frozen_before = module.frozen.snapshot().unwrap();
-        let buffer_before = module.buffer.snapshot().unwrap();
-        let parameters = ModuleParameterPlan::new(&module, &BTreeSet::new())
+    fn owned_module_momentum_checkpoint_resumes_fresh_identity_atomically() {
+        let config = CompiledMomentumSgdConfig::new(0.9)
             .unwrap()
-            .initial_parameters()
+            .with_input("x", [2], DType::F32)
             .unwrap();
-        let seal = CompiledModuleSeal::capture(&module, &BTreeSet::new()).unwrap();
-        let runtime = CpuCompiledMomentumSgd::compile(
-            CompiledMomentumSgdConfig::new(0.9)
-                .unwrap()
-                .with_input("x", [2], DType::F32)
-                .unwrap(),
-            parameters,
-            |graph, inputs, parameters| {
-                let output = graph.mul(inputs["x"], parameters["shared"])?;
-                Ok((graph.sum_all(output)?, BTreeMap::new()))
-            },
+        let source = TiedFrozenModule::new([1.0, -1.0]);
+        let mut uninterrupted = CompiledModuleTrainingSession::compile_momentum_sgd(
+            config.clone(),
+            source,
+            build_tied_frozen,
         )
         .unwrap();
-        let checkpoint_calls = Rc::new(Cell::new(0));
-        let mut session = CompiledModuleTrainingSession {
-            module,
-            runtime: CheckpointedMomentumRuntime {
-                inner: runtime,
-                checkpoint_calls: Rc::clone(&checkpoint_calls),
-            },
-            seal,
-            evaluation_capture_identity: None,
-        };
-        session
-            .step(
-                BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]),
-                TensorData::scalar(0.01),
-            )
-            .unwrap();
-        let expected = session.parameter_snapshots().unwrap();
-        let (module, checkpoint) = session.finish_with_checkpoint().unwrap();
+        let capture_identity = uninterrupted.capture_identity();
+        for x in [[0.5, -0.25], [0.75, 0.125]] {
+            uninterrupted
+                .step(
+                    BTreeMap::from([("x".into(), TensorData::new([2], x.to_vec()).unwrap())]),
+                    TensorData::scalar(0.01),
+                )
+                .unwrap();
+        }
+        let checkpoint = uninterrupted.checkpoint().unwrap();
+        assert_eq!(checkpoint.capture_identity(), capture_identity);
+        assert_eq!(checkpoint.step(), 2);
+        assert_eq!(
+            checkpoint.parameters(),
+            &uninterrupted.parameter_snapshots().unwrap()
+        );
+        assert_eq!(
+            checkpoint.momenta(),
+            &uninterrupted.runtime().momentum_snapshots().unwrap()
+        );
+        assert_eq!(
+            checkpoint.parameter_versions(),
+            &uninterrupted.runtime().parameter_versions().unwrap()
+        );
+        assert_eq!(
+            checkpoint.momentum_versions(),
+            &uninterrupted.runtime().momentum_versions().unwrap()
+        );
 
-        assert_eq!(checkpoint_calls.get(), 1);
-        assert_eq!(checkpoint.parameters, expected);
-        assert_eq!(module.shared.value().unwrap(), expected["shared"]);
-        assert_parameter_snapshot_eq(&module.frozen.snapshot().unwrap(), &frozen_before);
-        assert_parameter_snapshot_eq(&module.buffer.snapshot().unwrap(), &buffer_before);
+        let destination = TiedFrozenModule::new([1.0, -1.0]);
+        destination
+            .shared
+            .replace(TensorData::new([2], vec![9.0, -7.0]).unwrap())
+            .unwrap();
+        let destination_shared_before = destination.shared.snapshot().unwrap();
+        let destination_frozen_before = destination.frozen.snapshot().unwrap();
+        let destination_buffer_before = destination.buffer.snapshot().unwrap();
+        let destination_shared_identity = destination.shared.id();
+        let mut resumed = CompiledModuleTrainingSession::compile_momentum_sgd_from_checkpoint(
+            config,
+            destination,
+            &checkpoint,
+            build_tied_frozen,
+        )
+        .unwrap();
+        assert_eq!(resumed.capture_identity(), capture_identity);
+        assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+        assert_parameter_snapshot_eq(
+            &resumed.module.shared.snapshot().unwrap(),
+            &destination_shared_before,
+        );
+
+        let before_rejection = resumed.checkpoint().unwrap();
+        let mut foreign = before_rejection.clone();
+        foreign.capture_identity ^= 1;
+        assert!(resumed.restore_checkpoint_in_place(&foreign).is_err());
+        assert_eq!(resumed.checkpoint().unwrap(), before_rejection);
+
+        let next_inputs =
+            BTreeMap::from([("x".into(), TensorData::new([2], vec![-0.5, 0.375]).unwrap())]);
+        let expected = uninterrupted
+            .step(next_inputs.clone(), TensorData::scalar(0.02))
+            .unwrap();
+        let actual = resumed.step(next_inputs, TensorData::scalar(0.02)).unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(actual.outputs(), expected.outputs());
+        assert_eq!(actual.step(), expected.step());
+        assert_eq!(actual.capture_identity(), expected.capture_identity());
+        assert_eq!(
+            resumed.checkpoint().unwrap(),
+            uninterrupted.checkpoint().unwrap()
+        );
+
+        let final_checkpoint = resumed.checkpoint().unwrap();
+        let (destination, published) = resumed.finish_with_checkpoint().unwrap();
+        assert_eq!(published, final_checkpoint);
+        assert_eq!(destination.shared.id(), destination_shared_identity);
+        assert_eq!(
+            destination.shared.value().unwrap(),
+            published.parameters()["shared"]
+        );
+        assert_eq!(
+            destination.shared.version().unwrap(),
+            destination_shared_before.version + 1
+        );
+        assert_parameter_snapshot_eq(
+            &destination.frozen.snapshot().unwrap(),
+            &destination_frozen_before,
+        );
+        assert_parameter_snapshot_eq(
+            &destination.buffer.snapshot().unwrap(),
+            &destination_buffer_before,
+        );
     }
 
     #[test]
