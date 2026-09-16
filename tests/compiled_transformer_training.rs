@@ -21,8 +21,9 @@ use rustgrad::{
     LossOptions, MetalCompiledAdamWPlan, Module, NATIVE_TRAINING_REPORT_FORMAT_VERSION,
     NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget,
     NativeTrainingReport, NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result,
-    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, UnaryOp, cross_entropy,
-    load_safetensors, save_safetensors, schedule_many, sparse_categorical_cross_entropy,
+    Scalar, Shape, TensorData, TrainingDropoutProvider, TransformerBlock, TransformerPrecision,
+    UnaryOp, cross_entropy, load_safetensors, save_safetensors, schedule_many,
+    sparse_categorical_cross_entropy,
 };
 use serde::Deserialize;
 use std::cell::Cell;
@@ -706,6 +707,12 @@ fn two_block_gelu_policy_config() -> CompiledAdamWConfig {
         .unwrap()
 }
 
+fn two_block_mixed_precision_policy_config() -> CompiledAdamWConfig {
+    two_block_policy_frontier_config()
+        .with_weight_decay_exclusions(TWO_BLOCK_WEIGHT_DECAY_EXCLUSIONS)
+        .unwrap()
+}
+
 fn two_block_attention_dropout_config() -> CompiledAdamWConfig {
     two_block_config()
         .with_input(ATTENTION_DROPOUT_TRANSITION_GUARD, [], DType::F32)
@@ -1109,6 +1116,39 @@ fn build_two_block_gelu_policy_frontier(
     Ok(CompiledAdamWGraph::token_mean(losses, outputs))
 }
 
+fn build_two_block_mixed_precision_policy_frontier(
+    model: &TwoBlockPositionalGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    ignore_index: CompiledAdamWIgnoreIndexContext,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<CompiledAdamWGraph> {
+    let attention_keep_mask =
+        graph.reshape(ignore_index.validity(), POLICY_ATTENTION_KEEP_MASK_SHAPE)?;
+    let (logits, outputs) = forward_two_block_mixed_precision_with_attention_dropout(
+        model,
+        graph,
+        inputs,
+        attention_keep_mask,
+        dropout,
+    )?;
+    let losses = sparse_categorical_cross_entropy(
+        graph,
+        logits,
+        inputs["targets"],
+        LossOptions {
+            reduction: Reduction::None,
+            class_axis: 2,
+            ignore_index: Some(i64::from(POLICY_IGNORE_INDEX)),
+            label_smoothing: 0.0,
+        },
+    )?;
+    assert_eq!(graph.dtype(losses)?, DType::F32);
+    let guard = graph.reciprocal(inputs[ATTENTION_DROPOUT_TRANSITION_GUARD])?;
+    let losses = graph.add(losses, guard)?;
+    Ok(CompiledAdamWGraph::token_mean(losses, outputs))
+}
+
 fn build_two_block_policy_evaluation(
     model: &TwoBlockPositionalGpt,
     graph: &mut Graph,
@@ -1172,6 +1212,68 @@ fn forward_two_block_gelu_with_attention_dropout(
         attention_mask,
         &mut observed,
     )?;
+    observed_two_block_outputs(logits, observed)
+}
+
+fn forward_two_block_mixed_precision_with_attention_dropout(
+    model: &TwoBlockPositionalGpt,
+    graph: &mut Graph,
+    inputs: &BTreeMap<String, NodeId>,
+    attention_mask: NodeId,
+    dropout: &mut dyn TrainingDropoutProvider,
+) -> Result<(NodeId, BTreeMap<String, NodeId>)> {
+    let mut observed = ObservedTwoBlockDropout {
+        inner: dropout,
+        sites: Vec::new(),
+    };
+    let token_hidden = model.tokens.forward(graph, inputs["tokens"])?;
+    let positions = graph.constant(TensorData::from_scalars(
+        [BATCH, TIME],
+        DType::I32,
+        [0, 1, 2, 0, 1, 2].into_iter().map(Scalar::I),
+    )?);
+    let position_hidden = model.positions.forward(graph, positions)?;
+    let hidden = graph.add(token_hidden, position_hidden)?;
+    let hidden = model.first.forward_training_with_precision(
+        graph,
+        hidden,
+        Some(attention_mask),
+        TransformerPrecision::BF16,
+        &mut observed,
+    )?;
+    assert_eq!(graph.dtype(hidden)?, DType::BF16);
+    let hidden = model.second.forward_training_with_precision(
+        graph,
+        hidden,
+        Some(attention_mask),
+        TransformerPrecision::BF16,
+        &mut observed,
+    )?;
+    assert_eq!(graph.dtype(hidden)?, DType::BF16);
+    let hidden = graph.cast(hidden, DType::F32)?;
+    let hidden = model.norm.forward(graph, hidden)?;
+    assert_eq!(graph.dtype(hidden)?, DType::F32);
+    let tied_weight = model.tokens.weight.bind(graph)?;
+    assert_eq!(graph.dtype(tied_weight)?, DType::F32);
+    let tied_weight = graph.permute(tied_weight, [1, 0])?;
+    let logits = graph.matmul(hidden, tied_weight)?;
+    assert_eq!(graph.dtype(logits)?, DType::F32);
+    let raw_matmuls = graph
+        .trace(logits)?
+        .steps
+        .into_iter()
+        .map(|step| step.node)
+        .filter_map(|node| match graph.op(node).ok()? {
+            Op::Matmul { lhs, rhs } => Some((node, *lhs, *rhs)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(raw_matmuls.len(), 5);
+    assert!(raw_matmuls.iter().all(|(output, lhs, rhs)| {
+        [*output, *lhs, *rhs]
+            .into_iter()
+            .all(|node| graph.dtype(node).unwrap() == DType::F32)
+    }));
     observed_two_block_outputs(logits, observed)
 }
 
@@ -2167,6 +2269,28 @@ struct PyTorchGeluPolicyWindowFixture {
 }
 
 #[derive(Deserialize)]
+struct PyTorchMixedPrecisionPolicyWindowFixture {
+    rustgrad_base: String,
+    storage_dtype: String,
+    weight_decay: f32,
+    weight_decay_exclusions: Vec<String>,
+    loss_scale: f32,
+    accumulation_steps: u64,
+    max_gradient_norm: f32,
+    ignore_index: i32,
+    learning_rate: f32,
+    active_parameter_count: usize,
+    active_coordinate_count: usize,
+    changed_coordinate_count: usize,
+    frozen_parameter_name: String,
+    frozen_parameter: PyTorchTensorFixture,
+    initial_parameters: BTreeMap<String, PyTorchTensorFixture>,
+    replays: Vec<PyTorchReplayFixture>,
+    pending_checkpoint: PyTorchPolicyPendingCheckpointFixture,
+    commit: PyTorchPolicyAdamWWindowFixture,
+}
+
+#[derive(Deserialize)]
 struct PyTorchSingleStepPolicyFixture {
     rustgrad_base: String,
     source_replay: u64,
@@ -2210,6 +2334,7 @@ struct TwoBlockPyTorchFixture {
     single_step_policy: PyTorchSingleStepPolicyFixture,
     policy_frontier: PyTorchPolicyFrontierFixture,
     gelu_policy_window: PyTorchGeluPolicyWindowFixture,
+    mixed_precision_policy_window: PyTorchMixedPrecisionPolicyWindowFixture,
 }
 
 fn two_block_pytorch_fixture() -> TwoBlockPyTorchFixture {
@@ -9463,6 +9588,333 @@ fn compiled_two_block_gelu_adamw_windows_match_pytorch_across_checkpoint() {
         "strict-native GELU second window",
         native_sixth.window_loss_report().unwrap(),
         second_commit,
+    );
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(model.state_dict().unwrap(), state_before);
+    assert_eq!(module_parameter_state(&model), parameter_state_before);
+}
+
+#[test]
+fn compiled_two_block_bf16_adamw_window_matches_pytorch_across_checkpoint() {
+    let fixture = two_block_pytorch_fixture();
+    let expected = &fixture.mixed_precision_policy_window;
+    assert_eq!(
+        expected.rustgrad_base,
+        "3991f3afcb9ecd7985e846cf1e60920d5c4a2e96"
+    );
+    assert_eq!(expected.storage_dtype, "bfloat16");
+    assert_eq!(expected.accumulation_steps, 3);
+    assert_eq!(expected.ignore_index, POLICY_IGNORE_INDEX);
+    assert_eq!(expected.replays.len(), 3);
+    assert_eq!(expected.commit.adamw.optimizer_step, 1);
+    assert_eq!(expected.commit.microbatch_count, 3);
+    assert_eq!(expected.commit.adamw.valid_token_count, 11);
+    assert_eq!(expected.changed_coordinate_count, 364);
+
+    let model = TwoBlockPositionalGpt::new_with_attention_dropout(0x5678, 0.25).unwrap();
+    let state_before = model.state_dict().unwrap();
+    let parameter_state_before = module_parameter_state(&model);
+    assert_eq!(
+        &state_before.tensors()[POLICY_FROZEN_PARAMETER],
+        &expected.frozen_parameter.tensor()
+    );
+    assert_eq!(expected.frozen_parameter_name, POLICY_FROZEN_PARAMETER);
+    let mut traversal = BTreeMap::new();
+    model.visit("", &mut |name, parameter, kind| {
+        assert_eq!(kind, StateKind::Parameter);
+        assert!(traversal.insert(name, parameter.id()).is_none());
+    });
+    assert_eq!(traversal.len(), 37);
+    assert_eq!(traversal["tokens.weight"], traversal["lm_head.weight"]);
+    assert_eq!(
+        traversal.values().copied().collect::<BTreeSet<_>>().len(),
+        36
+    );
+
+    let optimizer = two_block_mixed_precision_policy_config();
+    assert_eq!(
+        optimizer.weight_decay().to_bits(),
+        expected.weight_decay.to_bits()
+    );
+    assert_eq!(
+        optimizer.weight_decay_exclusions().collect::<Vec<_>>(),
+        expected
+            .weight_decay_exclusions
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        optimizer.loss_scale().to_bits(),
+        expected.loss_scale.to_bits()
+    );
+    assert_eq!(
+        optimizer.max_gradient_norm(),
+        Some(expected.max_gradient_norm)
+    );
+    assert_eq!(
+        optimizer.captured_multi_step_lr(),
+        Some(&CompiledMultiStepLr::new(expected.learning_rate, 0.5, [1]).unwrap())
+    );
+    assert_eq!(
+        optimizer.frozen_parameters().collect::<Vec<_>>(),
+        [POLICY_FROZEN_PARAMETER]
+    );
+
+    let compile_count = Cell::new(0);
+    let plan = CompiledAdamWPlan::compile_module_graph_with_dropout_and_ignore_index(
+        optimizer.clone(),
+        dropout_config(),
+        &model,
+        |model, graph, inputs, ignore_index, dropout| {
+            compile_count.set(compile_count.get() + 1);
+            build_two_block_mixed_precision_policy_frontier(
+                model,
+                graph,
+                inputs,
+                ignore_index,
+                dropout,
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(compile_count.get(), 1);
+    assert_eq!(plan.dropout_blocks_per_replay(), Some(84));
+    assert_eq!(plan.gradient_accumulation_steps(), 3);
+    assert_eq!(
+        plan.token_weighted_ignore_index(),
+        Some(("targets", POLICY_IGNORE_INDEX))
+    );
+    assert!(plan.clip_report_enabled());
+    assert!(plan.window_loss_report_enabled());
+
+    let initial_expected = fixture_tensor_map(&expected.initial_parameters);
+    let mut interpreted = plan.prepare_cpu().unwrap();
+    let initial_parameters = interpreted.parameter_snapshots().unwrap();
+    assert_eq!(initial_parameters, initial_expected);
+    assert_eq!(initial_parameters.len(), expected.active_parameter_count);
+    assert_eq!(
+        initial_parameters
+            .values()
+            .map(TensorData::len)
+            .sum::<usize>(),
+        expected.active_coordinate_count
+    );
+    assert!(
+        initial_parameters
+            .values()
+            .all(|parameter| parameter.dtype() == DType::F32)
+    );
+
+    let first = interpreted
+        .step_scheduled(policy_frontier_batch(1))
+        .unwrap();
+    assert!(!first.did_update());
+    assert_eq!(first.loss().dtype(), DType::F32);
+    assert_policy_frontier_replay(&first, &expected.replays[0]);
+    assert_pytorch_tensor_map_close(
+        "BF16 replay 1 numerator gradient",
+        &interpreted.gradient_accumulator_snapshots().unwrap(),
+        &expected.replays[0].numerator_gradients,
+    );
+    assert_pytorch_active_gradient_family_evidence(
+        &interpreted.gradient_accumulator_snapshots().unwrap(),
+        &expected.replays[0].numerator_gradients,
+    );
+
+    let second = interpreted
+        .step_scheduled(policy_frontier_batch(2))
+        .unwrap();
+    assert!(!second.did_update());
+    assert_policy_frontier_replay(&second, &expected.replays[1]);
+    let expected_pending_gradients = summed_pytorch_numerator_gradients(&expected.replays[..2]);
+    assert_pytorch_tensor_map_close(
+        "BF16 replays 1+2 numerator gradient",
+        &interpreted.gradient_accumulator_snapshots().unwrap(),
+        &expected_pending_gradients,
+    );
+    let pending_checkpoint = interpreted.checkpoint().unwrap();
+    assert_policy_pending_checkpoint(
+        "BF16 replay 2 pending",
+        &pending_checkpoint,
+        &expected.pending_checkpoint,
+    );
+    let restored_plan = plan.restore_checkpoint(&pending_checkpoint).unwrap();
+    assert_eq!(restored_plan.capture_identity(), plan.capture_identity());
+    assert_eq!(compile_count.get(), 1);
+    let mut interpreted_resumed = restored_plan.prepare_cpu().unwrap();
+    assert_eq!(
+        interpreted_resumed.checkpoint().unwrap(),
+        pending_checkpoint
+    );
+
+    let third = interpreted
+        .step_scheduled(policy_frontier_batch(3))
+        .unwrap();
+    let resumed_third = interpreted_resumed
+        .step_scheduled(policy_frontier_batch(3))
+        .unwrap();
+    assert!(third.did_update());
+    assert_policy_frontier_replay(&third, &expected.replays[2]);
+    assert_compiled_adamw_steps_exact("BF16 replay 3 restore", &resumed_third, &third);
+    assert_eq!(
+        interpreted_resumed.checkpoint().unwrap(),
+        interpreted.checkpoint().unwrap()
+    );
+    assert_policy_window_report(
+        "BF16 window",
+        third.window_loss_report().unwrap(),
+        &expected.commit,
+    );
+    assert_pytorch_adamw_window_for_frontier(
+        "BF16 window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 1,
+            clip_report: third.clip_report().unwrap(),
+            actual_initial: &initial_parameters,
+            actual_first_moments: &interpreted.first_moment_snapshots().unwrap(),
+            actual_second_moments: &interpreted.second_moment_snapshots().unwrap(),
+            actual_successors: &interpreted.parameter_snapshots().unwrap(),
+            expected_initial: &expected.initial_parameters,
+            expected: &expected.commit.adamw,
+        },
+        expected.commit.microbatch_count,
+        expected.active_coordinate_count,
+        PyTorchSuccessorOracle::CrossFramework {
+            expected_changed_coordinates: Some(expected.changed_coordinate_count),
+        },
+    );
+    for state in [
+        interpreted.parameter_snapshots().unwrap(),
+        interpreted.first_moment_snapshots().unwrap(),
+        interpreted.second_moment_snapshots().unwrap(),
+        interpreted.gradient_accumulator_snapshots().unwrap(),
+    ] {
+        assert!(state.values().all(|tensor| tensor.dtype() == DType::F32));
+    }
+    assert_policy_accumulators_are_positive_zero(&interpreted);
+    assert_policy_accumulators_are_positive_zero(&interpreted_resumed);
+    let committed_checkpoint = interpreted.checkpoint().unwrap();
+    assert_eq!(committed_checkpoint.info().replay_step(), 3);
+    assert_eq!(committed_checkpoint.info().optimizer_step(), 1);
+    assert_eq!(committed_checkpoint.info().accumulation_index(), 0);
+    assert_eq!(
+        committed_checkpoint.info().accumulated_token_count(),
+        Some(0)
+    );
+
+    let mut committed_reference = interpreted;
+    let mut committed_resumed = plan
+        .restore_checkpoint(&committed_checkpoint)
+        .unwrap()
+        .prepare_cpu()
+        .unwrap();
+    let reference_fourth = committed_reference
+        .step_scheduled(policy_frontier_batch(4))
+        .unwrap();
+    let resumed_fourth = committed_resumed
+        .step_scheduled(policy_frontier_batch(4))
+        .unwrap();
+    assert_compiled_adamw_steps_exact(
+        "BF16 committed checkpoint continuation",
+        &resumed_fourth,
+        &reference_fourth,
+    );
+    assert_eq!(
+        committed_resumed.checkpoint().unwrap(),
+        committed_reference.checkpoint().unwrap()
+    );
+
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let mut native = plan.prepare(&target).unwrap();
+    assert_native_policy_preparation(&native);
+    assert_eq!(native.parameter_snapshots().unwrap(), initial_parameters);
+    let native_first = native.step_scheduled(policy_frontier_batch(1)).unwrap();
+    assert!(!native_first.did_update());
+    assert_native_policy_step(&native_first, &expected.replays[0]);
+    assert_pytorch_tensor_map_close(
+        "strict-native BF16 replay 1 numerator gradient",
+        &native.gradient_accumulator_snapshots().unwrap(),
+        &expected.replays[0].numerator_gradients,
+    );
+    assert_pytorch_active_gradient_family_evidence(
+        &native.gradient_accumulator_snapshots().unwrap(),
+        &expected.replays[0].numerator_gradients,
+    );
+    let native_second = native.step_scheduled(policy_frontier_batch(2)).unwrap();
+    assert!(!native_second.did_update());
+    assert_native_policy_step(&native_second, &expected.replays[1]);
+    let native_pending_checkpoint = native.checkpoint().unwrap();
+    assert_policy_pending_checkpoint(
+        "strict-native BF16 replay 2 pending",
+        &native_pending_checkpoint,
+        &expected.pending_checkpoint,
+    );
+    let mut native_resumed = plan
+        .restore_checkpoint(&native_pending_checkpoint)
+        .unwrap()
+        .prepare(&target)
+        .unwrap();
+    assert_native_policy_preparation(&native_resumed);
+    assert_eq!(
+        native_resumed.checkpoint().unwrap(),
+        native_pending_checkpoint
+    );
+    let native_third = native.step_scheduled(policy_frontier_batch(3)).unwrap();
+    let native_resumed_third = native_resumed
+        .step_scheduled(policy_frontier_batch(3))
+        .unwrap();
+    for step in [&native_third, &native_resumed_third] {
+        assert!(step.did_update());
+        assert_native_policy_step(step, &expected.replays[2]);
+    }
+    assert_compiled_adamw_steps_exact(
+        "strict-native BF16 replay 3 restore",
+        &native_resumed_third,
+        &native_third,
+    );
+    assert_compiled_adamw_steps_exact("BF16 interpreter/native replay 3", &native_third, &third);
+    assert_eq!(
+        native_resumed.checkpoint().unwrap(),
+        native.checkpoint().unwrap()
+    );
+    assert_policy_window_report(
+        "strict-native BF16 window",
+        native_third.window_loss_report().unwrap(),
+        &expected.commit,
+    );
+    assert_pytorch_adamw_window_for_frontier(
+        "strict-native BF16 window",
+        PyTorchAdamWWindowAssertion {
+            optimizer_step: 1,
+            clip_report: native_third.clip_report().unwrap(),
+            actual_initial: &initial_parameters,
+            actual_first_moments: &native.first_moment_snapshots().unwrap(),
+            actual_second_moments: &native.second_moment_snapshots().unwrap(),
+            actual_successors: &native.parameter_snapshots().unwrap(),
+            expected_initial: &expected.initial_parameters,
+            expected: &expected.commit.adamw,
+        },
+        expected.commit.microbatch_count,
+        expected.active_coordinate_count,
+        PyTorchSuccessorOracle::CrossFramework {
+            expected_changed_coordinates: Some(expected.changed_coordinate_count),
+        },
+    );
+    assert_policy_accumulators_are_positive_zero(&native);
+    assert_policy_accumulators_are_positive_zero(&native_resumed);
+    assert_eq!(
+        native.parameter_snapshots().unwrap(),
+        interpreted_resumed.parameter_snapshots().unwrap()
+    );
+    assert_eq!(
+        native.first_moment_snapshots().unwrap(),
+        interpreted_resumed.first_moment_snapshots().unwrap()
+    );
+    assert_eq!(
+        native.second_moment_snapshots().unwrap(),
+        interpreted_resumed.second_moment_snapshots().unwrap()
     );
     assert_eq!(compile_count.get(), 1);
     assert_eq!(model.state_dict().unwrap(), state_before);
