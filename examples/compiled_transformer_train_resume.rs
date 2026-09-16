@@ -60,10 +60,11 @@ use rustgrad::runtime::metal::MetalRuntime;
 use rustgrad::{
     Backend, CapturedReplayExecutor, CompiledAdamWCheckpoint, CompiledAdamWConfig,
     CompiledAdamWGraph, CompiledAdamWIgnoreIndexContext, CompiledAdamWPlan,
-    CompiledAdamWResumeBundle, CompiledAdamWRuntime, CompiledAdamWStep, CompiledCheckpointRuntime,
-    CompiledDropoutConfig, CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime,
-    CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan, CompiledModuleAdamWSession,
-    CompiledMultiStepLr, CompiledScheduledAdamWRuntime, CompiledTrainingRatePolicyRuntime,
+    CompiledAdamWResumeBundle, CompiledAdamWRuntime, CompiledAdamWStep,
+    CompiledCheckpointRestoreRuntime, CompiledCheckpointRuntime, CompiledDropoutConfig,
+    CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
+    CompiledInputSpec, CompiledModuleAdamWPlan, CompiledModuleAdamWSession, CompiledMultiStepLr,
+    CompiledScheduledAdamWRuntime, CompiledTrainingRatePolicyRuntime,
     CompiledTrainingRatePolicyWindowCommitRuntime, CompiledTrainingRuntime, CompiledTrainingStep,
     CompiledTrainingWindowCommit, CompiledTrainingWindowCommitRuntime,
     CompiledTrainingWindowResetRuntime, CompiledTrainingWindowRuntime, CompiledTrainingWindowStep,
@@ -874,6 +875,28 @@ where
     runtime.step_batch_with_rate_policy(batch)
 }
 
+fn assert_file_resume_steps_match<S>(actual: &S, expected: &S)
+where
+    S: CompiledAdamWStep,
+{
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(
+        actual
+            .output("logits")
+            .expect("the file-resume capture exposes logits")
+            .shape(),
+        &Shape::new([BATCH, TIME, VOCAB])
+    );
+    assert_eq!(actual.step(), expected.step());
+    assert_eq!(actual.optimizer_step(), expected.optimizer_step());
+    assert_eq!(actual.accumulation_index(), expected.accumulation_index());
+    assert_eq!(actual.loss_weight(), expected.loss_weight());
+    assert_eq!(actual.did_update(), expected.did_update());
+    assert_eq!(actual.clip_report(), expected.clip_report());
+    assert_eq!(actual.window_loss_report(), expected.window_loss_report());
+}
+
 fn run_exact_resume<R, P>(target_name: &str, mut prepare: P) -> Result<()>
 where
     R: CompiledAdamWRuntime + CompiledTrainingWindowCommitRuntime + CompiledEvaluationRuntime,
@@ -1480,6 +1503,7 @@ fn run_file_resume<R, P, V, S, E>(
 ) -> std::result::Result<(), Box<dyn Error>>
 where
     R: CompiledScheduledAdamWRuntime
+        + CompiledCheckpointRestoreRuntime<Checkpoint = CompiledAdamWCheckpoint>
         + CompiledTrainingRatePolicyWindowCommitRuntime
         + CompiledEvaluationRuntime,
     P: FnMut(
@@ -1652,7 +1676,7 @@ where
         assert_eq!(after.trainable, before.trainable);
     }
 
-    let mut resumed = prepare(restored_plan)?;
+    let resumed = prepare(restored_plan)?;
     validate_preparation(&resumed);
     assert_eq!(
         resumed.checkpoint()?,
@@ -1662,28 +1686,27 @@ where
         resumed.checkpoint()?.info().dropout_block_counter(),
         Some(saved_dropout_cursor)
     );
+    let mut resumed = resumed.into_training_session();
+    let restored_checkpoint = resumed.checkpoint()?;
+    assert_eq!(uninterrupted.checkpoint()?, restored_checkpoint);
+    let expected_restore_probe =
+        replay_prepared_policy_batch(&mut uninterrupted, file_resume_batch(5)?)?;
+    let actual_restore_probe = replay_prepared_policy_batch(&mut resumed, file_resume_batch(5)?)?;
+    validate_step(&expected_restore_probe);
+    validate_step(&actual_restore_probe);
+    assert_file_resume_steps_match(&actual_restore_probe, &expected_restore_probe);
+    assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
+    uninterrupted.restore_checkpoint_in_place(&restored_checkpoint)?;
+    resumed.restore_checkpoint_in_place(&restored_checkpoint)?;
+    assert_eq!(resumed.checkpoint()?, restored_checkpoint);
+    assert_eq!(uninterrupted.checkpoint()?, restored_checkpoint);
     for replay in 5..=LAST_REPLAY {
         let expected =
             replay_prepared_policy_batch(&mut uninterrupted, file_resume_batch(replay)?)?;
         let actual = replay_prepared_policy_batch(&mut resumed, file_resume_batch(replay)?)?;
         validate_step(&expected);
         validate_step(&actual);
-        assert_eq!(actual.loss(), expected.loss());
-        assert_eq!(actual.outputs(), expected.outputs());
-        assert_eq!(
-            actual
-                .output("logits")
-                .expect("the file-resume capture exposes logits")
-                .shape(),
-            &Shape::new([BATCH, TIME, VOCAB])
-        );
-        assert_eq!(actual.step(), expected.step());
-        assert_eq!(actual.optimizer_step(), expected.optimizer_step());
-        assert_eq!(actual.accumulation_index(), expected.accumulation_index());
-        assert_eq!(actual.loss_weight(), expected.loss_weight());
-        assert_eq!(actual.did_update(), expected.did_update());
-        assert_eq!(actual.clip_report(), expected.clip_report());
-        assert_eq!(actual.window_loss_report(), expected.window_loss_report());
+        assert_file_resume_steps_match(&actual, &expected);
         assert_eq!(
             actual.clip_report().is_some(),
             actual.accumulation_index() == 0
@@ -1708,8 +1731,8 @@ where
     let actual_partial = replay_prepared_policy_batch(&mut resumed, file_resume_batch(10)?)?;
     validate_step(&expected_partial);
     validate_step(&actual_partial);
-    assert_eq!(actual_partial.loss(), expected_partial.loss());
-    assert_eq!(actual_partial.outputs(), expected_partial.outputs());
+    assert_file_resume_steps_match(&actual_partial, &expected_partial);
+    assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
     let expected_flush = uninterrupted.commit_partial_window_with_rate_policy()?;
     let actual_flush = resumed.commit_partial_window_with_rate_policy()?;
     assert_eq!(
@@ -1717,20 +1740,21 @@ where
         expected_flush.did_commit_window()
     );
     assert_eq!(actual_flush.committed_microbatches(), 1);
+    assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
     let expected_discard =
         replay_prepared_policy_batch(&mut uninterrupted, file_resume_batch(11)?)?;
     let actual_discard = replay_prepared_policy_batch(&mut resumed, file_resume_batch(11)?)?;
     validate_step(&expected_discard);
     validate_step(&actual_discard);
-    assert_eq!(actual_discard.loss(), expected_discard.loss());
-    assert_eq!(actual_discard.outputs(), expected_discard.outputs());
+    assert_file_resume_steps_match(&actual_discard, &expected_discard);
+    assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
     let expected_reset = uninterrupted.reset_gradient_window()?;
     let actual_reset = resumed.reset_gradient_window()?;
     assert_eq!(actual_reset, expected_reset);
     assert_eq!(actual_reset.discarded_microbatches(), 1);
     assert_eq!(resumed.checkpoint()?, uninterrupted.checkpoint()?);
-    assert_eq!(resumed.optimizer_step()?, 4);
-    assert_eq!(resumed.accumulation_index()?, 0);
+    assert_eq!(resumed.runtime().optimizer_step()?, 4);
+    assert_eq!(resumed.runtime().accumulation_index()?, 0);
     for (_, parameter, _, before) in &destination_states {
         let after = parameter.snapshot()?;
         assert_eq!(after.data, before.data);
@@ -1741,7 +1765,7 @@ where
 
     let before_evaluation_checkpoint = resumed.checkpoint()?;
     let before_evaluation_counter = before_evaluation_checkpoint.info().dropout_block_counter();
-    let before_evaluation_accumulators = resumed.gradient_accumulator_snapshots()?;
+    let before_evaluation_accumulators = resumed.runtime().gradient_accumulator_snapshots()?;
     let uninterrupted_final_loss =
         evaluate_mean_file_resume_loss(&mut uninterrupted, &mut validate_evaluation)?;
     let final_loss = evaluate_mean_file_resume_loss(&mut resumed, &mut validate_evaluation)?;
@@ -1752,7 +1776,7 @@ where
         before_evaluation_counter
     );
     assert_eq!(
-        resumed.gradient_accumulator_snapshots()?,
+        resumed.runtime().gradient_accumulator_snapshots()?,
         before_evaluation_accumulators
     );
 
@@ -1760,9 +1784,16 @@ where
         .finish_with_module_checkpoint()
         .map_err(|error| error.into_parts().1)?;
     let (resumed_model, resumed_checkpoint) = resumed
-        .finish_with_module_checkpoint()
+        .finish_with_checkpoint()
         .map_err(|error| error.into_parts().1)?;
-    assert_eq!(resumed_checkpoint, uninterrupted_checkpoint);
+    assert_eq!(
+        &resumed_checkpoint,
+        uninterrupted_checkpoint.optimizer_checkpoint()
+    );
+    assert_eq!(
+        resumed_checkpoint.as_bytes(),
+        uninterrupted_checkpoint.optimizer_checkpoint().as_bytes()
+    );
     assert_eq!(
         resumed_model.state_dict()?,
         uninterrupted_model.state_dict()?
