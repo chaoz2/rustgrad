@@ -6157,6 +6157,155 @@ struct CompiledStepReplayRequest {
     injected_failure: Option<u64>,
 }
 
+struct AdmittedTrainingStep {
+    inputs: BTreeMap<String, TensorData>,
+    learning_rate: Option<TensorData>,
+    transaction: TrainingStepTransaction,
+}
+
+struct TrainingStepTransaction {
+    next_step: u64,
+    non_finite_policy: CpuNonFinitePolicy,
+    output_selection: CompiledStepOutputSelection,
+    injected_failure: Option<u64>,
+}
+
+struct AuthenticatedTrainingStep {
+    transaction: TrainingStepTransaction,
+    selected_requested: Option<Vec<u64>>,
+    named_output_count: usize,
+    observations: Option<CompiledTrainingObservationSchema>,
+    include_observations: bool,
+    validate_commit_observations: bool,
+}
+
+struct CompletedTrainingStep {
+    next_step: u64,
+    result: CompiledTrainingStepResult,
+}
+
+impl AdmittedTrainingStep {
+    fn into_main_bindings(mut self) -> (BTreeMap<String, TensorData>, TrainingStepTransaction) {
+        if let Some(learning_rate) = self.learning_rate {
+            self.inputs
+                .insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
+        }
+        (self.inputs, self.transaction)
+    }
+
+    fn into_accumulation_bindings(self) -> (BTreeMap<String, TensorData>, TrainingStepTransaction) {
+        (self.inputs, self.transaction)
+    }
+}
+
+impl TrainingStepTransaction {
+    fn authenticate_outputs(
+        self,
+        capture: &CapturedMixedSchedule,
+        outputs: &CompiledTrainingPhaseOutputSchema,
+        include_observations: bool,
+        validate_commit_observations: bool,
+    ) -> Result<AuthenticatedTrainingStep> {
+        let expected = outputs.selected_len(true, include_observations)?;
+        if capture.schedule.requested.len() != expected {
+            return Err(training(
+                "compiled requested output layout does not match its authenticated capture",
+            ));
+        }
+        let selected_requested = if self.output_selection.includes_named_outputs() {
+            None
+        } else {
+            let mut selected =
+                Vec::with_capacity(outputs.selected_len(false, include_observations)?);
+            selected.push(capture.schedule.requested[0]);
+            selected.extend(
+                capture
+                    .schedule
+                    .requested
+                    .iter()
+                    .skip(1 + outputs.named_outputs.len())
+                    .copied(),
+            );
+            Some(selected)
+        };
+        Ok(AuthenticatedTrainingStep {
+            transaction: self,
+            selected_requested,
+            named_output_count: outputs.named_outputs.len(),
+            observations: include_observations.then(|| outputs.observations.clone()),
+            include_observations,
+            validate_commit_observations,
+        })
+    }
+}
+
+impl AuthenticatedTrainingStep {
+    fn next_step(&self) -> u64 {
+        self.transaction.next_step
+    }
+
+    fn selected_requested(&self) -> Option<&[u64]> {
+        self.selected_requested.as_deref()
+    }
+
+    fn injected_failure(&self) -> Option<u64> {
+        self.transaction.injected_failure
+    }
+
+    fn validate_transition<'a>(
+        &self,
+        values: &[TensorData],
+        successors: impl IntoIterator<Item = &'a TensorData>,
+    ) -> std::result::Result<(), String> {
+        validate_staged_transition(values, successors, self.transaction.non_finite_policy, true)?;
+        if let Some(observations) = &self.observations {
+            validate_staged_observations(
+                values,
+                1 + usize::from(self.transaction.output_selection.includes_named_outputs())
+                    * self.named_output_count,
+                observations,
+                self.validate_commit_observations,
+                self.transaction.non_finite_policy,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn complete(
+        self,
+        values: Vec<TensorData>,
+        outputs: &CompiledTrainingPhaseOutputSchema,
+        capture_identity: u64,
+    ) -> CompletedTrainingStep {
+        debug_assert_eq!(
+            values.len(),
+            outputs
+                .selected_len(
+                    self.transaction.output_selection.includes_named_outputs(),
+                    self.include_observations,
+                )
+                .expect("compiled output schema was authenticated before replay")
+        );
+        let next_step = self.transaction.next_step;
+        let outputs = outputs.take(
+            values,
+            self.transaction.output_selection,
+            self.include_observations,
+        );
+        CompletedTrainingStep {
+            next_step,
+            result: CompiledTrainingStepResult {
+                loss: outputs.loss,
+                loss_aggregation_weight: 1,
+                outputs: outputs.named_outputs,
+                step: next_step,
+                capture_identity,
+                observations: outputs.observations,
+            },
+        }
+    }
+}
+
 struct PendingAdamWStep {
     request: CompiledStepReplayRequest,
     next_progress: CompiledTrainingWindowProgress,
@@ -8194,37 +8343,53 @@ impl CpuCompiledTrainingProgram {
         Ok(PreparedNativeCpuProgram { report, replay })
     }
 
-    fn selected_step_outputs(
+    fn admit_training_step(
         &self,
-        capture: &CapturedMixedSchedule,
-        selection: CompiledStepOutputSelection,
-        include_observations: bool,
-    ) -> Result<Option<Vec<u64>>> {
-        if selection.includes_named_outputs() {
-            return Ok(None);
+        request: CompiledStepReplayRequest,
+    ) -> Result<AdmittedTrainingStep> {
+        let CompiledStepReplayRequest {
+            inputs,
+            learning_rate,
+            non_finite_policy,
+            output_selection,
+            injected_failure,
+        } = request;
+        validate_training_inputs(&self.inputs, &inputs)?;
+        if let Some(learning_rate) = &learning_rate {
+            validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
         }
-        let expected = self
-            .phase_outputs
-            .selected_len(true, include_observations)?;
-        if capture.schedule.requested.len() != expected {
-            return Err(training(
-                "compiled requested output layout does not match its authenticated capture",
-            ));
-        }
-        let mut selected = Vec::with_capacity(
-            self.phase_outputs
-                .selected_len(false, include_observations)?,
-        );
-        selected.push(capture.schedule.requested[0]);
-        selected.extend(
-            capture
-                .schedule
-                .requested
-                .iter()
-                .skip(1 + self.phase_outputs.named_outputs.len())
-                .copied(),
-        );
-        Ok(Some(selected))
+        let next_step = self
+            .step
+            .checked_add(1)
+            .ok_or_else(|| training("compiled training step overflow"))?;
+        Ok(AdmittedTrainingStep {
+            inputs,
+            learning_rate,
+            transaction: TrainingStepTransaction {
+                next_step,
+                non_finite_policy,
+                output_selection,
+                injected_failure,
+            },
+        })
+    }
+
+    fn publish_main_step(
+        &mut self,
+        completed: CompletedTrainingStep,
+    ) -> CompiledTrainingStepResult {
+        self.step = completed.next_step;
+        completed.result
+    }
+
+    fn publish_accumulation_step(
+        &mut self,
+        completed: CompletedTrainingStep,
+        cursor: ProjectedRecurrentCursor,
+    ) -> CompiledTrainingStepResult {
+        cursor.publish(&mut self.cursor);
+        self.step = completed.next_step;
+        completed.result
     }
 
     /// Executes one graph-free replay and atomically publishes every recurrent
@@ -8297,64 +8462,31 @@ impl CpuCompiledTrainingProgram {
         request: CompiledStepReplayRequest,
         validate_commit_observations: bool,
     ) -> Result<CompiledTrainingStepResult> {
-        let CompiledStepReplayRequest {
-            inputs,
-            learning_rate,
-            non_finite_policy,
-            output_selection: selection,
-            injected_failure,
-        } = request;
-        validate_training_inputs(&self.inputs, &inputs)?;
-        if let Some(learning_rate) = &learning_rate {
-            validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
-        }
-        let next_step = self
-            .step
-            .checked_add(1)
-            .ok_or_else(|| training("compiled training step overflow"))?;
-        let mut provided = inputs;
-        if let Some(learning_rate) = learning_rate {
-            provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
-        }
-        let selected_requested = self.selected_step_outputs(&self.capture, selection, true)?;
-        let named_output_count = usize::from(selection.includes_named_outputs())
-            * self.phase_outputs.named_outputs.len();
-        let observation_start = 1 + named_output_count;
-        let observations = self.phase_outputs.observations.clone();
+        let admitted = self.admit_training_step(request)?;
+        let (provided, transaction) = admitted.into_main_bindings();
+        let transaction = transaction.authenticate_outputs(
+            &self.capture,
+            &self.phase_outputs,
+            true,
+            validate_commit_observations,
+        )?;
         let replay = self
             .capture
             .replay_recurrent_selected_checked(
                 &mut self.runtime,
                 &mut self.cursor,
                 &provided,
-                selected_requested.as_deref(),
-                injected_failure,
-                |outputs, successors| {
-                    validate_staged_transition(outputs, successors, non_finite_policy, true)?;
-                    validate_staged_observations(
-                        outputs,
-                        observation_start,
-                        &observations,
-                        validate_commit_observations,
-                        non_finite_policy,
-                    )
-                },
+                transaction.selected_requested(),
+                transaction.injected_failure(),
+                |outputs, successors| transaction.validate_transition(outputs, successors),
             )
             .map_err(replay_error)?;
-        debug_assert_eq!(
-            replay.outputs.len(),
-            1 + named_output_count + self.phase_outputs.observations.len()
+        let completed = transaction.complete(
+            replay.outputs,
+            &self.phase_outputs,
+            self.cursor.capture_identity(),
         );
-        let outputs = self.phase_outputs.take(replay.outputs, selection, true);
-        self.step = next_step;
-        Ok(CompiledTrainingStepResult {
-            loss: outputs.loss,
-            loss_aggregation_weight: 1,
-            outputs: outputs.named_outputs,
-            step: self.step,
-            capture_identity: self.cursor.capture_identity(),
-            observations: outputs.observations,
-        })
+        Ok(self.publish_main_step(completed))
     }
 
     fn step_native_inner_with_learning_rate(
@@ -8363,52 +8495,25 @@ impl CpuCompiledTrainingProgram {
         validate_commit_observations: bool,
         native: NativeReplayContext<'_>,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
-        let CompiledStepReplayRequest {
-            inputs,
-            learning_rate,
-            non_finite_policy,
-            output_selection: selection,
-            injected_failure,
-        } = request;
-        validate_training_inputs(&self.inputs, &inputs)?;
-        if let Some(learning_rate) = &learning_rate {
-            validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
-        }
-        let next_step = self
-            .step
-            .checked_add(1)
-            .ok_or_else(|| training("compiled training step overflow"))?;
-        let mut provided = inputs;
-        if let Some(learning_rate) = learning_rate {
-            provided.insert(LEARNING_RATE_INPUT.to_string(), learning_rate);
-        }
+        let admitted = self.admit_training_step(request)?;
+        let (provided, transaction) = admitted.into_main_bindings();
         let started = Instant::now();
-        let selected_requested = self.selected_step_outputs(&self.capture, selection, true)?;
-        let named_output_count = usize::from(selection.includes_named_outputs())
-            * self.phase_outputs.named_outputs.len();
-        let observation_start = 1 + named_output_count;
-        let observations = self.phase_outputs.observations.clone();
+        let transaction = transaction.authenticate_outputs(
+            &self.capture,
+            &self.phase_outputs,
+            true,
+            validate_commit_observations,
+        )?;
+        let next_step = transaction.next_step();
         let replay = native
             .replay_recurrent_selected_checked(
                 &mut self.runtime,
                 &mut self.cursor,
                 &provided,
-                selected_requested.as_deref(),
-                injected_failure,
+                transaction.selected_requested(),
+                transaction.injected_failure(),
                 |outputs, successors| {
-                    validate_staged_transition(
-                        outputs,
-                        successors.iter().copied(),
-                        non_finite_policy,
-                        true,
-                    )?;
-                    validate_staged_observations(
-                        outputs,
-                        observation_start,
-                        &observations,
-                        validate_commit_observations,
-                        non_finite_policy,
-                    )
+                    transaction.validate_transition(outputs, successors.iter().copied())
                 },
             )
             .map_err(replay_error)?;
@@ -8427,23 +8532,12 @@ impl CpuCompiledTrainingProgram {
             next_step,
             started.elapsed(),
         );
-        debug_assert_eq!(
-            replay.outputs.len(),
-            1 + named_output_count + self.phase_outputs.observations.len()
+        let completed = transaction.complete(
+            replay.outputs,
+            &self.phase_outputs,
+            self.cursor.capture_identity(),
         );
-        let outputs = self.phase_outputs.take(replay.outputs, selection, true);
-        self.step = next_step;
-        Ok((
-            CompiledTrainingStepResult {
-                loss: outputs.loss,
-                loss_aggregation_weight: 1,
-                outputs: outputs.named_outputs,
-                step: self.step,
-                capture_identity: self.cursor.capture_identity(),
-                observations: outputs.observations,
-            },
-            report,
-        ))
+        Ok((self.publish_main_step(completed), report))
     }
 
     fn step_accumulation_inner_with_learning_rate(
@@ -8451,25 +8545,16 @@ impl CpuCompiledTrainingProgram {
         transition: &CompiledTrainingSiblingPlan,
         request: CompiledStepReplayRequest,
     ) -> Result<CompiledTrainingStepResult> {
-        let CompiledStepReplayRequest {
-            inputs,
-            learning_rate,
-            non_finite_policy,
-            output_selection: selection,
-            injected_failure,
-        } = request;
-        validate_training_inputs(&self.inputs, &inputs)?;
-        if let Some(learning_rate) = &learning_rate {
-            validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
-        }
-        let next_step = self
-            .step
-            .checked_add(1)
-            .ok_or_else(|| training("compiled training step overflow"))?;
+        let admitted = self.admit_training_step(request)?;
+        let (provided, transaction) = admitted.into_accumulation_bindings();
         let mut prepared =
-            self.prepare_phase_replay(&transition.phase().cursor_projection, inputs)?;
-        let selected_requested =
-            self.selected_step_outputs(&transition.phase().capture, selection, false)?;
+            self.prepare_phase_replay(&transition.phase().cursor_projection, provided)?;
+        let transaction = transaction.authenticate_outputs(
+            &transition.phase().capture,
+            &self.phase_outputs,
+            false,
+            false,
+        )?;
         let replay = transition
             .phase()
             .capture
@@ -8477,27 +8562,14 @@ impl CpuCompiledTrainingProgram {
                 &mut self.runtime,
                 prepared.cursor.cursor_mut(),
                 &prepared.provided,
-                selected_requested.as_deref(),
-                injected_failure,
-                |outputs, successors| {
-                    validate_staged_transition(outputs, successors, non_finite_policy, true)
-                },
+                transaction.selected_requested(),
+                transaction.injected_failure(),
+                |outputs, successors| transaction.validate_transition(outputs, successors),
             )
             .map_err(replay_error)?;
-        let named_output_count = usize::from(selection.includes_named_outputs())
-            * self.phase_outputs.named_outputs.len();
-        debug_assert_eq!(replay.outputs.len(), 1 + named_output_count);
-        let outputs = self.phase_outputs.take(replay.outputs, selection, false);
-        prepared.cursor.publish(&mut self.cursor);
-        self.step = next_step;
-        Ok(CompiledTrainingStepResult {
-            loss: outputs.loss,
-            loss_aggregation_weight: 1,
-            outputs: outputs.named_outputs,
-            step: self.step,
-            capture_identity: self.capture_identity(),
-            observations: outputs.observations,
-        })
+        let completed =
+            transaction.complete(replay.outputs, &self.phase_outputs, self.capture_identity());
+        Ok(self.publish_accumulation_step(completed, prepared.cursor))
     }
 
     fn step_accumulation_native_inner_with_learning_rate(
@@ -8506,50 +8578,32 @@ impl CpuCompiledTrainingProgram {
         request: CompiledStepReplayRequest,
         native: NativeReplayContext<'_>,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
-        let CompiledStepReplayRequest {
-            inputs,
-            learning_rate,
-            non_finite_policy,
-            output_selection: selection,
-            injected_failure,
-        } = request;
-        validate_training_inputs(&self.inputs, &inputs)?;
-        if let Some(learning_rate) = &learning_rate {
-            validate_learning_rate_for_policy(learning_rate, non_finite_policy)?;
-        }
-        let next_step = self
-            .step
-            .checked_add(1)
-            .ok_or_else(|| training("compiled training step overflow"))?;
+        let admitted = self.admit_training_step(request)?;
+        let (provided, transaction) = admitted.into_accumulation_bindings();
         let started = Instant::now();
         let mut prepared =
-            self.prepare_phase_replay(&transition.phase().cursor_projection, inputs)?;
-        let selected_requested =
-            self.selected_step_outputs(&transition.phase().capture, selection, false)?;
+            self.prepare_phase_replay(&transition.phase().cursor_projection, provided)?;
+        let transaction = transaction.authenticate_outputs(
+            &transition.phase().capture,
+            &self.phase_outputs,
+            false,
+            false,
+        )?;
         let replay = native
             .replay_recurrent_selected_checked(
                 &mut self.runtime,
                 prepared.cursor.cursor_mut(),
                 &prepared.provided,
-                selected_requested.as_deref(),
-                injected_failure,
+                transaction.selected_requested(),
+                transaction.injected_failure(),
                 |outputs, successors| {
-                    validate_staged_transition(
-                        outputs,
-                        successors.iter().copied(),
-                        non_finite_policy,
-                        true,
-                    )
+                    transaction.validate_transition(outputs, successors.iter().copied())
                 },
             )
             .map_err(replay_error)?;
         let traffic = replay.traffic;
         let executor_wall_time = replay.executor_wall_time;
         let replay = replay.replay;
-        let named_output_count = usize::from(selection.includes_named_outputs())
-            * self.phase_outputs.named_outputs.len();
-        debug_assert_eq!(replay.outputs.len(), 1 + named_output_count);
-        let outputs = self.phase_outputs.take(replay.outputs, selection, false);
         let native = replay
             .native_trace
             .as_ref()
@@ -8562,17 +8616,10 @@ impl CpuCompiledTrainingProgram {
             0,
             started.elapsed(),
         );
-        prepared.cursor.publish(&mut self.cursor);
-        self.step = next_step;
+        let completed =
+            transaction.complete(replay.outputs, &self.phase_outputs, self.capture_identity());
         Ok((
-            CompiledTrainingStepResult {
-                loss: outputs.loss,
-                loss_aggregation_weight: 1,
-                outputs: outputs.named_outputs,
-                step: self.step,
-                capture_identity: self.capture_identity(),
-                observations: outputs.observations,
-            },
+            self.publish_accumulation_step(completed, prepared.cursor),
             report,
         ))
     }
@@ -19789,6 +19836,153 @@ mod tests {
             )
         );
         assert_eq!(native.successful_steps, 2);
+    }
+
+    #[test]
+    fn cpu_step_transaction_rejects_output_layout_before_publication() {
+        let plan = non_finite_flush_plan();
+
+        let mut interpreted = plan.prepare_cpu().unwrap();
+        let mut interpreted_reference = plan.prepare_cpu().unwrap();
+        let initial = interpreted.checkpoint().unwrap();
+        let accumulation_owner = interpreted
+            .inner
+            .accumulation
+            .as_mut()
+            .unwrap()
+            .phase
+            .capture
+            .schedule
+            .requested
+            .pop()
+            .unwrap();
+        let error = match interpreted.step_commit_only(scalar_batch(1.0), TensorData::scalar(0.01))
+        {
+            Ok(_) => panic!("malformed accumulation output layout succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requested output layout"));
+        assert_eq!(interpreted.checkpoint().unwrap(), initial);
+        interpreted
+            .inner
+            .accumulation
+            .as_mut()
+            .unwrap()
+            .phase
+            .capture
+            .schedule
+            .requested
+            .push(accumulation_owner);
+        let expected = interpreted_reference
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        let actual = interpreted
+            .step_commit_only(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(actual.loss(), expected.loss());
+        assert_eq!(
+            interpreted.checkpoint().unwrap(),
+            interpreted_reference.checkpoint().unwrap()
+        );
+
+        let pending = interpreted.checkpoint().unwrap();
+        let main_owner = interpreted.inner.capture.schedule.requested.pop().unwrap();
+        let error = match interpreted.step(scalar_batch(2.0), TensorData::scalar(0.01)) {
+            Ok(_) => panic!("malformed main output layout succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requested output layout"));
+        assert_eq!(interpreted.checkpoint().unwrap(), pending);
+        interpreted
+            .inner
+            .capture
+            .schedule
+            .requested
+            .push(main_owner);
+        interpreted_reference
+            .step(scalar_batch(2.0), TensorData::scalar(0.01))
+            .unwrap();
+        interpreted
+            .step(scalar_batch(2.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(
+            interpreted.checkpoint().unwrap(),
+            interpreted_reference.checkpoint().unwrap()
+        );
+
+        let executor = CapturedReplayExecutor::default();
+        let target = NativeCpuSessionTarget::new(&executor);
+        let mut native = target.prepare(&plan).unwrap();
+        let mut native_reference = target.prepare(&plan).unwrap();
+        let initial = native.checkpoint().unwrap();
+        let accumulation_owner = native
+            .inner
+            .inner
+            .accumulation
+            .as_mut()
+            .unwrap()
+            .phase
+            .capture
+            .schedule
+            .requested
+            .pop()
+            .unwrap();
+        let error = match native.step(scalar_batch(1.0), TensorData::scalar(0.01)) {
+            Ok(_) => panic!("malformed native accumulation output layout succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requested output layout"));
+        assert_eq!(native.checkpoint().unwrap(), initial);
+        assert_eq!(native.successful_steps, 0);
+        native
+            .inner
+            .inner
+            .accumulation
+            .as_mut()
+            .unwrap()
+            .phase
+            .capture
+            .schedule
+            .requested
+            .push(accumulation_owner);
+        native_reference
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        native
+            .step(scalar_batch(1.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(
+            native.checkpoint().unwrap(),
+            native_reference.checkpoint().unwrap()
+        );
+
+        let pending = native.checkpoint().unwrap();
+        let main_owner = native.inner.inner.capture.schedule.requested.pop().unwrap();
+        let error = match native.step_commit_only(scalar_batch(2.0), TensorData::scalar(0.01)) {
+            Ok(_) => panic!("malformed native main output layout succeeded"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requested output layout"));
+        assert_eq!(native.checkpoint().unwrap(), pending);
+        assert_eq!(native.successful_steps, 1);
+        native
+            .inner
+            .inner
+            .capture
+            .schedule
+            .requested
+            .push(main_owner);
+        native_reference
+            .step(scalar_batch(2.0), TensorData::scalar(0.01))
+            .unwrap();
+        native
+            .step_commit_only(scalar_batch(2.0), TensorData::scalar(0.01))
+            .unwrap();
+        assert_eq!(native.successful_steps, 2);
+        assert_eq!(
+            native.checkpoint().unwrap(),
+            native_reference.checkpoint().unwrap()
+        );
     }
 
     #[test]
