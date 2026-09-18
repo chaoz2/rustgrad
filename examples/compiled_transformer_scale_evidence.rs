@@ -367,6 +367,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(runtime.checkpoint()?, initial_checkpoint);
 
     let mut pending_checkpoint = None;
+    let mut pending_checkpoint_bytes = None;
     let mut continuation = Vec::new();
     for replay in 1..=REPLAYS {
         let step = runtime.step_batch_commit_only_scheduled(ScaleBatch::new(replay)?)?;
@@ -378,23 +379,30 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         assert_eq!(step.window_loss_report().is_some(), step.did_update());
         scoreboard.record_step(&step)?;
         if replay == CHECKPOINT_REPLAY {
-            let started = Instant::now();
             let checkpoint = runtime.checkpoint()?;
-            scoreboard.observe_checkpoint(&checkpoint, started.elapsed())?;
             assert_eq!(checkpoint.info().replay_step(), CHECKPOINT_REPLAY);
             assert_eq!(checkpoint.info().optimizer_step(), 1);
             assert_eq!(checkpoint.info().accumulation_index(), 1);
+            pending_checkpoint_bytes = Some(u64::try_from(checkpoint.as_bytes().len())?);
             pending_checkpoint = Some(checkpoint);
         } else if replay > CHECKPOINT_REPLAY {
             continuation.push((step.loss().clone(), runtime.checkpoint()?));
         }
     }
+    let terminal_checkpoint_started = Instant::now();
     let uninterrupted_final = runtime.checkpoint()?;
+    scoreboard.observe_checkpoint(&uninterrupted_final, terminal_checkpoint_started.elapsed())?;
     assert_eq!(uninterrupted_final.info().replay_step(), REPLAYS);
     assert_eq!(uninterrupted_final.info().optimizer_step(), 3);
     assert_eq!(uninterrupted_final.info().accumulation_index(), 0);
 
     let pending_checkpoint = pending_checkpoint.expect("replay three checkpoints a pending window");
+    let pending_checkpoint_bytes =
+        pending_checkpoint_bytes.expect("the pending checkpoint records its exact byte count");
+    assert_eq!(
+        pending_checkpoint_bytes,
+        u64::try_from(pending_checkpoint.as_bytes().len())?
+    );
     runtime.restore_checkpoint_in_place(&pending_checkpoint)?;
     assert_eq!(runtime.checkpoint()?, pending_checkpoint);
     for (index, replay) in ((CHECKPOINT_REPLAY + 1)..=REPLAYS).enumerate() {
@@ -423,7 +431,13 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         report.recurrent_state_bytes(),
         u64::try_from(inspection.recurrent_state_bytes())?
     );
-    assert!(report.checkpoint_byte_count().is_some());
+    let terminal_checkpoint_bytes = report
+        .checkpoint_byte_count()
+        .expect("the scoreboard records the terminal checkpoint");
+    assert_eq!(
+        terminal_checkpoint_bytes,
+        u64::try_from(uninterrupted_final.as_bytes().len())?
+    );
     fs::write(&scoreboard_path, report.to_json_bytes()?)?;
 
     let objective = json!({
@@ -447,10 +461,18 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
             "decreased": true
         },
         "progress": {
-            "checkpoint_replay": CHECKPOINT_REPLAY,
-            "checkpoint_optimizer_step": 1,
-            "checkpoint_accumulation_index": 1,
-            "checkpoint_bytes": report.checkpoint_byte_count(),
+            "pending_resume_checkpoint": {
+                "replay": CHECKPOINT_REPLAY,
+                "optimizer_step": 1,
+                "accumulation_index": 1,
+                "bytes": pending_checkpoint_bytes
+            },
+            "terminal_scoreboard_checkpoint": {
+                "replay": REPLAYS,
+                "optimizer_step": 3,
+                "accumulation_index": 0,
+                "bytes": terminal_checkpoint_bytes
+            },
             "final_replay": REPLAYS,
             "final_optimizer_step": 3,
             "final_accumulation_index": 0,
