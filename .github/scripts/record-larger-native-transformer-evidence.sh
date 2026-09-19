@@ -114,6 +114,77 @@ for evidence_path in "$scoreboard_path" "$objective_path" "$provenance_path"; do
   fi
 done
 
+python3 - "$objective_path" "$actual_sha" <<'PY'
+import json
+import math
+import pathlib
+import sys
+
+objective = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+def same_float(left, right):
+    return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-15)
+
+if objective.get("schema_version") != 2 or objective.get("git_sha") != sys.argv[2]:
+    raise SystemExit("larger Transformer objective provenance is invalid")
+probe = objective.get("gradient_probe")
+if not isinstance(probe, dict):
+    raise SystemExit("larger Transformer gradient probe is absent")
+if (
+    probe.get("replay") != 1
+    or probe.get("accumulation_index") != 1
+    or probe.get("did_update") is not False
+    or not same_float(probe.get("dropout_probability", math.nan), 0.0)
+    or probe.get("valid_token_count") != 22
+):
+    raise SystemExit("larger Transformer gradient replay contract is invalid")
+if probe.get("active_parameter_count") != 35 or probe.get("active_coordinate_count") != 1888:
+    raise SystemExit("larger Transformer gradient inventory is invalid")
+if probe.get("tied_output_head_is_canonical_alias") is not True:
+    raise SystemExit("larger Transformer tied output ownership is invalid")
+if probe.get("frozen_position_is_absent") is not True:
+    raise SystemExit("larger Transformer frozen-position ownership is invalid")
+if probe.get("native_preparation_fallback_count") != 0:
+    raise SystemExit("larger Transformer gradient probe prepared fallback")
+if probe.get("native_replay_fallback_count") != 0:
+    raise SystemExit("larger Transformer gradient probe executed fallback")
+projections = probe.get("projections")
+if not isinstance(projections, list) or [item.get("direction_id") for item in projections] != [
+    "alternating_dense_v1",
+    "seven_phase_dense_v1",
+]:
+    raise SystemExit("larger Transformer gradient directions are invalid")
+for projection in projections:
+    numbers = [
+        projection.get("epsilon"),
+        projection.get("expected_projection"),
+        projection.get("actual_projection"),
+        projection.get("absolute_error"),
+        projection.get("tolerance"),
+    ]
+    if not all(type(value) in (int, float) and math.isfinite(value) for value in numbers):
+        raise SystemExit("larger Transformer gradient projection is non-finite")
+    if not same_float(projection["epsilon"], 0.04):
+        raise SystemExit("larger Transformer gradient epsilon policy is invalid")
+    expected_error = abs(projection["actual_projection"] - projection["expected_projection"])
+    expected_tolerance = 0.03 * max(
+        1.0,
+        abs(projection["actual_projection"]),
+        abs(projection["expected_projection"]),
+    )
+    if not same_float(projection["absolute_error"], expected_error):
+        raise SystemExit("larger Transformer gradient error is not authenticated")
+    if not same_float(projection["tolerance"], expected_tolerance):
+        raise SystemExit("larger Transformer gradient tolerance is not authenticated")
+    if projection.get("mutation_sensitive") is not True:
+        raise SystemExit("larger Transformer gradient projection is not mutation-sensitive")
+    if abs(projection["expected_projection"]) <= projection["tolerance"]:
+        raise SystemExit("larger Transformer expected projection is not informative")
+    if abs(projection["actual_projection"]) <= projection["tolerance"]:
+        raise SystemExit("larger Transformer actual projection is not informative")
+    if expected_error > expected_tolerance and not same_float(expected_error, expected_tolerance):
+        raise SystemExit("larger Transformer gradient projection exceeds tolerance")
+PY
+
 (
   cd "$output_dir"
   sha256sum native-cpu-training-scoreboard.json objective-evidence.json provenance.txt
