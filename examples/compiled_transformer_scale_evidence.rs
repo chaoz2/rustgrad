@@ -14,10 +14,11 @@ use rustgrad::{
     CompiledAdamWIgnoreIndexContext, CompiledAdamWRuntime, CompiledCheckpointRestoreRuntime,
     CompiledCheckpointRuntime, CompiledDropoutConfig, CompiledDropoutKey,
     CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec, CompiledModuleAdamWPlan,
-    CompiledMultiStepLr, CompiledTrainingRuntime, CpuBackend, DType, Graph, LossOptions, Module,
-    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget,
-    NativeTrainingScoreboard, NodeId, Parameter, Reduction, Result, Scalar, TensorData,
-    TrainingDropoutProvider, TransformerBlock, sparse_categorical_cross_entropy,
+    CompiledMultiStepLr, CompiledTrainingRuntime, CpuBackend, DType, Error as RustGradError, Graph,
+    LossOptions, Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult,
+    NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Op, Parameter, Reduction, Result,
+    Scalar, TensorData, TrainingDropoutProvider, TransformerBlock,
+    sparse_categorical_cross_entropy,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -383,9 +384,17 @@ fn scale_gradient_oracle(model: &ScaleTransformer) -> Result<ScaleGradientOracle
         .filter(|(name, _)| name != FROZEN_POSITION_WEIGHT)
         .map(|(name, parameter)| {
             let snapshot = parameter.snapshot()?;
+            let node = parameter.node(&graph)?;
+            let Op::Input { name: input_name } = graph.op(node)? else {
+                return Err(RustGradError::SessionTraining {
+                    reason: format!(
+                        "scale gradient parameter {name:?} is not a direct graph input"
+                    ),
+                });
+            };
             Ok(ScaleGradientParameter {
                 name,
-                input_name: snapshot.input_name,
+                input_name: input_name.clone(),
                 value: snapshot.data,
             })
         })
@@ -416,6 +425,14 @@ fn scale_gradient_oracle(model: &ScaleTransformer) -> Result<ScaleGradientOracle
     );
 
     let mut bindings = model.input_bindings(&graph)?;
+    for parameter in &parameters {
+        assert_eq!(
+            bindings.get(&parameter.input_name),
+            Some(&parameter.value),
+            "scale gradient parameter {:?} must resolve to its exact versioned graph binding",
+            parameter.name
+        );
+    }
     let batch = ScaleBatch::new(1)?;
     bindings.insert(TOKENS.into(), batch.tokens);
     bindings.insert(TARGETS.into(), batch.targets);
@@ -480,6 +497,7 @@ fn perturbed_scale_bindings(
     epsilon: f64,
 ) -> Result<HashMap<String, TensorData>> {
     let mut bindings = oracle.bindings.clone();
+    let binding_count = bindings.len();
     for parameter in &oracle.parameters {
         let parameter_direction = &direction[&parameter.name];
         let value = TensorData::from_scalars(
@@ -492,8 +510,14 @@ fn perturbed_scale_bindings(
                 )
             }),
         )?;
-        bindings.insert(parameter.input_name.clone(), value);
+        let binding = bindings
+            .get_mut(&parameter.input_name)
+            .expect("the authenticated versioned parameter binding must remain present");
+        let original = std::mem::replace(binding, value);
+        assert_eq!(&original, &parameter.value);
+        assert_ne!(&*binding, &parameter.value);
     }
+    assert_eq!(bindings.len(), binding_count);
     Ok(bindings)
 }
 
