@@ -18,6 +18,8 @@ output_dir="native-cpu-larger-transformer-evidence"
 scoreboard_path="${output_dir}/native-cpu-training-scoreboard.json"
 objective_path="${output_dir}/objective-evidence.json"
 provenance_path="${output_dir}/provenance.txt"
+resume_bundle_path="${output_dir}/replay-3-resume.rgab"
+module_checkpoint_path="${output_dir}/replay-3-module-checkpoint.safetensors"
 checksums_path="${output_dir}/sha256.txt"
 if [[ -e "$output_dir" || -L "$output_dir" ]]; then
   echo "larger Transformer evidence output already exists: $output_dir" >&2
@@ -70,6 +72,7 @@ write_lscpu_field() {
   printf 'cargo_build_jobs=2\n'
   printf 'workflow_timeout_minutes=45\n'
   printf 'workload=batch4_time8_vocab16_embedding8_heads2_ff32_blocks2_replays6\n'
+  printf 'warm_resume=portable_rgab_replay3_to6_fresh_executor_same_temporary_cache\n'
   printf 'timing_policy=observational_no_threshold\n'
   printf 'temporary_cache=fresh_sha_scoped\n'
   printf 'runner_os=%s\n' "${RUNNER_OS:-unknown}"
@@ -100,10 +103,18 @@ TMPDIR="$measurement_tmpdir" CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 RUSTFLAGS="-
   RUSTGRAD_EVIDENCE_GIT_SHA="$actual_sha" \
   RUSTGRAD_LARGER_SCOREBOARD_PATH="$scoreboard_path" \
   RUSTGRAD_LARGER_OBJECTIVE_PATH="$objective_path" \
+  RUSTGRAD_LARGER_RESUME_BUNDLE_PATH="$resume_bundle_path" \
+  RUSTGRAD_LARGER_MODULE_CHECKPOINT_PATH="$module_checkpoint_path" \
   timeout 40m cargo run --locked --release --quiet \
     --example compiled_transformer_scale_evidence
 
-for evidence_path in "$scoreboard_path" "$objective_path" "$provenance_path"; do
+for evidence_path in \
+  "$scoreboard_path" \
+  "$objective_path" \
+  "$provenance_path" \
+  "$resume_bundle_path" \
+  "$module_checkpoint_path"
+do
   if [[ ! -s "$evidence_path" ]]; then
     echo "larger Transformer evidence file is absent or empty: $evidence_path" >&2
     exit 1
@@ -114,7 +125,11 @@ for evidence_path in "$scoreboard_path" "$objective_path" "$provenance_path"; do
   fi
 done
 
-python3 - "$objective_path" "$actual_sha" <<'PY'
+python3 - \
+  "$objective_path" \
+  "$actual_sha" \
+  "$resume_bundle_path" \
+  "$module_checkpoint_path" <<'PY'
 import json
 import math
 import pathlib
@@ -124,8 +139,59 @@ objective = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 def same_float(left, right):
     return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-15)
 
-if objective.get("schema_version") != 2 or objective.get("git_sha") != sys.argv[2]:
+if objective.get("schema_version") != 3 or objective.get("git_sha") != sys.argv[2]:
     raise SystemExit("larger Transformer objective provenance is invalid")
+warm = objective.get("warm_resume")
+if not isinstance(warm, dict):
+    raise SystemExit("larger Transformer warm resume evidence is absent")
+if (
+    warm.get("replay_from") != 3
+    or warm.get("replay_to") != 6
+    or warm.get("program_count") != 5
+    or warm.get("compiler_invocation_count") != 0
+    or warm.get("linker_invocation_count") != 0
+    or warm.get("fallback_count") != 0
+    or warm.get("module_visit_count") != 37
+    or warm.get("canonical_state_count") != 36
+):
+    raise SystemExit("larger Transformer warm resume inventory is invalid")
+if (
+    type(warm.get("loaded_module_count")) is not int
+    or warm["loaded_module_count"] <= 0
+    or warm.get("durable_artifact_cache_hit_count") != warm["loaded_module_count"]
+):
+    raise SystemExit("larger Transformer warm durable-cache evidence is invalid")
+for field in [
+    "resume_bundle_bytes",
+    "module_checkpoint_bytes",
+]:
+    if type(warm.get(field)) is not int or warm[field] <= 0:
+        raise SystemExit(f"larger Transformer warm resume {field} is invalid")
+if warm["resume_bundle_bytes"] != pathlib.Path(sys.argv[3]).stat().st_size:
+    raise SystemExit("larger Transformer warm resume bundle byte count is invalid")
+if warm["module_checkpoint_bytes"] != pathlib.Path(sys.argv[4]).stat().st_size:
+    raise SystemExit("larger Transformer module checkpoint byte count is invalid")
+for field in [
+    "artifact_decode_wall_time_ns",
+    "owner_restore_wall_time_ns",
+    "preparation_wall_time_ns",
+]:
+    if type(warm.get(field)) is not int or warm[field] < 0:
+        raise SystemExit(f"larger Transformer warm resume {field} is invalid")
+for field in [
+    "artifact_checkpoint_authenticated",
+    "topology_authenticated",
+    "different_initialization",
+    "fresh_executor",
+    "exact_continuation",
+    "evaluation_state_neutral",
+    "target_owned_module_published",
+]:
+    if warm.get(field) is not True:
+        raise SystemExit(f"larger Transformer warm resume {field} is invalid")
+for field in ["capture_identity", "evaluation_capture_identity"]:
+    if type(warm.get(field)) is not int or warm[field] <= 0:
+        raise SystemExit(f"larger Transformer warm resume {field} is invalid")
 probe = objective.get("gradient_probe")
 if not isinstance(probe, dict):
     raise SystemExit("larger Transformer gradient probe is absent")
@@ -187,5 +253,10 @@ PY
 
 (
   cd "$output_dir"
-  sha256sum native-cpu-training-scoreboard.json objective-evidence.json provenance.txt
+  sha256sum \
+    native-cpu-training-scoreboard.json \
+    objective-evidence.json \
+    provenance.txt \
+    replay-3-resume.rgab \
+    replay-3-module-checkpoint.safetensors
 ) > "$checksums_path"
