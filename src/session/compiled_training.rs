@@ -21,7 +21,7 @@ use self::adamw_contract::{CompiledAdamWContract, MetalAdamWContract};
 pub use self::module_adamw_checkpoint::CompiledModuleAdamWCheckpoint;
 use self::module_adamw_checkpoint::{
     DecodedModuleAdamWCheckpoint, ModuleCheckpointState, ModuleCheckpointStateKind,
-    ModuleCheckpointVisit, decode_module_adamw_checkpoint, encode_module_adamw_checkpoint,
+    ModuleCheckpointVisit, encode_module_adamw_checkpoint,
 };
 pub use self::program_artifact::{
     CompiledAdamWProgramArtifact, CompiledAdamWProgramArtifactFileError,
@@ -475,8 +475,7 @@ impl CompiledModuleSeal {
         if current_visits != checkpoint.visits || current_states.len() != checkpoint.states.len() {
             return Err(training("compiled module checkpoint topology mismatch"));
         }
-        let optimizer_parameters =
-            decode_adamw_checkpoint(checkpoint.optimizer.as_bytes())?.parameters;
+        let optimizer_parameters = &checkpoint.optimizer.decoded().parameters;
         let mut immutable_values = BTreeMap::new();
         for (current, saved) in current_states.iter().zip(&checkpoint.states) {
             if current.name != saved.name
@@ -10065,7 +10064,7 @@ impl CompiledAdamWPlan {
     /// success and failure, and each returned plan may be prepared or restored
     /// independently.
     pub fn restore_checkpoint(&self, checkpoint: &CompiledAdamWCheckpoint) -> Result<Self> {
-        let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
+        let decoded = checkpoint.decoded();
         let topology = CompiledTrainingWindowTopology::from_contract(&self.contract);
         if self.contract.gradient_accumulation_steps != decoded.accumulation_steps {
             return Err(training(
@@ -10151,25 +10150,28 @@ impl CompiledAdamWPlan {
 
         let mut values = decoded
             .parameters
-            .into_iter()
-            .map(|(name, value)| (RecurrentStateKey::parameter(name), value))
+            .iter()
+            .map(|(name, value)| (RecurrentStateKey::parameter(name.clone()), value.clone()))
             .collect::<BTreeMap<_, _>>();
-        for (name, value) in decoded.first_moments {
+        for (name, value) in &decoded.first_moments {
             values.insert(
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment),
-                value,
+                RecurrentStateKey::adamw_parameter(name.clone(), AdamWParameterState::FirstMoment),
+                value.clone(),
             );
         }
-        for (name, value) in decoded.second_moments {
+        for (name, value) in &decoded.second_moments {
             values.insert(
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment),
-                value,
+                RecurrentStateKey::adamw_parameter(name.clone(), AdamWParameterState::SecondMoment),
+                value.clone(),
             );
         }
-        for (name, value) in decoded.gradient_accumulators {
+        for (name, value) in &decoded.gradient_accumulators {
             values.insert(
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator),
-                value,
+                RecurrentStateKey::adamw_parameter(
+                    name.clone(),
+                    AdamWParameterState::GradientAccumulator,
+                ),
+                value.clone(),
             );
         }
         values.insert(
@@ -10196,10 +10198,10 @@ impl CompiledAdamWPlan {
                 TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(count)])?,
             );
         }
-        if let Some(numerator) = decoded.accumulated_loss_numerator {
+        if let Some(numerator) = &decoded.accumulated_loss_numerator {
             values.insert(
                 RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedLossNumerator),
-                numerator,
+                numerator.clone(),
             );
         }
         if let Some(counter) = decoded.dropout_block_counter {
@@ -10278,7 +10280,7 @@ impl CompiledAdamWPlan {
                 "compiled AdamW raw parameters cannot resolve frozen parameter names",
             ));
         }
-        let decoded = decode_adamw_checkpoint(checkpoint.as_bytes())?;
+        let decoded = checkpoint.decoded();
         let parameters = decoded
             .parameters
             .iter()
@@ -10639,10 +10641,10 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         F: FnOnce(&M, ModuleParameterPlan) -> Result<CompiledAdamWPlan>,
     {
         let result: Result<(CompiledAdamWPlan, CompiledModuleSeal, Option<u64>)> = (|| {
-            let decoded = decode_module_adamw_checkpoint(checkpoint.as_bytes())?;
+            let decoded = checkpoint.decoded();
             let required_evaluation_capture_identity = decoded.evaluation_capture_identity;
             let mut seal = CompiledModuleSeal::capture(&module, &config.frozen_parameters)?;
-            let immutable_values = seal.apply_module_checkpoint(&decoded)?;
+            let immutable_values = seal.apply_module_checkpoint(decoded)?;
             let parameter_plan = ModuleParameterPlan::new(&module, &config.frozen_parameters)?
                 .with_immutable_values(&immutable_values)?;
             let plan = build(&module, parameter_plan)?
@@ -15858,6 +15860,7 @@ fn training(reason: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use super::module_adamw_checkpoint::decode_module_adamw_checkpoint;
     use super::*;
     use crate::{Backend, CpuBackend, LossOptions, Op, Parameter, cross_entropy};
     use std::{
@@ -25523,6 +25526,76 @@ mod tests {
                 .flatten()
                 .filter_map(|entry| entry.file_name().into_string().ok())
                 .all(|name| !name.starts_with(".concurrent.rgab.rustgrad-"))
+        );
+    }
+
+    #[test]
+    fn compiled_resume_bundle_seals_one_decode_for_restore() {
+        let plan = CompiledModuleAdamWPlan::compile_graph(
+            module_config()
+                .with_gradient_accumulation(2)
+                .unwrap()
+                .with_window_loss_report(),
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap()
+        .with_evaluation_graph(|module, graph, inputs| {
+            let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+            Ok(CompiledAdamWGraph::scalar(loss, outputs))
+        })
+        .unwrap();
+        let capture_identity = plan.capture_identity();
+        let evaluation_capture_identity = plan.evaluation_capture_identity();
+        let artifact = plan.program_artifact().unwrap();
+        let checkpoint = plan
+            .prepare(&CpuSessionTarget::new())
+            .unwrap()
+            .module_checkpoint()
+            .unwrap();
+        let encoded = CompiledAdamWResumeBundle::new(artifact, checkpoint)
+            .unwrap()
+            .into_bytes();
+
+        let before = program_artifact::portable_resume_decode_counts();
+        let bundle = CompiledAdamWResumeBundle::from_bytes(encoded).unwrap();
+        let after_load = program_artifact::portable_resume_decode_counts();
+        assert_eq!(after_load.program_wire - before.program_wire, 1);
+        assert_eq!(after_load.mixed_captures - before.mixed_captures, 4);
+        assert_eq!(
+            after_load.evaluation_captures - before.evaluation_captures,
+            1
+        );
+        assert_eq!(after_load.module_checkpoints - before.module_checkpoints, 1);
+        assert_eq!(after_load.pair_admissions - before.pair_admissions, 1);
+        let retained_capture_extents = bundle.program_artifact().retained_capture_extents();
+        assert_eq!(retained_capture_extents.len(), 5);
+        assert!(
+            retained_capture_extents
+                .iter()
+                .all(|extent| *extent == (0, 0)),
+            "admission must release every raw capture allocation after materializing typed captures"
+        );
+
+        let cloned = bundle.clone();
+        assert!(bundle.shares_admission_with(&cloned));
+        let restored = CompiledModuleAdamWPlan::restore_from_resume_bundle(
+            TiedFrozenModule::new([9.0, 10.0]),
+            &cloned,
+        )
+        .unwrap();
+        assert_eq!(
+            program_artifact::portable_resume_decode_counts(),
+            after_load,
+            "restoring an admitted bundle must not reparse portable bytes or captures"
+        );
+        assert_eq!(restored.capture_identity(), capture_identity);
+        assert_eq!(
+            restored.evaluation_capture_identity(),
+            evaluation_capture_identity
         );
     }
 

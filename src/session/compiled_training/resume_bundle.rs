@@ -1,6 +1,7 @@
 use super::{CompiledAdamWProgramArtifact, CompiledModuleAdamWCheckpoint, training};
 use crate::file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically};
 use crate::{Error, Result};
+use std::sync::Arc;
 use std::{fmt, io, path::Path};
 
 const MAGIC: &[u8; 4] = b"RGAB";
@@ -15,12 +16,34 @@ pub(super) const MAX_BUNDLE_BYTES: usize = (1 << 30) + (256 << 20) + HEADER_BYTE
 /// The outer envelope does not reinterpret either inner format. It authenticates
 /// that they form one compatible restore pair and replaces a local destination
 /// atomically, so a saved resume point cannot expose artifacts from two writes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct CompiledAdamWResumeBundle {
     bytes: Vec<u8>,
     program_artifact: CompiledAdamWProgramArtifact,
     checkpoint: CompiledModuleAdamWCheckpoint,
+    admitted: Arc<super::program_artifact::AdmittedArtifactCheckpointPair>,
 }
+
+impl fmt::Debug for CompiledAdamWResumeBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledAdamWResumeBundle")
+            .field("bytes", &self.bytes)
+            .field("program_artifact", &self.program_artifact)
+            .field("checkpoint", &self.checkpoint)
+            .finish()
+    }
+}
+
+impl PartialEq for CompiledAdamWResumeBundle {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+            && self.program_artifact == other.program_artifact
+            && self.checkpoint == other.checkpoint
+    }
+}
+
+impl Eq for CompiledAdamWResumeBundle {}
 
 /// A local compiled AdamW resume-bundle file failure.
 #[derive(Debug)]
@@ -95,7 +118,6 @@ fn encode(
     program_artifact: &CompiledAdamWProgramArtifact,
     checkpoint: &CompiledModuleAdamWCheckpoint,
 ) -> Result<Vec<u8>> {
-    super::program_artifact::admit_artifact_checkpoint_pair(program_artifact, checkpoint)?;
     let program_len = u64::try_from(program_artifact.as_bytes().len())
         .map_err(|_| training("compiled AdamW resume-bundle program length overflows"))?;
     let checkpoint_len = u64::try_from(checkpoint.as_bytes().len())
@@ -120,7 +142,13 @@ fn encode(
     Ok(bytes)
 }
 
-fn decode(bytes: &[u8]) -> Result<(CompiledAdamWProgramArtifact, CompiledModuleAdamWCheckpoint)> {
+fn decode(
+    bytes: &[u8],
+) -> Result<(
+    CompiledAdamWProgramArtifact,
+    CompiledModuleAdamWCheckpoint,
+    Arc<super::program_artifact::AdmittedArtifactCheckpointPair>,
+)> {
     if bytes.len() < HEADER_BYTES + CHECKSUM_BYTES
         || bytes.len() > MAX_BUNDLE_BYTES
         || &bytes[..4] != MAGIC
@@ -167,8 +195,9 @@ fn decode(bytes: &[u8]) -> Result<(CompiledAdamWProgramArtifact, CompiledModuleA
         CompiledAdamWProgramArtifact::from_bytes(bytes[HEADER_BYTES..program_end].to_vec())?;
     let checkpoint =
         CompiledModuleAdamWCheckpoint::from_bytes(bytes[program_end..checkpoint_end].to_vec())?;
-    super::program_artifact::admit_artifact_checkpoint_pair(&program_artifact, &checkpoint)?;
-    Ok((program_artifact, checkpoint))
+    let admitted =
+        super::program_artifact::admit_artifact_checkpoint_pair(&program_artifact, &checkpoint)?;
+    Ok((program_artifact, checkpoint, admitted))
 }
 
 impl CompiledAdamWResumeBundle {
@@ -178,22 +207,28 @@ impl CompiledAdamWResumeBundle {
         program_artifact: CompiledAdamWProgramArtifact,
         checkpoint: CompiledModuleAdamWCheckpoint,
     ) -> Result<Self> {
+        let admitted = super::program_artifact::admit_artifact_checkpoint_pair(
+            &program_artifact,
+            &checkpoint,
+        )?;
         let bytes = encode(&program_artifact, &checkpoint)?;
         Ok(Self {
             bytes,
             program_artifact,
             checkpoint,
+            admitted,
         })
     }
 
     /// Validates and owns deterministic resume-bundle bytes.
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Result<Self> {
         let bytes = bytes.into();
-        let (program_artifact, checkpoint) = decode(&bytes)?;
+        let (program_artifact, checkpoint, admitted) = decode(&bytes)?;
         Ok(Self {
             bytes,
             program_artifact,
             checkpoint,
+            admitted,
         })
     }
 
@@ -234,6 +269,22 @@ impl CompiledAdamWResumeBundle {
 
     pub fn checkpoint(&self) -> &CompiledModuleAdamWCheckpoint {
         &self.checkpoint
+    }
+
+    pub(super) fn admitted(&self) -> &Arc<super::program_artifact::AdmittedArtifactCheckpointPair> {
+        &self.admitted
+    }
+
+    #[cfg(test)]
+    pub(super) fn shares_admission_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.admitted, &other.admitted)
+            && self
+                .program_artifact
+                .shares_admission_with(&other.program_artifact)
+            && Arc::ptr_eq(
+                self.checkpoint.decoded_arc(),
+                other.checkpoint.decoded_arc(),
+            )
     }
 
     pub fn as_bytes(&self) -> &[u8] {

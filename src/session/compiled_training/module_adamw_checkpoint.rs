@@ -1,4 +1,4 @@
-use super::{CompiledAdamWCheckpoint, checked_bytes, decode_adamw_checkpoint, training};
+use super::{CompiledAdamWCheckpoint, checked_bytes, training};
 use crate::safetensors::{read_safetensors_file_bytes_with_limits, save_safetensors_file_bytes};
 use crate::{
     DType, Metadata, Result, SafetensorsFileError, SafetensorsReadLimits, StateDict, TensorData,
@@ -6,6 +6,7 @@ use crate::{
 };
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 const MODULE_ADAMW_CHECKPOINT_FORMAT_V1: &str = "rustgrad-compiled-module-adamw-v1";
 const MODULE_ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-module-adamw-v2";
@@ -75,12 +76,35 @@ pub(super) struct DecodedModuleAdamWCheckpoint {
 /// recompilation cannot silently attach a different read-only program.
 /// Executable graphs, runtime resources, host identities, and versions are not
 /// serialized. A lifecycle without evaluation retains its exact v1 bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct CompiledModuleAdamWCheckpoint {
     bytes: Vec<u8>,
-    optimizer: CompiledAdamWCheckpoint,
-    evaluation_capture_identity: Option<u64>,
+    decoded: Arc<DecodedModuleAdamWCheckpoint>,
 }
+
+impl std::fmt::Debug for CompiledModuleAdamWCheckpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompiledModuleAdamWCheckpoint")
+            .field("bytes", &self.bytes)
+            .field("optimizer", &self.decoded.optimizer)
+            .field(
+                "evaluation_capture_identity",
+                &self.decoded.evaluation_capture_identity,
+            )
+            .finish()
+    }
+}
+
+impl PartialEq for CompiledModuleAdamWCheckpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+            && self.decoded.optimizer == other.decoded.optimizer
+            && self.decoded.evaluation_capture_identity == other.decoded.evaluation_capture_identity
+    }
+}
+
+impl Eq for CompiledModuleAdamWCheckpoint {}
 
 impl CompiledModuleAdamWCheckpoint {
     /// Validates and owns deterministic complete-module checkpoint bytes.
@@ -89,8 +113,7 @@ impl CompiledModuleAdamWCheckpoint {
         let decoded = decode_module_adamw_checkpoint(&bytes)?;
         Ok(Self {
             bytes,
-            optimizer: decoded.optimizer,
-            evaluation_capture_identity: decoded.evaluation_capture_identity,
+            decoded: Arc::new(decoded),
         })
     }
 
@@ -122,7 +145,15 @@ impl CompiledModuleAdamWCheckpoint {
 
     /// Returns the unchanged embedded optimizer checkpoint.
     pub fn optimizer_checkpoint(&self) -> &CompiledAdamWCheckpoint {
-        &self.optimizer
+        &self.decoded.optimizer
+    }
+
+    pub(super) fn decoded(&self) -> &DecodedModuleAdamWCheckpoint {
+        &self.decoded
+    }
+
+    pub(super) fn decoded_arc(&self) -> &Arc<DecodedModuleAdamWCheckpoint> {
+        &self.decoded
     }
 
     /// Required evaluator capture identity for a v2 checkpoint.
@@ -130,7 +161,7 @@ impl CompiledModuleAdamWCheckpoint {
     /// `None` denotes a v1 envelope with no authenticated evaluator requirement,
     /// including checkpoints written by older versions.
     pub fn evaluation_capture_identity(&self) -> Option<u64> {
-        self.evaluation_capture_identity
+        self.decoded.evaluation_capture_identity
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -239,6 +270,8 @@ pub(super) fn encode_module_adamw_checkpoint(
 }
 
 pub(super) fn decode_module_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedModuleAdamWCheckpoint> {
+    #[cfg(test)]
+    super::program_artifact::record_module_checkpoint_decode();
     let (mut tensors, metadata) = load_safetensors(bytes)?;
     let evaluation_capture_identity = match metadata.get("format").map(String::as_str) {
         Some(MODULE_ADAMW_CHECKPOINT_FORMAT_V1) => None,
@@ -269,7 +302,7 @@ pub(super) fn decode_module_adamw_checkpoint(bytes: &[u8]) -> Result<DecodedModu
         ));
     }
     let optimizer = CompiledAdamWCheckpoint::from_bytes(optimizer_tensor.to_le_bytes()?)?;
-    let optimizer_parameters = decode_adamw_checkpoint(optimizer.as_bytes())?.parameters;
+    let optimizer_parameters = &optimizer.decoded().parameters;
 
     let mut expected_metadata = BTreeSet::from([
         "format".to_owned(),
