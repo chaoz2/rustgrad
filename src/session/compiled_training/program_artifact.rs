@@ -2,17 +2,71 @@ use super::adamw_contract::{CompiledAdamWContract, CompiledAdamWPolicy};
 use super::*;
 use crate::file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically};
 use serde::{Deserialize, Serialize};
-use std::{io, path::Path};
+use std::{io, path::Path, sync::Arc};
 
 const MAGIC: &[u8; 4] = b"RGAP";
 const FORMAT_VERSION: u8 = 1;
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct PortableResumeDecodeCounts {
+    pub(super) program_wire: usize,
+    pub(super) mixed_captures: usize,
+    pub(super) evaluation_captures: usize,
+    pub(super) module_checkpoints: usize,
+    pub(super) pair_admissions: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PORTABLE_RESUME_DECODE_COUNTS: std::cell::Cell<PortableResumeDecodeCounts> =
+        std::cell::Cell::new(PortableResumeDecodeCounts::default());
+}
+
+#[cfg(test)]
+fn update_decode_counts(update: impl FnOnce(&mut PortableResumeDecodeCounts)) {
+    PORTABLE_RESUME_DECODE_COUNTS.with(|counts| {
+        let mut next = counts.get();
+        update(&mut next);
+        counts.set(next);
+    });
+}
+
+#[cfg(test)]
+pub(super) fn portable_resume_decode_counts() -> PortableResumeDecodeCounts {
+    PORTABLE_RESUME_DECODE_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn record_module_checkpoint_decode() {
+    update_decode_counts(|counts| counts.module_checkpoints += 1);
+}
+
+#[derive(Clone)]
 pub struct CompiledAdamWProgramArtifact {
     bytes: Vec<u8>,
     info: CompiledAdamWProgramArtifactInfo,
+    admitted: Option<Arc<AdmittedProgramArtifact>>,
 }
+
+impl fmt::Debug for CompiledAdamWProgramArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledAdamWProgramArtifact")
+            .field("bytes", &self.bytes)
+            .field("info", &self.info)
+            .finish()
+    }
+}
+
+impl PartialEq for CompiledAdamWProgramArtifact {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes && self.info == other.info
+    }
+}
+
+impl Eq for CompiledAdamWProgramArtifact {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompiledAdamWProgramArtifactInfo {
@@ -122,9 +176,14 @@ impl CompiledAdamWProgramArtifactInfo {
 impl CompiledAdamWProgramArtifact {
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Result<Self> {
         let bytes = bytes.into();
-        let wire = decode(&bytes)?;
-        let info = wire.validate()?;
-        Ok(Self { bytes, info })
+        let mut wire = decode(&bytes)?;
+        let (info, captures) = wire.validate()?;
+        wire.discard_capture_bytes();
+        Ok(Self {
+            bytes,
+            info,
+            admitted: Some(Arc::new(AdmittedProgramArtifact { wire, captures })),
+        })
     }
 
     /// Loads and validates one local RGAP artifact under its intrinsic byte bound.
@@ -153,7 +212,7 @@ impl CompiledAdamWProgramArtifact {
     ) -> std::result::Result<(), CompiledAdamWProgramArtifactFileError> {
         let wire =
             decode(self.as_bytes()).map_err(CompiledAdamWProgramArtifactFileError::Format)?;
-        let info = wire
+        let (info, _) = wire
             .validate()
             .map_err(CompiledAdamWProgramArtifactFileError::Format)?;
         if info != self.info {
@@ -174,6 +233,47 @@ impl CompiledAdamWProgramArtifact {
 
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+
+    fn admitted(&self) -> Option<&Arc<AdmittedProgramArtifact>> {
+        self.admitted.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_capture_extents(&self) -> Vec<(usize, usize)> {
+        let Some(admitted) = &self.admitted else {
+            return Vec::new();
+        };
+        let mut extents = vec![(
+            admitted.wire.main.phase.capture.len(),
+            admitted.wire.main.phase.capture.capacity(),
+        )];
+        extents.extend(
+            [
+                admitted.wire.accumulation.as_ref(),
+                admitted.wire.partial_flush.as_ref(),
+                admitted.wire.zero_grad.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|phase| (phase.capture.len(), phase.capture.capacity())),
+        );
+        extents.extend(
+            admitted
+                .wire
+                .evaluation
+                .as_ref()
+                .map(|evaluation| (evaluation.capture.len(), evaluation.capture.capacity())),
+        );
+        extents
+    }
+
+    #[cfg(test)]
+    pub(super) fn shares_admission_with(&self, other: &Self) -> bool {
+        self.admitted
+            .as_ref()
+            .zip(other.admitted.as_ref())
+            .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
     }
 }
 
@@ -345,10 +445,61 @@ struct AdamWMemberWire {
 }
 
 struct ValidatedMain {
-    capture: CapturedMixedSchedule,
     states: BTreeMap<RecurrentStateKey, u64>,
     flush_states: BTreeMap<RecurrentStateKey, u64>,
     zero_grad_states: BTreeMap<RecurrentStateKey, u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ProgramCaptures {
+    main: CapturedMixedSchedule,
+    accumulation: Option<CapturedMixedSchedule>,
+    partial_flush: Option<CapturedMixedSchedule>,
+    zero_grad: Option<CapturedMixedSchedule>,
+    evaluation: Option<CapturedSchedule>,
+}
+
+#[derive(Clone, Debug)]
+struct AdmittedProgramArtifact {
+    wire: ProgramWire,
+    captures: ProgramCaptures,
+}
+
+impl ProgramCaptures {
+    fn decode(wire: &ProgramWire) -> Result<Self> {
+        let decode_phase = |phase: &PhaseWire| -> Result<CapturedMixedSchedule> {
+            #[cfg(test)]
+            update_decode_counts(|counts| counts.mixed_captures += 1);
+            let capture =
+                CapturedMixedSchedule::from_bytes(&phase.capture).map_err(replay_error)?;
+            capture.initial_recurrent_cursor().map_err(replay_error)?;
+            Ok(capture)
+        };
+        let main = decode_phase(&wire.main.phase)?;
+        let accumulation = wire.accumulation.as_ref().map(decode_phase).transpose()?;
+        let partial_flush = wire.partial_flush.as_ref().map(decode_phase).transpose()?;
+        let zero_grad = wire.zero_grad.as_ref().map(decode_phase).transpose()?;
+        let evaluation = wire
+            .evaluation
+            .as_ref()
+            .map(|evaluation| {
+                #[cfg(test)]
+                update_decode_counts(|counts| counts.evaluation_captures += 1);
+                let capture =
+                    CapturedSchedule::from_bytes(&evaluation.capture).map_err(replay_error)?;
+                (capture.identity == evaluation.capture_identity)
+                    .then_some(capture)
+                    .ok_or_else(|| training("compiled evaluation artifact identity mismatch"))
+            })
+            .transpose()?;
+        Ok(Self {
+            main,
+            accumulation,
+            partial_flush,
+            zero_grad,
+            evaluation,
+        })
+    }
 }
 
 fn checksum(bytes: &[u8]) -> u64 {
@@ -379,6 +530,8 @@ fn encode(wire: &ProgramWire) -> Result<Vec<u8>> {
 }
 
 fn decode(bytes: &[u8]) -> Result<ProgramWire> {
+    #[cfg(test)]
+    update_decode_counts(|counts| counts.program_wire += 1);
     if bytes.len() < 21 || bytes.len() > MAX_ARTIFACT_BYTES || &bytes[..4] != MAGIC {
         return Err(training("compiled program artifact header is invalid"));
     }
@@ -426,71 +579,94 @@ where
     let unchecked = CompiledAdamWProgramArtifact {
         bytes: bytes.clone(),
         info: *artifact.info(),
+        admitted: None,
     };
     (bytes, unchecked)
 }
 
 impl ProgramWire {
-    fn info(&self, identity: u64) -> Result<CompiledAdamWProgramArtifactInfo> {
-        let main =
-            CapturedMixedSchedule::from_bytes(&self.main.phase.capture).map_err(replay_error)?;
-        let capture_identity = main
+    fn discard_capture_bytes(&mut self) {
+        drop(std::mem::take(&mut self.main.phase.capture));
+        if let Some(phase) = &mut self.accumulation {
+            drop(std::mem::take(&mut phase.capture));
+        }
+        if let Some(phase) = &mut self.partial_flush {
+            drop(std::mem::take(&mut phase.capture));
+        }
+        if let Some(phase) = &mut self.zero_grad {
+            drop(std::mem::take(&mut phase.capture));
+        }
+        if let Some(evaluation) = &mut self.evaluation {
+            drop(std::mem::take(&mut evaluation.capture));
+        }
+    }
+
+    fn info(
+        &self,
+        identity: u64,
+        captures: &ProgramCaptures,
+    ) -> Result<CompiledAdamWProgramArtifactInfo> {
+        let capture_identity = captures
+            .main
             .initial_recurrent_cursor()
             .map_err(replay_error)?
             .capture_identity();
-        let phase_identity = |phase: &PhaseWire| -> Result<u64> {
-            Ok(CapturedMixedSchedule::from_bytes(&phase.capture)
-                .map_err(replay_error)?
+        let phase_identity = |capture: &CapturedMixedSchedule| -> Result<u64> {
+            Ok(capture
                 .initial_recurrent_cursor()
                 .map_err(replay_error)?
                 .capture_identity())
         };
-        let evaluation_capture_identity = self
+        let evaluation_capture_identity = captures
             .evaluation
             .as_ref()
-            .map(|wire| {
-                CapturedSchedule::from_bytes(&wire.capture)
-                    .map_err(replay_error)
-                    .and_then(|capture| {
-                        (capture.identity == wire.capture_identity)
-                            .then_some(capture.identity)
-                            .ok_or_else(|| {
-                                training("compiled evaluation artifact identity mismatch")
-                            })
-                    })
+            .map(|capture| {
+                (capture.identity
+                    == self
+                        .evaluation
+                        .as_ref()
+                        .expect("capture has wire")
+                        .capture_identity)
+                    .then_some(capture.identity)
+                    .ok_or_else(|| training("compiled evaluation artifact identity mismatch"))
             })
             .transpose()?;
         Ok(CompiledAdamWProgramArtifactInfo {
             identity,
             capture_identity,
-            accumulation_capture_identity: self
+            accumulation_capture_identity: captures
                 .accumulation
                 .as_ref()
                 .map(phase_identity)
                 .transpose()?,
-            flush_capture_identity: self
+            flush_capture_identity: captures
                 .partial_flush
                 .as_ref()
                 .map(phase_identity)
                 .transpose()?,
-            zero_grad_capture_identity: self.zero_grad.as_ref().map(phase_identity).transpose()?,
+            zero_grad_capture_identity: captures
+                .zero_grad
+                .as_ref()
+                .map(phase_identity)
+                .transpose()?,
             evaluation_capture_identity,
         })
     }
 
-    fn validate(&self) -> Result<CompiledAdamWProgramArtifactInfo> {
+    fn validate(&self) -> Result<(CompiledAdamWProgramArtifactInfo, ProgramCaptures)> {
         let canonical = serde_json::to_vec(self)
             .map_err(|error| training(format!("compiled program artifact validation: {error}")))?;
-        let info = self.info(checksum(&canonical))?;
+        let captures = ProgramCaptures::decode(self)?;
+        let info = self.info(checksum(&canonical), &captures)?;
         validate_module_wire(&self.module, &self.frozen_parameters)?;
 
         self.validate_policy(&info)?;
-        let main = self.validate_main()?;
-        self.validate_auxiliary_programs(&main)?;
-        self.validate_evaluation(&main.capture)?;
+        let main = self.validate_main(&captures.main)?;
+        self.validate_auxiliary_programs(&main, &captures)?;
+        self.validate_evaluation(&captures.main, captures.evaluation.as_ref())?;
         self.validate_sibling_identities(&info)?;
         self.validate_adamw_policy()?;
-        Ok(info)
+        Ok((info, captures))
     }
 
     fn validate_policy(&self, info: &CompiledAdamWProgramArtifactInfo) -> Result<()> {
@@ -523,7 +699,7 @@ impl ProgramWire {
         Ok(())
     }
 
-    fn validate_main(&self) -> Result<ValidatedMain> {
+    fn validate_main(&self, main_capture: &CapturedMixedSchedule) -> Result<ValidatedMain> {
         if self.main.phase.clip_report != self.clip_report
             || self.main.phase.window_loss_report != self.window_loss_report
             || self.main.parameter_buffers.is_empty()
@@ -534,7 +710,7 @@ impl ProgramWire {
                 "compiled program artifact main inventory is inconsistent",
             ));
         }
-        let (main_capture, main_states) = decode_phase(&self.main.phase)?;
+        let main_states = validate_phase_capture(&self.main.phase, main_capture)?;
         let trainable_parameters = self
             .module
             .states
@@ -663,32 +839,35 @@ impl ProgramWire {
         } else {
             NativeManifestExpectation::None
         };
-        validate_native_manifests(&self.main.phase, &main_capture, native_manifests)?;
+        validate_native_manifests(&self.main.phase, main_capture, native_manifests)?;
         Ok(ValidatedMain {
-            capture: main_capture,
             states: expected_main_states,
             flush_states: expected_flush_states,
             zero_grad_states: expected_zero_grad_states,
         })
     }
 
-    fn validate_auxiliary_programs(&self, main: &ValidatedMain) -> Result<()> {
-        if let Some(phase) = &self.accumulation {
+    fn validate_auxiliary_programs(
+        &self,
+        main: &ValidatedMain,
+        captures: &ProgramCaptures,
+    ) -> Result<()> {
+        if let (Some(phase), Some(capture)) = (&self.accumulation, &captures.accumulation) {
             if phase.clip_report || phase.window_loss_report {
                 return Err(training("compiled accumulation artifact exposes reports"));
             }
-            let (capture, states) = decode_phase(phase)?;
+            let states = validate_phase_capture(phase, capture)?;
             if states != main.states
                 || capture.schedule.requested.len() != 1 + self.main.output_names.len()
-                || phase_external_inputs(&capture, phase).ne(self.main.inputs.keys().cloned())
+                || phase_external_inputs(capture, phase).ne(self.main.inputs.keys().cloned())
             {
                 return Err(training(
                     "compiled accumulation artifact frontier differs from main",
                 ));
             }
-            validate_native_manifests(phase, &capture, NativeManifestExpectation::None)?;
+            validate_native_manifests(phase, capture, NativeManifestExpectation::None)?;
         }
-        if let Some(phase) = &self.zero_grad {
+        if let (Some(phase), Some(capture)) = (&self.zero_grad, &captures.zero_grad) {
             let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
                 phase.clip_report,
                 phase.window_loss_report,
@@ -702,22 +881,22 @@ impl ProgramWire {
                     "compiled zero-grad artifact exposes update outputs",
                 ));
             }
-            let (capture, states) = decode_phase(phase)?;
+            let states = validate_phase_capture(phase, capture)?;
             if states != main.zero_grad_states
                 || !capture.schedule.requested.is_empty()
-                || phase_external_inputs(&capture, phase).next().is_some()
+                || phase_external_inputs(capture, phase).next().is_some()
             {
                 return Err(training("compiled zero-grad artifact state schema differs"));
             }
-            validate_native_manifests(phase, &capture, NativeManifestExpectation::None)?;
+            validate_native_manifests(phase, capture, NativeManifestExpectation::None)?;
         }
-        if let Some(phase) = &self.partial_flush {
+        if let (Some(phase), Some(capture)) = (&self.partial_flush, &captures.partial_flush) {
             let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
                 phase.clip_report,
                 phase.window_loss_report,
             );
             outputs.validate_report_flags(self.clip_report, self.window_loss_report)?;
-            let (capture, states) = decode_phase(phase)?;
+            let states = validate_phase_capture(phase, capture)?;
             let expected_outputs = outputs.observations.len();
             let has_learning_rate = capture
                 .schedule
@@ -726,14 +905,14 @@ impl ProgramWire {
                 .any(|input| input.name == LEARNING_RATE_INPUT);
             if states != main.flush_states
                 || capture.schedule.requested.len() != expected_outputs
-                || phase_external_inputs(&capture, phase).next().is_some()
+                || phase_external_inputs(capture, phase).next().is_some()
                 || has_learning_rate != matches!(&self.learning_rate, LearningRateWire::External)
             {
                 return Err(training("compiled flush artifact state schema differs"));
             }
             validate_native_manifests(
                 phase,
-                &capture,
+                capture,
                 NativeManifestExpectation::AdamW {
                     parameters: &self.main.parameter_buffers,
                     states: &states,
@@ -743,10 +922,12 @@ impl ProgramWire {
         Ok(())
     }
 
-    fn validate_evaluation(&self, main_capture: &CapturedMixedSchedule) -> Result<()> {
-        if let Some(evaluation) = &self.evaluation {
-            let capture =
-                CapturedSchedule::from_bytes(&evaluation.capture).map_err(replay_error)?;
+    fn validate_evaluation(
+        &self,
+        main_capture: &CapturedMixedSchedule,
+        capture: Option<&CapturedSchedule>,
+    ) -> Result<()> {
+        if let (Some(evaluation), Some(capture)) = (&self.evaluation, capture) {
             let parameter_inputs = evaluation
                 .parameter_inputs
                 .values()
@@ -1334,14 +1515,23 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         module: M,
         bundle: &CompiledAdamWResumeBundle,
     ) -> std::result::Result<Self, CompiledModuleAdamWArtifactRestoreError<M>> {
-        Self::restore_from_program_artifact(module, bundle.program_artifact(), bundle.checkpoint())
+        let result = restore_owner_from_admitted(&module, bundle.admitted());
+        match result {
+            Ok((plan, seal)) => Ok(Self {
+                module,
+                plan,
+                seal,
+                required_evaluation_capture_identity: None,
+            }),
+            Err(source) => Err(CompiledModuleAdamWArtifactRestoreError { module, source }),
+        }
     }
 }
 
-fn decode_phase(
+fn validate_phase_capture(
     wire: &PhaseWire,
-) -> Result<(CapturedMixedSchedule, BTreeMap<RecurrentStateKey, u64>)> {
-    let capture = CapturedMixedSchedule::from_bytes(&wire.capture).map_err(replay_error)?;
+    capture: &CapturedMixedSchedule,
+) -> Result<BTreeMap<RecurrentStateKey, u64>> {
     let state_buffers = decode_key_map(&wire.state_buffers)?;
     let frontier = capture
         .initial_recurrent_cursor()
@@ -1389,14 +1579,15 @@ fn decode_phase(
             "compiled program artifact recurrent input schema differs",
         ));
     }
-    Ok((capture, state_buffers))
+    Ok(state_buffers)
 }
 
 fn decode_auxiliary(
     main: &CapturedMixedSchedule,
     wire: &PhaseWire,
+    capture: CapturedMixedSchedule,
 ) -> Result<CompiledAdamWAuxiliaryPlan> {
-    let (capture, state_buffers) = decode_phase(wire)?;
+    let state_buffers = validate_phase_capture(wire, &capture)?;
     let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
         wire.clip_report,
         wire.window_loss_report,
@@ -1428,7 +1619,7 @@ fn decode_auxiliary(
 }
 
 fn checkpoint_module_wire(decoded: &DecodedModuleAdamWCheckpoint) -> Result<ModuleWire> {
-    let optimizer = decode_adamw_checkpoint(decoded.optimizer.as_bytes())?;
+    let optimizer = decoded.optimizer.decoded();
     let states = decoded
         .states
         .iter()
@@ -1465,22 +1656,34 @@ fn checkpoint_module_wire(decoded: &DecodedModuleAdamWCheckpoint) -> Result<Modu
     })
 }
 
-struct AdmittedArtifactCheckpointPair {
-    wire: ProgramWire,
-    checkpoint: DecodedModuleAdamWCheckpoint,
+#[derive(Clone, Debug)]
+pub(super) struct AdmittedArtifactCheckpointPair {
+    artifact: Arc<AdmittedProgramArtifact>,
+    checkpoint: Arc<DecodedModuleAdamWCheckpoint>,
 }
 
 fn decode_admitted_artifact_checkpoint_pair(
     artifact: &CompiledAdamWProgramArtifact,
     checkpoint: &CompiledModuleAdamWCheckpoint,
 ) -> Result<AdmittedArtifactCheckpointPair> {
-    let wire = decode(artifact.as_bytes())?;
-    let artifact_info = wire.validate()?;
-    if artifact_info != *artifact.info() {
-        return Err(training("compiled program artifact info differs"));
-    }
-    let decoded_module = decode_module_adamw_checkpoint(checkpoint.as_bytes())?;
-    if checkpoint_module_wire(&decoded_module)? != wire.module {
+    #[cfg(test)]
+    update_decode_counts(|counts| counts.pair_admissions += 1);
+    let admitted = match artifact.admitted() {
+        Some(admitted) => admitted.clone(),
+        None => {
+            let mut wire = decode(artifact.as_bytes())?;
+            let (artifact_info, captures) = wire.validate()?;
+            if artifact_info != *artifact.info() {
+                return Err(training("compiled program artifact info differs"));
+            }
+            wire.discard_capture_bytes();
+            Arc::new(AdmittedProgramArtifact { wire, captures })
+        }
+    };
+    let wire = &admitted.wire;
+    let artifact_info = *artifact.info();
+    let decoded_module = checkpoint.decoded_arc().clone();
+    if checkpoint_module_wire(decoded_module.as_ref())? != wire.module {
         return Err(training("compiled program artifact module schema mismatch"));
     }
     if decoded_module.evaluation_capture_identity != artifact_info.evaluation_capture_identity {
@@ -1527,7 +1730,7 @@ fn decode_admitted_artifact_checkpoint_pair(
         ));
     }
     Ok(AdmittedArtifactCheckpointPair {
-        wire,
+        artifact: admitted,
         checkpoint: decoded_module,
     })
 }
@@ -1535,8 +1738,8 @@ fn decode_admitted_artifact_checkpoint_pair(
 pub(super) fn admit_artifact_checkpoint_pair(
     artifact: &CompiledAdamWProgramArtifact,
     checkpoint: &CompiledModuleAdamWCheckpoint,
-) -> Result<()> {
-    decode_admitted_artifact_checkpoint_pair(artifact, checkpoint).map(drop)
+) -> Result<Arc<AdmittedArtifactCheckpointPair>> {
+    decode_admitted_artifact_checkpoint_pair(artifact, checkpoint).map(Arc::new)
 }
 
 fn zero_frontier(
@@ -1573,19 +1776,27 @@ fn restore_owner<M: Module>(
     artifact: &CompiledAdamWProgramArtifact,
     checkpoint: &CompiledModuleAdamWCheckpoint,
 ) -> Result<(CompiledAdamWPlan, CompiledModuleSeal)> {
-    let AdmittedArtifactCheckpointPair {
-        wire,
-        checkpoint: decoded_module,
-    } = decode_admitted_artifact_checkpoint_pair(artifact, checkpoint)?;
+    let admitted = decode_admitted_artifact_checkpoint_pair(artifact, checkpoint)?;
+    restore_owner_from_admitted(module, &admitted)
+}
+
+fn restore_owner_from_admitted<M: Module>(
+    module: &M,
+    admitted: &AdmittedArtifactCheckpointPair,
+) -> Result<(CompiledAdamWPlan, CompiledModuleSeal)> {
+    let wire = &admitted.artifact.wire;
+    let captures = &admitted.artifact.captures;
+    let decoded_module = admitted.checkpoint.as_ref();
     let mut seal = CompiledModuleSeal::capture(module, &wire.frozen_parameters)?;
-    let _immutable_values = seal.apply_module_checkpoint(&decoded_module)?;
+    let _immutable_values = seal.apply_module_checkpoint(decoded_module)?;
     if module_wire(&seal) != wire.module {
         return Err(training(
             "compiled program artifact destination module mismatch",
         ));
     }
 
-    let (capture, main_state_buffers) = decode_phase(&wire.main.phase)?;
+    let capture = captures.main.clone();
+    let main_state_buffers = validate_phase_capture(&wire.main.phase, &capture)?;
     let parameter_buffers = wire.main.parameter_buffers.clone();
     let optimizer_buffers = decode_key_map(&wire.main.optimizer_buffers)?;
     let workload_buffers = decode_key_map(&wire.main.workload_buffers)?;
@@ -1612,8 +1823,10 @@ fn restore_owner<M: Module>(
     let accumulation = wire
         .accumulation
         .as_ref()
-        .map(|phase| {
-            let (phase_capture, state_buffers) = decode_phase(phase)?;
+        .zip(captures.accumulation.as_ref())
+        .map(|(phase, admitted_capture)| {
+            let phase_capture = admitted_capture.clone();
+            let state_buffers = validate_phase_capture(phase, &phase_capture)?;
             let cursor_projection = PreparedRecurrentCursorProjection::prepare(
                 &capture,
                 &phase_capture,
@@ -1667,8 +1880,11 @@ fn restore_owner<M: Module>(
         .evaluation
         .as_ref()
         .map(|evaluation| {
-            let capture =
-                CapturedSchedule::from_bytes(&evaluation.capture).map_err(replay_error)?;
+            let capture = captures
+                .evaluation
+                .as_ref()
+                .expect("admitted evaluation capture is present")
+                .clone();
             if capture.identity != evaluation.capture_identity {
                 return Err(training("compiled evaluation artifact identity mismatch"));
             }
@@ -1708,12 +1924,14 @@ fn restore_owner<M: Module>(
     let partial_flush = wire
         .partial_flush
         .as_ref()
-        .map(|phase| decode_auxiliary(&inner.capture, phase))
+        .zip(captures.partial_flush.as_ref())
+        .map(|(phase, capture)| decode_auxiliary(&inner.capture, phase, capture.clone()))
         .transpose()?;
     let zero_grad = wire
         .zero_grad
         .as_ref()
-        .map(|phase| decode_auxiliary(&inner.capture, phase))
+        .zip(captures.zero_grad.as_ref())
+        .map(|(phase, capture)| decode_auxiliary(&inner.capture, phase, capture.clone()))
         .transpose()?;
     let plan = CompiledAdamWPlan {
         program_identity,
@@ -1746,7 +1964,7 @@ fn restore_owner<M: Module>(
         progress: CompiledTrainingWindowProgress::INITIAL,
         evaluation,
     }
-    .restore_checkpoint(checkpoint.optimizer_checkpoint())?;
+    .restore_checkpoint(&decoded_module.optimizer)?;
     seal.validate_unchanged(module)?;
     Ok((plan, seal))
 }

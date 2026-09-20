@@ -9,6 +9,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 pub(super) const ADAMW_CHECKPOINT_FORMAT_V1: &str = "rustgrad-compiled-adamw-v1";
 pub(super) const ADAMW_CHECKPOINT_FORMAT_V2: &str = "rustgrad-compiled-adamw-v2";
@@ -38,11 +39,30 @@ pub(super) const ADAMW_CHECKPOINT_FORMAT_V9: &str = "rustgrad-compiled-adamw-v9"
 /// F32 numerator. A v9 checkpoint authenticates the private accumulation-only
 /// sibling capture.
 /// Legacy v1--v8 bytes remain accepted unchanged.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct CompiledAdamWCheckpoint {
     bytes: Vec<u8>,
     info: CompiledAdamWCheckpointInfo,
+    decoded: Arc<DecodedAdamWCheckpoint>,
 }
+
+impl std::fmt::Debug for CompiledAdamWCheckpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompiledAdamWCheckpoint")
+            .field("bytes", &self.bytes)
+            .field("info", &self.info)
+            .finish()
+    }
+}
+
+impl PartialEq for CompiledAdamWCheckpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes && self.info == other.info
+    }
+}
+
+impl Eq for CompiledAdamWCheckpoint {}
 
 impl CompiledAdamWCheckpoint {
     /// Validates and owns deterministic checkpoint bytes.
@@ -50,7 +70,11 @@ impl CompiledAdamWCheckpoint {
         let bytes = bytes.into();
         let decoded = decode_adamw_checkpoint(&bytes)?;
         let info = CompiledAdamWCheckpointInfo::from_decoded(&decoded);
-        Ok(Self { bytes, info })
+        Ok(Self {
+            bytes,
+            info,
+            decoded: Arc::new(decoded),
+        })
     }
 
     /// Loads and validates a local checkpoint under the default safetensors
@@ -86,6 +110,10 @@ impl CompiledAdamWCheckpoint {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub(super) fn decoded(&self) -> &DecodedAdamWCheckpoint {
+        &self.decoded
     }
 
     pub fn into_bytes(self) -> Vec<u8> {
@@ -226,6 +254,7 @@ impl CompiledAdamWCheckpointInfo {
     }
 }
 
+#[derive(Clone, Debug)]
 pub(super) struct DecodedAdamWCheckpoint {
     pub(super) capture_identity: u64,
     pub(super) replay_step: u64,
