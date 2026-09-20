@@ -13,8 +13,8 @@ use self::adamw_checkpoint::{
     ADAMW_CHECKPOINT_FORMAT_V4, ADAMW_CHECKPOINT_FORMAT_V8, ADAMW_CHECKPOINT_FORMAT_V9,
 };
 use self::adamw_checkpoint::{
-    AdamWCheckpointProgress, AdamWCheckpointTensors, decode_adamw_checkpoint,
-    encode_adamw_checkpoint,
+    AdamWCheckpointProgress, AdamWCheckpointTensors, DecodedAdamWCheckpoint,
+    decode_adamw_checkpoint, encode_adamw_checkpoint,
 };
 pub use self::adamw_checkpoint::{CompiledAdamWCheckpoint, CompiledAdamWCheckpointInfo};
 use self::adamw_contract::{CompiledAdamWContract, MetalAdamWContract};
@@ -4759,6 +4759,62 @@ pub struct CompiledAdamWPlan {
     contract: CompiledAdamWContract,
     progress: CompiledTrainingWindowProgress,
     evaluation: Option<CompiledEvaluationPlan>,
+}
+
+struct ValidatedAdamWCheckpointFrontier {
+    replay_step: u64,
+    values: BTreeMap<RecurrentStateKey, TensorData>,
+    versions: BTreeMap<RecurrentStateKey, u64>,
+    progress: CompiledTrainingWindowProgress,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AdamWCheckpointRestoreCounts {
+    borrowed_plan_clones: usize,
+    consumed_plan_restores: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AdamWPlanCaptureAllocations {
+    main: (usize, usize, usize),
+    accumulation: Option<(usize, usize, usize)>,
+    partial_flush: Option<(usize, usize, usize)>,
+    zero_grad: Option<(usize, usize, usize)>,
+    evaluation: Option<(usize, usize, usize)>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ADAMW_CHECKPOINT_RESTORE_COUNTS: std::cell::Cell<AdamWCheckpointRestoreCounts> =
+        const { std::cell::Cell::new(AdamWCheckpointRestoreCounts {
+            borrowed_plan_clones: 0,
+            consumed_plan_restores: 0,
+        }) };
+}
+
+#[cfg(test)]
+fn record_adamw_checkpoint_restore(update: impl FnOnce(&mut AdamWCheckpointRestoreCounts)) {
+    ADAMW_CHECKPOINT_RESTORE_COUNTS.with(|counts| {
+        let mut next = counts.get();
+        update(&mut next);
+        counts.set(next);
+    });
+}
+
+#[cfg(test)]
+fn adamw_checkpoint_restore_counts() -> AdamWCheckpointRestoreCounts {
+    ADAMW_CHECKPOINT_RESTORE_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn captured_schedule_allocation(capture: &CapturedSchedule) -> (usize, usize, usize) {
+    (
+        capture.items.as_ptr() as usize,
+        capture.items.len(),
+        capture.items.capacity(),
+    )
 }
 
 /// Explicit scalar or token-mean objective returned by a compiled module
@@ -10065,6 +10121,23 @@ impl CompiledAdamWPlan {
     /// independently.
     pub fn restore_checkpoint(&self, checkpoint: &CompiledAdamWCheckpoint) -> Result<Self> {
         let decoded = checkpoint.decoded();
+        let frontier = self.validate_checkpoint_frontier(decoded)?;
+        #[cfg(test)]
+        record_adamw_checkpoint_restore(|counts| counts.borrowed_plan_clones += 1);
+        self.clone().apply_checkpoint_frontier(frontier)
+    }
+
+    fn restore_checkpoint_owned(self, checkpoint: &CompiledAdamWCheckpoint) -> Result<Self> {
+        let frontier = self.validate_checkpoint_frontier(checkpoint.decoded())?;
+        #[cfg(test)]
+        record_adamw_checkpoint_restore(|counts| counts.consumed_plan_restores += 1);
+        self.apply_checkpoint_frontier(frontier)
+    }
+
+    fn validate_checkpoint_frontier(
+        &self,
+        decoded: &DecodedAdamWCheckpoint,
+    ) -> Result<ValidatedAdamWCheckpointFrontier> {
         let topology = CompiledTrainingWindowTopology::from_contract(&self.contract);
         if self.contract.gradient_accumulation_steps != decoded.accumulation_steps {
             return Err(training(
@@ -10242,23 +10315,68 @@ impl CompiledAdamWPlan {
             })
             .collect();
 
-        let mut restored = self.clone();
-        restored.inner =
-            restored
+        Ok(ValidatedAdamWCheckpointFrontier {
+            replay_step: decoded.replay_step,
+            values,
+            versions,
+            progress,
+        })
+    }
+
+    fn apply_checkpoint_frontier(self, frontier: ValidatedAdamWCheckpointFrontier) -> Result<Self> {
+        let Self {
+            inner,
+            partial_flush,
+            zero_grad,
+            program_identity,
+            contract,
+            progress: _,
+            evaluation,
+        } = self;
+        let inner = inner.restore_frontier_with_versions(
+            frontier.replay_step,
+            frontier.values,
+            frontier.versions,
+        )?;
+        let partial_flush = partial_flush
+            .map(|transition| transition.with_frontier(&inner.state_values))
+            .transpose()?;
+        let zero_grad = zero_grad
+            .map(|transition| transition.with_frontier(&inner.state_values))
+            .transpose()?;
+        Ok(Self {
+            inner,
+            partial_flush,
+            zero_grad,
+            program_identity,
+            contract,
+            progress: frontier.progress,
+            evaluation,
+        })
+    }
+
+    #[cfg(test)]
+    fn capture_allocations(&self) -> AdamWPlanCaptureAllocations {
+        AdamWPlanCaptureAllocations {
+            main: captured_schedule_allocation(&self.inner.capture.schedule),
+            accumulation: self
                 .inner
-                .restore_frontier_with_versions(decoded.replay_step, values, versions)?;
-        restored.partial_flush = restored
-            .partial_flush
-            .take()
-            .map(|transition| transition.with_frontier(&restored.inner.state_values))
-            .transpose()?;
-        restored.zero_grad = restored
-            .zero_grad
-            .take()
-            .map(|transition| transition.with_frontier(&restored.inner.state_values))
-            .transpose()?;
-        restored.progress = progress;
-        Ok(restored)
+                .accumulation
+                .as_ref()
+                .map(|plan| captured_schedule_allocation(&plan.phase().capture.schedule)),
+            partial_flush: self
+                .partial_flush
+                .as_ref()
+                .map(|plan| captured_schedule_allocation(&plan.phase().capture.schedule)),
+            zero_grad: self
+                .zero_grad
+                .as_ref()
+                .map(|plan| captured_schedule_allocation(&plan.phase().capture.schedule)),
+            evaluation: self
+                .evaluation
+                .as_ref()
+                .map(|plan| captured_schedule_allocation(plan.inference.capture())),
+        }
     }
 
     /// Compatibility constructor that compiles an exact program and then
@@ -25550,12 +25668,95 @@ mod tests {
         .unwrap();
         let capture_identity = plan.capture_identity();
         let evaluation_capture_identity = plan.evaluation_capture_identity();
+        let owned_restore_probe = plan.plan.clone();
+        let public_restore_probe = plan.plan.clone();
         let artifact = plan.program_artifact().unwrap();
-        let checkpoint = plan
+        let mut source = plan.prepare(&CpuSessionTarget::new()).unwrap();
+        source
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        let checkpoint = source.module_checkpoint().unwrap();
+        let optimizer_checkpoint = checkpoint.optimizer_checkpoint().clone();
+
+        let owned_allocations = owned_restore_probe.capture_allocations();
+        assert!(owned_allocations.main.1 > 0);
+        assert!(owned_allocations.accumulation.is_some());
+        assert!(owned_allocations.partial_flush.is_some());
+        assert!(owned_allocations.zero_grad.is_some());
+        assert!(owned_allocations.evaluation.is_some());
+        let before_owned = adamw_checkpoint_restore_counts();
+        let owned_restore_probe = owned_restore_probe
+            .restore_checkpoint_owned(&optimizer_checkpoint)
+            .unwrap();
+        let after_owned = adamw_checkpoint_restore_counts();
+        assert_eq!(owned_restore_probe.capture_allocations(), owned_allocations);
+        assert_eq!(
+            after_owned.borrowed_plan_clones,
+            before_owned.borrowed_plan_clones
+        );
+        assert_eq!(
+            after_owned.consumed_plan_restores,
+            before_owned.consumed_plan_restores + 1
+        );
+
+        let public_allocations = public_restore_probe.capture_allocations();
+        let public_progress = public_restore_probe.progress;
+        let before_public = adamw_checkpoint_restore_counts();
+        let public_restored = public_restore_probe
+            .restore_checkpoint(&optimizer_checkpoint)
+            .unwrap();
+        let after_public = adamw_checkpoint_restore_counts();
+        assert_eq!(
+            public_restore_probe.capture_allocations(),
+            public_allocations
+        );
+        assert_eq!(public_restore_probe.progress, public_progress);
+        assert_eq!(public_restored.progress.accumulation_index, 1);
+        assert_eq!(
+            after_public.borrowed_plan_clones,
+            before_public.borrowed_plan_clones + 1
+        );
+        assert_eq!(
+            after_public.consumed_plan_restores,
+            before_public.consumed_plan_restores
+        );
+
+        let incompatible = CompiledModuleAdamWPlan::compile_graph(
+            module_config().with_gradient_accumulation(3).unwrap(),
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap();
+        let incompatible_checkpoint = incompatible
+            .plan
             .prepare(&CpuSessionTarget::new())
             .unwrap()
-            .module_checkpoint()
+            .checkpoint()
             .unwrap();
+        let before_rejected = adamw_checkpoint_restore_counts();
+        let error = match public_restore_probe.restore_checkpoint(&incompatible_checkpoint) {
+            Ok(_) => panic!("an incompatible checkpoint was restored"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            Error::SessionTraining {
+                reason: "compiled AdamW checkpoint accumulation policy mismatch".into(),
+            }
+        );
+        assert_eq!(
+            public_restore_probe.capture_allocations(),
+            public_allocations
+        );
+        assert_eq!(public_restore_probe.progress, public_progress);
+        assert_eq!(adamw_checkpoint_restore_counts(), before_rejected);
+
         let encoded = CompiledAdamWResumeBundle::new(artifact, checkpoint)
             .unwrap()
             .into_bytes();
@@ -25582,11 +25783,26 @@ mod tests {
 
         let cloned = bundle.clone();
         assert!(bundle.shares_admission_with(&cloned));
+        let before_restore = adamw_checkpoint_restore_counts();
         let restored = CompiledModuleAdamWPlan::restore_from_resume_bundle(
             TiedFrozenModule::new([9.0, 10.0]),
             &cloned,
         )
         .unwrap();
+        let independently_restored = CompiledModuleAdamWPlan::restore_from_resume_bundle(
+            TiedFrozenModule::new([11.0, 12.0]),
+            &bundle,
+        )
+        .unwrap();
+        let after_restore = adamw_checkpoint_restore_counts();
+        assert_eq!(
+            after_restore.borrowed_plan_clones, before_restore.borrowed_plan_clones,
+            "admitted owner restore must not clone its freshly reconstructed program"
+        );
+        assert_eq!(
+            after_restore.consumed_plan_restores,
+            before_restore.consumed_plan_restores + 2
+        );
         assert_eq!(
             program_artifact::portable_resume_decode_counts(),
             after_load,
@@ -25597,6 +25813,20 @@ mod tests {
             restored.evaluation_capture_identity(),
             evaluation_capture_identity
         );
+        let mut restored = restored.prepare(&CpuSessionTarget::new()).unwrap();
+        let independent = independently_restored
+            .prepare(&CpuSessionTarget::new())
+            .unwrap();
+        assert_eq!(restored.checkpoint().unwrap(), optimizer_checkpoint);
+        assert_eq!(independent.checkpoint().unwrap(), optimizer_checkpoint);
+        restored
+            .step(
+                BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 0.25]).unwrap())]),
+                TensorData::scalar(0.01),
+            )
+            .unwrap();
+        assert_ne!(restored.checkpoint().unwrap(), optimizer_checkpoint);
+        assert_eq!(independent.checkpoint().unwrap(), optimizer_checkpoint);
     }
 
     #[test]

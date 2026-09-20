@@ -1964,7 +1964,7 @@ fn restore_owner_from_admitted<M: Module>(
         progress: CompiledTrainingWindowProgress::INITIAL,
         evaluation,
     }
-    .restore_checkpoint(&decoded_module.optimizer)?;
+    .restore_checkpoint_owned(&decoded_module.optimizer)?;
     seal.validate_unchanged(module)?;
     Ok((plan, seal))
 }
