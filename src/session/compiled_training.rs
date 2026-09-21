@@ -68,6 +68,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     num::NonZeroU64,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -4786,6 +4787,16 @@ struct AdamWPlanCaptureAllocations {
 }
 
 #[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AdamWPlanTopologyAllocations {
+    main: (usize, usize),
+    accumulation: Option<(usize, usize, usize)>,
+    partial_flush: Option<(usize, usize, usize)>,
+    zero_grad: Option<(usize, usize, usize)>,
+    evaluation: Option<(usize, usize)>,
+}
+
+#[cfg(test)]
 std::thread_local! {
     static ADAMW_CHECKPOINT_RESTORE_COUNTS: std::cell::Cell<AdamWCheckpointRestoreCounts> =
         const { std::cell::Cell::new(AdamWCheckpointRestoreCounts {
@@ -6076,8 +6087,8 @@ where
 /// Resource-free output of compiled training graph construction.
 #[derive(Clone)]
 struct CompiledTrainingPlan {
-    capture: CapturedMixedSchedule,
-    recurrent_capture: CompiledRecurrentCapture,
+    capture: Arc<CapturedMixedSchedule>,
+    recurrent_capture: Arc<CompiledRecurrentCapture>,
     inputs: BTreeMap<String, (Shape, DType)>,
     phase_outputs: CompiledTrainingPhaseOutputSchema,
     parameter_buffers: BTreeMap<String, u64>,
@@ -6108,10 +6119,10 @@ enum CompiledRecurrentPhaseAdmission {
 
 #[derive(Clone)]
 struct CompiledRecurrentPhasePlan {
-    capture: CapturedMixedSchedule,
+    capture: Arc<CapturedMixedSchedule>,
     recurrent_capture: CompiledRecurrentCapture,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
-    cursor_projection: PreparedRecurrentCursorProjection,
+    cursor_projection: Arc<PreparedRecurrentCursorProjection>,
     capture_identity: u64,
     admission: CompiledRecurrentPhaseAdmission,
 }
@@ -6169,13 +6180,13 @@ struct CompiledEvaluationPlan {
 #[derive(Clone)]
 struct CompiledRecurrentCapture {
     stateful: Option<CapturedStatefulInference>,
-    execution_plan: ExecutionPlanSummary,
+    execution_plan: Arc<ExecutionPlanSummary>,
 }
 
 impl CompiledRecurrentCapture {
     fn from_stateful(stateful: CapturedStatefulInference) -> Self {
         Self {
-            execution_plan: stateful.execution_plan().clone(),
+            execution_plan: Arc::new(stateful.execution_plan().clone()),
             stateful: Some(stateful),
         }
     }
@@ -6184,12 +6195,12 @@ impl CompiledRecurrentCapture {
         let execution_plan = artifact_recurrent_execution_plan(capture)?;
         Ok(Self {
             stateful: None,
-            execution_plan,
+            execution_plan: Arc::new(execution_plan),
         })
     }
 
     fn execution_plan(&self) -> &ExecutionPlanSummary {
-        &self.execution_plan
+        self.execution_plan.as_ref()
     }
 
     fn stateful(&self) -> Result<CapturedStatefulInference> {
@@ -6202,6 +6213,8 @@ impl CompiledRecurrentCapture {
 fn artifact_recurrent_execution_plan(
     capture: &CapturedMixedSchedule,
 ) -> Result<ExecutionPlanSummary> {
+    #[cfg(test)]
+    program_artifact::record_recurrent_execution_plan();
     let split = capture
         .schedule
         .items
@@ -6245,35 +6258,37 @@ fn artifact_recurrent_execution_plan(
 #[derive(Clone)]
 struct CompiledEvaluationCapture {
     inference: Option<crate::CapturedInference>,
-    capture: CapturedSchedule,
-    execution_plan: ExecutionPlanSummary,
+    capture: Arc<CapturedSchedule>,
+    execution_plan: Arc<ExecutionPlanSummary>,
 }
 
 impl CompiledEvaluationCapture {
     fn from_inference(inference: crate::CapturedInference) -> Self {
         Self {
-            capture: inference.capture().clone(),
-            execution_plan: inference.execution_plan().clone(),
+            capture: Arc::new(inference.capture().clone()),
+            execution_plan: Arc::new(inference.execution_plan().clone()),
             inference: Some(inference),
         }
     }
 
-    fn from_artifact(capture: CapturedSchedule) -> Result<Self> {
-        let execution_plan = ExecutionPlanSummary::from_capture(&capture, true)
+    fn from_artifact(capture: Arc<CapturedSchedule>) -> Result<Self> {
+        #[cfg(test)]
+        program_artifact::record_evaluation_execution_plan();
+        let execution_plan = ExecutionPlanSummary::from_capture(capture.as_ref(), true)
             .map_err(|error| training(format!("compiled evaluation artifact summary: {error}")))?;
         Ok(Self {
             inference: None,
             capture,
-            execution_plan,
+            execution_plan: Arc::new(execution_plan),
         })
     }
 
     fn capture(&self) -> &CapturedSchedule {
-        &self.capture
+        self.capture.as_ref()
     }
 
     fn execution_plan(&self) -> &ExecutionPlanSummary {
-        &self.execution_plan
+        self.execution_plan.as_ref()
     }
 
     fn inference(&self) -> Result<crate::CapturedInference> {
@@ -6465,8 +6480,8 @@ struct PendingAdamWStep {
 
 /// One static CPU training program with runtime-owned recurrent state.
 struct CpuCompiledTrainingProgram {
-    capture: CapturedMixedSchedule,
-    recurrent_capture: CompiledRecurrentCapture,
+    capture: Arc<CapturedMixedSchedule>,
+    recurrent_capture: Arc<CompiledRecurrentCapture>,
     runtime: EffectRuntime,
     cursor: MixedReplayCursor,
     inputs: BTreeMap<String, (Shape, DType)>,
@@ -7062,12 +7077,12 @@ impl CompiledTrainingPlan {
                 let capture_identity = cursor_projection.target_capture_identity();
                 Ok::<_, Error>(CompiledTrainingSiblingPlan {
                     phase: CompiledRecurrentPhasePlan {
-                        capture: phase.capture,
+                        capture: Arc::new(phase.capture),
                         recurrent_capture: CompiledRecurrentCapture::from_stateful(
                             phase.recurrent_capture,
                         ),
                         state_buffers: phase.state_buffers,
-                        cursor_projection,
+                        cursor_projection: Arc::new(cursor_projection),
                         capture_identity,
                         admission: CompiledRecurrentPhaseAdmission::RetainUnchanged,
                     },
@@ -7093,8 +7108,10 @@ impl CompiledTrainingPlan {
             observations: observation_schema,
         };
         Ok(Self {
-            capture: main.capture,
-            recurrent_capture: CompiledRecurrentCapture::from_stateful(main.recurrent_capture),
+            capture: Arc::new(main.capture),
+            recurrent_capture: Arc::new(CompiledRecurrentCapture::from_stateful(
+                main.recurrent_capture,
+            )),
             inputs: optimizer.inputs().clone(),
             phase_outputs,
             parameter_buffers,
@@ -7599,10 +7616,10 @@ impl CompiledAdamWAuxiliaryPlan {
         )?;
         Ok(Self {
             phase: CompiledRecurrentPhasePlan {
-                capture,
+                capture: Arc::new(capture),
                 recurrent_capture: CompiledRecurrentCapture::from_stateful(recurrent_capture),
                 state_buffers,
-                cursor_projection,
+                cursor_projection: Arc::new(cursor_projection),
                 capture_identity,
                 admission: CompiledRecurrentPhaseAdmission::Replace {
                     store_groups: recurrent_store_groups,
@@ -7774,10 +7791,10 @@ impl CompiledRecurrentPhasePlan {
         .map_err(replay_error)?;
         let capture_identity = cursor_projection.target_capture_identity();
         Ok(Self {
-            capture,
+            capture: Arc::new(capture),
             recurrent_capture: CompiledRecurrentCapture::from_stateful(recurrent_capture),
             state_buffers,
-            cursor_projection,
+            cursor_projection: Arc::new(cursor_projection),
             capture_identity,
             admission: CompiledRecurrentPhaseAdmission::Replace {
                 store_groups: Vec::new(),
@@ -10376,6 +10393,36 @@ impl CompiledAdamWPlan {
                 .evaluation
                 .as_ref()
                 .map(|plan| captured_schedule_allocation(plan.inference.capture())),
+        }
+    }
+
+    #[cfg(test)]
+    fn topology_allocations(&self) -> AdamWPlanTopologyAllocations {
+        let phase = |phase: &CompiledRecurrentPhasePlan| {
+            (
+                Arc::as_ptr(&phase.capture) as usize,
+                Arc::as_ptr(&phase.recurrent_capture.execution_plan) as usize,
+                Arc::as_ptr(&phase.cursor_projection) as usize,
+            )
+        };
+        AdamWPlanTopologyAllocations {
+            main: (
+                Arc::as_ptr(&self.inner.capture) as usize,
+                Arc::as_ptr(&self.inner.recurrent_capture.execution_plan) as usize,
+            ),
+            accumulation: self
+                .inner
+                .accumulation
+                .as_ref()
+                .map(|plan| phase(plan.phase())),
+            partial_flush: self.partial_flush.as_ref().map(|plan| phase(plan.phase())),
+            zero_grad: self.zero_grad.as_ref().map(|plan| phase(plan.phase())),
+            evaluation: self.evaluation.as_ref().map(|plan| {
+                (
+                    Arc::as_ptr(&plan.inference.capture) as usize,
+                    Arc::as_ptr(&plan.inference.execution_plan) as usize,
+                )
+            }),
         }
     }
 
@@ -20285,17 +20332,19 @@ mod tests {
         let mut interpreted = plan.prepare_cpu().unwrap();
         let mut interpreted_reference = plan.prepare_cpu().unwrap();
         let initial = interpreted.checkpoint().unwrap();
-        let accumulation_owner = interpreted
-            .inner
-            .accumulation
-            .as_mut()
-            .unwrap()
-            .phase
-            .capture
-            .schedule
-            .requested
-            .pop()
-            .unwrap();
+        let accumulation_owner = Arc::make_mut(
+            &mut interpreted
+                .inner
+                .accumulation
+                .as_mut()
+                .unwrap()
+                .phase
+                .capture,
+        )
+        .schedule
+        .requested
+        .pop()
+        .unwrap();
         let error = match interpreted.step_commit_only(scalar_batch(1.0), TensorData::scalar(0.01))
         {
             Ok(_) => panic!("malformed accumulation output layout succeeded"),
@@ -20303,16 +20352,18 @@ mod tests {
         };
         assert!(error.to_string().contains("requested output layout"));
         assert_eq!(interpreted.checkpoint().unwrap(), initial);
-        interpreted
-            .inner
-            .accumulation
-            .as_mut()
-            .unwrap()
-            .phase
-            .capture
-            .schedule
-            .requested
-            .push(accumulation_owner);
+        Arc::make_mut(
+            &mut interpreted
+                .inner
+                .accumulation
+                .as_mut()
+                .unwrap()
+                .phase
+                .capture,
+        )
+        .schedule
+        .requested
+        .push(accumulation_owner);
         let expected = interpreted_reference
             .step(scalar_batch(1.0), TensorData::scalar(0.01))
             .unwrap();
@@ -20326,16 +20377,18 @@ mod tests {
         );
 
         let pending = interpreted.checkpoint().unwrap();
-        let main_owner = interpreted.inner.capture.schedule.requested.pop().unwrap();
+        let main_owner = Arc::make_mut(&mut interpreted.inner.capture)
+            .schedule
+            .requested
+            .pop()
+            .unwrap();
         let error = match interpreted.step(scalar_batch(2.0), TensorData::scalar(0.01)) {
             Ok(_) => panic!("malformed main output layout succeeded"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("requested output layout"));
         assert_eq!(interpreted.checkpoint().unwrap(), pending);
-        interpreted
-            .inner
-            .capture
+        Arc::make_mut(&mut interpreted.inner.capture)
             .schedule
             .requested
             .push(main_owner);
@@ -20355,18 +20408,20 @@ mod tests {
         let mut native = target.prepare(&plan).unwrap();
         let mut native_reference = target.prepare(&plan).unwrap();
         let initial = native.checkpoint().unwrap();
-        let accumulation_owner = native
-            .inner
-            .inner
-            .accumulation
-            .as_mut()
-            .unwrap()
-            .phase
-            .capture
-            .schedule
-            .requested
-            .pop()
-            .unwrap();
+        let accumulation_owner = Arc::make_mut(
+            &mut native
+                .inner
+                .inner
+                .accumulation
+                .as_mut()
+                .unwrap()
+                .phase
+                .capture,
+        )
+        .schedule
+        .requested
+        .pop()
+        .unwrap();
         let error = match native.step(scalar_batch(1.0), TensorData::scalar(0.01)) {
             Ok(_) => panic!("malformed native accumulation output layout succeeded"),
             Err(error) => error,
@@ -20374,17 +20429,19 @@ mod tests {
         assert!(error.to_string().contains("requested output layout"));
         assert_eq!(native.checkpoint().unwrap(), initial);
         assert_eq!(native.successful_steps, 0);
-        native
-            .inner
-            .inner
-            .accumulation
-            .as_mut()
-            .unwrap()
-            .phase
-            .capture
-            .schedule
-            .requested
-            .push(accumulation_owner);
+        Arc::make_mut(
+            &mut native
+                .inner
+                .inner
+                .accumulation
+                .as_mut()
+                .unwrap()
+                .phase
+                .capture,
+        )
+        .schedule
+        .requested
+        .push(accumulation_owner);
         native_reference
             .step(scalar_batch(1.0), TensorData::scalar(0.01))
             .unwrap();
@@ -20397,7 +20454,11 @@ mod tests {
         );
 
         let pending = native.checkpoint().unwrap();
-        let main_owner = native.inner.inner.capture.schedule.requested.pop().unwrap();
+        let main_owner = Arc::make_mut(&mut native.inner.inner.capture)
+            .schedule
+            .requested
+            .pop()
+            .unwrap();
         let error = match native.step_commit_only(scalar_batch(2.0), TensorData::scalar(0.01)) {
             Ok(_) => panic!("malformed native main output layout succeeded"),
             Err(error) => error,
@@ -20405,10 +20466,7 @@ mod tests {
         assert!(error.to_string().contains("requested output layout"));
         assert_eq!(native.checkpoint().unwrap(), pending);
         assert_eq!(native.successful_steps, 1);
-        native
-            .inner
-            .inner
-            .capture
+        Arc::make_mut(&mut native.inner.inner.capture)
             .schedule
             .requested
             .push(main_owner);
@@ -22235,8 +22293,44 @@ mod tests {
             weight: Parameter::new(TensorData::scalar(9.0), true),
         };
         let destination_before = destination.weight.snapshot().unwrap();
+        let before_topology = program_artifact::portable_resume_decode_counts();
         let restored =
             CompiledModuleAdamWPlan::restore_from_resume_bundle(destination, &bundle).unwrap();
+        let independent = CompiledModuleAdamWPlan::restore_from_resume_bundle(
+            TokenMeanModule {
+                weight: Parameter::new(TensorData::scalar(11.0), true),
+            },
+            &bundle,
+        )
+        .unwrap();
+        let after_topology = program_artifact::portable_resume_decode_counts();
+        assert_eq!(
+            after_topology.topology_seals,
+            before_topology.topology_seals + 1
+        );
+        assert_eq!(
+            after_topology.topology_phase_validations,
+            before_topology.topology_phase_validations + 1
+        );
+        assert_eq!(
+            after_topology.recurrent_execution_plans,
+            before_topology.recurrent_execution_plans + 1
+        );
+        assert_eq!(
+            after_topology.evaluation_execution_plans,
+            before_topology.evaluation_execution_plans + 1
+        );
+        assert_eq!(
+            after_topology.cursor_projections,
+            before_topology.cursor_projections
+        );
+        assert_eq!(
+            restored.plan.topology_allocations(),
+            independent.plan.topology_allocations()
+        );
+        assert!(restored.plan.topology_allocations().accumulation.is_none());
+        assert!(restored.plan.topology_allocations().partial_flush.is_none());
+        assert!(restored.plan.topology_allocations().zero_grad.is_none());
         assert_parameter_snapshot_eq(
             &restored.module.weight.snapshot().unwrap(),
             &destination_before,
@@ -25648,10 +25742,10 @@ mod tests {
     }
 
     #[test]
-    fn compiled_resume_bundle_seals_one_decode_for_restore() {
+    fn compiled_resume_bundle_seals_one_decode_and_training_topology_for_restore() {
         let plan = CompiledModuleAdamWPlan::compile_graph(
             module_config()
-                .with_gradient_accumulation(2)
+                .with_gradient_accumulation(3)
                 .unwrap()
                 .with_window_loss_report(),
             TiedFrozenModule::new([1.0, -1.0]),
@@ -25725,7 +25819,7 @@ mod tests {
         );
 
         let incompatible = CompiledModuleAdamWPlan::compile_graph(
-            module_config().with_gradient_accumulation(3).unwrap(),
+            module_config().with_gradient_accumulation(2).unwrap(),
             TiedFrozenModule::new([1.0, -1.0]),
             |module, graph, inputs| {
                 let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
@@ -25772,6 +25866,7 @@ mod tests {
         );
         assert_eq!(after_load.module_checkpoints - before.module_checkpoints, 1);
         assert_eq!(after_load.pair_admissions - before.pair_admissions, 1);
+        assert_eq!(after_load.topology_seals, before.topology_seals);
         let retained_capture_extents = bundle.program_artifact().retained_capture_extents();
         assert_eq!(retained_capture_extents.len(), 5);
         assert!(
@@ -25795,6 +25890,7 @@ mod tests {
         )
         .unwrap();
         let after_restore = adamw_checkpoint_restore_counts();
+        let after_topology = program_artifact::portable_resume_decode_counts();
         assert_eq!(
             after_restore.borrowed_plan_clones, before_restore.borrowed_plan_clones,
             "admitted owner restore must not clone its freshly reconstructed program"
@@ -25803,20 +25899,89 @@ mod tests {
             after_restore.consumed_plan_restores,
             before_restore.consumed_plan_restores + 2
         );
+        assert_eq!(after_topology.program_wire, after_load.program_wire);
+        assert_eq!(after_topology.mixed_captures, after_load.mixed_captures);
+        assert_eq!(
+            after_topology.evaluation_captures,
+            after_load.evaluation_captures
+        );
+        assert_eq!(
+            after_topology.module_checkpoints,
+            after_load.module_checkpoints
+        );
+        assert_eq!(after_topology.pair_admissions, after_load.pair_admissions);
+        assert_eq!(after_topology.topology_seals, after_load.topology_seals + 1);
+        assert_eq!(
+            after_topology.topology_phase_validations,
+            after_load.topology_phase_validations + 4
+        );
+        assert_eq!(
+            after_topology.recurrent_execution_plans,
+            after_load.recurrent_execution_plans + 4
+        );
+        assert_eq!(
+            after_topology.evaluation_execution_plans,
+            after_load.evaluation_execution_plans + 1
+        );
+        assert_eq!(
+            after_topology.cursor_projections,
+            after_load.cursor_projections + 3
+        );
+        assert_eq!(
+            restored.plan.topology_allocations(),
+            independently_restored.plan.topology_allocations(),
+            "restored owners must share only immutable admitted replay topology"
+        );
+        let mismatched_destination = TiedFrozenModule {
+            shared: Parameter::new(TensorData::new([3], vec![7.0, 8.0, 9.0]).unwrap(), true),
+            frozen: Parameter::new(TensorData::new([2], vec![3.0, 4.0]).unwrap(), false),
+            buffer: Parameter::new(TensorData::scalar(5.0), false),
+        };
+        let mismatched_before = mismatched_destination.shared.snapshot().unwrap();
+        let before_mismatch = program_artifact::portable_resume_decode_counts();
+        let mismatched_destination = match CompiledModuleAdamWPlan::restore_from_resume_bundle(
+            mismatched_destination,
+            &bundle,
+        ) {
+            Ok(_) => panic!("admitted topology restored into a mismatched module"),
+            Err(error) => error.into_module(),
+        };
+        assert_parameter_snapshot_eq(
+            &mismatched_destination.shared.snapshot().unwrap(),
+            &mismatched_before,
+        );
         assert_eq!(
             program_artifact::portable_resume_decode_counts(),
-            after_load,
-            "restoring an admitted bundle must not reparse portable bytes or captures"
+            before_mismatch,
+            "destination rejection must neither mutate the module nor rebuild admitted topology"
         );
         assert_eq!(restored.capture_identity(), capture_identity);
         assert_eq!(
             restored.evaluation_capture_identity(),
             evaluation_capture_identity
         );
+        let inspection = independently_restored.inspection().unwrap();
         let mut restored = restored.prepare(&CpuSessionTarget::new()).unwrap();
+        let executor = CapturedReplayExecutor::default();
         let independent = independently_restored
-            .prepare(&CpuSessionTarget::new())
+            .prepare(&NativeCpuSessionTarget::new(&executor))
             .unwrap();
+        let preparation = independent.native_cpu_preparation_report();
+        assert_eq!(preparation.main().capture_identity(), inspection.main().0);
+        assert_eq!(preparation.main().execution_plan(), inspection.main().1);
+        assert_eq!(preparation.main().fallback_count(), 0);
+        for (prepared, expected) in [
+            (preparation.accumulation(), inspection.accumulation()),
+            (preparation.partial_flush(), inspection.partial_flush()),
+            (preparation.zero_grad(), inspection.zero_grad()),
+            (preparation.evaluation(), inspection.evaluation()),
+        ] {
+            let prepared = prepared.expect("the N=3 artifact retains every attached phase");
+            let expected = expected.expect("the admitted topology retains every attached phase");
+            assert_eq!(prepared.capture_identity(), expected.0);
+            assert_eq!(prepared.execution_plan(), expected.1);
+            assert_eq!(prepared.fallback_count(), 0);
+        }
         assert_eq!(restored.checkpoint().unwrap(), optimizer_checkpoint);
         assert_eq!(independent.checkpoint().unwrap(), optimizer_checkpoint);
         restored
