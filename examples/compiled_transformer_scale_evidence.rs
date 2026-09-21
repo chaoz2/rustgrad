@@ -371,6 +371,35 @@ struct ScaleGradientEvidence {
 }
 
 #[derive(Serialize)]
+struct ScaleReplayProgressEvidence {
+    replay: u64,
+    optimizer_step: u64,
+    accumulation_index: u64,
+    did_update: bool,
+}
+
+#[derive(Serialize)]
+struct ScaleEvaluationSampleEvidence {
+    batch_replay: u64,
+    capture_identity: u64,
+    token_mean_loss: f64,
+    valid_token_count: u64,
+    native_fallback_count: usize,
+    executed_native_item_count: usize,
+    module_dispatch_count: usize,
+}
+
+#[derive(Serialize)]
+struct ScaleEvaluationFrontierEvidence {
+    replay: u64,
+    optimizer_step: u64,
+    accumulation_index: u64,
+    token_mean_loss: f64,
+    checkpoint_state_neutral: bool,
+    samples: Vec<ScaleEvaluationSampleEvidence>,
+}
+
+#[derive(Serialize)]
 struct ScaleWarmResumeEvidence {
     replay_from: u64,
     replay_to: u64,
@@ -933,7 +962,7 @@ fn collect_scale_warm_resume_evidence(
     assert_eq!(resumed.module_checkpoint()?, *expected_final_checkpoint);
 
     let before_evaluation = resumed.module_checkpoint()?;
-    let warm_final_loss = mean_evaluation_loss(&mut resumed)?;
+    let warm_final_loss = mean_evaluation_loss(&mut resumed, evaluation_capture_identity)?;
     assert_eq!(warm_final_loss.to_bits(), expected_final_loss.to_bits());
     assert_eq!(resumed.module_checkpoint()?, before_evaluation);
     let (resumed_model, resumed_final_checkpoint) = resumed
@@ -1014,19 +1043,75 @@ fn mean_evaluation_loss(
         ScaleTransformer,
         NativeCpuCompiledAdamW<'_>,
     >,
+    evaluation_capture_identity: u64,
 ) -> Result<f64> {
+    Ok(scale_evaluation_samples(runtime, evaluation_capture_identity)?.0)
+}
+
+fn scale_evaluation_samples(
+    runtime: &mut rustgrad::CompiledModuleAdamWSession<
+        ScaleTransformer,
+        NativeCpuCompiledAdamW<'_>,
+    >,
+    evaluation_capture_identity: u64,
+) -> Result<(f64, Vec<ScaleEvaluationSampleEvidence>)> {
     let mut weighted_sum = 0.0;
     let mut weight_sum = 0_u64;
+    let mut samples = Vec::new();
     for replay in 1..=ACCUMULATION_STEPS {
         let evaluation = runtime.evaluate_batch(ScaleBatch::new(replay)?)?;
+        assert_eq!(evaluation.capture_identity(), evaluation_capture_identity);
         assert_eq!(evaluation.report().fallback_count(), 0);
-        assert!(evaluation.loss_weight() > 0);
-        weighted_sum += evaluation.loss().scalar_at(0).as_f64() * evaluation.loss_weight() as f64;
+        assert!(evaluation.report().executed_native_item_count() > 0);
+        assert!(evaluation.report().module_dispatch_count() > 0);
+        let valid_token_count = evaluation.loss_weight();
+        assert_eq!(valid_token_count, if replay == 1 { 22 } else { 16 });
+        let token_mean_loss = evaluation.loss().scalar_at(0).as_f64();
+        assert!(token_mean_loss.is_finite());
+        weighted_sum += token_mean_loss * valid_token_count as f64;
         weight_sum = weight_sum
-            .checked_add(evaluation.loss_weight())
+            .checked_add(valid_token_count)
             .expect("the fixed evaluation weight cannot overflow");
+        samples.push(ScaleEvaluationSampleEvidence {
+            batch_replay: replay,
+            capture_identity: evaluation.capture_identity(),
+            token_mean_loss,
+            valid_token_count,
+            native_fallback_count: evaluation.report().fallback_count(),
+            executed_native_item_count: evaluation.report().executed_native_item_count(),
+            module_dispatch_count: evaluation.report().module_dispatch_count(),
+        });
     }
-    Ok(weighted_sum / weight_sum as f64)
+    assert_eq!(weight_sum, 38);
+    Ok((weighted_sum / weight_sum as f64, samples))
+}
+
+fn evaluate_scale_frontier(
+    runtime: &mut rustgrad::CompiledModuleAdamWSession<
+        ScaleTransformer,
+        NativeCpuCompiledAdamW<'_>,
+    >,
+    replay: u64,
+    optimizer_step: u64,
+    evaluation_capture_identity: u64,
+) -> Result<ScaleEvaluationFrontierEvidence> {
+    let before = runtime.module_checkpoint()?;
+    let info = before.optimizer_checkpoint().info();
+    assert_eq!(info.replay_step(), replay);
+    assert_eq!(info.optimizer_step(), optimizer_step);
+    assert_eq!(info.accumulation_index(), 0);
+    let (token_mean_loss, samples) =
+        scale_evaluation_samples(runtime, evaluation_capture_identity)?;
+    assert!(token_mean_loss.is_finite());
+    assert_eq!(runtime.module_checkpoint()?, before);
+    Ok(ScaleEvaluationFrontierEvidence {
+        replay,
+        optimizer_step,
+        accumulation_index: 0,
+        token_mean_loss,
+        checkpoint_state_neutral: true,
+        samples,
+    })
 }
 
 fn assert_strict_native(step: &NativeCpuCompiledAdamWStepResult) {
@@ -1103,14 +1188,20 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         prepare_wall_time,
     )?;
 
-    let initial_checkpoint = runtime.checkpoint()?;
-    let initial_loss = mean_evaluation_loss(&mut runtime)?;
-    assert_eq!(runtime.checkpoint()?, initial_checkpoint);
+    let mut evaluation_trajectory = vec![evaluate_scale_frontier(
+        &mut runtime,
+        0,
+        0,
+        evaluation_capture_identity,
+    )?];
+    let initial_loss = evaluation_trajectory[0].token_mean_loss;
 
     let mut pending_checkpoint = None;
     let mut pending_checkpoint_bytes = None;
+    let mut pending_module_checkpoint_bytes = None;
     let mut saved_resume_bundle = None;
     let mut continuation = Vec::new();
+    let mut replay_progress = Vec::new();
     for replay in 1..=REPLAYS {
         let step = runtime.step_batch_commit_only_scheduled(ScaleBatch::new(replay)?)?;
         assert_strict_native(&step);
@@ -1120,6 +1211,20 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         assert_eq!(step.clip_report().is_some(), step.did_update());
         assert_eq!(step.window_loss_report().is_some(), step.did_update());
         scoreboard.record_step(&step)?;
+        replay_progress.push(ScaleReplayProgressEvidence {
+            replay,
+            optimizer_step: step.optimizer_step(),
+            accumulation_index: step.accumulation_index(),
+            did_update: step.did_update(),
+        });
+        if step.did_update() {
+            evaluation_trajectory.push(evaluate_scale_frontier(
+                &mut runtime,
+                replay,
+                step.optimizer_step(),
+                evaluation_capture_identity,
+            )?);
+        }
         if replay == CHECKPOINT_REPLAY {
             let checkpoint = runtime.checkpoint()?;
             assert_eq!(checkpoint.info().replay_step(), CHECKPOINT_REPLAY);
@@ -1138,6 +1243,8 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
             resume_bundle.save_file(&resume_bundle_path)?;
             module_checkpoint.save_file(&module_checkpoint_path)?;
             pending_checkpoint_bytes = Some(u64::try_from(checkpoint.as_bytes().len())?);
+            pending_module_checkpoint_bytes =
+                Some(u64::try_from(module_checkpoint.as_bytes().len())?);
             pending_checkpoint = Some(checkpoint);
             saved_resume_bundle = Some(resume_bundle);
         } else if replay > CHECKPOINT_REPLAY {
@@ -1161,10 +1268,17 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(uninterrupted_final.info().replay_step(), REPLAYS);
     assert_eq!(uninterrupted_final.info().optimizer_step(), 3);
     assert_eq!(uninterrupted_final.info().accumulation_index(), 0);
+    assert_eq!(evaluation_trajectory.len(), 4);
+    let uninterrupted_final_loss = evaluation_trajectory
+        .last()
+        .expect("the final committed window is evaluated")
+        .token_mean_loss;
 
     let pending_checkpoint = pending_checkpoint.expect("replay three checkpoints a pending window");
     let pending_checkpoint_bytes =
         pending_checkpoint_bytes.expect("the pending checkpoint records its exact byte count");
+    let pending_module_checkpoint_bytes = pending_module_checkpoint_bytes
+        .expect("the pending module checkpoint records its exact byte count");
     assert_eq!(
         pending_checkpoint_bytes,
         u64::try_from(pending_checkpoint.as_bytes().len())?
@@ -1181,8 +1295,9 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     }
     assert_eq!(runtime.checkpoint()?, uninterrupted_final);
     let before_final_evaluation = runtime.checkpoint()?;
-    let final_loss = mean_evaluation_loss(&mut runtime)?;
+    let final_loss = mean_evaluation_loss(&mut runtime, evaluation_capture_identity)?;
     assert_eq!(runtime.checkpoint()?, before_final_evaluation);
+    assert_eq!(final_loss.to_bits(), uninterrupted_final_loss.to_bits());
     assert!(
         final_loss < initial_loss,
         "larger compiled Transformer loss did not decrease: {initial_loss} -> {final_loss}"
@@ -1248,7 +1363,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let gradient_evidence = collect_scale_gradient_evidence()?;
 
     let objective = json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "git_sha": git_sha,
         "workload": {
             "batch": BATCH,
@@ -1265,14 +1380,17 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         "objective": {
             "initial_token_mean_loss": initial_loss,
             "final_token_mean_loss": final_loss,
-            "decreased": true
+            "decreased": true,
+            "evaluation_trajectory": evaluation_trajectory
         },
         "progress": {
+            "replays": replay_progress,
             "pending_resume_checkpoint": {
                 "replay": CHECKPOINT_REPLAY,
                 "optimizer_step": 1,
                 "accumulation_index": 1,
-                "bytes": pending_checkpoint_bytes
+                "bytes": pending_checkpoint_bytes,
+                "module_checkpoint_bytes": pending_module_checkpoint_bytes
             },
             "terminal_scoreboard_checkpoint": {
                 "replay": REPLAYS,
