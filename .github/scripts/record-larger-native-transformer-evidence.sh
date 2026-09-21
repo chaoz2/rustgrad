@@ -127,6 +127,7 @@ done
 
 python3 - \
   "$objective_path" \
+  "$scoreboard_path" \
   "$actual_sha" \
   "$resume_bundle_path" \
   "$module_checkpoint_path" <<'PY'
@@ -136,11 +137,191 @@ import pathlib
 import sys
 
 objective = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+scoreboard = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+scoreboard_main = scoreboard.get("main")
+scoreboard_evaluation = scoreboard.get("evaluation")
 def same_float(left, right):
     return math.isclose(left, right, rel_tol=1e-12, abs_tol=1e-15)
 
-if objective.get("schema_version") != 3 or objective.get("git_sha") != sys.argv[2]:
+def phase_sample_count(report):
+    if not isinstance(report, dict):
+        return None
+    wall_time = report.get("wall_time")
+    return wall_time.get("sample_count") if isinstance(wall_time, dict) else None
+
+if objective.get("schema_version") != 4 or objective.get("git_sha") != sys.argv[3]:
     raise SystemExit("larger Transformer objective provenance is invalid")
+expected_workload = {
+    "batch": 4,
+    "time": 8,
+    "vocabulary": 16,
+    "embedding": 8,
+    "heads": 2,
+    "feed_forward": 32,
+    "blocks": 2,
+    "compile_count": 1,
+    "gradient_accumulation_steps": 2,
+    "replays": 6,
+}
+if objective.get("workload") != expected_workload:
+    raise SystemExit("larger Transformer workload identity is invalid")
+
+objective_facts = objective.get("objective")
+if not isinstance(objective_facts, dict):
+    raise SystemExit("larger Transformer objective facts are absent")
+trajectory = objective_facts.get("evaluation_trajectory")
+expected_frontiers = [(0, 0, 0), (2, 1, 0), (4, 2, 0), (6, 3, 0)]
+if not isinstance(trajectory, list) or len(trajectory) != len(expected_frontiers):
+    raise SystemExit("larger Transformer evaluation trajectory is invalid")
+trajectory_losses = []
+for point, expected in zip(trajectory, expected_frontiers):
+    if not isinstance(point, dict):
+        raise SystemExit("larger Transformer evaluation point is invalid")
+    if (
+        (point.get("replay"), point.get("optimizer_step"), point.get("accumulation_index"))
+        != expected
+        or point.get("checkpoint_state_neutral") is not True
+    ):
+        raise SystemExit("larger Transformer evaluation frontier is invalid")
+    loss = point.get("token_mean_loss")
+    if type(loss) not in (int, float) or not math.isfinite(loss):
+        raise SystemExit("larger Transformer evaluation loss is non-finite")
+    samples = point.get("samples")
+    if not isinstance(samples, list) or len(samples) != 2:
+        raise SystemExit("larger Transformer evaluation samples are invalid")
+    weighted_loss = 0.0
+    total_weight = 0
+    for sample, batch_replay, valid_tokens in zip(samples, [1, 2], [22, 16]):
+        if not isinstance(sample, dict):
+            raise SystemExit("larger Transformer evaluation sample is invalid")
+        sample_loss = sample.get("token_mean_loss")
+        if (
+            sample.get("batch_replay") != batch_replay
+            or not isinstance(scoreboard_evaluation, dict)
+            or sample.get("capture_identity") != scoreboard_evaluation.get("capture_identity")
+            or sample.get("valid_token_count") != valid_tokens
+            or type(sample_loss) not in (int, float)
+            or not math.isfinite(sample_loss)
+            or sample.get("native_fallback_count") != 0
+            or type(sample.get("executed_native_item_count")) is not int
+            or sample["executed_native_item_count"] <= 0
+            or type(sample.get("module_dispatch_count")) is not int
+            or sample["module_dispatch_count"] <= 0
+        ):
+            raise SystemExit("larger Transformer evaluation sample contract is invalid")
+        weighted_loss += sample_loss * valid_tokens
+        total_weight += valid_tokens
+    if total_weight != 38 or not same_float(loss, weighted_loss / total_weight):
+        raise SystemExit("larger Transformer weighted evaluation mean is invalid")
+    trajectory_losses.append(loss)
+initial_loss = objective_facts.get("initial_token_mean_loss")
+final_loss = objective_facts.get("final_token_mean_loss")
+if (
+    type(initial_loss) not in (int, float)
+    or type(final_loss) not in (int, float)
+    or not math.isfinite(initial_loss)
+    or not math.isfinite(final_loss)
+    or not same_float(initial_loss, trajectory_losses[0])
+    or not same_float(final_loss, trajectory_losses[-1])
+    or objective_facts.get("decreased") is not True
+    or not final_loss < initial_loss
+):
+    raise SystemExit("larger Transformer objective trajectory does not decrease")
+
+progress = objective.get("progress")
+if not isinstance(progress, dict):
+    raise SystemExit("larger Transformer progress evidence is absent")
+expected_replays = [
+    {
+        "replay": replay,
+        "optimizer_step": replay // 2,
+        "accumulation_index": replay % 2,
+        "did_update": replay % 2 == 0,
+    }
+    for replay in range(1, 7)
+]
+if progress.get("replays") != expected_replays:
+    raise SystemExit("larger Transformer replay progression is invalid")
+pending = progress.get("pending_resume_checkpoint")
+terminal = progress.get("terminal_scoreboard_checkpoint")
+if (
+    not isinstance(pending, dict)
+    or pending.get("replay") != 3
+    or pending.get("optimizer_step") != 1
+    or pending.get("accumulation_index") != 1
+    or type(pending.get("bytes")) is not int
+    or pending["bytes"] <= 0
+    or type(pending.get("module_checkpoint_bytes")) is not int
+    or pending["module_checkpoint_bytes"] <= 0
+    or pending["module_checkpoint_bytes"] != pathlib.Path(sys.argv[5]).stat().st_size
+):
+    raise SystemExit("larger Transformer pending checkpoint evidence is invalid")
+if (
+    not isinstance(terminal, dict)
+    or terminal.get("replay") != 6
+    or terminal.get("optimizer_step") != 3
+    or terminal.get("accumulation_index") != 0
+    or type(terminal.get("bytes")) is not int
+    or terminal["bytes"] <= 0
+    or progress.get("final_replay") != 6
+    or progress.get("final_optimizer_step") != 3
+    or progress.get("final_accumulation_index") != 0
+    or progress.get("exact_resume") is not True
+):
+    raise SystemExit("larger Transformer terminal checkpoint evidence is invalid")
+
+native = objective.get("native")
+if not isinstance(native, dict):
+    raise SystemExit("larger Transformer native evidence is absent")
+if scoreboard.get("format_version") != 21 or scoreboard.get("initial_replay_step") != 0:
+    raise SystemExit("larger Transformer scoreboard identity is invalid")
+scoreboard_checkpoint = scoreboard.get("checkpoint")
+if (
+    not isinstance(scoreboard_checkpoint, dict)
+    or not isinstance(scoreboard_main, dict)
+    or scoreboard_checkpoint.get("replay_step") != 6
+    or scoreboard_checkpoint.get("byte_count") != terminal["bytes"]
+    or scoreboard_checkpoint.get("capture_identity") != scoreboard_main.get("capture_identity")
+):
+    raise SystemExit("larger Transformer scoreboard checkpoint is invalid")
+expected_native = {
+    "fallback_count": scoreboard.get("fallback_count"),
+    "successful_replay_count": scoreboard.get("successful_replay_count"),
+    "recurrent_state_count": scoreboard.get("recurrent_logical_state_count"),
+    "recurrent_state_bytes": scoreboard.get("recurrent_logical_state_bytes"),
+}
+if native != expected_native:
+    raise SystemExit("larger Transformer native evidence differs from scoreboard")
+if (
+    native["fallback_count"] != 0
+    or native["successful_replay_count"] != 6
+    or type(native["recurrent_state_count"]) is not int
+    or native["recurrent_state_count"] <= 0
+    or type(native["recurrent_state_bytes"]) is not int
+    or native["recurrent_state_bytes"] <= 0
+):
+    raise SystemExit("larger Transformer native replay inventory is invalid")
+for program_name in ["main", "accumulation", "partial_flush", "zero_grad", "evaluation"]:
+    program = scoreboard.get(program_name)
+    if (
+        not isinstance(program, dict)
+        or program.get("vectorized") is not True
+        or type(program.get("native_item_count")) is not int
+        or program["native_item_count"] <= 0
+    ):
+        raise SystemExit(f"larger Transformer {program_name} program inventory is invalid")
+step_phases = scoreboard.get("step_phases")
+if (
+    not isinstance(step_phases, dict)
+    or not isinstance(step_phases.get("first"), dict)
+    or step_phases["first"].get("phase") != "accumulation_only"
+    or not isinstance(step_phases.get("warm_accumulation_only"), dict)
+    or phase_sample_count(step_phases["warm_accumulation_only"]) != 2
+    or not isinstance(step_phases.get("warm_optimizer_commit"), dict)
+    or phase_sample_count(step_phases["warm_optimizer_commit"]) != 3
+):
+    raise SystemExit("larger Transformer scoreboard replay census is invalid")
+
 warm = objective.get("warm_resume")
 if not isinstance(warm, dict):
     raise SystemExit("larger Transformer warm resume evidence is absent")
@@ -167,9 +348,9 @@ for field in [
 ]:
     if type(warm.get(field)) is not int or warm[field] <= 0:
         raise SystemExit(f"larger Transformer warm resume {field} is invalid")
-if warm["resume_bundle_bytes"] != pathlib.Path(sys.argv[3]).stat().st_size:
+if warm["resume_bundle_bytes"] != pathlib.Path(sys.argv[4]).stat().st_size:
     raise SystemExit("larger Transformer warm resume bundle byte count is invalid")
-if warm["module_checkpoint_bytes"] != pathlib.Path(sys.argv[4]).stat().st_size:
+if warm["module_checkpoint_bytes"] != pathlib.Path(sys.argv[5]).stat().st_size:
     raise SystemExit("larger Transformer module checkpoint byte count is invalid")
 for field in [
     "artifact_decode_wall_time_ns",
@@ -192,6 +373,12 @@ for field in [
 for field in ["capture_identity", "evaluation_capture_identity"]:
     if type(warm.get(field)) is not int or warm[field] <= 0:
         raise SystemExit(f"larger Transformer warm resume {field} is invalid")
+if (
+    warm["capture_identity"] != scoreboard_main.get("capture_identity")
+    or warm["evaluation_capture_identity"]
+    != scoreboard["evaluation"].get("capture_identity")
+):
+    raise SystemExit("larger Transformer warm resume identities differ from scoreboard")
 probe = objective.get("gradient_probe")
 if not isinstance(probe, dict):
     raise SystemExit("larger Transformer gradient probe is absent")
