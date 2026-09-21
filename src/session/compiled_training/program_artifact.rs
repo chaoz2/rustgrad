@@ -2,7 +2,11 @@ use super::adamw_contract::{CompiledAdamWContract, CompiledAdamWPolicy};
 use super::*;
 use crate::file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically};
 use serde::{Deserialize, Serialize};
-use std::{io, path::Path, sync::Arc};
+use std::{
+    io,
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 const MAGIC: &[u8; 4] = b"RGAP";
 const FORMAT_VERSION: u8 = 1;
@@ -16,6 +20,11 @@ pub(super) struct PortableResumeDecodeCounts {
     pub(super) evaluation_captures: usize,
     pub(super) module_checkpoints: usize,
     pub(super) pair_admissions: usize,
+    pub(super) topology_seals: usize,
+    pub(super) topology_phase_validations: usize,
+    pub(super) recurrent_execution_plans: usize,
+    pub(super) evaluation_execution_plans: usize,
+    pub(super) cursor_projections: usize,
 }
 
 #[cfg(test)]
@@ -41,6 +50,16 @@ pub(super) fn portable_resume_decode_counts() -> PortableResumeDecodeCounts {
 #[cfg(test)]
 pub(super) fn record_module_checkpoint_decode() {
     update_decode_counts(|counts| counts.module_checkpoints += 1);
+}
+
+#[cfg(test)]
+pub(super) fn record_recurrent_execution_plan() {
+    update_decode_counts(|counts| counts.recurrent_execution_plans += 1);
+}
+
+#[cfg(test)]
+pub(super) fn record_evaluation_execution_plan() {
+    update_decode_counts(|counts| counts.evaluation_execution_plans += 1);
 }
 
 #[derive(Clone)]
@@ -182,7 +201,7 @@ impl CompiledAdamWProgramArtifact {
         Ok(Self {
             bytes,
             info,
-            admitted: Some(Arc::new(AdmittedProgramArtifact { wire, captures })),
+            admitted: Some(Arc::new(AdmittedProgramArtifact::new(wire, captures))),
         })
     }
 
@@ -452,28 +471,73 @@ struct ValidatedMain {
 
 #[derive(Clone, Debug)]
 struct ProgramCaptures {
-    main: CapturedMixedSchedule,
-    accumulation: Option<CapturedMixedSchedule>,
-    partial_flush: Option<CapturedMixedSchedule>,
-    zero_grad: Option<CapturedMixedSchedule>,
-    evaluation: Option<CapturedSchedule>,
+    main: Arc<CapturedMixedSchedule>,
+    accumulation: Option<Arc<CapturedMixedSchedule>>,
+    partial_flush: Option<Arc<CapturedMixedSchedule>>,
+    zero_grad: Option<Arc<CapturedMixedSchedule>>,
+    evaluation: Option<Arc<CapturedSchedule>>,
 }
 
-#[derive(Clone, Debug)]
 struct AdmittedProgramArtifact {
     wire: ProgramWire,
     captures: ProgramCaptures,
+    training_topology: OnceLock<Result<Arc<AdmittedTrainingTopology>>>,
+}
+
+/// Immutable resource-free replay structure derived at most once per admitted
+/// artifact. Mutable tensor values, logical versions, module seals, backend
+/// resources, and replay cursors remain destination-owned.
+struct AdmittedTrainingTopology {
+    plan: CompiledAdamWPlan,
+}
+
+impl fmt::Debug for AdmittedProgramArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdmittedProgramArtifact")
+            .field("wire", &self.wire)
+            .field("captures", &self.captures)
+            .field(
+                "training_topology_sealed",
+                &self.training_topology.get().is_some(),
+            )
+            .finish()
+    }
+}
+
+impl AdmittedProgramArtifact {
+    fn new(wire: ProgramWire, captures: ProgramCaptures) -> Self {
+        Self {
+            wire,
+            captures,
+            training_topology: OnceLock::new(),
+        }
+    }
+
+    fn training_topology(
+        &self,
+        checkpoint: &DecodedModuleAdamWCheckpoint,
+    ) -> Result<Arc<AdmittedTrainingTopology>> {
+        self.training_topology
+            .get_or_init(|| {
+                #[cfg(test)]
+                update_decode_counts(|counts| counts.topology_seals += 1);
+                seal_admitted_training_topology(&self.wire, &self.captures, checkpoint)
+                    .map(Arc::new)
+            })
+            .clone()
+    }
 }
 
 impl ProgramCaptures {
     fn decode(wire: &ProgramWire) -> Result<Self> {
-        let decode_phase = |phase: &PhaseWire| -> Result<CapturedMixedSchedule> {
+        let decode_phase = |phase: &PhaseWire| -> Result<Arc<CapturedMixedSchedule>> {
             #[cfg(test)]
             update_decode_counts(|counts| counts.mixed_captures += 1);
             let capture =
                 CapturedMixedSchedule::from_bytes(&phase.capture).map_err(replay_error)?;
             capture.initial_recurrent_cursor().map_err(replay_error)?;
-            Ok(capture)
+            Ok(Arc::new(capture))
         };
         let main = decode_phase(&wire.main.phase)?;
         let accumulation = wire.accumulation.as_ref().map(decode_phase).transpose()?;
@@ -488,7 +552,7 @@ impl ProgramCaptures {
                 let capture =
                     CapturedSchedule::from_bytes(&evaluation.capture).map_err(replay_error)?;
                 (capture.identity == evaluation.capture_identity)
-                    .then_some(capture)
+                    .then_some(Arc::new(capture))
                     .ok_or_else(|| training("compiled evaluation artifact identity mismatch"))
             })
             .transpose()?;
@@ -637,17 +701,17 @@ impl ProgramWire {
             accumulation_capture_identity: captures
                 .accumulation
                 .as_ref()
-                .map(phase_identity)
+                .map(|capture| phase_identity(capture.as_ref()))
                 .transpose()?,
             flush_capture_identity: captures
                 .partial_flush
                 .as_ref()
-                .map(phase_identity)
+                .map(|capture| phase_identity(capture.as_ref()))
                 .transpose()?,
             zero_grad_capture_identity: captures
                 .zero_grad
                 .as_ref()
-                .map(phase_identity)
+                .map(|capture| phase_identity(capture.as_ref()))
                 .transpose()?,
             evaluation_capture_identity,
         })
@@ -661,9 +725,9 @@ impl ProgramWire {
         validate_module_wire(&self.module, &self.frozen_parameters)?;
 
         self.validate_policy(&info)?;
-        let main = self.validate_main(&captures.main)?;
+        let main = self.validate_main(captures.main.as_ref())?;
         self.validate_auxiliary_programs(&main, &captures)?;
-        self.validate_evaluation(&captures.main, captures.evaluation.as_ref())?;
+        self.validate_evaluation(captures.main.as_ref(), captures.evaluation.as_deref())?;
         self.validate_sibling_identities(&info)?;
         self.validate_adamw_policy()?;
         Ok((info, captures))
@@ -856,16 +920,20 @@ impl ProgramWire {
             if phase.clip_report || phase.window_loss_report {
                 return Err(training("compiled accumulation artifact exposes reports"));
             }
-            let states = validate_phase_capture(phase, capture)?;
+            let states = validate_phase_capture(phase, capture.as_ref())?;
             if states != main.states
                 || capture.schedule.requested.len() != 1 + self.main.output_names.len()
-                || phase_external_inputs(capture, phase).ne(self.main.inputs.keys().cloned())
+                || phase_external_inputs(capture.as_ref(), phase).ne(self
+                    .main
+                    .inputs
+                    .keys()
+                    .cloned())
             {
                 return Err(training(
                     "compiled accumulation artifact frontier differs from main",
                 ));
             }
-            validate_native_manifests(phase, capture, NativeManifestExpectation::None)?;
+            validate_native_manifests(phase, capture.as_ref(), NativeManifestExpectation::None)?;
         }
         if let (Some(phase), Some(capture)) = (&self.zero_grad, &captures.zero_grad) {
             let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
@@ -881,14 +949,16 @@ impl ProgramWire {
                     "compiled zero-grad artifact exposes update outputs",
                 ));
             }
-            let states = validate_phase_capture(phase, capture)?;
+            let states = validate_phase_capture(phase, capture.as_ref())?;
             if states != main.zero_grad_states
                 || !capture.schedule.requested.is_empty()
-                || phase_external_inputs(capture, phase).next().is_some()
+                || phase_external_inputs(capture.as_ref(), phase)
+                    .next()
+                    .is_some()
             {
                 return Err(training("compiled zero-grad artifact state schema differs"));
             }
-            validate_native_manifests(phase, capture, NativeManifestExpectation::None)?;
+            validate_native_manifests(phase, capture.as_ref(), NativeManifestExpectation::None)?;
         }
         if let (Some(phase), Some(capture)) = (&self.partial_flush, &captures.partial_flush) {
             let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
@@ -896,7 +966,7 @@ impl ProgramWire {
                 phase.window_loss_report,
             );
             outputs.validate_report_flags(self.clip_report, self.window_loss_report)?;
-            let states = validate_phase_capture(phase, capture)?;
+            let states = validate_phase_capture(phase, capture.as_ref())?;
             let expected_outputs = outputs.observations.len();
             let has_learning_rate = capture
                 .schedule
@@ -905,14 +975,16 @@ impl ProgramWire {
                 .any(|input| input.name == LEARNING_RATE_INPUT);
             if states != main.flush_states
                 || capture.schedule.requested.len() != expected_outputs
-                || phase_external_inputs(capture, phase).next().is_some()
+                || phase_external_inputs(capture.as_ref(), phase)
+                    .next()
+                    .is_some()
                 || has_learning_rate != matches!(&self.learning_rate, LearningRateWire::External)
             {
                 return Err(training("compiled flush artifact state schema differs"));
             }
             validate_native_manifests(
                 phase,
-                capture,
+                capture.as_ref(),
                 NativeManifestExpectation::AdamW {
                     parameters: &self.main.parameter_buffers,
                     states: &states,
@@ -1585,25 +1657,32 @@ fn validate_phase_capture(
 fn decode_auxiliary(
     main: &CapturedMixedSchedule,
     wire: &PhaseWire,
-    capture: CapturedMixedSchedule,
+    capture: Arc<CapturedMixedSchedule>,
 ) -> Result<CompiledAdamWAuxiliaryPlan> {
-    let state_buffers = validate_phase_capture(wire, &capture)?;
+    #[cfg(test)]
+    update_decode_counts(|counts| counts.topology_phase_validations += 1);
+    let state_buffers = validate_phase_capture(wire, capture.as_ref())?;
     let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
         wire.clip_report,
         wire.window_loss_report,
     );
     outputs.validate_report_flags(wire.clip_report, wire.window_loss_report)?;
-    let cursor_projection =
-        PreparedRecurrentCursorProjection::prepare(main, &capture, state_buffers.values().copied())
-            .map_err(replay_error)?;
+    let cursor_projection = PreparedRecurrentCursorProjection::prepare(
+        main,
+        capture.as_ref(),
+        state_buffers.values().copied(),
+    )
+    .map_err(replay_error)?;
+    #[cfg(test)]
+    update_decode_counts(|counts| counts.cursor_projections += 1);
     let capture_identity = cursor_projection.target_capture_identity();
-    let recurrent_capture = CompiledRecurrentCapture::from_artifact(&capture)?;
+    let recurrent_capture = CompiledRecurrentCapture::from_artifact(capture.as_ref())?;
     Ok(CompiledAdamWAuxiliaryPlan {
         phase: CompiledRecurrentPhasePlan {
             capture,
             recurrent_capture,
             state_buffers,
-            cursor_projection,
+            cursor_projection: Arc::new(cursor_projection),
             capture_identity,
             admission: CompiledRecurrentPhaseAdmission::Replace {
                 store_groups: wire
@@ -1677,7 +1756,7 @@ fn decode_admitted_artifact_checkpoint_pair(
                 return Err(training("compiled program artifact info differs"));
             }
             wire.discard_capture_bytes();
-            Arc::new(AdmittedProgramArtifact { wire, captures })
+            Arc::new(AdmittedProgramArtifact::new(wire, captures))
         }
     };
     let wire = &admitted.wire;
@@ -1785,7 +1864,6 @@ fn restore_owner_from_admitted<M: Module>(
     admitted: &AdmittedArtifactCheckpointPair,
 ) -> Result<(CompiledAdamWPlan, CompiledModuleSeal)> {
     let wire = &admitted.artifact.wire;
-    let captures = &admitted.artifact.captures;
     let decoded_module = admitted.checkpoint.as_ref();
     let mut seal = CompiledModuleSeal::capture(module, &wire.frozen_parameters)?;
     let _immutable_values = seal.apply_module_checkpoint(decoded_module)?;
@@ -1794,9 +1872,25 @@ fn restore_owner_from_admitted<M: Module>(
             "compiled program artifact destination module mismatch",
         ));
     }
+    let plan = admitted
+        .artifact
+        .training_topology(decoded_module)?
+        .plan
+        .clone()
+        .restore_checkpoint_owned(&decoded_module.optimizer)?;
+    seal.validate_unchanged(module)?;
+    Ok((plan, seal))
+}
 
+fn seal_admitted_training_topology(
+    wire: &ProgramWire,
+    captures: &ProgramCaptures,
+    decoded_module: &DecodedModuleAdamWCheckpoint,
+) -> Result<AdmittedTrainingTopology> {
     let capture = captures.main.clone();
-    let main_state_buffers = validate_phase_capture(&wire.main.phase, &capture)?;
+    #[cfg(test)]
+    update_decode_counts(|counts| counts.topology_phase_validations += 1);
+    let main_state_buffers = validate_phase_capture(&wire.main.phase, capture.as_ref())?;
     let parameter_buffers = wire.main.parameter_buffers.clone();
     let optimizer_buffers = decode_key_map(&wire.main.optimizer_buffers)?;
     let workload_buffers = decode_key_map(&wire.main.workload_buffers)?;
@@ -1819,27 +1913,33 @@ fn restore_owner_from_admitted<M: Module>(
     }
     let (state_values, state_versions) = zero_frontier(&capture, &main_state_buffers)?;
     let state_input_keys = decode_input_key_map(&wire.main.state_input_keys)?;
-    let recurrent_capture = CompiledRecurrentCapture::from_artifact(&capture)?;
+    let recurrent_capture = Arc::new(CompiledRecurrentCapture::from_artifact(capture.as_ref())?);
     let accumulation = wire
         .accumulation
         .as_ref()
         .zip(captures.accumulation.as_ref())
         .map(|(phase, admitted_capture)| {
             let phase_capture = admitted_capture.clone();
-            let state_buffers = validate_phase_capture(phase, &phase_capture)?;
+            #[cfg(test)]
+            update_decode_counts(|counts| counts.topology_phase_validations += 1);
+            let state_buffers = validate_phase_capture(phase, phase_capture.as_ref())?;
             let cursor_projection = PreparedRecurrentCursorProjection::prepare(
-                &capture,
-                &phase_capture,
+                capture.as_ref(),
+                phase_capture.as_ref(),
                 state_buffers.values().copied(),
             )
             .map_err(replay_error)?;
+            #[cfg(test)]
+            update_decode_counts(|counts| counts.cursor_projections += 1);
             let capture_identity = cursor_projection.target_capture_identity();
             Ok(CompiledTrainingSiblingPlan {
                 phase: CompiledRecurrentPhasePlan {
-                    recurrent_capture: CompiledRecurrentCapture::from_artifact(&phase_capture)?,
+                    recurrent_capture: CompiledRecurrentCapture::from_artifact(
+                        phase_capture.as_ref(),
+                    )?,
                     capture: phase_capture,
                     state_buffers,
-                    cursor_projection,
+                    cursor_projection: Arc::new(cursor_projection),
                     capture_identity,
                     admission: CompiledRecurrentPhaseAdmission::RetainUnchanged,
                 },
@@ -1925,13 +2025,13 @@ fn restore_owner_from_admitted<M: Module>(
         .partial_flush
         .as_ref()
         .zip(captures.partial_flush.as_ref())
-        .map(|(phase, capture)| decode_auxiliary(&inner.capture, phase, capture.clone()))
+        .map(|(phase, capture)| decode_auxiliary(inner.capture.as_ref(), phase, capture.clone()))
         .transpose()?;
     let zero_grad = wire
         .zero_grad
         .as_ref()
         .zip(captures.zero_grad.as_ref())
-        .map(|(phase, capture)| decode_auxiliary(&inner.capture, phase, capture.clone()))
+        .map(|(phase, capture)| decode_auxiliary(inner.capture.as_ref(), phase, capture.clone()))
         .transpose()?;
     let plan = CompiledAdamWPlan {
         program_identity,
@@ -1963,8 +2063,6 @@ fn restore_owner_from_admitted<M: Module>(
         },
         progress: CompiledTrainingWindowProgress::INITIAL,
         evaluation,
-    }
-    .restore_checkpoint_owned(&decoded_module.optimizer)?;
-    seal.validate_unchanged(module)?;
-    Ok((plan, seal))
+    };
+    Ok(AdmittedTrainingTopology { plan })
 }
