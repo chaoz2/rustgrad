@@ -441,6 +441,9 @@ struct ScaleWarmResumeEvidence {
     loaded_module_count: usize,
     durable_artifact_cache_hit_count: usize,
     durable_artifact_cache_miss_count: usize,
+    render_capsule_hit_count: usize,
+    render_capsule_miss_count: usize,
+    local_render_job_count: usize,
     compiler_invocation_count: usize,
     linker_invocation_count: usize,
     fallback_count: usize,
@@ -1022,6 +1025,12 @@ fn collect_scale_warm_resume_evidence(
     assert_eq!(loaded_module_count, 5);
     assert_eq!(durable_artifact_cache_hit_count, 5);
     assert_eq!(durable_artifact_cache_miss_count, 0);
+    let render_capsule_hit_count = preparation.render_capsule_hit_count();
+    let render_capsule_miss_count = preparation.render_capsule_miss_count();
+    let local_render_job_count = preparation.local_render_job_count();
+    assert_eq!(render_capsule_hit_count, 5);
+    assert_eq!(render_capsule_miss_count, 0);
+    assert_eq!(local_render_job_count, 0);
 
     let (main_preparation, main_wall, main_render) = warm_program_preparation_evidence(main)?;
     let (accumulation_preparation, accumulation_wall, accumulation_render) =
@@ -1160,6 +1169,9 @@ fn collect_scale_warm_resume_evidence(
         loaded_module_count,
         durable_artifact_cache_hit_count,
         durable_artifact_cache_miss_count,
+        render_capsule_hit_count,
+        render_capsule_miss_count,
+        local_render_job_count,
         compiler_invocation_count,
         linker_invocation_count,
         fallback_count,
@@ -1500,7 +1512,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let gradient_evidence = collect_scale_gradient_evidence()?;
 
     let objective = json!({
-        "schema_version": 5,
+        "schema_version": 6,
         "git_sha": git_sha,
         "workload": {
             "batch": BATCH,

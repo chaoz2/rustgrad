@@ -2131,6 +2131,122 @@ impl NativeCpuProgramPreparationReport {
     }
 }
 
+/// Result of attempting to admit one authenticated render capsule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NativeCpuRenderCapsuleLoadStatus {
+    Hit,
+    RecipeUnavailable,
+    FileUnavailable,
+    DecodeRejected,
+    AuthenticationRejected,
+}
+
+/// Result of persisting a locally rendered program as a capsule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NativeCpuRenderCapsuleStoreStatus {
+    NotAttempted,
+    RecipeUnavailable,
+    Stored,
+    EncodeRejected,
+    FilesystemRejected,
+}
+
+/// Compiled training program owning one render-capsule outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeCpuRenderCapsuleProgramRole {
+    Main,
+    Accumulation,
+    PartialFlush,
+    ZeroGrad,
+    Evaluation,
+}
+
+/// Per-program capsule admission and persistence evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeCpuRenderCapsuleDiagnostic {
+    role: NativeCpuRenderCapsuleProgramRole,
+    load: NativeCpuRenderCapsuleLoadStatus,
+    store: NativeCpuRenderCapsuleStoreStatus,
+}
+
+impl NativeCpuRenderCapsuleDiagnostic {
+    pub const fn role(&self) -> NativeCpuRenderCapsuleProgramRole {
+        self.role
+    }
+
+    pub const fn load(&self) -> NativeCpuRenderCapsuleLoadStatus {
+        self.load
+    }
+
+    pub const fn store(&self) -> NativeCpuRenderCapsuleStoreStatus {
+        self.store
+    }
+
+    fn from_native(
+        role: NativeCpuTrainingProgramRole,
+        value: crate::backend::NativeRenderCapsuleDiagnostic,
+    ) -> Self {
+        use crate::backend::{NativeRenderCapsuleLoadStatus, NativeRenderCapsuleStoreStatus};
+        Self {
+            role: role.render_capsule_role(),
+            load: match value.load {
+                NativeRenderCapsuleLoadStatus::Hit => NativeCpuRenderCapsuleLoadStatus::Hit,
+                NativeRenderCapsuleLoadStatus::RecipeUnavailable => {
+                    NativeCpuRenderCapsuleLoadStatus::RecipeUnavailable
+                }
+                NativeRenderCapsuleLoadStatus::FileUnavailable => {
+                    NativeCpuRenderCapsuleLoadStatus::FileUnavailable
+                }
+                NativeRenderCapsuleLoadStatus::DecodeRejected => {
+                    NativeCpuRenderCapsuleLoadStatus::DecodeRejected
+                }
+                NativeRenderCapsuleLoadStatus::AuthenticationRejected => {
+                    NativeCpuRenderCapsuleLoadStatus::AuthenticationRejected
+                }
+            },
+            store: match value.store {
+                NativeRenderCapsuleStoreStatus::NotAttempted => {
+                    NativeCpuRenderCapsuleStoreStatus::NotAttempted
+                }
+                NativeRenderCapsuleStoreStatus::RecipeUnavailable => {
+                    NativeCpuRenderCapsuleStoreStatus::RecipeUnavailable
+                }
+                NativeRenderCapsuleStoreStatus::Stored => NativeCpuRenderCapsuleStoreStatus::Stored,
+                NativeRenderCapsuleStoreStatus::EncodeRejected => {
+                    NativeCpuRenderCapsuleStoreStatus::EncodeRejected
+                }
+                NativeRenderCapsuleStoreStatus::FilesystemRejected => {
+                    NativeCpuRenderCapsuleStoreStatus::FilesystemRejected
+                }
+            },
+        }
+    }
+
+    fn from_ordered_native(
+        roles: &[NativeCpuTrainingProgramRole],
+        values: Vec<crate::backend::NativeRenderCapsuleDiagnostic>,
+    ) -> Result<Vec<Self>> {
+        if roles.len() != values.len()
+            || values
+                .iter()
+                .enumerate()
+                .any(|(program_index, value)| value.program_index != program_index)
+        {
+            return Err(training(
+                "compiled native CPU render capsule diagnostic inventory differs",
+            ));
+        }
+        Ok(roles
+            .iter()
+            .copied()
+            .zip(values)
+            .map(|(role, value)| Self::from_native(role, value))
+            .collect())
+    }
+}
+
 /// Complete preparation evidence for a native CPU AdamW session.
 #[derive(Clone, Debug)]
 pub struct NativeCpuCompiledAdamWPreparationReport {
@@ -2141,6 +2257,9 @@ pub struct NativeCpuCompiledAdamWPreparationReport {
     evaluation: Option<NativeCpuProgramPreparationReport>,
     recurrent_state_count: usize,
     recurrent_state_bytes: usize,
+    render_capsule_hit_count: usize,
+    render_capsule_miss_count: usize,
+    local_render_job_count: usize,
     parallel_render_overlap_wall_time: Duration,
     max_parallel_render_job_count: usize,
     parallel_module_overlap_wall_time: Duration,
@@ -2151,6 +2270,7 @@ pub struct NativeCpuCompiledAdamWPreparationReport {
     module_overlaps: Vec<NativeCpuModuleOverlap>,
     program_pair_overlaps: Vec<NativeCpuProgramPairOverlap>,
     translation_units: Vec<NativeCpuTranslationUnitEvidence>,
+    render_capsule_diagnostics: Vec<NativeCpuRenderCapsuleDiagnostic>,
 }
 
 impl NativeCpuCompiledAdamWPreparationReport {
@@ -2182,6 +2302,26 @@ impl NativeCpuCompiledAdamWPreparationReport {
 
     pub const fn recurrent_state_bytes(&self) -> usize {
         self.recurrent_state_bytes
+    }
+
+    pub const fn render_capsule_hit_count(&self) -> usize {
+        self.render_capsule_hit_count
+    }
+
+    pub const fn render_capsule_miss_count(&self) -> usize {
+        self.render_capsule_miss_count
+    }
+
+    pub const fn local_render_job_count(&self) -> usize {
+        self.local_render_job_count
+    }
+
+    /// Per-program cache admission and cold-write outcome in canonical
+    /// preparation order. This distinguishes an ordinary missing capsule from
+    /// codec, authentication, and filesystem rejection without changing the
+    /// fail-soft cache contract.
+    pub fn render_capsule_diagnostics(&self) -> &[NativeCpuRenderCapsuleDiagnostic] {
+        &self.render_capsule_diagnostics
     }
 
     /// Exact overlap among the immutable per-program native render jobs.
@@ -5356,6 +5496,16 @@ impl NativeCpuTrainingProgramRole {
             Self::PartialFlush => "partial-flush",
             Self::ZeroGrad => "zero-grad",
             Self::Evaluation => "evaluation",
+        }
+    }
+
+    const fn render_capsule_role(self) -> NativeCpuRenderCapsuleProgramRole {
+        match self {
+            Self::Main => NativeCpuRenderCapsuleProgramRole::Main,
+            Self::Accumulation => NativeCpuRenderCapsuleProgramRole::Accumulation,
+            Self::PartialFlush => NativeCpuRenderCapsuleProgramRole::PartialFlush,
+            Self::ZeroGrad => NativeCpuRenderCapsuleProgramRole::ZeroGrad,
+            Self::Evaluation => NativeCpuRenderCapsuleProgramRole::Evaluation,
         }
     }
 }
@@ -12763,6 +12913,10 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         let (plans, compilation) = executor
             .plan_native_item_drafts(programs, vectorized)
             .map_err(replay_error)?;
+        let render_capsule_diagnostics = NativeCpuRenderCapsuleDiagnostic::from_ordered_native(
+            &roles,
+            compilation.render_capsule_diagnostics,
+        )?;
         let NativeCpuTrainingPrograms {
             main: main_plan,
             accumulation: accumulation_plan,
@@ -12885,6 +13039,9 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 evaluation: evaluation_report,
                 recurrent_state_count,
                 recurrent_state_bytes,
+                render_capsule_hit_count: compilation.render_capsule_hit_count,
+                render_capsule_miss_count: compilation.render_capsule_miss_count,
+                local_render_job_count: compilation.local_render_job_count,
                 parallel_render_overlap_wall_time: compilation.parallel_render_overlap_wall_time,
                 max_parallel_render_job_count: compilation.max_parallel_render_job_count,
                 parallel_module_overlap_wall_time: compilation.parallel_work_overlap_wall_time,
@@ -12912,6 +13069,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     .into_iter()
                     .map(NativeCpuTranslationUnitEvidence::from_native)
                     .collect(),
+                render_capsule_diagnostics,
             },
             successful_steps: 0,
             successful_flushes: 0,
@@ -16124,6 +16282,61 @@ mod tests {
         assert_eq!(plans.zero_grad, Some(4));
         assert_eq!(plans.evaluation, Some(5));
 
+        let capsule_diagnostic = |program_index| crate::backend::NativeRenderCapsuleDiagnostic {
+            program_index,
+            load: crate::backend::NativeRenderCapsuleLoadStatus::Hit,
+            store: crate::backend::NativeRenderCapsuleStoreStatus::NotAttempted,
+        };
+        let main_evaluation = NativeCpuRenderCapsuleDiagnostic::from_ordered_native(
+            &[Main, Evaluation],
+            vec![capsule_diagnostic(0), capsule_diagnostic(1)],
+        )
+        .unwrap();
+        assert_eq!(
+            main_evaluation
+                .iter()
+                .map(NativeCpuRenderCapsuleDiagnostic::role)
+                .collect::<Vec<_>>(),
+            [
+                NativeCpuRenderCapsuleProgramRole::Main,
+                NativeCpuRenderCapsuleProgramRole::Evaluation,
+            ]
+        );
+        let accumulating = NativeCpuRenderCapsuleDiagnostic::from_ordered_native(
+            &[Main, Accumulation, PartialFlush],
+            vec![
+                capsule_diagnostic(0),
+                capsule_diagnostic(1),
+                capsule_diagnostic(2),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            accumulating
+                .iter()
+                .map(NativeCpuRenderCapsuleDiagnostic::role)
+                .collect::<Vec<_>>(),
+            [
+                NativeCpuRenderCapsuleProgramRole::Main,
+                NativeCpuRenderCapsuleProgramRole::Accumulation,
+                NativeCpuRenderCapsuleProgramRole::PartialFlush,
+            ]
+        );
+        assert!(
+            NativeCpuRenderCapsuleDiagnostic::from_ordered_native(
+                &[Main, Evaluation],
+                vec![capsule_diagnostic(1), capsule_diagnostic(0)],
+            )
+            .is_err()
+        );
+        assert!(
+            NativeCpuRenderCapsuleDiagnostic::from_ordered_native(
+                &[Main, Evaluation],
+                vec![capsule_diagnostic(0)],
+            )
+            .is_err()
+        );
+
         let mut missing_main = NativeCpuTrainingProgramBatch::with_capacity(1);
         assert!(missing_main.push(Evaluation, (), ()).is_err());
         let mut reordered = NativeCpuTrainingProgramBatch::with_capacity(3);
@@ -18021,7 +18234,7 @@ mod tests {
             preparation.parallel_module_overlap_wall_time(),
             Duration::ZERO
         );
-        assert_eq!(preparation.max_parallel_render_job_count(), 1);
+        assert!(preparation.max_parallel_render_job_count() <= 1);
         assert_eq!(
             preparation.parallel_render_overlap_wall_time(),
             Duration::ZERO

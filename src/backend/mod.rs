@@ -9,6 +9,7 @@ pub use cpu::CpuBackend;
 pub(crate) use cpu::{execute_prefix_scan, stable_sort_pair};
 pub use jit::{CpuJitBackend, JitBackendError, JitExecution, JitFallback};
 pub(crate) use jit::{
+    NativeRenderCapsuleDiagnostic, NativeRenderCapsuleLoadStatus, NativeRenderCapsuleStoreStatus,
     NativeScheduleCompilationBatch, NativeScheduleCompilerProcessTiming, NativeScheduleLayout,
     NativeScheduleModuleOverlap, NativeScheduleModulePreparation, NativeScheduleProgramPairOverlap,
     NativeScheduleTranslationUnit, NativeStoreGroup, NativeStoreGroupMember,

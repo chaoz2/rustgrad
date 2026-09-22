@@ -27,6 +27,28 @@ const C11_TRANSLATION_UNIT_FLAGS: &[&str] = &[
 ];
 const C11_LINK_FLAGS: &[&str] = &["-shared", "-Werror"];
 
+pub(super) fn render_capsule_environment() -> String {
+    let mut environment = format!(
+        "rustgrad-native-render-capsule-environment-v1\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        super::RENDERER_VERSION,
+        super::MOVEMENT_RENDERER_VERSION,
+        super::STATIC_POSITION_RENDERER_VERSION,
+        super::THREEFRY_RENDERER_VERSION,
+        super::NATIVE_STORE_GROUP_RENDERER_VERSION,
+        super::NATIVE_STORE_GROUP_CACHE_DOMAIN,
+        super::ABI_VERSION,
+        C11_COMPILER_COMMAND,
+        C11_COMPILER_FLAGS.join("\u{1e}"),
+        C11_TRANSLATION_UNIT_FLAGS.join("\u{1e}"),
+        C11_LINK_FLAGS.join("\u{1e}"),
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+    );
+    environment.push('\u{1f}');
+    environment.push_str(&schedule_module_manifest(&[]));
+    environment
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativeScheduleModuleBuildMode {
     Combined,

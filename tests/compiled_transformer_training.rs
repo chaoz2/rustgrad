@@ -6950,7 +6950,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let preparation = session.preparation_report();
     let preparation_parallel_module_overlap = preparation.parallel_module_overlap_wall_time();
     let preparation_parallel_render_overlap = preparation.parallel_render_overlap_wall_time();
-    assert!((1..=2).contains(&preparation.max_parallel_render_job_count()));
+    assert!(preparation.max_parallel_render_job_count() <= 2);
     let prepare_wall_time = std::iter::once(preparation.main())
         .chain(preparation.accumulation())
         .chain(preparation.partial_flush())
@@ -7229,7 +7229,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     assert!(
         report
             .prepare_max_parallel_render_job_count()
-            .is_some_and(|count| (1..=2).contains(&count))
+            .is_some_and(|count| count <= 2)
     );
     assert_eq!(
         program_prepare_total

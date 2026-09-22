@@ -46,7 +46,9 @@ pub use compiled_training::{
     NativeCpuCompiledAdamWFlushResult, NativeCpuCompiledAdamWPreparationReport,
     NativeCpuCompiledAdamWStepResult, NativeCpuCompiledEvaluationResult,
     NativeCpuDispatchSegmentation, NativeCpuPreparationPhases, NativeCpuPreparationWork,
-    NativeCpuProgramPreparationReport, NativeCpuReplayTraffic, NativeCpuRunReport,
+    NativeCpuProgramPreparationReport, NativeCpuRenderCapsuleDiagnostic,
+    NativeCpuRenderCapsuleLoadStatus, NativeCpuRenderCapsuleProgramRole,
+    NativeCpuRenderCapsuleStoreStatus, NativeCpuReplayTraffic, NativeCpuRunReport,
     TrainingParameterInit,
 };
 pub use cpu::{
