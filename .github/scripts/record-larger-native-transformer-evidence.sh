@@ -149,7 +149,7 @@ def phase_sample_count(report):
     wall_time = report.get("wall_time")
     return wall_time.get("sample_count") if isinstance(wall_time, dict) else None
 
-if objective.get("schema_version") != 5 or objective.get("git_sha") != sys.argv[3]:
+if objective.get("schema_version") != 6 or objective.get("git_sha") != sys.argv[3]:
     raise SystemExit("larger Transformer objective provenance is invalid")
 expected_workload = {
     "batch": 4,
@@ -273,7 +273,7 @@ if (
 native = objective.get("native")
 if not isinstance(native, dict):
     raise SystemExit("larger Transformer native evidence is absent")
-if scoreboard.get("format_version") != 21 or scoreboard.get("initial_replay_step") != 0:
+if scoreboard.get("format_version") != 22 or scoreboard.get("initial_replay_step") != 0:
     raise SystemExit("larger Transformer scoreboard identity is invalid")
 scoreboard_checkpoint = scoreboard.get("checkpoint")
 if (
@@ -332,6 +332,9 @@ if (
     or warm.get("loaded_module_count") != 5
     or warm.get("durable_artifact_cache_hit_count") != 5
     or warm.get("durable_artifact_cache_miss_count") != 0
+    or warm.get("render_capsule_hit_count") != 5
+    or warm.get("render_capsule_miss_count") != 0
+    or warm.get("local_render_job_count") != 0
     or warm.get("compiler_invocation_count") != 0
     or warm.get("linker_invocation_count") != 0
     or warm.get("fallback_count") != 0

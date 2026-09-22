@@ -41,9 +41,9 @@ use rustgrad::{
     CompiledTrainingWindowResetRuntime, CompiledTrainingWindowRuntime, CompiledTrainingWindowStep,
     CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, LossOptions,
     MetalSessionTarget, Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult,
-    NativeCpuCompiledEvaluationResult, NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId,
-    Parameter, Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider,
-    TransformerBlock, sparse_categorical_cross_entropy,
+    NativeCpuCompiledEvaluationResult, NativeCpuRenderCapsuleProgramRole, NativeCpuSessionTarget,
+    NativeTrainingScoreboard, NodeId, Parameter, Reduction, Result, Scalar, Shape, TensorData,
+    TrainingDropoutProvider, TransformerBlock, sparse_categorical_cross_entropy,
 };
 use std::{
     cell::Cell,
@@ -2568,17 +2568,41 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
         restored_preparation.parallel_module_overlap_wall_time(),
         Duration::ZERO
     );
-    assert!((1..=2).contains(&restored_preparation.max_parallel_render_job_count()));
-    for program in [
+    let capsule_diagnostics = restored_preparation.render_capsule_diagnostics();
+    assert_eq!(
+        capsule_diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.role())
+            .collect::<Vec<_>>(),
+        [
+            NativeCpuRenderCapsuleProgramRole::Main,
+            NativeCpuRenderCapsuleProgramRole::Accumulation,
+            NativeCpuRenderCapsuleProgramRole::PartialFlush,
+            NativeCpuRenderCapsuleProgramRole::ZeroGrad,
+        ]
+    );
+    assert_eq!(
+        restored_preparation.max_parallel_render_job_count(),
+        0,
+        "warm render capsule diagnostics: {capsule_diagnostics:#?}"
+    );
+    assert_eq!(restored_preparation.render_capsule_hit_count(), 4);
+    assert_eq!(restored_preparation.render_capsule_miss_count(), 0);
+    assert_eq!(restored_preparation.local_render_job_count(), 0);
+    assert_eq!(
+        restored_preparation.parallel_render_overlap_wall_time(),
+        Duration::ZERO
+    );
+    let restored_programs = [
         Some(restored_preparation.main()),
         restored_preparation.accumulation(),
         restored_preparation.partial_flush(),
         restored_preparation.zero_grad(),
         restored_preparation.evaluation(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    ];
+    assert_eq!(restored_programs.iter().flatten().count(), 4);
+    assert!(restored_preparation.evaluation().is_none());
+    for program in restored_programs.into_iter().flatten() {
         assert_eq!(program.cache_miss_count(), 0);
         assert_eq!(program.cache_hit_count(), program.native_item_count());
         assert!(program.work().rendered_entry_count() <= program.native_item_count());

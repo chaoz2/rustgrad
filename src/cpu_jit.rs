@@ -1984,6 +1984,60 @@ fn render(root: &UOp) -> Result<RenderedC, JitError> {
 }
 
 pub(crate) use store_group::render_native_store_group;
+pub(crate) use store_group::{
+    NATIVE_STORE_GROUP_CACHE_DOMAIN, NATIVE_STORE_GROUP_RENDERER_VERSION, native_store_group_abi,
+    native_store_group_cache_key,
+};
+
+pub(crate) fn native_rendered_cache_key(
+    root: &UOp,
+    request_vector: bool,
+    source: &str,
+) -> Result<String, JitError> {
+    let discriminator = match root.operation() {
+        Operation::PrefixScan(_) => "prefix-scan".to_owned(),
+        Operation::Random(_) => "random".to_owned(),
+        Operation::Threefry(_) => THREEFRY_RENDERER_VERSION.to_owned(),
+        Operation::Matmul(MatmulValue::Quantized(plan)) => plan.cache_key.to_string(),
+        Operation::Matmul(MatmulValue::Serial(plan)) => plan.cache_key.to_string(),
+        Operation::Matmul(MatmulValue::Tiled(payload)) => payload.matmul.cache_key.to_string(),
+        Operation::Matmul(MatmulValue::TensorCore(payload)) => payload.matmul.cache_key.to_string(),
+        Operation::Movement(MovementValue::QuantizedRowGather(plan)) => plan.cache_key.to_string(),
+        Operation::Movement(MovementValue::Plan(plan)) => format!("movement-{}", plan.cache_key),
+        Operation::Conv2d(plan) => {
+            return Ok(key(&(RENDERER_VERSION.to_owned()
+                + std::env::consts::ARCH
+                + std::env::consts::OS
+                + &plan.cache_key.to_string()
+                + source)));
+        }
+        _ => {
+            let nodes = root
+                .topological()
+                .map_err(|error| JitError::Unsupported(error.to_string()))?;
+            let request_vector = request_vector
+                && !nodes
+                    .iter()
+                    .any(crate::projected_index::ProjectedIndexPlan::is_projected);
+            if request_vector {
+                let linear = crate::LinearKernel::from_uop(root)
+                    .map_err(|error| JitError::Unsupported(error.to_string()))?;
+                let memory_spaces = crate::MemorySpacePlan::from_linear(&linear)
+                    .map_err(|error| JitError::Unsupported(error.to_string()))?;
+                let vector = crate::VectorProgram::from_linear(&linear, &memory_spaces)
+                    .map_err(|error| JitError::Unsupported(error.to_string()))?;
+                if vector.b1_eligibility().is_ok() {
+                    format!("b1-{}", vector.cache_key)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        }
+    };
+    Ok(native_cache_key(&discriminator, source))
+}
 
 fn native_scalar_operation_can_signal(operation: &Operation, output: Option<DType>) -> bool {
     matches!(
@@ -3930,7 +3984,20 @@ fn render_vector_program(
         "int rustgrad_kernel(void **buffers, const int64_t *symbols, uint64_t *failure) { (void)symbols; failure[0]=UINT64_MAX; failure[1]=0;".into(),
         format!("  for (size_t rg_base=0; rg_base<{}u; rg_base+={}u) {{", program.main_elements, lanes),
     ];
-    emit_vector_insts(&mut lines, program, abi, ids, "rg_base", lanes)?;
+    // Match the scalar renderer's source-map contract: dense observation
+    // ordinal to a one-based generated C line. Record the main-loop emission
+    // once; a tail re-emits the same instruction program and must not replace
+    // the canonical locations.
+    let mut source_map = BTreeMap::new();
+    emit_vector_insts(
+        &mut lines,
+        program,
+        abi,
+        ids,
+        "rg_base",
+        lanes,
+        Some(&mut source_map),
+    )?;
     lines.push("  }".into());
     if program.tail_elements != 0 {
         lines.push(format!(
@@ -3944,6 +4011,7 @@ fn render_vector_program(
             ids,
             "rg_base",
             program.tail_elements,
+            None,
         )?;
         lines.push("  }".into());
     }
@@ -3953,12 +4021,7 @@ fn render_vector_program(
     let cache_key = native_cache_key(&format!("b1-{}", program.cache_key), &source);
     Ok(RenderedC {
         source,
-        source_map: program
-            .instructions
-            .iter()
-            .enumerate()
-            .map(|(i, x)| (i, x.index as usize))
-            .collect(),
+        source_map,
         abi: abi.clone(),
         cache_key,
     })
@@ -4108,9 +4171,13 @@ fn emit_vector_insts(
     ids: &BTreeMap<u64, usize>,
     base: &str,
     active: usize,
+    mut source_map: Option<&mut BTreeMap<usize, usize>>,
 ) -> Result<(), JitError> {
     let mut names = BTreeMap::new();
-    for inst in &program.instructions {
+    for (ordinal, inst) in program.instructions.iter().enumerate() {
+        if let Some(source_map) = source_map.as_deref_mut() {
+            source_map.insert(ordinal, lines.len() + 1);
+        }
         let view = inst.instruction.view();
         let dst = view
             .output()
@@ -5355,6 +5422,14 @@ fn native_cache_key(discriminator: &str, source: &str) -> String {
 }
 fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("rustgrad-cpu-jit-v1")
+}
+
+pub(crate) fn native_render_capsule_environment() -> String {
+    schedule_module::render_capsule_environment()
+}
+
+pub(crate) fn native_render_capsule_path(identity: u64) -> PathBuf {
+    cache_dir().join(format!("render-capsule-v1-{identity:016x}.rgrc"))
 }
 static COMPILE_GATES: OnceLock<Mutex<BTreeMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
 static COMPILER_PROCESS_LIMIT: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();

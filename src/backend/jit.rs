@@ -16,6 +16,11 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+mod render_capsule;
+pub(crate) use render_capsule::{
+    CapsuleLoadStatus as NativeRenderCapsuleLoadStatus,
+    CapsuleStoreStatus as NativeRenderCapsuleStoreStatus,
+};
 mod store_group;
 pub(crate) use store_group::{NativeStoreGroup, NativeStoreGroupMember, PreparedNativeStoreGroup};
 use store_group::{PreparedNativeStoreGroupMember, render_schedule_module_entries};
@@ -89,7 +94,7 @@ struct PreparedNativeModuleEntry {
     dispatcher: Arc<JitScheduleDispatcher>,
 }
 
-#[derive(Hash)]
+#[derive(Clone, Hash)]
 struct RenderedScheduleEntry {
     logical_indices: Vec<usize>,
     native_layouts: Vec<NativeScheduleLayout>,
@@ -99,10 +104,12 @@ struct RenderedScheduleEntry {
     output_initialization: crate::cpu_jit::NativeOutputInitialization,
 }
 
+#[derive(Clone)]
 struct PreparedZeroDomainEntry {
     logical_index: usize,
 }
 
+#[derive(Clone)]
 struct RenderedScheduleModule {
     entries: Vec<RenderedScheduleEntry>,
     zero_domains: Vec<PreparedZeroDomainEntry>,
@@ -472,6 +479,9 @@ pub(crate) struct NativeScheduleCompilerProcessTiming {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NativeScheduleCompilationBatch {
+    pub(crate) render_capsule_hit_count: usize,
+    pub(crate) render_capsule_miss_count: usize,
+    pub(crate) local_render_job_count: usize,
     pub(crate) parallel_render_overlap_wall_time: Duration,
     pub(crate) max_parallel_render_job_count: usize,
     pub(crate) parallel_work_overlap_wall_time: Duration,
@@ -482,6 +492,14 @@ pub(crate) struct NativeScheduleCompilationBatch {
     pub(crate) module_overlaps: Vec<NativeScheduleModuleOverlap>,
     pub(crate) program_pair_overlaps: Vec<NativeScheduleProgramPairOverlap>,
     pub(crate) translation_units: Vec<NativeScheduleTranslationUnit>,
+    pub(crate) render_capsule_diagnostics: Vec<NativeRenderCapsuleDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeRenderCapsuleDiagnostic {
+    pub(crate) program_index: usize,
+    pub(crate) load: NativeRenderCapsuleLoadStatus,
+    pub(crate) store: NativeRenderCapsuleStoreStatus,
 }
 
 const MAX_PARALLEL_NATIVE_RENDER_JOB_COUNT: usize = 2;
@@ -496,13 +514,18 @@ struct NativeScheduleRenderJob<'a> {
 struct NativeScheduleRenderResult {
     ordinal: usize,
     rendered: Result<RenderedScheduleModule, JitBackendError>,
-    interval: (Instant, Instant),
+    interval: Option<(Instant, Instant)>,
+    rendered_locally: bool,
 }
 
 struct NativeScheduleRenderBatch {
     rendered: Vec<RenderedScheduleModule>,
+    capsule_hit_count: usize,
+    capsule_miss_count: usize,
+    local_render_job_count: usize,
     parallel_overlap_wall_time: Duration,
     max_parallel_job_count: usize,
+    capsule_diagnostics: Vec<NativeRenderCapsuleDiagnostic>,
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
@@ -578,7 +601,8 @@ fn render_schedule_module_job(
     NativeScheduleRenderResult {
         ordinal: job.ordinal,
         rendered,
-        interval: (started, finished),
+        interval: Some((started, finished)),
+        rendered_locally: true,
     }
 }
 
@@ -594,9 +618,56 @@ fn render_schedule_modules(
         Vec<NativeStoreGroup>,
     )],
 ) -> Result<NativeScheduleRenderBatch, JitBackendError> {
+    let recipes = programs
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (items, layouts, store_groups))| {
+            render_capsule::capsule_recipe(
+                backend,
+                ordinal,
+                programs.len(),
+                items,
+                layouts,
+                store_groups,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut results = Vec::with_capacity(programs.len());
+    let mut capsule_diagnostics = Vec::with_capacity(programs.len());
+    for (ordinal, ((items, layouts, store_groups), recipe)) in
+        programs.iter().zip(&recipes).enumerate()
+    {
+        let load = match recipe {
+            Some(recipe) => {
+                match render_capsule::load_capsule(backend, recipe, items, layouts, store_groups) {
+                    Ok(rendered) => {
+                        results.push(NativeScheduleRenderResult {
+                            ordinal,
+                            rendered: Ok(rendered),
+                            interval: None,
+                            rendered_locally: false,
+                        });
+                        render_capsule::CapsuleLoadStatus::Hit
+                    }
+                    Err(status) => status,
+                }
+            }
+            None => render_capsule::CapsuleLoadStatus::RecipeUnavailable,
+        };
+        capsule_diagnostics.push(NativeRenderCapsuleDiagnostic {
+            program_index: ordinal,
+            load,
+            store: render_capsule::CapsuleStoreStatus::NotAttempted,
+        });
+    }
+    let hits = results
+        .iter()
+        .map(|result| result.ordinal)
+        .collect::<HashSet<_>>();
     let jobs = programs
         .iter()
         .enumerate()
+        .filter(|(ordinal, _)| !hits.contains(ordinal))
         .map(
             |(ordinal, (items, layouts, store_groups))| NativeScheduleRenderJob {
                 ordinal,
@@ -606,9 +677,11 @@ fn render_schedule_modules(
             },
         )
         .collect::<VecDeque<_>>();
+    let capsule_hit_count = hits.len();
+    let capsule_miss_count = jobs.len();
     let worker_count = native_render_worker_count(jobs.len());
     let queue = Arc::new(Mutex::new(jobs));
-    let mut results = thread::scope(|scope| -> Result<Vec<_>, JitBackendError> {
+    let rendered_results = thread::scope(|scope| -> Result<Vec<_>, JitBackendError> {
         let handles = (0..worker_count)
             .map(|worker| {
                 let queue = queue.clone();
@@ -643,6 +716,8 @@ fn render_schedule_modules(
         }
         Ok(results)
     })?;
+    let local_render_job_count = rendered_results.len();
+    results.extend(rendered_results);
     results.sort_by_key(|result| result.ordinal);
     if results.len() != programs.len()
         || results
@@ -656,18 +731,34 @@ fn render_schedule_modules(
     }
     let intervals = results
         .iter()
-        .map(|result| result.interval)
+        .filter_map(|result| result.interval)
         .collect::<Vec<_>>();
     let (parallel_overlap_wall_time, max_parallel_job_count) =
         overlapping_wall_time(&intervals, "native schedule render")?;
+    let rendered_locally = results
+        .iter()
+        .map(|result| result.rendered_locally)
+        .collect::<Vec<_>>();
     let rendered = results
         .into_iter()
         .map(|result| result.rendered)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, JitBackendError>>()?;
+    for (ordinal, module) in rendered.iter().enumerate() {
+        if rendered_locally[ordinal] {
+            capsule_diagnostics[ordinal].store = match recipes[ordinal].as_ref() {
+                Some(recipe) => render_capsule::store_capsule(recipe, module),
+                None => render_capsule::CapsuleStoreStatus::RecipeUnavailable,
+            };
+        }
+    }
     Ok(NativeScheduleRenderBatch {
         rendered,
+        capsule_hit_count,
+        capsule_miss_count,
+        local_render_job_count,
         parallel_overlap_wall_time,
         max_parallel_job_count,
+        capsule_diagnostics,
     })
 }
 
@@ -1677,8 +1768,12 @@ impl CpuJitBackend {
         let batch_origin = Instant::now();
         let NativeScheduleRenderBatch {
             rendered,
+            capsule_hit_count: render_capsule_hit_count,
+            capsule_miss_count: render_capsule_miss_count,
+            local_render_job_count,
             parallel_overlap_wall_time: parallel_render_overlap_wall_time,
             max_parallel_job_count: max_parallel_render_job_count,
+            capsule_diagnostics: render_capsule_diagnostics,
         } = render_schedule_modules(self, &programs)?;
         let program_pair_overlaps = exact_program_pair_overlaps(&rendered)?;
         let module_overlaps = main_module_overlaps(&program_pair_overlaps);
@@ -1875,6 +1970,9 @@ impl CpuJitBackend {
         let (parallel_work_overlap_wall_time, _) =
             overlapping_wall_time(&work_intervals, "native schedule module")?;
         let compilation = NativeScheduleCompilationBatch {
+            render_capsule_hit_count,
+            render_capsule_miss_count,
+            local_render_job_count,
             parallel_render_overlap_wall_time,
             max_parallel_render_job_count,
             parallel_work_overlap_wall_time,
@@ -1885,6 +1983,7 @@ impl CpuJitBackend {
             module_overlaps,
             program_pair_overlaps,
             translation_units,
+            render_capsule_diagnostics,
         };
 
         // Resolve every worker result and authenticate every module ABI before
@@ -2775,6 +2874,30 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let backend = CpuJitBackend::new(JitFallback::Error);
+        let capsule_recipes = [
+            render_capsule::capsule_recipe(
+                &backend,
+                0,
+                3,
+                &schedule.items[..1],
+                &layouts[..1],
+                &[],
+            )
+            .unwrap(),
+            render_capsule::capsule_recipe(&backend, 1, 3, &schedule.items, &layouts, &[]).unwrap(),
+            render_capsule::capsule_recipe(
+                &backend,
+                2,
+                3,
+                &schedule.items[..1],
+                &layouts[..1],
+                &[],
+            )
+            .unwrap(),
+        ];
+        for recipe in &capsule_recipes {
+            render_capsule::remove_capsule(recipe);
+        }
         let (programs, compilation) = backend
             .prepare_schedule_modules(vec![
                 (&schedule.items[..1], layouts[..1].to_vec(), Vec::new()),
@@ -2783,6 +2906,21 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(programs.len(), 3);
+        assert_eq!(compilation.render_capsule_hit_count, 0);
+        assert_eq!(compilation.render_capsule_miss_count, 3);
+        assert_eq!(compilation.local_render_job_count, 3);
+        assert_eq!(compilation.render_capsule_diagnostics.len(), 3);
+        assert!(
+            compilation
+                .render_capsule_diagnostics
+                .iter()
+                .enumerate()
+                .all(
+                    |(program_index, diagnostic)| diagnostic.program_index == program_index
+                        && diagnostic.load == render_capsule::CapsuleLoadStatus::FileUnavailable
+                        && diagnostic.store == render_capsule::CapsuleStoreStatus::Stored,
+                )
+        );
         assert!(compilation.max_parallel_render_job_count > 0);
         assert!(compilation.max_parallel_render_job_count <= 2);
         assert!(compilation.compiler_process_count <= 2);
@@ -2885,6 +3023,20 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(warm_programs.len(), programs.len());
+        assert_eq!(warm_compilation.render_capsule_hit_count, 3);
+        assert_eq!(warm_compilation.render_capsule_miss_count, 0);
+        assert_eq!(warm_compilation.local_render_job_count, 0);
+        assert!(
+            warm_compilation
+                .render_capsule_diagnostics
+                .iter()
+                .enumerate()
+                .all(
+                    |(program_index, diagnostic)| diagnostic.program_index == program_index
+                        && diagnostic.load == render_capsule::CapsuleLoadStatus::Hit
+                        && diagnostic.store == render_capsule::CapsuleStoreStatus::NotAttempted,
+                )
+        );
         assert_eq!(warm_compilation.compiler_process_count, 0);
         assert!(warm_compilation.compiler_process_timings.is_empty());
         assert_eq!(
@@ -2899,8 +3051,19 @@ mod tests {
             warm_compilation.translation_units,
             compilation.translation_units
         );
-        assert!(warm_compilation.max_parallel_render_job_count > 0);
-        assert!(warm_compilation.max_parallel_render_job_count <= 2);
+        assert_eq!(warm_compilation.max_parallel_render_job_count, 0);
+        assert_eq!(
+            warm_compilation.parallel_render_overlap_wall_time,
+            Duration::ZERO
+        );
+        assert!(
+            warm_programs
+                .iter()
+                .all(|(_, work)| work.render_wall_time.is_zero())
+        );
+        for recipe in &capsule_recipes {
+            render_capsule::remove_capsule(recipe);
+        }
     }
 
     #[test]
@@ -3043,6 +3206,141 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_render_capsules_cover_all_hit_mixed_hit_and_corrupt_fallback() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("capsule_input", [7], DType::F32);
+        let first = graph.relu(input).unwrap();
+        let second = graph.square(input).unwrap();
+        let schedule = crate::schedule_many(&graph, &[first, second]).unwrap();
+        let layouts = schedule
+            .items
+            .iter()
+            .map(schedule_native_layout)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let backend = CpuJitBackend::new(JitFallback::Error).vectorized(true);
+        let recipes = [
+            render_capsule::capsule_recipe(
+                &backend,
+                0,
+                2,
+                &schedule.items[..1],
+                &layouts[..1],
+                &[],
+            )
+            .unwrap(),
+            render_capsule::capsule_recipe(&backend, 1, 2, &schedule.items, &layouts, &[]).unwrap(),
+        ];
+        for recipe in &recipes {
+            render_capsule::remove_capsule(recipe);
+        }
+        let programs = || {
+            vec![
+                (&schedule.items[..1], layouts[..1].to_vec(), Vec::new()),
+                (&schedule.items[..], layouts.clone(), Vec::new()),
+            ]
+        };
+
+        let cold = render_schedule_modules(&backend, &programs()).unwrap();
+        assert_eq!(cold.rendered.len(), 2);
+        assert!(cold.rendered.iter().any(|module| {
+            module.entries.iter().any(|entry| {
+                !entry.rendered.source_map.is_empty()
+                    && entry
+                        .rendered
+                        .source_map
+                        .values()
+                        .all(|line| *line != 0 && *line <= entry.rendered.source.lines().count())
+            })
+        }));
+        assert_eq!(cold.capsule_hit_count, 0);
+        assert_eq!(cold.capsule_miss_count, 2);
+        assert_eq!(cold.local_render_job_count, 2);
+        assert!(cold.capsule_diagnostics.iter().all(|diagnostic| {
+            diagnostic.load == render_capsule::CapsuleLoadStatus::FileUnavailable
+                && diagnostic.store == render_capsule::CapsuleStoreStatus::Stored
+        }));
+        assert!(cold.max_parallel_job_count > 0);
+
+        let warm = render_schedule_modules(&backend, &programs()).unwrap();
+        assert_eq!(warm.capsule_hit_count, 2);
+        assert_eq!(warm.capsule_miss_count, 0);
+        assert_eq!(warm.local_render_job_count, 0);
+        assert!(warm.capsule_diagnostics.iter().all(|diagnostic| {
+            diagnostic.load == render_capsule::CapsuleLoadStatus::Hit
+                && diagnostic.store == render_capsule::CapsuleStoreStatus::NotAttempted
+        }));
+        assert_eq!(warm.max_parallel_job_count, 0);
+        assert_eq!(warm.parallel_overlap_wall_time, Duration::ZERO);
+        assert!(
+            warm.rendered
+                .iter()
+                .all(|module| module.render_wall_time.is_zero())
+        );
+        assert!(
+            warm.rendered.iter().zip(&cold.rendered).all(
+                |(warm, cold)| exact_program_pair_overlaps(&[warm.clone(), cold.clone()]).unwrap()
+                    [0]
+                .contiguous_prefix_entry_count
+                    == cold.entries.len()
+            )
+        );
+
+        for mutation in [
+            render_capsule::CapsuleMutation::LogicalInventory,
+            render_capsule::CapsuleMutation::Layout,
+            render_capsule::CapsuleMutation::Vector,
+            render_capsule::CapsuleMutation::Abi,
+            render_capsule::CapsuleMutation::SourceMap,
+            render_capsule::CapsuleMutation::Source,
+            render_capsule::CapsuleMutation::RenderedCacheKey,
+            render_capsule::CapsuleMutation::NativeCacheKey,
+            render_capsule::CapsuleMutation::OutputInitialization,
+        ] {
+            render_capsule::mutate_capsule_with_valid_checksum(&recipes[0], mutation);
+            let repaired = render_schedule_modules(&backend, &programs()).unwrap();
+            assert_eq!(repaired.capsule_hit_count, 1);
+            assert_eq!(repaired.capsule_miss_count, 1);
+            assert_eq!(repaired.local_render_job_count, 1);
+            assert!(repaired.capsule_diagnostics.iter().any(|diagnostic| {
+                diagnostic.load == render_capsule::CapsuleLoadStatus::AuthenticationRejected
+                    && diagnostic.store == render_capsule::CapsuleStoreStatus::Stored
+            }));
+            assert_eq!(repaired.max_parallel_job_count, 1);
+            assert!(repaired.rendered[1].render_wall_time.is_zero());
+        }
+
+        render_capsule::remove_capsule(&recipes[1]);
+        let mixed = render_schedule_modules(&backend, &programs()).unwrap();
+        assert_eq!(mixed.capsule_hit_count, 1);
+        assert_eq!(mixed.capsule_miss_count, 1);
+        assert_eq!(mixed.local_render_job_count, 1);
+        assert_eq!(mixed.max_parallel_job_count, 1);
+        assert!(mixed.rendered[0].render_wall_time.is_zero());
+        assert!(render_capsule::capsule_path(&recipes[1]).is_file());
+
+        let path = render_capsule::capsule_path(&recipes[0]);
+        let mut corrupted = std::fs::read(&path).unwrap();
+        corrupted[0] ^= 1;
+        std::fs::write(&path, corrupted).unwrap();
+        let recovered = render_schedule_modules(&backend, &programs()).unwrap();
+        assert_eq!(recovered.capsule_hit_count, 1);
+        assert_eq!(recovered.capsule_miss_count, 1);
+        assert_eq!(recovered.local_render_job_count, 1);
+        assert!(recovered.capsule_diagnostics.iter().any(|diagnostic| {
+            diagnostic.load == render_capsule::CapsuleLoadStatus::DecodeRejected
+                && diagnostic.store == render_capsule::CapsuleStoreStatus::Stored
+        }));
+        assert_eq!(recovered.max_parallel_job_count, 1);
+        assert!(recovered.rendered[1].render_wall_time.is_zero());
+        assert!(render_capsule::capsule_path(&recipes[0]).is_file());
+
+        for recipe in &recipes {
+            render_capsule::remove_capsule(recipe);
+        }
+    }
+
+    #[test]
     fn native_store_group_preserves_an_independent_intervening_item() {
         let mut graph = Graph::new();
         let input = graph.input_dtype("input", [4], DType::F32);
@@ -3086,6 +3384,51 @@ mod tests {
         assert_eq!(rendered.entries.len(), 2);
         assert_eq!(rendered.entries[0].logical_indices, vec![1]);
         assert_eq!(rendered.entries[1].logical_indices, vec![0, 2]);
+
+        let backend = CpuJitBackend::new(JitFallback::Error);
+        let recipe = render_capsule::capsule_recipe(
+            &backend,
+            0,
+            1,
+            &schedule.items,
+            &layouts,
+            std::slice::from_ref(&group),
+        )
+        .unwrap();
+        render_capsule::remove_capsule(&recipe);
+        let programs = || {
+            vec![(
+                schedule.items.as_slice(),
+                layouts.clone(),
+                vec![group.clone()],
+            )]
+        };
+        assert_eq!(
+            render_schedule_modules(&backend, &programs())
+                .unwrap()
+                .max_parallel_job_count,
+            1
+        );
+        assert_eq!(
+            render_schedule_modules(&backend, &programs())
+                .unwrap()
+                .max_parallel_job_count,
+            0
+        );
+        for mutation in [
+            render_capsule::CapsuleMutation::StoreGroupInputId,
+            render_capsule::CapsuleMutation::StoreGroupInputDType,
+            render_capsule::CapsuleMutation::StoreGroupInputElements,
+        ] {
+            render_capsule::mutate_capsule_with_valid_checksum(&recipe, mutation);
+            assert_eq!(
+                render_schedule_modules(&backend, &programs())
+                    .unwrap()
+                    .max_parallel_job_count,
+                1
+            );
+        }
+        render_capsule::remove_capsule(&recipe);
 
         for members in [
             vec![group.members[0].clone(), group.members[0].clone()],

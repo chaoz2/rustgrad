@@ -30,7 +30,7 @@ pub enum GgmlType {
 }
 
 impl GgmlType {
-    pub(super) fn from_raw(raw: u32) -> Option<Self> {
+    pub(crate) fn from_raw(raw: u32) -> Option<Self> {
         Some(match raw {
             0 => Self::F32,
             1 => Self::F16,

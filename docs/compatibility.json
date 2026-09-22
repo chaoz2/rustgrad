@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:52a277c3eba7a41f",
+  "source_fingerprint": "fnv1a64:0299a56b6b49a2aa",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -450,7 +450,7 @@
       "subject": "Strict-native CPU compiled AdamW replay",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`NativeCpuSessionTarget` prepares attached CPU programs with fallback disabled. Preparation uses bounded two-way program rendering and compiler processes while retaining ordered errors, exact module/prefix authentication, and atomic publication. `NativeTrainingScoreboard` v21 adds exact ordered earlier-to-later program overlap plus translation-unit identity/count/byte evidence for evaluating future object reuse; v1--v20 remain readable. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for commit-only behavior, ownership, evidence, and backend boundaries."
+        "Acceptance requirement": "`NativeCpuSessionTarget` prepares attached CPU programs with fallback disabled. Authenticated render capsules fail closed to bounded rendering without changing module identities or publication. `NativeTrainingScoreboard` v22 adds exact capsule hit/miss/local-render counts; v21 retains ordered program-overlap and translation-unit evidence, and v1--v21 remain readable. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership, evidence, and backend boundaries."
       }
     },
     {

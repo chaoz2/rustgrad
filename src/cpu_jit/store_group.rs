@@ -6,6 +6,13 @@ use super::{
 use crate::{DType, IndexValue, Operation, Shape, UOp};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(crate) const NATIVE_STORE_GROUP_RENDERER_VERSION: &str = "private native store group v1";
+pub(crate) const NATIVE_STORE_GROUP_CACHE_DOMAIN: &str = "native-store-group-v1";
+
+pub(crate) fn native_store_group_cache_key(source: &str) -> String {
+    native_cache_key(NATIVE_STORE_GROUP_CACHE_DOMAIN, source)
+}
+
 fn authenticates_external_broadcast(
     input_shape: &Shape,
     output_shape: &Shape,
@@ -22,6 +29,173 @@ fn authenticates_external_broadcast(
     input_shape
         .broadcast_with(output_domain)
         .is_ok_and(|shape| shape == *output_domain)
+}
+
+pub(crate) fn native_store_group_abi(root: &UOp) -> Result<KernelAbi, JitError> {
+    root.validate()
+        .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    let nodes = root
+        .topological()
+        .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    if nodes.iter().any(|node| {
+        native_scalar_operation_can_signal(node.operation(), node.ty().map(|ty| ty.scalar))
+    }) {
+        return Err(JitError::Unsupported(
+            "native store group contains a failure-capable operation".into(),
+        ));
+    }
+    let stores = root
+        .sources()
+        .iter()
+        .filter(|node| matches!(node.operation(), Operation::Store))
+        .collect::<Vec<_>>();
+    if stores.len() < 2 {
+        return Err(JitError::Unsupported(
+            "native store group requires multiple stores".into(),
+        ));
+    }
+    let mut outputs = Vec::with_capacity(stores.len());
+    let mut output_ids = BTreeSet::new();
+    let mut extent = None;
+    let mut output_domain = None;
+    for store in &stores {
+        let [index, _] = store.sources() else {
+            return Err(JitError::Unsupported(
+                "native store group store is malformed".into(),
+            ));
+        };
+        let Operation::Index(IndexValue::Buffer {
+            buffer,
+            elements,
+            input_shape,
+            output_shape,
+            addressing: crate::IndexAddressing::Broadcast,
+        }) = index.operation()
+        else {
+            return Err(JitError::Unsupported(
+                "native store group output is not dense".into(),
+            ));
+        };
+        if index.ty().map(|ty| ty.scalar) != Some(DType::F32)
+            || *elements == 0
+            || input_shape != output_shape
+            || extent.is_some_and(|expected| expected != *elements)
+            || output_domain
+                .as_ref()
+                .is_some_and(|expected| expected != output_shape)
+            || !output_ids.insert(*buffer)
+        {
+            return Err(JitError::Unsupported(
+                "native store group output descriptor differs".into(),
+            ));
+        }
+        let iteration = linear_store_iteration(index)?;
+        extent = Some(*elements);
+        output_domain = Some(output_shape.clone());
+        outputs.push((*buffer, *elements, iteration));
+    }
+    let output_domain = output_domain.expect("native store group outputs have a domain");
+    let output_positions = outputs
+        .iter()
+        .enumerate()
+        .map(|(position, (buffer, _, _))| (*buffer, position))
+        .collect::<BTreeMap<_, _>>();
+    let mut buffers = Vec::<BufferAbi>::new();
+    let mut seen = BTreeMap::<u64, usize>::new();
+    for (consumer_position, (store, (_, _, consumer_iteration))) in
+        stores.iter().zip(&outputs).enumerate()
+    {
+        let value = store.sources().get(1).ok_or_else(|| {
+            JitError::Unsupported("native store group Store missing value".into())
+        })?;
+        for node in value
+            .topological()
+            .map_err(|error| JitError::Unsupported(error.to_string()))?
+        {
+            if !matches!(node.operation(), Operation::Load) {
+                continue;
+            }
+            let Some(index) = node.sources().first() else {
+                return Err(JitError::Unsupported(
+                    "native store group load has no index".into(),
+                ));
+            };
+            let Operation::Index(IndexValue::Buffer {
+                buffer,
+                elements,
+                input_shape,
+                output_shape,
+                addressing: crate::IndexAddressing::Broadcast,
+            }) = index.operation()
+            else {
+                return Err(JitError::Unsupported(
+                    "native store group load is not dense".into(),
+                ));
+            };
+            let dtype = node
+                .ty()
+                .ok_or_else(|| JitError::Unsupported("untyped native store group load".into()))?
+                .scalar;
+            if let Some(&producer_position) = output_positions.get(buffer) {
+                let (_, output_elements, _) = outputs[producer_position];
+                let load_iteration = linear_store_iteration(index)?;
+                if producer_position >= consumer_position
+                    || dtype != DType::F32
+                    || *elements != output_elements
+                    || input_shape != &output_domain
+                    || output_shape != &output_domain
+                    || !load_iteration.shares_node_with(consumer_iteration)
+                {
+                    return Err(JitError::Unsupported(
+                        "native store group has an unordered output dependency".into(),
+                    ));
+                }
+                continue;
+            }
+            if !authenticates_external_broadcast(
+                input_shape,
+                output_shape,
+                *elements,
+                &output_domain,
+            ) {
+                return Err(JitError::Unsupported(
+                    "native store group input broadcast descriptor differs".into(),
+                ));
+            }
+            let candidate = BufferAbi {
+                id: *buffer,
+                dtype,
+                elements: *elements,
+                mutable: false,
+            };
+            if let Some(&position) = seen.get(buffer) {
+                if buffers[position] != candidate {
+                    return Err(JitError::Unsupported(
+                        "native store group input descriptor differs".into(),
+                    ));
+                }
+                continue;
+            }
+            seen.insert(*buffer, buffers.len());
+            buffers.push(candidate);
+        }
+    }
+    for (buffer, elements, _) in &outputs {
+        seen.insert(*buffer, buffers.len());
+        buffers.push(BufferAbi {
+            id: *buffer,
+            dtype: DType::F32,
+            elements: *elements,
+            mutable: true,
+        });
+    }
+    Ok(KernelAbi {
+        version: ABI_VERSION,
+        pointer_order: (0..buffers.len()).map(KernelPointerAbi::Dense).collect(),
+        buffers,
+        quantized_buffers: Vec::new(),
+        symbol_count: 0,
+    })
 }
 
 pub(crate) fn render_native_store_group(
@@ -185,13 +359,15 @@ pub(crate) fn render_native_store_group(
             mutable: true,
         });
     }
-    let abi = KernelAbi {
+    let derived_abi = KernelAbi {
         version: ABI_VERSION,
         pointer_order: (0..buffers.len()).map(KernelPointerAbi::Dense).collect(),
         buffers,
         quantized_buffers: Vec::new(),
         symbol_count: 0,
     };
+    let abi = native_store_group_abi(root)?;
+    debug_assert_eq!(abi, derived_abi);
     let ids = abi
         .buffers
         .iter()
@@ -200,7 +376,7 @@ pub(crate) fn render_native_store_group(
         .collect::<BTreeMap<_, _>>();
     let extent = extent.expect("native store group outputs have an extent");
     let mut lines = scalar_kernel_prologue(
-        "/* private native store group v1 */".into(),
+        format!("/* {NATIVE_STORE_GROUP_RENDERER_VERSION} */"),
         false,
         false,
         false,
@@ -230,7 +406,7 @@ pub(crate) fn render_native_store_group(
     lines.push("  return 0;".into());
     lines.push("}".into());
     let source = lines.join("\n") + "\n";
-    let cache_key = native_cache_key("native-store-group-v1", &source);
+    let cache_key = native_store_group_cache_key(&source);
     Ok((
         RenderedC {
             source,
