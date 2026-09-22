@@ -149,7 +149,7 @@ def phase_sample_count(report):
     wall_time = report.get("wall_time")
     return wall_time.get("sample_count") if isinstance(wall_time, dict) else None
 
-if objective.get("schema_version") != 4 or objective.get("git_sha") != sys.argv[3]:
+if objective.get("schema_version") != 5 or objective.get("git_sha") != sys.argv[3]:
     raise SystemExit("larger Transformer objective provenance is invalid")
 expected_workload = {
     "batch": 4,
@@ -329,6 +329,9 @@ if (
     warm.get("replay_from") != 3
     or warm.get("replay_to") != 6
     or warm.get("program_count") != 5
+    or warm.get("loaded_module_count") != 5
+    or warm.get("durable_artifact_cache_hit_count") != 5
+    or warm.get("durable_artifact_cache_miss_count") != 0
     or warm.get("compiler_invocation_count") != 0
     or warm.get("linker_invocation_count") != 0
     or warm.get("fallback_count") != 0
@@ -336,12 +339,96 @@ if (
     or warm.get("canonical_state_count") != 36
 ):
     raise SystemExit("larger Transformer warm resume inventory is invalid")
+preparation = warm.get("preparation")
+preparation_roles = [
+    "main",
+    "accumulation",
+    "partial_flush",
+    "zero_grad",
+    "evaluation",
+]
+preparation_totals = {
+    "summed_program_wall_time_ns",
+    "runtime_overhead_wall_time_ns",
+    "module_overlap_wall_time_ns",
+    "render_overlap_wall_time_ns",
+    "effective_render_wall_time_ns",
+    "effective_render_fraction",
+}
 if (
-    type(warm.get("loaded_module_count")) is not int
-    or warm["loaded_module_count"] <= 0
-    or warm.get("durable_artifact_cache_hit_count") != warm["loaded_module_count"]
+    not isinstance(preparation, dict)
+    or set(preparation) != set(preparation_roles) | preparation_totals
 ):
-    raise SystemExit("larger Transformer warm durable-cache evidence is invalid")
+    raise SystemExit("larger Transformer warm preparation evidence is invalid")
+phase_fields = {
+    "total_wall_time_ns",
+    "layout_wall_time_ns",
+    "render_wall_time_ns",
+    "compiler_wall_time_ns",
+    "load_wall_time_ns",
+    "residual_wall_time_ns",
+}
+program_total = 0
+render_total = 0
+for role in preparation_roles:
+    phases = preparation.get(role)
+    if not isinstance(phases, dict) or set(phases) != phase_fields:
+        raise SystemExit(f"larger Transformer warm {role} phases are invalid")
+    if any(type(phases.get(field)) is not int or phases[field] < 0 for field in phase_fields):
+        raise SystemExit(f"larger Transformer warm {role} timing is invalid")
+    accounted = sum(
+        phases[field]
+        for field in [
+            "layout_wall_time_ns",
+            "render_wall_time_ns",
+            "compiler_wall_time_ns",
+            "load_wall_time_ns",
+            "residual_wall_time_ns",
+        ]
+    )
+    if phases["total_wall_time_ns"] != accounted:
+        raise SystemExit(f"larger Transformer warm {role} timing does not balance")
+    if phases["compiler_wall_time_ns"] != 0:
+        raise SystemExit(f"larger Transformer warm {role} unexpectedly compiled")
+    program_total += phases["total_wall_time_ns"]
+    render_total += phases["render_wall_time_ns"]
+for field in preparation_totals - {"effective_render_fraction"}:
+    if type(preparation.get(field)) is not int or preparation[field] < 0:
+        raise SystemExit(f"larger Transformer warm preparation {field} is invalid")
+if preparation["summed_program_wall_time_ns"] != program_total:
+    raise SystemExit("larger Transformer warm program timing sum is invalid")
+if (
+    preparation["module_overlap_wall_time_ns"]
+    + preparation["render_overlap_wall_time_ns"]
+    > program_total
+):
+    raise SystemExit("larger Transformer warm overlap exceeds program timing")
+whole_preparation = warm.get("preparation_wall_time_ns")
+if type(whole_preparation) is not int or whole_preparation <= 0:
+    raise SystemExit("larger Transformer warm whole preparation timing is invalid")
+reconstructed_preparation = (
+    preparation["runtime_overhead_wall_time_ns"]
+    + program_total
+    - preparation["module_overlap_wall_time_ns"]
+    - preparation["render_overlap_wall_time_ns"]
+)
+if reconstructed_preparation != whole_preparation:
+    raise SystemExit("larger Transformer warm whole preparation timing does not balance")
+effective_render = render_total - preparation["render_overlap_wall_time_ns"]
+if (
+    effective_render < 0
+    or preparation["effective_render_wall_time_ns"] != effective_render
+):
+    raise SystemExit("larger Transformer warm effective render timing is invalid")
+render_fraction = preparation.get("effective_render_fraction")
+if (
+    not isinstance(render_fraction, (int, float))
+    or isinstance(render_fraction, bool)
+    or not math.isfinite(render_fraction)
+    or not same_float(render_fraction, effective_render / whole_preparation)
+    or not 0.0 <= render_fraction <= 1.0
+):
+    raise SystemExit("larger Transformer warm effective render fraction is invalid")
 for field in [
     "resume_bundle_bytes",
     "module_checkpoint_bytes",

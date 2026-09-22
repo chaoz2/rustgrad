@@ -6,9 +6,9 @@
 //! commit and uploads its authenticated scoreboard, objective facts, and host
 //! provenance. A separate no-dropout replay checks two dense gradient
 //! projections, while a fresh executor restores the replay-three portable
-//! bundle through the same isolated durable cache. Neither affects the cold
-//! six-replay timing sample. Timings are observations, never pass/fail
-//! thresholds.
+//! bundle through the same isolated durable cache and partitions its warm
+//! preparation by program role. Neither affects the cold six-replay timing
+//! sample. Timings are observations, never pass/fail thresholds.
 
 use rustgrad::nn::{Embedding, LayerNorm, Mode, StateKind};
 use rustgrad::{
@@ -19,9 +19,10 @@ use rustgrad::{
     CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
     CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan, CompiledMultiStepLr,
     CompiledTrainingRuntime, CpuBackend, DType, Error as RustGradError, Graph, LossOptions, Module,
-    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuSessionTarget,
-    NativeTrainingScoreboard, NodeId, Op, Parameter, ParameterSnapshot, Reduction, Result, Scalar,
-    TensorData, TrainingDropoutProvider, TransformerBlock, sparse_categorical_cross_entropy,
+    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuProgramPreparationReport,
+    NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Op, Parameter, ParameterSnapshot,
+    Reduction, Result, Scalar, TensorData, TrainingDropoutProvider, TransformerBlock,
+    sparse_categorical_cross_entropy,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -400,6 +401,31 @@ struct ScaleEvaluationFrontierEvidence {
 }
 
 #[derive(Serialize)]
+struct ScaleWarmProgramPreparationEvidence {
+    total_wall_time_ns: u64,
+    layout_wall_time_ns: u64,
+    render_wall_time_ns: u64,
+    compiler_wall_time_ns: u64,
+    load_wall_time_ns: u64,
+    residual_wall_time_ns: u64,
+}
+
+#[derive(Serialize)]
+struct ScaleWarmPreparationEvidence {
+    main: ScaleWarmProgramPreparationEvidence,
+    accumulation: ScaleWarmProgramPreparationEvidence,
+    partial_flush: ScaleWarmProgramPreparationEvidence,
+    zero_grad: ScaleWarmProgramPreparationEvidence,
+    evaluation: ScaleWarmProgramPreparationEvidence,
+    summed_program_wall_time_ns: u64,
+    runtime_overhead_wall_time_ns: u64,
+    module_overlap_wall_time_ns: u64,
+    render_overlap_wall_time_ns: u64,
+    effective_render_wall_time_ns: u64,
+    effective_render_fraction: f64,
+}
+
+#[derive(Serialize)]
 struct ScaleWarmResumeEvidence {
     replay_from: u64,
     replay_to: u64,
@@ -408,11 +434,13 @@ struct ScaleWarmResumeEvidence {
     artifact_decode_wall_time_ns: u64,
     owner_restore_wall_time_ns: u64,
     preparation_wall_time_ns: u64,
+    preparation: ScaleWarmPreparationEvidence,
     capture_identity: u64,
     evaluation_capture_identity: u64,
     program_count: usize,
     loaded_module_count: usize,
     durable_artifact_cache_hit_count: usize,
+    durable_artifact_cache_miss_count: usize,
     compiler_invocation_count: usize,
     linker_invocation_count: usize,
     fallback_count: usize,
@@ -488,6 +516,48 @@ fn assert_scale_parameter_snapshot_eq(actual: &ParameterSnapshot, expected: &Par
 
 fn duration_nanos(duration: std::time::Duration) -> Result<u64> {
     u64::try_from(duration.as_nanos()).map_err(|_| RustGradError::InvalidIndex)
+}
+
+fn checked_duration_sum(
+    durations: impl IntoIterator<Item = std::time::Duration>,
+) -> Result<std::time::Duration> {
+    durations
+        .into_iter()
+        .try_fold(std::time::Duration::ZERO, |total, duration| {
+            total
+                .checked_add(duration)
+                .ok_or(RustGradError::InvalidIndex)
+        })
+}
+
+fn warm_program_preparation_evidence(
+    report: &NativeCpuProgramPreparationReport,
+) -> Result<(
+    ScaleWarmProgramPreparationEvidence,
+    std::time::Duration,
+    std::time::Duration,
+)> {
+    let phases = report.phases();
+    let accounted = checked_duration_sum([
+        phases.layout_wall_time(),
+        phases.render_wall_time(),
+        phases.compiler_process_wall_time(),
+        phases.module_load_wall_time(),
+        phases.residual_wall_time(),
+    ])?;
+    assert_eq!(accounted, report.wall_time());
+    Ok((
+        ScaleWarmProgramPreparationEvidence {
+            total_wall_time_ns: duration_nanos(report.wall_time())?,
+            layout_wall_time_ns: duration_nanos(phases.layout_wall_time())?,
+            render_wall_time_ns: duration_nanos(phases.render_wall_time())?,
+            compiler_wall_time_ns: duration_nanos(phases.compiler_process_wall_time())?,
+            load_wall_time_ns: duration_nanos(phases.module_load_wall_time())?,
+            residual_wall_time_ns: duration_nanos(phases.residual_wall_time())?,
+        },
+        report.wall_time(),
+        phases.render_wall_time(),
+    ))
 }
 
 fn scale_gradient_oracle(model: &ScaleTransformer) -> Result<ScaleGradientOracle> {
@@ -890,7 +960,8 @@ fn collect_scale_warm_resume_evidence(
     let mut resumed = restored_plan
         .prepare(&warm_target)
         .map_err(|error| error.into_parts().1)?;
-    let preparation_wall_time_ns = duration_nanos(preparation_started.elapsed())?;
+    let preparation_wall_time = preparation_started.elapsed();
+    let preparation_wall_time_ns = duration_nanos(preparation_wall_time)?;
     assert_scale_module_witness_unchanged(&destination_states)?;
     assert_eq!(
         resumed.checkpoint()?,
@@ -899,32 +970,33 @@ fn collect_scale_warm_resume_evidence(
 
     let preparation = resumed.native_cpu_preparation_report();
     assert_eq!(preparation.compiler_process_count(), 0);
-    let programs = [
-        Some(preparation.main()),
-        preparation.accumulation(),
-        preparation.partial_flush(),
-        preparation.zero_grad(),
-        preparation.evaluation(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    assert_eq!(programs.len(), 5);
+    let main = preparation.main();
+    let accumulation = preparation
+        .accumulation()
+        .expect("the scale workload has an accumulation program");
+    let partial_flush = preparation
+        .partial_flush()
+        .expect("the scale workload has a partial-flush program");
+    let zero_grad = preparation
+        .zero_grad()
+        .expect("the scale workload has a zero-grad program");
+    let evaluation = preparation
+        .evaluation()
+        .expect("the scale workload has an evaluation program");
+    let programs = [main, accumulation, partial_flush, zero_grad, evaluation];
     let program_count = programs.len();
     let mut loaded_module_count = 0_usize;
     let mut durable_artifact_cache_hit_count = 0_usize;
+    let mut durable_artifact_cache_miss_count = 0_usize;
     let mut compiler_invocation_count = 0_usize;
     let mut linker_invocation_count = 0_usize;
     let mut fallback_count = 0_usize;
     for program in &programs {
         assert!(program.native_item_count() > 0);
         let work = program.work();
+        assert_eq!(work.loaded_module_count(), 1);
         assert_eq!(work.durable_artifact_cache_miss_count(), 0);
-        assert_eq!(
-            work.durable_artifact_cache_hit_count(),
-            work.loaded_module_count(),
-            "every module loaded by a restored program must come from the isolated durable cache"
-        );
+        assert_eq!(work.durable_artifact_cache_hit_count(), 1);
         assert_eq!(work.compiler_invocation_count(), 0);
         assert_eq!(work.linker_invocation_count(), 0);
         assert_eq!(program.fallback_count(), 0);
@@ -934,6 +1006,9 @@ fn collect_scale_warm_resume_evidence(
         durable_artifact_cache_hit_count = durable_artifact_cache_hit_count
             .checked_add(work.durable_artifact_cache_hit_count())
             .expect("the fixed durable-hit inventory cannot overflow");
+        durable_artifact_cache_miss_count = durable_artifact_cache_miss_count
+            .checked_add(work.durable_artifact_cache_miss_count())
+            .expect("the fixed durable-miss inventory cannot overflow");
         compiler_invocation_count = compiler_invocation_count
             .checked_add(work.compiler_invocation_count())
             .expect("the fixed compiler inventory cannot overflow");
@@ -944,9 +1019,69 @@ fn collect_scale_warm_resume_evidence(
             .checked_add(program.fallback_count())
             .expect("the fixed fallback inventory cannot overflow");
     }
-    assert!(loaded_module_count > 0);
-    assert_eq!(durable_artifact_cache_hit_count, loaded_module_count);
-    drop(programs);
+    assert_eq!(loaded_module_count, 5);
+    assert_eq!(durable_artifact_cache_hit_count, 5);
+    assert_eq!(durable_artifact_cache_miss_count, 0);
+
+    let (main_preparation, main_wall, main_render) = warm_program_preparation_evidence(main)?;
+    let (accumulation_preparation, accumulation_wall, accumulation_render) =
+        warm_program_preparation_evidence(accumulation)?;
+    let (partial_flush_preparation, partial_flush_wall, partial_flush_render) =
+        warm_program_preparation_evidence(partial_flush)?;
+    let (zero_grad_preparation, zero_grad_wall, zero_grad_render) =
+        warm_program_preparation_evidence(zero_grad)?;
+    let (evaluation_preparation, evaluation_wall, evaluation_render) =
+        warm_program_preparation_evidence(evaluation)?;
+    let summed_program_wall_time = checked_duration_sum([
+        main_wall,
+        accumulation_wall,
+        partial_flush_wall,
+        zero_grad_wall,
+        evaluation_wall,
+    ])?;
+    let summed_render_wall_time = checked_duration_sum([
+        main_render,
+        accumulation_render,
+        partial_flush_render,
+        zero_grad_render,
+        evaluation_render,
+    ])?;
+    let module_overlap_wall_time = preparation.parallel_module_overlap_wall_time();
+    let render_overlap_wall_time = preparation.parallel_render_overlap_wall_time();
+    let effective_program_wall_time = summed_program_wall_time
+        .checked_sub(module_overlap_wall_time)
+        .and_then(|duration| duration.checked_sub(render_overlap_wall_time))
+        .ok_or(RustGradError::InvalidIndex)?;
+    let runtime_overhead_wall_time = preparation_wall_time
+        .checked_sub(effective_program_wall_time)
+        .ok_or(RustGradError::InvalidIndex)?;
+    let reconstructed_preparation_wall_time = runtime_overhead_wall_time
+        .checked_add(summed_program_wall_time)
+        .and_then(|duration| duration.checked_sub(module_overlap_wall_time))
+        .and_then(|duration| duration.checked_sub(render_overlap_wall_time))
+        .ok_or(RustGradError::InvalidIndex)?;
+    assert_eq!(reconstructed_preparation_wall_time, preparation_wall_time);
+    let effective_render_wall_time = summed_render_wall_time
+        .checked_sub(render_overlap_wall_time)
+        .ok_or(RustGradError::InvalidIndex)?;
+    assert!(effective_render_wall_time <= preparation_wall_time);
+    assert!(!preparation_wall_time.is_zero());
+    let effective_render_fraction =
+        effective_render_wall_time.as_secs_f64() / preparation_wall_time.as_secs_f64();
+    assert!(effective_render_fraction.is_finite());
+    let warm_preparation = ScaleWarmPreparationEvidence {
+        main: main_preparation,
+        accumulation: accumulation_preparation,
+        partial_flush: partial_flush_preparation,
+        zero_grad: zero_grad_preparation,
+        evaluation: evaluation_preparation,
+        summed_program_wall_time_ns: duration_nanos(summed_program_wall_time)?,
+        runtime_overhead_wall_time_ns: duration_nanos(runtime_overhead_wall_time)?,
+        module_overlap_wall_time_ns: duration_nanos(module_overlap_wall_time)?,
+        render_overlap_wall_time_ns: duration_nanos(render_overlap_wall_time)?,
+        effective_render_wall_time_ns: duration_nanos(effective_render_wall_time)?,
+        effective_render_fraction,
+    };
 
     assert_eq!(
         continuation.len(),
@@ -1018,11 +1153,13 @@ fn collect_scale_warm_resume_evidence(
         artifact_decode_wall_time_ns,
         owner_restore_wall_time_ns,
         preparation_wall_time_ns,
+        preparation: warm_preparation,
         capture_identity,
         evaluation_capture_identity,
         program_count,
         loaded_module_count,
         durable_artifact_cache_hit_count,
+        durable_artifact_cache_miss_count,
         compiler_invocation_count,
         linker_invocation_count,
         fallback_count,
@@ -1363,7 +1500,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let gradient_evidence = collect_scale_gradient_evidence()?;
 
     let objective = json!({
-        "schema_version": 4,
+        "schema_version": 5,
         "git_sha": git_sha,
         "workload": {
             "batch": BATCH,
