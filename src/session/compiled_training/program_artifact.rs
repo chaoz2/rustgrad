@@ -2063,6 +2063,7 @@ fn seal_admitted_training_topology(
         },
         progress: CompiledTrainingWindowProgress::INITIAL,
         evaluation,
+        compile_phases: None,
     };
     Ok(AdmittedTrainingTopology { plan })
 }

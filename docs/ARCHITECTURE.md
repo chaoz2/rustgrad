@@ -1329,7 +1329,7 @@ times. Wall times do not participate in identity.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional accumulation/flush/zero-grad/evaluation programs plus
 checked logical recurrent state bytes without preparing a target or exposing a
-capture. The separate `NativeTrainingScoreboard` v22 authenticates
+capture. The separate `NativeTrainingScoreboard` v23 authenticates
 strict-native preparation and successful training-step reports, then emits
 bounded versioned JSON.
 
@@ -1340,7 +1340,7 @@ bounded versioned JSON.
 | Module reuse | Referenced modules, the unique/shared-prefix entry partition, and exact overlap for every ordered earlier-program/later-program pair, split into contiguous prefix and additional scattered target entries/source bytes. This is evidence for future reuse, not object reuse today. |
 | Execution | Logical schedule/cache inventory, physical rendered/executed entries, actual module-dispatch calls, and mutually exclusive reasons each sealed dispatch segment ends. |
 | Replay traffic | Owned external imports, borrowed/retained/replaced recurrent bytes, and logical CPU egress materialization count/bytes. CPU egress is not a device transfer. |
-| Timing | Caller-observed compile, prepare, and checkpoint time plus bounded first/steady replay, executor/recurrent-overhead, and native-dispatcher/executor-host partitions. No threshold or speedup is claimed. |
+| Timing | Caller-observed compile, prepare, and checkpoint time; a checked backend-neutral objective/forward, autograd, optimizer-lowering, per-program capture, and wrapper-residual compile partition; plus bounded first/steady replay, executor/recurrent-overhead, and native-dispatcher/executor-host partitions. No threshold or speedup is claimed. |
 
 The executor-host remainder includes workspace, binding, input/output, and any
 conservative per-entry execution outside sealed dispatcher segments. It is not
@@ -1353,7 +1353,7 @@ themselves add dispatch segments or reached-module evidence.
 
 ##### Replay phases and wire versions
 
-V1-v21 JSON remains readable. The current wire additions are:
+V1-v22 JSON remains readable. The current wire additions are:
 
 | Version | Added contract |
 |---|---|
@@ -1367,8 +1367,9 @@ V1-v21 JSON remains readable. The current wire additions are:
 | V20 | Exact main-to-auxiliary rendered-entry/source-byte overlap and per-translation-unit rendered-source bytes. |
 | V21 | Authenticated triangular earlier-to-later program overlap and exact build-plan translation-unit identities/counts/source bytes. V20 fields remain unchanged. |
 | V22 | Exact render-capsule hit, miss, and local-render job counts. V1-v21 reports omit this evidence. |
+| V23 | One compile plus typed objective/forward, autograd, optimizer/update lowering, main/optional accumulation/flush/zero-grad/evaluation capture timings and inventories; checked phases plus residual equal caller-observed compile wall time. V1-v22 reports omit this evidence. |
 
-V22 is emitted for raw and classified recording. Classified steps use only
+V23 is emitted for raw and classified recording. Classified steps use only
 `did_update`; the first replay stays separate, and warm accumulation-only and
 optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
 classification. A scoreboard rejects mixed recording modes without consuming a

@@ -1901,6 +1901,19 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let compile_wall_time = compile_started.elapsed();
     assert_eq!(builds.get(), 1, "the training graph must compile once");
     let inspection = plan.inspection()?;
+    let compile_phases = inspection
+        .compile_phases()
+        .expect("fresh compilation retains phase evidence");
+    assert_eq!(compile_phases.compile_count(), 1);
+    assert_eq!(
+        compile_phases.main_capture().logical_schedule_item_count(),
+        Some(inspection.main().1.schedule_item_count)
+    );
+    assert!(compile_phases.accumulation_capture().is_some());
+    assert!(compile_phases.partial_flush().is_some());
+    assert!(compile_phases.zero_grad().is_some());
+    assert!(compile_phases.evaluation().is_none());
+    assert!(compile_phases.measured_wall_time().unwrap() <= compile_wall_time);
     assert_eq!(
         u64::try_from(inspection.recurrent_state_count())?,
         GUARANTEED_RETAINED_RECURRENT_STATES + REMAINING_RECURRENT_STATES
@@ -2197,6 +2210,9 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
     let checkpoint_wall_time = checkpoint_started.elapsed();
     scoreboard.observe_checkpoint(&checkpoint, checkpoint_wall_time)?;
     let report = scoreboard.report()?;
+    let reported_compile = report.compile_phases().expect("v23 reports compile phases");
+    assert_eq!(reported_compile.compile_count(), 1);
+    assert!(reported_compile.evaluation().is_none());
     let executed_native_items = report
         .main_replay_executed_native_item_count()
         .expect("current native CPU scoreboard reports executed JIT items");

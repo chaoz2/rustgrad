@@ -49,7 +49,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V18: u32 = 18;
 const NATIVE_TRAINING_REPORT_FORMAT_V19: u32 = 19;
 const NATIVE_TRAINING_REPORT_FORMAT_V20: u32 = 20;
 const NATIVE_TRAINING_REPORT_FORMAT_V21: u32 = 21;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 22;
+const NATIVE_TRAINING_REPORT_FORMAT_V22: u32 = 22;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 23;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 /// Compiler subprocess role in one cold native preparation batch.
@@ -691,6 +692,7 @@ fn validate_compiler_process_evidence(
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(bytes),
             ) => {
@@ -765,6 +767,7 @@ fn validate_compiler_process_evidence(
             format_version,
             NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             let rendered = program
@@ -957,6 +960,7 @@ impl NativeTrainingPreparationTiming {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(total),
                 Some(linker),
@@ -984,6 +988,7 @@ impl NativeTrainingPreparationTiming {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 _,
                 _,
@@ -1040,7 +1045,11 @@ impl NativeTrainingPreparationTiming {
 
 /// Immutable logical work and recurrent-state facts for one compiled AdamW
 /// plan. Inspection prepares no target and exposes no capture.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Equality compares only that logical topology. Optional compile-phase
+/// observations describe one construction and remain independently
+/// inspectable, but do not make equivalent plans unequal.
+#[derive(Clone, Debug)]
 pub struct CompiledAdamWInspection {
     initial_replay_step: u64,
     main: ProgramInspection,
@@ -1050,6 +1059,167 @@ pub struct CompiledAdamWInspection {
     evaluation: Option<ProgramInspection>,
     recurrent_state_count: usize,
     recurrent_state_bytes: usize,
+    compile_phases: Option<CompiledTrainingCompileObservation>,
+}
+
+impl PartialEq for CompiledAdamWInspection {
+    fn eq(&self, other: &Self) -> bool {
+        self.initial_replay_step == other.initial_replay_step
+            && self.main == other.main
+            && self.accumulation == other.accumulation
+            && self.partial_flush == other.partial_flush
+            && self.zero_grad == other.zero_grad
+            && self.evaluation == other.evaluation
+            && self.recurrent_state_count == other.recurrent_state_count
+            && self.recurrent_state_bytes == other.recurrent_state_bytes
+    }
+}
+
+impl Eq for CompiledAdamWInspection {}
+
+/// One backend-neutral compiled-training construction phase observed before
+/// target preparation. Counts describe the immutable graph or schedule at the
+/// end of the phase; neither durations nor counts enter program identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledTrainingCompilePhaseObservation {
+    wall_time: Duration,
+    graph_node_count: Option<usize>,
+    logical_schedule_item_count: Option<usize>,
+}
+
+impl CompiledTrainingCompilePhaseObservation {
+    pub(crate) const fn graph(wall_time: Duration, graph_node_count: usize) -> Self {
+        Self {
+            wall_time,
+            graph_node_count: Some(graph_node_count),
+            logical_schedule_item_count: None,
+        }
+    }
+
+    pub(crate) const fn schedule(wall_time: Duration, logical_schedule_item_count: usize) -> Self {
+        Self {
+            wall_time,
+            graph_node_count: None,
+            logical_schedule_item_count: Some(logical_schedule_item_count),
+        }
+    }
+
+    pub fn wall_time(&self) -> Duration {
+        self.wall_time
+    }
+
+    pub const fn graph_node_count(&self) -> Option<usize> {
+        self.graph_node_count
+    }
+
+    pub const fn logical_schedule_item_count(&self) -> Option<usize> {
+        self.logical_schedule_item_count
+    }
+}
+
+/// Typed observation of one successful backend-neutral training compilation.
+/// The caller-observed wrapper residual is derived later by the scoreboard so
+/// configuration, module traversal, and optional evaluator work remain visible.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledTrainingCompileObservation {
+    objective_forward: CompiledTrainingCompilePhaseObservation,
+    autograd: CompiledTrainingCompilePhaseObservation,
+    optimizer_lowering: CompiledTrainingCompilePhaseObservation,
+    main_capture: CompiledTrainingCompilePhaseObservation,
+    accumulation_capture: Option<CompiledTrainingCompilePhaseObservation>,
+    partial_flush: Option<CompiledTrainingCompilePhaseObservation>,
+    zero_grad: Option<CompiledTrainingCompilePhaseObservation>,
+    evaluation: Option<CompiledTrainingCompilePhaseObservation>,
+}
+
+impl CompiledTrainingCompileObservation {
+    pub(crate) const fn new(
+        objective_forward: CompiledTrainingCompilePhaseObservation,
+        autograd: CompiledTrainingCompilePhaseObservation,
+        optimizer_lowering: CompiledTrainingCompilePhaseObservation,
+        main_capture: CompiledTrainingCompilePhaseObservation,
+        accumulation_capture: Option<CompiledTrainingCompilePhaseObservation>,
+    ) -> Self {
+        Self {
+            objective_forward,
+            autograd,
+            optimizer_lowering,
+            main_capture,
+            accumulation_capture,
+            partial_flush: None,
+            zero_grad: None,
+            evaluation: None,
+        }
+    }
+
+    pub(crate) fn set_auxiliary(
+        &mut self,
+        partial_flush: Option<CompiledTrainingCompilePhaseObservation>,
+        zero_grad: Option<CompiledTrainingCompilePhaseObservation>,
+    ) {
+        self.partial_flush = partial_flush;
+        self.zero_grad = zero_grad;
+    }
+
+    pub(crate) fn set_evaluation(&mut self, evaluation: CompiledTrainingCompilePhaseObservation) {
+        self.evaluation = Some(evaluation);
+    }
+
+    pub const fn compile_count(&self) -> u64 {
+        1
+    }
+
+    pub const fn objective_forward(&self) -> CompiledTrainingCompilePhaseObservation {
+        self.objective_forward
+    }
+
+    pub const fn autograd(&self) -> CompiledTrainingCompilePhaseObservation {
+        self.autograd
+    }
+
+    pub const fn optimizer_lowering(&self) -> CompiledTrainingCompilePhaseObservation {
+        self.optimizer_lowering
+    }
+
+    pub const fn main_capture(&self) -> CompiledTrainingCompilePhaseObservation {
+        self.main_capture
+    }
+
+    pub const fn accumulation_capture(&self) -> Option<CompiledTrainingCompilePhaseObservation> {
+        self.accumulation_capture
+    }
+
+    pub const fn partial_flush(&self) -> Option<CompiledTrainingCompilePhaseObservation> {
+        self.partial_flush
+    }
+
+    pub const fn zero_grad(&self) -> Option<CompiledTrainingCompilePhaseObservation> {
+        self.zero_grad
+    }
+
+    pub const fn evaluation(&self) -> Option<CompiledTrainingCompilePhaseObservation> {
+        self.evaluation
+    }
+
+    /// Checked sum of the instrumented compile phases. The enclosing caller
+    /// wall time may be larger; the scoreboard records that remainder.
+    pub fn measured_wall_time(&self) -> Option<Duration> {
+        [
+            Some(self.objective_forward),
+            Some(self.autograd),
+            Some(self.optimizer_lowering),
+            Some(self.main_capture),
+            self.accumulation_capture,
+            self.partial_flush,
+            self.zero_grad,
+            self.evaluation,
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(Duration::ZERO, |total, phase| {
+            total.checked_add(phase.wall_time())
+        })
+    }
 }
 
 impl CompiledAdamWInspection {
@@ -1075,7 +1245,16 @@ impl CompiledAdamWInspection {
             evaluation: evaluation.map(program),
             recurrent_state_count: recurrent_state.0,
             recurrent_state_bytes: recurrent_state.1,
+            compile_phases: None,
         }
+    }
+
+    pub(crate) fn with_compile_phases(
+        mut self,
+        compile_phases: Option<CompiledTrainingCompileObservation>,
+    ) -> Self {
+        self.compile_phases = compile_phases;
+        self
     }
 
     pub const fn initial_replay_step(&self) -> u64 {
@@ -1116,6 +1295,10 @@ impl CompiledAdamWInspection {
 
     pub const fn recurrent_state_bytes(&self) -> usize {
         self.recurrent_state_bytes
+    }
+
+    pub fn compile_phases(&self) -> Option<&CompiledTrainingCompileObservation> {
+        self.compile_phases.as_ref()
     }
 }
 
@@ -1464,6 +1647,7 @@ impl NativeTrainingProgramReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self, format_version)?,
@@ -1788,12 +1972,263 @@ enum ReplayRecordingMode {
     Phased,
 }
 
+/// One typed backend-neutral compilation phase in the portable training
+/// scoreboard. Exactly one inventory kind is present: graph nodes for graph
+/// construction phases or logical schedule items for captured programs.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTrainingCompilePhase {
+    wall_time: BenchmarkDuration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    graph_node_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    logical_schedule_item_count: Option<u64>,
+}
+
+impl NativeTrainingCompilePhase {
+    fn from_observation(observation: CompiledTrainingCompilePhaseObservation) -> Result<Self> {
+        Ok(Self {
+            wall_time: BenchmarkDuration::from_duration(observation.wall_time()),
+            graph_node_count: observation
+                .graph_node_count()
+                .map(|value| count(value, "compiled graph node"))
+                .transpose()?,
+            logical_schedule_item_count: observation
+                .logical_schedule_item_count()
+                .map(|value| count(value, "compiled logical schedule item"))
+                .transpose()?,
+        })
+    }
+
+    fn duration(self) -> Result<Duration> {
+        self.wall_time
+            .to_duration()
+            .map_err(|_| invalid("invalid compiled training phase duration"))
+    }
+
+    fn validate_graph(self) -> Result<()> {
+        self.duration()?;
+        if self.graph_node_count.is_none() || self.logical_schedule_item_count.is_some() {
+            return Err(invalid("compiled graph phase inventory differs"));
+        }
+        Ok(())
+    }
+
+    fn validate_schedule(self, expected_items: u64) -> Result<()> {
+        self.duration()?;
+        if self.graph_node_count.is_some()
+            || self.logical_schedule_item_count != Some(expected_items)
+        {
+            return Err(invalid("compiled capture phase inventory differs"));
+        }
+        Ok(())
+    }
+
+    pub const fn wall_time(&self) -> BenchmarkDuration {
+        self.wall_time
+    }
+
+    pub const fn graph_node_count(&self) -> Option<u64> {
+        self.graph_node_count
+    }
+
+    pub const fn logical_schedule_item_count(&self) -> Option<u64> {
+        self.logical_schedule_item_count
+    }
+}
+
+/// Exact partition of one caller-observed backend-neutral training compile.
+/// Residual time contains wrapper work outside the timed compiler phases; the
+/// checked sum of all phase durations and residual equals `compile_wall_time`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTrainingCompilePhaseReport {
+    compile_count: u64,
+    objective_forward: NativeTrainingCompilePhase,
+    autograd: NativeTrainingCompilePhase,
+    optimizer_lowering: NativeTrainingCompilePhase,
+    main_capture: NativeTrainingCompilePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accumulation_capture: Option<NativeTrainingCompilePhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    partial_flush: Option<NativeTrainingCompilePhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    zero_grad: Option<NativeTrainingCompilePhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evaluation: Option<NativeTrainingCompilePhase>,
+    residual_wall_time: BenchmarkDuration,
+}
+
+impl NativeTrainingCompilePhaseReport {
+    fn from_observation(
+        observation: &CompiledTrainingCompileObservation,
+        compile_wall_time: Duration,
+    ) -> Result<Self> {
+        let objective_forward =
+            NativeTrainingCompilePhase::from_observation(observation.objective_forward())?;
+        let autograd = NativeTrainingCompilePhase::from_observation(observation.autograd())?;
+        let optimizer_lowering =
+            NativeTrainingCompilePhase::from_observation(observation.optimizer_lowering())?;
+        let main_capture =
+            NativeTrainingCompilePhase::from_observation(observation.main_capture())?;
+        let accumulation_capture = observation
+            .accumulation_capture()
+            .map(NativeTrainingCompilePhase::from_observation)
+            .transpose()?;
+        let partial_flush = observation
+            .partial_flush()
+            .map(NativeTrainingCompilePhase::from_observation)
+            .transpose()?;
+        let zero_grad = observation
+            .zero_grad()
+            .map(NativeTrainingCompilePhase::from_observation)
+            .transpose()?;
+        let evaluation = observation
+            .evaluation()
+            .map(NativeTrainingCompilePhase::from_observation)
+            .transpose()?;
+        let measured = observation
+            .measured_wall_time()
+            .ok_or_else(|| invalid("compiled training phase duration overflows"))?;
+        let residual = compile_wall_time
+            .checked_sub(measured)
+            .ok_or_else(|| invalid("compiled training phases exceed compile wall time"))?;
+        Ok(Self {
+            compile_count: observation.compile_count(),
+            objective_forward,
+            autograd,
+            optimizer_lowering,
+            main_capture,
+            accumulation_capture,
+            partial_flush,
+            zero_grad,
+            evaluation,
+            residual_wall_time: BenchmarkDuration::from_duration(residual),
+        })
+    }
+
+    fn validate(
+        &self,
+        compile_wall_time: BenchmarkDuration,
+        main: &NativeTrainingProgramReport,
+        accumulation: Option<&NativeTrainingProgramReport>,
+        partial_flush: Option<&NativeTrainingProgramReport>,
+        zero_grad: Option<&NativeTrainingProgramReport>,
+        evaluation: Option<&NativeTrainingProgramReport>,
+    ) -> Result<()> {
+        if self.compile_count != 1 {
+            return Err(invalid("compiled training compile count differs"));
+        }
+        self.objective_forward.validate_graph()?;
+        self.autograd.validate_graph()?;
+        self.optimizer_lowering.validate_graph()?;
+        let objective_nodes = self.objective_forward.graph_node_count.unwrap_or(0);
+        let autograd_nodes = self.autograd.graph_node_count.unwrap_or(0);
+        let optimizer_nodes = self.optimizer_lowering.graph_node_count.unwrap_or(0);
+        if objective_nodes == 0
+            || objective_nodes > autograd_nodes
+            || autograd_nodes > optimizer_nodes
+        {
+            return Err(invalid("compiled graph phase inventory order differs"));
+        }
+        self.main_capture
+            .validate_schedule(main.logical_schedule_item_count)?;
+        for (phase, program) in [
+            (self.accumulation_capture, accumulation),
+            (self.partial_flush, partial_flush),
+            (self.zero_grad, zero_grad),
+            (self.evaluation, evaluation),
+        ] {
+            match (phase, program) {
+                (Some(phase), Some(program)) => {
+                    phase.validate_schedule(program.logical_schedule_item_count)?
+                }
+                (None, None) => {}
+                _ => return Err(invalid("compiled phase program inventory differs")),
+            }
+        }
+        let total = [
+            Some(self.objective_forward),
+            Some(self.autograd),
+            Some(self.optimizer_lowering),
+            Some(self.main_capture),
+            self.accumulation_capture,
+            self.partial_flush,
+            self.zero_grad,
+            self.evaluation,
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(Duration::ZERO, |total, phase| {
+            total
+                .checked_add(phase.duration()?)
+                .ok_or_else(|| invalid("compiled training phase duration overflows"))
+        })?
+        .checked_add(
+            self.residual_wall_time
+                .to_duration()
+                .map_err(|_| invalid("invalid compiled training residual duration"))?,
+        )
+        .ok_or_else(|| invalid("compiled training phase duration overflows"))?;
+        if total
+            != compile_wall_time
+                .to_duration()
+                .map_err(|_| invalid("invalid native training compile duration"))?
+        {
+            return Err(invalid("compiled training phase partition differs"));
+        }
+        Ok(())
+    }
+
+    pub const fn compile_count(&self) -> u64 {
+        self.compile_count
+    }
+
+    pub const fn objective_forward(&self) -> NativeTrainingCompilePhase {
+        self.objective_forward
+    }
+
+    pub const fn autograd(&self) -> NativeTrainingCompilePhase {
+        self.autograd
+    }
+
+    pub const fn optimizer_lowering(&self) -> NativeTrainingCompilePhase {
+        self.optimizer_lowering
+    }
+
+    pub const fn main_capture(&self) -> NativeTrainingCompilePhase {
+        self.main_capture
+    }
+
+    pub const fn accumulation_capture(&self) -> Option<NativeTrainingCompilePhase> {
+        self.accumulation_capture
+    }
+
+    pub const fn partial_flush(&self) -> Option<NativeTrainingCompilePhase> {
+        self.partial_flush
+    }
+
+    pub const fn zero_grad(&self) -> Option<NativeTrainingCompilePhase> {
+        self.zero_grad
+    }
+
+    pub const fn evaluation(&self) -> Option<NativeTrainingCompilePhase> {
+        self.evaluation
+    }
+
+    pub const fn residual_wall_time(&self) -> BenchmarkDuration {
+        self.residual_wall_time
+    }
+}
+
 /// Versioned strict-native CPU compiled-training observation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeTrainingReport {
     format_version: u32,
     compile_wall_time: BenchmarkDuration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compile_phases: Option<NativeTrainingCompilePhaseReport>,
     prepare_wall_time: BenchmarkDuration,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepare_runtime_overhead_wall_time: Option<BenchmarkDuration>,
@@ -1872,6 +2307,10 @@ pub struct NativeTrainingReport {
 impl NativeTrainingReport {
     pub const fn compile_wall_time(&self) -> BenchmarkDuration {
         self.compile_wall_time
+    }
+
+    pub fn compile_phases(&self) -> Option<&NativeTrainingCompilePhaseReport> {
+        self.compile_phases.as_ref()
     }
 
     pub const fn prepare_wall_time(&self) -> BenchmarkDuration {
@@ -2079,6 +2518,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             return Err(invalid("unsupported native training report version"));
@@ -2109,6 +2549,21 @@ impl NativeTrainingReport {
                 .to_duration()
                 .map_err(|_| invalid("invalid native training duration"))?;
         }
+        match (self.format_version, &self.compile_phases) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V22, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(phases)) => phases.validate(
+                self.compile_wall_time,
+                &self.main,
+                self.accumulation.as_ref(),
+                self.partial_flush.as_ref(),
+                self.zero_grad.as_ref(),
+                self.evaluation.as_ref(),
+            )?,
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V22, Some(_)) => {
+                return Err(invalid("legacy native training report has compile phases"));
+            }
+            _ => return Err(invalid("native training compile phases are absent")),
+        }
         self.main.validate(self.format_version)?;
         if self.format_version >= NATIVE_TRAINING_REPORT_FORMAT_V14
             && (self.main.shared_prefix_entry_count() != 0
@@ -2136,6 +2591,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 None,
                 None,
@@ -2169,6 +2625,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(program),
                 Some(traffic),
@@ -2231,6 +2688,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(traffic),
             ) if traffic.borrowed_recurrent_input_bytes() == self.recurrent_logical_state_bytes
@@ -2263,6 +2721,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
                     if traffic.materialized_egress_count() != 0
                         && traffic.materialized_egress_bytes() != 0 => {}
@@ -2278,6 +2737,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                     return Err(invalid("native CPU egress evidence is absent"));
                 }
@@ -2312,6 +2772,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executed),
             ) if executed <= self.main.rendered_entry_count => {}
@@ -2359,6 +2820,7 @@ impl NativeTrainingReport {
             (
                 NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overlaps),
             ) => {
@@ -2376,7 +2838,9 @@ impl NativeTrainingReport {
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V20, None, None) => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V21 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overlaps),
                 Some(translation_units),
             ) => {
@@ -2426,6 +2890,7 @@ impl NativeTrainingReport {
             | NATIVE_TRAINING_REPORT_FORMAT_V19
             | NATIVE_TRAINING_REPORT_FORMAT_V20
             | NATIVE_TRAINING_REPORT_FORMAT_V21
+            | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 let compiler_overlap = self
                     .prepare_compiler_process_overlap_wall_time
@@ -2492,6 +2957,7 @@ impl NativeTrainingReport {
                 NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timings),
                 claimed_tail,
@@ -2535,7 +3001,12 @@ impl NativeTrainingReport {
             self.prepare_local_render_job_count,
         ) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V21, None, None, None) => {}
-            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(_), Some(_), Some(_)) => {}
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V22 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                Some(_),
+                Some(_),
+                Some(_),
+            ) => {}
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V21, _, _, _) => {
                 return Err(invalid("legacy native report has render capsule evidence"));
             }
@@ -2553,7 +3024,8 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V18
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
-                | NATIVE_TRAINING_REPORT_FORMAT_V21,
+                | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22,
                 Some(overlap),
                 Some(max_parallel),
             ) => {
@@ -2653,6 +3125,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(overhead),
                 overlap,
@@ -2674,6 +3147,7 @@ impl NativeTrainingReport {
                         | NATIVE_TRAINING_REPORT_FORMAT_V19
                         | NATIVE_TRAINING_REPORT_FORMAT_V20
                         | NATIVE_TRAINING_REPORT_FORMAT_V21
+                        | NATIVE_TRAINING_REPORT_FORMAT_V22
                         | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                         Some(overlap),
                     ) => overlap
@@ -2775,6 +3249,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(executor),
                 Some(overhead),
@@ -2811,6 +3286,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(native_dispatcher),
                 Some(executor_host),
@@ -2879,6 +3355,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(phases),
             ) => phases.validate(
@@ -2906,6 +3383,7 @@ impl NativeTrainingReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V19
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
+                | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 None,
             ) if self.accumulation.is_none() => {}
@@ -2962,6 +3440,7 @@ impl NativeTrainingReport {
 /// Bounded collector for successful strict-native CPU training-step replays.
 pub struct NativeTrainingScoreboard {
     compile_wall_time: Duration,
+    compile_phases: NativeTrainingCompilePhaseReport,
     prepare_wall_time: Duration,
     prepare_runtime_overhead_wall_time: Duration,
     prepare_parallel_module_overlap_wall_time: Duration,
@@ -2998,9 +3477,10 @@ pub struct NativeTrainingScoreboard {
 
 impl NativeTrainingScoreboard {
     /// Starts a bounded observation from one complete strict-native
-    /// preparation. `prepare_wall_time` is caller-observed around the whole
-    /// target preparation and must contain every attached program's measured
-    /// preparation time.
+    /// preparation. `compile_wall_time` is caller-observed around the fresh
+    /// plan construction and must contain its measured compile phases;
+    /// `prepare_wall_time` similarly encloses every attached program's
+    /// measured preparation time.
     pub fn new(
         inspection: CompiledAdamWInspection,
         preparation: &NativeCpuCompiledAdamWPreparationReport,
@@ -3046,6 +3526,12 @@ impl NativeTrainingScoreboard {
             inspection.evaluation.as_ref(),
             preparation.evaluation(),
             &prior_native_identities,
+        )?;
+        let compile_phases = NativeTrainingCompilePhaseReport::from_observation(
+            inspection
+                .compile_phases()
+                .ok_or_else(|| invalid("compiled training phase observation is absent"))?,
+            compile_wall_time,
         )?;
         let programs = std::iter::once(&main)
             .chain(accumulation.iter())
@@ -3133,6 +3619,7 @@ impl NativeTrainingScoreboard {
             .ok_or_else(|| invalid("native program preparation exceeds whole prepare time"))?;
         Ok(Self {
             compile_wall_time,
+            compile_phases,
             prepare_wall_time,
             prepare_runtime_overhead_wall_time,
             prepare_parallel_module_overlap_wall_time,
@@ -3424,6 +3911,7 @@ impl NativeTrainingScoreboard {
         let report = NativeTrainingReport {
             format_version: NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             compile_wall_time: BenchmarkDuration::from_duration(self.compile_wall_time),
+            compile_phases: Some(self.compile_phases.clone()),
             prepare_wall_time: BenchmarkDuration::from_duration(self.prepare_wall_time),
             prepare_runtime_overhead_wall_time: Some(BenchmarkDuration::from_duration(
                 self.prepare_runtime_overhead_wall_time,
@@ -3654,6 +4142,84 @@ mod tests {
             steady_total: zero_duration(),
             steady: zero_latency_summary(),
         }
+    }
+
+    fn zero_compile_phase(
+        graph_node_count: Option<u64>,
+        logical_schedule_item_count: Option<u64>,
+    ) -> NativeTrainingCompilePhase {
+        NativeTrainingCompilePhase {
+            wall_time: zero_duration(),
+            graph_node_count,
+            logical_schedule_item_count,
+        }
+    }
+
+    fn zero_compile_phases(main_schedule_item_count: u64) -> NativeTrainingCompilePhaseReport {
+        NativeTrainingCompilePhaseReport {
+            compile_count: 1,
+            objective_forward: zero_compile_phase(Some(1), None),
+            autograd: zero_compile_phase(Some(2), None),
+            optimizer_lowering: zero_compile_phase(Some(3), None),
+            main_capture: zero_compile_phase(None, Some(main_schedule_item_count)),
+            accumulation_capture: None,
+            partial_flush: None,
+            zero_grad: None,
+            evaluation: None,
+            residual_wall_time: zero_duration(),
+        }
+    }
+
+    fn empty_execution_plan_summary() -> ExecutionPlanSummary {
+        ExecutionPlanSummary {
+            requested_outputs: Vec::new(),
+            items: Vec::new(),
+            schedule_item_count: 0,
+            temporary_allocation_count: 0,
+            peak_logical_allocations: 0,
+            peak_logical_bytes: 0,
+            reuse_enabled: false,
+            reuse_count: 0,
+            zero_domain_item_count: 0,
+            zero_byte_sentinel_count: 0,
+            identity: 13,
+        }
+    }
+
+    fn observed_compile(duration: Duration) -> CompiledTrainingCompileObservation {
+        CompiledTrainingCompileObservation::new(
+            CompiledTrainingCompilePhaseObservation::graph(duration, 1),
+            CompiledTrainingCompilePhaseObservation::graph(duration, 2),
+            CompiledTrainingCompilePhaseObservation::graph(duration, 3),
+            CompiledTrainingCompilePhaseObservation::schedule(duration, 0),
+            None,
+        )
+    }
+
+    #[test]
+    fn inspection_equality_is_logical_not_compile_observational() {
+        let inspection = |compile_phases| {
+            CompiledAdamWInspection::new(
+                0,
+                (7, empty_execution_plan_summary()),
+                None,
+                None,
+                None,
+                None,
+                (4, 16),
+            )
+            .with_compile_phases(compile_phases)
+        };
+        let first = inspection(Some(observed_compile(Duration::from_nanos(1))));
+        let later = inspection(Some(observed_compile(Duration::from_nanos(2))));
+        let unavailable = inspection(None);
+        assert_eq!(first, later);
+        assert_eq!(first, unavailable);
+        assert_ne!(
+            first.compile_phases(),
+            later.compile_phases(),
+            "the excluded observations remain independently inspectable"
+        );
     }
 
     fn zero_preparation_timing() -> NativeTrainingPreparationTiming {
@@ -3906,6 +4472,10 @@ mod tests {
         }
     }
 
+    fn remove_compile_phase_evidence(json: &mut serde_json::Value) {
+        json.as_object_mut().unwrap().remove("compile_phases");
+    }
+
     fn remove_dispatch_segmentation_evidence(json: &mut serde_json::Value) {
         for program in [
             "main",
@@ -3924,6 +4494,7 @@ mod tests {
         NativeTrainingReport {
             format_version: NATIVE_TRAINING_REPORT_FORMAT_V10,
             compile_wall_time: zero_duration(),
+            compile_phases: None,
             prepare_wall_time: zero_duration(),
             prepare_runtime_overhead_wall_time: Some(zero_duration()),
             prepare_parallel_module_overlap_wall_time: Some(zero_duration()),
@@ -4056,6 +4627,7 @@ mod tests {
     fn phase_specialized_report() -> NativeTrainingReport {
         let mut report = zero_report();
         report.format_version = NATIVE_TRAINING_REPORT_FORMAT_VERSION;
+        report.compile_phases = Some(zero_compile_phases(report.main.logical_schedule_item_count));
         report.prepare_parallel_render_overlap_wall_time = Some(zero_duration());
         report.prepare_max_parallel_render_job_count = Some(0);
         report.prepare_render_capsule_hit_count = Some(2);
@@ -4116,6 +4688,16 @@ mod tests {
             derived_slot_dependency_count: 0,
         });
         report.accumulation = Some(accumulation);
+        report.compile_phases.as_mut().unwrap().accumulation_capture = Some(zero_compile_phase(
+            None,
+            Some(
+                report
+                    .accumulation
+                    .as_ref()
+                    .unwrap()
+                    .logical_schedule_item_count,
+            ),
+        ));
         report.accumulation_replay_traffic = Some(
             NativeCpuReplayTraffic::new(2, 12, 16, 8)
                 .with_recurrent_inventory(2, 8, 2, 8)
@@ -4213,6 +4795,12 @@ mod tests {
         report.main.rendered_entry_count = count;
         report.main.rendered_source_bytes = Some(rendered_source_bytes);
         report.main.unique_rendered_entry_count = Some(count);
+        report
+            .compile_phases
+            .as_mut()
+            .unwrap()
+            .main_capture
+            .logical_schedule_item_count = Some(count);
         report.schedule_cache_keys = (0..count_usize)
             .map(|index| u64::try_from(index).unwrap() + 101)
             .collect();
@@ -4280,6 +4868,11 @@ mod tests {
         );
         assert_eq!(decoded.accumulation().unwrap().capture_identity(), 8);
         assert_eq!(decoded.accumulation_schedule_cache_keys(), [23, 29]);
+        assert_eq!(
+            decoded.prepare_parallel_render_overlap_wall_time(),
+            Some(zero_duration())
+        );
+        assert_eq!(decoded.prepare_max_parallel_render_job_count(), Some(0));
         assert!(decoded.main_replay_native_dispatcher_wall_time().is_some());
         assert!(decoded.main_replay_executor_host_wall_time().is_some());
         assert_eq!(
@@ -4570,6 +5163,7 @@ mod tests {
         let report = phase_specialized_report();
         let mut json = serde_json::to_value(report).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V11);
+        remove_compile_phase_evidence(&mut json);
         remove_module_overlap_evidence(&mut json);
         remove_dispatcher_timing(&mut json);
         remove_dispatch_segmentation_evidence(&mut json);
@@ -4603,6 +5197,7 @@ mod tests {
     fn phase_specialized_v12_report_decodes_without_egress_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V12);
+        remove_compile_phase_evidence(&mut json);
         remove_module_overlap_evidence(&mut json);
         remove_dispatcher_timing(&mut json);
         remove_dispatch_segmentation_evidence(&mut json);
@@ -4637,6 +5232,7 @@ mod tests {
     fn version_thirteen_report_decodes_without_prefix_module_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V13);
+        remove_compile_phase_evidence(&mut json);
         remove_module_overlap_evidence(&mut json);
         remove_dispatcher_timing(&mut json);
         remove_dispatch_segmentation_evidence(&mut json);
@@ -4681,6 +5277,7 @@ mod tests {
     fn version_fourteen_preserves_prefix_evidence_and_rejects_v15_compiler_fields() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V14);
+        remove_compile_phase_evidence(&mut json);
         remove_module_overlap_evidence(&mut json);
         remove_dispatcher_timing(&mut json);
         remove_dispatch_segmentation_evidence(&mut json);
@@ -4834,6 +5431,7 @@ mod tests {
     fn version_fifteen_decodes_without_parallel_render_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V15);
+        remove_compile_phase_evidence(&mut json);
         remove_module_overlap_evidence(&mut json);
         remove_dispatcher_timing(&mut json);
         remove_dispatch_segmentation_evidence(&mut json);
@@ -4857,6 +5455,7 @@ mod tests {
     fn version_sixteen_rejects_dispatch_segmentation_even_when_zero() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V16);
+        remove_compile_phase_evidence(&mut json);
         remove_render_capsule_evidence(&mut json);
         remove_module_overlap_evidence(&mut json);
         remove_dispatcher_timing(&mut json);
@@ -4890,6 +5489,7 @@ mod tests {
     fn version_seventeen_decodes_without_dispatcher_timing() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V17);
+        remove_compile_phase_evidence(&mut json);
         remove_render_capsule_evidence(&mut json);
         remove_module_overlap_evidence(&mut json);
         assert!(
@@ -4916,6 +5516,7 @@ mod tests {
     fn version_eighteen_decodes_without_compiler_critical_path() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V18);
+        remove_compile_phase_evidence(&mut json);
         remove_render_capsule_evidence(&mut json);
         remove_module_overlap_evidence(&mut json);
         assert!(
@@ -4933,6 +5534,7 @@ mod tests {
     fn version_nineteen_decodes_without_module_overlap_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V19);
+        remove_compile_phase_evidence(&mut json);
         remove_render_capsule_evidence(&mut json);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
@@ -4949,6 +5551,7 @@ mod tests {
     fn version_twenty_decodes_without_pair_and_translation_unit_evidence() {
         let mut json = serde_json::to_value(phase_specialized_report()).unwrap();
         json["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V20);
+        remove_compile_phase_evidence(&mut json);
         remove_render_capsule_evidence(&mut json);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&json).unwrap()).is_err(),
@@ -4980,6 +5583,7 @@ mod tests {
         let report = phase_specialized_report();
         let mut legacy = serde_json::to_value(&report).unwrap();
         legacy["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V21);
+        remove_compile_phase_evidence(&mut legacy);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&legacy).unwrap()).is_err(),
             "v21 rejects v22 render capsule evidence"
@@ -4994,8 +5598,83 @@ mod tests {
         remove_render_capsule_evidence(&mut current);
         assert!(
             NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&current).unwrap()).is_err(),
-            "v22 requires complete render capsule evidence"
+            "current report requires complete render capsule evidence"
         );
+    }
+
+    #[test]
+    fn version_twenty_two_decodes_without_compile_phases_and_current_requires_them() {
+        let report = phase_specialized_report();
+        let mut legacy = serde_json::to_value(&report).unwrap();
+        legacy["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V22);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&legacy).unwrap()).is_err(),
+            "v22 rejects v23 compile-phase evidence"
+        );
+        remove_compile_phase_evidence(&mut legacy);
+        let decoded =
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V22);
+        assert!(decoded.compile_phases().is_none());
+        assert!(decoded.prepare_render_capsule_hit_count().is_some());
+
+        let mut current = serde_json::to_value(report).unwrap();
+        remove_compile_phase_evidence(&mut current);
+        assert!(
+            NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&current).unwrap()).is_err(),
+            "v23 requires compile-phase evidence"
+        );
+    }
+
+    #[test]
+    fn current_report_authenticates_compile_phase_partition_and_inventory() {
+        let mut report = phase_specialized_report();
+        report.compile_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(10));
+        let phases = report.compile_phases.as_mut().unwrap();
+        phases.objective_forward.wall_time =
+            BenchmarkDuration::from_duration(Duration::from_nanos(2));
+        phases.autograd.wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        phases.optimizer_lowering.wall_time =
+            BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        phases.main_capture.wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        phases.accumulation_capture.as_mut().unwrap().wall_time =
+            BenchmarkDuration::from_duration(Duration::from_nanos(1));
+        phases.residual_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(4));
+        assert!(report.validate().is_ok());
+
+        let valid = report.clone();
+        report.compile_phases.as_mut().unwrap().compile_count = 2;
+        assert!(report.validate().is_err(), "compile count is exact");
+
+        let mut report = valid.clone();
+        report
+            .compile_phases
+            .as_mut()
+            .unwrap()
+            .main_capture
+            .logical_schedule_item_count = Some(3);
+        assert!(report.validate().is_err(), "main inventory is exact");
+
+        let mut report = valid.clone();
+        report.compile_phases.as_mut().unwrap().accumulation_capture = None;
+        assert!(report.validate().is_err(), "phase presence is exact");
+
+        let mut report = valid;
+        report.compile_phases.as_mut().unwrap().residual_wall_time =
+            BenchmarkDuration::from_duration(Duration::from_nanos(3));
+        assert!(report.validate().is_err(), "compile partition is exact");
+
+        let mut report = phase_specialized_report();
+        report
+            .compile_phases
+            .as_mut()
+            .unwrap()
+            .objective_forward
+            .wall_time = BenchmarkDuration {
+            secs: u64::MAX,
+            nanos: 999_999_999,
+        };
+        assert!(report.validate().is_err(), "compile phase sums are checked");
     }
 
     #[test]
@@ -5518,6 +6197,8 @@ mod tests {
         let mut report = phase_specialized_report();
         let evaluation = report.accumulation.take();
         report.evaluation = evaluation;
+        let compile_phases = report.compile_phases.as_mut().unwrap();
+        compile_phases.evaluation = compile_phases.accumulation_capture.take();
         report.accumulation_replay_traffic = None;
         report.accumulation_replay_executed_native_item_count = None;
         report.accumulation_schedule_cache_keys.clear();

@@ -31,7 +31,10 @@ pub use self::resume_bundle::{CompiledAdamWResumeBundle, CompiledAdamWResumeBund
 use self::state_schema::{
     AdamWGlobalState, AdamWParameterState, INTERNAL_PREFIX, RecurrentStateKey, StateSpec,
 };
-use super::native_training_scoreboard::CompiledAdamWInspection;
+use super::native_training_scoreboard::{
+    CompiledAdamWInspection, CompiledTrainingCompileObservation,
+    CompiledTrainingCompilePhaseObservation,
+};
 use super::target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,
     NativeCpuSessionTarget, SessionTarget,
@@ -4900,6 +4903,7 @@ pub struct CompiledAdamWPlan {
     contract: CompiledAdamWContract,
     progress: CompiledTrainingWindowProgress,
     evaluation: Option<CompiledEvaluationPlan>,
+    compile_phases: Option<CompiledTrainingCompileObservation>,
 }
 
 struct ValidatedAdamWCheckpointFrontier {
@@ -6991,7 +6995,23 @@ impl CompiledTrainingPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        Self::compile_with_workload(
+        Self::compile_observed(optimizer, parameters, build).map(|(plan, _)| plan)
+    }
+
+    fn compile_observed<F, O>(
+        optimizer: O,
+        parameters: impl IntoIterator<Item = TrainingParameterInit>,
+        build: F,
+    ) -> Result<(Self, CompiledTrainingCompileObservation)>
+    where
+        O: CompiledOptimizerProgram,
+        F: FnOnce(
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        Self::compile_with_workload_observed(
             optimizer,
             parameters,
             None,
@@ -7002,11 +7022,11 @@ impl CompiledTrainingPlan {
         )
     }
 
-    fn compile_with_token_weight<F, O>(
+    fn compile_with_token_weight_observed<F, O>(
         optimizer: O,
         parameters: impl IntoIterator<Item = TrainingParameterInit>,
         build: F,
-    ) -> Result<Self>
+    ) -> Result<(Self, CompiledTrainingCompileObservation)>
     where
         O: CompiledOptimizerProgram,
         F: FnOnce(
@@ -7015,7 +7035,7 @@ impl CompiledTrainingPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>, NodeId)>,
     {
-        Self::compile_with_workload(
+        Self::compile_with_workload_observed(
             optimizer,
             parameters,
             None,
@@ -7026,12 +7046,12 @@ impl CompiledTrainingPlan {
         )
     }
 
-    fn compile_with_workload<F, O>(
+    fn compile_with_workload_observed<F, O>(
         optimizer: O,
         parameters: impl IntoIterator<Item = TrainingParameterInit>,
         workload: Option<StateSpec>,
         build: F,
-    ) -> Result<Self>
+    ) -> Result<(Self, CompiledTrainingCompileObservation)>
     where
         O: CompiledOptimizerProgram,
         F: FnOnce(
@@ -7132,8 +7152,13 @@ impl CompiledTrainingPlan {
         let workload_node = specs
             .get(optimizer_spec_count)
             .map(|spec| state_nodes[&spec.key]);
+        let objective_started = Instant::now();
         let (loss, outputs, workload_successor, token_weight) =
             build(&mut graph, &inputs, &parameter_nodes, workload_node)?;
+        let objective_forward = CompiledTrainingCompilePhaseObservation::graph(
+            objective_started.elapsed(),
+            graph.node_count(),
+        );
         validate_loss(&graph, loss)?;
         validate_outputs(
             loss,
@@ -7142,7 +7167,12 @@ impl CompiledTrainingPlan {
         )?;
 
         let targets = parameter_nodes.values().copied().collect::<Vec<_>>();
+        let autograd_started = Instant::now();
         let gradients = optimizer.gradients(&mut graph, loss, &targets)?;
+        let autograd = CompiledTrainingCompilePhaseObservation::graph(
+            autograd_started.elapsed(),
+            graph.node_count(),
+        );
         if gradients.len() != targets.len() {
             return Err(training("compiled gradient target count mismatch"));
         }
@@ -7151,6 +7181,7 @@ impl CompiledTrainingPlan {
             .cloned()
             .zip(gradients)
             .collect::<BTreeMap<_, _>>();
+        let optimizer_lowering_started = Instant::now();
         let CompiledOptimizerLowering {
             mut updates,
             mut sibling_updates,
@@ -7180,11 +7211,16 @@ impl CompiledTrainingPlan {
         }
         let observation_schema =
             CompiledTrainingObservationSchema::from_nodes(&graph, &observations)?;
+        let optimizer_lowering = CompiledTrainingCompilePhaseObservation::graph(
+            optimizer_lowering_started.elapsed(),
+            graph.node_count(),
+        );
         let main_public_requested = std::iter::once(loss)
             .chain(outputs.values().copied())
             .chain(observations.iter().map(|observation| observation.node))
             .collect::<Vec<_>>();
         let external_input_names = optimizer.inputs().keys().cloned().collect::<Vec<_>>();
+        let main_started = Instant::now();
         let main = capture_training_phase(
             &mut graph,
             CompiledTrainingPhaseInput {
@@ -7199,46 +7235,59 @@ impl CompiledTrainingPlan {
                 materialize_state_passthroughs: false,
             },
         )?;
-        let accumulation = sibling_updates
-            .map(|updates| {
-                let public_requested = std::iter::once(loss)
-                    .chain(outputs.values().copied())
-                    .collect::<Vec<_>>();
-                let phase = capture_training_phase(
-                    &mut graph,
-                    CompiledTrainingPhaseInput {
-                        specs: &specs,
-                        state_nodes: &state_nodes,
-                        state_values: &state_values,
-                        state_by_input: &state_by_input,
-                        recurrent_store_groups: &recurrent_store_groups,
-                        updates: &updates,
-                        public_requested: &public_requested,
-                        external_input_names: &external_input_names,
-                        materialize_state_passthroughs: true,
-                    },
-                )?;
-                let cursor_projection = PreparedRecurrentCursorProjection::prepare(
-                    &main.capture,
-                    &phase.capture,
-                    phase.state_buffers.values().copied(),
-                )
-                .map_err(replay_error)?;
-                let capture_identity = cursor_projection.target_capture_identity();
-                Ok::<_, Error>(CompiledTrainingSiblingPlan {
-                    phase: CompiledRecurrentPhasePlan {
-                        capture: Arc::new(phase.capture),
-                        recurrent_capture: CompiledRecurrentCapture::from_stateful(
-                            phase.recurrent_capture,
-                        ),
-                        state_buffers: phase.state_buffers,
-                        cursor_projection: Arc::new(cursor_projection),
-                        capture_identity,
-                        admission: CompiledRecurrentPhaseAdmission::RetainUnchanged,
-                    },
-                })
-            })
-            .transpose()?;
+        let main_capture = CompiledTrainingCompilePhaseObservation::schedule(
+            main_started.elapsed(),
+            main.recurrent_capture.execution_plan().schedule_item_count,
+        );
+        let (accumulation, accumulation_capture) = if let Some(updates) = sibling_updates {
+            let accumulation_started = Instant::now();
+            let public_requested = std::iter::once(loss)
+                .chain(outputs.values().copied())
+                .collect::<Vec<_>>();
+            let phase = capture_training_phase(
+                &mut graph,
+                CompiledTrainingPhaseInput {
+                    specs: &specs,
+                    state_nodes: &state_nodes,
+                    state_values: &state_values,
+                    state_by_input: &state_by_input,
+                    recurrent_store_groups: &recurrent_store_groups,
+                    updates: &updates,
+                    public_requested: &public_requested,
+                    external_input_names: &external_input_names,
+                    materialize_state_passthroughs: true,
+                },
+            )?;
+            let cursor_projection = PreparedRecurrentCursorProjection::prepare(
+                &main.capture,
+                &phase.capture,
+                phase.state_buffers.values().copied(),
+            )
+            .map_err(replay_error)?;
+            let capture_identity = cursor_projection.target_capture_identity();
+            let schedule_item_count = phase.recurrent_capture.execution_plan().schedule_item_count;
+            let plan = CompiledTrainingSiblingPlan {
+                phase: CompiledRecurrentPhasePlan {
+                    capture: Arc::new(phase.capture),
+                    recurrent_capture: CompiledRecurrentCapture::from_stateful(
+                        phase.recurrent_capture,
+                    ),
+                    state_buffers: phase.state_buffers,
+                    cursor_projection: Arc::new(cursor_projection),
+                    capture_identity,
+                    admission: CompiledRecurrentPhaseAdmission::RetainUnchanged,
+                },
+            };
+            (
+                Some(plan),
+                Some(CompiledTrainingCompilePhaseObservation::schedule(
+                    accumulation_started.elapsed(),
+                    schedule_item_count,
+                )),
+            )
+        } else {
+            (None, None)
+        };
         if let Some(accumulation) = &accumulation {
             let main_identity = main
                 .capture
@@ -7257,28 +7306,38 @@ impl CompiledTrainingPlan {
             named_outputs: outputs.keys().cloned().collect(),
             observations: observation_schema,
         };
-        Ok(Self {
-            capture: Arc::new(main.capture),
-            recurrent_capture: Arc::new(CompiledRecurrentCapture::from_stateful(
-                main.recurrent_capture,
-            )),
-            inputs: optimizer.inputs().clone(),
-            phase_outputs,
-            parameter_buffers,
-            optimizer_buffers,
-            workload_buffers,
-            state_input_buffers,
-            state_input_keys,
-            state_values: specs
-                .iter()
-                .map(|spec| (spec.key.clone(), spec.value.clone()))
-                .collect(),
-            state_versions: specs.iter().map(|spec| (spec.key.clone(), 0)).collect(),
-            recurrent_store_groups: main.recurrent_store_groups,
-            frozen_parameter_nodes: BTreeSet::new(),
-            step: 0,
-            accumulation,
-        })
+        let observation = CompiledTrainingCompileObservation::new(
+            objective_forward,
+            autograd,
+            optimizer_lowering,
+            main_capture,
+            accumulation_capture,
+        );
+        Ok((
+            Self {
+                capture: Arc::new(main.capture),
+                recurrent_capture: Arc::new(CompiledRecurrentCapture::from_stateful(
+                    main.recurrent_capture,
+                )),
+                inputs: optimizer.inputs().clone(),
+                phase_outputs,
+                parameter_buffers,
+                optimizer_buffers,
+                workload_buffers,
+                state_input_buffers,
+                state_input_keys,
+                state_values: specs
+                    .iter()
+                    .map(|spec| (spec.key.clone(), spec.value.clone()))
+                    .collect(),
+                state_versions: specs.iter().map(|spec| (spec.key.clone(), 0)).collect(),
+                recurrent_store_groups: main.recurrent_store_groups,
+                frozen_parameter_nodes: BTreeSet::new(),
+                step: 0,
+                accumulation,
+            },
+            observation,
+        ))
     }
 
     fn capture_identity(&self) -> Result<u64> {
@@ -9802,14 +9861,14 @@ impl CompiledAdamWPlan {
             &config,
             parameters.iter().map(TrainingParameterInit::name),
         )?;
-        let inner = CompiledTrainingPlan::compile(
+        let (inner, compile_phases) = CompiledTrainingPlan::compile_observed(
             AdamWProgram {
                 config: config.clone(),
             },
             parameters,
             build,
         )?;
-        Self::from_compiled_inner(config, inner)
+        Self::from_compiled_inner(config, inner, compile_phases)
     }
 
     fn compile_parameters_with_ignore_index<F>(
@@ -9829,29 +9888,51 @@ impl CompiledAdamWPlan {
             &config,
             parameters.iter().map(TrainingParameterInit::name),
         )?;
-        let inner = CompiledTrainingPlan::compile_with_token_weight(
+        let (inner, compile_phases) = CompiledTrainingPlan::compile_with_token_weight_observed(
             AdamWProgram {
                 config: config.clone(),
             },
             parameters,
             build,
         )?;
-        Self::from_compiled_inner(config, inner)
+        Self::from_compiled_inner(config, inner, compile_phases)
     }
 
     fn from_compiled_inner(
         config: CompiledAdamWConfig,
         inner: CompiledTrainingPlan,
+        mut compile_phases: CompiledTrainingCompileObservation,
     ) -> Result<Self> {
         let topology = CompiledTrainingWindowTopology::from_config(&config);
-        let partial_flush = topology
-            .accumulating()
-            .then(|| CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config))
-            .transpose()?;
-        let zero_grad = topology
-            .accumulating()
-            .then(|| CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner, topology))
-            .transpose()?;
+        let (partial_flush, partial_flush_phase) = if topology.accumulating() {
+            let started = Instant::now();
+            let plan = CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config)?;
+            let phase = CompiledTrainingCompilePhaseObservation::schedule(
+                started.elapsed(),
+                plan.phase()
+                    .recurrent_capture
+                    .execution_plan()
+                    .schedule_item_count,
+            );
+            (Some(plan), Some(phase))
+        } else {
+            (None, None)
+        };
+        let (zero_grad, zero_grad_phase) = if topology.accumulating() {
+            let started = Instant::now();
+            let plan = CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner, topology)?;
+            let phase = CompiledTrainingCompilePhaseObservation::schedule(
+                started.elapsed(),
+                plan.phase()
+                    .recurrent_capture
+                    .execution_plan()
+                    .schedule_item_count,
+            );
+            (Some(plan), Some(phase))
+        } else {
+            (None, None)
+        };
+        compile_phases.set_auxiliary(partial_flush_phase, zero_grad_phase);
         let program_identity = inner.capture_identity()?;
         Ok(Self {
             inner,
@@ -9861,6 +9942,7 @@ impl CompiledAdamWPlan {
             contract: CompiledAdamWContract::from_config(&config, None),
             progress: CompiledTrainingWindowProgress::INITIAL,
             evaluation: None,
+            compile_phases: Some(compile_phases),
         })
     }
 
@@ -10231,7 +10313,7 @@ impl CompiledAdamWPlan {
         let workload = StateSpec::dropout_counter()?;
         let mut dropout_state = None;
         let mut frozen_parameter_nodes = BTreeSet::new();
-        let mut inner = CompiledTrainingPlan::compile_with_workload(
+        let (mut inner, mut compile_phases) = CompiledTrainingPlan::compile_with_workload_observed(
             AdamWProgram {
                 config: config.clone(),
             },
@@ -10256,14 +10338,35 @@ impl CompiledAdamWPlan {
         inner.frozen_parameter_nodes = frozen_parameter_nodes;
         let dropout = dropout_state
             .ok_or_else(|| training("compiled dropout configuration produced no state"))?;
-        let partial_flush = topology
-            .accumulating()
-            .then(|| CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config))
-            .transpose()?;
-        let zero_grad = topology
-            .accumulating()
-            .then(|| CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner, topology))
-            .transpose()?;
+        let (partial_flush, partial_flush_phase) = if topology.accumulating() {
+            let started = Instant::now();
+            let plan = CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config)?;
+            let phase = CompiledTrainingCompilePhaseObservation::schedule(
+                started.elapsed(),
+                plan.phase()
+                    .recurrent_capture
+                    .execution_plan()
+                    .schedule_item_count,
+            );
+            (Some(plan), Some(phase))
+        } else {
+            (None, None)
+        };
+        let (zero_grad, zero_grad_phase) = if topology.accumulating() {
+            let started = Instant::now();
+            let plan = CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner, topology)?;
+            let phase = CompiledTrainingCompilePhaseObservation::schedule(
+                started.elapsed(),
+                plan.phase()
+                    .recurrent_capture
+                    .execution_plan()
+                    .schedule_item_count,
+            );
+            (Some(plan), Some(phase))
+        } else {
+            (None, None)
+        };
+        compile_phases.set_auxiliary(partial_flush_phase, zero_grad_phase);
         let program_identity = inner.capture_identity()?;
         Ok(Self {
             inner,
@@ -10273,6 +10376,7 @@ impl CompiledAdamWPlan {
             contract: CompiledAdamWContract::from_config(&config, Some(dropout)),
             progress: CompiledTrainingWindowProgress::INITIAL,
             evaluation: None,
+            compile_phases: Some(compile_phases),
         })
     }
 
@@ -10499,6 +10603,7 @@ impl CompiledAdamWPlan {
             contract,
             progress: _,
             evaluation,
+            compile_phases,
         } = self;
         let inner = inner.restore_frontier_with_versions(
             frontier.replay_step,
@@ -10519,6 +10624,7 @@ impl CompiledAdamWPlan {
             contract,
             progress: frontier.progress,
             evaluation,
+            compile_phases,
         })
     }
 
@@ -10881,7 +10987,15 @@ impl CompiledAdamWPlan {
             zero_grad,
             evaluation,
             recurrent_state,
-        ))
+        )
+        .with_compile_phases(self.compile_phases.clone()))
+    }
+
+    /// Backend-neutral graph/autograd/lowering/capture observations retained
+    /// by the freshly compiled plan. Restored runtime snapshots deliberately
+    /// carry no synthetic compilation evidence.
+    pub fn compile_phases(&self) -> Option<&CompiledTrainingCompileObservation> {
+        self.compile_phases.as_ref()
     }
 
     /// Returns the explicit compiled dropout policy, when present.
@@ -11393,19 +11507,27 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             }
             self.seal.validate_unchanged(&self.module)?;
             let parameter_plan = self.seal.parameter_plan(&self.module)?;
+            let started = Instant::now();
             let evaluation = CompiledEvaluationPlan::compile_with_parameter_plan(
                 &self.module,
                 &self.plan,
                 parameter_plan,
                 build,
             )?;
+            let phase = CompiledTrainingCompilePhaseObservation::schedule(
+                started.elapsed(),
+                evaluation.inference.execution_plan().schedule_item_count,
+            );
             self.seal.validate_unchanged(&self.module)?;
             self.authenticate_restored_evaluation(&evaluation)?;
-            Ok(evaluation)
+            Ok((evaluation, phase))
         })();
         match result {
-            Ok(evaluation) => {
+            Ok((evaluation, phase)) => {
                 self.plan.evaluation = Some(evaluation);
+                if let Some(observation) = &mut self.plan.compile_phases {
+                    observation.set_evaluation(phase);
+                }
                 self.required_evaluation_capture_identity = None;
                 Ok(self)
             }
@@ -11440,19 +11562,27 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             }
             self.seal.validate_unchanged(&self.module)?;
             let parameter_plan = self.seal.parameter_plan(&self.module)?;
+            let started = Instant::now();
             let evaluation = CompiledEvaluationPlan::compile_graph_with_parameter_plan(
                 &self.module,
                 &self.plan,
                 parameter_plan,
                 build,
             )?;
+            let phase = CompiledTrainingCompilePhaseObservation::schedule(
+                started.elapsed(),
+                evaluation.inference.execution_plan().schedule_item_count,
+            );
             self.seal.validate_unchanged(&self.module)?;
             self.authenticate_restored_evaluation(&evaluation)?;
-            Ok(evaluation)
+            Ok((evaluation, phase))
         })();
         match result {
-            Ok(evaluation) => {
+            Ok((evaluation, phase)) => {
                 self.plan.evaluation = Some(evaluation);
+                if let Some(observation) = &mut self.plan.compile_phases {
+                    observation.set_evaluation(phase);
+                }
                 self.required_evaluation_capture_identity = None;
                 Ok(self)
             }
@@ -11483,6 +11613,7 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
             }
             self.seal.validate_unchanged(&self.module)?;
             let parameter_plan = self.seal.parameter_plan(&self.module)?;
+            let started = Instant::now();
             let evaluation =
                 CompiledEvaluationPlan::compile_graph_with_ignore_index_parameter_plan(
                     &self.module,
@@ -11490,13 +11621,20 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                     parameter_plan,
                     build,
                 )?;
+            let phase = CompiledTrainingCompilePhaseObservation::schedule(
+                started.elapsed(),
+                evaluation.inference.execution_plan().schedule_item_count,
+            );
             self.seal.validate_unchanged(&self.module)?;
             self.authenticate_restored_evaluation(&evaluation)?;
-            Ok(evaluation)
+            Ok((evaluation, phase))
         })();
         match result {
-            Ok(evaluation) => {
+            Ok((evaluation, phase)) => {
                 self.plan.evaluation = Some(evaluation);
+                if let Some(observation) = &mut self.plan.compile_phases {
+                    observation.set_evaluation(phase);
+                }
                 self.required_evaluation_capture_identity = None;
                 Ok(self)
             }
@@ -12608,6 +12746,7 @@ impl CpuCompiledAdamW {
                 .evaluation
                 .as_ref()
                 .map(|evaluation| evaluation.plan.clone()),
+            compile_phases: None,
         })
     }
 
@@ -18181,17 +18320,36 @@ mod tests {
     }
 
     #[test]
+    fn fresh_checkpoint_restore_retains_compile_phase_observation() {
+        let plan = CompiledAdamWPlan::compile(adamw_config(), initial_parameters(), build_tinybob)
+            .unwrap();
+        let observation = plan.compile_phases().cloned().unwrap();
+        let checkpoint = plan.prepare_cpu().unwrap().checkpoint().unwrap();
+        let restored = plan.restore_checkpoint(&checkpoint).unwrap();
+        assert_eq!(restored.compile_phases(), Some(&observation));
+    }
+
+    #[test]
     fn native_cpu_adamw_prepares_strictly_reuses_cache_and_commits_atomically() {
         let plan = CompiledAdamWPlan::compile(adamw_config(), initial_parameters(), build_tinybob)
             .unwrap();
         let inspection = plan.inspection().unwrap();
+        let compile_phases = inspection
+            .compile_phases()
+            .expect("fresh compilation retains phase evidence");
+        assert_eq!(compile_phases.compile_count(), 1);
+        assert!(compile_phases.accumulation_capture().is_none());
+        assert!(compile_phases.partial_flush().is_none());
+        assert!(compile_phases.zero_grad().is_none());
+        assert!(compile_phases.evaluation().is_none());
+        let compile_wall_time = compile_phases.measured_wall_time().unwrap();
         let executor = CapturedReplayExecutor::default();
         let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
         let mut native = target.prepare(&plan).unwrap();
         let mut scoreboard = crate::NativeTrainingScoreboard::new(
             inspection,
             native.preparation_report(),
-            Duration::ZERO,
+            compile_wall_time,
             native.preparation_report().main().wall_time(),
         )
         .unwrap();
@@ -26280,6 +26438,10 @@ mod tests {
             "flat RGAP bytes must survive the private contract adapter"
         );
         let restored_inspection = restored.inspection().unwrap();
+        assert!(
+            restored_inspection.compile_phases().is_none(),
+            "artifact-derived plans must not synthesize compile observations"
+        );
         assert_eq!(source_inspection.initial_replay_step(), 0);
         assert_eq!(
             restored_inspection.initial_replay_step(),
