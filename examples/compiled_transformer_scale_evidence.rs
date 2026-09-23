@@ -1308,6 +1308,19 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     assert_eq!(inspection.initial_replay_step(), 0);
     assert!(inspection.recurrent_state_count() > 0);
     assert!(inspection.recurrent_state_bytes() > 0);
+    let compile_phases = inspection
+        .compile_phases()
+        .expect("fresh compilation retains phase evidence");
+    assert_eq!(compile_phases.compile_count(), 1);
+    assert_eq!(
+        compile_phases.main_capture().logical_schedule_item_count(),
+        Some(inspection.main().1.schedule_item_count)
+    );
+    assert!(compile_phases.accumulation_capture().is_some());
+    assert!(compile_phases.partial_flush().is_some());
+    assert!(compile_phases.zero_grad().is_some());
+    assert!(compile_phases.evaluation().is_some());
+    assert!(compile_phases.measured_wall_time().unwrap() <= compile_wall_time);
 
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
@@ -1453,6 +1466,9 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     );
 
     let report = scoreboard.report()?;
+    let reported_compile = report.compile_phases().expect("v23 reports compile phases");
+    assert_eq!(reported_compile.compile_count(), 1);
+    assert!(reported_compile.evaluation().is_some());
     assert_eq!(report.fallback_count(), 0);
     assert_eq!(report.successful_replay_count(), REPLAYS);
     assert_eq!(

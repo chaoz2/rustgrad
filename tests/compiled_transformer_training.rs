@@ -6943,6 +6943,11 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     assert!(inspection.evaluation().is_none());
     assert!(inspection.recurrent_state_count() > 0);
     assert!(inspection.recurrent_state_bytes() > 0);
+    let compile_wall_time = inspection
+        .compile_phases()
+        .unwrap()
+        .measured_wall_time()
+        .unwrap();
 
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
@@ -6962,7 +6967,7 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     let mut scoreboard = NativeTrainingScoreboard::new(
         inspection.clone(),
         preparation,
-        Duration::ZERO,
+        compile_wall_time,
         prepare_wall_time,
     )
     .unwrap();

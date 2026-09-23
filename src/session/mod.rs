@@ -66,7 +66,9 @@ pub(crate) use inference::{
     CapturedHostGather, CapturedHostIndexedMovement, CapturedHostIndexedMovementKind,
 };
 pub use native_training_scoreboard::{
-    CompiledAdamWInspection, NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeTrainingFirstStepReport,
+    CompiledAdamWInspection, CompiledTrainingCompileObservation,
+    CompiledTrainingCompilePhaseObservation, NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+    NativeTrainingCompilePhase, NativeTrainingCompilePhaseReport, NativeTrainingFirstStepReport,
     NativeTrainingPreparationTiming, NativeTrainingProgramReport, NativeTrainingReplayTiming,
     NativeTrainingReport, NativeTrainingScoreboard, NativeTrainingStepPhase,
     NativeTrainingStepPhaseReport, NativeTrainingWarmStepReport,
