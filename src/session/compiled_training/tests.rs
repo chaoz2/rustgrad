@@ -1,5 +1,6 @@
 use super::module_adamw_checkpoint::decode_module_adamw_checkpoint;
 use super::*;
+use crate::nn::{ParameterSnapshot, StateKind};
 use crate::{Backend, CpuBackend, LossOptions, Op, Parameter, cross_entropy};
 use std::{
     cell::Cell,
