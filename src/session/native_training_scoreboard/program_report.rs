@@ -5,6 +5,7 @@
 //! execute training programs or collect timings.
 
 use super::super::{NativeCpuDispatchSegmentation, NativeCpuProgramPreparationReport};
+use super::inspection::{NativeTrainingPreparationTiming, ProgramInspection};
 use super::{
     NATIVE_TRAINING_REPORT_FORMAT_V5, NATIVE_TRAINING_REPORT_FORMAT_V6,
     NATIVE_TRAINING_REPORT_FORMAT_V7, NATIVE_TRAINING_REPORT_FORMAT_V8,
@@ -15,8 +16,7 @@ use super::{
     NATIVE_TRAINING_REPORT_FORMAT_V17, NATIVE_TRAINING_REPORT_FORMAT_V18,
     NATIVE_TRAINING_REPORT_FORMAT_V19, NATIVE_TRAINING_REPORT_FORMAT_V20,
     NATIVE_TRAINING_REPORT_FORMAT_V21, NATIVE_TRAINING_REPORT_FORMAT_V22,
-    NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeTrainingPreparationTiming, ProgramInspection,
-    count, invalid,
+    NATIVE_TRAINING_REPORT_FORMAT_VERSION, count, invalid,
 };
 use crate::Result;
 use serde::{Deserialize, Serialize};
