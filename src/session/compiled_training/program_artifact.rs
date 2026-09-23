@@ -1,4 +1,5 @@
 use super::adamw_contract::{CompiledAdamWContract, CompiledAdamWPolicy};
+use super::module_adamw_checkpoint::{DecodedModuleAdamWCheckpoint, ModuleCheckpointStateKind};
 use super::*;
 use crate::file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically};
 use serde::{Deserialize, Serialize};
