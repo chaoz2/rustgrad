@@ -1430,7 +1430,7 @@ Legacy reports remain readable when these evidence fields are absent:
 ##### Compiled AdamW program artifacts
 
 `CompiledAdamWProgramArtifact` is a separate bounded, checksummed envelope for
-the resource-free CPU training program.
+the resource-free training program.
 
 ###### Artifact contents
 
@@ -1438,6 +1438,8 @@ the resource-free CPU training program.
   accumulation, partial-flush, `zero_grad`, and evaluation sibling.
 - It includes each program's input/output, recurrent-buffer, optimizer,
   dropout, learning-rate, token-weight, freeze/tie, and native-update schemas.
+- RGAP v2 additionally retains bounded, checksummed Metal recipes for the main,
+  partial-flush, and evaluation captures of Metal-admissible policies.
 - It never contains checkpoint tensors, live `Parameter` handles, runtime
   banks, native pointers, loaded libraries, or machine code.
 
@@ -1447,16 +1449,17 @@ the resource-free CPU training program.
   complete-module checkpoint bytes remain unchanged.
 - **Restore.** `restore_from_program_artifact` consumes a differently
   initialized compatible module and its complete-module checkpoint. It rebuilds
-  the resource-free CPU plan without invoking the workload builder, autograd,
+  the resource-free plan without invoking the workload builder, autograd,
   scheduling, capture, or evaluator construction.
 - **Admission.** Envelope version, byte bound, checksum, every embedded
   capture, sibling cardinality and identity, state maps, module topology,
   evaluator identity, policy, and checkpoint capture identities authenticate
   before runtime preparation or module publication.
-- **Execution.** Interpreter and strict-native CPU retain the existing replay,
-  commit-only egress, failure atomicity, checkpoint, and durable native-cache
-  paths. Artifact-restored plans reject strict-Metal rendering because the
-  graph-origin stateful wrapper is intentionally not serialized.
+- **Execution.** Interpreter and strict-native CPU retain their existing paths.
+  RGAP v2 reconstructs the same strict-Metal wrappers without rebuilding the
+  graph; v1 and Metal-ineligible CPU policies remain explicitly CPU-only.
+- **Evidence boundary.** Recipe admission is resource-free. Real Metal
+  execution still requires the protected Apple-hardware lane.
 
 The artifact supplies immutable executable structure. The unchanged checkpoint
 supplies the current parameter, optimizer, accumulation, loss/token, and

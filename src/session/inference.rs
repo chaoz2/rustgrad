@@ -1,4 +1,9 @@
 //! Backend-neutral static module capture and fresh-graph CPU inference.
+mod portable_recipe;
+
+pub(crate) use self::portable_recipe::{
+    PortableCapturedInferenceRecipe, PortableInferenceHostPolicy,
+};
 use crate::nn::{Module, ModuleForward, Parameter, module_input_node_bindings};
 use crate::{
     Backend, CapturedReplayExecutor, CapturedReplayTrace, CapturedSchedule, CompileTrace,
@@ -235,6 +240,13 @@ impl fmt::Display for CapturedInferenceError {
 impl error::Error for CapturedInferenceError {}
 
 impl CapturedInference {
+    pub(crate) fn portable_recipe(
+        &self,
+        host_policy: PortableInferenceHostPolicy,
+    ) -> std::result::Result<PortableCapturedInferenceRecipe, CapturedInferenceError> {
+        PortableCapturedInferenceRecipe::from_inference(self, None, &[], host_policy)
+    }
+
     /// Authenticates one static request and snapshots only graph-bound values
     /// belonging to `module` that remain inputs of the resulting capture.
     /// All validation completes before the owned capture is returned.
@@ -883,6 +895,23 @@ impl CapturedInference {
 }
 
 impl CapturedStatefulInference {
+    pub(crate) fn portable_recipe(
+        &self,
+        host_policy: PortableInferenceHostPolicy,
+    ) -> std::result::Result<PortableCapturedInferenceRecipe, CapturedInferenceError> {
+        let state_links = self
+            .states
+            .iter()
+            .map(|state| state.link)
+            .collect::<Vec<_>>();
+        PortableCapturedInferenceRecipe::from_inference(
+            &self.inference,
+            Some(self.public_output_count),
+            &state_links,
+            host_policy,
+        )
+    }
+
     pub fn from_module_graph(
         module: &(impl Module + ?Sized),
         graph: &Graph,
@@ -2621,6 +2650,20 @@ mod tests {
         fixed_links.hash(&mut fixed_identity);
         assert_eq!(fixed.deployment_identity(), fixed_identity.finish());
         assert_ne!(fixed.deployment_identity(), ordinary.deployment_identity());
+
+        let recipe = fixed
+            .portable_recipe(PortableInferenceHostPolicy::FixedGathers)
+            .unwrap();
+        let bytes = recipe.to_bytes().unwrap();
+        let restored = PortableCapturedInferenceRecipe::from_bytes(&bytes)
+            .unwrap()
+            .instantiate(BTreeMap::new())
+            .unwrap();
+        assert_eq!(restored.deployment_identity(), fixed.deployment_identity());
+        assert_eq!(restored.host_gathers, fixed.host_gathers);
+        let mut corrupt = bytes;
+        corrupt[13] ^= 1;
+        assert!(PortableCapturedInferenceRecipe::from_bytes(&corrupt).is_err());
     }
 
     fn configured_cifar_classifier() -> (Sequential, Parameter) {
@@ -2764,6 +2807,26 @@ mod tests {
             captured.deployment_identity(),
             changed.deployment_identity()
         );
+        let recipe = captured
+            .portable_recipe(PortableInferenceHostPolicy::None)
+            .unwrap();
+        let restored = PortableCapturedInferenceRecipe::from_bytes(&recipe.to_bytes().unwrap())
+            .unwrap()
+            .instantiate_stateful(initial.clone())
+            .unwrap();
+        assert_eq!(
+            restored.deployment_identity(),
+            captured.deployment_identity()
+        );
+        assert_eq!(
+            restored.state_links().collect::<Vec<_>>(),
+            [InferenceStateLink::new(state, next)]
+        );
+        let retargeted = recipe.with_state_output_for_test(0, public);
+        assert!(
+            PortableCapturedInferenceRecipe::from_bytes(&retargeted.to_bytes().unwrap()).is_err(),
+            "a checksummed recipe cannot retarget recurrent state to a public output"
+        );
         assert_eq!(graph.node_count(), count);
 
         assert!(matches!(
@@ -2797,6 +2860,46 @@ mod tests {
             Err(CapturedInferenceError::Binding(_))
         ));
         assert_eq!(graph.node_count(), count);
+    }
+
+    #[test]
+    fn portable_state_recipe_rejects_reordered_successors() {
+        let module = Sequential::default();
+        let mut graph = Graph::new();
+        let left = graph.input_dtype("left_state", [2], DType::F32);
+        let right = graph.input_dtype("right_state", [2], DType::F32);
+        let transient = graph.input_dtype("transient", [2], DType::F32);
+        let next_left = graph.add(left, transient).unwrap();
+        let next_right = graph.sub(right, transient).unwrap();
+        let public = graph.add(next_left, next_right).unwrap();
+        let captured = CapturedStatefulInference::from_module_graph(
+            &module,
+            &graph,
+            &[public],
+            &[
+                InferenceStateLink::new(left, next_left),
+                InferenceStateLink::new(right, next_right),
+            ],
+            BTreeMap::from([
+                (
+                    "left_state".into(),
+                    TensorData::new([2], vec![0.0, 1.0]).unwrap(),
+                ),
+                (
+                    "right_state".into(),
+                    TensorData::new([2], vec![2.0, 3.0]).unwrap(),
+                ),
+            ]),
+        )
+        .unwrap();
+        let recipe = captured
+            .portable_recipe(PortableInferenceHostPolicy::None)
+            .unwrap()
+            .swap_state_links_for_test(0, 1);
+        assert!(
+            PortableCapturedInferenceRecipe::from_bytes(&recipe.to_bytes().unwrap()).is_err(),
+            "a checksummed recipe cannot reorder recurrent successor ownership"
+        );
     }
 
     #[test]

@@ -14880,6 +14880,10 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     .unwrap()
     .with_evaluation(build_evaluation)
     .unwrap();
+    let program_artifact = seed
+        .program_artifact()
+        .expect("the Metal-admissible training plan must emit a portable RGAP v2 artifact");
+    assert_eq!(program_artifact.info().format_version(), 2);
     let capture_identity = seed.capture_identity();
     let accumulation_capture_identity = seed.accumulation_capture_identity().unwrap();
     let cpu_model = TinyCausalTransformer::new(7).unwrap();
@@ -15218,6 +15222,10 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
     assert_eq!(uninterrupted.optimizer_step().unwrap(), 0);
     assert_eq!(uninterrupted.accumulation_index().unwrap(), 2);
     let checkpoint = uninterrupted.checkpoint().unwrap();
+    let module_checkpoint = uninterrupted.module_checkpoint().unwrap();
+    assert_eq!(module_checkpoint.optimizer_checkpoint(), &checkpoint);
+    let resume_bundle =
+        CompiledAdamWResumeBundle::new(program_artifact.clone(), module_checkpoint).unwrap();
     let cpu_checkpoint = cpu_primary.checkpoint().unwrap();
     let (partial_parameter_lanes, partial_parameter_error) = assert_live_tensor_maps_close(
         "partial parameters",
@@ -15264,16 +15272,10 @@ fn live_metal_compiled_causal_transformer_training_resumes_exactly() {
         .into_iter()
         .map(|(name, parameter)| (name, parameter.version().unwrap()))
         .collect::<BTreeMap<_, _>>();
-    let resumed_seed = CompiledModuleAdamWPlan::compile_with_dropout_from_checkpoint(
-        policy.clone(),
-        dropout_config(),
-        resumed_model,
-        &checkpoint,
-        build,
-    )
-    .unwrap()
-    .with_evaluation(build_evaluation)
-    .unwrap();
+    let resumed_seed =
+        CompiledModuleAdamWPlan::restore_from_resume_bundle(resumed_model, &resume_bundle)
+            .expect("portable RGAB restore must reconstruct the strict-Metal replay wrappers");
+    assert_eq!(resumed_seed.program_artifact().unwrap(), program_artifact);
     let cpu_resumed_model = TinyCausalTransformer::new(7).unwrap();
     let cpu_tied = cpu_resumed_model.tokens.weight.clone();
     let cpu_tied_before = cpu_tied.snapshot().unwrap();

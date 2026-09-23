@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:036f5590ed137d9f",
+  "source_fingerprint": "fnv1a64:6d86f70bf756bba3",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -459,7 +459,7 @@
       "subject": "Compiled persistent-state training runtime",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CompiledAdamWPlan` compiles one fixed-shape forward, loss, backward pass, and AdamW recurrent program for atomic replay on interpreter CPU, strict-native CPU, or the bounded strict-Metal target. The maintained two-block Transformer proves decreasing loss plus exact in-process and portable resume. Resource-free program artifacts restore fresh CPU plans without rebuilding the graph, autograd, schedule, or captures, while native resources remain excluded. Metal stays bounded and fail-closed; dynamic shapes, mixed-precision state, distributed or asynchronous training, broad optimizer construction, and live-Metal performance evidence remain gaps. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for mechanics."
+        "Acceptance requirement": "`CompiledAdamWPlan` compiles one fixed-shape forward, loss, backward pass, and AdamW recurrent program for atomic replay on interpreter CPU, strict-native CPU, or the bounded strict-Metal target. The maintained two-block Transformer proves decreasing loss plus exact in-process and portable resume. Resource-free RGAP v1 artifacts restore fresh CPU plans; Metal-admissible RGAP v2 artifacts also reconstruct strict-Metal main, partial-flush, and evaluation wrappers without rebuilding the graph, autograd, schedule, or captures. Native resources remain excluded, and unsupported policies stay CPU-only. Dynamic shapes, mixed-precision state, distributed or asynchronous training, broad optimizer construction, and live-Metal performance evidence remain gaps. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for mechanics."
       }
     },
     {

@@ -31,6 +31,7 @@ pub use self::resume_bundle::{CompiledAdamWResumeBundle, CompiledAdamWResumeBund
 use self::state_schema::{
     AdamWGlobalState, AdamWParameterState, INTERNAL_PREFIX, RecurrentStateKey, StateSpec,
 };
+use super::inference::{PortableCapturedInferenceRecipe, PortableInferenceHostPolicy};
 use super::native_training_scoreboard::{
     CompiledAdamWInspection, CompiledTrainingCompileObservation,
     CompiledTrainingCompilePhaseObservation,
@@ -6331,9 +6332,10 @@ struct CompiledEvaluationPlan {
     capture_identity: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CompiledRecurrentCapture {
     stateful: Option<CapturedStatefulInference>,
+    portable: Option<Arc<PortableCapturedInferenceRecipe>>,
     execution_plan: Arc<ExecutionPlanSummary>,
 }
 
@@ -6342,13 +6344,25 @@ impl CompiledRecurrentCapture {
         Self {
             execution_plan: Arc::new(stateful.execution_plan().clone()),
             stateful: Some(stateful),
+            portable: None,
         }
     }
 
-    fn from_artifact(capture: &CapturedMixedSchedule) -> Result<Self> {
-        let execution_plan = artifact_recurrent_execution_plan(capture)?;
+    fn from_artifact(
+        capture: &CapturedMixedSchedule,
+        portable: Option<PortableCapturedInferenceRecipe>,
+    ) -> Result<Self> {
+        let (pure, execution_plan) = artifact_recurrent_execution_plan(capture)?;
+        if let Some(portable) = &portable
+            && portable.capture_bytes() != pure.to_bytes().map_err(replay_error)?
+        {
+            return Err(training(
+                "compiled program artifact Metal recipe capture differs",
+            ));
+        }
         Ok(Self {
             stateful: None,
+            portable: portable.map(Arc::new),
             execution_plan: Arc::new(execution_plan),
         })
     }
@@ -6357,16 +6371,65 @@ impl CompiledRecurrentCapture {
         self.execution_plan.as_ref()
     }
 
-    fn stateful(&self) -> Result<CapturedStatefulInference> {
-        self.stateful.clone().ok_or_else(|| {
-            training("compiled AdamW program artifacts currently prepare on CPU only")
-        })
+    fn stateful(
+        &self,
+        initial_state: BTreeMap<String, TensorData>,
+    ) -> Result<CapturedStatefulInference> {
+        if let Some(stateful) = &self.stateful {
+            return stateful
+                .clone()
+                .with_initial_state(initial_state)
+                .map_err(captured_inference_error);
+        }
+        self.portable
+            .as_ref()
+            .ok_or_else(|| {
+                training("compiled AdamW program artifacts currently prepare on CPU only")
+            })?
+            .instantiate_stateful(initial_state)
+            .map_err(captured_inference_error)
+    }
+
+    fn portable_recipe(
+        &self,
+        policy: PortableInferenceHostPolicy,
+    ) -> Result<PortableCapturedInferenceRecipe> {
+        if let Some(recipe) = &self.portable {
+            return Ok(recipe.as_ref().clone());
+        }
+        self.stateful
+            .as_ref()
+            .ok_or_else(|| training("compiled recurrent capture is absent"))?
+            .portable_recipe(policy)
+            .map_err(captured_inference_error)
+    }
+
+    fn portable_training_recipe(
+        &self,
+        host_token_inputs: &BTreeMap<String, Shape>,
+        frozen_parameter_nodes: &BTreeSet<NodeId>,
+    ) -> Result<PortableCapturedInferenceRecipe> {
+        if let Some(recipe) = &self.portable {
+            return Ok(recipe.as_ref().clone());
+        }
+        self.stateful
+            .as_ref()
+            .ok_or_else(|| training("compiled recurrent capture is absent"))?
+            .clone()
+            .with_authenticated_training_host_indices(host_token_inputs, frozen_parameter_nodes)
+            .map_err(captured_inference_error)?
+            .portable_recipe(if host_token_inputs.is_empty() {
+                PortableInferenceHostPolicy::None
+            } else {
+                PortableInferenceHostPolicy::Training
+            })
+            .map_err(captured_inference_error)
     }
 }
 
 fn artifact_recurrent_execution_plan(
     capture: &CapturedMixedSchedule,
-) -> Result<ExecutionPlanSummary> {
+) -> Result<(CapturedSchedule, ExecutionPlanSummary)> {
     #[cfg(test)]
     program_artifact::record_recurrent_execution_plan();
     let split = capture
@@ -6405,13 +6468,15 @@ fn artifact_recurrent_execution_plan(
         .map_err(|error| training(format!("compiled artifact capture identity: {error}")))?;
     let pure = CapturedSchedule::from_bytes(&pure.to_bytes().map_err(replay_error)?)
         .map_err(replay_error)?;
-    ExecutionPlanSummary::from_capture(&pure, true)
-        .map_err(|error| training(format!("compiled artifact execution summary: {error}")))
+    let execution_plan = ExecutionPlanSummary::from_capture(&pure, true)
+        .map_err(|error| training(format!("compiled artifact execution summary: {error}")))?;
+    Ok((pure, execution_plan))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CompiledEvaluationCapture {
     inference: Option<crate::CapturedInference>,
+    portable: Option<Arc<PortableCapturedInferenceRecipe>>,
     capture: Arc<CapturedSchedule>,
     execution_plan: Arc<ExecutionPlanSummary>,
 }
@@ -6422,16 +6487,28 @@ impl CompiledEvaluationCapture {
             capture: Arc::new(inference.capture().clone()),
             execution_plan: Arc::new(inference.execution_plan().clone()),
             inference: Some(inference),
+            portable: None,
         }
     }
 
-    fn from_artifact(capture: Arc<CapturedSchedule>) -> Result<Self> {
+    fn from_artifact(
+        capture: Arc<CapturedSchedule>,
+        portable: Option<PortableCapturedInferenceRecipe>,
+    ) -> Result<Self> {
         #[cfg(test)]
         program_artifact::record_evaluation_execution_plan();
         let execution_plan = ExecutionPlanSummary::from_capture(capture.as_ref(), true)
             .map_err(|error| training(format!("compiled evaluation artifact summary: {error}")))?;
+        if let Some(portable) = &portable
+            && portable.capture_bytes() != capture.to_bytes().map_err(replay_error)?
+        {
+            return Err(training(
+                "compiled evaluation artifact Metal recipe capture differs",
+            ));
+        }
         Ok(Self {
             inference: None,
+            portable: portable.map(Arc::new),
             capture,
             execution_plan: Arc::new(execution_plan),
         })
@@ -6445,10 +6522,31 @@ impl CompiledEvaluationCapture {
         self.execution_plan.as_ref()
     }
 
-    fn inference(&self) -> Result<crate::CapturedInference> {
-        self.inference.clone().ok_or_else(|| {
-            training("compiled AdamW program artifacts currently prepare on CPU only")
-        })
+    fn inference(
+        &self,
+        resident_bindings: BTreeMap<String, TensorData>,
+    ) -> Result<crate::CapturedInference> {
+        if let Some(inference) = &self.inference {
+            return Ok(inference.clone());
+        }
+        self.portable
+            .as_ref()
+            .ok_or_else(|| {
+                training("compiled AdamW program artifacts currently prepare on CPU only")
+            })?
+            .instantiate(resident_bindings)
+            .map_err(captured_inference_error)
+    }
+
+    fn portable_recipe(&self) -> Result<PortableCapturedInferenceRecipe> {
+        if let Some(recipe) = &self.portable {
+            return Ok(recipe.as_ref().clone());
+        }
+        self.inference
+            .as_ref()
+            .ok_or_else(|| training("compiled evaluation capture is absent"))?
+            .portable_recipe(PortableInferenceHostPolicy::FixedGathers)
+            .map_err(captured_inference_error)
     }
 }
 
@@ -7361,10 +7459,7 @@ impl CompiledTrainingPlan {
                 Ok((input.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        self.recurrent_capture
-            .stateful()?
-            .with_initial_state(initial_state)
-            .map_err(captured_inference_error)
+        self.recurrent_capture.stateful(initial_state)
     }
 
     fn metal_plan(
@@ -7374,12 +7469,16 @@ impl CompiledTrainingPlan {
         evaluation: Option<CompiledEvaluationPlan>,
     ) -> Result<MetalCompiledTrainingPlan> {
         let recurrent = self.recurrent_capture()?;
-        let recurrent = recurrent
-            .with_authenticated_training_host_indices(
-                host_token_inputs,
-                &self.frozen_parameter_nodes,
-            )
-            .map_err(captured_inference_error)?;
+        let recurrent = if self.recurrent_capture.portable.is_some() {
+            recurrent
+        } else {
+            recurrent
+                .with_authenticated_training_host_indices(
+                    host_token_inputs,
+                    &self.frozen_parameter_nodes,
+                )
+                .map_err(captured_inference_error)?
+        };
         let inner = MetalStatefulInferencePlan::new(recurrent.clone(), renderer.clone()).map_err(
             |error| {
                 let detail = if matches!(&error, MetalError::Unsupported(_)) {
@@ -7411,8 +7510,22 @@ impl CompiledTrainingPlan {
                     .values()
                     .cloned()
                     .collect::<BTreeSet<_>>();
+                let resident_bindings = evaluation
+                    .parameter_inputs
+                    .iter()
+                    .map(|(parameter, input)| {
+                        let value = self
+                            .state_values
+                            .get(&RecurrentStateKey::parameter(parameter))
+                            .cloned()
+                            .ok_or_else(|| {
+                                training("compiled evaluation parameter value is absent")
+                            })?;
+                        Ok((input.clone(), value))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
                 MetalFixedStateReadPlan::new(
-                    evaluation.inference.inference()?,
+                    evaluation.inference.inference(resident_bindings)?,
                     renderer,
                     &inner,
                     &parameter_names,
@@ -10853,8 +10966,21 @@ impl CompiledAdamWPlan {
             .partial_flush
             .as_ref()
             .map(|transition| {
+                let initial_state = transition
+                    .state_input_keys
+                    .iter()
+                    .map(|(input, key)| {
+                        let value = self.inner.state_values.get(key).cloned().ok_or_else(|| {
+                            training("compiled partial-flush state value is absent")
+                        })?;
+                        Ok((input.clone(), value))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
                 MetalFixedStateTransitionPlan::new(
-                    transition.phase().recurrent_capture.stateful()?,
+                    transition
+                        .phase()
+                        .recurrent_capture
+                        .stateful(initial_state)?,
                     renderer,
                     &inner.inner,
                 )
@@ -22632,6 +22758,11 @@ mod tests {
         assert_eq!(owner.flush_capture_identity(), None);
         let artifact = owner.program_artifact().unwrap();
         assert_eq!(owner.program_artifact().unwrap(), artifact);
+        assert_eq!(artifact.info().format_version(), 1);
+        assert_eq!(artifact.as_bytes()[4], 1);
+        program_artifact::rewrite_json_for_test(&artifact, |json| {
+            assert!(json.get("metal").is_none());
+        });
         let mut source = owner.prepare(&CpuSessionTarget).unwrap();
 
         let empty = || ignore_index_batch([7.0, 11.0, 13.0], [-100; 3]);
@@ -26385,6 +26516,19 @@ mod tests {
         let source_contract = source_plan.plan.contract.clone();
         let program_artifact = source_plan.program_artifact().unwrap();
         assert_eq!(source_plan.program_artifact().unwrap(), program_artifact);
+        assert_eq!(program_artifact.info().format_version(), 2);
+        assert_eq!(program_artifact.as_bytes()[4], 2);
+        program_artifact::rewrite_json_for_test(&program_artifact, |json| {
+            assert!(json["metal"]["main"].as_array().unwrap().len() > 21);
+            assert!(!json["metal"]["partial_flush"].is_null());
+            assert!(json["metal"]["evaluation"].is_null());
+        });
+        let (corrupt_recipe_bytes, _) =
+            program_artifact::rewrite_json_for_test(&program_artifact, |json| {
+                let byte = json["metal"]["main"][13].as_u64().unwrap();
+                json["metal"]["main"][13] = serde_json::Value::from(byte ^ 1);
+            });
+        assert!(CompiledAdamWProgramArtifact::from_bytes(corrupt_recipe_bytes).is_err());
         let artifact_file = TemporaryCheckpointPath::new("compiled-adamw-program-artifact");
         program_artifact.save_file(artifact_file.path()).unwrap();
         let program_artifact =
@@ -26476,6 +26620,22 @@ mod tests {
             &restored.module.shared.snapshot().unwrap(),
             &artifact_destination_before,
         );
+        let restored_metal = restored
+            .plan
+            .metal_plan(
+                MetalRenderer::new(
+                    8,
+                    crate::runtime::metal::MetalCapabilities {
+                        max_buffer_length: 1 << 30,
+                        unified_memory: true,
+                        family: "Apple9".into(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(restored_metal.partial_flush.is_some());
+        assert_eq!(restored_metal.inner.program_identity, capture_identity);
         let restored = restored.prepare(&CpuSessionTarget::new()).unwrap();
         assert_eq!(
             restored.checkpoint().unwrap(),
@@ -26728,6 +26888,112 @@ mod tests {
         assert_parameter_snapshot_eq(
             &malformed_destination.buffer.snapshot().unwrap(),
             &malformed_buffer,
+        );
+    }
+
+    #[test]
+    fn portable_v2_program_artifact_reconstructs_strict_metal_training_wrappers() {
+        let source = CompiledModuleAdamWPlan::compile_graph(
+            module_config().with_gradient_accumulation(3).unwrap(),
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap()
+        .with_evaluation_graph(|module, graph, inputs| {
+            let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+            Ok(CompiledAdamWGraph::scalar(loss, outputs))
+        })
+        .unwrap();
+        let capture_identity = source.capture_identity();
+        let artifact = source.program_artifact().unwrap();
+        assert_eq!(artifact.info().format_version(), 2);
+        assert_eq!(artifact.retained_metal_recipe_extents().len(), 3);
+        assert!(
+            artifact
+                .retained_metal_recipe_extents()
+                .into_iter()
+                .all(|extent| extent == (0, 0))
+        );
+        let checkpoint = source
+            .prepare(&CpuSessionTarget::new())
+            .unwrap()
+            .module_checkpoint()
+            .unwrap();
+        let bundle = CompiledAdamWResumeBundle::new(artifact.clone(), checkpoint).unwrap();
+        let restored = CompiledModuleAdamWPlan::restore_from_resume_bundle(
+            TiedFrozenModule::new([7.0, 8.0]),
+            &bundle,
+        )
+        .unwrap();
+        assert_eq!(restored.program_artifact().unwrap(), artifact);
+        let rendered = restored
+            .plan
+            .metal_plan(
+                MetalRenderer::new(
+                    8,
+                    crate::runtime::metal::MetalCapabilities {
+                        max_buffer_length: 1 << 30,
+                        unified_memory: true,
+                        family: "Apple9".into(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(rendered.capture_identity(), capture_identity);
+        assert!(rendered.partial_flush.is_some());
+        assert!(rendered.inner.evaluation.is_some());
+        assert_eq!(rendered.summary().fallback_count, 0);
+    }
+
+    #[test]
+    fn cpu_only_scheduled_program_artifact_retains_v1_identity_and_round_trip() {
+        let schedule = CompiledMultiStepLr::new(0.01, 0.5, [2, 4]).unwrap();
+        let source = CompiledModuleAdamWPlan::compile_graph(
+            module_config().with_captured_multi_step_lr(schedule),
+            TiedFrozenModule::new([1.0, -1.0]),
+            |module, graph, inputs| {
+                let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                Ok(CompiledAdamWGraph::scalar(loss, outputs))
+            },
+        )
+        .unwrap();
+        let artifact = source.program_artifact().unwrap();
+        assert_eq!(artifact.info().format_version(), 1);
+        assert_eq!(artifact.as_bytes()[4], 1);
+        program_artifact::rewrite_json_for_test(&artifact, |json| {
+            assert!(json.get("metal").is_none());
+        });
+        let checkpoint = source
+            .prepare(&CpuSessionTarget::new())
+            .unwrap()
+            .module_checkpoint()
+            .unwrap();
+        let restored = CompiledModuleAdamWPlan::restore_from_program_artifact(
+            TiedFrozenModule::new([9.0, 10.0]),
+            &CompiledAdamWProgramArtifact::from_bytes(artifact.as_bytes().to_vec()).unwrap(),
+            &checkpoint,
+        )
+        .unwrap();
+        assert_eq!(restored.program_artifact().unwrap(), artifact);
+        assert!(
+            restored
+                .plan
+                .metal_plan(
+                    MetalRenderer::new(
+                        8,
+                        crate::runtime::metal::MetalCapabilities {
+                            max_buffer_length: 1 << 30,
+                            unified_memory: true,
+                            family: "Apple9".into(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .is_err()
         );
     }
 
