@@ -9,7 +9,8 @@ use std::{
 };
 
 const MAGIC: &[u8; 4] = b"RGAP";
-const FORMAT_VERSION: u8 = 1;
+const LEGACY_FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 
 #[cfg(test)]
@@ -89,6 +90,7 @@ impl Eq for CompiledAdamWProgramArtifact {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompiledAdamWProgramArtifactInfo {
+    format_version: u8,
     identity: u64,
     capture_identity: u64,
     accumulation_capture_identity: Option<u64>,
@@ -164,7 +166,7 @@ fn artifact_file_error(error: ExactFileError) -> CompiledAdamWProgramArtifactFil
 
 impl CompiledAdamWProgramArtifactInfo {
     pub fn format_version(&self) -> u8 {
-        FORMAT_VERSION
+        self.format_version
     }
 
     pub fn identity(&self) -> u64 {
@@ -288,6 +290,25 @@ impl CompiledAdamWProgramArtifact {
     }
 
     #[cfg(test)]
+    pub(super) fn retained_metal_recipe_extents(&self) -> Vec<(usize, usize)> {
+        let Some(metal) = self
+            .admitted
+            .as_ref()
+            .and_then(|admitted| admitted.wire.metal.as_ref())
+        else {
+            return Vec::new();
+        };
+        std::iter::once((metal.main.len(), metal.main.capacity()))
+            .chain(
+                [metal.partial_flush.as_ref(), metal.evaluation.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|recipe| (recipe.len(), recipe.capacity())),
+            )
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(super) fn shares_admission_with(&self, other: &Self) -> bool {
         self.admitted
             .as_ref()
@@ -339,6 +360,8 @@ impl<M> std::error::Error for CompiledModuleAdamWArtifactRestoreError<M> {}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProgramWire {
+    #[serde(skip)]
+    format_version: u8,
     module: ModuleWire,
     main: MainWire,
     accumulation: Option<PhaseWire>,
@@ -357,6 +380,16 @@ struct ProgramWire {
     frozen_parameters: BTreeSet<String>,
     learning_rate: LearningRateWire,
     adamw: AdamWPolicyWire,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metal: Option<MetalProgramWire>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MetalProgramWire {
+    main: Vec<u8>,
+    partial_flush: Option<Vec<u8>>,
+    evaluation: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -476,6 +509,12 @@ struct ProgramCaptures {
     partial_flush: Option<Arc<CapturedMixedSchedule>>,
     zero_grad: Option<Arc<CapturedMixedSchedule>>,
     evaluation: Option<Arc<CapturedSchedule>>,
+    metal_main: Option<PortableCapturedInferenceRecipe>,
+    metal_partial_flush: Option<PortableCapturedInferenceRecipe>,
+    metal_evaluation: Option<PortableCapturedInferenceRecipe>,
+    metal_main_recurrent: Option<CompiledRecurrentCapture>,
+    metal_partial_flush_recurrent: Option<CompiledRecurrentCapture>,
+    metal_evaluation_capture: Option<CompiledEvaluationCapture>,
 }
 
 struct AdmittedProgramArtifact {
@@ -556,12 +595,62 @@ impl ProgramCaptures {
                     .ok_or_else(|| training("compiled evaluation artifact identity mismatch"))
             })
             .transpose()?;
+        let metal_main = wire
+            .metal
+            .as_ref()
+            .map(|metal| {
+                PortableCapturedInferenceRecipe::from_bytes(&metal.main)
+                    .map_err(captured_inference_error)
+            })
+            .transpose()?;
+        let metal_partial_flush = wire
+            .metal
+            .as_ref()
+            .and_then(|metal| metal.partial_flush.as_ref())
+            .map(|recipe| {
+                PortableCapturedInferenceRecipe::from_bytes(recipe)
+                    .map_err(captured_inference_error)
+            })
+            .transpose()?;
+        let metal_evaluation = wire
+            .metal
+            .as_ref()
+            .and_then(|metal| metal.evaluation.as_ref())
+            .map(|recipe| {
+                PortableCapturedInferenceRecipe::from_bytes(recipe)
+                    .map_err(captured_inference_error)
+            })
+            .transpose()?;
+        let metal_main_recurrent = metal_main
+            .clone()
+            .map(|recipe| CompiledRecurrentCapture::from_artifact(main.as_ref(), Some(recipe)))
+            .transpose()?;
+        let metal_partial_flush_recurrent = metal_partial_flush
+            .clone()
+            .zip(partial_flush.as_ref())
+            .map(|(recipe, capture)| {
+                CompiledRecurrentCapture::from_artifact(capture.as_ref(), Some(recipe))
+            })
+            .transpose()?;
+        let metal_evaluation_capture = metal_evaluation
+            .clone()
+            .zip(evaluation.as_ref())
+            .map(|(recipe, capture)| {
+                CompiledEvaluationCapture::from_artifact(capture.clone(), Some(recipe))
+            })
+            .transpose()?;
         Ok(Self {
             main,
             accumulation,
             partial_flush,
             zero_grad,
             evaluation,
+            metal_main,
+            metal_partial_flush,
+            metal_evaluation,
+            metal_main_recurrent,
+            metal_partial_flush_recurrent,
+            metal_evaluation_capture,
         })
     }
 }
@@ -573,6 +662,9 @@ fn checksum(bytes: &[u8]) -> u64 {
 }
 
 fn encode(wire: &ProgramWire) -> Result<Vec<u8>> {
+    if !matches!(wire.format_version, LEGACY_FORMAT_VERSION | FORMAT_VERSION) {
+        return Err(training("compiled program artifact version is unsupported"));
+    }
     let payload = serde_json::to_vec(wire)
         .map_err(|error| training(format!("compiled program artifact encode: {error}")))?;
     let length = u64::try_from(payload.len())
@@ -586,7 +678,7 @@ fn encode(wire: &ProgramWire) -> Result<Vec<u8>> {
     }
     let mut bytes = Vec::with_capacity(total);
     bytes.extend_from_slice(MAGIC);
-    bytes.push(FORMAT_VERSION);
+    bytes.push(wire.format_version);
     bytes.extend_from_slice(&length.to_le_bytes());
     bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(&checksum(&bytes).to_le_bytes());
@@ -599,7 +691,7 @@ fn decode(bytes: &[u8]) -> Result<ProgramWire> {
     if bytes.len() < 21 || bytes.len() > MAX_ARTIFACT_BYTES || &bytes[..4] != MAGIC {
         return Err(training("compiled program artifact header is invalid"));
     }
-    if bytes[4] != FORMAT_VERSION {
+    if !matches!(bytes[4], LEGACY_FORMAT_VERSION | FORMAT_VERSION) {
         return Err(training("compiled program artifact version is unsupported"));
     }
     let payload_len = u64::from_le_bytes(
@@ -623,8 +715,10 @@ fn decode(bytes: &[u8]) -> Result<ProgramWire> {
     if checksum(&bytes[..payload_end]) != expected {
         return Err(training("compiled program artifact checksum mismatch"));
     }
-    serde_json::from_slice(&bytes[13..payload_end])
-        .map_err(|error| training(format!("compiled program artifact payload: {error}")))
+    let mut wire: ProgramWire = serde_json::from_slice(&bytes[13..payload_end])
+        .map_err(|error| training(format!("compiled program artifact payload: {error}")))?;
+    wire.format_version = bytes[4];
+    Ok(wire)
 }
 
 #[cfg(test)]
@@ -636,9 +730,12 @@ where
     F: FnOnce(&mut serde_json::Value),
 {
     let wire = decode(artifact.as_bytes()).expect("valid test artifact");
+    let format_version = wire.format_version;
     let mut json = serde_json::to_value(wire).expect("serializable test artifact");
     rewrite(&mut json);
-    let wire = serde_json::from_value(json).expect("well-formed rewritten test artifact");
+    let mut wire: ProgramWire =
+        serde_json::from_value(json).expect("well-formed rewritten test artifact");
+    wire.format_version = format_version;
     let bytes = encode(&wire).expect("bounded rewritten test artifact");
     let unchecked = CompiledAdamWProgramArtifact {
         bytes: bytes.clone(),
@@ -662,6 +759,15 @@ impl ProgramWire {
         }
         if let Some(evaluation) = &mut self.evaluation {
             drop(std::mem::take(&mut evaluation.capture));
+        }
+        if let Some(metal) = &mut self.metal {
+            drop(std::mem::take(&mut metal.main));
+            if let Some(recipe) = &mut metal.partial_flush {
+                drop(std::mem::take(recipe));
+            }
+            if let Some(recipe) = &mut metal.evaluation {
+                drop(std::mem::take(recipe));
+            }
         }
     }
 
@@ -696,6 +802,7 @@ impl ProgramWire {
             })
             .transpose()?;
         Ok(CompiledAdamWProgramArtifactInfo {
+            format_version: self.format_version,
             identity,
             capture_identity,
             accumulation_capture_identity: captures
@@ -718,9 +825,66 @@ impl ProgramWire {
     }
 
     fn validate(&self) -> Result<(CompiledAdamWProgramArtifactInfo, ProgramCaptures)> {
+        if self.format_version == LEGACY_FORMAT_VERSION {
+            if self.metal.is_some() {
+                return Err(training(
+                    "compiled v1 program artifact cannot contain a Metal recipe",
+                ));
+            }
+        } else if self.format_version == FORMAT_VERSION {
+            let metal = self
+                .metal
+                .as_ref()
+                .ok_or_else(|| training("compiled v2 program artifact Metal recipe is absent"))?;
+            if metal.partial_flush.is_some() != self.partial_flush.is_some()
+                || metal.evaluation.is_some() != self.evaluation.is_some()
+            {
+                return Err(training(
+                    "compiled program artifact Metal recipe inventory differs",
+                ));
+            }
+        } else {
+            return Err(training("compiled program artifact version is unsupported"));
+        }
         let canonical = serde_json::to_vec(self)
             .map_err(|error| training(format!("compiled program artifact validation: {error}")))?;
         let captures = ProgramCaptures::decode(self)?;
+        if self.format_version == FORMAT_VERSION {
+            let expected_names = self
+                .host_token_inputs
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let main = captures
+                .metal_main
+                .as_ref()
+                .expect("v2 validation requires a main Metal recipe");
+            let expected_main_policy = if expected_names.is_empty() {
+                PortableInferenceHostPolicy::None
+            } else {
+                PortableInferenceHostPolicy::Training
+            };
+            if main.host_policy() != expected_main_policy
+                || main.host_input_names() != expected_names
+                || captures.metal_partial_flush.as_ref().is_some_and(|recipe| {
+                    recipe.host_policy() != PortableInferenceHostPolicy::None
+                        || !recipe.host_input_names().is_empty()
+                })
+                || captures.metal_evaluation.as_ref().is_some_and(|recipe| {
+                    recipe.host_policy()
+                        != if expected_names.is_empty() {
+                            PortableInferenceHostPolicy::None
+                        } else {
+                            PortableInferenceHostPolicy::FixedGathers
+                        }
+                        || recipe.host_input_names() != expected_names
+                })
+            {
+                return Err(training(
+                    "compiled program artifact Metal host policy differs",
+                ));
+            }
+        }
         let info = self.info(checksum(&canonical), &captures)?;
         validate_module_wire(&self.module, &self.frozen_parameters)?;
 
@@ -1490,7 +1654,53 @@ fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
             })
         })
         .transpose()?;
+    let metal = match plan.contract.metal() {
+        Ok(_) => Some((|| -> Result<MetalProgramWire> {
+            let main_recipe = main
+                .recurrent_capture
+                .portable_training_recipe(
+                    &plan.contract.host_token_inputs,
+                    &main.frozen_parameter_nodes,
+                )?
+                .to_bytes()
+                .map_err(captured_inference_error)?;
+            let partial_flush = plan
+                .partial_flush
+                .as_ref()
+                .map(|transition| {
+                    transition
+                        .phase()
+                        .recurrent_capture
+                        .portable_recipe(PortableInferenceHostPolicy::None)?
+                        .to_bytes()
+                        .map_err(captured_inference_error)
+                })
+                .transpose()?;
+            let evaluation = plan
+                .evaluation
+                .as_ref()
+                .map(|evaluation| {
+                    evaluation
+                        .inference
+                        .portable_recipe()?
+                        .to_bytes()
+                        .map_err(captured_inference_error)
+                })
+                .transpose()?;
+            Ok(MetalProgramWire {
+                main: main_recipe,
+                partial_flush,
+                evaluation,
+            })
+        })()?),
+        Err(_) => None,
+    };
     Ok(ProgramWire {
+        format_version: if metal.is_some() {
+            FORMAT_VERSION
+        } else {
+            LEGACY_FORMAT_VERSION
+        },
         module: module_wire(&owner.seal),
         main: MainWire {
             phase: phase_wire(
@@ -1545,11 +1755,12 @@ fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
             weight_decay_bits: plan.contract.optimizer.weight_decay.to_bits(),
             weight_decay_exclusions: plan.contract.optimizer.weight_decay_exclusions.clone(),
         },
+        metal,
     })
 }
 
 impl<M: Module> CompiledModuleAdamWPlan<M> {
-    /// Serializes the resource-free CPU executable plan separately from tensor state.
+    /// Serializes the resource-free executable plan separately from tensor state.
     pub fn program_artifact(&self) -> Result<CompiledAdamWProgramArtifact> {
         self.validate_ready_for_preparation()?;
         let wire = program_wire(self)?;
@@ -1658,6 +1869,7 @@ fn decode_auxiliary(
     main: &CapturedMixedSchedule,
     wire: &PhaseWire,
     capture: Arc<CapturedMixedSchedule>,
+    admitted_recurrent: Option<CompiledRecurrentCapture>,
 ) -> Result<CompiledAdamWAuxiliaryPlan> {
     #[cfg(test)]
     update_decode_counts(|counts| counts.topology_phase_validations += 1);
@@ -1676,7 +1888,10 @@ fn decode_auxiliary(
     #[cfg(test)]
     update_decode_counts(|counts| counts.cursor_projections += 1);
     let capture_identity = cursor_projection.target_capture_identity();
-    let recurrent_capture = CompiledRecurrentCapture::from_artifact(capture.as_ref())?;
+    let recurrent_capture = match admitted_recurrent {
+        Some(recurrent) => recurrent,
+        None => CompiledRecurrentCapture::from_artifact(capture.as_ref(), None)?,
+    };
     Ok(CompiledAdamWAuxiliaryPlan {
         phase: CompiledRecurrentPhasePlan {
             capture,
@@ -1913,7 +2128,10 @@ fn seal_admitted_training_topology(
     }
     let (state_values, state_versions) = zero_frontier(&capture, &main_state_buffers)?;
     let state_input_keys = decode_input_key_map(&wire.main.state_input_keys)?;
-    let recurrent_capture = Arc::new(CompiledRecurrentCapture::from_artifact(capture.as_ref())?);
+    let recurrent_capture = Arc::new(match &captures.metal_main_recurrent {
+        Some(recurrent) => recurrent.clone(),
+        None => CompiledRecurrentCapture::from_artifact(capture.as_ref(), None)?,
+    });
     let accumulation = wire
         .accumulation
         .as_ref()
@@ -1936,6 +2154,7 @@ fn seal_admitted_training_topology(
                 phase: CompiledRecurrentPhasePlan {
                     recurrent_capture: CompiledRecurrentCapture::from_artifact(
                         phase_capture.as_ref(),
+                        None,
                     )?,
                     capture: phase_capture,
                     state_buffers,
@@ -1989,7 +2208,10 @@ fn seal_admitted_training_topology(
                 return Err(training("compiled evaluation artifact identity mismatch"));
             }
             Ok(CompiledEvaluationPlan {
-                inference: CompiledEvaluationCapture::from_artifact(capture)?,
+                inference: match &captures.metal_evaluation_capture {
+                    Some(inference) => inference.clone(),
+                    None => CompiledEvaluationCapture::from_artifact(capture, None)?,
+                },
                 inputs: evaluation.inputs.clone(),
                 output_names: evaluation.output_names.clone(),
                 parameter_inputs: evaluation.parameter_inputs.clone(),
@@ -2025,13 +2247,22 @@ fn seal_admitted_training_topology(
         .partial_flush
         .as_ref()
         .zip(captures.partial_flush.as_ref())
-        .map(|(phase, capture)| decode_auxiliary(inner.capture.as_ref(), phase, capture.clone()))
+        .map(|(phase, capture)| {
+            decode_auxiliary(
+                inner.capture.as_ref(),
+                phase,
+                capture.clone(),
+                captures.metal_partial_flush_recurrent.clone(),
+            )
+        })
         .transpose()?;
     let zero_grad = wire
         .zero_grad
         .as_ref()
         .zip(captures.zero_grad.as_ref())
-        .map(|(phase, capture)| decode_auxiliary(inner.capture.as_ref(), phase, capture.clone()))
+        .map(|(phase, capture)| {
+            decode_auxiliary(inner.capture.as_ref(), phase, capture.clone(), None)
+        })
         .transpose()?;
     let plan = CompiledAdamWPlan {
         program_identity,
