@@ -6367,6 +6367,63 @@ impl CompiledRecurrentCapture {
         })
     }
 
+    fn from_canonical_mixed(
+        graph: &Graph,
+        capture: &CapturedMixedSchedule,
+        public_requested: &[NodeId],
+        state_links: &[InferenceStateLink],
+        initial_state: BTreeMap<String, TensorData>,
+    ) -> Result<Self> {
+        let prefix = AuthenticatedRecurrentPrefix::from_mixed(capture)?;
+        #[cfg(test)]
+        let reference_initial_state = initial_state.clone();
+        let stateful = CapturedStatefulInference::from_captured_graph(
+            graph,
+            prefix.capture,
+            prefix.execution_plan,
+            public_requested,
+            state_links,
+            initial_state,
+        )
+        .map_err(captured_inference_error)?;
+        #[cfg(test)]
+        {
+            record_canonical_recurrent_capture();
+            if canonical_recurrent_reference_enabled() {
+                let reference = CapturedStatefulInference::from_graph(
+                    graph,
+                    public_requested,
+                    state_links,
+                    reference_initial_state,
+                )
+                .map_err(captured_inference_error)?;
+                let stateful_recipe = stateful
+                    .portable_recipe(PortableInferenceHostPolicy::None)
+                    .and_then(|recipe| recipe.to_bytes())
+                    .map_err(captured_inference_error)?;
+                let reference_recipe = reference
+                    .portable_recipe(PortableInferenceHostPolicy::None)
+                    .and_then(|recipe| recipe.to_bytes())
+                    .map_err(captured_inference_error)?;
+                if stateful.capture().to_bytes().map_err(replay_error)?
+                    != reference.capture().to_bytes().map_err(replay_error)?
+                    || stateful.execution_plan() != reference.execution_plan()
+                    || stateful.public_output_count() != reference.public_output_count()
+                    || stateful.state_links().ne(reference.state_links())
+                    || stateful.initial_state() != reference.initial_state()
+                    || stateful.deployment_identity() != reference.deployment_identity()
+                    || stateful_recipe != reference_recipe
+                {
+                    return Err(training(
+                        "canonical recurrent capture differs from reference construction",
+                    ));
+                }
+                record_reference_recurrent_capture();
+            }
+        }
+        Ok(Self::from_stateful(stateful))
+    }
+
     fn execution_plan(&self) -> &ExecutionPlanSummary {
         self.execution_plan.as_ref()
     }
@@ -6432,45 +6489,135 @@ fn artifact_recurrent_execution_plan(
 ) -> Result<(CapturedSchedule, ExecutionPlanSummary)> {
     #[cfg(test)]
     program_artifact::record_recurrent_execution_plan();
-    let split = capture
-        .schedule
-        .items
-        .iter()
-        .position(crate::ScheduleItem::is_effect)
-        .ok_or_else(|| training("compiled artifact mixed capture has no effects"))?;
-    if capture.schedule.items[split..]
-        .iter()
-        .any(|item| !item.is_effect())
-    {
-        return Err(training(
-            "compiled artifact mixed capture does not have an ordered effect suffix",
-        ));
-    }
-    let mut pure = capture.schedule.clone();
-    pure.items.truncate(split);
-    let split = u64::try_from(split).map_err(|_| training("compiled artifact split overflows"))?;
-    for item in &mut pure.items {
-        item.consumers.retain(|consumer| *consumer < split);
-    }
-    pure.requested.extend(
-        capture
-            .value_bindings
+    let prefix = AuthenticatedRecurrentPrefix::from_mixed(capture)?;
+    Ok((prefix.capture, prefix.execution_plan))
+}
+
+struct AuthenticatedRecurrentPrefix {
+    capture: CapturedSchedule,
+    execution_plan: ExecutionPlanSummary,
+}
+
+impl AuthenticatedRecurrentPrefix {
+    fn from_mixed(capture: &CapturedMixedSchedule) -> Result<Self> {
+        let split = capture
+            .schedule
+            .items
             .iter()
-            .map(|binding| binding.producer_output.id),
-    );
-    let specialization = pure
-        .specialized_from
-        .as_ref()
-        .map(|source| (source.source_identity, source.bindings.as_slice()));
-    crate::schedule::rekey_schedule_items(&mut pure.items, &[], specialization)
-        .map_err(schedule_error)?;
-    pure.identity = crate::schedule::artifact::identity(&pure)
-        .map_err(|error| training(format!("compiled artifact capture identity: {error}")))?;
-    let pure = CapturedSchedule::from_bytes(&pure.to_bytes().map_err(replay_error)?)
-        .map_err(replay_error)?;
-    let execution_plan = ExecutionPlanSummary::from_capture(&pure, true)
-        .map_err(|error| training(format!("compiled artifact execution summary: {error}")))?;
-    Ok((pure, execution_plan))
+            .position(crate::ScheduleItem::is_effect)
+            .ok_or_else(|| training("compiled artifact mixed capture has no effects"))?;
+        if capture.schedule.items[split..]
+            .iter()
+            .any(|item| !item.is_effect())
+        {
+            return Err(training(
+                "compiled artifact mixed capture does not have an ordered effect suffix",
+            ));
+        }
+        let mut pure = capture.schedule.clone();
+        pure.items.truncate(split);
+        let split =
+            u64::try_from(split).map_err(|_| training("compiled artifact split overflows"))?;
+        for item in &mut pure.items {
+            item.consumers.retain(|consumer| *consumer < split);
+        }
+        pure.requested.extend(
+            capture
+                .value_bindings
+                .iter()
+                .map(|binding| binding.producer_output.id),
+        );
+        let specialization = pure
+            .specialized_from
+            .as_ref()
+            .map(|source| (source.source_identity, source.bindings.as_slice()));
+        crate::schedule::rekey_schedule_items(&mut pure.items, &[], specialization)
+            .map_err(schedule_error)?;
+        pure.identity = crate::schedule::artifact::identity(&pure)
+            .map_err(|error| training(format!("compiled artifact capture identity: {error}")))?;
+        let pure = CapturedSchedule::from_bytes(&pure.to_bytes().map_err(replay_error)?)
+            .map_err(replay_error)?;
+        let execution_plan = ExecutionPlanSummary::from_capture(&pure, true)
+            .map_err(|error| training(format!("compiled artifact execution summary: {error}")))?;
+        Ok(Self {
+            capture: pure,
+            execution_plan,
+        })
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CanonicalRecurrentCaptureCounts {
+    canonical: usize,
+    reference: usize,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CANONICAL_RECURRENT_CAPTURE_COUNTS: std::cell::Cell<CanonicalRecurrentCaptureCounts> =
+        const { std::cell::Cell::new(CanonicalRecurrentCaptureCounts {
+            canonical: 0,
+            reference: 0,
+        }) };
+    static CANONICAL_RECURRENT_REFERENCE_ENABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+struct CanonicalRecurrentReferenceGuard(bool);
+
+#[cfg(test)]
+impl Drop for CanonicalRecurrentReferenceGuard {
+    fn drop(&mut self) {
+        CANONICAL_RECURRENT_REFERENCE_ENABLED.with(|enabled| enabled.set(self.0));
+    }
+}
+
+#[cfg(test)]
+fn with_canonical_recurrent_reference<T>(f: impl FnOnce() -> T) -> T {
+    let previous = CANONICAL_RECURRENT_REFERENCE_ENABLED.with(|enabled| enabled.replace(true));
+    let _guard = CanonicalRecurrentReferenceGuard(previous);
+    f()
+}
+
+#[cfg(test)]
+fn canonical_recurrent_capture_counts() -> CanonicalRecurrentCaptureCounts {
+    CANONICAL_RECURRENT_CAPTURE_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_canonical_recurrent_capture() {
+    CANONICAL_RECURRENT_CAPTURE_COUNTS.with(|counts| {
+        let mut next = counts.get();
+        next.canonical += 1;
+        counts.set(next);
+    });
+}
+
+#[cfg(test)]
+fn canonical_recurrent_reference_enabled() -> bool {
+    CANONICAL_RECURRENT_REFERENCE_ENABLED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_reference_recurrent_capture() {
+    CANONICAL_RECURRENT_CAPTURE_COUNTS.with(|counts| {
+        let mut next = counts.get();
+        next.reference += 1;
+        counts.set(next);
+    });
+}
+
+#[cfg(test)]
+fn canonical_recurrent_capture_delta(
+    before: CanonicalRecurrentCaptureCounts,
+    after: CanonicalRecurrentCaptureCounts,
+) -> CanonicalRecurrentCaptureCounts {
+    CanonicalRecurrentCaptureCounts {
+        canonical: after.canonical - before.canonical,
+        reference: after.reference - before.reference,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -6931,7 +7078,7 @@ fn resolve_recurrent_store_groups(
 
 struct CompiledTrainingPhaseCapture {
     capture: CapturedMixedSchedule,
-    recurrent_capture: CapturedStatefulInference,
+    recurrent_capture: CompiledRecurrentCapture,
     state_buffers: BTreeMap<RecurrentStateKey, u64>,
     recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
 }
@@ -6990,17 +7137,9 @@ fn capture_training_phase(
         .iter()
         .map(|spec| (spec.input_name.clone(), spec.value.clone()))
         .collect();
-    let recurrent_capture = CapturedStatefulInference::from_graph(
-        graph,
-        &public_requested,
-        &state_links,
-        initial_state,
-    )
-    .map_err(captured_inference_error)?;
-
     let public_output_count = public_requested.len();
     let mut requested = Vec::with_capacity(public_output_count + updates.len());
-    requested.extend(public_requested);
+    requested.extend(public_requested.iter().copied());
     for spec in specs {
         requested.push(updates[&spec.key]);
     }
@@ -7065,6 +7204,13 @@ fn capture_training_phase(
     let capture =
         CapturedMixedSchedule::from_parts(captured, &mixed, states).map_err(replay_error)?;
     validate_external_binding_ownership(&capture, external_input_names.iter())?;
+    let recurrent_capture = CompiledRecurrentCapture::from_canonical_mixed(
+        graph,
+        &capture,
+        &public_requested,
+        &state_links,
+        initial_state,
+    )?;
     Ok(CompiledTrainingPhaseCapture {
         capture,
         recurrent_capture,
@@ -7367,9 +7513,7 @@ impl CompiledTrainingPlan {
             let plan = CompiledTrainingSiblingPlan {
                 phase: CompiledRecurrentPhasePlan {
                     capture: Arc::new(phase.capture),
-                    recurrent_capture: CompiledRecurrentCapture::from_stateful(
-                        phase.recurrent_capture,
-                    ),
+                    recurrent_capture: phase.recurrent_capture,
                     state_buffers: phase.state_buffers,
                     cursor_projection: Arc::new(cursor_projection),
                     capture_identity,
@@ -7414,9 +7558,7 @@ impl CompiledTrainingPlan {
         Ok((
             Self {
                 capture: Arc::new(main.capture),
-                recurrent_capture: Arc::new(CompiledRecurrentCapture::from_stateful(
-                    main.recurrent_capture,
-                )),
+                recurrent_capture: Arc::new(main.recurrent_capture),
                 inputs: optimizer.inputs().clone(),
                 phase_outputs,
                 parameter_buffers,
@@ -7861,16 +8003,8 @@ impl CompiledAdamWAuxiliaryPlan {
             &public_requested,
             &state_links,
         )?;
-        let recurrent_capture = CapturedStatefulInference::from_graph(
-            &graph,
-            &public_requested,
-            &state_links,
-            initial_state,
-        )
-        .map_err(captured_inference_error)?;
-
         let public_output_count = public_requested.len();
-        let mut requested = public_requested;
+        let mut requested = public_requested.clone();
         requested.extend(specs.iter().map(|(_, key, ..)| updates[key]));
         for node in &requested {
             checked_descriptor(graph.shape(*node)?, graph.dtype(*node)?)?;
@@ -7924,6 +8058,13 @@ impl CompiledAdamWAuxiliaryPlan {
         let capture = CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
             .map_err(replay_error)?;
         validate_external_binding_ownership(&capture, std::iter::empty::<&String>())?;
+        let recurrent_capture = CompiledRecurrentCapture::from_canonical_mixed(
+            &graph,
+            &capture,
+            &public_requested,
+            &state_links,
+            initial_state,
+        )?;
         let cursor_projection = PreparedRecurrentCursorProjection::prepare(
             &training_plan.capture,
             &capture,
@@ -7939,7 +8080,7 @@ impl CompiledAdamWAuxiliaryPlan {
         Ok(Self {
             phase: CompiledRecurrentPhasePlan {
                 capture: Arc::new(capture),
-                recurrent_capture: CompiledRecurrentCapture::from_stateful(recurrent_capture),
+                recurrent_capture,
                 state_buffers,
                 cursor_projection: Arc::new(cursor_projection),
                 capture_identity,
@@ -8047,10 +8188,6 @@ impl CompiledRecurrentPhasePlan {
             .iter()
             .map(|(input, _, value, _, _)| (input.clone(), value.clone()))
             .collect();
-        let recurrent_capture =
-            CapturedStatefulInference::from_graph(&graph, &[], &state_links, initial_state)
-                .map_err(captured_inference_error)?;
-
         let requested = specs
             .iter()
             .map(|(_, key, ..)| successors[key])
@@ -8105,6 +8242,13 @@ impl CompiledRecurrentPhasePlan {
         let capture = CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
             .map_err(replay_error)?;
         validate_external_binding_ownership(&capture, std::iter::empty::<&String>())?;
+        let recurrent_capture = CompiledRecurrentCapture::from_canonical_mixed(
+            &graph,
+            &capture,
+            &[],
+            &state_links,
+            initial_state,
+        )?;
         let cursor_projection = PreparedRecurrentCursorProjection::prepare(
             &training_plan.capture,
             &capture,
@@ -8114,7 +8258,7 @@ impl CompiledRecurrentPhasePlan {
         let capture_identity = cursor_projection.target_capture_identity();
         Ok(Self {
             capture: Arc::new(capture),
-            recurrent_capture: CompiledRecurrentCapture::from_stateful(recurrent_capture),
+            recurrent_capture,
             state_buffers,
             cursor_projection: Arc::new(cursor_projection),
             capture_identity,
@@ -17567,6 +17711,31 @@ mod tests {
         let squared = graph.square(output)?;
         let loss = graph.reduce(squared, crate::ReduceKind::Mean, None, false)?;
         Ok((loss, BTreeMap::from([("output".into(), output)])))
+    }
+
+    #[test]
+    fn recurrent_training_phases_derive_from_one_canonical_mixed_capture() {
+        let before = canonical_recurrent_capture_counts();
+        let module = TiedFrozenModule::new([1.0, -1.0]);
+        let plan = with_canonical_recurrent_reference(|| {
+            CompiledAdamWPlan::compile_module_graph(
+                module_config().with_gradient_accumulation(3).unwrap(),
+                &module,
+                |module, graph, inputs| {
+                    let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+                    Ok(CompiledAdamWGraph::scalar(loss, outputs))
+                },
+            )
+        })
+        .unwrap();
+        let counts =
+            canonical_recurrent_capture_delta(before, canonical_recurrent_capture_counts());
+
+        assert_eq!(counts.canonical, 4);
+        assert_eq!(counts.reference, 4);
+        assert!(plan.inner.accumulation.is_some());
+        assert!(plan.partial_flush.is_some());
+        assert!(plan.zero_grad.is_some());
     }
 
     fn tied_token_mean_config() -> CompiledAdamWConfig {

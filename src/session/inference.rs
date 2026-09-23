@@ -327,27 +327,33 @@ impl CapturedInference {
         }
         let identity =
             captured_inference_identity(&capture, &resident_bindings, &quantized_input_names)?;
-        let captured_outputs = capture
-            .items
-            .iter()
-            .flat_map(|item| item.outputs.iter().map(|output| output.id))
-            .collect::<BTreeSet<_>>();
-        let mut gather_vjp_provenance = graph
-            .gather_vjp_provenance()
-            .iter()
-            .filter(|provenance| {
-                captured_outputs.contains(&(provenance.gather.index() as u64))
-                    && captured_outputs.contains(&(provenance.scatter_add.index() as u64))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        gather_vjp_provenance
-            .sort_by_key(|provenance| (provenance.gather.index(), provenance.scatter_add.index()));
+        let gather_vjp_provenance = captured_gather_vjp_provenance(graph, &capture);
         Ok(Self {
             capture,
             execution_plan,
             resident_bindings,
             quantized_input_names,
+            transient_inputs,
+            host_gathers: Vec::new(),
+            host_indexed_movements: Vec::new(),
+            gather_vjp_provenance,
+            identity,
+        })
+    }
+
+    fn from_captured_graph(
+        graph: &Graph,
+        capture: CapturedSchedule,
+        execution_plan: ExecutionPlanSummary,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        let identity = captured_inference_identity(&capture, &BTreeMap::new(), &BTreeMap::new())?;
+        let gather_vjp_provenance = captured_gather_vjp_provenance(graph, &capture);
+        let transient_inputs = capture.inputs.clone();
+        Ok(Self {
+            capture,
+            execution_plan,
+            resident_bindings: BTreeMap::new(),
+            quantized_input_names: BTreeMap::new(),
             transient_inputs,
             host_gathers: Vec::new(),
             host_indexed_movements: Vec::new(),
@@ -926,10 +932,10 @@ impl CapturedStatefulInference {
         Self::from_graph_impl(graph, requested, state_links, initial_state, residents)
     }
 
-    /// Captures a fixed-shape recurrent graph without assigning immutable
-    /// module residents. This is the backend-neutral seam used by compiled
-    /// training: parameters and optimizer slots are recurrent state inputs,
-    /// while frozen values are already graph constants.
+    /// Test-only reference capture without immutable module residents.
+    /// Compiled training uses this to authenticate its canonical mixed-prefix
+    /// derivation against the former independent capture path.
+    #[cfg(test)]
     pub(crate) fn from_graph(
         graph: &Graph,
         requested: &[NodeId],
@@ -942,6 +948,39 @@ impl CapturedStatefulInference {
             state_links,
             initial_state,
             BTreeMap::new(),
+        )
+    }
+
+    /// Authenticates recurrent ownership around an already captured schedule.
+    ///
+    /// This is the graph-backed counterpart to a portable recipe restore. It
+    /// deliberately reuses the caller's canonical capture and execution
+    /// summary instead of scheduling and capturing the same graph a second
+    /// time. The graph remains authoritative for state-input names and Gather
+    /// VJP provenance used by training-only host-index authentication.
+    pub(crate) fn from_captured_graph(
+        graph: &Graph,
+        capture: CapturedSchedule,
+        execution_plan: ExecutionPlanSummary,
+        public_requested: &[NodeId],
+        state_links: &[InferenceStateLink],
+        initial_state: BTreeMap<String, TensorData>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        if state_links.is_empty() {
+            return Err(CapturedInferenceError::Binding(
+                "stateful inference requires at least one state link".into(),
+            ));
+        }
+        let public = public_requested.iter().copied().collect::<BTreeSet<_>>();
+        let state_nodes = Self::validate_state_link_nodes(graph, &public, state_links)?;
+        let inference = CapturedInference::from_captured_graph(graph, capture, execution_plan)?;
+        Self::from_captured_inference(
+            graph,
+            inference,
+            public_requested.len(),
+            state_links,
+            initial_state,
+            state_nodes,
         )
     }
 
@@ -958,8 +997,29 @@ impl CapturedStatefulInference {
             ));
         }
         let public = requested.iter().copied().collect::<BTreeSet<_>>();
-        let mut state_nodes = BTreeSet::new();
+        let state_nodes = Self::validate_state_link_nodes(graph, &public, state_links)?;
         let mut combined = requested.to_vec();
+        for link in state_links {
+            combined.push(link.output);
+        }
+        let inference =
+            CapturedInference::from_graph_residents_impl(graph, &combined, residents, false, &[])?;
+        Self::from_captured_inference(
+            graph,
+            inference,
+            requested.len(),
+            state_links,
+            initial_state,
+            state_nodes,
+        )
+    }
+
+    fn validate_state_link_nodes(
+        graph: &Graph,
+        public: &BTreeSet<NodeId>,
+        state_links: &[InferenceStateLink],
+    ) -> std::result::Result<BTreeSet<NodeId>, CapturedInferenceError> {
+        let mut state_nodes = BTreeSet::new();
         for link in state_links {
             graph
                 .op(link.input)
@@ -977,10 +1037,35 @@ impl CapturedStatefulInference {
                     "state links and public outputs must own distinct nodes".into(),
                 ));
             }
-            combined.push(link.output);
         }
-        let mut inference =
-            CapturedInference::from_graph_residents_impl(graph, &combined, residents, false, &[])?;
+        Ok(state_nodes)
+    }
+
+    fn from_captured_inference(
+        graph: &Graph,
+        mut inference: CapturedInference,
+        public_output_count: usize,
+        state_links: &[InferenceStateLink],
+        initial_state: BTreeMap<String, TensorData>,
+        state_nodes: BTreeSet<NodeId>,
+    ) -> std::result::Result<Self, CapturedInferenceError> {
+        if state_links.is_empty() {
+            return Err(CapturedInferenceError::Binding(
+                "stateful inference requires at least one state link".into(),
+            ));
+        }
+        if public_output_count > inference.capture.requested.len()
+            || public_output_count.checked_add(state_links.len())
+                != Some(inference.capture.requested.len())
+            || inference.capture.requested[public_output_count..]
+                .iter()
+                .copied()
+                .ne(state_links.iter().map(|link| link.output.index() as u64))
+        {
+            return Err(CapturedInferenceError::Binding(
+                "stateful inference requested inventory differs".into(),
+            ));
+        }
         let mut states = Vec::with_capacity(state_links.len());
         let mut names = BTreeSet::new();
         for link in state_links {
@@ -1024,13 +1109,13 @@ impl CapturedStatefulInference {
 
         let identity = captured_stateful_identity(
             inference.identity,
-            requested.len(),
+            public_output_count,
             &states,
             &initial_state,
         )?;
         Ok(Self {
             inference,
-            public_output_count: requested.len(),
+            public_output_count,
             states,
             initial_state,
             identity,
@@ -1160,6 +1245,29 @@ fn captured_stateful_identity(
             .hash(&mut hasher);
     }
     Ok(hasher.finish())
+}
+
+fn captured_gather_vjp_provenance(
+    graph: &Graph,
+    capture: &CapturedSchedule,
+) -> Vec<crate::ir::GatherVjpProvenance> {
+    let captured_outputs = capture
+        .items
+        .iter()
+        .flat_map(|item| item.outputs.iter().map(|output| output.id))
+        .collect::<BTreeSet<_>>();
+    let mut provenance = graph
+        .gather_vjp_provenance()
+        .iter()
+        .filter(|provenance| {
+            captured_outputs.contains(&(provenance.gather.index() as u64))
+                && captured_outputs.contains(&(provenance.scatter_add.index() as u64))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    provenance
+        .sort_by_key(|provenance| (provenance.gather.index(), provenance.scatter_add.index()));
+    provenance
 }
 
 fn authenticate_append_index_graph(
