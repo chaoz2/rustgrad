@@ -1212,7 +1212,7 @@ mod tests {
     use super::*;
     use crate::{
         ActivationFn, Backend, CapturedReplayExecutor, CapturedReplayOptions, CpuBackend, Error,
-        ModuleStateDict, Op, TensorData, nn::CastPolicy,
+        GradcheckConfig, ModuleStateDict, Op, TensorData, gradcheck_cpu, nn::CastPolicy,
     };
     use std::collections::{BTreeMap, HashMap};
 
@@ -2106,5 +2106,67 @@ mod tests {
             assert!(block.forward_mode(&mut graph, input, Mode::Eval).is_err());
             assert_eq!(graph.node_count(), before);
         }
+    }
+
+    #[test]
+    fn transformer_training_graph_matches_central_difference_oracle() {
+        let block = TransformerBlock::new_static_with_activation(
+            2,
+            1,
+            2,
+            true,
+            0.0,
+            17,
+            ActivationFn::new(|graph: &mut Graph, input| graph.square(input)),
+        )
+        .unwrap()
+        .with_causal_attention(true);
+        let mut graph = Graph::new();
+        let input = graph.input("input", [1, 2, 2]);
+        let output = block
+            .forward_mode(&mut graph, input, Mode::Training)
+            .unwrap()
+            .output;
+        let squared = graph.square(output).unwrap();
+        let loss = graph.sum_all(squared).unwrap();
+
+        let mut targets = vec![input];
+        block.visit("", &mut |name, parameter, kind| {
+            if kind == StateKind::Parameter
+                && matches!(name.as_str(), "query.0" | "value.0" | "ff1.0" | "ln1.0")
+            {
+                targets.push(parameter.node(&graph).unwrap());
+            }
+        });
+        let mut bindings = block
+            .input_bindings(&graph)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        bindings.insert("input".into(), data([1, 2, 2], &[0.2, -0.4, 0.7, 0.1]));
+        let original_nodes = graph.node_count();
+        let original_bindings = bindings.clone();
+
+        let report = gradcheck_cpu(
+            &graph,
+            loss,
+            &targets,
+            &bindings,
+            GradcheckConfig {
+                epsilon: 2e-3,
+                absolute_tolerance: 3e-2,
+                relative_tolerance: 3e-2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.coordinates_checked, 18);
+        assert!(
+            report.passed(),
+            "Transformer analytic gradients diverged from central differences: {:?}",
+            report.mismatches
+        );
+        assert_eq!(graph.node_count(), original_nodes);
+        assert_eq!(bindings, original_bindings);
     }
 }
