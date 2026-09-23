@@ -14,8 +14,9 @@
 //! | Mode | Command | Boundary |
 //! |---|---|---|
 //! | Reuse one plan | `cargo run --example compiled_transformer_train_resume -- cpu-reuse` | Restores in process without rebuilding the graph or capture. |
-//! | Portable file | `cargo run --example compiled_transformer_train_resume -- cpu-file-resume` | Recompiles a deliberately different initialization from a complete module checkpoint. |
+//! | Portable file | `cargo run --example compiled_transformer_train_resume -- cpu-file-resume` | Restores a deliberately different initialization from a resource-free program artifact and complete module checkpoint. |
 //! | Strict-native file | `cargo run --release --example compiled_transformer_train_resume -- native-cpu-file-resume` | Runs the same file lifecycle through CPU JIT with no fallback. |
+//! | Cross-process file | `cross-process-produce <cpu|native-cpu> <directory>`, then `cross-process-consume <cpu|native-cpu> <directory>` | Produces a pending RGAB and authenticates its continuation in a fresh OS process. |
 //!
 //! ## Replay and evidence modes
 //!
@@ -34,24 +35,26 @@ use rustgrad::{
     CompiledAdamWResumeBundle, CompiledAdamWRuntime, CompiledAdamWStep,
     CompiledCheckpointRestoreRuntime, CompiledCheckpointRuntime, CompiledDropoutConfig,
     CompiledDropoutKey, CompiledEvaluation, CompiledEvaluationRuntime, CompiledInputBatch,
-    CompiledInputSpec, CompiledModuleAdamWPlan, CompiledModuleAdamWSession, CompiledMultiStepLr,
-    CompiledScheduledAdamWRuntime, CompiledTrainingRatePolicyRuntime,
-    CompiledTrainingRatePolicyWindowCommitRuntime, CompiledTrainingRuntime, CompiledTrainingStep,
-    CompiledTrainingWindowCommit, CompiledTrainingWindowCommitRuntime,
-    CompiledTrainingWindowResetRuntime, CompiledTrainingWindowRuntime, CompiledTrainingWindowStep,
-    CpuBackend, CpuCompiledAdamW, CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, LossOptions,
-    MetalSessionTarget, Module, NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult,
-    NativeCpuCompiledEvaluationResult, NativeCpuRenderCapsuleProgramRole, NativeCpuSessionTarget,
-    NativeTrainingScoreboard, NodeId, Parameter, Reduction, Result, Scalar, Shape, TensorData,
-    TrainingDropoutProvider, TransformerBlock, sparse_categorical_cross_entropy,
+    CompiledInputSpec, CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan,
+    CompiledModuleAdamWSession, CompiledMultiStepLr, CompiledScheduledAdamWRuntime,
+    CompiledTrainingRatePolicyRuntime, CompiledTrainingRatePolicyWindowCommitRuntime,
+    CompiledTrainingRuntime, CompiledTrainingStep, CompiledTrainingWindowCommit,
+    CompiledTrainingWindowCommitRuntime, CompiledTrainingWindowResetRuntime,
+    CompiledTrainingWindowRuntime, CompiledTrainingWindowStep, CpuBackend, CpuCompiledAdamW,
+    CpuNonFinitePolicy, CpuSessionTarget, DType, Graph, LossOptions, MetalSessionTarget, Module,
+    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuCompiledEvaluationResult,
+    NativeCpuRenderCapsuleProgramRole, NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId,
+    Parameter, Reduction, Result, Scalar, Shape, TensorData, TrainingDropoutProvider,
+    TransformerBlock, sparse_categorical_cross_entropy,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     cell::Cell,
     collections::BTreeMap,
     env,
     error::Error,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -831,6 +834,211 @@ impl Drop for TemporaryCheckpointFile {
     }
 }
 
+const CROSS_PROCESS_EVIDENCE_VERSION: u64 = 1;
+const CROSS_PROCESS_EVIDENCE_MAX_BYTES: u64 = 64 << 10;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CrossProcessBackend {
+    Cpu,
+    NativeCpu,
+}
+
+impl CrossProcessBackend {
+    fn parse(value: &str) -> std::result::Result<Self, Box<dyn Error>> {
+        match value {
+            "cpu" => Ok(Self::Cpu),
+            "native-cpu" => Ok(Self::NativeCpu),
+            other => Err(format!(
+                "unknown cross-process backend {other:?}; expected `cpu` or `native-cpu`"
+            )
+            .into()),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::NativeCpu => "native CPU",
+        }
+    }
+}
+
+struct CrossProcessResumePaths {
+    pending_bundle: PathBuf,
+    terminal_checkpoint: PathBuf,
+    evidence: PathBuf,
+}
+
+impl CrossProcessResumePaths {
+    fn new(directory: &Path) -> std::result::Result<Self, Box<dyn Error>> {
+        let metadata = fs::symlink_metadata(directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("cross-process resume directory must be a real directory".into());
+        }
+        Ok(Self {
+            pending_bundle: directory.join("pending.rgab"),
+            terminal_checkpoint: directory.join("expected-terminal.safetensors"),
+            evidence: directory.join("expected.json"),
+        })
+    }
+
+    fn require_absent(&self) -> std::result::Result<(), Box<dyn Error>> {
+        for path in [
+            &self.pending_bundle,
+            &self.terminal_checkpoint,
+            &self.evidence,
+        ] {
+            match fs::symlink_metadata(path) {
+                Ok(_) => {
+                    return Err(format!(
+                        "cross-process resume producer refuses existing output {}",
+                        path.display()
+                    )
+                    .into());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CrossProcessCheckpointEvidence {
+    capture_identity: u64,
+    replay_step: u64,
+    optimizer_step: u64,
+    gradient_accumulation_steps: u64,
+    accumulation_index: u64,
+    discarded_microbatches: u64,
+    flushed_window_count: u64,
+    flushed_microbatch_count: u64,
+    flush_capture_identity: Option<u64>,
+    dropout_block_counter: Option<u64>,
+    accumulated_token_count: Option<u64>,
+    accumulated_loss_numerator_bits: Option<u32>,
+    window_loss_report_enabled: bool,
+    reset_transition_count: u64,
+    reset_capture_identity: Option<u64>,
+    accumulation_capture_identity: Option<u64>,
+}
+
+impl CrossProcessCheckpointEvidence {
+    fn new(checkpoint: &CompiledAdamWCheckpoint) -> Self {
+        let info = checkpoint.info();
+        Self {
+            capture_identity: info.capture_identity(),
+            replay_step: info.replay_step(),
+            optimizer_step: info.optimizer_step(),
+            gradient_accumulation_steps: info.gradient_accumulation_steps(),
+            accumulation_index: info.accumulation_index(),
+            discarded_microbatches: info.discarded_microbatches(),
+            flushed_window_count: info.flushed_window_count(),
+            flushed_microbatch_count: info.flushed_microbatch_count(),
+            flush_capture_identity: info.flush_capture_identity(),
+            dropout_block_counter: info.dropout_block_counter(),
+            accumulated_token_count: info.accumulated_token_count(),
+            accumulated_loss_numerator_bits: info.accumulated_loss_numerator().map(f32::to_bits),
+            window_loss_report_enabled: info.window_loss_report_enabled(),
+            reset_transition_count: info.reset_transition_count(),
+            reset_capture_identity: info.reset_capture_identity(),
+            accumulation_capture_identity: info.accumulation_capture_identity(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CrossProcessResumeEvidence {
+    format_version: u64,
+    backend: CrossProcessBackend,
+    pending_bundle_bytes: u64,
+    pending_bundle_checksum: u64,
+    terminal_checkpoint_bytes: u64,
+    terminal_checkpoint_checksum: u64,
+    evaluation_capture_identity: u64,
+    initial_evaluation_loss_bits: u64,
+    terminal_evaluation_loss_bits: u64,
+    pending: CrossProcessCheckpointEvidence,
+    terminal: CrossProcessCheckpointEvidence,
+}
+
+impl CrossProcessResumeEvidence {
+    fn canonical_bytes(&self) -> std::result::Result<Vec<u8>, Box<dyn Error>> {
+        let mut bytes = serde_json::to_vec_pretty(self)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    fn save(&self, path: &Path) -> std::result::Result<(), Box<dyn Error>> {
+        let bytes = self.canonical_bytes()?;
+        if u64::try_from(bytes.len())? > CROSS_PROCESS_EVIDENCE_MAX_BYTES {
+            return Err("cross-process resume evidence exceeds its byte bound".into());
+        }
+        fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    fn load(path: &Path) -> std::result::Result<Self, Box<dyn Error>> {
+        let length = fs::metadata(path)?.len();
+        if length > CROSS_PROCESS_EVIDENCE_MAX_BYTES {
+            return Err("cross-process resume evidence exceeds its byte bound".into());
+        }
+        let bytes = fs::read(path)?;
+        Self::from_canonical_bytes(&bytes)
+    }
+
+    fn from_canonical_bytes(bytes: &[u8]) -> std::result::Result<Self, Box<dyn Error>> {
+        if u64::try_from(bytes.len())? > CROSS_PROCESS_EVIDENCE_MAX_BYTES {
+            return Err("cross-process resume evidence exceeds its byte bound".into());
+        }
+        let evidence: Self = serde_json::from_slice(bytes)?;
+        if evidence.format_version != CROSS_PROCESS_EVIDENCE_VERSION {
+            return Err(format!(
+                "unsupported cross-process resume evidence version {}",
+                evidence.format_version
+            )
+            .into());
+        }
+        if evidence.canonical_bytes()? != bytes {
+            return Err("cross-process resume evidence is not canonical".into());
+        }
+        Ok(evidence)
+    }
+
+    fn validate_backend(
+        &self,
+        expected: CrossProcessBackend,
+    ) -> std::result::Result<(), Box<dyn Error>> {
+        if self.backend != expected {
+            return Err("cross-process resume evidence backend differs".into());
+        }
+        Ok(())
+    }
+}
+
+fn cross_process_checksum(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn validate_cross_process_file_binding(
+    label: &str,
+    bytes: &[u8],
+    expected_bytes: u64,
+    expected_checksum: u64,
+) -> std::result::Result<(), Box<dyn Error>> {
+    let actual_bytes = u64::try_from(bytes.len())?;
+    if actual_bytes != expected_bytes || cross_process_checksum(bytes) != expected_checksum {
+        return Err(format!("cross-process {label} differs from its evidence binding").into());
+    }
+    Ok(())
+}
+
 fn replay_prepared_transformer<R>(runtime: &mut R, replay: u64) -> Result<R::Step>
 where
     R: CompiledTrainingWindowRuntime,
@@ -1396,20 +1604,400 @@ fn run_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
     )
 }
 
+fn assert_cross_process_pending_checkpoint(checkpoint: &CompiledAdamWCheckpoint) {
+    let info = checkpoint.info();
+    assert_eq!(info.replay_step(), 4);
+    assert_eq!(info.optimizer_step(), 1);
+    assert_eq!(info.gradient_accumulation_steps(), ACCUMULATION_STEPS);
+    assert_eq!(info.accumulation_index(), 1);
+    assert_eq!(info.accumulated_token_count(), Some(5));
+    assert!(
+        info.dropout_block_counter()
+            .is_some_and(|counter| counter > 0)
+    );
+    assert!(
+        info.accumulated_loss_numerator()
+            .is_some_and(|value| value.is_finite() && value != 0.0)
+    );
+    assert!(info.window_loss_report_enabled());
+}
+
+fn assert_cross_process_terminal_checkpoint(checkpoint: &CompiledAdamWCheckpoint) {
+    let info = checkpoint.info();
+    assert_eq!(info.replay_step(), 11);
+    assert_eq!(info.optimizer_step(), 4);
+    assert_eq!(info.gradient_accumulation_steps(), ACCUMULATION_STEPS);
+    assert_eq!(info.accumulation_index(), 0);
+    assert_eq!(info.discarded_microbatches(), 1);
+    assert_eq!(info.flushed_window_count(), 1);
+    assert_eq!(info.flushed_microbatch_count(), 1);
+    assert_eq!(info.accumulated_token_count(), Some(0));
+    assert_eq!(info.accumulated_loss_numerator(), Some(0.0));
+    assert_eq!(info.reset_transition_count(), 1);
+    assert!(info.window_loss_report_enabled());
+}
+
+fn assert_cross_process_zero_accumulators<R>(
+    session: &CompiledModuleAdamWSession<FileResumeTransformer, R>,
+) -> Result<()>
+where
+    R: CompiledScheduledAdamWRuntime,
+{
+    let accumulators = session.gradient_accumulator_snapshots()?;
+    assert!(!accumulators.is_empty());
+    for (name, accumulator) in accumulators {
+        for value in accumulator.values() {
+            assert_eq!(
+                value.to_bits(),
+                0,
+                "terminal accumulator {name} must contain positive zero"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_cross_process_file_resume_suffix<R, S, E>(
+    session: &mut CompiledModuleAdamWSession<FileResumeTransformer, R>,
+    mut validate_step: S,
+    mut validate_evaluation: E,
+) -> std::result::Result<f64, Box<dyn Error>>
+where
+    R: CompiledScheduledAdamWRuntime
+        + CompiledTrainingRatePolicyWindowCommitRuntime
+        + CompiledEvaluationRuntime,
+    S: FnMut(&R::Step),
+    E: FnMut(&R::Evaluation),
+{
+    const WINDOW_LOSS_WEIGHT: u64 = 11;
+    for replay in 5..=9 {
+        let batch = file_resume_batch(replay)?;
+        let loss_weight = loss_mask_weight(batch.loss_mask());
+        let step = replay_prepared_policy_batch(session, batch)?;
+        validate_step(&step);
+        assert_eq!(step.loss_weight(), loss_weight);
+        assert_eq!(step.did_update(), matches!(replay, 6 | 9));
+        assert_eq!(step.clip_report().is_some(), step.did_update());
+        assert_eq!(step.window_loss_report().is_some(), step.did_update());
+        if let Some(report) = step.window_loss_report() {
+            assert!(report.is_finite());
+            assert_eq!(report.microbatch_count(), ACCUMULATION_STEPS);
+            assert_eq!(report.loss_weight(), WINDOW_LOSS_WEIGHT);
+        }
+    }
+
+    let partial = replay_prepared_policy_batch(session, file_resume_batch(10)?)?;
+    validate_step(&partial);
+    assert!(!partial.did_update());
+    assert_eq!(partial.accumulation_index(), 1);
+    let flush = session.commit_partial_window_with_rate_policy()?;
+    assert!(flush.did_commit_window());
+    assert_eq!(flush.committed_microbatches(), 1);
+
+    let discard = replay_prepared_policy_batch(session, file_resume_batch(11)?)?;
+    validate_step(&discard);
+    assert!(!discard.did_update());
+    assert_eq!(discard.accumulation_index(), 1);
+    let reset = session.reset_gradient_window()?;
+    assert_eq!(reset.discarded_microbatches(), 1);
+    assert_eq!(session.optimizer_step()?, 4);
+    assert_eq!(session.accumulation_index()?, 0);
+    assert_cross_process_zero_accumulators(session)?;
+
+    let before_evaluation = session.checkpoint()?;
+    let before_counter = before_evaluation.info().dropout_block_counter();
+    let before_accumulators = session.gradient_accumulator_snapshots()?;
+    let terminal_loss = evaluate_mean_file_resume_loss(session, &mut validate_evaluation)?;
+    assert_eq!(session.checkpoint()?, before_evaluation);
+    assert_eq!(
+        session.checkpoint()?.info().dropout_block_counter(),
+        before_counter
+    );
+    assert_eq!(
+        session.gradient_accumulator_snapshots()?,
+        before_accumulators
+    );
+    Ok(terminal_loss)
+}
+
+fn produce_cross_process_file_resume<R, P, V, S, E>(
+    backend: CrossProcessBackend,
+    paths: &CrossProcessResumePaths,
+    mut prepare: P,
+    mut validate_preparation: V,
+    mut validate_step: S,
+    mut validate_evaluation: E,
+) -> std::result::Result<(), Box<dyn Error>>
+where
+    R: CompiledScheduledAdamWRuntime
+        + CompiledTrainingRatePolicyWindowCommitRuntime
+        + CompiledEvaluationRuntime,
+    P: FnMut(
+        CompiledModuleAdamWPlan<FileResumeTransformer>,
+    ) -> Result<CompiledModuleAdamWSession<FileResumeTransformer, R>>,
+    V: FnMut(&CompiledModuleAdamWSession<FileResumeTransformer, R>),
+    S: FnMut(&R::Step),
+    E: FnMut(&R::Evaluation),
+{
+    paths.require_absent()?;
+    let schedule = CompiledMultiStepLr::new(1e-3, 0.5, [1])?;
+    let config = file_resume_config(schedule)?;
+    let source = FileResumeTransformer::new(0x5678)?;
+    let builds = Cell::new(0_u64);
+    let source_plan = CompiledModuleAdamWPlan::compile_graph_with_dropout_and_ignore_index(
+        config,
+        dropout_config(),
+        source,
+        |model, graph, inputs, ignore_index, dropout| {
+            builds.set(builds.get() + 1);
+            build_file_resume(model, graph, inputs, ignore_index, dropout)
+        },
+    )
+    .map_err(|error| error.into_parts().1)?
+    .with_evaluation_graph_and_ignore_index(build_file_resume_evaluation)
+    .map_err(|error| error.into_parts().1)?;
+    assert_eq!(builds.get(), 1, "the producer training graph compiles once");
+    let evaluation_capture_identity = source_plan
+        .evaluation_capture_identity()
+        .expect("the cross-process evaluator is attached");
+    let program_artifact = source_plan.program_artifact()?;
+    let mut source = prepare(source_plan)?;
+    validate_preparation(&source);
+
+    let before_initial_evaluation = source.checkpoint()?;
+    let initial_loss = evaluate_mean_file_resume_loss(&mut source, &mut validate_evaluation)?;
+    assert_eq!(source.checkpoint()?, before_initial_evaluation);
+    for replay in 1..=4 {
+        let batch = file_resume_batch(replay)?;
+        let loss_weight = loss_mask_weight(batch.loss_mask());
+        let step = replay_prepared_policy_batch(&mut source, batch)?;
+        validate_step(&step);
+        assert_eq!(step.loss_weight(), loss_weight);
+        assert_eq!(step.did_update(), replay == ACCUMULATION_STEPS);
+    }
+
+    let pending_checkpoint = source.module_checkpoint()?;
+    assert_cross_process_pending_checkpoint(pending_checkpoint.optimizer_checkpoint());
+    let pending_bundle =
+        CompiledAdamWResumeBundle::new(program_artifact, pending_checkpoint.clone())?;
+    pending_bundle.save_file(&paths.pending_bundle)?;
+
+    let terminal_loss = run_cross_process_file_resume_suffix(
+        &mut source,
+        &mut validate_step,
+        &mut validate_evaluation,
+    )?;
+    assert!(
+        terminal_loss < initial_loss,
+        "cross-process producer loss did not decrease: {initial_loss} -> {terminal_loss}"
+    );
+    let terminal_checkpoint = source.module_checkpoint()?;
+    assert_cross_process_terminal_checkpoint(terminal_checkpoint.optimizer_checkpoint());
+    terminal_checkpoint.save_file(&paths.terminal_checkpoint)?;
+
+    let evidence = CrossProcessResumeEvidence {
+        format_version: CROSS_PROCESS_EVIDENCE_VERSION,
+        backend,
+        pending_bundle_bytes: u64::try_from(pending_bundle.as_bytes().len())?,
+        pending_bundle_checksum: cross_process_checksum(pending_bundle.as_bytes()),
+        terminal_checkpoint_bytes: u64::try_from(terminal_checkpoint.as_bytes().len())?,
+        terminal_checkpoint_checksum: cross_process_checksum(terminal_checkpoint.as_bytes()),
+        evaluation_capture_identity,
+        initial_evaluation_loss_bits: initial_loss.to_bits(),
+        terminal_evaluation_loss_bits: terminal_loss.to_bits(),
+        pending: CrossProcessCheckpointEvidence::new(pending_checkpoint.optimizer_checkpoint()),
+        terminal: CrossProcessCheckpointEvidence::new(terminal_checkpoint.optimizer_checkpoint()),
+    };
+    evidence.save(&paths.evidence)?;
+    assert_eq!(CrossProcessResumeEvidence::load(&paths.evidence)?, evidence);
+    println!(
+        "{} cross-process producer: replay=4, optimizer=1, accumulation=1, terminal_replay=11, terminal_optimizer=4, loss={initial_loss:.6}->{terminal_loss:.6}",
+        backend.label()
+    );
+    Ok(())
+}
+
+fn consume_cross_process_file_resume<R, P, V, S, E>(
+    backend: CrossProcessBackend,
+    paths: &CrossProcessResumePaths,
+    mut prepare: P,
+    mut validate_preparation: V,
+    validate_step: S,
+    validate_evaluation: E,
+) -> std::result::Result<(), Box<dyn Error>>
+where
+    R: CompiledScheduledAdamWRuntime
+        + CompiledTrainingRatePolicyWindowCommitRuntime
+        + CompiledEvaluationRuntime,
+    P: FnMut(
+        CompiledModuleAdamWPlan<FileResumeTransformer>,
+    ) -> Result<CompiledModuleAdamWSession<FileResumeTransformer, R>>,
+    V: FnMut(&CompiledModuleAdamWSession<FileResumeTransformer, R>),
+    S: FnMut(&R::Step),
+    E: FnMut(&R::Evaluation),
+{
+    let evidence = CrossProcessResumeEvidence::load(&paths.evidence)?;
+    evidence.validate_backend(backend)?;
+    let pending_bundle = CompiledAdamWResumeBundle::load_file(&paths.pending_bundle)?;
+    let terminal_checkpoint = CompiledModuleAdamWCheckpoint::load_file(&paths.terminal_checkpoint)?;
+    validate_cross_process_file_binding(
+        "pending bundle",
+        pending_bundle.as_bytes(),
+        evidence.pending_bundle_bytes,
+        evidence.pending_bundle_checksum,
+    )?;
+    validate_cross_process_file_binding(
+        "terminal checkpoint",
+        terminal_checkpoint.as_bytes(),
+        evidence.terminal_checkpoint_bytes,
+        evidence.terminal_checkpoint_checksum,
+    )?;
+    assert_eq!(
+        CrossProcessCheckpointEvidence::new(pending_bundle.checkpoint().optimizer_checkpoint()),
+        evidence.pending
+    );
+    assert_eq!(
+        CrossProcessCheckpointEvidence::new(terminal_checkpoint.optimizer_checkpoint()),
+        evidence.terminal
+    );
+    assert_eq!(
+        terminal_checkpoint.evaluation_capture_identity(),
+        Some(evidence.evaluation_capture_identity)
+    );
+    assert_eq!(
+        pending_bundle.checkpoint().evaluation_capture_identity(),
+        Some(evidence.evaluation_capture_identity)
+    );
+    assert_cross_process_pending_checkpoint(pending_bundle.checkpoint().optimizer_checkpoint());
+    assert_cross_process_terminal_checkpoint(terminal_checkpoint.optimizer_checkpoint());
+
+    let initial_loss = f64::from_bits(evidence.initial_evaluation_loss_bits);
+    let expected_terminal_loss = f64::from_bits(evidence.terminal_evaluation_loss_bits);
+    assert!(initial_loss.is_finite());
+    assert!(expected_terminal_loss.is_finite());
+    assert!(expected_terminal_loss < initial_loss);
+
+    let destination = FileResumeTransformer::new(0x9abc)?;
+    destination.frozen_scale.replace(TensorData::scalar(7.0))?;
+    destination
+        .running_marker
+        .replace(TensorData::scalar(29.0))?;
+    let destination_tied_identity = destination.tokens.weight.id();
+    let mut tied_alias = None;
+    let mut destination_states = Vec::new();
+    destination.visit("", &mut |name, parameter, kind| {
+        if name == "lm_head.weight" {
+            tied_alias = Some(parameter.clone());
+        }
+        destination_states.push((
+            name,
+            parameter.clone(),
+            kind,
+            parameter
+                .snapshot()
+                .expect("the cross-process destination remains readable"),
+        ));
+    });
+    let tied_alias = tied_alias.expect("the destination exposes the tied output head");
+    assert_eq!(tied_alias.id(), destination_tied_identity);
+
+    let restored_plan =
+        CompiledModuleAdamWPlan::restore_from_resume_bundle(destination, &pending_bundle)
+            .map_err(|error| error.into_parts().1)?;
+    assert_eq!(
+        restored_plan.capture_identity(),
+        evidence.pending.capture_identity
+    );
+    assert_eq!(
+        restored_plan.evaluation_capture_identity(),
+        Some(evidence.evaluation_capture_identity)
+    );
+    for (_, parameter, _, before) in &destination_states {
+        let after = parameter.snapshot()?;
+        assert_eq!(after.data, before.data);
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.identity, before.identity);
+        assert_eq!(after.trainable, before.trainable);
+    }
+
+    let mut resumed = prepare(restored_plan)?;
+    validate_preparation(&resumed);
+    assert_eq!(&resumed.module_checkpoint()?, pending_bundle.checkpoint());
+    let terminal_loss =
+        run_cross_process_file_resume_suffix(&mut resumed, validate_step, validate_evaluation)?;
+    assert_eq!(
+        terminal_loss.to_bits(),
+        evidence.terminal_evaluation_loss_bits
+    );
+    assert_eq!(resumed.module_checkpoint()?, terminal_checkpoint);
+
+    let (resumed_model, resumed_checkpoint) = resumed
+        .finish_with_module_checkpoint()
+        .map_err(|error| error.into_parts().1)?;
+    assert_eq!(resumed_checkpoint, terminal_checkpoint);
+    let mut resumed_states = Vec::new();
+    resumed_model.visit("", &mut |name, parameter, kind| {
+        resumed_states.push((
+            name,
+            kind,
+            parameter
+                .snapshot()
+                .expect("the cross-process result remains readable"),
+        ));
+    });
+    assert_eq!(resumed_states.len(), destination_states.len());
+    for ((name, _, kind, before), (actual_name, actual_kind, actual)) in
+        destination_states.iter().zip(&resumed_states)
+    {
+        assert_eq!(actual_name, name);
+        assert_eq!(actual_kind, kind);
+        assert_eq!(actual.identity, before.identity);
+        assert_eq!(actual.trainable, before.trainable);
+        assert_eq!(
+            actual.version,
+            before
+                .version
+                .checked_add(1)
+                .expect("successful publication cannot overflow a version")
+        );
+    }
+    assert_eq!(resumed_model.tokens.weight.id(), destination_tied_identity);
+    assert_eq!(tied_alias.id(), destination_tied_identity);
+    assert_eq!(tied_alias.value()?, resumed_model.tokens.weight.value()?);
+    assert!(resumed_model.positions.weight.is_trainable());
+    assert!(!resumed_model.frozen_scale.is_trainable());
+    assert!(!resumed_model.running_marker.is_trainable());
+    assert_ne!(resumed_model.frozen_scale.value()?, TensorData::scalar(7.0));
+    assert_ne!(
+        resumed_model.running_marker.value()?,
+        TensorData::scalar(29.0)
+    );
+    println!(
+        "{} cross-process consumer: exact_terminal=true, different_init=true, published=true, loss={initial_loss:.6}->{terminal_loss:.6}",
+        backend.label()
+    );
+    Ok(())
+}
+
 fn assert_native_file_resume_preparation(
     session: &CompiledModuleAdamWSession<FileResumeTransformer, NativeCpuCompiledAdamW<'_>>,
 ) {
     let preparation = session.native_cpu_preparation_report();
     for program in [
-        Some(preparation.main()),
-        preparation.accumulation(),
-        preparation.partial_flush(),
-        preparation.zero_grad(),
-        preparation.evaluation(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+        preparation.main(),
+        preparation
+            .accumulation()
+            .expect("three-step accumulation has a native sibling"),
+        preparation
+            .partial_flush()
+            .expect("partial commit has a native sibling"),
+        preparation
+            .zero_grad()
+            .expect("window reset has a native sibling"),
+        preparation
+            .evaluation()
+            .expect("file resume has a native evaluator"),
+    ] {
         assert!(program.native_item_count() > 0);
         assert_eq!(program.fallback_count(), 0);
     }
@@ -1463,6 +2051,76 @@ fn run_native_cpu_file_resume() -> std::result::Result<(), Box<dyn Error>> {
         assert_native_file_resume_step,
         assert_native_file_resume_evaluation,
     )
+}
+
+fn run_cross_process_producer(
+    backend: CrossProcessBackend,
+    directory: &Path,
+) -> std::result::Result<(), Box<dyn Error>> {
+    let paths = CrossProcessResumePaths::new(directory)?;
+    match backend {
+        CrossProcessBackend::Cpu => {
+            let target = CpuSessionTarget::new()
+                .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+            produce_cross_process_file_resume::<CpuCompiledAdamW, _, _, _, _>(
+                backend,
+                &paths,
+                |plan| plan.prepare(&target).map_err(|error| error.into_parts().1),
+                |_| {},
+                |_| {},
+                |_| {},
+            )
+        }
+        CrossProcessBackend::NativeCpu => {
+            let executor = CapturedReplayExecutor::default();
+            let target = NativeCpuSessionTarget::new(&executor)
+                .vectorized(true)
+                .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+            produce_cross_process_file_resume::<NativeCpuCompiledAdamW<'_>, _, _, _, _>(
+                backend,
+                &paths,
+                |plan| plan.prepare(&target).map_err(|error| error.into_parts().1),
+                assert_native_file_resume_preparation,
+                assert_native_file_resume_step,
+                assert_native_file_resume_evaluation,
+            )
+        }
+    }
+}
+
+fn run_cross_process_consumer(
+    backend: CrossProcessBackend,
+    directory: &Path,
+) -> std::result::Result<(), Box<dyn Error>> {
+    let paths = CrossProcessResumePaths::new(directory)?;
+    match backend {
+        CrossProcessBackend::Cpu => {
+            let target = CpuSessionTarget::new()
+                .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+            consume_cross_process_file_resume::<CpuCompiledAdamW, _, _, _, _>(
+                backend,
+                &paths,
+                |plan| plan.prepare(&target).map_err(|error| error.into_parts().1),
+                |_| {},
+                |_| {},
+                |_| {},
+            )
+        }
+        CrossProcessBackend::NativeCpu => {
+            let executor = CapturedReplayExecutor::default();
+            let target = NativeCpuSessionTarget::new(&executor)
+                .vectorized(true)
+                .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+            consume_cross_process_file_resume::<NativeCpuCompiledAdamW<'_>, _, _, _, _>(
+                backend,
+                &paths,
+                |plan| plan.prepare(&target).map_err(|error| error.into_parts().1),
+                assert_native_file_resume_preparation,
+                assert_native_file_resume_step,
+                assert_native_file_resume_evaluation,
+            )
+        }
+    }
 }
 
 fn run_file_resume<R, P, V, S, E>(
@@ -2793,11 +3451,30 @@ fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
 }
 
 fn main() -> std::result::Result<(), Box<dyn Error>> {
-    match env::args().nth(1).as_deref().unwrap_or("cpu") {
+    let mut arguments = env::args().skip(1);
+    let mode = arguments.next().unwrap_or_else(|| "cpu".to_owned());
+    match mode.as_str() {
         "native-cpu-scoreboard" => run_native_cpu_scoreboard()?,
         "cpu-reuse" => run_cpu_reuse()?,
         "cpu-file-resume" => run_cpu_file_resume()?,
         "native-cpu-file-resume" => run_native_cpu_file_resume()?,
+        "cross-process-produce" | "cross-process-consume" => {
+            let backend = arguments
+                .next()
+                .ok_or_else(|| format!("{mode} requires a `cpu` or `native-cpu` backend"))?;
+            let backend = CrossProcessBackend::parse(&backend)?;
+            let directory = arguments
+                .next()
+                .ok_or_else(|| format!("{mode} requires an output directory"))?;
+            if let Some(unexpected) = arguments.next() {
+                return Err(format!("unexpected {mode} argument {unexpected:?}").into());
+            }
+            if mode == "cross-process-produce" {
+                run_cross_process_producer(backend, Path::new(&directory))?;
+            } else {
+                run_cross_process_consumer(backend, Path::new(&directory))?;
+            }
+        }
         "cpu" => {
             let target = CpuSessionTarget::new();
             run_exact_resume("CPU", |plan| {
@@ -2825,10 +3502,102 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         }
         other => {
             return Err(format!(
-                "unknown target {other:?}; expected `native-cpu-scoreboard`, `cpu-reuse`, `cpu-file-resume`, `native-cpu-file-resume`, `cpu`, `native-cpu`, or `metal`"
+                "unknown target {other:?}; expected `native-cpu-scoreboard`, `cpu-reuse`, `cpu-file-resume`, `native-cpu-file-resume`, `cross-process-produce`, `cross-process-consume`, `cpu`, `native-cpu`, or `metal`"
             )
             .into());
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cross_process_evidence_tests {
+    use super::*;
+
+    fn checkpoint(replay_step: u64) -> CrossProcessCheckpointEvidence {
+        CrossProcessCheckpointEvidence {
+            capture_identity: 11,
+            replay_step,
+            optimizer_step: 1,
+            gradient_accumulation_steps: 3,
+            accumulation_index: 1,
+            discarded_microbatches: 0,
+            flushed_window_count: 0,
+            flushed_microbatch_count: 0,
+            flush_capture_identity: Some(12),
+            dropout_block_counter: Some(48),
+            accumulated_token_count: Some(5),
+            accumulated_loss_numerator_bits: Some(1.25_f32.to_bits()),
+            window_loss_report_enabled: true,
+            reset_transition_count: 0,
+            reset_capture_identity: Some(13),
+            accumulation_capture_identity: Some(14),
+        }
+    }
+
+    fn evidence() -> CrossProcessResumeEvidence {
+        CrossProcessResumeEvidence {
+            format_version: CROSS_PROCESS_EVIDENCE_VERSION,
+            backend: CrossProcessBackend::Cpu,
+            pending_bundle_bytes: 3,
+            pending_bundle_checksum: cross_process_checksum(b"one"),
+            terminal_checkpoint_bytes: 3,
+            terminal_checkpoint_checksum: cross_process_checksum(b"two"),
+            evaluation_capture_identity: 15,
+            initial_evaluation_loss_bits: 2.0_f64.to_bits(),
+            terminal_evaluation_loss_bits: 1.0_f64.to_bits(),
+            pending: checkpoint(4),
+            terminal: checkpoint(11),
+        }
+    }
+
+    #[test]
+    fn cross_process_evidence_round_trips_canonically() {
+        let expected = evidence();
+        let bytes = expected.canonical_bytes().unwrap();
+        assert_eq!(
+            CrossProcessResumeEvidence::from_canonical_bytes(&bytes).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn cross_process_evidence_rejects_unknown_version_and_fields() {
+        let mut unsupported = evidence();
+        unsupported.format_version += 1;
+        let bytes = unsupported.canonical_bytes().unwrap();
+        assert!(CrossProcessResumeEvidence::from_canonical_bytes(&bytes).is_err());
+
+        let mut value = serde_json::to_value(evidence()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), serde_json::Value::Bool(true));
+        let mut bytes = serde_json::to_vec_pretty(&value).unwrap();
+        bytes.push(b'\n');
+        assert!(CrossProcessResumeEvidence::from_canonical_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn cross_process_evidence_rejects_backend_mismatch() {
+        assert!(
+            evidence()
+                .validate_backend(CrossProcessBackend::NativeCpu)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cross_process_evidence_rejects_checksum_mismatch() {
+        let bytes = b"one";
+        assert!(
+            validate_cross_process_file_binding(
+                "pending bundle",
+                bytes,
+                u64::try_from(bytes.len()).unwrap(),
+                cross_process_checksum(bytes) ^ 1,
+            )
+            .is_err()
+        );
+    }
 }
