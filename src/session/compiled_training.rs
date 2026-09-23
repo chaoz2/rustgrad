@@ -3,6 +3,7 @@
 mod adamw_checkpoint;
 mod adamw_contract;
 mod capture;
+mod delegation;
 mod dropout;
 mod exchange;
 mod module_adamw_checkpoint;
@@ -8837,138 +8838,6 @@ impl CompiledScheduledAdamWCommitOnlyRuntime for NativeCpuCompiledAdamW<'_> {
         inputs: BTreeMap<String, TensorData>,
     ) -> Result<Self::Step> {
         NativeCpuCompiledAdamW::step_commit_only_scheduled(self, inputs)
-    }
-}
-
-impl<M, R> CompiledTrainingRuntime for CompiledModuleTrainingSession<M, R>
-where
-    R: CompiledTrainingRuntime,
-{
-    type Step = R::Step;
-
-    fn step(
-        &mut self,
-        inputs: BTreeMap<String, TensorData>,
-        learning_rate: TensorData,
-    ) -> Result<Self::Step> {
-        self.runtime.step(inputs, learning_rate)
-    }
-
-    fn step_count(&self) -> u64 {
-        self.runtime.step_count()
-    }
-
-    fn capture_identity(&self) -> u64 {
-        self.runtime.capture_identity()
-    }
-
-    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.runtime.parameter_snapshots()
-    }
-
-    fn publish_parameters(&self, module: &dyn Module) -> Result<LoadReport> {
-        self.runtime.publish_parameters(module)
-    }
-}
-
-impl<M, R> CompiledCheckpointRuntime for CompiledModuleTrainingSession<M, R>
-where
-    R: CompiledCheckpointRuntime,
-{
-    type Checkpoint = R::Checkpoint;
-
-    fn checkpoint(&self) -> Result<Self::Checkpoint> {
-        self.runtime.checkpoint()
-    }
-}
-
-impl<M, R> CompiledCheckpointRestoreRuntime for CompiledModuleTrainingSession<M, R>
-where
-    R: CompiledCheckpointRestoreRuntime,
-{
-    fn restore_checkpoint_in_place(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
-        self.runtime.restore_checkpoint_in_place(checkpoint)
-    }
-}
-
-impl<M, R> CompiledEvaluationRuntime for CompiledModuleTrainingSession<M, R>
-where
-    R: CompiledEvaluationRuntime,
-{
-    type Evaluation = R::Evaluation;
-
-    fn evaluate(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Evaluation> {
-        self.runtime.evaluate(inputs)
-    }
-
-    fn evaluation_capture_identity(&self) -> Option<u64> {
-        self.runtime.evaluation_capture_identity()
-    }
-}
-
-impl<M, R> CompiledTrainingRuntime for CompiledModuleAdamWSession<M, R>
-where
-    R: CompiledTrainingRuntime,
-{
-    type Step = R::Step;
-
-    fn step(
-        &mut self,
-        inputs: BTreeMap<String, TensorData>,
-        learning_rate: TensorData,
-    ) -> Result<Self::Step> {
-        self.training.step(inputs, learning_rate)
-    }
-
-    fn step_count(&self) -> u64 {
-        self.training.step_count()
-    }
-
-    fn capture_identity(&self) -> u64 {
-        self.training.capture_identity()
-    }
-
-    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.training.parameter_snapshots()
-    }
-
-    fn publish_parameters(&self, module: &dyn Module) -> Result<LoadReport> {
-        self.training.publish_parameters(module)
-    }
-}
-
-impl<M, R> CompiledCheckpointRuntime for CompiledModuleAdamWSession<M, R>
-where
-    R: CompiledCheckpointRuntime,
-{
-    type Checkpoint = R::Checkpoint;
-
-    fn checkpoint(&self) -> Result<Self::Checkpoint> {
-        self.training.checkpoint()
-    }
-}
-
-impl<M, R> CompiledCheckpointRestoreRuntime for CompiledModuleAdamWSession<M, R>
-where
-    R: CompiledCheckpointRestoreRuntime,
-{
-    fn restore_checkpoint_in_place(&mut self, checkpoint: &Self::Checkpoint) -> Result<()> {
-        self.training.restore_checkpoint_in_place(checkpoint)
-    }
-}
-
-impl<M, R> CompiledEvaluationRuntime for CompiledModuleAdamWSession<M, R>
-where
-    R: CompiledEvaluationRuntime,
-{
-    type Evaluation = R::Evaluation;
-
-    fn evaluate(&mut self, inputs: BTreeMap<String, TensorData>) -> Result<Self::Evaluation> {
-        self.training.evaluate(inputs)
-    }
-
-    fn evaluation_capture_identity(&self) -> Option<u64> {
-        self.training.evaluation_capture_identity()
     }
 }
 
