@@ -12,6 +12,7 @@ mod module_plan;
 mod module_session;
 mod module_state;
 mod native_cpu_evidence;
+mod native_cpu_programs;
 mod objective;
 mod observation;
 mod optimizer_lowering;
@@ -50,6 +51,7 @@ pub use self::module_state::TrainingParameterInit;
 use self::module_state::{CompiledModuleSeal, ModuleParameterPlan};
 use self::native_cpu_evidence::native_preparation_wall_time;
 pub use self::native_cpu_evidence::*;
+use self::native_cpu_programs::*;
 use self::objective::{
     lower_compiled_adamw_objective, lower_compiled_adamw_objective_for_ignore_index_policy,
     lower_compiled_adamw_objective_for_policy,
@@ -860,148 +862,6 @@ pub struct NativeCpuCompiledAdamW<'a> {
     successful_flushes: u64,
     successful_zero_grads: u64,
     successful_evaluations: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum NativeCpuTrainingProgramRole {
-    Main,
-    Accumulation,
-    PartialFlush,
-    ZeroGrad,
-    Evaluation,
-}
-
-impl NativeCpuTrainingProgramRole {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Main => "main",
-            Self::Accumulation => "accumulation",
-            Self::PartialFlush => "partial-flush",
-            Self::ZeroGrad => "zero-grad",
-            Self::Evaluation => "evaluation",
-        }
-    }
-
-    const fn render_capsule_role(self) -> NativeCpuRenderCapsuleProgramRole {
-        match self {
-            Self::Main => NativeCpuRenderCapsuleProgramRole::Main,
-            Self::Accumulation => NativeCpuRenderCapsuleProgramRole::Accumulation,
-            Self::PartialFlush => NativeCpuRenderCapsuleProgramRole::PartialFlush,
-            Self::ZeroGrad => NativeCpuRenderCapsuleProgramRole::ZeroGrad,
-            Self::Evaluation => NativeCpuRenderCapsuleProgramRole::Evaluation,
-        }
-    }
-}
-
-struct NativeCpuTrainingProgramDrafts<D> {
-    by_role: BTreeMap<NativeCpuTrainingProgramRole, D>,
-}
-
-impl<D> NativeCpuTrainingProgramDrafts<D> {
-    fn new() -> Self {
-        Self {
-            by_role: BTreeMap::new(),
-        }
-    }
-
-    fn insert(&mut self, role: NativeCpuTrainingProgramRole, draft: D) -> Result<()> {
-        if self.by_role.insert(role, draft).is_some() {
-            return Err(training(format!(
-                "compiled native CPU {} planning draft is duplicated",
-                role.name()
-            )));
-        }
-        Ok(())
-    }
-
-    fn take(&mut self, role: NativeCpuTrainingProgramRole) -> Result<D> {
-        self.by_role.remove(&role).ok_or_else(|| {
-            training(format!(
-                "compiled native CPU {} planning draft is absent",
-                role.name()
-            ))
-        })
-    }
-
-    fn is_empty(&self) -> bool {
-        self.by_role.is_empty()
-    }
-}
-
-struct NativeCpuTrainingProgramBatch<C, D> {
-    programs: Vec<(NativeCpuTrainingProgramRole, C, D)>,
-}
-
-impl<C, D> NativeCpuTrainingProgramBatch<C, D> {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            programs: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn push(&mut self, role: NativeCpuTrainingProgramRole, capture: C, draft: D) -> Result<()> {
-        match self.programs.last() {
-            None if role != NativeCpuTrainingProgramRole::Main => {
-                return Err(training("compiled native CPU main program is absent"));
-            }
-            Some((previous, _, _)) if *previous >= role => {
-                return Err(training("compiled native CPU program role order differs"));
-            }
-            _ => {}
-        }
-        self.programs.push((role, capture, draft));
-        Ok(())
-    }
-
-    fn into_planning_inputs(self) -> (Vec<NativeCpuTrainingProgramRole>, Vec<(C, D)>) {
-        let mut roles = Vec::with_capacity(self.programs.len());
-        let mut programs = Vec::with_capacity(self.programs.len());
-        for (role, capture, draft) in self.programs {
-            roles.push(role);
-            programs.push((capture, draft));
-        }
-        (roles, programs)
-    }
-}
-
-struct NativeCpuTrainingPrograms<P> {
-    main: P,
-    accumulation: Option<P>,
-    partial_flush: Option<P>,
-    zero_grad: Option<P>,
-    evaluation: Option<P>,
-}
-
-impl<P> NativeCpuTrainingPrograms<P> {
-    fn from_ordered(roles: Vec<NativeCpuTrainingProgramRole>, plans: Vec<P>) -> Result<Self> {
-        if roles.len() != plans.len() {
-            return Err(training("compiled native CPU plan inventory differs"));
-        }
-        let mut main = None;
-        let mut accumulation = None;
-        let mut partial_flush = None;
-        let mut zero_grad = None;
-        let mut evaluation = None;
-        for (role, plan) in roles.into_iter().zip(plans) {
-            let slot = match role {
-                NativeCpuTrainingProgramRole::Main => &mut main,
-                NativeCpuTrainingProgramRole::Accumulation => &mut accumulation,
-                NativeCpuTrainingProgramRole::PartialFlush => &mut partial_flush,
-                NativeCpuTrainingProgramRole::ZeroGrad => &mut zero_grad,
-                NativeCpuTrainingProgramRole::Evaluation => &mut evaluation,
-            };
-            if slot.replace(plan).is_some() {
-                return Err(training("compiled native CPU program role is duplicated"));
-            }
-        }
-        Ok(Self {
-            main: main.ok_or_else(|| training("compiled native CPU main plan is absent"))?,
-            accumulation,
-            partial_flush,
-            zero_grad,
-            evaluation,
-        })
-    }
 }
 
 /// Resource-free Metal rendering of one compiled AdamW plan. Preparing it
