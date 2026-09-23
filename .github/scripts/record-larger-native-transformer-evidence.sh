@@ -149,6 +149,20 @@ def phase_sample_count(report):
     wall_time = report.get("wall_time")
     return wall_time.get("sample_count") if isinstance(wall_time, dict) else None
 
+def duration_nanos(value):
+    if not isinstance(value, dict) or set(value) != {"secs", "nanos"}:
+        return None
+    secs = value.get("secs")
+    nanos = value.get("nanos")
+    if (
+        type(secs) is not int
+        or secs < 0
+        or type(nanos) is not int
+        or not 0 <= nanos < 1_000_000_000
+    ):
+        return None
+    return secs * 1_000_000_000 + nanos
+
 if objective.get("schema_version") != 6 or objective.get("git_sha") != sys.argv[3]:
     raise SystemExit("larger Transformer objective provenance is invalid")
 expected_workload = {
@@ -273,8 +287,75 @@ if (
 native = objective.get("native")
 if not isinstance(native, dict):
     raise SystemExit("larger Transformer native evidence is absent")
-if scoreboard.get("format_version") != 22 or scoreboard.get("initial_replay_step") != 0:
+if scoreboard.get("format_version") != 23 or scoreboard.get("initial_replay_step") != 0:
     raise SystemExit("larger Transformer scoreboard identity is invalid")
+compile_phases = scoreboard.get("compile_phases")
+compile_phase_names = {
+    "compile_count",
+    "objective_forward",
+    "autograd",
+    "optimizer_lowering",
+    "main_capture",
+    "accumulation_capture",
+    "partial_flush",
+    "zero_grad",
+    "evaluation",
+    "residual_wall_time",
+}
+if (
+    not isinstance(compile_phases, dict)
+    or set(compile_phases) != compile_phase_names
+    or compile_phases.get("compile_count") != 1
+):
+    raise SystemExit("larger Transformer compile-phase evidence is invalid")
+
+compile_phase_total_ns = 0
+graph_node_counts = []
+for phase_name in ["objective_forward", "autograd", "optimizer_lowering"]:
+    phase = compile_phases.get(phase_name)
+    if (
+        not isinstance(phase, dict)
+        or set(phase) != {"wall_time", "graph_node_count"}
+        or type(phase.get("graph_node_count")) is not int
+        or phase["graph_node_count"] <= 0
+        or duration_nanos(phase.get("wall_time")) is None
+    ):
+        raise SystemExit(f"larger Transformer {phase_name} compile phase is invalid")
+    graph_node_counts.append(phase["graph_node_count"])
+    compile_phase_total_ns += duration_nanos(phase["wall_time"])
+if graph_node_counts != sorted(graph_node_counts):
+    raise SystemExit("larger Transformer compiled graph inventories are not monotonic")
+
+capture_programs = {
+    "main_capture": scoreboard_main,
+    "accumulation_capture": scoreboard.get("accumulation"),
+    "partial_flush": scoreboard.get("partial_flush"),
+    "zero_grad": scoreboard.get("zero_grad"),
+    "evaluation": scoreboard_evaluation,
+}
+for phase_name, program in capture_programs.items():
+    phase = compile_phases.get(phase_name)
+    if (
+        not isinstance(phase, dict)
+        or set(phase) != {"wall_time", "logical_schedule_item_count"}
+        or not isinstance(program, dict)
+        or type(phase.get("logical_schedule_item_count")) is not int
+        or phase["logical_schedule_item_count"] <= 0
+        or phase["logical_schedule_item_count"]
+        != program.get("logical_schedule_item_count")
+        or duration_nanos(phase.get("wall_time")) is None
+    ):
+        raise SystemExit(f"larger Transformer {phase_name} compile phase is invalid")
+    compile_phase_total_ns += duration_nanos(phase["wall_time"])
+
+residual_compile_ns = duration_nanos(compile_phases.get("residual_wall_time"))
+compile_wall_ns = duration_nanos(scoreboard.get("compile_wall_time"))
+if (
+    residual_compile_ns is None
+    or compile_wall_ns is None
+    or compile_phase_total_ns + residual_compile_ns != compile_wall_ns
+):
+    raise SystemExit("larger Transformer compile-phase timing does not balance")
 scoreboard_checkpoint = scoreboard.get("checkpoint")
 if (
     not isinstance(scoreboard_checkpoint, dict)
