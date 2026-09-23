@@ -4,6 +4,7 @@
 //! results, checkpoint values, and partial-window outcomes. Graph lowering,
 //! recurrent transactions, and backend execution remain in the parent module.
 
+use super::observation::CompiledTrainingObservationValue;
 use super::*;
 
 /// Detached result of one successfully committed compiled training step.
