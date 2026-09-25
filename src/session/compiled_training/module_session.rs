@@ -24,10 +24,7 @@ impl<M: Module> CompiledModuleTrainingSession<M, CpuCompiledMomentumSgd> {
             Ok(session) => Ok(session),
             Err(error) => {
                 let (plan, source) = error.into_parts();
-                Err(CompiledModuleMomentumSgdCompileError {
-                    module: plan.into_module(),
-                    source,
-                })
+                Err(momentum_sgd_compile_error(plan.into_module(), source))
             }
         }
     }
@@ -718,18 +715,18 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for CpuSessionTarget {
         plan: CompiledModuleAdamWPlan<M>,
     ) -> std::result::Result<Self::Session, Self::Error> {
         if let Err(source) = plan.validate_ready_for_preparation() {
-            return Err(CompiledModuleAdamWPrepareError { plan, source });
+            return Err(adamw_prepare_error(plan, source));
         }
         let evaluation_capture_identity = plan.evaluation_capture_identity();
         let runtime = match plan.plan.prepare_cpu() {
             Ok(runtime) => runtime,
-            Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
+            Err(source) => return Err(adamw_prepare_error(plan, source)),
         };
-        let CompiledModuleAdamWPlan {
+        let CompiledModuleTrainingPlan {
             module,
             seal,
             plan: _,
-            required_evaluation_capture_identity: _,
+            attachment: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
             training: CompiledModuleTrainingSession {
@@ -751,7 +748,7 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for ConfiguredCpuSessi
         plan: CompiledModuleAdamWPlan<M>,
     ) -> std::result::Result<Self::Session, Self::Error> {
         if let Err(source) = plan.validate_ready_for_preparation() {
-            return Err(CompiledModuleAdamWPrepareError { plan, source });
+            return Err(adamw_prepare_error(plan, source));
         }
         let evaluation_capture_identity = plan.evaluation_capture_identity();
         let runtime = match plan
@@ -759,13 +756,13 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for ConfiguredCpuSessi
             .prepare_cpu_with_non_finite_policy(self.non_finite_policy())
         {
             Ok(runtime) => runtime,
-            Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
+            Err(source) => return Err(adamw_prepare_error(plan, source)),
         };
-        let CompiledModuleAdamWPlan {
+        let CompiledModuleTrainingPlan {
             module,
             seal,
             plan: _,
-            required_evaluation_capture_identity: _,
+            attachment: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
             training: CompiledModuleTrainingSession {
@@ -789,18 +786,18 @@ impl<'executor, M: Module> SessionTarget<CompiledModuleAdamWPlan<M>>
         plan: CompiledModuleAdamWPlan<M>,
     ) -> std::result::Result<Self::Session, Self::Error> {
         if let Err(source) = plan.validate_ready_for_preparation() {
-            return Err(CompiledModuleAdamWPrepareError { plan, source });
+            return Err(adamw_prepare_error(plan, source));
         }
         let evaluation_capture_identity = plan.evaluation_capture_identity();
         let runtime = match plan.plan.prepare_native_cpu(self) {
             Ok(runtime) => runtime,
-            Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
+            Err(source) => return Err(adamw_prepare_error(plan, source)),
         };
-        let CompiledModuleAdamWPlan {
+        let CompiledModuleTrainingPlan {
             module,
             seal,
             plan: _,
-            required_evaluation_capture_identity: _,
+            attachment: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
             training: CompiledModuleTrainingSession {
@@ -822,18 +819,18 @@ impl<M: Module> SessionTarget<CompiledModuleAdamWPlan<M>> for MetalSessionTarget
         plan: CompiledModuleAdamWPlan<M>,
     ) -> std::result::Result<Self::Session, Self::Error> {
         if let Err(source) = plan.validate_ready_for_preparation() {
-            return Err(CompiledModuleAdamWPrepareError { plan, source });
+            return Err(adamw_prepare_error(plan, source));
         }
         let evaluation_capture_identity = plan.evaluation_capture_identity();
         let runtime = match <Self as SessionTarget<&CompiledAdamWPlan>>::prepare(self, &plan.plan) {
             Ok(runtime) => runtime,
-            Err(source) => return Err(CompiledModuleAdamWPrepareError { plan, source }),
+            Err(source) => return Err(adamw_prepare_error(plan, source)),
         };
-        let CompiledModuleAdamWPlan {
+        let CompiledModuleTrainingPlan {
             module,
             seal,
             plan: _,
-            required_evaluation_capture_identity: _,
+            attachment: _,
         } = plan;
         Ok(CompiledModuleAdamWSession {
             training: CompiledModuleTrainingSession {

@@ -1475,9 +1475,13 @@ none of these APIs claims parent-directory durability across a system crash.
 
 ###### Owned lifecycle
 
-- `CompiledModuleAdamWPlan<M>` consumes the exact module. Target preparation
-  transfers it into `CompiledModuleAdamWSession<M, R>`, and replay exposes no
-  module handle.
+- `CompiledModuleTrainingPlan<M, P, A>` owns the optimizer-neutral sealed
+  module lifecycle. `P` keeps optimizer policy typed and `A` keeps any
+  optimizer-specific pre-preparation attachment typed; AdamW and momentum-SGD
+  are aliases rather than parallel owner implementations.
+- Target preparation transfers that owner into
+  `CompiledModuleTrainingSession<M, R>`. AdamW retains its compatibility
+  session wrapper, while replay exposes no module handle.
 - A private complete-state seal authenticates traversal order and names, tied
   identities, kinds, trainability, descriptors, versions, and raw bytes before
   resources and again at finish.
@@ -1559,7 +1563,9 @@ runtime slot, or host pointer is serialized.
 
 - Compilation failure returns the exact module, including graph-build,
   checkpoint-admission, seal, and maximum-version preflight failures.
-- Preparation failure retains the owned plan. Checkpoint snapshot, decode, or
+- Compilation aliases share one generic recoverable module error; restore,
+  evaluator attachment, and preparation aliases share one boxed-plan error.
+  Preparation failure retains the owned plan. Checkpoint snapshot, decode, or
   publication failure retains the intact session.
 - A caller may abort a live or failed session to recover its sealed host module
   without publishing the runtime frontier.
