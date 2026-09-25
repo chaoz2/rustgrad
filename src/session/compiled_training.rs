@@ -20,6 +20,7 @@ mod observation;
 mod optimizer_lowering;
 mod policy;
 mod program_artifact;
+mod recurrent_phase;
 mod resume_bundle;
 mod runtime;
 mod state_schema;
@@ -98,6 +99,7 @@ pub use self::program_artifact::{
     CompiledAdamWProgramArtifact, CompiledAdamWProgramArtifactFileError,
     CompiledAdamWProgramArtifactInfo, CompiledModuleAdamWArtifactRestoreError,
 };
+use self::recurrent_phase::*;
 pub use self::resume_bundle::{CompiledAdamWResumeBundle, CompiledAdamWResumeBundleFileError};
 pub use self::runtime::*;
 #[cfg(test)]
