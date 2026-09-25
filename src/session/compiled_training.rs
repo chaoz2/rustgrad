@@ -38,14 +38,20 @@ use self::adamw_checkpoint::{
 };
 pub use self::adamw_checkpoint::{CompiledAdamWCheckpoint, CompiledAdamWCheckpointInfo};
 use self::adamw_contract::{CompiledAdamWContract, MetalAdamWContract};
+pub use self::adamw_plan::CompiledAdamWPlan;
+#[cfg(test)]
+use self::adamw_plan::adamw_checkpoint_restore_counts;
 use self::capture::{CompiledEvaluationCapture, CompiledRecurrentCapture};
 #[cfg(test)]
 use self::capture::{
     canonical_recurrent_capture_counts, canonical_recurrent_capture_delta,
     with_canonical_recurrent_reference,
 };
-use self::cpu_adamw_runtime::adamw_step_result;
 pub use self::cpu_adamw_runtime::{CpuCompiledAdamW, NativeCpuCompiledAdamW};
+use self::cpu_adamw_runtime::{
+    NativeCpuEvaluationPreparation, PreparedNativeCpuEvaluation, PreparedNativeCpuProgram,
+    PreparedNativeEvaluationParameterInput, adamw_step_result,
+};
 use self::cpu_training_program::{
     CompiledStepOutputSelection, CompiledStepReplayRequest, CpuCompiledTrainingProgram,
 };
@@ -60,6 +66,9 @@ use self::module_state::{CompiledModuleSeal, ModuleParameterPlan};
 use self::native_cpu_evidence::native_preparation_wall_time;
 pub use self::native_cpu_evidence::*;
 use self::native_cpu_programs::*;
+pub use self::objective::{
+    CompiledAdamWGraph, CompiledAdamWIgnoreIndexContext, CompiledAdamWObjective,
+};
 use self::objective::{
     lower_compiled_adamw_objective, lower_compiled_adamw_objective_for_ignore_index_policy,
     lower_compiled_adamw_objective_for_policy,
@@ -151,313 +160,9 @@ const LEARNING_RATE_INPUT: &str = "__rustgrad_compiled_training_learning_rate";
 const STATE_BUFFER_BASE: u64 = 1_u64 << 62;
 const MAX_EXACT_F32_INTEGER_COUNT: u64 = 1_u64 << 24;
 
-struct PreparedNativeCpuProgram {
-    report: NativeCpuProgramPreparationReport,
-    replay: PreparedRecurrentNativeReplay,
-}
-
-struct PreparedNativeCpuEvaluation {
-    report: NativeCpuProgramPreparationReport,
-    plan: PlannedNativeItems,
-    parameter_inputs: Vec<PreparedNativeEvaluationParameterInput>,
-}
-
-struct NativeCpuEvaluationPreparation {
-    inputs: Option<BTreeMap<String, TensorData>>,
-    parameter_inputs: Vec<PreparedNativeEvaluationParameterInput>,
-    residual_wall_time: Duration,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PreparedNativeEvaluationParameterInput {
-    parameter: String,
-    input: String,
-    buffer: u64,
-    shape: Shape,
-    dtype: DType,
-    bytes: usize,
-}
-
-impl PreparedNativeCpuEvaluation {
-    fn validate(
-        &self,
-        capture_identity: u64,
-        capture: &CapturedSchedule,
-        parameter_buffers: &BTreeMap<String, u64>,
-    ) -> Result<()> {
-        self.plan
-            .validate_structure(capture)
-            .map_err(replay_error)?;
-        let native_identity = native_cpu_identity(
-            capture_identity,
-            self.plan.vectorized(),
-            self.plan.schedule_cache_keys().iter().copied(),
-        );
-        if self.report.capture_identity != capture_identity
-            || self.report.native_identity != native_identity
-            || self.report.native_item_count != self.plan.item_count()
-            || self.report.cache_hit_count != self.plan.cache_hit_count()
-            || self.report.cache_miss_count != self.plan.cache_miss_count()
-            || self.report.work
-                != NativeCpuPreparationWork::from_module(self.plan.module_preparation())
-            || self.report.vectorized != self.plan.vectorized()
-            || capture.items.iter().map(|item| item.cache_key).ne(self
-                .plan
-                .schedule_cache_keys()
-                .iter()
-                .copied())
-        {
-            return Err(training(
-                "compiled native CPU evaluation preparation identity mismatch",
-            ));
-        }
-        self.report.validate_work()?;
-        if parameter_buffers.len() != self.parameter_inputs.len() {
-            return Err(training(
-                "compiled native CPU evaluation parameter mapping mismatch",
-            ));
-        }
-        let mut parameters = BTreeSet::new();
-        let mut inputs = BTreeSet::new();
-        let mut buffers = BTreeSet::new();
-        for binding in &self.parameter_inputs {
-            let input = capture
-                .inputs
-                .iter()
-                .find(|input| input.name == binding.input)
-                .ok_or_else(|| {
-                    training("compiled native CPU evaluation parameter input is absent")
-                })?;
-            if !parameters.insert(binding.parameter.as_str())
-                || parameter_buffers.get(&binding.parameter) != Some(&binding.buffer)
-                || !inputs.insert(binding.input.as_str())
-                || !buffers.insert(binding.buffer)
-                || input.desc.shape != binding.shape
-                || input.desc.dtype != binding.dtype
-                || input.desc.bytes != binding.bytes
-            {
-                return Err(training(
-                    "compiled native CPU evaluation parameter mapping mismatch",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn active_parameter_states(&self, frontier: &[BufferState]) -> Result<Vec<BufferState>> {
-        let mut frontier_by_buffer = BTreeMap::new();
-        for state in frontier {
-            if frontier_by_buffer.insert(state.buffer, state).is_some() {
-                return Err(training(
-                    "compiled native CPU recurrent frontier contains duplicate buffers",
-                ));
-            }
-        }
-        self.parameter_inputs
-            .iter()
-            .map(|binding| {
-                let state = frontier_by_buffer.get(&binding.buffer).ok_or_else(|| {
-                    training("compiled native CPU evaluation parameter state is absent")
-                })?;
-                if state.shape != binding.shape
-                    || state.dtype != binding.dtype
-                    || state.bytes != binding.bytes
-                {
-                    return Err(training(
-                        "compiled native CPU evaluation parameter state descriptor mismatch",
-                    ));
-                }
-                Ok((*state).clone())
-            })
-            .collect()
-    }
-}
-
 /// One compiled momentum-SGD training program.
 pub struct CpuCompiledMomentumSgd {
     inner: CpuCompiledTrainingProgram,
-}
-
-/// Resource-free compiled AdamW program ready for a concrete runtime.
-///
-/// Compilation owns graph construction, differentiation, scheduling, capture,
-/// recurrent-state admission, and optional checkpoint restoration. Preparing
-/// the plan then chooses CPU replay or strict Metal rendering without changing
-/// the authenticated program or optimizer frontier.
-#[derive(Clone)]
-pub struct CompiledAdamWPlan {
-    inner: CompiledTrainingPlan,
-    partial_flush: Option<CompiledAdamWAuxiliaryPlan>,
-    zero_grad: Option<CompiledAdamWAuxiliaryPlan>,
-    program_identity: u64,
-    contract: CompiledAdamWContract,
-    progress: CompiledTrainingWindowProgress,
-    evaluation: Option<CompiledEvaluationPlan>,
-    compile_phases: Option<CompiledTrainingCompileObservation>,
-}
-
-struct ValidatedAdamWCheckpointFrontier {
-    replay_step: u64,
-    values: BTreeMap<RecurrentStateKey, TensorData>,
-    versions: BTreeMap<RecurrentStateKey, u64>,
-    progress: CompiledTrainingWindowProgress,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct AdamWCheckpointRestoreCounts {
-    borrowed_plan_clones: usize,
-    consumed_plan_restores: usize,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AdamWPlanCaptureAllocations {
-    main: (usize, usize, usize),
-    accumulation: Option<(usize, usize, usize)>,
-    partial_flush: Option<(usize, usize, usize)>,
-    zero_grad: Option<(usize, usize, usize)>,
-    evaluation: Option<(usize, usize, usize)>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AdamWPlanTopologyAllocations {
-    main: (usize, usize),
-    accumulation: Option<(usize, usize, usize)>,
-    partial_flush: Option<(usize, usize, usize)>,
-    zero_grad: Option<(usize, usize, usize)>,
-    evaluation: Option<(usize, usize)>,
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static ADAMW_CHECKPOINT_RESTORE_COUNTS: std::cell::Cell<AdamWCheckpointRestoreCounts> =
-        const { std::cell::Cell::new(AdamWCheckpointRestoreCounts {
-            borrowed_plan_clones: 0,
-            consumed_plan_restores: 0,
-        }) };
-}
-
-#[cfg(test)]
-fn record_adamw_checkpoint_restore(update: impl FnOnce(&mut AdamWCheckpointRestoreCounts)) {
-    ADAMW_CHECKPOINT_RESTORE_COUNTS.with(|counts| {
-        let mut next = counts.get();
-        update(&mut next);
-        counts.set(next);
-    });
-}
-
-#[cfg(test)]
-fn adamw_checkpoint_restore_counts() -> AdamWCheckpointRestoreCounts {
-    ADAMW_CHECKPOINT_RESTORE_COUNTS.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-fn captured_schedule_allocation(capture: &CapturedSchedule) -> (usize, usize, usize) {
-    (
-        capture.items.as_ptr() as usize,
-        capture.items.len(),
-        capture.items.capacity(),
-    )
-}
-
-/// Explicit scalar or token-mean objective returned by a compiled module
-/// training or evaluation builder.
-///
-/// [`Scalar`](Self::Scalar) is the already-normalized scalar loss used by the
-/// ordinary compiled AdamW policy. [`TokenMean`](Self::TokenMean) is a
-/// fixed-shape F32 tensor of per-token losses; compilation combines it with
-/// the explicit mask or target-derived ignore-index policy configured on
-/// [`CompiledAdamWConfig`] and owns the resulting masked mean as both the
-/// public loss and differentiation root.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CompiledAdamWObjective {
-    Scalar(NodeId),
-    TokenMean(NodeId),
-}
-
-impl CompiledAdamWObjective {
-    pub const fn scalar(loss: NodeId) -> Self {
-        Self::Scalar(loss)
-    }
-
-    pub const fn token_mean(losses: NodeId) -> Self {
-        Self::TokenMean(losses)
-    }
-
-    pub const fn node(self) -> NodeId {
-        match self {
-            Self::Scalar(node) | Self::TokenMean(node) => node,
-        }
-    }
-}
-
-/// Compact result of building one compiled AdamW module training or evaluation
-/// graph.
-///
-/// The objective makes scalar-loss versus compiler-owned token-mean policy
-/// explicit at the builder boundary. Named outputs retain their existing
-/// replay behavior and capture identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompiledAdamWGraph {
-    objective: CompiledAdamWObjective,
-    outputs: BTreeMap<String, NodeId>,
-}
-
-/// Compiler-derived graph nodes for one configured ignore-index token policy.
-///
-/// All three nodes have the configured fixed target shape. [`Self::targets`] is
-/// the declared I32 target input, [`Self::validity`] is the Bool result of the
-/// exact `target != ignore_index` comparison, and [`Self::weight`] is that same
-/// validity cast to F32. Context-aware builders may reshape the Bool node for a
-/// model's attention policy while compilation reuses the F32 node for the
-/// token-mean objective and optimizer window accounting.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CompiledAdamWIgnoreIndexContext {
-    targets: NodeId,
-    validity: NodeId,
-    weight: NodeId,
-}
-
-impl CompiledAdamWIgnoreIndexContext {
-    pub const fn targets(self) -> NodeId {
-        self.targets
-    }
-
-    pub const fn validity(self) -> NodeId {
-        self.validity
-    }
-
-    pub const fn weight(self) -> NodeId {
-        self.weight
-    }
-}
-
-impl CompiledAdamWGraph {
-    pub fn new(objective: CompiledAdamWObjective, outputs: BTreeMap<String, NodeId>) -> Self {
-        Self { objective, outputs }
-    }
-
-    pub fn scalar(loss: NodeId, outputs: BTreeMap<String, NodeId>) -> Self {
-        Self::new(CompiledAdamWObjective::Scalar(loss), outputs)
-    }
-
-    pub fn token_mean(losses: NodeId, outputs: BTreeMap<String, NodeId>) -> Self {
-        Self::new(CompiledAdamWObjective::TokenMean(losses), outputs)
-    }
-
-    pub const fn objective(&self) -> CompiledAdamWObjective {
-        self.objective
-    }
-
-    pub fn outputs(&self) -> &BTreeMap<String, NodeId> {
-        &self.outputs
-    }
-
-    pub fn into_parts(self) -> (CompiledAdamWObjective, BTreeMap<String, NodeId>) {
-        (self.objective, self.outputs)
-    }
 }
 
 /// Resource-free AdamW plan paired with the exact module value used to build it.
@@ -1054,12 +759,6 @@ impl CompiledAdamWStep for MetalCompiledAdamWStepResult {
     fn loss_weight(&self) -> u64 {
         MetalCompiledAdamWStepResult::loss_weight(self)
     }
-}
-
-struct PendingAdamWStep {
-    request: CompiledStepReplayRequest,
-    next_progress: CompiledTrainingWindowProgress,
-    loss_weight: u64,
 }
 
 fn zero_inputs(inputs: &BTreeMap<String, (Shape, DType)>) -> Result<BTreeMap<String, TensorData>> {

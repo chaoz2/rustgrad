@@ -2,6 +2,90 @@
 
 use super::*;
 
+/// Resource-free compiled AdamW program ready for a concrete runtime.
+///
+/// Compilation owns graph construction, differentiation, scheduling, capture,
+/// recurrent-state admission, and optional checkpoint restoration. Preparing
+/// the plan then chooses CPU replay or strict Metal rendering without changing
+/// the authenticated program or optimizer frontier.
+#[derive(Clone)]
+pub struct CompiledAdamWPlan {
+    pub(super) inner: CompiledTrainingPlan,
+    pub(super) partial_flush: Option<CompiledAdamWAuxiliaryPlan>,
+    pub(super) zero_grad: Option<CompiledAdamWAuxiliaryPlan>,
+    pub(super) program_identity: u64,
+    pub(super) contract: CompiledAdamWContract,
+    pub(super) progress: CompiledTrainingWindowProgress,
+    pub(super) evaluation: Option<CompiledEvaluationPlan>,
+    pub(super) compile_phases: Option<CompiledTrainingCompileObservation>,
+}
+
+struct ValidatedAdamWCheckpointFrontier {
+    replay_step: u64,
+    values: BTreeMap<RecurrentStateKey, TensorData>,
+    versions: BTreeMap<RecurrentStateKey, u64>,
+    progress: CompiledTrainingWindowProgress,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct AdamWCheckpointRestoreCounts {
+    pub(super) borrowed_plan_clones: usize,
+    pub(super) consumed_plan_restores: usize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AdamWPlanCaptureAllocations {
+    pub(super) main: (usize, usize, usize),
+    pub(super) accumulation: Option<(usize, usize, usize)>,
+    pub(super) partial_flush: Option<(usize, usize, usize)>,
+    pub(super) zero_grad: Option<(usize, usize, usize)>,
+    pub(super) evaluation: Option<(usize, usize, usize)>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AdamWPlanTopologyAllocations {
+    pub(super) main: (usize, usize),
+    pub(super) accumulation: Option<(usize, usize, usize)>,
+    pub(super) partial_flush: Option<(usize, usize, usize)>,
+    pub(super) zero_grad: Option<(usize, usize, usize)>,
+    pub(super) evaluation: Option<(usize, usize)>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ADAMW_CHECKPOINT_RESTORE_COUNTS: std::cell::Cell<AdamWCheckpointRestoreCounts> =
+        const { std::cell::Cell::new(AdamWCheckpointRestoreCounts {
+            borrowed_plan_clones: 0,
+            consumed_plan_restores: 0,
+        }) };
+}
+
+#[cfg(test)]
+fn record_adamw_checkpoint_restore(update: impl FnOnce(&mut AdamWCheckpointRestoreCounts)) {
+    ADAMW_CHECKPOINT_RESTORE_COUNTS.with(|counts| {
+        let mut next = counts.get();
+        update(&mut next);
+        counts.set(next);
+    });
+}
+
+#[cfg(test)]
+pub(super) fn adamw_checkpoint_restore_counts() -> AdamWCheckpointRestoreCounts {
+    ADAMW_CHECKPOINT_RESTORE_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn captured_schedule_allocation(capture: &CapturedSchedule) -> (usize, usize, usize) {
+    (
+        capture.items.as_ptr() as usize,
+        capture.items.len(),
+        capture.items.capacity(),
+    )
+}
+
 impl CompiledAdamWPlan {
     pub fn compile<F>(
         config: CompiledAdamWConfig,
