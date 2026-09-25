@@ -130,6 +130,10 @@ use self::policy::{
 pub use self::program_artifact::{
     CompiledAdamWProgramArtifact, CompiledAdamWProgramArtifactFileError,
     CompiledAdamWProgramArtifactInfo, CompiledModuleAdamWArtifactRestoreError,
+    CompiledModuleMomentumSgdArtifactRestoreError, CompiledMomentumSgdProgramArtifact,
+    CompiledMomentumSgdProgramArtifactFileError, CompiledTrainingOptimizer,
+    CompiledTrainingProgramArtifact, CompiledTrainingProgramArtifactFileError,
+    CompiledTrainingProgramArtifactInfo,
 };
 use self::recurrent_phase::*;
 pub use self::resume_bundle::{CompiledAdamWResumeBundle, CompiledAdamWResumeBundleFileError};

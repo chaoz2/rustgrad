@@ -1427,10 +1427,13 @@ Legacy reports remain readable when these evidence fields are absent:
 
 #### Persistence and module ownership
 
-##### Compiled AdamW program artifacts
+##### Compiled training program artifacts
 
-`CompiledAdamWProgramArtifact` is a separate bounded, checksummed envelope for
-the resource-free training program.
+`CompiledTrainingProgramArtifact` is the optimizer-neutral name for a separate
+bounded, checksummed envelope around one resource-free training program.
+`CompiledAdamWProgramArtifact` remains a source-compatible name for existing
+callers, while `CompiledMomentumSgdProgramArtifact` exposes the same envelope
+for momentum-SGD.
 
 ###### Artifact contents
 
@@ -1440,13 +1443,18 @@ the resource-free training program.
   dropout, learning-rate, token-weight, freeze/tie, and native-update schemas.
 - RGAP v2 additionally retains bounded, checksummed Metal recipes for the main,
   partial-flush, and evaluation captures of Metal-admissible policies.
+- RGAP v3 adds an explicit optimizer discriminator and carries a CPU
+  momentum-SGD main capture. Its complete-module checkpoint supplies the exact
+  parameter and momentum frontier; restoration does not invoke the workload
+  builder, autograd, scheduling, or capture.
 - It never contains checkpoint tensors, live `Parameter` handles, runtime
   banks, native pointers, loaded libraries, or machine code.
 
 ###### Artifact and checkpoint boundary
 
-- **Save.** An owned module plan emits deterministic artifact bytes. AdamW and
-  complete-module checkpoint bytes remain unchanged.
+- **Save.** An owned AdamW or momentum-SGD module plan emits deterministic
+  artifact bytes. Existing RGAP v1/v2 AdamW and complete-module checkpoint
+  bytes remain unchanged.
 - **Restore.** `restore_from_program_artifact` consumes a differently
   initialized compatible module and its complete-module checkpoint. It rebuilds
   the resource-free plan without invoking the workload builder, autograd,
@@ -1457,7 +1465,8 @@ the resource-free training program.
   before runtime preparation or module publication.
 - **Execution.** Interpreter and strict-native CPU retain their existing paths.
   RGAP v2 reconstructs the same strict-Metal wrappers without rebuilding the
-  graph; v1 and Metal-ineligible CPU policies remain explicitly CPU-only.
+  graph; v1, v3 momentum-SGD, and Metal-ineligible policies remain explicitly
+  CPU-only.
 - **Evidence boundary.** Recipe admission is resource-free. Real Metal
   execution still requires the protected Apple-hardware lane.
 

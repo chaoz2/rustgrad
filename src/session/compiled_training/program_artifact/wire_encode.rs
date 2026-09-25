@@ -27,9 +27,9 @@ fn manifest_wire(
         output: member.output,
         state_buffer: member.state_buffer,
     };
-    // RGAP remains an AdamW artifact: adapt the optimizer-neutral runtime
-    // group back to its historical fixed role/order wire without serializing
-    // engine-only grouping metadata.
+    // Legacy AdamW RGAP payloads retain this historical fixed role/order wire;
+    // adapt the optimizer-neutral runtime group without serializing engine-only
+    // grouping metadata.
     let members = [
         member(0, parameter),
         member(1, first_moment),
@@ -304,7 +304,7 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
         let plan = self.plan();
         Ok(ProgramWire {
             format_version: if metal.is_some() {
-                FORMAT_VERSION
+                METAL_FORMAT_VERSION
             } else {
                 LEGACY_FORMAT_VERSION
             },
@@ -328,7 +328,9 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
             host_token_inputs: plan.contract.host_token_inputs.clone(),
             frozen_parameters: plan.contract.frozen_parameters.clone(),
             learning_rate: self.learning_rate_wire(),
-            adamw: self.adamw_wire(),
+            optimizer: OptimizerPolicyWire::AdamW {
+                adamw: self.adamw_wire(),
+            },
             metal,
         })
     }
@@ -336,4 +338,65 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
 
 pub(super) fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
     ProgramWireEncoder::new(owner).encode()
+}
+
+pub(super) fn momentum_program_wire<M>(
+    owner: &CompiledModuleMomentumSgdPlan<M>,
+) -> Result<ProgramWire> {
+    let main = &owner.plan.inner;
+    let state_buffers = main
+        .parameter_buffers
+        .iter()
+        .map(|(name, buffer)| (RecurrentStateKey::parameter(name), *buffer))
+        .chain(
+            main.optimizer_buffers
+                .iter()
+                .map(|(key, buffer)| (key.clone(), *buffer)),
+        )
+        .chain(
+            main.workload_buffers
+                .iter()
+                .map(|(key, buffer)| (key.clone(), *buffer)),
+        )
+        .collect::<BTreeMap<_, _>>();
+    Ok(ProgramWire {
+        format_version: OPTIMIZER_FORMAT_VERSION,
+        module: module_wire(&owner.seal),
+        main: MainWire {
+            phase: phase_wire(
+                &main.capture,
+                &state_buffers,
+                &main.state_input_keys,
+                &main.recurrent_store_groups,
+                false,
+                false,
+            )?,
+            inputs: main.inputs.clone(),
+            output_names: main.phase_outputs.named_outputs.clone(),
+            parameter_buffers: main.parameter_buffers.clone(),
+            optimizer_buffers: key_map(&main.optimizer_buffers),
+            workload_buffers: key_map(&main.workload_buffers),
+            state_input_buffers: main.state_input_buffers.clone(),
+            state_input_keys: input_key_map(&main.state_input_keys),
+        },
+        accumulation: None,
+        partial_flush: None,
+        zero_grad: None,
+        evaluation: None,
+        gradient_accumulation_steps: 1,
+        token_weight_policy: None,
+        allow_zero_valid_token_microbatches: false,
+        max_gradient_norm_bits: None,
+        clip_report: false,
+        window_loss_report: false,
+        loss_scale_bits: 1.0f32.to_bits(),
+        dropout: None,
+        host_token_inputs: BTreeMap::new(),
+        frozen_parameters: BTreeSet::new(),
+        learning_rate: LearningRateWire::External,
+        optimizer: OptimizerPolicyWire::MomentumSgd {
+            momentum_sgd: MomentumSgdPolicyWire {},
+        },
+        metal: None,
+    })
 }

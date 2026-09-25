@@ -1,9 +1,9 @@
 use super::adamw_contract::{CompiledAdamWContract, CompiledAdamWPolicy};
 use super::module_adamw_checkpoint::DecodedModuleAdamWCheckpoint;
-use super::module_checkpoint::ModuleCheckpointStateKind;
+use super::module_checkpoint::{DecodedModuleCheckpoint, ModuleCheckpointStateKind};
 use super::*;
 use crate::file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     io,
     path::Path,
@@ -18,11 +18,12 @@ use self::wire_decode::{
     decode_auxiliary, decode_input_key_map, decode_key_map, decode_manifest,
     validate_phase_capture, zero_frontier,
 };
-use self::wire_encode::{module_wire, program_wire};
+use self::wire_encode::{module_wire, momentum_program_wire, program_wire};
 
 const MAGIC: &[u8; 4] = b"RGAP";
 const LEGACY_FORMAT_VERSION: u8 = 1;
-const FORMAT_VERSION: u8 = 2;
+const METAL_FORMAT_VERSION: u8 = 2;
+const OPTIMIZER_FORMAT_VERSION: u8 = 3;
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 
 #[cfg(test)]
@@ -75,34 +76,41 @@ pub(super) fn record_evaluation_execution_plan() {
     update_decode_counts(|counts| counts.evaluation_execution_plans += 1);
 }
 
+/// Bounded, checksummed resource-free executable for one compiled optimizer.
+///
+/// Tensor state is persisted separately in a compatible complete-module
+/// checkpoint. [`Self::info`] identifies the optimizer before a caller selects
+/// the corresponding typed restore entrypoint.
 #[derive(Clone)]
-pub struct CompiledAdamWProgramArtifact {
+pub struct CompiledTrainingProgramArtifact {
     bytes: Vec<u8>,
-    info: CompiledAdamWProgramArtifactInfo,
+    info: CompiledTrainingProgramArtifactInfo,
     admitted: Option<Arc<AdmittedProgramArtifact>>,
 }
 
-impl fmt::Debug for CompiledAdamWProgramArtifact {
+impl fmt::Debug for CompiledTrainingProgramArtifact {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("CompiledAdamWProgramArtifact")
+            .debug_struct("CompiledTrainingProgramArtifact")
             .field("bytes", &self.bytes)
             .field("info", &self.info)
             .finish()
     }
 }
 
-impl PartialEq for CompiledAdamWProgramArtifact {
+impl PartialEq for CompiledTrainingProgramArtifact {
     fn eq(&self, other: &Self) -> bool {
         self.bytes == other.bytes && self.info == other.info
     }
 }
 
-impl Eq for CompiledAdamWProgramArtifact {}
+impl Eq for CompiledTrainingProgramArtifact {}
 
+/// Stable identity metadata decoded and validated from an RGAP envelope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CompiledAdamWProgramArtifactInfo {
+pub struct CompiledTrainingProgramArtifactInfo {
     format_version: u8,
+    optimizer: CompiledTrainingOptimizer,
     identity: u64,
     capture_identity: u64,
     accumulation_capture_identity: Option<u64>,
@@ -111,9 +119,29 @@ pub struct CompiledAdamWProgramArtifactInfo {
     evaluation_capture_identity: Option<u64>,
 }
 
+/// Optimizer policy embedded in a compiled-training program artifact.
+///
+/// This is deliberately an explicit enum rather than a string discriminator:
+/// callers can inspect the executable contract without parsing private wire
+/// data, while optimizer-specific plans keep their concrete Rust types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompiledTrainingOptimizer {
+    AdamW,
+    MomentumSgd,
+}
+
+/// Source-compatible AdamW name for the optimizer-neutral RGAP envelope.
+pub type CompiledAdamWProgramArtifact = CompiledTrainingProgramArtifact;
+
+/// Momentum-SGD compatibility name for the shared RGAP executable envelope.
+pub type CompiledMomentumSgdProgramArtifact = CompiledTrainingProgramArtifact;
+
+/// Source-compatible AdamW name for optimizer-neutral RGAP metadata.
+pub type CompiledAdamWProgramArtifactInfo = CompiledTrainingProgramArtifactInfo;
+
 /// A local compiled-program artifact file failure.
 #[derive(Debug)]
-pub enum CompiledAdamWProgramArtifactFileError {
+pub enum CompiledTrainingProgramArtifactFileError {
     Io {
         operation: &'static str,
         kind: io::ErrorKind,
@@ -125,7 +153,13 @@ pub enum CompiledAdamWProgramArtifactFileError {
     Format(Error),
 }
 
-impl fmt::Display for CompiledAdamWProgramArtifactFileError {
+/// Source-compatible AdamW name for local RGAP file failures.
+pub type CompiledAdamWProgramArtifactFileError = CompiledTrainingProgramArtifactFileError;
+
+/// Momentum-SGD compatibility name for local RGAP file failures.
+pub type CompiledMomentumSgdProgramArtifactFileError = CompiledTrainingProgramArtifactFileError;
+
+impl fmt::Display for CompiledTrainingProgramArtifactFileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { operation, kind } => {
@@ -143,7 +177,7 @@ impl fmt::Display for CompiledAdamWProgramArtifactFileError {
     }
 }
 
-impl std::error::Error for CompiledAdamWProgramArtifactFileError {
+impl std::error::Error for CompiledTrainingProgramArtifactFileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Format(error) => Some(error),
@@ -152,37 +186,41 @@ impl std::error::Error for CompiledAdamWProgramArtifactFileError {
     }
 }
 
-fn artifact_file_error(error: ExactFileError) -> CompiledAdamWProgramArtifactFileError {
+fn artifact_file_error(error: ExactFileError) -> CompiledTrainingProgramArtifactFileError {
     match error {
-        ExactFileError::Io { operation, source } => CompiledAdamWProgramArtifactFileError::Io {
+        ExactFileError::Io { operation, source } => CompiledTrainingProgramArtifactFileError::Io {
             operation,
             kind: source.kind(),
         },
         ExactFileError::Limit { actual, maximum } => {
-            CompiledAdamWProgramArtifactFileError::Limit { actual, maximum }
+            CompiledTrainingProgramArtifactFileError::Limit { actual, maximum }
         }
-        ExactFileError::Allocation => CompiledAdamWProgramArtifactFileError::Io {
+        ExactFileError::Allocation => CompiledTrainingProgramArtifactFileError::Io {
             operation: "allocate read buffer",
             kind: io::ErrorKind::OutOfMemory,
         },
-        ExactFileError::InvalidFileName => CompiledAdamWProgramArtifactFileError::Io {
+        ExactFileError::InvalidFileName => CompiledTrainingProgramArtifactFileError::Io {
             operation: "validate path",
             kind: io::ErrorKind::InvalidInput,
         },
-        ExactFileError::StagingExhausted => CompiledAdamWProgramArtifactFileError::Io {
+        ExactFileError::StagingExhausted => CompiledTrainingProgramArtifactFileError::Io {
             operation: "create unique staging file",
             kind: io::ErrorKind::AlreadyExists,
         },
     }
 }
 
-impl CompiledAdamWProgramArtifactInfo {
+impl CompiledTrainingProgramArtifactInfo {
     pub fn format_version(&self) -> u8 {
         self.format_version
     }
 
     pub fn identity(&self) -> u64 {
         self.identity
+    }
+
+    pub fn optimizer(&self) -> CompiledTrainingOptimizer {
+        self.optimizer
     }
 
     pub fn capture_identity(&self) -> u64 {
@@ -206,7 +244,7 @@ impl CompiledAdamWProgramArtifactInfo {
     }
 }
 
-impl CompiledAdamWProgramArtifact {
+impl CompiledTrainingProgramArtifact {
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Result<Self> {
         let bytes = bytes.into();
         let mut wire = decode(&bytes)?;
@@ -222,7 +260,7 @@ impl CompiledAdamWProgramArtifact {
     /// Loads and validates one local RGAP artifact under its intrinsic byte bound.
     pub fn load_file(
         path: impl AsRef<Path>,
-    ) -> std::result::Result<Self, CompiledAdamWProgramArtifactFileError> {
+    ) -> std::result::Result<Self, CompiledTrainingProgramArtifactFileError> {
         Self::load_file_with_byte_limit(path, MAX_ARTIFACT_BYTES)
     }
 
@@ -231,10 +269,10 @@ impl CompiledAdamWProgramArtifact {
     pub fn load_file_with_byte_limit(
         path: impl AsRef<Path>,
         maximum: usize,
-    ) -> std::result::Result<Self, CompiledAdamWProgramArtifactFileError> {
+    ) -> std::result::Result<Self, CompiledTrainingProgramArtifactFileError> {
         let bytes = read_file_bytes_bounded(path, maximum.min(MAX_ARTIFACT_BYTES))
             .map_err(artifact_file_error)?;
-        Self::from_bytes(bytes).map_err(CompiledAdamWProgramArtifactFileError::Format)
+        Self::from_bytes(bytes).map_err(CompiledTrainingProgramArtifactFileError::Format)
     }
 
     /// Atomically replaces `path` with these exact validated artifact bytes
@@ -242,21 +280,21 @@ impl CompiledAdamWProgramArtifact {
     pub fn save_file(
         &self,
         path: impl AsRef<Path>,
-    ) -> std::result::Result<(), CompiledAdamWProgramArtifactFileError> {
+    ) -> std::result::Result<(), CompiledTrainingProgramArtifactFileError> {
         let wire =
-            decode(self.as_bytes()).map_err(CompiledAdamWProgramArtifactFileError::Format)?;
+            decode(self.as_bytes()).map_err(CompiledTrainingProgramArtifactFileError::Format)?;
         let (info, _) = wire
             .validate()
-            .map_err(CompiledAdamWProgramArtifactFileError::Format)?;
+            .map_err(CompiledTrainingProgramArtifactFileError::Format)?;
         if info != self.info {
-            return Err(CompiledAdamWProgramArtifactFileError::Format(training(
+            return Err(CompiledTrainingProgramArtifactFileError::Format(training(
                 "compiled program artifact info differs",
             )));
         }
         replace_file_bytes_atomically(path, self.as_bytes()).map_err(artifact_file_error)
     }
 
-    pub fn info(&self) -> &CompiledAdamWProgramArtifactInfo {
+    pub fn info(&self) -> &CompiledTrainingProgramArtifactInfo {
         &self.info
     }
 
@@ -369,10 +407,50 @@ impl<M> fmt::Display for CompiledModuleAdamWArtifactRestoreError<M> {
 
 impl<M> std::error::Error for CompiledModuleAdamWArtifactRestoreError<M> {}
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+/// Recoverable failure while pairing a momentum-SGD executable artifact with
+/// a complete-module checkpoint.
+pub struct CompiledModuleMomentumSgdArtifactRestoreError<M> {
+    module: M,
+    source: Error,
+}
+
+impl<M> CompiledModuleMomentumSgdArtifactRestoreError<M> {
+    pub fn source_error(&self) -> &Error {
+        &self.source
+    }
+
+    pub fn into_module(self) -> M {
+        self.module
+    }
+
+    pub fn into_parts(self) -> (M, Error) {
+        (self.module, self.source)
+    }
+}
+
+impl<M> fmt::Debug for CompiledModuleMomentumSgdArtifactRestoreError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledModuleMomentumSgdArtifactRestoreError")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> fmt::Display for CompiledModuleMomentumSgdArtifactRestoreError<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "compiled momentum-SGD program artifact restore failed: {}",
+            self.source
+        )
+    }
+}
+
+impl<M> std::error::Error for CompiledModuleMomentumSgdArtifactRestoreError<M> {}
+
+#[derive(Clone, Debug)]
 struct ProgramWire {
-    #[serde(skip)]
     format_version: u8,
     module: ModuleWire,
     main: MainWire,
@@ -391,9 +469,138 @@ struct ProgramWire {
     host_token_inputs: BTreeMap<String, Shape>,
     frozen_parameters: BTreeSet<String>,
     learning_rate: LearningRateWire,
-    adamw: AdamWPolicyWire,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    optimizer: OptimizerPolicyWire,
     metal: Option<MetalProgramWire>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgramWireSerde {
+    module: ModuleWire,
+    main: MainWire,
+    accumulation: Option<PhaseWire>,
+    partial_flush: Option<PhaseWire>,
+    zero_grad: Option<PhaseWire>,
+    evaluation: Option<EvaluationWire>,
+    gradient_accumulation_steps: u64,
+    token_weight_policy: Option<TokenWeightWire>,
+    allow_zero_valid_token_microbatches: bool,
+    max_gradient_norm_bits: Option<u32>,
+    clip_report: bool,
+    window_loss_report: bool,
+    loss_scale_bits: u32,
+    dropout: Option<DropoutWire>,
+    host_token_inputs: BTreeMap<String, Shape>,
+    frozen_parameters: BTreeSet<String>,
+    learning_rate: LearningRateWire,
+    #[serde(default)]
+    adamw: Option<AdamWPolicyWire>,
+    #[serde(default)]
+    momentum_sgd: Option<MomentumSgdPolicyWire>,
+    #[serde(default)]
+    metal: Option<MetalProgramWire>,
+}
+
+#[derive(Serialize)]
+struct ProgramWireSerdeRef<'a> {
+    module: &'a ModuleWire,
+    main: &'a MainWire,
+    accumulation: &'a Option<PhaseWire>,
+    partial_flush: &'a Option<PhaseWire>,
+    zero_grad: &'a Option<PhaseWire>,
+    evaluation: &'a Option<EvaluationWire>,
+    gradient_accumulation_steps: u64,
+    token_weight_policy: &'a Option<TokenWeightWire>,
+    allow_zero_valid_token_microbatches: bool,
+    max_gradient_norm_bits: Option<u32>,
+    clip_report: bool,
+    window_loss_report: bool,
+    loss_scale_bits: u32,
+    dropout: Option<DropoutWire>,
+    host_token_inputs: &'a BTreeMap<String, Shape>,
+    frozen_parameters: &'a BTreeSet<String>,
+    learning_rate: &'a LearningRateWire,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adamw: Option<&'a AdamWPolicyWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    momentum_sgd: Option<&'a MomentumSgdPolicyWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metal: Option<&'a MetalProgramWire>,
+}
+
+impl Serialize for ProgramWire {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (adamw, momentum_sgd) = match &self.optimizer {
+            OptimizerPolicyWire::AdamW { adamw } => (Some(adamw), None),
+            OptimizerPolicyWire::MomentumSgd { momentum_sgd } => (None, Some(momentum_sgd)),
+        };
+        ProgramWireSerdeRef {
+            module: &self.module,
+            main: &self.main,
+            accumulation: &self.accumulation,
+            partial_flush: &self.partial_flush,
+            zero_grad: &self.zero_grad,
+            evaluation: &self.evaluation,
+            gradient_accumulation_steps: self.gradient_accumulation_steps,
+            token_weight_policy: &self.token_weight_policy,
+            allow_zero_valid_token_microbatches: self.allow_zero_valid_token_microbatches,
+            max_gradient_norm_bits: self.max_gradient_norm_bits,
+            clip_report: self.clip_report,
+            window_loss_report: self.window_loss_report,
+            loss_scale_bits: self.loss_scale_bits,
+            dropout: self.dropout,
+            host_token_inputs: &self.host_token_inputs,
+            frozen_parameters: &self.frozen_parameters,
+            learning_rate: &self.learning_rate,
+            adamw,
+            momentum_sgd,
+            metal: self.metal.as_ref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProgramWire {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ProgramWireSerde::deserialize(deserializer)?;
+        let optimizer = match (wire.adamw, wire.momentum_sgd) {
+            (Some(adamw), None) => OptimizerPolicyWire::AdamW { adamw },
+            (None, Some(momentum_sgd)) => OptimizerPolicyWire::MomentumSgd { momentum_sgd },
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "compiled program artifact optimizer policy is inconsistent",
+                ));
+            }
+        };
+        Ok(Self {
+            format_version: 0,
+            module: wire.module,
+            main: wire.main,
+            accumulation: wire.accumulation,
+            partial_flush: wire.partial_flush,
+            zero_grad: wire.zero_grad,
+            evaluation: wire.evaluation,
+            gradient_accumulation_steps: wire.gradient_accumulation_steps,
+            token_weight_policy: wire.token_weight_policy,
+            allow_zero_valid_token_microbatches: wire.allow_zero_valid_token_microbatches,
+            max_gradient_norm_bits: wire.max_gradient_norm_bits,
+            clip_report: wire.clip_report,
+            window_loss_report: wire.window_loss_report,
+            loss_scale_bits: wire.loss_scale_bits,
+            dropout: wire.dropout,
+            host_token_inputs: wire.host_token_inputs,
+            frozen_parameters: wire.frozen_parameters,
+            learning_rate: wire.learning_rate,
+            optimizer,
+            metal: wire.metal,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -490,6 +697,16 @@ struct AdamWPolicyWire {
     weight_decay_exclusions: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug)]
+enum OptimizerPolicyWire {
+    AdamW { adamw: AdamWPolicyWire },
+    MomentumSgd { momentum_sgd: MomentumSgdPolicyWire },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MomentumSgdPolicyWire {}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 struct DropoutWire {
     key: [u32; 2],
@@ -538,8 +755,9 @@ struct AdmittedProgramArtifact {
 /// Immutable resource-free replay structure derived at most once per admitted
 /// artifact. Mutable tensor values, logical versions, module seals, backend
 /// resources, and replay cursors remain destination-owned.
-struct AdmittedTrainingTopology {
-    plan: CompiledAdamWPlan,
+enum AdmittedTrainingTopology {
+    AdamW(Box<CompiledAdamWPlan>),
+    MomentumSgd(Box<CompiledMomentumSgdPlan>),
 }
 
 impl fmt::Debug for AdmittedProgramArtifact {
@@ -565,16 +783,12 @@ impl AdmittedProgramArtifact {
         }
     }
 
-    fn training_topology(
-        &self,
-        checkpoint: &DecodedModuleAdamWCheckpoint,
-    ) -> Result<Arc<AdmittedTrainingTopology>> {
+    fn training_topology(&self) -> Result<Arc<AdmittedTrainingTopology>> {
         self.training_topology
             .get_or_init(|| {
                 #[cfg(test)]
                 update_decode_counts(|counts| counts.topology_seals += 1);
-                seal_admitted_training_topology(&self.wire, &self.captures, checkpoint)
-                    .map(Arc::new)
+                seal_admitted_training_topology(&self.wire, &self.captures).map(Arc::new)
             })
             .clone()
     }
@@ -682,7 +896,10 @@ fn checksum(bytes: &[u8]) -> u64 {
 }
 
 fn encode(wire: &ProgramWire) -> Result<Vec<u8>> {
-    if !matches!(wire.format_version, LEGACY_FORMAT_VERSION | FORMAT_VERSION) {
+    if !matches!(
+        wire.format_version,
+        LEGACY_FORMAT_VERSION | METAL_FORMAT_VERSION | OPTIMIZER_FORMAT_VERSION
+    ) {
         return Err(training("compiled program artifact version is unsupported"));
     }
     let payload = serde_json::to_vec(wire)
@@ -711,7 +928,10 @@ fn decode(bytes: &[u8]) -> Result<ProgramWire> {
     if bytes.len() < 21 || bytes.len() > MAX_ARTIFACT_BYTES || &bytes[..4] != MAGIC {
         return Err(training("compiled program artifact header is invalid"));
     }
-    if !matches!(bytes[4], LEGACY_FORMAT_VERSION | FORMAT_VERSION) {
+    if !matches!(
+        bytes[4],
+        LEGACY_FORMAT_VERSION | METAL_FORMAT_VERSION | OPTIMIZER_FORMAT_VERSION
+    ) {
         return Err(training("compiled program artifact version is unsupported"));
     }
     let payload_len = u64::from_le_bytes(
@@ -757,7 +977,7 @@ where
         serde_json::from_value(json).expect("well-formed rewritten test artifact");
     wire.format_version = format_version;
     let bytes = encode(&wire).expect("bounded rewritten test artifact");
-    let unchecked = CompiledAdamWProgramArtifact {
+    let unchecked = CompiledTrainingProgramArtifact {
         bytes: bytes.clone(),
         info: *artifact.info(),
         admitted: None,
@@ -817,8 +1037,45 @@ impl<M: Module> CompiledModuleTrainingPlan<M, CompiledAdamWPlan, Option<u64>> {
     }
 }
 
-fn checkpoint_module_wire(decoded: &DecodedModuleAdamWCheckpoint) -> Result<ModuleWire> {
-    let optimizer = decoded.optimizer.decoded();
+impl<M: Module> CompiledModuleTrainingPlan<M, CompiledMomentumSgdPlan> {
+    /// Serializes the resource-free momentum-SGD executable separately from
+    /// its complete-module checkpoint.
+    pub fn program_artifact(&self) -> Result<CompiledMomentumSgdProgramArtifact> {
+        self.seal.validate_unchanged(&self.module)?;
+        let wire = momentum_program_wire(self)?;
+        let bytes = encode(&wire)?;
+        let artifact = CompiledTrainingProgramArtifact::from_bytes(bytes)?;
+        if artifact.info().optimizer() != CompiledTrainingOptimizer::MomentumSgd {
+            return Err(training(
+                "compiled momentum-SGD program artifact optimizer differs",
+            ));
+        }
+        Ok(artifact)
+    }
+
+    /// Restores a differently initialized module without rebuilding the
+    /// momentum-SGD graph, derivatives, schedules, or captures.
+    pub fn restore_from_program_artifact(
+        module: M,
+        artifact: &CompiledMomentumSgdProgramArtifact,
+        checkpoint: &CompiledModuleMomentumSgdCheckpoint,
+    ) -> std::result::Result<Self, CompiledModuleMomentumSgdArtifactRestoreError<M>> {
+        match restore_momentum_owner(&module, artifact, checkpoint) {
+            Ok((plan, seal)) => Ok(Self {
+                module,
+                plan,
+                seal,
+                attachment: (),
+            }),
+            Err(source) => Err(CompiledModuleMomentumSgdArtifactRestoreError { module, source }),
+        }
+    }
+}
+
+fn checkpoint_module_wire<C>(
+    decoded: &DecodedModuleCheckpoint<C>,
+    optimizer_parameters: &BTreeMap<String, TensorData>,
+) -> Result<ModuleWire> {
     let states = decoded
         .states
         .iter()
@@ -826,7 +1083,7 @@ fn checkpoint_module_wire(decoded: &DecodedModuleAdamWCheckpoint) -> Result<Modu
             let value = state
                 .value
                 .as_ref()
-                .or_else(|| optimizer.parameters.get(&state.name))
+                .or_else(|| optimizer_parameters.get(&state.name))
                 .ok_or_else(|| training("compiled module checkpoint state value is absent"))?;
             Ok(ModuleStateWire {
                 name: state.name.clone(),
@@ -861,14 +1118,11 @@ pub(super) struct AdmittedArtifactCheckpointPair {
     checkpoint: Arc<DecodedModuleAdamWCheckpoint>,
 }
 
-fn decode_admitted_artifact_checkpoint_pair(
-    artifact: &CompiledAdamWProgramArtifact,
-    checkpoint: &CompiledModuleAdamWCheckpoint,
-) -> Result<AdmittedArtifactCheckpointPair> {
-    #[cfg(test)]
-    update_decode_counts(|counts| counts.pair_admissions += 1);
-    let admitted = match artifact.admitted() {
-        Some(admitted) => admitted.clone(),
+fn admitted_artifact(
+    artifact: &CompiledTrainingProgramArtifact,
+) -> Result<Arc<AdmittedProgramArtifact>> {
+    match artifact.admitted() {
+        Some(admitted) => Ok(admitted.clone()),
         None => {
             let mut wire = decode(artifact.as_bytes())?;
             let (artifact_info, captures) = wire.validate()?;
@@ -876,13 +1130,31 @@ fn decode_admitted_artifact_checkpoint_pair(
                 return Err(training("compiled program artifact info differs"));
             }
             wire.discard_capture_bytes();
-            Arc::new(AdmittedProgramArtifact::new(wire, captures))
+            Ok(Arc::new(AdmittedProgramArtifact::new(wire, captures)))
         }
-    };
+    }
+}
+
+fn decode_admitted_artifact_checkpoint_pair(
+    artifact: &CompiledAdamWProgramArtifact,
+    checkpoint: &CompiledModuleAdamWCheckpoint,
+) -> Result<AdmittedArtifactCheckpointPair> {
+    #[cfg(test)]
+    update_decode_counts(|counts| counts.pair_admissions += 1);
+    let admitted = admitted_artifact(artifact)?;
     let wire = &admitted.wire;
     let artifact_info = *artifact.info();
+    if artifact_info.optimizer != CompiledTrainingOptimizer::AdamW {
+        return Err(training(
+            "compiled program artifact optimizer differs from checkpoint",
+        ));
+    }
     let decoded_module = checkpoint.decoded_arc().clone();
-    if checkpoint_module_wire(decoded_module.as_ref())? != wire.module {
+    if checkpoint_module_wire(
+        decoded_module.as_ref(),
+        &decoded_module.optimizer.decoded().parameters,
+    )? != wire.module
+    {
         return Err(training("compiled program artifact module schema mismatch"));
     }
     if decoded_module.evaluation_capture_identity != artifact_info.evaluation_capture_identity {
@@ -950,6 +1222,56 @@ fn restore_owner<M: Module>(
     restore_owner_from_admitted(module, &admitted)
 }
 
+fn restore_momentum_owner<M: Module>(
+    module: &M,
+    artifact: &CompiledMomentumSgdProgramArtifact,
+    checkpoint: &CompiledModuleMomentumSgdCheckpoint,
+) -> Result<(CompiledMomentumSgdPlan, CompiledModuleSeal)> {
+    let admitted = admitted_artifact(artifact)?;
+    if artifact.info().optimizer() != CompiledTrainingOptimizer::MomentumSgd {
+        return Err(training(
+            "compiled program artifact optimizer differs from checkpoint",
+        ));
+    }
+    let wire = &admitted.wire;
+    let decoded = checkpoint.decoded_arc();
+    if checkpoint_module_wire(decoded, checkpoint.optimizer_checkpoint().parameters())?
+        != wire.module
+    {
+        return Err(training("compiled program artifact module schema mismatch"));
+    }
+    if decoded.evaluation_capture_identity.is_some()
+        || checkpoint.optimizer_checkpoint().capture_identity()
+            != artifact.info().capture_identity()
+    {
+        return Err(training(
+            "compiled program artifact checkpoint policy mismatch",
+        ));
+    }
+    let mut seal = CompiledModuleSeal::capture(module, &BTreeSet::new())?;
+    let _immutable_values =
+        seal.apply_module_checkpoint(decoded, checkpoint.optimizer_checkpoint().parameters())?;
+    if module_wire(&seal) != wire.module {
+        return Err(training(
+            "compiled program artifact destination module mismatch",
+        ));
+    }
+    let topology = admitted.training_topology()?;
+    let plan = match topology.as_ref() {
+        AdmittedTrainingTopology::MomentumSgd(plan) => plan
+            .as_ref()
+            .clone()
+            .restore_checkpoint_owned(checkpoint.optimizer_checkpoint())?,
+        AdmittedTrainingTopology::AdamW(_) => {
+            return Err(training(
+                "compiled program artifact optimizer differs from checkpoint",
+            ));
+        }
+    };
+    seal.validate_unchanged(module)?;
+    Ok((plan, seal))
+}
+
 fn restore_owner_from_admitted<M: Module>(
     module: &M,
     admitted: &AdmittedArtifactCheckpointPair,
@@ -966,12 +1288,18 @@ fn restore_owner_from_admitted<M: Module>(
             "compiled program artifact destination module mismatch",
         ));
     }
-    let plan = admitted
-        .artifact
-        .training_topology(decoded_module)?
-        .plan
-        .clone()
-        .restore_checkpoint_owned(&decoded_module.optimizer)?;
+    let plan = admitted.artifact.training_topology()?;
+    let plan = match plan.as_ref() {
+        AdmittedTrainingTopology::AdamW(plan) => plan
+            .as_ref()
+            .clone()
+            .restore_checkpoint_owned(&decoded_module.optimizer)?,
+        AdmittedTrainingTopology::MomentumSgd(_) => {
+            return Err(training(
+                "compiled program artifact optimizer differs from checkpoint",
+            ));
+        }
+    };
     seal.validate_unchanged(module)?;
     Ok((plan, seal))
 }
@@ -979,7 +1307,6 @@ fn restore_owner_from_admitted<M: Module>(
 fn seal_admitted_training_topology(
     wire: &ProgramWire,
     captures: &ProgramCaptures,
-    decoded_module: &DecodedModuleAdamWCheckpoint,
 ) -> Result<AdmittedTrainingTopology> {
     let capture = captures.main.clone();
     #[cfg(test)]
@@ -1074,6 +1401,11 @@ fn seal_admitted_training_topology(
         step: 0,
         accumulation,
     };
+    if matches!(&wire.optimizer, OptimizerPolicyWire::MomentumSgd { .. }) {
+        return CompiledMomentumSgdPlan::from_inner(inner)
+            .map(Box::new)
+            .map(AdmittedTrainingTopology::MomentumSgd);
+    }
     let evaluation = wire
         .evaluation
         .as_ref()
@@ -1100,15 +1432,6 @@ fn seal_admitted_training_topology(
             })
         })
         .transpose()?;
-    if decoded_module.evaluation_capture_identity
-        != evaluation
-            .as_ref()
-            .map(|evaluation| evaluation.capture_identity)
-    {
-        return Err(training(
-            "compiled program artifact evaluation identity mismatch",
-        ));
-    }
     let learning_rate = match &wire.learning_rate {
         LearningRateWire::External => CompiledLearningRatePolicy::External,
         LearningRateWire::MultiStep {
@@ -1143,6 +1466,9 @@ fn seal_admitted_training_topology(
             decode_auxiliary(inner.capture.as_ref(), phase, capture.clone(), None)
         })
         .transpose()?;
+    let OptimizerPolicyWire::AdamW { adamw } = &wire.optimizer else {
+        return Err(training("compiled program artifact AdamW policy is absent"));
+    };
     let plan = CompiledAdamWPlan {
         program_identity,
         inner,
@@ -1164,16 +1490,16 @@ fn seal_admitted_training_topology(
             frozen_parameters: wire.frozen_parameters.clone(),
             learning_rate,
             optimizer: CompiledAdamWPolicy {
-                beta1: f32::from_bits(wire.adamw.beta1_bits),
-                beta2: f32::from_bits(wire.adamw.beta2_bits),
-                eps: f32::from_bits(wire.adamw.eps_bits),
-                weight_decay: f32::from_bits(wire.adamw.weight_decay_bits),
-                weight_decay_exclusions: wire.adamw.weight_decay_exclusions.clone(),
+                beta1: f32::from_bits(adamw.beta1_bits),
+                beta2: f32::from_bits(adamw.beta2_bits),
+                eps: f32::from_bits(adamw.eps_bits),
+                weight_decay: f32::from_bits(adamw.weight_decay_bits),
+                weight_decay_exclusions: adamw.weight_decay_exclusions.clone(),
             },
         },
         progress: CompiledTrainingWindowProgress::INITIAL,
         evaluation,
         compile_phases: None,
     };
-    Ok(AdmittedTrainingTopology { plan })
+    Ok(AdmittedTrainingTopology::AdamW(Box::new(plan)))
 }
