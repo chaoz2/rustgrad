@@ -305,48 +305,6 @@ impl CompiledTrainingStepResult {
 
 pub type CompiledMomentumSgdStepResult = CompiledTrainingStepResult;
 
-/// Exact persistent frontier of one compiled CPU momentum-SGD program.
-///
-/// The checkpoint is independent of the runtime's host module identity. A
-/// matching program may validate it against a freshly initialized module,
-/// restore parameter and momentum values with their logical versions, and
-/// continue replay without publishing into that module until finalization.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CompiledMomentumSgdCheckpoint {
-    pub(super) capture_identity: u64,
-    pub(super) step: u64,
-    pub(super) parameters: BTreeMap<String, TensorData>,
-    pub(super) momenta: BTreeMap<String, TensorData>,
-    pub(super) parameter_versions: BTreeMap<String, u64>,
-    pub(super) momentum_versions: BTreeMap<String, u64>,
-}
-
-impl CompiledMomentumSgdCheckpoint {
-    pub const fn capture_identity(&self) -> u64 {
-        self.capture_identity
-    }
-
-    pub const fn step(&self) -> u64 {
-        self.step
-    }
-
-    pub fn parameters(&self) -> &BTreeMap<String, TensorData> {
-        &self.parameters
-    }
-
-    pub fn momenta(&self) -> &BTreeMap<String, TensorData> {
-        &self.momenta
-    }
-
-    pub fn parameter_versions(&self) -> &BTreeMap<String, u64> {
-        &self.parameter_versions
-    }
-
-    pub fn momentum_versions(&self) -> &BTreeMap<String, u64> {
-        &self.momentum_versions
-    }
-}
-
 /// Backend- and optimizer-neutral view of one committed compiled training step.
 ///
 /// Concrete optimizer results may expose additional progress, while device
