@@ -570,57 +570,65 @@ impl AdmittedProgramArtifact {
 }
 
 impl ProgramCaptures {
+    fn decode_phase(phase: &PhaseWire) -> Result<Arc<CapturedMixedSchedule>> {
+        #[cfg(test)]
+        update_decode_counts(|counts| counts.mixed_captures += 1);
+        let capture = CapturedMixedSchedule::from_bytes(&phase.capture).map_err(replay_error)?;
+        capture.initial_recurrent_cursor().map_err(replay_error)?;
+        Ok(Arc::new(capture))
+    }
+
+    fn decode_evaluation(evaluation: &EvaluationWire) -> Result<Arc<CapturedSchedule>> {
+        #[cfg(test)]
+        update_decode_counts(|counts| counts.evaluation_captures += 1);
+        let capture = CapturedSchedule::from_bytes(&evaluation.capture).map_err(replay_error)?;
+        (capture.identity == evaluation.capture_identity)
+            .then_some(Arc::new(capture))
+            .ok_or_else(|| training("compiled evaluation artifact identity mismatch"))
+    }
+
+    fn decode_metal_recipe(bytes: &[u8]) -> Result<PortableCapturedInferenceRecipe> {
+        PortableCapturedInferenceRecipe::from_bytes(bytes).map_err(captured_inference_error)
+    }
+
     fn decode(wire: &ProgramWire) -> Result<Self> {
-        let decode_phase = |phase: &PhaseWire| -> Result<Arc<CapturedMixedSchedule>> {
-            #[cfg(test)]
-            update_decode_counts(|counts| counts.mixed_captures += 1);
-            let capture =
-                CapturedMixedSchedule::from_bytes(&phase.capture).map_err(replay_error)?;
-            capture.initial_recurrent_cursor().map_err(replay_error)?;
-            Ok(Arc::new(capture))
-        };
-        let main = decode_phase(&wire.main.phase)?;
-        let accumulation = wire.accumulation.as_ref().map(decode_phase).transpose()?;
-        let partial_flush = wire.partial_flush.as_ref().map(decode_phase).transpose()?;
-        let zero_grad = wire.zero_grad.as_ref().map(decode_phase).transpose()?;
+        let main = Self::decode_phase(&wire.main.phase)?;
+        let accumulation = wire
+            .accumulation
+            .as_ref()
+            .map(Self::decode_phase)
+            .transpose()?;
+        let partial_flush = wire
+            .partial_flush
+            .as_ref()
+            .map(Self::decode_phase)
+            .transpose()?;
+        let zero_grad = wire
+            .zero_grad
+            .as_ref()
+            .map(Self::decode_phase)
+            .transpose()?;
         let evaluation = wire
             .evaluation
             .as_ref()
-            .map(|evaluation| {
-                #[cfg(test)]
-                update_decode_counts(|counts| counts.evaluation_captures += 1);
-                let capture =
-                    CapturedSchedule::from_bytes(&evaluation.capture).map_err(replay_error)?;
-                (capture.identity == evaluation.capture_identity)
-                    .then_some(Arc::new(capture))
-                    .ok_or_else(|| training("compiled evaluation artifact identity mismatch"))
-            })
+            .map(Self::decode_evaluation)
             .transpose()?;
         let metal_main = wire
             .metal
             .as_ref()
-            .map(|metal| {
-                PortableCapturedInferenceRecipe::from_bytes(&metal.main)
-                    .map_err(captured_inference_error)
-            })
+            .map(|metal| Self::decode_metal_recipe(&metal.main))
             .transpose()?;
         let metal_partial_flush = wire
             .metal
             .as_ref()
             .and_then(|metal| metal.partial_flush.as_ref())
-            .map(|recipe| {
-                PortableCapturedInferenceRecipe::from_bytes(recipe)
-                    .map_err(captured_inference_error)
-            })
+            .map(|recipe| Self::decode_metal_recipe(recipe))
             .transpose()?;
         let metal_evaluation = wire
             .metal
             .as_ref()
             .and_then(|metal| metal.evaluation.as_ref())
-            .map(|recipe| {
-                PortableCapturedInferenceRecipe::from_bytes(recipe)
-                    .map_err(captured_inference_error)
-            })
+            .map(|recipe| Self::decode_metal_recipe(recipe))
             .transpose()?;
         let metal_main_recurrent = metal_main
             .clone()
@@ -825,7 +833,7 @@ impl ProgramWire {
         })
     }
 
-    fn validate(&self) -> Result<(CompiledAdamWProgramArtifactInfo, ProgramCaptures)> {
+    fn validate_format_inventory(&self) -> Result<()> {
         if self.format_version == LEGACY_FORMAT_VERSION {
             if self.metal.is_some() {
                 return Err(training(
@@ -847,45 +855,56 @@ impl ProgramWire {
         } else {
             return Err(training("compiled program artifact version is unsupported"));
         }
+        Ok(())
+    }
+
+    fn validate_metal_host_policy(&self, captures: &ProgramCaptures) -> Result<()> {
+        if self.format_version != FORMAT_VERSION {
+            return Ok(());
+        }
+        let expected_names = self
+            .host_token_inputs
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let main = captures
+            .metal_main
+            .as_ref()
+            .expect("v2 validation requires a main Metal recipe");
+        let expected_main_policy = if expected_names.is_empty() {
+            PortableInferenceHostPolicy::None
+        } else {
+            PortableInferenceHostPolicy::Training
+        };
+        let expected_evaluation_policy = if expected_names.is_empty() {
+            PortableInferenceHostPolicy::None
+        } else {
+            PortableInferenceHostPolicy::FixedGathers
+        };
+        if main.host_policy() != expected_main_policy
+            || main.host_input_names() != expected_names
+            || captures.metal_partial_flush.as_ref().is_some_and(|recipe| {
+                recipe.host_policy() != PortableInferenceHostPolicy::None
+                    || !recipe.host_input_names().is_empty()
+            })
+            || captures.metal_evaluation.as_ref().is_some_and(|recipe| {
+                recipe.host_policy() != expected_evaluation_policy
+                    || recipe.host_input_names() != expected_names
+            })
+        {
+            return Err(training(
+                "compiled program artifact Metal host policy differs",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(CompiledAdamWProgramArtifactInfo, ProgramCaptures)> {
+        self.validate_format_inventory()?;
         let canonical = serde_json::to_vec(self)
             .map_err(|error| training(format!("compiled program artifact validation: {error}")))?;
         let captures = ProgramCaptures::decode(self)?;
-        if self.format_version == FORMAT_VERSION {
-            let expected_names = self
-                .host_token_inputs
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>();
-            let main = captures
-                .metal_main
-                .as_ref()
-                .expect("v2 validation requires a main Metal recipe");
-            let expected_main_policy = if expected_names.is_empty() {
-                PortableInferenceHostPolicy::None
-            } else {
-                PortableInferenceHostPolicy::Training
-            };
-            if main.host_policy() != expected_main_policy
-                || main.host_input_names() != expected_names
-                || captures.metal_partial_flush.as_ref().is_some_and(|recipe| {
-                    recipe.host_policy() != PortableInferenceHostPolicy::None
-                        || !recipe.host_input_names().is_empty()
-                })
-                || captures.metal_evaluation.as_ref().is_some_and(|recipe| {
-                    recipe.host_policy()
-                        != if expected_names.is_empty() {
-                            PortableInferenceHostPolicy::None
-                        } else {
-                            PortableInferenceHostPolicy::FixedGathers
-                        }
-                        || recipe.host_input_names() != expected_names
-                })
-            {
-                return Err(training(
-                    "compiled program artifact Metal host policy differs",
-                ));
-            }
-        }
+        self.validate_metal_host_policy(&captures)?;
         let info = self.info(checksum(&canonical), &captures)?;
         validate_module_wire(&self.module, &self.frozen_parameters)?;
 
@@ -928,7 +947,7 @@ impl ProgramWire {
         Ok(())
     }
 
-    fn validate_main(&self, main_capture: &CapturedMixedSchedule) -> Result<ValidatedMain> {
+    fn validate_main_inventory(&self) -> Result<()> {
         if self.main.phase.clip_report != self.clip_report
             || self.main.phase.window_loss_report != self.window_loss_report
             || self.main.parameter_buffers.is_empty()
@@ -939,7 +958,10 @@ impl ProgramWire {
                 "compiled program artifact main inventory is inconsistent",
             ));
         }
-        let main_states = validate_phase_capture(&self.main.phase, main_capture)?;
+        Ok(())
+    }
+
+    fn validate_parameter_policy(&self) -> Result<()> {
         let trainable_parameters = self
             .module
             .states
@@ -965,6 +987,10 @@ impl ProgramWire {
                 "compiled program artifact parameter policy differs",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_main_output_schema(&self, main_capture: &CapturedMixedSchedule) -> Result<()> {
         let expected_requested = 1usize
             .checked_add(self.main.output_names.len())
             .and_then(|count| count.checked_add(usize::from(self.clip_report) * 2))
@@ -975,6 +1001,10 @@ impl ProgramWire {
                 "compiled program artifact requested output schema differs",
             ));
         }
+        Ok(())
+    }
+
+    fn expected_main_states(&self) -> Result<ValidatedMain> {
         let expected_main_states = self
             .main
             .parameter_buffers
@@ -995,7 +1025,19 @@ impl ProgramWire {
             .filter(|(key, _)| key.is_accumulation_reset_state())
             .map(|(key, buffer)| (key.clone(), *buffer))
             .collect::<BTreeMap<_, _>>();
-        if main_states != expected_main_states
+        Ok(ValidatedMain {
+            states: expected_main_states,
+            flush_states: expected_flush_states,
+            zero_grad_states: expected_zero_grad_states,
+        })
+    }
+
+    fn validate_main_state_schema(
+        &self,
+        captured_states: &BTreeMap<RecurrentStateKey, u64>,
+        expected: &ValidatedMain,
+    ) -> Result<()> {
+        if captured_states != &expected.states
             || self
                 .main
                 .state_input_buffers
@@ -1006,13 +1048,17 @@ impl ProgramWire {
         }
         let input_keys = decode_input_key_map(&self.main.state_input_keys)?;
         if input_keys.iter().any(|(input, key)| {
-            self.main.state_input_buffers.get(input) != expected_main_states.get(key)
+            self.main.state_input_buffers.get(input) != expected.states.get(key)
         }) || self.main.state_input_buffers.len() != input_keys.len()
         {
             return Err(training(
                 "compiled program artifact state input mapping differs",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_host_token_inputs(&self) -> Result<()> {
         if self.host_token_inputs.iter().any(|(name, shape)| {
             self.main.inputs.get(name) != Some(&(shape.clone(), DType::I32))
                 || shape.rank() != 2
@@ -1022,6 +1068,10 @@ impl ProgramWire {
                 "compiled program artifact host-token policy differs",
             ));
         }
+        Ok(())
+    }
+
+    fn validate_main_inputs(&self, main_capture: &CapturedMixedSchedule) -> Result<()> {
         let captured_inputs = main_capture
             .schedule
             .inputs
@@ -1047,6 +1097,18 @@ impl ProgramWire {
         {
             return Err(training("compiled program artifact input schema differs"));
         }
+        Ok(())
+    }
+
+    fn validate_main(&self, main_capture: &CapturedMixedSchedule) -> Result<ValidatedMain> {
+        self.validate_main_inventory()?;
+        let captured_states = validate_phase_capture(&self.main.phase, main_capture)?;
+        self.validate_parameter_policy()?;
+        self.validate_main_output_schema(main_capture)?;
+        let expected_states = self.expected_main_states()?;
+        self.validate_main_state_schema(&captured_states, &expected_states)?;
+        self.validate_host_token_inputs()?;
+        self.validate_main_inputs(main_capture)?;
         if let Some(policy) = &self.token_weight_policy {
             let policy = CompiledTokenWeightPolicy::from(policy);
             validate_token_weight_policy(
@@ -1063,17 +1125,95 @@ impl ProgramWire {
         let native_manifests = if topology.accumulating() {
             NativeManifestExpectation::AdamW {
                 parameters: &self.main.parameter_buffers,
-                states: &expected_main_states,
+                states: &expected_states.states,
             }
         } else {
             NativeManifestExpectation::None
         };
         validate_native_manifests(&self.main.phase, main_capture, native_manifests)?;
-        Ok(ValidatedMain {
-            states: expected_main_states,
-            flush_states: expected_flush_states,
-            zero_grad_states: expected_zero_grad_states,
-        })
+        Ok(expected_states)
+    }
+
+    fn validate_accumulation(
+        &self,
+        main: &ValidatedMain,
+        phase: &PhaseWire,
+        capture: &CapturedMixedSchedule,
+    ) -> Result<()> {
+        if phase.clip_report || phase.window_loss_report {
+            return Err(training("compiled accumulation artifact exposes reports"));
+        }
+        let states = validate_phase_capture(phase, capture)?;
+        if states != main.states
+            || capture.schedule.requested.len() != 1 + self.main.output_names.len()
+            || phase_external_inputs(capture, phase).ne(self.main.inputs.keys().cloned())
+        {
+            return Err(training(
+                "compiled accumulation artifact frontier differs from main",
+            ));
+        }
+        validate_native_manifests(phase, capture, NativeManifestExpectation::None)
+    }
+
+    fn validate_zero_grad(
+        &self,
+        main: &ValidatedMain,
+        phase: &PhaseWire,
+        capture: &CapturedMixedSchedule,
+    ) -> Result<()> {
+        let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
+            phase.clip_report,
+            phase.window_loss_report,
+        );
+        outputs.validate_report_flags(false, false)?;
+        if phase.clip_report || phase.window_loss_report || !phase.adamw_native_updates.is_empty() {
+            return Err(training(
+                "compiled zero-grad artifact exposes update outputs",
+            ));
+        }
+        let states = validate_phase_capture(phase, capture)?;
+        if states != main.zero_grad_states
+            || !capture.schedule.requested.is_empty()
+            || phase_external_inputs(capture, phase).next().is_some()
+        {
+            return Err(training("compiled zero-grad artifact state schema differs"));
+        }
+        validate_native_manifests(phase, capture, NativeManifestExpectation::None)
+    }
+
+    fn validate_partial_flush(
+        &self,
+        main: &ValidatedMain,
+        phase: &PhaseWire,
+        capture: &CapturedMixedSchedule,
+    ) -> Result<()> {
+        let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
+            phase.clip_report,
+            phase.window_loss_report,
+        );
+        outputs.validate_report_flags(self.clip_report, self.window_loss_report)?;
+        let states = validate_phase_capture(phase, capture)?;
+        let expected_outputs = outputs.observations.len();
+        let has_learning_rate = capture
+            .schedule
+            .inputs
+            .iter()
+            .any(|input| input.name == LEARNING_RATE_INPUT);
+        if states != main.flush_states
+            || capture.schedule.requested.len() != expected_outputs
+            || phase_external_inputs(capture, phase).next().is_some()
+            || has_learning_rate != matches!(&self.learning_rate, LearningRateWire::External)
+        {
+            return Err(training("compiled flush artifact state schema differs"));
+        }
+        validate_native_manifests(
+            phase,
+            capture,
+            NativeManifestExpectation::AdamW {
+                parameters: &self.main.parameter_buffers,
+                states: &states,
+            },
+        )
     }
 
     fn validate_auxiliary_programs(
@@ -1082,79 +1222,13 @@ impl ProgramWire {
         captures: &ProgramCaptures,
     ) -> Result<()> {
         if let (Some(phase), Some(capture)) = (&self.accumulation, &captures.accumulation) {
-            if phase.clip_report || phase.window_loss_report {
-                return Err(training("compiled accumulation artifact exposes reports"));
-            }
-            let states = validate_phase_capture(phase, capture.as_ref())?;
-            if states != main.states
-                || capture.schedule.requested.len() != 1 + self.main.output_names.len()
-                || phase_external_inputs(capture.as_ref(), phase).ne(self
-                    .main
-                    .inputs
-                    .keys()
-                    .cloned())
-            {
-                return Err(training(
-                    "compiled accumulation artifact frontier differs from main",
-                ));
-            }
-            validate_native_manifests(phase, capture.as_ref(), NativeManifestExpectation::None)?;
+            self.validate_accumulation(main, phase, capture.as_ref())?;
         }
         if let (Some(phase), Some(capture)) = (&self.zero_grad, &captures.zero_grad) {
-            let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
-                phase.clip_report,
-                phase.window_loss_report,
-            );
-            outputs.validate_report_flags(false, false)?;
-            if phase.clip_report
-                || phase.window_loss_report
-                || !phase.adamw_native_updates.is_empty()
-            {
-                return Err(training(
-                    "compiled zero-grad artifact exposes update outputs",
-                ));
-            }
-            let states = validate_phase_capture(phase, capture.as_ref())?;
-            if states != main.zero_grad_states
-                || !capture.schedule.requested.is_empty()
-                || phase_external_inputs(capture.as_ref(), phase)
-                    .next()
-                    .is_some()
-            {
-                return Err(training("compiled zero-grad artifact state schema differs"));
-            }
-            validate_native_manifests(phase, capture.as_ref(), NativeManifestExpectation::None)?;
+            self.validate_zero_grad(main, phase, capture.as_ref())?;
         }
         if let (Some(phase), Some(capture)) = (&self.partial_flush, &captures.partial_flush) {
-            let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
-                phase.clip_report,
-                phase.window_loss_report,
-            );
-            outputs.validate_report_flags(self.clip_report, self.window_loss_report)?;
-            let states = validate_phase_capture(phase, capture.as_ref())?;
-            let expected_outputs = outputs.observations.len();
-            let has_learning_rate = capture
-                .schedule
-                .inputs
-                .iter()
-                .any(|input| input.name == LEARNING_RATE_INPUT);
-            if states != main.flush_states
-                || capture.schedule.requested.len() != expected_outputs
-                || phase_external_inputs(capture.as_ref(), phase)
-                    .next()
-                    .is_some()
-                || has_learning_rate != matches!(&self.learning_rate, LearningRateWire::External)
-            {
-                return Err(training("compiled flush artifact state schema differs"));
-            }
-            validate_native_manifests(
-                phase,
-                capture.as_ref(),
-                NativeManifestExpectation::AdamW {
-                    parameters: &self.main.parameter_buffers,
-                    states: &states,
-                },
-            )?;
+            self.validate_partial_flush(main, phase, capture.as_ref())?;
         }
         Ok(())
     }
@@ -1599,114 +1673,56 @@ fn module_wire(seal: &CompiledModuleSeal) -> ModuleWire {
     }
 }
 
-fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
-    let plan = &owner.plan;
-    let main = &plan.inner;
-    validate_adamw_observation_schema(
-        &main.phase_outputs.observations,
-        plan.contract.clip_report,
-        plan.contract.window_loss_report,
-    )?;
-    let main_state_buffers = main
-        .parameter_buffers
-        .iter()
-        .map(|(name, buffer)| (RecurrentStateKey::parameter(name), *buffer))
-        .chain(
-            main.optimizer_buffers
-                .iter()
-                .map(|(key, buffer)| (key.clone(), *buffer)),
+struct ProgramWireEncoder<'a, M> {
+    owner: &'a CompiledModuleAdamWPlan<M>,
+}
+
+impl<'a, M> ProgramWireEncoder<'a, M> {
+    fn new(owner: &'a CompiledModuleAdamWPlan<M>) -> Self {
+        Self { owner }
+    }
+
+    fn plan(&self) -> &CompiledAdamWPlan {
+        &self.owner.plan
+    }
+
+    fn main(&self) -> &CompiledTrainingPlan {
+        &self.plan().inner
+    }
+
+    fn validate_observations(&self) -> Result<()> {
+        validate_adamw_observation_schema(
+            &self.main().phase_outputs.observations,
+            self.plan().contract.clip_report,
+            self.plan().contract.window_loss_report,
         )
-        .chain(
-            main.workload_buffers
-                .iter()
-                .map(|(key, buffer)| (key.clone(), *buffer)),
-        )
-        .collect();
-    let accumulation = main
-        .accumulation
-        .as_ref()
-        .map(|phase| {
-            phase_wire(
-                &phase.phase().capture,
-                &phase.phase().state_buffers,
-                &main.state_input_keys,
-                &[],
-                false,
-                false,
+    }
+
+    fn main_state_buffers(&self) -> BTreeMap<RecurrentStateKey, u64> {
+        let main = self.main();
+        main.parameter_buffers
+            .iter()
+            .map(|(name, buffer)| (RecurrentStateKey::parameter(name), *buffer))
+            .chain(
+                main.optimizer_buffers
+                    .iter()
+                    .map(|(key, buffer)| (key.clone(), *buffer)),
             )
-        })
-        .transpose()?;
-    let evaluation = plan
-        .evaluation
-        .as_ref()
-        .map(|evaluation| {
-            Ok(EvaluationWire {
-                capture: evaluation
-                    .inference
-                    .capture()
-                    .to_bytes()
-                    .map_err(replay_error)?,
-                inputs: evaluation.inputs.clone(),
-                output_names: evaluation.output_names.clone(),
-                parameter_inputs: evaluation.parameter_inputs.clone(),
-                loss_weight_policy: evaluation.loss_weight_policy.as_ref().map(Into::into),
-                allow_zero_valid_token_microbatches: evaluation.allow_zero_valid_token_microbatches,
-                capture_identity: evaluation.capture_identity,
-            })
-        })
-        .transpose()?;
-    let metal = match plan.contract.metal() {
-        Ok(_) => Some((|| -> Result<MetalProgramWire> {
-            let main_recipe = main
-                .recurrent_capture
-                .portable_training_recipe(
-                    &plan.contract.host_token_inputs,
-                    &main.frozen_parameter_nodes,
-                )?
-                .to_bytes()
-                .map_err(captured_inference_error)?;
-            let partial_flush = plan
-                .partial_flush
-                .as_ref()
-                .map(|transition| {
-                    transition
-                        .phase()
-                        .recurrent_capture
-                        .portable_recipe(PortableInferenceHostPolicy::None)?
-                        .to_bytes()
-                        .map_err(captured_inference_error)
-                })
-                .transpose()?;
-            let evaluation = plan
-                .evaluation
-                .as_ref()
-                .map(|evaluation| {
-                    evaluation
-                        .inference
-                        .portable_recipe()?
-                        .to_bytes()
-                        .map_err(captured_inference_error)
-                })
-                .transpose()?;
-            Ok(MetalProgramWire {
-                main: main_recipe,
-                partial_flush,
-                evaluation,
-            })
-        })()?),
-        Err(_) => None,
-    };
-    Ok(ProgramWire {
-        format_version: if metal.is_some() {
-            FORMAT_VERSION
-        } else {
-            LEGACY_FORMAT_VERSION
-        },
-        module: module_wire(&owner.seal),
-        main: MainWire {
+            .chain(
+                main.workload_buffers
+                    .iter()
+                    .map(|(key, buffer)| (key.clone(), *buffer)),
+            )
+            .collect()
+    }
+
+    fn main_wire(&self, state_buffers: &BTreeMap<RecurrentStateKey, u64>) -> Result<MainWire> {
+        let plan = self.plan();
+        let main = self.main();
+        Ok(MainWire {
             phase: phase_wire(
                 &main.capture,
-                &main_state_buffers,
+                state_buffers,
                 &main.state_input_keys,
                 &main.recurrent_store_groups,
                 plan.contract.clip_report,
@@ -1719,45 +1735,170 @@ fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
             workload_buffers: key_map(&main.workload_buffers),
             state_input_buffers: main.state_input_buffers.clone(),
             state_input_keys: input_key_map(&main.state_input_keys),
-        },
-        accumulation,
-        partial_flush: plan
+        })
+    }
+
+    fn accumulation_wire(&self) -> Result<Option<PhaseWire>> {
+        let main = self.main();
+        main.accumulation
+            .as_ref()
+            .map(|phase| {
+                phase_wire(
+                    &phase.phase().capture,
+                    &phase.phase().state_buffers,
+                    &main.state_input_keys,
+                    &[],
+                    false,
+                    false,
+                )
+            })
+            .transpose()
+    }
+
+    fn evaluation_wire(&self) -> Result<Option<EvaluationWire>> {
+        self.plan()
+            .evaluation
+            .as_ref()
+            .map(|evaluation| {
+                Ok(EvaluationWire {
+                    capture: evaluation
+                        .inference
+                        .capture()
+                        .to_bytes()
+                        .map_err(replay_error)?,
+                    inputs: evaluation.inputs.clone(),
+                    output_names: evaluation.output_names.clone(),
+                    parameter_inputs: evaluation.parameter_inputs.clone(),
+                    loss_weight_policy: evaluation.loss_weight_policy.as_ref().map(Into::into),
+                    allow_zero_valid_token_microbatches: evaluation
+                        .allow_zero_valid_token_microbatches,
+                    capture_identity: evaluation.capture_identity,
+                })
+            })
+            .transpose()
+    }
+
+    fn metal_wire(&self) -> Result<Option<MetalProgramWire>> {
+        let plan = self.plan();
+        if plan.contract.metal().is_err() {
+            return Ok(None);
+        }
+        let main = self.main();
+        let main = main
+            .recurrent_capture
+            .portable_training_recipe(
+                &plan.contract.host_token_inputs,
+                &main.frozen_parameter_nodes,
+            )?
+            .to_bytes()
+            .map_err(captured_inference_error)?;
+        let partial_flush = plan
             .partial_flush
             .as_ref()
-            .map(auxiliary_wire)
-            .transpose()?,
-        zero_grad: plan.zero_grad.as_ref().map(auxiliary_wire).transpose()?,
-        evaluation,
-        gradient_accumulation_steps: plan.contract.gradient_accumulation_steps,
-        token_weight_policy: plan.contract.token_weight_policy.as_ref().map(Into::into),
-        allow_zero_valid_token_microbatches: plan.contract.allow_zero_valid_token_microbatches,
-        max_gradient_norm_bits: plan.contract.max_gradient_norm.map(f32::to_bits),
-        clip_report: plan.contract.clip_report,
-        window_loss_report: plan.contract.window_loss_report,
-        loss_scale_bits: plan.contract.loss_scale.to_bits(),
-        dropout: plan.contract.dropout.map(|dropout| DropoutWire {
-            key: dropout.config.key().words(),
-            blocks_per_replay: dropout.blocks_per_replay,
-        }),
-        host_token_inputs: plan.contract.host_token_inputs.clone(),
-        frozen_parameters: plan.contract.frozen_parameters.clone(),
-        learning_rate: match &plan.contract.learning_rate {
+            .map(|transition| {
+                transition
+                    .phase()
+                    .recurrent_capture
+                    .portable_recipe(PortableInferenceHostPolicy::None)?
+                    .to_bytes()
+                    .map_err(captured_inference_error)
+            })
+            .transpose()?;
+        let evaluation = plan
+            .evaluation
+            .as_ref()
+            .map(|evaluation| {
+                evaluation
+                    .inference
+                    .portable_recipe()?
+                    .to_bytes()
+                    .map_err(captured_inference_error)
+            })
+            .transpose()?;
+        Ok(Some(MetalProgramWire {
+            main,
+            partial_flush,
+            evaluation,
+        }))
+    }
+
+    fn learning_rate_wire(&self) -> LearningRateWire {
+        match &self.plan().contract.learning_rate {
             CompiledLearningRatePolicy::External => LearningRateWire::External,
             CompiledLearningRatePolicy::MultiStep(schedule) => LearningRateWire::MultiStep {
                 base_bits: schedule.base.to_bits(),
                 gamma_bits: schedule.gamma.to_bits(),
                 milestones: schedule.milestones.clone(),
             },
-        },
-        adamw: AdamWPolicyWire {
-            beta1_bits: plan.contract.optimizer.beta1.to_bits(),
-            beta2_bits: plan.contract.optimizer.beta2.to_bits(),
-            eps_bits: plan.contract.optimizer.eps.to_bits(),
-            weight_decay_bits: plan.contract.optimizer.weight_decay.to_bits(),
-            weight_decay_exclusions: plan.contract.optimizer.weight_decay_exclusions.clone(),
-        },
-        metal,
-    })
+        }
+    }
+
+    fn adamw_wire(&self) -> AdamWPolicyWire {
+        let optimizer = &self.plan().contract.optimizer;
+        AdamWPolicyWire {
+            beta1_bits: optimizer.beta1.to_bits(),
+            beta2_bits: optimizer.beta2.to_bits(),
+            eps_bits: optimizer.eps.to_bits(),
+            weight_decay_bits: optimizer.weight_decay.to_bits(),
+            weight_decay_exclusions: optimizer.weight_decay_exclusions.clone(),
+        }
+    }
+
+    fn encode(self) -> Result<ProgramWire> {
+        self.validate_observations()?;
+        let main_state_buffers = self.main_state_buffers();
+        let accumulation = self.accumulation_wire()?;
+        let evaluation = self.evaluation_wire()?;
+        let metal = self.metal_wire()?;
+        let module = module_wire(&self.owner.seal);
+        let main = self.main_wire(&main_state_buffers)?;
+        let partial_flush = self
+            .plan()
+            .partial_flush
+            .as_ref()
+            .map(auxiliary_wire)
+            .transpose()?;
+        let zero_grad = self
+            .plan()
+            .zero_grad
+            .as_ref()
+            .map(auxiliary_wire)
+            .transpose()?;
+        let plan = self.plan();
+        Ok(ProgramWire {
+            format_version: if metal.is_some() {
+                FORMAT_VERSION
+            } else {
+                LEGACY_FORMAT_VERSION
+            },
+            module,
+            main,
+            accumulation,
+            partial_flush,
+            zero_grad,
+            evaluation,
+            gradient_accumulation_steps: plan.contract.gradient_accumulation_steps,
+            token_weight_policy: plan.contract.token_weight_policy.as_ref().map(Into::into),
+            allow_zero_valid_token_microbatches: plan.contract.allow_zero_valid_token_microbatches,
+            max_gradient_norm_bits: plan.contract.max_gradient_norm.map(f32::to_bits),
+            clip_report: plan.contract.clip_report,
+            window_loss_report: plan.contract.window_loss_report,
+            loss_scale_bits: plan.contract.loss_scale.to_bits(),
+            dropout: plan.contract.dropout.map(|dropout| DropoutWire {
+                key: dropout.config.key().words(),
+                blocks_per_replay: dropout.blocks_per_replay,
+            }),
+            host_token_inputs: plan.contract.host_token_inputs.clone(),
+            frozen_parameters: plan.contract.frozen_parameters.clone(),
+            learning_rate: self.learning_rate_wire(),
+            adamw: self.adamw_wire(),
+            metal,
+        })
+    }
+}
+
+fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
+    ProgramWireEncoder::new(owner).encode()
 }
 
 impl<M: Module> CompiledModuleAdamWPlan<M> {
