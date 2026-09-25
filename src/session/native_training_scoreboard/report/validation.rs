@@ -358,7 +358,26 @@ fn validate_program_inventory(
     Ok(prior_programs)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CompilerParallelism {
+    overlap: u128,
+    module_job_count: u64,
+    internal_overlap: u128,
+}
+
 fn validate_preparation(
+    report: &NativeTrainingReport,
+    prior_programs: &[&NativeTrainingProgramReport],
+) -> Result<()> {
+    validate_module_evidence(report, prior_programs)?;
+    let compiler_parallelism = validate_compiler_parallelism(report)?;
+    validate_compiler_critical_tail(report, prior_programs)?;
+    validate_render_capsules(report)?;
+    let render_overlap = validate_render_parallelism(report)?;
+    validate_preparation_partition(report, compiler_parallelism, render_overlap)
+}
+
+fn validate_module_evidence(
     report: &NativeTrainingReport,
     prior_programs: &[&NativeTrainingProgramReport],
 ) -> Result<()> {
@@ -413,6 +432,12 @@ fn validate_preparation(
         }
         _ => return Err(invalid("native v21 module evidence is absent")),
     }
+    Ok(())
+}
+
+fn validate_compiler_parallelism(
+    report: &NativeTrainingReport,
+) -> Result<Option<CompilerParallelism>> {
     let parallel_evidence = match report.format_version {
         1..=NATIVE_TRAINING_REPORT_FORMAT_V7 => {
             if report.prepare_compiler_process_overlap_wall_time.is_some()
@@ -486,14 +511,21 @@ fn validate_preparation(
             {
                 return Err(invalid("native parallel compiler evidence differs"));
             }
-            Some((
-                compiler_overlap,
-                aggregate.module_job_count,
-                internal_compiler_overlap,
-            ))
+            Some(CompilerParallelism {
+                overlap: compiler_overlap,
+                module_job_count: aggregate.module_job_count,
+                internal_overlap: internal_compiler_overlap,
+            })
         }
         _ => unreachable!("format version was validated"),
     };
+    Ok(parallel_evidence)
+}
+
+fn validate_compiler_critical_tail(
+    report: &NativeTrainingReport,
+    prior_programs: &[&NativeTrainingProgramReport],
+) -> Result<()> {
     match (
         report.format_version,
         &report.prepare_compiler_process_timings,
@@ -541,6 +573,10 @@ fn validate_preparation(
         }
         _ => return Err(invalid("native compiler critical-path evidence is absent")),
     }
+    Ok(())
+}
+
+fn validate_render_capsules(report: &NativeTrainingReport) -> Result<()> {
     match (
         report.format_version,
         report.prepare_render_capsule_hit_count,
@@ -559,6 +595,10 @@ fn validate_preparation(
         }
         _ => return Err(invalid("native render capsule evidence is absent")),
     }
+    Ok(())
+}
+
+fn validate_render_parallelism(report: &NativeTrainingReport) -> Result<u128> {
     let render_overlap = match (
         report.format_version,
         report.prepare_parallel_render_overlap_wall_time,
@@ -649,6 +689,14 @@ fn validate_preparation(
         }
         _ => return Err(invalid("native parallel render evidence is absent")),
     };
+    Ok(render_overlap)
+}
+
+fn validate_preparation_partition(
+    report: &NativeTrainingReport,
+    compiler_parallelism: Option<CompilerParallelism>,
+    render_overlap: u128,
+) -> Result<()> {
     match (
         report.format_version,
         report.prepare_runtime_overhead_wall_time,
@@ -701,8 +749,12 @@ fn validate_preparation(
                     .map_err(|_| invalid("invalid native prepare overlap duration"))?,
                 _ => return Err(invalid("native prepare overlap timing differs")),
             };
-            if let Some((compiler_overlap, module_job_count, internal_overlap)) = parallel_evidence
-            {
+            if let Some(parallelism) = compiler_parallelism {
+                let CompilerParallelism {
+                    overlap: compiler_overlap,
+                    module_job_count,
+                    internal_overlap,
+                } = parallelism;
                 let cross_program_compiler_overlap = compiler_overlap
                     .checked_sub(internal_overlap)
                     .ok_or_else(|| invalid("native internal compiler overlap exceeds total"))?;
