@@ -23,6 +23,7 @@ mod module_state;
 mod momentum_checkpoint;
 mod momentum_module_plan;
 mod momentum_plan;
+mod native_cpu_adamw_runtime;
 mod native_cpu_evidence;
 mod native_cpu_preparation;
 mod native_cpu_programs;
@@ -59,11 +60,8 @@ use self::capture::{
     canonical_recurrent_capture_counts, canonical_recurrent_capture_delta,
     with_canonical_recurrent_reference,
 };
-pub use self::cpu_adamw_runtime::{CpuCompiledAdamW, NativeCpuCompiledAdamW};
-use self::cpu_adamw_runtime::{
-    NativeCpuEvaluationPreparation, PreparedNativeCpuEvaluation, PreparedNativeCpuProgram,
-    PreparedNativeEvaluationParameterInput, adamw_step_result,
-};
+pub use self::cpu_adamw_runtime::CpuCompiledAdamW;
+use self::cpu_adamw_runtime::{PendingAdamWStep, adamw_step_result};
 pub use self::cpu_momentum_runtime::CpuCompiledMomentumSgd;
 use self::cpu_training_program::CpuCompiledTrainingProgram;
 use self::cpu_training_step::{CompiledStepOutputSelection, CompiledStepReplayRequest};
@@ -93,6 +91,11 @@ pub use self::module_state::TrainingParameterInit;
 use self::module_state::{CompiledModuleSeal, ModuleParameterPlan};
 pub use self::momentum_checkpoint::CompiledMomentumSgdCheckpoint;
 pub use self::momentum_plan::CompiledMomentumSgdPlan;
+pub use self::native_cpu_adamw_runtime::NativeCpuCompiledAdamW;
+use self::native_cpu_adamw_runtime::{
+    NativeCpuEvaluationPreparation, PreparedNativeCpuEvaluation, PreparedNativeCpuProgram,
+    PreparedNativeEvaluationParameterInput,
+};
 use self::native_cpu_evidence::native_preparation_wall_time;
 pub use self::native_cpu_evidence::*;
 use self::native_cpu_programs::*;
