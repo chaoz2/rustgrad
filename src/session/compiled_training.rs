@@ -17,6 +17,7 @@ mod module_owner;
 mod module_plan;
 mod module_session;
 mod module_state;
+mod momentum_checkpoint;
 mod momentum_module_plan;
 mod momentum_plan;
 mod native_cpu_evidence;
@@ -83,6 +84,7 @@ use self::module_owner::{
 };
 pub use self::module_state::TrainingParameterInit;
 use self::module_state::{CompiledModuleSeal, ModuleParameterPlan};
+pub use self::momentum_checkpoint::CompiledMomentumSgdCheckpoint;
 pub use self::momentum_plan::CompiledMomentumSgdPlan;
 use self::native_cpu_evidence::native_preparation_wall_time;
 pub use self::native_cpu_evidence::*;

@@ -4,7 +4,10 @@ use super::observation::{
 };
 use super::*;
 use crate::nn::{ParameterSnapshot, StateKind};
-use crate::{Backend, CpuBackend, LossOptions, Op, Parameter, cross_entropy};
+use crate::{
+    Backend, CpuBackend, LossOptions, Op, Parameter, SafetensorsFileError, SafetensorsReadLimits,
+    cross_entropy,
+};
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -9432,6 +9435,100 @@ fn owned_module_momentum_checkpoint_resumes_fresh_identity_atomically() {
     assert_parameter_snapshot_eq(
         &destination.buffer.snapshot().unwrap(),
         &destination_buffer_before,
+    );
+}
+
+#[test]
+fn momentum_checkpoint_round_trips_deterministic_bytes_and_files() {
+    let config = CompiledMomentumSgdConfig::new(0.9)
+        .unwrap()
+        .with_input("x", [2], DType::F32)
+        .unwrap();
+    let module = TiedFrozenModule::new([1.0, -1.0]);
+    let mut session =
+        CompiledModuleTrainingSession::compile_momentum_sgd(config, module, build_tied_frozen)
+            .unwrap();
+    session
+        .step(
+            BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]),
+            TensorData::scalar(0.01),
+        )
+        .unwrap();
+    let checkpoint = session.checkpoint().unwrap();
+    let source_parameters = checkpoint.parameters().clone();
+    let source_momenta = checkpoint.momenta().clone();
+
+    let bytes = checkpoint.to_bytes().unwrap();
+    let restored = CompiledMomentumSgdCheckpoint::from_bytes(&bytes).unwrap();
+    assert_eq!(restored, checkpoint);
+    assert_eq!(restored.to_bytes().unwrap(), bytes);
+    assert_eq!(checkpoint.parameters(), &source_parameters);
+    assert_eq!(checkpoint.momenta(), &source_momenta);
+
+    let (tensors, metadata) = load_safetensors(&bytes).unwrap();
+    assert_eq!(metadata["format"], "rustgrad-compiled-momentum-sgd-v1");
+    assert_eq!(metadata["parameter_count"], "1");
+    assert_eq!(metadata["state.0.name"], "shared");
+    assert_eq!(
+        tensors["state.0.parameter"],
+        checkpoint.parameters()["shared"]
+    );
+    assert_eq!(tensors["state.0.momentum"], checkpoint.momenta()["shared"]);
+
+    let path = TemporaryCheckpointPath::new("compiled-momentum-sgd");
+    checkpoint.save_file(path.path()).unwrap();
+    assert_eq!(fs::read(path.path()).unwrap(), bytes);
+    assert_eq!(
+        CompiledMomentumSgdCheckpoint::load_file(path.path()).unwrap(),
+        checkpoint
+    );
+    assert!(matches!(
+        CompiledMomentumSgdCheckpoint::load_file_with_limits(
+            path.path(),
+            SafetensorsReadLimits {
+                max_file_bytes: bytes.len() - 1,
+            },
+        ),
+        Err(SafetensorsFileError::Limit { .. })
+    ));
+
+    let (tensors, mut unexpected_metadata) = load_safetensors(&bytes).unwrap();
+    unexpected_metadata.insert("unexpected".into(), "value".into());
+    assert!(
+        CompiledMomentumSgdCheckpoint::from_bytes(
+            &save_safetensors(&tensors, &unexpected_metadata).unwrap()
+        )
+        .is_err()
+    );
+
+    let (mut mismatched, metadata) = load_safetensors(&bytes).unwrap();
+    mismatched.insert("state.0.momentum".into(), TensorData::scalar(0.0));
+    assert!(
+        CompiledMomentumSgdCheckpoint::from_bytes(
+            &save_safetensors(&mismatched, &metadata).unwrap()
+        )
+        .is_err()
+    );
+
+    let (tensors, mut duplicate_metadata) = load_safetensors(&bytes).unwrap();
+    duplicate_metadata.insert("parameter_count".into(), "2".into());
+    duplicate_metadata.insert("state.1.name".into(), "shared".into());
+    duplicate_metadata.insert("state.1.parameter_version".into(), "0".into());
+    duplicate_metadata.insert("state.1.momentum_version".into(), "0".into());
+    let mut duplicate_tensors = tensors;
+    duplicate_tensors.insert(
+        "state.1.parameter".into(),
+        checkpoint.parameters()["shared"].clone(),
+    );
+    duplicate_tensors.insert(
+        "state.1.momentum".into(),
+        checkpoint.momenta()["shared"].clone(),
+    );
+    assert!(
+        CompiledMomentumSgdCheckpoint::from_bytes(
+            &save_safetensors(&duplicate_tensors, &duplicate_metadata).unwrap()
+        )
+        .is_err()
     );
 }
 
