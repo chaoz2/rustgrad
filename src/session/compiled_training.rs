@@ -5,6 +5,7 @@ mod adamw_contract;
 mod adamw_plan;
 mod adamw_plan_restore;
 mod capture;
+mod cpu_adamw_capabilities;
 mod cpu_adamw_runtime;
 mod cpu_training_program;
 mod cpu_training_step;
