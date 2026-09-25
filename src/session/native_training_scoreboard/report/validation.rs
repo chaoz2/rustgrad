@@ -116,6 +116,14 @@ fn validate_header(report: &NativeTrainingReport) -> Result<()> {
 fn validate_program_inventory(
     report: &NativeTrainingReport,
 ) -> Result<Vec<&NativeTrainingProgramReport>> {
+    validate_accumulation_inventory(report)?;
+    validate_main_replay_traffic(report)?;
+    validate_materialized_egress(report)?;
+    validate_main_execution_count(report)?;
+    collect_program_inventory(report)
+}
+
+fn validate_accumulation_inventory(report: &NativeTrainingReport) -> Result<()> {
     match (
         report.format_version,
         &report.accumulation,
@@ -197,6 +205,10 @@ fn validate_program_inventory(
         }
         _ => return Err(invalid("native accumulation replay inventory differs")),
     }
+    Ok(())
+}
+
+fn validate_main_replay_traffic(report: &NativeTrainingReport) -> Result<()> {
     match (report.format_version, &report.main_replay_traffic) {
         (1 | NATIVE_TRAINING_REPORT_FORMAT_V2, None) => {}
         (
@@ -243,6 +255,10 @@ fn validate_program_inventory(
         }
         _ => return Err(invalid("native training replay traffic differs")),
     }
+    Ok(())
+}
+
+fn validate_materialized_egress(report: &NativeTrainingReport) -> Result<()> {
     for traffic in report
         .main_replay_traffic
         .iter()
@@ -284,6 +300,10 @@ fn validate_program_inventory(
             _ => unreachable!("format version was validated"),
         }
     }
+    Ok(())
+}
+
+fn validate_main_execution_count(report: &NativeTrainingReport) -> Result<()> {
     match (
         report.format_version,
         report.main_replay_executed_native_item_count,
@@ -321,6 +341,12 @@ fn validate_program_inventory(
         }
         _ => return Err(invalid("native training execution count differs")),
     }
+    Ok(())
+}
+
+fn collect_program_inventory(
+    report: &NativeTrainingReport,
+) -> Result<Vec<&NativeTrainingProgramReport>> {
     let mut prior_programs = vec![&report.main];
     for program in report
         .accumulation
