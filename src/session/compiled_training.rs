@@ -1570,6 +1570,22 @@ impl CompiledAdamWRuntime for MetalCompiledAdamW {
     }
 }
 
+impl CompiledTrainingWindowResetRuntime for MetalCompiledAdamW {
+    fn reset_gradient_window(&mut self) -> Result<CompiledTrainingWindowReset> {
+        MetalCompiledAdamW::zero_grad(self)
+    }
+}
+
+impl CompiledTrainingWindowRuntime for MetalCompiledAdamW {
+    fn gradient_window_size(&self) -> u64 {
+        MetalCompiledAdamW::gradient_accumulation_steps(self)
+    }
+
+    fn pending_microbatch_count(&self) -> Result<u64> {
+        MetalCompiledAdamW::accumulation_index(self)
+    }
+}
+
 impl CompiledTrainingWindowCommitRuntime for MetalCompiledAdamW {
     type WindowCommit = MetalCompiledAdamWFlushResult;
 

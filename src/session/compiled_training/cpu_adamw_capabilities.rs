@@ -276,6 +276,26 @@ macro_rules! impl_cpu_adamw_capabilities {
             }
         }
 
+        $($impl_prefix)* CompiledTrainingWindowResetRuntime for $runtime {
+            fn reset_gradient_window(&mut self) -> Result<CompiledTrainingWindowReset> {
+                self.run_zero_grad()
+            }
+
+            fn gradient_window_reset_capture_identity(&self) -> Option<u64> {
+                self.adamw().zero_grad_capture_identity()
+            }
+        }
+
+        $($impl_prefix)* CompiledTrainingWindowRuntime for $runtime {
+            fn gradient_window_size(&self) -> u64 {
+                self.adamw().gradient_accumulation_steps()
+            }
+
+            fn pending_microbatch_count(&self) -> Result<u64> {
+                self.adamw().accumulation_index()
+            }
+        }
+
         $($impl_prefix)* CompiledAdamWCommitOnlyRuntime for $runtime {
             fn step_commit_only(
                 &mut self,
@@ -326,6 +346,24 @@ macro_rules! impl_cpu_adamw_capabilities {
         $($impl_prefix)* CompiledTrainingRatePolicyWindowCommitRuntime for $runtime {
             fn commit_partial_window_with_rate_policy(&mut self) -> Result<Self::WindowCommit> {
                 self.run_scheduled_partial_window()
+            }
+        }
+
+        $($impl_prefix)* CompiledTrainingRatePolicyRuntime for $runtime {
+            fn step_with_rate_policy(
+                &mut self,
+                inputs: BTreeMap<String, TensorData>,
+            ) -> Result<Self::Step> {
+                self.run_scheduled_step(inputs)
+            }
+        }
+
+        $($impl_prefix)* CompiledTrainingRatePolicyCommitOnlyRuntime for $runtime {
+            fn commit_step_with_rate_policy(
+                &mut self,
+                inputs: BTreeMap<String, TensorData>,
+            ) -> Result<Self::Step> {
+                self.run_scheduled_commit_only(inputs)
             }
         }
 

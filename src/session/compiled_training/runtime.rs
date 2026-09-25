@@ -167,19 +167,6 @@ pub trait CompiledTrainingWindowResetRuntime: CompiledTrainingRuntime {
     }
 }
 
-impl<R> CompiledTrainingWindowResetRuntime for R
-where
-    R: CompiledAdamWRuntime + ?Sized,
-{
-    fn reset_gradient_window(&mut self) -> Result<CompiledTrainingWindowReset> {
-        CompiledAdamWRuntime::zero_grad(self)
-    }
-
-    fn gradient_window_reset_capture_identity(&self) -> Option<u64> {
-        CompiledAdamWRuntime::zero_grad_capture_identity(self)
-    }
-}
-
 /// Optimizer-neutral accumulation-window configuration and live progress.
 ///
 /// The reset supertrait makes cancellation part of the same structural
@@ -192,20 +179,6 @@ pub trait CompiledTrainingWindowRuntime:
 
     /// Microbatches currently retained toward the next complete window.
     fn pending_microbatch_count(&self) -> Result<u64>;
-}
-
-impl<R> CompiledTrainingWindowRuntime for R
-where
-    R: CompiledAdamWRuntime + ?Sized,
-    R::Step: CompiledTrainingWindowStep,
-{
-    fn gradient_window_size(&self) -> u64 {
-        CompiledAdamWRuntime::gradient_accumulation_steps(self)
-    }
-
-    fn pending_microbatch_count(&self) -> Result<u64> {
-        CompiledAdamWRuntime::accumulation_index(self)
-    }
 }
 
 /// Optimizer-neutral capability for committing a retained partial gradient
@@ -378,29 +351,5 @@ pub trait CompiledScheduledAdamWCommitOnlyRuntime:
         B: CompiledInputBatch,
     {
         self.step_commit_only_scheduled(batch.into_compiled_inputs()?)
-    }
-}
-
-impl<R> CompiledTrainingRatePolicyRuntime for R
-where
-    R: CompiledScheduledAdamWRuntime + ?Sized,
-{
-    fn step_with_rate_policy(
-        &mut self,
-        inputs: BTreeMap<String, TensorData>,
-    ) -> Result<Self::Step> {
-        CompiledScheduledAdamWRuntime::step_scheduled(self, inputs)
-    }
-}
-
-impl<R> CompiledTrainingRatePolicyCommitOnlyRuntime for R
-where
-    R: CompiledScheduledAdamWCommitOnlyRuntime + ?Sized,
-{
-    fn commit_step_with_rate_policy(
-        &mut self,
-        inputs: BTreeMap<String, TensorData>,
-    ) -> Result<Self::Step> {
-        CompiledScheduledAdamWCommitOnlyRuntime::step_commit_only_scheduled(self, inputs)
     }
 }

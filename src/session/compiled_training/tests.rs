@@ -469,6 +469,97 @@ struct CheckpointCountingRuntime {
     checkpoint_calls: Rc<Cell<u64>>,
 }
 
+/// Test-only optimizer facade proving that the shared training capabilities do
+/// not require an AdamW implementation from their concrete runtime.
+struct OptimizerNeutralRuntimeProbe {
+    inner: CpuCompiledAdamW,
+}
+
+impl CompiledTrainingRuntime for OptimizerNeutralRuntimeProbe {
+    type Step = CompiledAdamWStepResult;
+
+    fn step(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+    ) -> Result<Self::Step> {
+        CompiledTrainingRuntime::step(&mut self.inner, inputs, learning_rate)
+    }
+
+    fn step_count(&self) -> u64 {
+        CompiledTrainingRuntime::step_count(&self.inner)
+    }
+
+    fn capture_identity(&self) -> u64 {
+        CompiledTrainingRuntime::capture_identity(&self.inner)
+    }
+
+    fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
+        CompiledTrainingRuntime::parameter_snapshots(&self.inner)
+    }
+}
+
+impl CompiledTrainingWindowResetRuntime for OptimizerNeutralRuntimeProbe {
+    fn reset_gradient_window(&mut self) -> Result<CompiledTrainingWindowReset> {
+        CompiledTrainingWindowResetRuntime::reset_gradient_window(&mut self.inner)
+    }
+
+    fn gradient_window_reset_capture_identity(&self) -> Option<u64> {
+        CompiledTrainingWindowResetRuntime::gradient_window_reset_capture_identity(&self.inner)
+    }
+}
+
+impl CompiledTrainingWindowRuntime for OptimizerNeutralRuntimeProbe {
+    fn gradient_window_size(&self) -> u64 {
+        CompiledTrainingWindowRuntime::gradient_window_size(&self.inner)
+    }
+
+    fn pending_microbatch_count(&self) -> Result<u64> {
+        CompiledTrainingWindowRuntime::pending_microbatch_count(&self.inner)
+    }
+}
+
+impl CompiledTrainingWindowCommitRuntime for OptimizerNeutralRuntimeProbe {
+    type WindowCommit = CompiledAdamWFlushResult;
+
+    fn commit_partial_window(&mut self, learning_rate: TensorData) -> Result<Self::WindowCommit> {
+        CompiledTrainingWindowCommitRuntime::commit_partial_window(&mut self.inner, learning_rate)
+    }
+
+    fn partial_window_commit_capture_identity(&self) -> Option<u64> {
+        CompiledTrainingWindowCommitRuntime::partial_window_commit_capture_identity(&self.inner)
+    }
+}
+
+impl CompiledTrainingRatePolicyRuntime for OptimizerNeutralRuntimeProbe {
+    fn step_with_rate_policy(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step> {
+        CompiledTrainingRatePolicyRuntime::step_with_rate_policy(&mut self.inner, inputs)
+    }
+}
+
+impl CompiledTrainingRatePolicyCommitOnlyRuntime for OptimizerNeutralRuntimeProbe {
+    fn commit_step_with_rate_policy(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+    ) -> Result<Self::Step> {
+        CompiledTrainingRatePolicyCommitOnlyRuntime::commit_step_with_rate_policy(
+            &mut self.inner,
+            inputs,
+        )
+    }
+}
+
+impl CompiledTrainingRatePolicyWindowCommitRuntime for OptimizerNeutralRuntimeProbe {
+    fn commit_partial_window_with_rate_policy(&mut self) -> Result<Self::WindowCommit> {
+        CompiledTrainingRatePolicyWindowCommitRuntime::commit_partial_window_with_rate_policy(
+            &mut self.inner,
+        )
+    }
+}
+
 impl CompiledTrainingRuntime for CheckpointCountingRuntime {
     type Step = CompiledAdamWStepResult;
 
@@ -3919,6 +4010,52 @@ fn run_core_rate_policy_commit_only_step<R: CompiledTrainingRatePolicyCommitOnly
     runtime
         .commit_step_batch_with_rate_policy(TinyBobBatch(batch()))
         .unwrap()
+}
+
+#[test]
+fn owned_session_forwards_optimizer_neutral_training_capabilities() {
+    let schedule = CompiledMultiStepLr::new(0.01, 0.5, [2]).unwrap();
+    let plan = CompiledModuleAdamWPlan::compile_graph(
+        module_config()
+            .with_gradient_accumulation(2)
+            .unwrap()
+            .with_captured_multi_step_lr(schedule),
+        TiedFrozenModule::new([1.0, -1.0]),
+        |module, graph, inputs| {
+            let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
+            Ok(CompiledAdamWGraph::scalar(loss, outputs))
+        },
+    )
+    .unwrap();
+    let session = plan.prepare(&CpuSessionTarget::new()).unwrap();
+    let mut session = session.map_runtime(|inner| OptimizerNeutralRuntimeProbe { inner });
+    let input = || BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]);
+
+    assert_core_training_window(&session, 2, 0);
+    let first =
+        CompiledTrainingRatePolicyRuntime::step_with_rate_policy(&mut session, input()).unwrap();
+    assert_core_training_window_step(&first, 1, false);
+    assert_core_training_window(&session, 2, 1);
+
+    let reset = CompiledTrainingWindowResetRuntime::reset_gradient_window(&mut session).unwrap();
+    assert_eq!(reset.discarded_microbatches(), 1);
+    assert_core_training_window(&session, 2, 0);
+
+    let committed = CompiledTrainingRatePolicyCommitOnlyRuntime::commit_step_with_rate_policy(
+        &mut session,
+        input(),
+    )
+    .unwrap();
+    assert!(committed.outputs().is_empty());
+    assert_core_training_window(&session, 2, 1);
+
+    let flush =
+        CompiledTrainingRatePolicyWindowCommitRuntime::commit_partial_window_with_rate_policy(
+            &mut session,
+        )
+        .unwrap();
+    assert_eq!(flush.committed_microbatches(), 1);
+    assert_core_training_window(&session, 2, 0);
 }
 
 fn reset_core_training_window<R: CompiledTrainingWindowRuntime>(
