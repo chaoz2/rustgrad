@@ -2,7 +2,9 @@ use super::super::compiler_evidence::{
     CompilerProcessValidationContext, validate_compiler_process_evidence, validate_module_overlaps,
     validate_program_pair_overlaps, validate_translation_units,
 };
-use super::super::program_report::{NativeCompilerAggregate, NativeRenderAggregate};
+use super::super::program_report::{
+    NativeCompilerAggregate, NativeRenderAggregate, NativeTrainingProgramReport,
+};
 use super::super::step_phases::ReplayTimingPartition;
 use super::super::{
     MAX_REPLAY_SAMPLES, NATIVE_TRAINING_REPORT_FORMAT_V2, NATIVE_TRAINING_REPORT_FORMAT_V3,
@@ -22,6 +24,14 @@ use super::NativeTrainingReport;
 use crate::Result;
 
 pub(super) fn validate(report: &NativeTrainingReport) -> Result<()> {
+    validate_header(report)?;
+    let programs = validate_program_inventory(report)?;
+    validate_preparation(report, &programs)?;
+    validate_replay(report)?;
+    validate_availability_and_checkpoint(report)
+}
+
+fn validate_header(report: &NativeTrainingReport) -> Result<()> {
     if !matches!(
         report.format_version,
         1 | NATIVE_TRAINING_REPORT_FORMAT_V2
@@ -100,6 +110,12 @@ pub(super) fn validate(report: &NativeTrainingReport) -> Result<()> {
             "native main program cannot reference an earlier prefix module",
         ));
     }
+    Ok(())
+}
+
+fn validate_program_inventory(
+    report: &NativeTrainingReport,
+) -> Result<Vec<&NativeTrainingProgramReport>> {
     match (
         report.format_version,
         &report.accumulation,
@@ -339,6 +355,13 @@ pub(super) fn validate(report: &NativeTrainingReport) -> Result<()> {
         }
         prior_programs.push(program);
     }
+    Ok(prior_programs)
+}
+
+fn validate_preparation(
+    report: &NativeTrainingReport,
+    prior_programs: &[&NativeTrainingProgramReport],
+) -> Result<()> {
     match (report.format_version, &report.prepare_module_overlaps) {
         (1..=NATIVE_TRAINING_REPORT_FORMAT_V19, None) => {}
         (
@@ -348,7 +371,7 @@ pub(super) fn validate(report: &NativeTrainingReport) -> Result<()> {
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(overlaps),
         ) => {
-            validate_module_overlaps(overlaps, &prior_programs)?;
+            validate_module_overlaps(overlaps, prior_programs)?;
         }
         (1..=NATIVE_TRAINING_REPORT_FORMAT_V19, Some(_)) => {
             return Err(invalid("legacy native report has module overlap evidence"));
@@ -370,7 +393,7 @@ pub(super) fn validate(report: &NativeTrainingReport) -> Result<()> {
         ) => {
             validate_program_pair_overlaps(
                 overlaps,
-                &prior_programs,
+                prior_programs,
                 report
                     .prepare_module_overlaps
                     .as_deref()
@@ -378,7 +401,7 @@ pub(super) fn validate(report: &NativeTrainingReport) -> Result<()> {
             )?;
             validate_translation_units(
                 translation_units,
-                &prior_programs,
+                prior_programs,
                 report
                     .prepare_compiler_process_timings
                     .as_deref()
@@ -498,7 +521,7 @@ pub(super) fn validate(report: &NativeTrainingReport) -> Result<()> {
             let derived_tail = validate_compiler_process_evidence(
                 timings,
                 claimed_tail.as_ref(),
-                &prior_programs,
+                prior_programs,
                 CompilerProcessValidationContext {
                     format_version: report.format_version,
                     process_count,
@@ -733,6 +756,10 @@ pub(super) fn validate(report: &NativeTrainingReport) -> Result<()> {
         }
         _ => return Err(invalid("native prepare timing differs")),
     }
+    Ok(())
+}
+
+fn validate_replay(report: &NativeTrainingReport) -> Result<()> {
     if report.successful_replay_count < 2
         || report.successful_replay_count > MAX_REPLAY_SAMPLES as u64
         || report.steady_replay_wall_time.sample_count != report.successful_replay_count - 1
@@ -930,6 +957,10 @@ pub(super) fn validate(report: &NativeTrainingReport) -> Result<()> {
     {
         return Err(invalid("invalid native training replay inventory"));
     }
+    Ok(())
+}
+
+fn validate_availability_and_checkpoint(report: &NativeTrainingReport) -> Result<()> {
     if report.fallback_count != 0
         || report.kernel_launch_count.is_some()
         || report.host_to_device.is_some()
