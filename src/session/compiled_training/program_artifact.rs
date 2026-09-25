@@ -1,5 +1,6 @@
 use super::adamw_contract::{CompiledAdamWContract, CompiledAdamWPolicy};
-use super::module_adamw_checkpoint::{DecodedModuleAdamWCheckpoint, ModuleCheckpointStateKind};
+use super::module_adamw_checkpoint::DecodedModuleAdamWCheckpoint;
+use super::module_checkpoint::ModuleCheckpointStateKind;
 use super::*;
 use crate::file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically};
 use serde::{Deserialize, Serialize};
@@ -956,7 +957,10 @@ fn restore_owner_from_admitted<M: Module>(
     let wire = &admitted.artifact.wire;
     let decoded_module = admitted.checkpoint.as_ref();
     let mut seal = CompiledModuleSeal::capture(module, &wire.frozen_parameters)?;
-    let _immutable_values = seal.apply_module_checkpoint(decoded_module)?;
+    let _immutable_values = seal.apply_module_checkpoint(
+        decoded_module,
+        &decoded_module.optimizer.decoded().parameters,
+    )?;
     if module_wire(&seal) != wire.module {
         return Err(training(
             "compiled program artifact destination module mismatch",
