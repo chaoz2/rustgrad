@@ -764,7 +764,7 @@ where
     (bytes, unchecked)
 }
 
-impl<M: Module> CompiledModuleAdamWPlan<M> {
+impl<M: Module> CompiledModuleTrainingPlan<M, CompiledAdamWPlan, Option<u64>> {
     /// Serializes the resource-free executable plan separately from tensor state.
     pub fn program_artifact(&self) -> Result<CompiledAdamWProgramArtifact> {
         self.validate_ready_for_preparation()?;
@@ -788,7 +788,7 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 module,
                 plan,
                 seal,
-                required_evaluation_capture_identity: None,
+                attachment: None,
             }),
             Err(source) => Err(CompiledModuleAdamWArtifactRestoreError { module, source }),
         }
@@ -809,7 +809,7 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 module,
                 plan,
                 seal,
-                required_evaluation_capture_identity: None,
+                attachment: None,
             }),
             Err(source) => Err(CompiledModuleAdamWArtifactRestoreError { module, source }),
         }

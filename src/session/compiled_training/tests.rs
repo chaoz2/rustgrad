@@ -9038,6 +9038,13 @@ fn owned_module_compile_failures_retain_module_and_preflight_versions() {
             .to_string()
             .contains("owned graph builder rejected")
     );
+    let generic: &CompiledModuleCompileError<_> = &error;
+    assert!(format!("{generic:?}").starts_with("CompiledModuleAdamWCompileError"));
+    assert!(
+        generic
+            .to_string()
+            .starts_with("owned compiled AdamW compilation failed:")
+    );
     let (module, source) = error.into_parts();
     assert!(source.to_string().contains("owned graph builder rejected"));
     assert_eq!(module.shared.id(), shared_identity);
@@ -9126,6 +9133,13 @@ fn owned_module_momentum_plan_restores_before_preparation() {
             .source_error()
             .to_string()
             .contains("capture identity mismatch")
+    );
+    let generic: &CompiledModulePlanError<_, _> = &error;
+    assert!(format!("{generic:?}").starts_with("CompiledModuleMomentumSgdRestoreError"));
+    assert!(
+        generic
+            .to_string()
+            .starts_with("owned compiled momentum-SGD checkpoint restore failed:")
     );
     let plan = error.into_plan();
     assert_eq!(plan.capture_identity(), capture_identity);

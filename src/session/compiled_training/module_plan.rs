@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl<M: Module> CompiledModuleAdamWPlan<M> {
+impl<M: Module> CompiledModuleTrainingPlan<M, CompiledAdamWPlan, Option<u64>> {
     fn build_owned<F>(
         module: M,
         frozen_parameters: &BTreeSet<String>,
@@ -22,9 +22,9 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 module,
                 plan,
                 seal,
-                required_evaluation_capture_identity: None,
+                attachment: None,
             }),
-            Err(source) => Err(CompiledModuleAdamWCompileError { module, source }),
+            Err(source) => Err(adamw_compile_error(module, source)),
         }
     }
 
@@ -54,14 +54,14 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 module,
                 plan,
                 seal,
-                required_evaluation_capture_identity,
+                attachment: required_evaluation_capture_identity,
             }),
-            Err(source) => Err(CompiledModuleAdamWCompileError { module, source }),
+            Err(source) => Err(adamw_compile_error(module, source)),
         }
     }
 
     fn authenticate_restored_evaluation(&self, evaluation: &CompiledEvaluationPlan) -> Result<()> {
-        if let Some(expected) = self.required_evaluation_capture_identity
+        if let Some(expected) = self.attachment
             && evaluation.capture_identity != expected
         {
             return Err(training(
@@ -73,7 +73,7 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
 
     pub(super) fn validate_ready_for_preparation(&self) -> Result<()> {
         self.seal.validate_unchanged(&self.module)?;
-        if self.required_evaluation_capture_identity.is_some() {
+        if self.attachment.is_some() {
             return Err(training(
                 "compiled module checkpoint requires its authenticated evaluation capture",
             ));
@@ -387,10 +387,7 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         Self::compile(config, module, build).and_then(|plan| {
             plan.restore_checkpoint(checkpoint).map_err(|error| {
                 let (plan, source) = error.into_parts();
-                CompiledModuleAdamWCompileError {
-                    module: plan.module,
-                    source,
-                }
+                adamw_compile_error(plan.module, source)
             })
         })
     }
@@ -415,10 +412,7 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         Self::compile_with_dropout(config, dropout, module, build).and_then(|plan| {
             plan.restore_checkpoint(checkpoint).map_err(|error| {
                 let (plan, source) = error.into_parts();
-                CompiledModuleAdamWCompileError {
-                    module: plan.module,
-                    source,
-                }
+                adamw_compile_error(plan.module, source)
             })
         })
     }
@@ -435,20 +429,14 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
         checkpoint: &CompiledAdamWCheckpoint,
     ) -> std::result::Result<Self, CompiledModuleAdamWRestoreError<M>> {
         if let Err(source) = self.seal.validate_unchanged(&self.module) {
-            return Err(CompiledModuleAdamWRestoreError {
-                plan: Box::new(self),
-                source,
-            });
+            return Err(adamw_restore_error(self, source));
         }
         match self.plan.restore_checkpoint(checkpoint) {
             Ok(plan) => {
                 self.plan = plan;
                 Ok(self)
             }
-            Err(source) => Err(CompiledModuleAdamWRestoreError {
-                plan: Box::new(self),
-                source,
-            }),
+            Err(source) => Err(adamw_restore_error(self, source)),
         }
     }
 
@@ -496,13 +484,10 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 if let Some(observation) = &mut self.plan.compile_phases {
                     observation.set_evaluation(phase);
                 }
-                self.required_evaluation_capture_identity = None;
+                self.attachment = None;
                 Ok(self)
             }
-            Err(source) => Err(CompiledModuleAdamWEvaluationError {
-                plan: Box::new(self),
-                source,
-            }),
+            Err(source) => Err(adamw_evaluation_error(self, source)),
         }
     }
 
@@ -551,13 +536,10 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 if let Some(observation) = &mut self.plan.compile_phases {
                     observation.set_evaluation(phase);
                 }
-                self.required_evaluation_capture_identity = None;
+                self.attachment = None;
                 Ok(self)
             }
-            Err(source) => Err(CompiledModuleAdamWEvaluationError {
-                plan: Box::new(self),
-                source,
-            }),
+            Err(source) => Err(adamw_evaluation_error(self, source)),
         }
     }
 
@@ -603,26 +585,11 @@ impl<M: Module> CompiledModuleAdamWPlan<M> {
                 if let Some(observation) = &mut self.plan.compile_phases {
                     observation.set_evaluation(phase);
                 }
-                self.required_evaluation_capture_identity = None;
+                self.attachment = None;
                 Ok(self)
             }
-            Err(source) => Err(CompiledModuleAdamWEvaluationError {
-                plan: Box::new(self),
-                source,
-            }),
+            Err(source) => Err(adamw_evaluation_error(self, source)),
         }
-    }
-
-    /// Consumes this owner into a target-specific session. A preparation error
-    /// retains the complete plan and module for inspection or retry.
-    pub fn prepare<T>(
-        self,
-        target: &T,
-    ) -> std::result::Result<<T as SessionTarget<Self>>::Session, <T as SessionTarget<Self>>::Error>
-    where
-        T: SessionTarget<Self>,
-    {
-        target.prepare(self)
     }
 
     pub fn capture_identity(&self) -> u64 {

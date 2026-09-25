@@ -13,6 +13,7 @@ mod delegation;
 mod dropout;
 mod exchange;
 mod module_adamw_checkpoint;
+mod module_owner;
 mod module_plan;
 mod module_session;
 mod module_state;
@@ -67,12 +68,19 @@ pub use self::exchange::*;
 use self::exchange::{CompiledAdamWWindowLossValue, CompiledInputPolicy};
 pub use self::module_adamw_checkpoint::CompiledModuleAdamWCheckpoint;
 use self::module_adamw_checkpoint::encode_module_adamw_checkpoint;
+pub use self::module_owner::{
+    CompiledModuleAdamWCompileError, CompiledModuleAdamWEvaluationError, CompiledModuleAdamWPlan,
+    CompiledModuleAdamWPrepareError, CompiledModuleAdamWRestoreError, CompiledModuleCompileError,
+    CompiledModuleMomentumSgdCompileError, CompiledModuleMomentumSgdPlan,
+    CompiledModuleMomentumSgdPrepareError, CompiledModuleMomentumSgdRestoreError,
+    CompiledModulePlanError, CompiledModuleTrainingPlan,
+};
+use self::module_owner::{
+    adamw_compile_error, adamw_evaluation_error, adamw_prepare_error, adamw_restore_error,
+    momentum_sgd_compile_error, momentum_sgd_prepare_error, momentum_sgd_restore_error,
+};
 pub use self::module_state::TrainingParameterInit;
 use self::module_state::{CompiledModuleSeal, ModuleParameterPlan};
-pub use self::momentum_module_plan::{
-    CompiledModuleMomentumSgdPlan, CompiledModuleMomentumSgdPrepareError,
-    CompiledModuleMomentumSgdRestoreError,
-};
 pub use self::momentum_plan::CompiledMomentumSgdPlan;
 use self::native_cpu_evidence::native_preparation_wall_time;
 pub use self::native_cpu_evidence::*;
@@ -177,68 +185,6 @@ pub struct CpuCompiledMomentumSgd {
     inner: CpuCompiledTrainingProgram,
 }
 
-/// Resource-free AdamW plan paired with the exact module value used to build it.
-///
-/// The module is not exposed while the plan or its prepared session exists.
-/// This prevents ordinary callers from accidentally treating its stale host
-/// parameters as the active training frontier. Successful
-/// [`CompiledModuleAdamWSession::finish`] publishes before returning it; the
-/// explicit abort path returns the sealed host state without publication.
-pub struct CompiledModuleAdamWPlan<M> {
-    module: M,
-    plan: CompiledAdamWPlan,
-    seal: CompiledModuleSeal,
-    required_evaluation_capture_identity: Option<u64>,
-}
-
-/// Recoverable momentum-SGD owned-module compilation failure.
-///
-/// Compilation and checkpoint validation never publish into the supplied
-/// module. The unchanged module is returned to callers on every failure.
-pub struct CompiledModuleMomentumSgdCompileError<M> {
-    module: M,
-    source: Error,
-}
-
-impl<M> CompiledModuleMomentumSgdCompileError<M> {
-    pub fn source_error(&self) -> &Error {
-        &self.source
-    }
-
-    pub fn into_module(self) -> M {
-        self.module
-    }
-
-    pub fn into_parts(self) -> (M, Error) {
-        (self.module, self.source)
-    }
-}
-
-impl<M> fmt::Debug for CompiledModuleMomentumSgdCompileError<M> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CompiledModuleMomentumSgdCompileError")
-            .field("source", &self.source)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<M> fmt::Display for CompiledModuleMomentumSgdCompileError<M> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "owned compiled momentum-SGD compilation failed: {}",
-            self.source
-        )
-    }
-}
-
-impl<M> std::error::Error for CompiledModuleMomentumSgdCompileError<M> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
 /// Prepared compiled training session that owns its source module for the
 /// complete replay lifecycle.
 ///
@@ -255,192 +201,6 @@ pub struct CompiledModuleTrainingSession<M, R> {
 /// Source-compatible compiled AdamW owner around the optimizer-neutral session.
 pub struct CompiledModuleAdamWSession<M, R> {
     training: CompiledModuleTrainingSession<M, R>,
-}
-
-/// Recoverable compilation failure retaining the exact uncompiled module.
-pub struct CompiledModuleAdamWCompileError<M> {
-    module: M,
-    source: Error,
-}
-
-/// Recoverable checkpoint-restore failure retaining the complete owned plan.
-pub struct CompiledModuleAdamWRestoreError<M> {
-    plan: Box<CompiledModuleAdamWPlan<M>>,
-    source: Error,
-}
-
-impl<M> CompiledModuleAdamWRestoreError<M> {
-    pub fn source_error(&self) -> &Error {
-        &self.source
-    }
-
-    pub fn plan(&self) -> &CompiledModuleAdamWPlan<M> {
-        &self.plan
-    }
-
-    pub fn into_plan(self) -> CompiledModuleAdamWPlan<M> {
-        *self.plan
-    }
-
-    pub fn into_parts(self) -> (CompiledModuleAdamWPlan<M>, Error) {
-        (*self.plan, self.source)
-    }
-}
-
-impl<M> fmt::Debug for CompiledModuleAdamWRestoreError<M> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CompiledModuleAdamWRestoreError")
-            .field("source", &self.source)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<M> fmt::Display for CompiledModuleAdamWRestoreError<M> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "owned compiled AdamW checkpoint restore failed: {}",
-            self.source
-        )
-    }
-}
-
-impl<M> std::error::Error for CompiledModuleAdamWRestoreError<M> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-impl<M> CompiledModuleAdamWCompileError<M> {
-    pub fn source_error(&self) -> &Error {
-        &self.source
-    }
-
-    pub fn into_module(self) -> M {
-        self.module
-    }
-
-    pub fn into_parts(self) -> (M, Error) {
-        (self.module, self.source)
-    }
-}
-
-impl<M> fmt::Debug for CompiledModuleAdamWCompileError<M> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CompiledModuleAdamWCompileError")
-            .field("source", &self.source)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<M> fmt::Display for CompiledModuleAdamWCompileError<M> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "owned compiled AdamW compilation failed: {}",
-            self.source
-        )
-    }
-}
-
-impl<M> std::error::Error for CompiledModuleAdamWCompileError<M> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-/// Recoverable target-preparation failure retaining the unconsumed owned plan.
-pub struct CompiledModuleAdamWPrepareError<M, E> {
-    plan: CompiledModuleAdamWPlan<M>,
-    source: E,
-}
-
-/// Recoverable evaluation-capture failure retaining the complete owned plan.
-pub struct CompiledModuleAdamWEvaluationError<M> {
-    plan: Box<CompiledModuleAdamWPlan<M>>,
-    source: Error,
-}
-
-impl<M> CompiledModuleAdamWEvaluationError<M> {
-    pub fn source_error(&self) -> &Error {
-        &self.source
-    }
-
-    pub fn into_plan(self) -> CompiledModuleAdamWPlan<M> {
-        *self.plan
-    }
-
-    pub fn into_parts(self) -> (CompiledModuleAdamWPlan<M>, Error) {
-        (*self.plan, self.source)
-    }
-}
-
-impl<M> fmt::Debug for CompiledModuleAdamWEvaluationError<M> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CompiledModuleAdamWEvaluationError")
-            .field("source", &self.source)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<M> fmt::Display for CompiledModuleAdamWEvaluationError<M> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "owned compiled AdamW evaluation capture failed: {}",
-            self.source
-        )
-    }
-}
-
-impl<M> std::error::Error for CompiledModuleAdamWEvaluationError<M> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-impl<M, E> CompiledModuleAdamWPrepareError<M, E> {
-    pub fn source_error(&self) -> &E {
-        &self.source
-    }
-
-    pub fn into_plan(self) -> CompiledModuleAdamWPlan<M> {
-        self.plan
-    }
-
-    pub fn into_parts(self) -> (CompiledModuleAdamWPlan<M>, E) {
-        (self.plan, self.source)
-    }
-}
-
-impl<M, E: fmt::Debug> fmt::Debug for CompiledModuleAdamWPrepareError<M, E> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CompiledModuleAdamWPrepareError")
-            .field("source", &self.source)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<M, E: fmt::Display> fmt::Display for CompiledModuleAdamWPrepareError<M, E> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "owned compiled AdamW preparation failed: {}",
-            self.source
-        )
-    }
-}
-
-impl<M, E: std::error::Error + 'static> std::error::Error
-    for CompiledModuleAdamWPrepareError<M, E>
-{
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
 }
 
 /// Finalization failure retaining the intact owned module/session pair.
