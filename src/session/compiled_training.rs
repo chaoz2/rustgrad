@@ -69,11 +69,13 @@ use self::exchange::{CompiledAdamWWindowLossValue, CompiledInputPolicy};
 pub use self::module_adamw_checkpoint::CompiledModuleAdamWCheckpoint;
 use self::module_adamw_checkpoint::encode_module_adamw_checkpoint;
 pub use self::module_owner::{
-    CompiledModuleAdamWCompileError, CompiledModuleAdamWEvaluationError, CompiledModuleAdamWPlan,
-    CompiledModuleAdamWPrepareError, CompiledModuleAdamWRestoreError, CompiledModuleCompileError,
+    CompiledModuleAdamWCompileError, CompiledModuleAdamWEvaluationError,
+    CompiledModuleAdamWFinishError, CompiledModuleAdamWPlan, CompiledModuleAdamWPrepareError,
+    CompiledModuleAdamWRestoreError, CompiledModuleAdamWSession, CompiledModuleCompileError,
     CompiledModuleMomentumSgdCompileError, CompiledModuleMomentumSgdPlan,
     CompiledModuleMomentumSgdPrepareError, CompiledModuleMomentumSgdRestoreError,
-    CompiledModulePlanError, CompiledModuleTrainingPlan,
+    CompiledModulePlanError, CompiledModuleTrainingFinishError, CompiledModuleTrainingPlan,
+    CompiledModuleTrainingSession,
 };
 use self::module_owner::{
     adamw_compile_error, adamw_evaluation_error, adamw_prepare_error, adamw_restore_error,
@@ -183,140 +185,6 @@ const MAX_EXACT_F32_INTEGER_COUNT: u64 = 1_u64 << 24;
 /// One compiled momentum-SGD training program.
 pub struct CpuCompiledMomentumSgd {
     inner: CpuCompiledTrainingProgram,
-}
-
-/// Prepared compiled training session that owns its source module for the
-/// complete replay lifecycle.
-///
-/// Optimizer policy remains on `R`. This owner only seals the source module,
-/// forwards the runtime's supported capabilities, and publishes one exact
-/// detached parameter frontier when the session finishes.
-pub struct CompiledModuleTrainingSession<M, R> {
-    module: M,
-    runtime: R,
-    seal: CompiledModuleSeal,
-    evaluation_capture_identity: Option<u64>,
-}
-
-/// Source-compatible compiled AdamW owner around the optimizer-neutral session.
-pub struct CompiledModuleAdamWSession<M, R> {
-    training: CompiledModuleTrainingSession<M, R>,
-}
-
-/// Finalization failure retaining the intact owned module/session pair.
-///
-/// This covers both parameter-only [`CompiledModuleTrainingSession::finish`] and
-/// checkpointed [`CompiledModuleTrainingSession::finish_with_checkpoint`]
-/// finalization.
-/// The retained session remains available for inspection, retry, or recovery
-/// without publication.
-pub struct CompiledModuleTrainingFinishError<M, R> {
-    session: Box<CompiledModuleTrainingSession<M, R>>,
-    source: Error,
-}
-
-/// Compiled AdamW compatibility failure retaining its intact owned session.
-pub struct CompiledModuleAdamWFinishError<M, R> {
-    session: Box<CompiledModuleAdamWSession<M, R>>,
-    source: Error,
-}
-
-impl<M, R> CompiledModuleTrainingFinishError<M, R> {
-    pub fn source_error(&self) -> &Error {
-        &self.source
-    }
-
-    pub fn session(&self) -> &CompiledModuleTrainingSession<M, R> {
-        &self.session
-    }
-
-    pub fn into_session(self) -> CompiledModuleTrainingSession<M, R> {
-        *self.session
-    }
-
-    pub fn into_parts(self) -> (CompiledModuleTrainingSession<M, R>, Error) {
-        (*self.session, self.source)
-    }
-
-    /// Discards the failed runtime frontier and returns the sealed host module
-    /// exactly as it currently exists, without attempting publication again.
-    pub fn into_module_without_publication(self) -> M {
-        (*self.session).into_module_without_publication()
-    }
-}
-
-impl<M, R> fmt::Debug for CompiledModuleTrainingFinishError<M, R> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CompiledModuleTrainingFinishError")
-            .field("source", &self.source)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<M, R> fmt::Display for CompiledModuleTrainingFinishError<M, R> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "owned compiled training finalization failed: {}",
-            self.source
-        )
-    }
-}
-
-impl<M, R> CompiledModuleAdamWFinishError<M, R> {
-    pub fn source_error(&self) -> &Error {
-        &self.source
-    }
-
-    pub fn session(&self) -> &CompiledModuleAdamWSession<M, R> {
-        &self.session
-    }
-
-    pub fn into_session(self) -> CompiledModuleAdamWSession<M, R> {
-        *self.session
-    }
-
-    pub fn into_parts(self) -> (CompiledModuleAdamWSession<M, R>, Error) {
-        (*self.session, self.source)
-    }
-
-    /// Discards the failed runtime frontier and returns the sealed host module
-    /// exactly as it currently exists, without attempting publication again.
-    pub fn into_module_without_publication(self) -> M {
-        (*self.session).into_module_without_publication()
-    }
-}
-
-impl<M, R> fmt::Debug for CompiledModuleAdamWFinishError<M, R> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CompiledModuleAdamWFinishError")
-            .field("source", &self.source)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<M, R> fmt::Display for CompiledModuleAdamWFinishError<M, R> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "owned compiled AdamW finalization failed: {}",
-            self.source
-        )
-    }
-}
-
-impl<M, R> std::error::Error for CompiledModuleAdamWFinishError<M, R> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-impl<M, R> std::error::Error for CompiledModuleTrainingFinishError<M, R> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
 }
 
 /// Resource-free Metal rendering of one compiled AdamW plan. Preparing it
