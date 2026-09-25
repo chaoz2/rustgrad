@@ -6,6 +6,7 @@ mod adamw_plan;
 mod capture;
 mod cpu_adamw_runtime;
 mod cpu_training_program;
+mod cpu_training_step;
 mod delegation;
 mod dropout;
 mod exchange;
@@ -54,9 +55,8 @@ use self::cpu_adamw_runtime::{
     NativeCpuEvaluationPreparation, PreparedNativeCpuEvaluation, PreparedNativeCpuProgram,
     PreparedNativeEvaluationParameterInput, adamw_step_result,
 };
-use self::cpu_training_program::{
-    CompiledStepOutputSelection, CompiledStepReplayRequest, CpuCompiledTrainingProgram,
-};
+use self::cpu_training_program::CpuCompiledTrainingProgram;
+use self::cpu_training_step::{CompiledStepOutputSelection, CompiledStepReplayRequest};
 pub use self::dropout::{CompiledDropoutConfig, CompiledDropoutKey};
 use self::dropout::{CompiledDropoutState, CompiledDropoutStream, expected_dropout_counter};
 pub use self::exchange::*;
