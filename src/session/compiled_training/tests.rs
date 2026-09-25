@@ -4627,6 +4627,53 @@ fn optimizer_neutral_plan_renders_momentum_through_shared_metal_core() {
 }
 
 #[test]
+fn momentum_plan_prepares_independent_cpu_runtimes() {
+    let plan =
+        CompiledMomentumSgdPlan::compile(config(), initial_parameters(), build_tinybob).unwrap();
+    let identity = plan.capture_identity();
+    assert_eq!(plan.step_count(), 0);
+
+    let mut first = plan.prepare_cpu().unwrap();
+    let second = plan.prepare(&CpuSessionTarget::new()).unwrap();
+    assert_eq!(first.capture_identity(), identity);
+    assert_eq!(second.capture_identity(), identity);
+    assert_eq!(
+        first.parameter_snapshots().unwrap(),
+        second.parameter_snapshots().unwrap()
+    );
+
+    first.step(batch(), lr()).unwrap();
+    assert_eq!(first.step_count(), 1);
+    assert_eq!(second.step_count(), 0);
+    assert_ne!(
+        first.parameter_snapshots().unwrap(),
+        second.parameter_snapshots().unwrap()
+    );
+}
+
+#[test]
+fn momentum_plan_restores_checkpoint_without_recompiling_or_mutating_source() {
+    let plan =
+        CompiledMomentumSgdPlan::compile(config(), initial_parameters(), build_tinybob).unwrap();
+    let mut trained = plan.prepare_cpu().unwrap();
+    trained.step(batch(), lr()).unwrap();
+    let checkpoint = trained.checkpoint().unwrap();
+
+    let restored = plan.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(plan.step_count(), 0);
+    assert_eq!(restored.step_count(), checkpoint.step());
+    assert_eq!(restored.capture_identity(), plan.capture_identity());
+
+    let resumed = restored.prepare_cpu().unwrap();
+    assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
+
+    let mut foreign = checkpoint.clone();
+    foreign.capture_identity ^= 1;
+    assert!(plan.restore_checkpoint(&foreign).is_err());
+    assert_eq!(plan.step_count(), 0);
+}
+
+#[test]
 fn adamw_plan_prepares_independent_cpu_runtimes() {
     let plan =
         CompiledAdamWPlan::compile(adamw_config(), initial_parameters(), build_tinybob).unwrap();

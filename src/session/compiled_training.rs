@@ -16,6 +16,7 @@ mod module_adamw_checkpoint;
 mod module_plan;
 mod module_session;
 mod module_state;
+mod momentum_plan;
 mod native_cpu_evidence;
 mod native_cpu_preparation;
 mod native_cpu_programs;
@@ -67,6 +68,7 @@ pub use self::module_adamw_checkpoint::CompiledModuleAdamWCheckpoint;
 use self::module_adamw_checkpoint::encode_module_adamw_checkpoint;
 pub use self::module_state::TrainingParameterInit;
 use self::module_state::{CompiledModuleSeal, ModuleParameterPlan};
+pub use self::momentum_plan::CompiledMomentumSgdPlan;
 use self::native_cpu_evidence::native_preparation_wall_time;
 pub use self::native_cpu_evidence::*;
 use self::native_cpu_programs::*;
@@ -946,10 +948,7 @@ impl CpuCompiledMomentumSgd {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let plan = CompiledTrainingPlan::compile(MomentumProgram { config }, parameters, build)?;
-        Ok(Self {
-            inner: plan.prepare_cpu()?,
-        })
+        CompiledMomentumSgdPlan::compile(config, parameters, build)?.prepare_cpu()
     }
 
     /// Compiles an ordinary module forward against optimizer-owned parameter
@@ -967,11 +966,7 @@ impl CpuCompiledMomentumSgd {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let parameter_plan = ModuleParameterPlan::new(module, &BTreeSet::new())?;
-        let parameters = parameter_plan.initial_parameters()?;
-        Self::compile(config, parameters, |graph, inputs, parameters| {
-            parameter_plan.lower(graph, parameters, |graph| build(module, graph, inputs))
-        })
+        CompiledMomentumSgdPlan::compile_module(config, module, build)?.prepare_cpu()
     }
 
     /// Recompiles a matching program and restores its exact momentum frontier
@@ -988,14 +983,7 @@ impl CpuCompiledMomentumSgd {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let parameters = checkpoint
-            .parameters
-            .iter()
-            .map(|(name, value)| TrainingParameterInit::new(name.clone(), value.clone()))
-            .collect::<Result<Vec<_>>>()?;
-        let mut runtime = Self::compile(config, parameters, build)?;
-        runtime.restore_checkpoint_in_place(checkpoint)?;
-        Ok(runtime)
+        CompiledMomentumSgdPlan::compile_from_checkpoint(config, checkpoint, build)?.prepare_cpu()
     }
 
     /// Recompiles a module-bound program and restores its exact parameter and
@@ -1014,33 +1002,8 @@ impl CpuCompiledMomentumSgd {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        let parameter_plan = ModuleParameterPlan::new(module, &BTreeSet::new())?;
-        let destination_parameters = parameter_plan.initial_parameters()?;
-        if destination_parameters.len() != checkpoint.parameters.len()
-            || destination_parameters.iter().any(|parameter| {
-                checkpoint
-                    .parameters
-                    .get(parameter.name())
-                    .is_none_or(|saved| {
-                        saved.shape() != parameter.value().shape()
-                            || saved.dtype() != parameter.value().dtype()
-                    })
-            })
-        {
-            return Err(training(
-                "compiled momentum-SGD checkpoint parameter schema mismatch",
-            ));
-        }
-        let parameters = checkpoint
-            .parameters
-            .iter()
-            .map(|(name, value)| TrainingParameterInit::new(name.clone(), value.clone()))
-            .collect::<Result<Vec<_>>>()?;
-        let mut runtime = Self::compile(config, parameters, |graph, inputs, parameters| {
-            parameter_plan.lower(graph, parameters, |graph| build(module, graph, inputs))
-        })?;
-        runtime.restore_checkpoint_in_place(checkpoint)?;
-        Ok(runtime)
+        CompiledMomentumSgdPlan::compile_module_from_checkpoint(config, module, checkpoint, build)?
+            .prepare_cpu()
     }
 
     pub fn step(
@@ -1126,54 +1089,9 @@ impl CpuCompiledMomentumSgd {
     }
 
     fn restored_candidate(&self, checkpoint: &CompiledMomentumSgdCheckpoint) -> Result<Self> {
-        if self.capture_identity() != checkpoint.capture_identity {
-            return Err(training(
-                "compiled momentum-SGD checkpoint capture identity mismatch",
-            ));
-        }
-        if checkpoint.parameters.keys().ne(checkpoint.momenta.keys())
-            || checkpoint
-                .parameters
-                .keys()
-                .ne(checkpoint.parameter_versions.keys())
-            || checkpoint
-                .parameters
-                .keys()
-                .ne(checkpoint.momentum_versions.keys())
-        {
-            return Err(training(
-                "compiled momentum-SGD checkpoint state names mismatch",
-            ));
-        }
-        let values = checkpoint
-            .parameters
-            .iter()
-            .map(|(name, value)| (RecurrentStateKey::parameter(name), value.clone()))
-            .chain(
-                checkpoint
-                    .momenta
-                    .iter()
-                    .map(|(name, value)| (RecurrentStateKey::momentum(name), value.clone())),
-            )
-            .collect();
-        let versions = checkpoint
-            .parameter_versions
-            .iter()
-            .map(|(name, version)| (RecurrentStateKey::parameter(name), *version))
-            .chain(
-                checkpoint
-                    .momentum_versions
-                    .iter()
-                    .map(|(name, version)| (RecurrentStateKey::momentum(name), *version)),
-            )
-            .collect();
-        let plan =
-            self.inner
-                .plan()?
-                .restore_frontier_with_versions(checkpoint.step, values, versions)?;
-        Ok(Self {
-            inner: plan.prepare_cpu()?,
-        })
+        CompiledMomentumSgdPlan::from_inner(self.inner.plan()?)?
+            .restore_checkpoint_owned(checkpoint)?
+            .prepare_cpu()
     }
 
     /// Validates and restores a checkpoint atomically. A rejected checkpoint
