@@ -9083,6 +9083,73 @@ fn owned_module_compile_failures_retain_module_and_preflight_versions() {
 }
 
 #[test]
+fn owned_module_momentum_plan_restores_before_preparation() {
+    let config = CompiledMomentumSgdConfig::new(0.9)
+        .unwrap()
+        .with_input("x", [2], DType::F32)
+        .unwrap();
+    let source = TiedFrozenModule::new([1.0, -1.0]);
+    let source_identity = source.shared.id();
+    let plan =
+        CompiledModuleMomentumSgdPlan::compile(config.clone(), source, build_tied_frozen).unwrap();
+    let capture_identity = plan.capture_identity();
+    assert_eq!(plan.step_count(), 0);
+
+    let mut session = plan.prepare(&CpuSessionTarget).unwrap();
+    session
+        .step(
+            BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]),
+            TensorData::scalar(0.01),
+        )
+        .unwrap();
+    let checkpoint = session.checkpoint().unwrap();
+    let trained_source = session.finish().unwrap();
+    assert_eq!(trained_source.shared.id(), source_identity);
+    assert_eq!(
+        trained_source.shared.value().unwrap(),
+        checkpoint.parameters()["shared"]
+    );
+
+    let destination = TiedFrozenModule::new([1.0, -1.0]);
+    let destination_identity = destination.shared.id();
+    let destination_before = destination.shared.snapshot().unwrap();
+    let plan =
+        CompiledModuleMomentumSgdPlan::compile(config, destination, build_tied_frozen).unwrap();
+    let mut foreign = checkpoint.clone();
+    foreign.capture_identity ^= 1;
+    let error = match plan.restore_checkpoint(&foreign) {
+        Ok(_) => panic!("foreign momentum checkpoint restored"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .source_error()
+            .to_string()
+            .contains("capture identity mismatch")
+    );
+    let plan = error.into_plan();
+    assert_eq!(plan.capture_identity(), capture_identity);
+    assert_eq!(plan.step_count(), 0);
+
+    let plan = plan.restore_checkpoint(&checkpoint).unwrap();
+    assert_eq!(plan.capture_identity(), capture_identity);
+    assert_eq!(plan.step_count(), 1);
+    let session = CpuSessionTarget.prepare(plan).unwrap();
+    assert_eq!(session.checkpoint().unwrap(), checkpoint);
+    let (destination, restored) = session.finish_with_checkpoint().unwrap();
+    assert_eq!(restored, checkpoint);
+    assert_eq!(destination.shared.id(), destination_identity);
+    assert_eq!(
+        destination.shared.value().unwrap(),
+        checkpoint.parameters()["shared"]
+    );
+    assert_eq!(
+        destination.shared.version().unwrap(),
+        destination_before.version + 1
+    );
+}
+
+#[test]
 fn owned_module_momentum_checkpoint_resumes_fresh_identity_atomically() {
     let config = CompiledMomentumSgdConfig::new(0.9)
         .unwrap()
