@@ -94,6 +94,30 @@ impl CompiledMomentumSgdPlan {
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
         let parameter_plan = ModuleParameterPlan::new(module, &BTreeSet::new())?;
+        Self::compile_module_from_parameter_plan_checkpoint(
+            config,
+            module,
+            parameter_plan,
+            checkpoint,
+            build,
+        )
+    }
+
+    pub(super) fn compile_module_from_parameter_plan_checkpoint<M, F>(
+        config: CompiledMomentumSgdConfig,
+        module: &M,
+        parameter_plan: ModuleParameterPlan,
+        checkpoint: &CompiledMomentumSgdCheckpoint,
+        build: F,
+    ) -> Result<Self>
+    where
+        M: Module + ?Sized,
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
         validate_module_checkpoint_schema(&parameter_plan, checkpoint)?;
         let parameters = checkpoint
             .parameters

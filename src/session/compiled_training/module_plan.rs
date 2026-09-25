@@ -41,7 +41,8 @@ impl<M: Module> CompiledModuleTrainingPlan<M, CompiledAdamWPlan, Option<u64>> {
             let decoded = checkpoint.decoded();
             let required_evaluation_capture_identity = decoded.evaluation_capture_identity;
             let mut seal = CompiledModuleSeal::capture(&module, &config.frozen_parameters)?;
-            let immutable_values = seal.apply_module_checkpoint(decoded)?;
+            let immutable_values =
+                seal.apply_module_checkpoint(decoded, &decoded.optimizer.decoded().parameters)?;
             let parameter_plan = ModuleParameterPlan::new(&module, &config.frozen_parameters)?
                 .with_immutable_values(&immutable_values)?;
             let plan = build(&module, parameter_plan)?

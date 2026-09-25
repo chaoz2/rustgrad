@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:6d86f70bf756bba3",
+  "source_fingerprint": "fnv1a64:384782b661048f6e",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -459,7 +459,7 @@
       "subject": "Compiled persistent-state training runtime",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CompiledAdamWPlan` compiles one fixed-shape forward, loss, backward pass, and AdamW recurrent program for atomic replay on interpreter CPU, strict-native CPU, or the bounded strict-Metal target. The maintained two-block Transformer proves decreasing loss plus exact in-process and portable resume. Resource-free RGAP v1 artifacts restore fresh CPU plans; Metal-admissible RGAP v2 artifacts also reconstruct strict-Metal main, partial-flush, and evaluation wrappers without rebuilding the graph, autograd, schedule, or captures. Native resources remain excluded, and unsupported policies stay CPU-only. Dynamic shapes, mixed-precision state, distributed or asynchronous training, broad optimizer construction, and live-Metal performance evidence remain gaps. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for mechanics."
+        "Acceptance requirement": "`CompiledAdamWPlan` compiles one fixed-shape forward, loss, backward pass, and AdamW recurrent program for atomic replay on interpreter CPU, strict-native CPU, or the bounded strict-Metal target. The maintained two-block Transformer proves decreasing loss plus exact in-process and portable resume. AdamW and CPU momentum SGD share one complete-module checkpoint envelope for canonical topology, ties, frozen values, and buffers while retaining distinct exact optimizer payloads. Resource-free RGAP v1 artifacts restore fresh CPU plans; Metal-admissible RGAP v2 artifacts also reconstruct strict-Metal main, partial-flush, and evaluation wrappers without rebuilding the graph, autograd, schedule, or captures. Native resources remain excluded, and unsupported policies stay CPU-only. Dynamic shapes, mixed-precision state, distributed or asynchronous training, broader optimizer construction, and live-Metal performance evidence remain gaps. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for mechanics."
       }
     },
     {

@@ -1502,10 +1502,20 @@ none of these APIs claims parent-directory durability across a system crash.
 
 ###### Portable checkpoint envelopes
 
-`CompiledModuleAdamWCheckpoint` embeds the existing AdamW checkpoint bytes
-unchanged and adds a canonical, identity-deduplicated inventory of traversal
+`CompiledModuleCheckpoint<C>` is the optimizer-neutral complete-module
+envelope. `C: CompiledModuleCheckpointPayload` owns the optimizer wire format;
+the envelope adds a canonical, identity-deduplicated inventory of traversal
 aliases, state kinds, source trainability, policy freezing, descriptors, and
 immutable frozen/buffer values.
+
+- `CompiledModuleAdamWCheckpoint` and
+  `CompiledModuleMomentumSgdCheckpoint` remain descriptive aliases over the
+  same generic envelope. Their embedded optimizer bytes and existing module
+  format identifiers are unchanged.
+- `CompiledModuleTrainingSession::module_checkpoint` and
+  `finish_with_module_checkpoint` operate through the shared checkpoint
+  capability. Adding another checkpointable optimizer does not require a
+  parallel module-envelope implementation or optimizer-named session methods.
 
 - Fresh owned recompilation validates that topology, injects saved immutable
   values only into capture constants, and restores the optimizer frontier
@@ -1591,6 +1601,12 @@ runtime slot, or host pointer is serialized.
   compiled resource-free program and rebases only its authenticated recurrent
   frontier. It invokes no module builder, graph/autograd transform, scheduler,
   capture, or attached-evaluation construction.
+- Complete owned-module checkpoints share one optimizer-neutral envelope for
+  canonical topology, tied aliases, frozen parameters, and buffers. AdamW
+  retains its existing v1/v2 wire formats and optional evaluator identity;
+  momentum SGD embeds its exact optimizer checkpoint in a distinct v1 format.
+  Fresh restore validates topology and stages immutable values in the sealed
+  plan, then publishes nothing into the destination module until finalization.
 - Independent runtimes may prepare from original and restored plans.
   Publication may target a separately initialized module once its
   capture-owned frozen constants align with the compiled program, without

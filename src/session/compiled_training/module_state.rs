@@ -1,5 +1,5 @@
-use super::module_adamw_checkpoint::{
-    DecodedModuleAdamWCheckpoint, ModuleCheckpointState, ModuleCheckpointStateKind,
+use super::module_checkpoint::{
+    DecodedModuleCheckpoint, ModuleCheckpointState, ModuleCheckpointStateKind,
     ModuleCheckpointVisit,
 };
 use super::{CompiledAdamWConfig, checked_bytes, training, validate_user_name};
@@ -260,15 +260,15 @@ impl CompiledModuleSeal {
         (states, visits)
     }
 
-    pub(super) fn apply_module_checkpoint(
+    pub(super) fn apply_module_checkpoint<C>(
         &mut self,
-        checkpoint: &DecodedModuleAdamWCheckpoint,
+        checkpoint: &DecodedModuleCheckpoint<C>,
+        optimizer_parameters: &BTreeMap<String, TensorData>,
     ) -> Result<BTreeMap<String, TensorData>> {
         let (current_states, current_visits) = self.checkpoint_inventory();
         if current_visits != checkpoint.visits || current_states.len() != checkpoint.states.len() {
             return Err(training("compiled module checkpoint topology mismatch"));
         }
-        let optimizer_parameters = &checkpoint.optimizer.decoded().parameters;
         let mut immutable_values = BTreeMap::new();
         for (current, saved) in current_states.iter().zip(&checkpoint.states) {
             if current.name != saved.name
@@ -283,7 +283,9 @@ impl CompiledModuleSeal {
             }
             let saved_value = match &saved.value {
                 Some(value) => value,
-                None => &optimizer_parameters[&saved.name],
+                None => optimizer_parameters.get(&saved.name).ok_or_else(|| {
+                    training("compiled module checkpoint trainable state is absent")
+                })?,
             };
             let state = self
                 .states

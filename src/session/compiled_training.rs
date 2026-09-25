@@ -13,6 +13,8 @@ mod delegation;
 mod dropout;
 mod exchange;
 mod module_adamw_checkpoint;
+mod module_checkpoint;
+mod module_momentum_checkpoint;
 mod module_owner;
 mod module_plan;
 mod module_session;
@@ -68,11 +70,14 @@ use self::dropout::{CompiledDropoutState, CompiledDropoutStream, expected_dropou
 pub use self::exchange::*;
 use self::exchange::{CompiledAdamWWindowLossValue, CompiledInputPolicy};
 pub use self::module_adamw_checkpoint::CompiledModuleAdamWCheckpoint;
-use self::module_adamw_checkpoint::encode_module_adamw_checkpoint;
+pub use self::module_checkpoint::{CompiledModuleCheckpoint, CompiledModuleCheckpointPayload};
+use self::module_checkpoint::{DecodedModuleCheckpoint, encode_complete_module_checkpoint};
+pub use self::module_momentum_checkpoint::CompiledModuleMomentumSgdCheckpoint;
 pub use self::module_owner::{
     CompiledModuleAdamWCompileError, CompiledModuleAdamWEvaluationError,
     CompiledModuleAdamWFinishError, CompiledModuleAdamWPlan, CompiledModuleAdamWPrepareError,
-    CompiledModuleAdamWRestoreError, CompiledModuleAdamWSession, CompiledModuleCompileError,
+    CompiledModuleAdamWRestoreError, CompiledModuleAdamWSession,
+    CompiledModuleCheckpointFinishResult, CompiledModuleCompileError,
     CompiledModuleMomentumSgdCompileError, CompiledModuleMomentumSgdPlan,
     CompiledModuleMomentumSgdPrepareError, CompiledModuleMomentumSgdRestoreError,
     CompiledModulePlanError, CompiledModuleTrainingFinishError, CompiledModuleTrainingPlan,

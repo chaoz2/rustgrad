@@ -229,6 +229,11 @@ pub struct CompiledModuleTrainingFinishError<M, R> {
 /// AdamW compatibility alias for a recoverable owned-session failure.
 pub type CompiledModuleAdamWFinishError<M, R> = CompiledModuleTrainingFinishError<M, R>;
 
+/// Recoverable result of publishing one owned module together with its
+/// complete optimizer-neutral checkpoint.
+pub type CompiledModuleCheckpointFinishResult<M, R, C> =
+    std::result::Result<(M, CompiledModuleCheckpoint<C>), CompiledModuleTrainingFinishError<M, R>>;
+
 impl<M, R> CompiledModuleTrainingFinishError<M, R> {
     pub(super) fn new(session: CompiledModuleTrainingSession<M, R>, source: Error) -> Self {
         let descriptor = session.descriptor;

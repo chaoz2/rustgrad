@@ -67,6 +67,49 @@ impl<M: Module> CompiledModuleTrainingPlan<M, CompiledMomentumSgdPlan> {
         })
     }
 
+    /// Recompiles a fresh module from one complete topology-authenticated
+    /// momentum-SGD checkpoint without publishing into that module.
+    pub fn compile_from_module_checkpoint<F>(
+        config: CompiledMomentumSgdConfig,
+        module: M,
+        checkpoint: &CompiledModuleMomentumSgdCheckpoint,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleMomentumSgdCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let result: Result<(CompiledMomentumSgdPlan, CompiledModuleSeal)> = (|| {
+            let decoded = checkpoint.decoded();
+            let mut seal = CompiledModuleSeal::capture(&module, &BTreeSet::new())?;
+            let immutable_values =
+                seal.apply_module_checkpoint(decoded, decoded.optimizer.parameters())?;
+            let parameter_plan = ModuleParameterPlan::new(&module, &BTreeSet::new())?
+                .with_immutable_values(&immutable_values)?;
+            let plan = CompiledMomentumSgdPlan::compile_module_from_parameter_plan_checkpoint(
+                config,
+                &module,
+                parameter_plan,
+                checkpoint.optimizer_checkpoint(),
+                build,
+            )?;
+            seal.validate_unchanged(&module)?;
+            Ok((plan, seal))
+        })();
+        match result {
+            Ok((plan, seal)) => Ok(Self {
+                module,
+                plan,
+                seal,
+                attachment: (),
+            }),
+            Err(source) => Err(momentum_sgd_compile_error(module, source)),
+        }
+    }
+
     /// Restores an authenticated checkpoint without rebuilding the graph,
     /// gradients, schedules, or capture.
     ///

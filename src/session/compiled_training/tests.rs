@@ -1,4 +1,3 @@
-use super::module_adamw_checkpoint::decode_module_adamw_checkpoint;
 use super::observation::{
     AdamWObservation, CompiledTrainingObservationNode, CompiledTrainingObservationValue,
 };
@@ -9439,6 +9438,84 @@ fn owned_module_momentum_checkpoint_resumes_fresh_identity_atomically() {
 }
 
 #[test]
+fn complete_momentum_module_checkpoint_restores_topology_and_immutable_state() {
+    let config = CompiledMomentumSgdConfig::new(0.9)
+        .unwrap()
+        .with_input("x", [2], DType::F32)
+        .unwrap();
+    let source = TiedFrozenModule::new([1.0, -1.0]);
+    let source_frozen = source.frozen.value().unwrap();
+    let source_buffer = source.buffer.value().unwrap();
+    let mut source = CompiledModuleTrainingSession::compile_momentum_sgd(
+        config.clone(),
+        source,
+        build_tied_frozen,
+    )
+    .unwrap();
+    source
+        .step(
+            BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]),
+            TensorData::scalar(0.01),
+        )
+        .unwrap();
+    let checkpoint = source.module_checkpoint().unwrap();
+    assert_eq!(
+        checkpoint.optimizer_checkpoint(),
+        &source.checkpoint().unwrap()
+    );
+    assert_eq!(
+        CompiledModuleMomentumSgdCheckpoint::from_bytes(checkpoint.as_bytes().to_vec()).unwrap(),
+        checkpoint
+    );
+
+    let path = TemporaryCheckpointPath::new("compiled-module-momentum-sgd");
+    checkpoint.save_file(path.path()).unwrap();
+    assert_eq!(
+        CompiledModuleMomentumSgdCheckpoint::load_file(path.path()).unwrap(),
+        checkpoint
+    );
+
+    let destination = TiedFrozenModule::new([9.0, -7.0]);
+    destination
+        .frozen
+        .replace(TensorData::new([2], vec![8.0, 7.0]).unwrap())
+        .unwrap();
+    destination.buffer.replace(TensorData::scalar(6.0)).unwrap();
+    let destination_shared_identity = destination.shared.id();
+    let destination_before = destination.shared.value().unwrap();
+    let resumed = CompiledModuleTrainingSession::compile_momentum_sgd_from_module_checkpoint(
+        config,
+        destination,
+        &checkpoint,
+        build_tied_frozen,
+    )
+    .unwrap();
+    assert_eq!(resumed.module.shared.value().unwrap(), destination_before);
+    assert_eq!(resumed.module_checkpoint().unwrap(), checkpoint);
+
+    let (destination, finished) = resumed.finish_with_module_checkpoint().unwrap();
+    assert_eq!(finished, checkpoint);
+    assert_eq!(destination.shared.id(), destination_shared_identity);
+    assert_eq!(
+        destination.shared.value().unwrap(),
+        checkpoint.optimizer_checkpoint().parameters()["shared"]
+    );
+    assert_eq!(destination.frozen.value().unwrap(), source_frozen);
+    assert_eq!(destination.buffer.value().unwrap(), source_buffer);
+
+    let (tensors, metadata) = load_safetensors(checkpoint.as_bytes()).unwrap();
+    assert_eq!(
+        metadata["format"],
+        "rustgrad-compiled-module-momentum-sgd-v1"
+    );
+    assert_eq!(metadata["visit_count"], "4");
+    assert_eq!(metadata["state_count"], "3");
+    assert!(tensors.contains_key("optimizer_checkpoint"));
+    assert_eq!(tensors["immutable.1"], source_frozen);
+    assert_eq!(tensors["immutable.2"], source_buffer);
+}
+
+#[test]
 fn momentum_checkpoint_round_trips_deterministic_bytes_and_files() {
     let config = CompiledMomentumSgdConfig::new(0.9)
         .unwrap()
@@ -9982,8 +10059,8 @@ fn compiled_resume_bundle_preserves_exact_inner_bytes_and_atomic_file_boundary()
         legacy_optimizer.info().accumulation_capture_identity(),
         None
     );
-    let decoded_module = decode_module_adamw_checkpoint(checkpoint.as_bytes()).unwrap();
-    let legacy_checkpoint = encode_module_adamw_checkpoint(
+    let decoded_module = checkpoint.decoded();
+    let legacy_checkpoint = encode_complete_module_checkpoint(
         &legacy_optimizer,
         decoded_module.evaluation_capture_identity,
         &decoded_module.states,
@@ -11039,7 +11116,7 @@ fn complete_checkpoint_finish_publishes_one_snapshot_and_resumes_exactly() {
     );
     assert_parameter_snapshot_eq(&source_module.frozen.snapshot().unwrap(), &source_frozen);
     assert_parameter_snapshot_eq(&source_module.buffer.snapshot().unwrap(), &source_buffer);
-    let decoded = decode_module_adamw_checkpoint(completed.as_bytes()).unwrap();
+    let decoded = completed.decoded();
     assert_eq!(decoded.states.len(), 3);
     assert_eq!(decoded.visits.len(), 4);
     assert_eq!(decoded.visits[0].canonical_name, "shared");

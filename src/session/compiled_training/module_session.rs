@@ -73,6 +73,27 @@ impl<M: Module> CompiledModuleTrainingSession<M, CpuCompiledMomentumSgd> {
         )?;
         Self::prepare_momentum_plan(plan)
     }
+
+    /// Recompiles a fresh owned module from a complete checkpoint containing
+    /// optimizer state, immutable module values, ties, and traversal topology.
+    pub fn compile_momentum_sgd_from_module_checkpoint<F>(
+        config: CompiledMomentumSgdConfig,
+        module: M,
+        checkpoint: &CompiledModuleMomentumSgdCheckpoint,
+        build: F,
+    ) -> std::result::Result<Self, CompiledModuleMomentumSgdCompileError<M>>
+    where
+        F: FnOnce(
+            &M,
+            &mut Graph,
+            &BTreeMap<String, NodeId>,
+        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
+    {
+        let plan = CompiledModuleMomentumSgdPlan::compile_from_module_checkpoint(
+            config, module, checkpoint, build,
+        )?;
+        Self::prepare_momentum_plan(plan)
+    }
 }
 
 impl<M: Module, R: CompiledScheduledAdamWRuntime> CompiledModuleTrainingSession<M, R> {
@@ -209,22 +230,23 @@ where
     }
 }
 
-impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleTrainingSession<M, R> {
+impl<M: Module, R> CompiledModuleTrainingSession<M, R>
+where
+    R: CompiledCheckpointRuntime,
+    R::Checkpoint: CompiledModuleCheckpointPayload,
+{
     /// Snapshots the exact optimizer frontier together with the owned
     /// module's canonical immutable state and topology.
     ///
     /// This does not publish into or release the sealed host module. The
-    /// embedded optimizer checkpoint is reused byte-for-byte across v1--v9.
-    /// Programs without the private accumulation sibling retain their existing
-    /// v1--v8 formats; multi-replay accumulation emits v9. The module envelope
-    /// remains v1 when no evaluator is attached and uses v2 only to authenticate
-    /// an attached evaluator's capture identity.
-    pub fn module_checkpoint(&self) -> Result<CompiledModuleAdamWCheckpoint> {
+    /// embedded optimizer checkpoint retains its optimizer-specific exact
+    /// bytes; the surrounding envelope is shared across optimizer runtimes.
+    pub fn module_checkpoint(&self) -> Result<CompiledModuleCheckpoint<R::Checkpoint>> {
         self.seal.validate_unchanged(&self.module)?;
         let optimizer = self.runtime.checkpoint()?;
         self.seal.validate_unchanged(&self.module)?;
         let (states, visits) = self.seal.checkpoint_inventory();
-        encode_module_adamw_checkpoint(
+        encode_complete_module_checkpoint(
             &optimizer,
             self.evaluation_capture_identity,
             &states,
@@ -233,18 +255,16 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleTrainingSession<M, R> {
     }
 
     /// Atomically publishes and returns one complete module checkpoint built
-    /// from the exact AdamW snapshot used for publication.
+    /// from the exact optimizer snapshot used for publication.
     ///
     /// The checkpoint retains canonical module topology, ties, frozen
     /// parameters, and buffers in addition to the optimizer frontier. The
     /// runtime is checkpointed exactly once; encoding and publication both use
     /// that same snapshot. A seal, checkpoint, encoding, decode, or publication
-    /// failure retains the intact session in [`CompiledModuleAdamWFinishError`]
-    /// for inspection or retry.
+    /// failure retains the intact session for inspection or retry.
     pub fn finish_with_module_checkpoint(
         self,
-    ) -> std::result::Result<(M, CompiledModuleAdamWCheckpoint), CompiledModuleAdamWFinishError<M, R>>
-    {
+    ) -> CompiledModuleCheckpointFinishResult<M, R, R::Checkpoint> {
         if let Err(source) = self.seal.validate_unchanged(&self.module) {
             return Err(CompiledModuleTrainingFinishError::new(self, source));
         }
@@ -255,7 +275,7 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleTrainingSession<M, R> {
             }
         };
         let (states, visits) = self.seal.checkpoint_inventory();
-        let checkpoint = match encode_module_adamw_checkpoint(
+        let checkpoint = match encode_complete_module_checkpoint(
             &optimizer,
             self.evaluation_capture_identity,
             &states,
@@ -266,8 +286,8 @@ impl<M: Module, R: CompiledAdamWRuntime> CompiledModuleTrainingSession<M, R> {
                 return Err(CompiledModuleTrainingFinishError::new(self, source));
             }
         };
-        let parameters = match decode_adamw_checkpoint(optimizer.as_bytes()) {
-            Ok(decoded) => decoded.parameters,
+        let parameters = match optimizer.checkpoint_parameter_snapshots() {
+            Ok(parameters) => parameters,
             Err(source) => {
                 return Err(CompiledModuleTrainingFinishError::new(self, source));
             }
