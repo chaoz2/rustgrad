@@ -14,6 +14,7 @@ mod module_plan;
 mod module_session;
 mod module_state;
 mod native_cpu_evidence;
+mod native_cpu_preparation;
 mod native_cpu_programs;
 mod objective;
 mod observation;
