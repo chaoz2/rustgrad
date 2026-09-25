@@ -838,6 +838,14 @@ fn validate_preparation_partition(
 }
 
 fn validate_replay(report: &NativeTrainingReport) -> Result<()> {
+    validate_replay_summary(report)?;
+    validate_replay_phase_partition(report)?;
+    validate_dispatcher_phase_partition(report)?;
+    validate_step_phases(report)?;
+    validate_replay_inventory(report)
+}
+
+fn validate_replay_summary(report: &NativeTrainingReport) -> Result<()> {
     if report.successful_replay_count < 2
         || report.successful_replay_count > MAX_REPLAY_SAMPLES as u64
         || report.steady_replay_wall_time.sample_count != report.successful_replay_count - 1
@@ -853,6 +861,10 @@ fn validate_replay(report: &NativeTrainingReport) -> Result<()> {
         &report.steady_replay_wall_time,
         report.steady_replay_total_wall_time,
     )?;
+    Ok(())
+}
+
+fn validate_replay_phase_partition(report: &NativeTrainingReport) -> Result<()> {
     match (
         report.format_version,
         &report.main_replay_executor_wall_time,
@@ -902,6 +914,10 @@ fn validate_replay(report: &NativeTrainingReport) -> Result<()> {
         }
         _ => return Err(invalid("native training replay phases differ")),
     }
+    Ok(())
+}
+
+fn validate_dispatcher_phase_partition(report: &NativeTrainingReport) -> Result<()> {
     match (
         report.format_version,
         &report.main_replay_native_dispatcher_wall_time,
@@ -945,6 +961,10 @@ fn validate_replay(report: &NativeTrainingReport) -> Result<()> {
         }
         _ => return Err(invalid("native training dispatcher timing differs")),
     }
+    Ok(())
+}
+
+fn validate_step_phases(report: &NativeTrainingReport) -> Result<()> {
     match (report.format_version, &report.step_phases) {
         (1..=NATIVE_TRAINING_REPORT_FORMAT_V9, None) => {}
         (
@@ -1016,6 +1036,10 @@ fn validate_replay(report: &NativeTrainingReport) -> Result<()> {
         ) if report.accumulation.is_none() => {}
         _ => return Err(invalid("native training step phases differ")),
     }
+    Ok(())
+}
+
+fn validate_replay_inventory(report: &NativeTrainingReport) -> Result<()> {
     let expected_rate = rate_from_total(
         report.steady_replay_wall_time.sample_count,
         report.steady_replay_total_wall_time,
