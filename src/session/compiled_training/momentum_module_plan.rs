@@ -116,12 +116,9 @@ impl<M: Module> CompiledModuleTrainingPlan<M, CompiledMomentumSgdPlan> {
             }
         };
         let Self { module, seal, .. } = self;
-        Ok(CompiledModuleTrainingSession {
-            module,
-            runtime,
-            seal,
-            evaluation_capture_identity: None,
-        })
+        Ok(CompiledModuleTrainingSession::training(
+            module, runtime, seal, None,
+        ))
     }
 }
 

@@ -26,18 +26,6 @@ impl<M, R> RuntimeDelegate for CompiledModuleTrainingSession<M, R> {
     }
 }
 
-impl<M, R> RuntimeDelegate for CompiledModuleAdamWSession<M, R> {
-    type Runtime = R;
-
-    fn runtime(&self) -> &Self::Runtime {
-        &self.training.runtime
-    }
-
-    fn runtime_mut(&mut self) -> &mut Self::Runtime {
-        &mut self.training.runtime
-    }
-}
-
 impl<T> CompiledTrainingRuntime for T
 where
     T: RuntimeDelegate,

@@ -3681,7 +3681,6 @@ fn native_cpu_adamw_evaluation_borrows_active_parameters_and_retries() {
         .parameter_inputs[0]
         .clone();
     session
-        .training
         .runtime
         .evaluation_replay
         .as_mut()
@@ -3697,7 +3696,6 @@ fn native_cpu_adamw_evaluation_borrows_active_parameters_and_retries() {
             .is_err()
     );
     session
-        .training
         .runtime
         .evaluation_replay
         .as_mut()
@@ -9250,7 +9248,36 @@ fn owned_module_momentum_checkpoint_resumes_fresh_identity_atomically() {
     );
 
     let final_checkpoint = resumed.checkpoint().unwrap();
-    let (destination, published) = resumed.finish_with_checkpoint().unwrap();
+    resumed
+        .module
+        .frozen
+        .replace(TensorData::new([2], vec![7.0, 8.0]).unwrap())
+        .unwrap();
+    let error = match resumed.finish_with_checkpoint() {
+        Ok(_) => panic!("stale momentum module state must reject publication"),
+        Err(error) => error,
+    };
+    let generic: &CompiledModuleTrainingFinishError<_, _> = &error;
+    assert!(format!("{generic:?}").starts_with("CompiledModuleTrainingFinishError"));
+    assert!(
+        generic
+            .to_string()
+            .starts_with("owned compiled training finalization failed:")
+    );
+    assert_eq!(generic.session().checkpoint().unwrap(), final_checkpoint);
+    generic
+        .session()
+        .module
+        .frozen
+        .replace(destination_frozen_before.data.clone())
+        .unwrap();
+    generic
+        .session()
+        .module
+        .frozen
+        .set_version_for_test(destination_frozen_before.version)
+        .unwrap();
+    let (destination, published) = error.into_session().finish_with_checkpoint().unwrap();
     assert_eq!(published, final_checkpoint);
     assert_eq!(destination.shared.id(), destination_shared_identity);
     assert_eq!(
@@ -9283,7 +9310,8 @@ fn owned_module_adamw_session_seals_replay_and_finishes_atomically() {
     let plan =
         CompiledModuleAdamWPlan::compile(module_config(), module, build_tied_frozen).unwrap();
     let capture_identity = plan.capture_identity();
-    let mut session = plan.prepare(&CpuSessionTarget::new()).unwrap();
+    let session = plan.prepare(&CpuSessionTarget::new()).unwrap();
+    let mut session: CompiledModuleTrainingSession<_, _> = session.into_training_session();
     let input = BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]);
     let step = session.step(input, TensorData::scalar(0.01)).unwrap();
     assert_eq!(step.capture_identity(), capture_identity);
@@ -9325,6 +9353,13 @@ fn owned_module_adamw_session_seals_replay_and_finishes_atomically() {
         Ok(_) => panic!("stale module state must reject publication"),
         Err(error) => error,
     };
+    let compatible: &CompiledModuleAdamWFinishError<_, _> = &error;
+    assert!(format!("{compatible:?}").starts_with("CompiledModuleAdamWFinishError"));
+    assert!(
+        compatible
+            .to_string()
+            .starts_with("owned compiled AdamW finalization failed:")
+    );
     assert_eq!(error.session().step_count(), 1);
     assert_eq!(error.session().checkpoint().unwrap(), runtime_checkpoint);
     assert_eq!(error.session().parameter_snapshots().unwrap().len(), 1);
@@ -10711,15 +10746,15 @@ fn complete_checkpoint_finish_publishes_one_snapshot_and_resumes_exactly() {
     let mut resumed = restored_plan.prepare(&CpuSessionTarget::new()).unwrap();
     assert_eq!(resumed.module_checkpoint().unwrap(), partial);
     assert_parameter_snapshot_eq(
-        &resumed.training.module.shared.snapshot().unwrap(),
+        &resumed.module.shared.snapshot().unwrap(),
         &destination_shared,
     );
     assert_parameter_snapshot_eq(
-        &resumed.training.module.frozen.snapshot().unwrap(),
+        &resumed.module.frozen.snapshot().unwrap(),
         &destination_frozen,
     );
     assert_parameter_snapshot_eq(
-        &resumed.training.module.buffer.snapshot().unwrap(),
+        &resumed.module.buffer.snapshot().unwrap(),
         &destination_buffer,
     );
 
@@ -10744,25 +10779,11 @@ fn complete_checkpoint_finish_publishes_one_snapshot_and_resumes_exactly() {
     let expected_complete = source.module_checkpoint().unwrap();
     assert_eq!(expected_optimizer.info().accumulation_index(), 1);
     assert_eq!(expected_optimizer.info().accumulated_token_count(), Some(1));
-    let CompiledModuleAdamWSession { training } = source;
-    let CompiledModuleTrainingSession {
-        module,
-        runtime,
-        seal,
-        evaluation_capture_identity,
-    } = training;
     let checkpoint_calls = Rc::new(Cell::new(0));
-    let source = CompiledModuleAdamWSession {
-        training: CompiledModuleTrainingSession {
-            module,
-            runtime: CheckpointCountingRuntime {
-                inner: runtime,
-                checkpoint_calls: Rc::clone(&checkpoint_calls),
-            },
-            seal,
-            evaluation_capture_identity,
-        },
-    };
+    let source = source.map_runtime(|runtime| CheckpointCountingRuntime {
+        inner: runtime,
+        checkpoint_calls: Rc::clone(&checkpoint_calls),
+    });
     let (source_module, completed) = source.finish_with_module_checkpoint().unwrap();
     assert_eq!(checkpoint_calls.get(), 1);
     assert_eq!(completed, expected_complete);
@@ -10816,7 +10837,7 @@ fn checkpointed_finish_retains_session_after_late_publication_race() {
         )
         .unwrap();
     let checkpoint = session.module_checkpoint().unwrap();
-    session.training.module.arm_finish_race();
+    session.module.arm_finish_race();
 
     let error = session.finish_with_module_checkpoint().unwrap_err();
     assert!(matches!(

@@ -1480,8 +1480,9 @@ none of these APIs claims parent-directory durability across a system crash.
   optimizer-specific pre-preparation attachment typed; AdamW and momentum-SGD
   are aliases rather than parallel owner implementations.
 - Target preparation transfers that owner into
-  `CompiledModuleTrainingSession<M, R>`. AdamW retains its compatibility
-  session wrapper, while replay exposes no module handle.
+  `CompiledModuleTrainingSession<M, R>`. `CompiledModuleAdamWSession<M, R>` is
+  a source-compatible alias for that same owner, not a second wrapper; replay
+  exposes no module handle.
 - A private complete-state seal authenticates traversal order and names, tied
   identities, kinds, trainability, descriptors, versions, and raw bytes before
   resources and again at finish.
