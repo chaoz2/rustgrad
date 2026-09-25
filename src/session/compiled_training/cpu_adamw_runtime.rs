@@ -2,6 +2,131 @@
 
 use super::*;
 
+pub(super) struct PreparedNativeCpuProgram {
+    pub(super) report: NativeCpuProgramPreparationReport,
+    pub(super) replay: PreparedRecurrentNativeReplay,
+}
+
+pub(super) struct PreparedNativeCpuEvaluation {
+    pub(super) report: NativeCpuProgramPreparationReport,
+    pub(super) plan: PlannedNativeItems,
+    pub(super) parameter_inputs: Vec<PreparedNativeEvaluationParameterInput>,
+}
+
+pub(super) struct NativeCpuEvaluationPreparation {
+    pub(super) inputs: Option<BTreeMap<String, TensorData>>,
+    pub(super) parameter_inputs: Vec<PreparedNativeEvaluationParameterInput>,
+    pub(super) residual_wall_time: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PreparedNativeEvaluationParameterInput {
+    pub(super) parameter: String,
+    pub(super) input: String,
+    pub(super) buffer: u64,
+    pub(super) shape: Shape,
+    pub(super) dtype: DType,
+    pub(super) bytes: usize,
+}
+
+impl PreparedNativeCpuEvaluation {
+    pub(super) fn validate(
+        &self,
+        capture_identity: u64,
+        capture: &CapturedSchedule,
+        parameter_buffers: &BTreeMap<String, u64>,
+    ) -> Result<()> {
+        self.plan
+            .validate_structure(capture)
+            .map_err(replay_error)?;
+        let native_identity = native_cpu_identity(
+            capture_identity,
+            self.plan.vectorized(),
+            self.plan.schedule_cache_keys().iter().copied(),
+        );
+        if self.report.capture_identity != capture_identity
+            || self.report.native_identity != native_identity
+            || self.report.native_item_count != self.plan.item_count()
+            || self.report.cache_hit_count != self.plan.cache_hit_count()
+            || self.report.cache_miss_count != self.plan.cache_miss_count()
+            || self.report.work
+                != NativeCpuPreparationWork::from_module(self.plan.module_preparation())
+            || self.report.vectorized != self.plan.vectorized()
+            || capture.items.iter().map(|item| item.cache_key).ne(self
+                .plan
+                .schedule_cache_keys()
+                .iter()
+                .copied())
+        {
+            return Err(training(
+                "compiled native CPU evaluation preparation identity mismatch",
+            ));
+        }
+        self.report.validate_work()?;
+        if parameter_buffers.len() != self.parameter_inputs.len() {
+            return Err(training(
+                "compiled native CPU evaluation parameter mapping mismatch",
+            ));
+        }
+        let mut parameters = BTreeSet::new();
+        let mut inputs = BTreeSet::new();
+        let mut buffers = BTreeSet::new();
+        for binding in &self.parameter_inputs {
+            let input = capture
+                .inputs
+                .iter()
+                .find(|input| input.name == binding.input)
+                .ok_or_else(|| {
+                    training("compiled native CPU evaluation parameter input is absent")
+                })?;
+            if !parameters.insert(binding.parameter.as_str())
+                || parameter_buffers.get(&binding.parameter) != Some(&binding.buffer)
+                || !inputs.insert(binding.input.as_str())
+                || !buffers.insert(binding.buffer)
+                || input.desc.shape != binding.shape
+                || input.desc.dtype != binding.dtype
+                || input.desc.bytes != binding.bytes
+            {
+                return Err(training(
+                    "compiled native CPU evaluation parameter mapping mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn active_parameter_states(
+        &self,
+        frontier: &[BufferState],
+    ) -> Result<Vec<BufferState>> {
+        let mut frontier_by_buffer = BTreeMap::new();
+        for state in frontier {
+            if frontier_by_buffer.insert(state.buffer, state).is_some() {
+                return Err(training(
+                    "compiled native CPU recurrent frontier contains duplicate buffers",
+                ));
+            }
+        }
+        self.parameter_inputs
+            .iter()
+            .map(|binding| {
+                let state = frontier_by_buffer.get(&binding.buffer).ok_or_else(|| {
+                    training("compiled native CPU evaluation parameter state is absent")
+                })?;
+                if state.shape != binding.shape
+                    || state.dtype != binding.dtype
+                    || state.bytes != binding.bytes
+                {
+                    return Err(training(
+                        "compiled native CPU evaluation parameter state descriptor mismatch",
+                    ));
+                }
+                Ok((*state).clone())
+            })
+            .collect()
+    }
+}
+
 /// One compiled AdamW training program with recurrent first/second moments, a
 /// graph-owned step counter, and capture-authenticated gradient policies.
 pub struct CpuCompiledAdamW {
@@ -31,6 +156,12 @@ pub struct NativeCpuCompiledAdamW<'a> {
     pub(super) successful_flushes: u64,
     pub(super) successful_zero_grads: u64,
     pub(super) successful_evaluations: u64,
+}
+
+pub(super) struct PendingAdamWStep {
+    pub(super) request: CompiledStepReplayRequest,
+    pub(super) next_progress: CompiledTrainingWindowProgress,
+    pub(super) loss_weight: u64,
 }
 
 impl CpuCompiledAdamW {

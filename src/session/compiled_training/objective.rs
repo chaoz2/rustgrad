@@ -1,11 +1,109 @@
 //! Objective and token-weight lowering for compiled AdamW programs.
 
 use super::{
-    CompiledAdamWConfig, CompiledAdamWIgnoreIndexContext, CompiledAdamWObjective,
-    CompiledTokenWeightPolicy, MAX_EXACT_F32_INTEGER_COUNT, scalar_f32, training,
+    CompiledAdamWConfig, CompiledTokenWeightPolicy, MAX_EXACT_F32_INTEGER_COUNT, scalar_f32,
+    training,
 };
 use crate::{CompareOp, DType, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::collections::BTreeMap;
+
+/// Explicit scalar or token-mean objective returned by a compiled module
+/// training or evaluation builder.
+///
+/// [`Scalar`](Self::Scalar) is the already-normalized scalar loss used by the
+/// ordinary compiled AdamW policy. [`TokenMean`](Self::TokenMean) is a
+/// fixed-shape F32 tensor of per-token losses; compilation combines it with
+/// the explicit mask or target-derived ignore-index policy configured on
+/// [`CompiledAdamWConfig`] and owns the resulting masked mean as both the
+/// public loss and differentiation root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompiledAdamWObjective {
+    Scalar(NodeId),
+    TokenMean(NodeId),
+}
+
+impl CompiledAdamWObjective {
+    pub const fn scalar(loss: NodeId) -> Self {
+        Self::Scalar(loss)
+    }
+
+    pub const fn token_mean(losses: NodeId) -> Self {
+        Self::TokenMean(losses)
+    }
+
+    pub const fn node(self) -> NodeId {
+        match self {
+            Self::Scalar(node) | Self::TokenMean(node) => node,
+        }
+    }
+}
+
+/// Compact result of building one compiled AdamW module training or evaluation
+/// graph.
+///
+/// The objective makes scalar-loss versus compiler-owned token-mean policy
+/// explicit at the builder boundary. Named outputs retain their existing
+/// replay behavior and capture identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompiledAdamWGraph {
+    objective: CompiledAdamWObjective,
+    outputs: BTreeMap<String, NodeId>,
+}
+
+impl CompiledAdamWGraph {
+    pub fn new(objective: CompiledAdamWObjective, outputs: BTreeMap<String, NodeId>) -> Self {
+        Self { objective, outputs }
+    }
+
+    pub fn scalar(loss: NodeId, outputs: BTreeMap<String, NodeId>) -> Self {
+        Self::new(CompiledAdamWObjective::Scalar(loss), outputs)
+    }
+
+    pub fn token_mean(losses: NodeId, outputs: BTreeMap<String, NodeId>) -> Self {
+        Self::new(CompiledAdamWObjective::TokenMean(losses), outputs)
+    }
+
+    pub const fn objective(&self) -> CompiledAdamWObjective {
+        self.objective
+    }
+
+    pub fn outputs(&self) -> &BTreeMap<String, NodeId> {
+        &self.outputs
+    }
+
+    pub fn into_parts(self) -> (CompiledAdamWObjective, BTreeMap<String, NodeId>) {
+        (self.objective, self.outputs)
+    }
+}
+
+/// Compiler-derived graph nodes for one configured ignore-index token policy.
+///
+/// All three nodes have the configured fixed target shape. [`Self::targets`] is
+/// the declared I32 target input, [`Self::validity`] is the Bool result of the
+/// exact `target != ignore_index` comparison, and [`Self::weight`] is that same
+/// validity cast to F32. Context-aware builders may reshape the Bool node for a
+/// model's attention policy while compilation reuses the F32 node for the
+/// token-mean objective and optimizer window accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledAdamWIgnoreIndexContext {
+    pub(super) targets: NodeId,
+    pub(super) validity: NodeId,
+    pub(super) weight: NodeId,
+}
+
+impl CompiledAdamWIgnoreIndexContext {
+    pub const fn targets(self) -> NodeId {
+        self.targets
+    }
+
+    pub const fn validity(self) -> NodeId {
+        self.validity
+    }
+
+    pub const fn weight(self) -> NodeId {
+        self.weight
+    }
+}
 
 pub(super) fn validate_token_weight_policy(
     inputs: &BTreeMap<String, (Shape, DType)>,
