@@ -70,8 +70,8 @@ use self::dropout::{CompiledDropoutState, CompiledDropoutStream, expected_dropou
 pub use self::exchange::*;
 use self::exchange::{CompiledAdamWWindowLossValue, CompiledInputPolicy};
 pub use self::module_adamw_checkpoint::CompiledModuleAdamWCheckpoint;
+use self::module_checkpoint::encode_complete_module_checkpoint;
 pub use self::module_checkpoint::{CompiledModuleCheckpoint, CompiledModuleCheckpointPayload};
-use self::module_checkpoint::{DecodedModuleCheckpoint, encode_complete_module_checkpoint};
 pub use self::module_momentum_checkpoint::CompiledModuleMomentumSgdCheckpoint;
 pub use self::module_owner::{
     CompiledModuleAdamWCompileError, CompiledModuleAdamWEvaluationError,
@@ -136,7 +136,11 @@ pub use self::program_artifact::{
     CompiledTrainingProgramArtifactInfo,
 };
 use self::recurrent_phase::*;
-pub use self::resume_bundle::{CompiledAdamWResumeBundle, CompiledAdamWResumeBundleFileError};
+pub use self::resume_bundle::{
+    CompiledAdamWResumeBundle, CompiledAdamWResumeBundleFileError, CompiledMomentumSgdResumeBundle,
+    CompiledMomentumSgdResumeBundleFileError, CompiledTrainingResumeBundle,
+    CompiledTrainingResumeBundleFileError,
+};
 pub use self::runtime::*;
 #[cfg(test)]
 use self::state_schema::INTERNAL_PREFIX;

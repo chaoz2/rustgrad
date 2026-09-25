@@ -1474,11 +1474,20 @@ The artifact supplies immutable executable structure. The unchanged checkpoint
 supplies the current parameter, optimizer, accumulation, loss/token, and
 dropout frontier; neither can substitute for the other.
 
-`CompiledAdamWResumeBundle` preserves those two validated byte streams unchanged
-inside one bounded, checksummed envelope. Loading authenticates the complete
-pair before restore, and saving syncs one unique same-directory staging file
-before atomic replacement. The constituent files remain independently usable;
-none of these APIs claims parent-directory durability across a system crash.
+`CompiledTrainingResumeBundle<C>` preserves those two validated byte streams
+unchanged inside one bounded, checksummed envelope:
+
+- `CompiledAdamWResumeBundle` remains the source-compatible AdamW alias and
+  retains its existing RGAB bytes.
+- `CompiledMomentumSgdResumeBundle` pairs an RGAP v3 executable with its typed
+  complete-module momentum-SGD checkpoint.
+- Loading authenticates the optimizer, module topology, capture identity, and
+  complete recurrent frontier before restore.
+- Saving syncs one unique same-directory staging file before atomic
+  replacement. The constituent files remain independently usable.
+
+The bundle API does not claim parent-directory durability across a system
+crash.
 
 ##### Resume modes and module ownership
 

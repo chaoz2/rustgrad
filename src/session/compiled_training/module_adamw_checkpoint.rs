@@ -1,9 +1,6 @@
 //! Complete owned-module AdamW checkpoints.
 
-use super::{
-    CompiledAdamWCheckpoint, CompiledModuleCheckpoint, CompiledModuleCheckpointPayload,
-    DecodedModuleCheckpoint,
-};
+use super::{CompiledAdamWCheckpoint, CompiledModuleCheckpoint, CompiledModuleCheckpointPayload};
 use crate::Result;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -15,8 +12,6 @@ use std::collections::BTreeSet;
 /// deduplicated immutable parameter/buffer values. A v2 envelope also
 /// authenticates an attached evaluator's capture identity.
 pub type CompiledModuleAdamWCheckpoint = CompiledModuleCheckpoint<CompiledAdamWCheckpoint>;
-
-pub(super) type DecodedModuleAdamWCheckpoint = DecodedModuleCheckpoint<CompiledAdamWCheckpoint>;
 
 impl CompiledModuleCheckpointPayload for CompiledAdamWCheckpoint {
     const MODULE_FORMAT: &'static str = "rustgrad-compiled-module-adamw-v1";
