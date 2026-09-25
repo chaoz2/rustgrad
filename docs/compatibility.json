@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:fdc72d399d36e858",
+  "source_fingerprint": "fnv1a64:2e18c1b1a143ceef",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -429,10 +429,10 @@
     {
       "section": "Runtime, codegen and JIT",
       "subject_header": "Capability",
-      "subject": "CPU non-finite admission for compiled AdamW",
+      "subject": "CPU non-finite admission for compiled training",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CpuNonFinitePolicy::RejectTransition` is selected on `CpuSessionTarget` through the source-compatible `ConfiguredCpuSessionTarget`, or directly on `NativeCpuSessionTarget`. Interpreter and strict-native CPU stage the exact authenticated replay, require a finite rank-zero F32 loss and every fully applied final F32 recurrent successor, then perform the existing single atomic commit; non-finite external learning rates reject before staging. Rejection preserves parameters, moments, partial accumulators, optimizer/replay progress, dropout position, cursor versions, and native successful-invocation counts, so corrected retry is exact. Named outputs, non-F32 counters, signed zero, subnormals, and empty F32 tensors are not rejected. The default remains IEEE propagation, and the target-owned policy changes no plan, capture, checkpoint identity, or wire format. Metal is unchanged."
+        "Acceptance requirement": "`CpuNonFinitePolicy::RejectTransition` is retained by interpreter and strict-native AdamW and momentum-SGD runtimes. Each stages the authenticated replay, requires a finite rank-zero F32 loss and every fully applied F32 recurrent successor, and commits atomically; non-finite external learning rates reject before staging. Rejection preserves the optimizer's complete recurrent frontier, replay progress, versions, and native successful-invocation count, so corrected retry and checkpoint restore remain exact. AdamW additionally preserves partial accumulation and dropout state. Named outputs, non-F32 counters, signed zero, subnormals, and empty F32 tensors are not rejected. Propagation remains the default, and target policy changes no plan, capture, checkpoint identity, or wire format. Metal is unchanged."
       }
     },
     {
@@ -447,10 +447,10 @@
     {
       "section": "Runtime, codegen and JIT",
       "subject_header": "Capability",
-      "subject": "Strict-native CPU compiled AdamW replay",
+      "subject": "Strict-native CPU compiled training replay",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`NativeCpuSessionTarget` prepares attached CPU programs with fallback disabled. Authenticated render capsules fail closed to bounded rendering without changing module identities or publication. `NativeTrainingScoreboard` v23 adds a checked backend-neutral compile-phase partition; v22 retains exact capsule hit/miss/local-render counts, and v1--v22 remain readable. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership, evidence, and backend boundaries."
+        "Acceptance requirement": "`NativeCpuSessionTarget` prepares momentum-SGD's main program and every attached AdamW program with fallback disabled before mutable state is returned. Both optimizers reuse the same recurrent transaction, typed preparation/run evidence, non-finite admission, checkpoint frontier, owned-module lifecycle, and output-suppression contract. Authenticated render capsules fail closed without changing module identities or publication. `NativeTrainingScoreboard` remains the AdamW workload scoreboard; momentum-SGD exposes the shared program/run reports directly. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership and backend boundaries."
       }
     },
     {
@@ -459,7 +459,7 @@
       "subject": "Compiled persistent-state training runtime",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`CompiledAdamWPlan` compiles one fixed-shape forward, loss, backward pass, and AdamW recurrent program for atomic replay on interpreter CPU, strict-native CPU, or the bounded strict-Metal target. The maintained two-block Transformer proves decreasing loss plus exact in-process and portable resume. AdamW and CPU momentum SGD share one complete-module checkpoint envelope for canonical topology, ties, frozen values, and buffers while retaining distinct exact optimizer payloads. `CompiledTrainingProgramArtifact` exposes an explicit AdamW/momentum-SGD discriminator with source-compatible optimizer aliases: existing RGAP v1 CPU and v2 Metal-capable AdamW bytes remain unchanged, while RGAP v3 pairs a resource-free momentum-SGD CPU executable with its complete-module checkpoint. Both optimizers restore compatible fresh modules without rebuilding the graph, autograd, schedule, or captures. Native resources remain excluded, and unsupported policies stay CPU-only. Dynamic shapes, mixed-precision state, distributed or asynchronous training, broader optimizer construction, and live-Metal performance evidence remain gaps. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for mechanics."
+        "Acceptance requirement": "`CompiledAdamWPlan` compiles one fixed-shape forward, loss, backward pass, and AdamW recurrent program for atomic replay on interpreter CPU, strict-native CPU, or the bounded strict-Metal target. The maintained two-block Transformer proves decreasing loss plus exact in-process and portable resume. AdamW and momentum-SGD share interpreter and strict-native CPU preparation, one complete-module checkpoint envelope for canonical topology, ties, frozen values, and buffers, and distinct exact optimizer payloads. `CompiledTrainingProgramArtifact` exposes their explicit discriminator with source-compatible aliases: existing RGAP v1 CPU and v2 Metal-capable AdamW bytes remain unchanged, while RGAP v3 carries the resource-free momentum-SGD executable. Both optimizers restore compatible fresh modules and prepare either CPU target without rebuilding graph, autograd, schedule, or captures. Native resources remain excluded, and unsupported policies stay CPU-only. Dynamic shapes, mixed-precision state, distributed or asynchronous training, broader optimizer construction, and live-Metal performance evidence remain gaps. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for mechanics."
       }
     },
     {

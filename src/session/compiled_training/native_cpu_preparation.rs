@@ -159,17 +159,13 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         let (plans, compilation) = executor
             .plan_native_item_drafts(programs, vectorized)
             .map_err(replay_error)?;
-        let render_capsule_diagnostics = NativeCpuRenderCapsuleDiagnostic::from_ordered_native(
-            &roles,
-            compilation.render_capsule_diagnostics,
-        )?;
         let NativeCpuTrainingPrograms {
             main: main_plan,
             accumulation: accumulation_plan,
             partial_flush: partial_flush_plan,
             zero_grad: zero_grad_plan,
             evaluation: evaluation_plan,
-        } = NativeCpuTrainingPrograms::from_ordered(roles, plans)?;
+        } = NativeCpuTrainingPrograms::from_ordered(roles.clone(), plans)?;
         let main = inner
             .inner
             .finish_native(main_preparation, main_plan, main_residual)?;
@@ -269,6 +265,18 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .map(|prepared| (prepared.report, prepared.replay))
             .unzip();
         let evaluation_report = evaluation.as_ref().map(|prepared| prepared.report.clone());
+        let preparation = NativeCpuCompiledTrainingPreparationReport::from_compilation(
+            &roles,
+            NativeCpuTrainingPrograms {
+                main: main_report,
+                accumulation: accumulation_report,
+                partial_flush: partial_flush_report,
+                zero_grad: zero_grad_report,
+                evaluation: evaluation_report,
+            },
+            (recurrent_state_count, recurrent_state_bytes),
+            compilation,
+        )?;
         Ok(Self {
             inner,
             executor,
@@ -277,46 +285,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             partial_flush_replay,
             zero_grad_replay,
             evaluation_replay: evaluation,
-            preparation: NativeCpuCompiledAdamWPreparationReport {
-                main: main_report,
-                accumulation: accumulation_report,
-                partial_flush: partial_flush_report,
-                zero_grad: zero_grad_report,
-                evaluation: evaluation_report,
-                recurrent_state_count,
-                recurrent_state_bytes,
-                render_capsule_hit_count: compilation.render_capsule_hit_count,
-                render_capsule_miss_count: compilation.render_capsule_miss_count,
-                local_render_job_count: compilation.local_render_job_count,
-                parallel_render_overlap_wall_time: compilation.parallel_render_overlap_wall_time,
-                max_parallel_render_job_count: compilation.max_parallel_render_job_count,
-                parallel_module_overlap_wall_time: compilation.parallel_work_overlap_wall_time,
-                compiler_process_overlap_wall_time: compilation.compiler_process_overlap_wall_time,
-                compiler_process_count: compilation.compiler_process_count,
-                max_parallel_compiler_process_count: compilation
-                    .max_parallel_compiler_process_count,
-                compiler_process_timings: compilation
-                    .compiler_process_timings
-                    .into_iter()
-                    .map(NativeCpuCompilerProcessTiming::from_native)
-                    .collect(),
-                module_overlaps: compilation
-                    .module_overlaps
-                    .into_iter()
-                    .map(NativeCpuModuleOverlap::from_native)
-                    .collect(),
-                program_pair_overlaps: compilation
-                    .program_pair_overlaps
-                    .into_iter()
-                    .map(NativeCpuProgramPairOverlap::from_native)
-                    .collect(),
-                translation_units: compilation
-                    .translation_units
-                    .into_iter()
-                    .map(NativeCpuTranslationUnitEvidence::from_native)
-                    .collect(),
-                render_capsule_diagnostics,
-            },
+            preparation,
             successful_steps: 0,
             successful_flushes: 0,
             successful_zero_grads: 0,

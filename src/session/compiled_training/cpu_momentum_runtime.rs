@@ -4,7 +4,8 @@ use super::cpu_training_program::CpuCompiledTrainingProgram;
 use super::{
     CompiledCheckpointRestoreRuntime, CompiledCheckpointRuntime, CompiledMomentumSgdCheckpoint,
     CompiledMomentumSgdConfig, CompiledMomentumSgdPlan, CompiledMomentumSgdStepResult,
-    CompiledTrainingCommitOnlyRuntime, CompiledTrainingRuntime, TrainingParameterInit, training,
+    CompiledStepOutputSelection, CompiledStepReplayRequest, CompiledTrainingCommitOnlyRuntime,
+    CompiledTrainingRuntime, CpuNonFinitePolicy, TrainingParameterInit, training,
 };
 use crate::{Graph, Module, NodeId, Result, TensorData};
 use std::collections::BTreeMap;
@@ -12,6 +13,7 @@ use std::collections::BTreeMap;
 /// One compiled momentum-SGD training program.
 pub struct CpuCompiledMomentumSgd {
     pub(super) inner: CpuCompiledTrainingProgram,
+    pub(super) non_finite_policy: CpuNonFinitePolicy,
 }
 
 impl CpuCompiledMomentumSgd {
@@ -90,7 +92,12 @@ impl CpuCompiledMomentumSgd {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<CompiledMomentumSgdStepResult> {
-        self.inner.step(inputs, learning_rate)
+        self.step_with_output_selection(
+            inputs,
+            learning_rate,
+            CompiledStepOutputSelection::All,
+            None,
+        )
     }
 
     /// Commits one replay while omitting only graph-named outputs.
@@ -99,7 +106,31 @@ impl CpuCompiledMomentumSgd {
         inputs: BTreeMap<String, TensorData>,
         learning_rate: TensorData,
     ) -> Result<CompiledMomentumSgdStepResult> {
-        self.inner.step_commit_only(inputs, learning_rate)
+        self.step_with_output_selection(
+            inputs,
+            learning_rate,
+            CompiledStepOutputSelection::CommitOnly,
+            None,
+        )
+    }
+
+    pub(super) fn step_with_output_selection(
+        &mut self,
+        inputs: BTreeMap<String, TensorData>,
+        learning_rate: TensorData,
+        output_selection: CompiledStepOutputSelection,
+        injected_failure: Option<u64>,
+    ) -> Result<CompiledMomentumSgdStepResult> {
+        self.inner.step_inner_with_learning_rate(
+            CompiledStepReplayRequest {
+                inputs,
+                learning_rate: Some(learning_rate),
+                non_finite_policy: self.non_finite_policy,
+                output_selection,
+                injected_failure,
+            },
+            true,
+        )
     }
 
     pub fn step_count(&self) -> u64 {
@@ -108,6 +139,11 @@ impl CpuCompiledMomentumSgd {
 
     pub fn capture_identity(&self) -> u64 {
         self.inner.capture_identity()
+    }
+
+    /// CPU-only admission policy selected when this runtime was prepared.
+    pub const fn non_finite_policy(&self) -> CpuNonFinitePolicy {
+        self.non_finite_policy
     }
 
     pub fn parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
@@ -170,7 +206,7 @@ impl CpuCompiledMomentumSgd {
     fn restored_candidate(&self, checkpoint: &CompiledMomentumSgdCheckpoint) -> Result<Self> {
         CompiledMomentumSgdPlan::from_inner(self.inner.plan()?)?
             .restore_checkpoint_owned(checkpoint)?
-            .prepare_cpu()
+            .prepare_cpu_with_non_finite_policy(self.non_finite_policy)
     }
 
     /// Validates and restores a checkpoint atomically. A rejected checkpoint
@@ -191,8 +227,12 @@ impl CpuCompiledMomentumSgd {
         learning_rate: TensorData,
         injected_failure: Option<u64>,
     ) -> Result<CompiledMomentumSgdStepResult> {
-        self.inner
-            .step_inner(inputs, learning_rate, injected_failure)
+        self.step_with_output_selection(
+            inputs,
+            learning_rate,
+            CompiledStepOutputSelection::All,
+            injected_failure,
+        )
     }
 
     #[cfg(test)]
@@ -202,8 +242,12 @@ impl CpuCompiledMomentumSgd {
         learning_rate: TensorData,
         injected_failure: Option<u64>,
     ) -> Result<CompiledMomentumSgdStepResult> {
-        self.inner
-            .step_commit_only_inner(inputs, learning_rate, injected_failure)
+        self.step_with_output_selection(
+            inputs,
+            learning_rate,
+            CompiledStepOutputSelection::CommitOnly,
+            injected_failure,
+        )
     }
 }
 

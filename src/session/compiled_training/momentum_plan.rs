@@ -182,6 +182,7 @@ impl CompiledMomentumSgdPlan {
     pub fn prepare_cpu(&self) -> Result<CpuCompiledMomentumSgd> {
         Ok(CpuCompiledMomentumSgd {
             inner: self.inner.prepare_cpu()?,
+            non_finite_policy: CpuNonFinitePolicy::Propagate,
         })
     }
 
@@ -193,7 +194,17 @@ impl CompiledMomentumSgdPlan {
             inner: self
                 .inner
                 .prepare_cpu_with_non_finite_policy(non_finite_policy)?,
+            non_finite_policy,
         })
+    }
+
+    /// Prepares strict-native CPU replay before exposing mutable momentum state.
+    pub fn prepare_native_cpu<'a>(
+        &self,
+        target: &NativeCpuSessionTarget<'a>,
+    ) -> Result<NativeCpuCompiledMomentumSgd<'a>> {
+        let inner = self.prepare_cpu_with_non_finite_policy(target.non_finite_policy())?;
+        NativeCpuCompiledMomentumSgd::prepare(inner, target.executor(), target.is_vectorized())
     }
 
     /// Prepares this plan through a concrete target without introducing a
@@ -243,6 +254,15 @@ impl<'a> SessionTarget<&'a CompiledMomentumSgdPlan> for ConfiguredCpuSessionTarg
 
     fn prepare(&self, plan: &'a CompiledMomentumSgdPlan) -> Result<Self::Session> {
         plan.prepare_cpu_with_non_finite_policy(self.non_finite_policy())
+    }
+}
+
+impl<'executor> SessionTarget<&CompiledMomentumSgdPlan> for NativeCpuSessionTarget<'executor> {
+    type Session = NativeCpuCompiledMomentumSgd<'executor>;
+    type Error = Error;
+
+    fn prepare(&self, plan: &CompiledMomentumSgdPlan) -> Result<Self::Session> {
+        plan.prepare_native_cpu(self)
     }
 }
 

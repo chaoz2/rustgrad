@@ -163,6 +163,26 @@ impl<M: Module> CompiledModuleTrainingPlan<M, CompiledMomentumSgdPlan> {
             module, runtime, seal, None,
         ))
     }
+
+    fn prepare_native_cpu<'executor>(
+        self,
+        target: &NativeCpuSessionTarget<'executor>,
+    ) -> std::result::Result<
+        CompiledModuleTrainingSession<M, NativeCpuCompiledMomentumSgd<'executor>>,
+        CompiledModuleMomentumSgdPrepareError<M, Error>,
+    > {
+        if let Err(source) = self.seal.validate_unchanged(&self.module) {
+            return Err(momentum_sgd_prepare_error(self, source));
+        }
+        let runtime = match self.plan.prepare_native_cpu(target) {
+            Ok(runtime) => runtime,
+            Err(source) => return Err(momentum_sgd_prepare_error(self, source)),
+        };
+        let Self { module, seal, .. } = self;
+        Ok(CompiledModuleTrainingSession::training(
+            module, runtime, seal, None,
+        ))
+    }
 }
 
 impl<M: Module> SessionTarget<CompiledModuleMomentumSgdPlan<M>> for CpuSessionTarget {
@@ -186,5 +206,19 @@ impl<M: Module> SessionTarget<CompiledModuleMomentumSgdPlan<M>> for ConfiguredCp
         plan: CompiledModuleMomentumSgdPlan<M>,
     ) -> std::result::Result<Self::Session, Self::Error> {
         plan.prepare_cpu(self.non_finite_policy())
+    }
+}
+
+impl<'executor, M: Module> SessionTarget<CompiledModuleMomentumSgdPlan<M>>
+    for NativeCpuSessionTarget<'executor>
+{
+    type Session = CompiledModuleTrainingSession<M, NativeCpuCompiledMomentumSgd<'executor>>;
+    type Error = CompiledModuleMomentumSgdPrepareError<M, Error>;
+
+    fn prepare(
+        &self,
+        plan: CompiledModuleMomentumSgdPlan<M>,
+    ) -> std::result::Result<Self::Session, Self::Error> {
+        plan.prepare_native_cpu(self)
     }
 }
