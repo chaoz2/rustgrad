@@ -1,5 +1,4 @@
 use super::adamw_contract::{CompiledAdamWContract, CompiledAdamWPolicy};
-use super::module_adamw_checkpoint::DecodedModuleAdamWCheckpoint;
 use super::module_checkpoint::{DecodedModuleCheckpoint, ModuleCheckpointStateKind};
 use super::*;
 use crate::file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically};
@@ -1070,6 +1069,23 @@ impl<M: Module> CompiledModuleTrainingPlan<M, CompiledMomentumSgdPlan> {
             Err(source) => Err(CompiledModuleMomentumSgdArtifactRestoreError { module, source }),
         }
     }
+
+    /// Restores from one atomically persisted executable-and-state bundle
+    /// without rebuilding the momentum-SGD training program.
+    pub fn restore_from_resume_bundle(
+        module: M,
+        bundle: &CompiledMomentumSgdResumeBundle,
+    ) -> std::result::Result<Self, CompiledModuleMomentumSgdArtifactRestoreError<M>> {
+        match restore_momentum_owner_from_admitted(&module, bundle.admitted()) {
+            Ok((plan, seal)) => Ok(Self {
+                module,
+                plan,
+                seal,
+                attachment: (),
+            }),
+            Err(source) => Err(CompiledModuleMomentumSgdArtifactRestoreError { module, source }),
+        }
+    }
 }
 
 fn checkpoint_module_wire<C>(
@@ -1113,9 +1129,9 @@ fn checkpoint_module_wire<C>(
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct AdmittedArtifactCheckpointPair {
+pub(super) struct AdmittedArtifactCheckpointPair<C> {
     artifact: Arc<AdmittedProgramArtifact>,
-    checkpoint: Arc<DecodedModuleAdamWCheckpoint>,
+    checkpoint: Arc<DecodedModuleCheckpoint<C>>,
 }
 
 fn admitted_artifact(
@@ -1138,7 +1154,7 @@ fn admitted_artifact(
 fn decode_admitted_artifact_checkpoint_pair(
     artifact: &CompiledAdamWProgramArtifact,
     checkpoint: &CompiledModuleAdamWCheckpoint,
-) -> Result<AdmittedArtifactCheckpointPair> {
+) -> Result<AdmittedArtifactCheckpointPair<CompiledAdamWCheckpoint>> {
     #[cfg(test)]
     update_decode_counts(|counts| counts.pair_admissions += 1);
     let admitted = admitted_artifact(artifact)?;
@@ -1209,8 +1225,45 @@ fn decode_admitted_artifact_checkpoint_pair(
 pub(super) fn admit_artifact_checkpoint_pair(
     artifact: &CompiledAdamWProgramArtifact,
     checkpoint: &CompiledModuleAdamWCheckpoint,
-) -> Result<Arc<AdmittedArtifactCheckpointPair>> {
+) -> Result<Arc<AdmittedArtifactCheckpointPair<CompiledAdamWCheckpoint>>> {
     decode_admitted_artifact_checkpoint_pair(artifact, checkpoint).map(Arc::new)
+}
+
+fn decode_admitted_momentum_artifact_checkpoint_pair(
+    artifact: &CompiledMomentumSgdProgramArtifact,
+    checkpoint: &CompiledModuleMomentumSgdCheckpoint,
+) -> Result<AdmittedArtifactCheckpointPair<CompiledMomentumSgdCheckpoint>> {
+    #[cfg(test)]
+    update_decode_counts(|counts| counts.pair_admissions += 1);
+    let admitted = admitted_artifact(artifact)?;
+    if artifact.info().optimizer() != CompiledTrainingOptimizer::MomentumSgd {
+        return Err(training(
+            "compiled program artifact optimizer differs from checkpoint",
+        ));
+    }
+    let wire = &admitted.wire;
+    let decoded = checkpoint.decoded_arc().clone();
+    if checkpoint_module_wire(decoded.as_ref(), decoded.optimizer.parameters())? != wire.module {
+        return Err(training("compiled program artifact module schema mismatch"));
+    }
+    if decoded.evaluation_capture_identity.is_some()
+        || decoded.optimizer.capture_identity() != artifact.info().capture_identity()
+    {
+        return Err(training(
+            "compiled program artifact checkpoint policy mismatch",
+        ));
+    }
+    Ok(AdmittedArtifactCheckpointPair {
+        artifact: admitted,
+        checkpoint: decoded,
+    })
+}
+
+pub(super) fn admit_momentum_artifact_checkpoint_pair(
+    artifact: &CompiledMomentumSgdProgramArtifact,
+    checkpoint: &CompiledModuleMomentumSgdCheckpoint,
+) -> Result<Arc<AdmittedArtifactCheckpointPair<CompiledMomentumSgdCheckpoint>>> {
+    decode_admitted_momentum_artifact_checkpoint_pair(artifact, checkpoint).map(Arc::new)
 }
 
 fn restore_owner<M: Module>(
@@ -1227,41 +1280,30 @@ fn restore_momentum_owner<M: Module>(
     artifact: &CompiledMomentumSgdProgramArtifact,
     checkpoint: &CompiledModuleMomentumSgdCheckpoint,
 ) -> Result<(CompiledMomentumSgdPlan, CompiledModuleSeal)> {
-    let admitted = admitted_artifact(artifact)?;
-    if artifact.info().optimizer() != CompiledTrainingOptimizer::MomentumSgd {
-        return Err(training(
-            "compiled program artifact optimizer differs from checkpoint",
-        ));
-    }
-    let wire = &admitted.wire;
-    let decoded = checkpoint.decoded_arc();
-    if checkpoint_module_wire(decoded, checkpoint.optimizer_checkpoint().parameters())?
-        != wire.module
-    {
-        return Err(training("compiled program artifact module schema mismatch"));
-    }
-    if decoded.evaluation_capture_identity.is_some()
-        || checkpoint.optimizer_checkpoint().capture_identity()
-            != artifact.info().capture_identity()
-    {
-        return Err(training(
-            "compiled program artifact checkpoint policy mismatch",
-        ));
-    }
+    let admitted = decode_admitted_momentum_artifact_checkpoint_pair(artifact, checkpoint)?;
+    restore_momentum_owner_from_admitted(module, &admitted)
+}
+
+fn restore_momentum_owner_from_admitted<M: Module>(
+    module: &M,
+    admitted: &AdmittedArtifactCheckpointPair<CompiledMomentumSgdCheckpoint>,
+) -> Result<(CompiledMomentumSgdPlan, CompiledModuleSeal)> {
+    let wire = &admitted.artifact.wire;
+    let decoded = admitted.checkpoint.as_ref();
     let mut seal = CompiledModuleSeal::capture(module, &BTreeSet::new())?;
     let _immutable_values =
-        seal.apply_module_checkpoint(decoded, checkpoint.optimizer_checkpoint().parameters())?;
+        seal.apply_module_checkpoint(decoded, decoded.optimizer.parameters())?;
     if module_wire(&seal) != wire.module {
         return Err(training(
             "compiled program artifact destination module mismatch",
         ));
     }
-    let topology = admitted.training_topology()?;
+    let topology = admitted.artifact.training_topology()?;
     let plan = match topology.as_ref() {
         AdmittedTrainingTopology::MomentumSgd(plan) => plan
             .as_ref()
             .clone()
-            .restore_checkpoint_owned(checkpoint.optimizer_checkpoint())?,
+            .restore_checkpoint_owned(&decoded.optimizer)?,
         AdmittedTrainingTopology::AdamW(_) => {
             return Err(training(
                 "compiled program artifact optimizer differs from checkpoint",
@@ -1274,7 +1316,7 @@ fn restore_momentum_owner<M: Module>(
 
 fn restore_owner_from_admitted<M: Module>(
     module: &M,
-    admitted: &AdmittedArtifactCheckpointPair,
+    admitted: &AdmittedArtifactCheckpointPair<CompiledAdamWCheckpoint>,
 ) -> Result<(CompiledAdamWPlan, CompiledModuleSeal)> {
     let wire = &admitted.artifact.wire;
     let decoded_module = admitted.checkpoint.as_ref();

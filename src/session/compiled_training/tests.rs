@@ -9552,15 +9552,26 @@ fn momentum_program_artifact_restores_without_rebuilding_the_training_graph() {
         .step(first_inputs, TensorData::scalar(0.01))
         .unwrap();
     let checkpoint = uninterrupted.module_checkpoint().unwrap();
+    let bundle =
+        CompiledMomentumSgdResumeBundle::new(artifact.clone(), checkpoint.clone()).unwrap();
+    let decoded_bundle =
+        CompiledMomentumSgdResumeBundle::from_bytes(bundle.as_bytes().to_vec()).unwrap();
+    assert_eq!(decoded_bundle, bundle);
+    assert_eq!(decoded_bundle.program_artifact(), &artifact);
+    assert_eq!(decoded_bundle.checkpoint(), &checkpoint);
+    assert!(CompiledAdamWResumeBundle::from_bytes(bundle.as_bytes().to_vec()).is_err());
+    let bundle_path = TemporaryCheckpointPath::new("compiled-momentum-sgd-resume-bundle");
+    bundle.save_file(bundle_path.path()).unwrap();
+    assert_eq!(
+        CompiledMomentumSgdResumeBundle::load_file(bundle_path.path()).unwrap(),
+        bundle
+    );
 
     let destination = TiedFrozenModule::new([9.0, -7.0]);
     let destination_identity = destination.shared.id();
-    let restored = CompiledModuleMomentumSgdPlan::restore_from_program_artifact(
-        destination,
-        &artifact,
-        &checkpoint,
-    )
-    .unwrap();
+    let restored =
+        CompiledModuleMomentumSgdPlan::restore_from_resume_bundle(destination, &decoded_bundle)
+            .unwrap();
     assert_eq!(
         restored.capture_identity(),
         artifact.info().capture_identity()

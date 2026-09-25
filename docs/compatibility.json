@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:d97b436def4e6ba9",
+  "source_fingerprint": "fnv1a64:fdc72d399d36e858",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -468,7 +468,7 @@
       "subject": "Compiled checkpoint local-file persistence",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "Program artifacts, AdamW checkpoints, complete-module checkpoints, and validated resume bundles use bounded, checksummed local files with failure-before-publication behavior. Writes use unique same-directory staging and atomic replacement; parent-directory crash durability is not claimed. See [Persistence and module ownership](ARCHITECTURE.md#persistence-and-module-ownership) for format, admission, cleanup, and ownership details."
+        "Acceptance requirement": "Program artifacts, optimizer checkpoints, complete-module checkpoints, and optimizer-typed AdamW/momentum-SGD resume bundles use bounded, checksummed local files with failure-before-publication behavior. Bundle admission authenticates optimizer, module topology, capture identity, and recurrent frontier before restore. Writes use unique same-directory staging and atomic replacement; parent-directory crash durability is not claimed. See [Persistence and module ownership](ARCHITECTURE.md#persistence-and-module-ownership) for format, admission, cleanup, and ownership details."
       }
     },
     {
