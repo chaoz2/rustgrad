@@ -674,6 +674,16 @@ impl CompiledTrainingStep for NativeCpuCompiledTrainingStepResult {
     }
 }
 
+impl NativeCpuCompiledTrainingStep for NativeCpuCompiledTrainingStepResult {
+    fn native_report(&self) -> &NativeCpuRunReport {
+        NativeCpuCompiledTrainingStepResult::report(self)
+    }
+
+    fn did_update(&self) -> bool {
+        true
+    }
+}
+
 /// Strict-native CPU momentum-SGD step result.
 pub type NativeCpuCompiledMomentumSgdStepResult = NativeCpuCompiledTrainingStepResult;
 
@@ -731,6 +741,16 @@ impl NativeCpuCompiledAdamWStepResult {
 
     pub fn report(&self) -> &NativeCpuRunReport {
         &self.report
+    }
+}
+
+impl NativeCpuCompiledTrainingStep for NativeCpuCompiledAdamWStepResult {
+    fn native_report(&self) -> &NativeCpuRunReport {
+        NativeCpuCompiledAdamWStepResult::report(self)
+    }
+
+    fn did_update(&self) -> bool {
+        NativeCpuCompiledAdamWStepResult::did_update(self)
     }
 }
 

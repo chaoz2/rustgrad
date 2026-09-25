@@ -4,7 +4,7 @@
 //! their overlap, translation-unit, and critical-tail relationships. They do
 //! not execute compiler processes or participate in executable identities.
 
-use super::super::NativeCpuCompiledAdamWPreparationReport;
+use super::super::NativeCpuCompiledTrainingPreparationReport;
 use super::super::compiled_training::{
     NativeCpuCompilerProcessTiming, NativeCpuModuleOverlap, NativeCpuProgramPairOverlap,
     NativeCpuTranslationUnitEvidence,
@@ -582,7 +582,7 @@ pub(super) struct CompilerProcessValidationContext {
 }
 
 pub(super) fn compiler_process_evidence(
-    preparation: &NativeCpuCompiledAdamWPreparationReport,
+    preparation: &NativeCpuCompiledTrainingPreparationReport,
     programs: &[&NativeTrainingProgramReport],
     prepare_wall_time: Duration,
 ) -> Result<(

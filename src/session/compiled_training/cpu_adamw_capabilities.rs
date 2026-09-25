@@ -410,6 +410,16 @@ impl_cpu_adamw_capabilities!(
     flush = NativeCpuCompiledAdamWFlushResult
 );
 
+impl NativeCpuCompiledTrainingRuntime for NativeCpuCompiledAdamW<'_> {
+    fn native_preparation_report(&self) -> &NativeCpuCompiledTrainingPreparationReport {
+        self.preparation_report()
+    }
+
+    fn non_finite_policy(&self) -> CpuNonFinitePolicy {
+        NativeCpuCompiledAdamW::non_finite_policy(self)
+    }
+}
+
 impl<'a> SessionTarget<&'a CompiledAdamWPlan> for CpuSessionTarget {
     type Session = CpuCompiledAdamW;
     type Error = Error;

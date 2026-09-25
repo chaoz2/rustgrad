@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:2e18c1b1a143ceef",
+  "source_fingerprint": "fnv1a64:2ebc20ccb16dae4d",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -450,7 +450,7 @@
       "subject": "Strict-native CPU compiled training replay",
       "status": "partial",
       "fields": {
-        "Acceptance requirement": "`NativeCpuSessionTarget` prepares momentum-SGD's main program and every attached AdamW program with fallback disabled before mutable state is returned. Both optimizers reuse the same recurrent transaction, typed preparation/run evidence, non-finite admission, checkpoint frontier, owned-module lifecycle, and output-suppression contract. Authenticated render capsules fail closed without changing module identities or publication. `NativeTrainingScoreboard` remains the AdamW workload scoreboard; momentum-SGD exposes the shared program/run reports directly. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership and backend boundaries."
+        "Acceptance requirement": "`NativeCpuSessionTarget` prepares momentum-SGD's main program and every attached AdamW program with fallback disabled before mutable state is returned. Both optimizers reuse the same recurrent transaction, typed preparation/run evidence, non-finite admission, checkpoint frontier, owned-module lifecycle, output suppression, logical inspection, and `NativeTrainingScoreboard`. Optimizer-neutral runtime, step, and checkpoint-evidence traits feed that scoreboard; AdamW keeps source-compatible inspection aliases and its accumulation-specific reports. Authenticated render capsules fail closed without changing module identities or publication. See [Compiled recurrent training](ARCHITECTURE.md#compiled-recurrent-training) for ownership and backend boundaries."
       }
     },
     {

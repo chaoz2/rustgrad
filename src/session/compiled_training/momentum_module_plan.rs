@@ -135,6 +135,18 @@ impl<M: Module> CompiledModuleTrainingPlan<M, CompiledMomentumSgdPlan> {
         self.plan.capture_identity()
     }
 
+    /// Returns immutable logical work and recurrent-state facts without
+    /// exposing the sealed module or preparing a backend.
+    pub fn inspection(&self) -> Result<CompiledTrainingInspection> {
+        self.plan.inspection()
+    }
+
+    /// Returns construction-phase evidence for a freshly compiled plan.
+    /// Artifact-restored plans carry no synthetic compilation observation.
+    pub fn compile_phases(&self) -> Option<&CompiledTrainingCompileObservation> {
+        self.plan.compile_phases()
+    }
+
     pub fn step_count(&self) -> u64 {
         self.plan.step_count()
     }

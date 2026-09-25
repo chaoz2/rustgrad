@@ -252,3 +252,13 @@ impl CompiledCheckpointRestoreRuntime for NativeCpuCompiledMomentumSgd<'_> {
         NativeCpuCompiledMomentumSgd::restore_checkpoint_in_place(self, checkpoint)
     }
 }
+
+impl NativeCpuCompiledTrainingRuntime for NativeCpuCompiledMomentumSgd<'_> {
+    fn native_preparation_report(&self) -> &NativeCpuCompiledTrainingPreparationReport {
+        self.preparation_report()
+    }
+
+    fn non_finite_policy(&self) -> CpuNonFinitePolicy {
+        NativeCpuCompiledMomentumSgd::non_finite_policy(self)
+    }
+}
