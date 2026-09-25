@@ -16,6 +16,7 @@ mod module_adamw_checkpoint;
 mod module_plan;
 mod module_session;
 mod module_state;
+mod momentum_module_plan;
 mod momentum_plan;
 mod native_cpu_evidence;
 mod native_cpu_preparation;
@@ -68,6 +69,10 @@ pub use self::module_adamw_checkpoint::CompiledModuleAdamWCheckpoint;
 use self::module_adamw_checkpoint::encode_module_adamw_checkpoint;
 pub use self::module_state::TrainingParameterInit;
 use self::module_state::{CompiledModuleSeal, ModuleParameterPlan};
+pub use self::momentum_module_plan::{
+    CompiledModuleMomentumSgdPlan, CompiledModuleMomentumSgdPrepareError,
+    CompiledModuleMomentumSgdRestoreError,
+};
 pub use self::momentum_plan::CompiledMomentumSgdPlan;
 use self::native_cpu_evidence::native_preparation_wall_time;
 pub use self::native_cpu_evidence::*;

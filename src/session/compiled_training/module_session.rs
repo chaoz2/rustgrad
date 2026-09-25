@@ -17,27 +17,18 @@ impl<M, R> CompiledModuleTrainingSession<M, R> {
 }
 
 impl<M: Module> CompiledModuleTrainingSession<M, CpuCompiledMomentumSgd> {
-    fn compile_owned_momentum<F>(
-        module: M,
-        build: F,
-    ) -> std::result::Result<Self, CompiledModuleMomentumSgdCompileError<M>>
-    where
-        F: FnOnce(&M) -> Result<CpuCompiledMomentumSgd>,
-    {
-        let result: Result<(CpuCompiledMomentumSgd, CompiledModuleSeal)> = (|| {
-            let seal = CompiledModuleSeal::capture(&module, &BTreeSet::new())?;
-            let runtime = build(&module)?;
-            seal.validate_unchanged(&module)?;
-            Ok((runtime, seal))
-        })();
-        match result {
-            Ok((runtime, seal)) => Ok(Self {
-                module,
-                runtime,
-                seal,
-                evaluation_capture_identity: None,
-            }),
-            Err(source) => Err(CompiledModuleMomentumSgdCompileError { module, source }),
+    fn prepare_momentum_plan(
+        plan: CompiledModuleMomentumSgdPlan<M>,
+    ) -> std::result::Result<Self, CompiledModuleMomentumSgdCompileError<M>> {
+        match CpuSessionTarget.prepare(plan) {
+            Ok(session) => Ok(session),
+            Err(error) => {
+                let (plan, source) = error.into_parts();
+                Err(CompiledModuleMomentumSgdCompileError {
+                    module: plan.into_module(),
+                    source,
+                })
+            }
         }
     }
 
@@ -55,9 +46,8 @@ impl<M: Module> CompiledModuleTrainingSession<M, CpuCompiledMomentumSgd> {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        Self::compile_owned_momentum(module, |module| {
-            CpuCompiledMomentumSgd::compile_module(config, module, build)
-        })
+        let plan = CompiledModuleMomentumSgdPlan::compile(config, module, build)?;
+        Self::prepare_momentum_plan(plan)
     }
 
     /// Compiles against a fresh module identity and restores an authenticated
@@ -75,11 +65,10 @@ impl<M: Module> CompiledModuleTrainingSession<M, CpuCompiledMomentumSgd> {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        Self::compile_owned_momentum(module, |module| {
-            CpuCompiledMomentumSgd::compile_module_from_checkpoint(
-                config, module, checkpoint, build,
-            )
-        })
+        let plan = CompiledModuleMomentumSgdPlan::compile_from_checkpoint(
+            config, module, checkpoint, build,
+        )?;
+        Self::prepare_momentum_plan(plan)
     }
 }
 
