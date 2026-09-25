@@ -3,6 +3,7 @@
 mod adamw_checkpoint;
 mod adamw_contract;
 mod adamw_plan;
+mod adamw_plan_restore;
 mod capture;
 mod cpu_adamw_runtime;
 mod cpu_training_program;
@@ -43,7 +44,7 @@ pub use self::adamw_checkpoint::{CompiledAdamWCheckpoint, CompiledAdamWCheckpoin
 use self::adamw_contract::{CompiledAdamWContract, MetalAdamWContract};
 pub use self::adamw_plan::CompiledAdamWPlan;
 #[cfg(test)]
-use self::adamw_plan::adamw_checkpoint_restore_counts;
+use self::adamw_plan_restore::adamw_checkpoint_restore_counts;
 use self::capture::{CompiledEvaluationCapture, CompiledRecurrentCapture};
 #[cfg(test)]
 use self::capture::{
