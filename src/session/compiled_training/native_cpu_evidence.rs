@@ -825,9 +825,13 @@ impl NativeCpuRenderCapsuleDiagnostic {
     }
 }
 
-/// Complete preparation evidence for a native CPU AdamW session.
+/// Complete preparation evidence for one strict-native CPU training session.
+///
+/// Optimizers with only a main program leave the optional program reports
+/// absent. AdamW additionally uses the accumulation, flush, reset, and
+/// evaluation slots without changing this optimizer-neutral evidence shape.
 #[derive(Clone, Debug)]
-pub struct NativeCpuCompiledAdamWPreparationReport {
+pub struct NativeCpuCompiledTrainingPreparationReport {
     pub(super) main: NativeCpuProgramPreparationReport,
     pub(super) accumulation: Option<NativeCpuProgramPreparationReport>,
     pub(super) partial_flush: Option<NativeCpuProgramPreparationReport>,
@@ -851,7 +855,66 @@ pub struct NativeCpuCompiledAdamWPreparationReport {
     pub(super) render_capsule_diagnostics: Vec<NativeCpuRenderCapsuleDiagnostic>,
 }
 
-impl NativeCpuCompiledAdamWPreparationReport {
+impl NativeCpuCompiledTrainingPreparationReport {
+    pub(super) fn from_compilation(
+        roles: &[NativeCpuTrainingProgramRole],
+        reports: NativeCpuTrainingPrograms<NativeCpuProgramPreparationReport>,
+        recurrent_state: (usize, usize),
+        compilation: crate::backend::NativeScheduleCompilationBatch,
+    ) -> Result<Self> {
+        let NativeCpuTrainingPrograms {
+            main,
+            accumulation,
+            partial_flush,
+            zero_grad,
+            evaluation,
+        } = reports;
+        let (recurrent_state_count, recurrent_state_bytes) = recurrent_state;
+        let render_capsule_diagnostics = NativeCpuRenderCapsuleDiagnostic::from_ordered_native(
+            roles,
+            compilation.render_capsule_diagnostics,
+        )?;
+        Ok(Self {
+            main,
+            accumulation,
+            partial_flush,
+            zero_grad,
+            evaluation,
+            recurrent_state_count,
+            recurrent_state_bytes,
+            render_capsule_hit_count: compilation.render_capsule_hit_count,
+            render_capsule_miss_count: compilation.render_capsule_miss_count,
+            local_render_job_count: compilation.local_render_job_count,
+            parallel_render_overlap_wall_time: compilation.parallel_render_overlap_wall_time,
+            max_parallel_render_job_count: compilation.max_parallel_render_job_count,
+            parallel_module_overlap_wall_time: compilation.parallel_work_overlap_wall_time,
+            compiler_process_overlap_wall_time: compilation.compiler_process_overlap_wall_time,
+            compiler_process_count: compilation.compiler_process_count,
+            max_parallel_compiler_process_count: compilation.max_parallel_compiler_process_count,
+            compiler_process_timings: compilation
+                .compiler_process_timings
+                .into_iter()
+                .map(NativeCpuCompilerProcessTiming::from_native)
+                .collect(),
+            module_overlaps: compilation
+                .module_overlaps
+                .into_iter()
+                .map(NativeCpuModuleOverlap::from_native)
+                .collect(),
+            program_pair_overlaps: compilation
+                .program_pair_overlaps
+                .into_iter()
+                .map(NativeCpuProgramPairOverlap::from_native)
+                .collect(),
+            translation_units: compilation
+                .translation_units
+                .into_iter()
+                .map(NativeCpuTranslationUnitEvidence::from_native)
+                .collect(),
+            render_capsule_diagnostics,
+        })
+    }
+
     pub const fn main(&self) -> &NativeCpuProgramPreparationReport {
         &self.main
     }
@@ -952,6 +1015,12 @@ impl NativeCpuCompiledAdamWPreparationReport {
         &self.translation_units
     }
 }
+
+/// Source-compatible name for AdamW preparation evidence.
+pub type NativeCpuCompiledAdamWPreparationReport = NativeCpuCompiledTrainingPreparationReport;
+
+/// Preparation evidence for strict-native CPU momentum-SGD.
+pub type NativeCpuCompiledMomentumSgdPreparationReport = NativeCpuCompiledTrainingPreparationReport;
 
 /// Logical host traffic completed by one successful strict-native CPU replay.
 ///

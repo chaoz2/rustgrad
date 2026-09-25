@@ -966,11 +966,13 @@ counter in that recurrent frontier.
 | `zero_grad` | Optional accumulator reset. |
 | Evaluation | Optional read-only objective over the current parameter frontier. |
 
-`NativeCpuSessionTarget` is a separate strict-native AdamW preparation target,
-not an interpreter-session mode. It prepares the main replay and every attached
-sibling through `CapturedReplayExecutor` before returning mutable state. Replay
-then uses the existing mixed staging and one `EffectRuntime` commit with
-interpreter fallback disabled.
+`NativeCpuSessionTarget` is a separate strict-native training target, not an
+interpreter-session mode. Momentum-SGD prepares its main program; AdamW prepares
+the main program plus every attached sibling. Both finish native compilation
+before returning mutable state, then reuse the same mixed staging and one
+`EffectRuntime` commit with interpreter fallback disabled. The shared
+preparation/run reports retain optimizer-specific policy outside this replay
+core.
 
 ##### State ownership and atomicity
 

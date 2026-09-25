@@ -114,7 +114,7 @@ not block CPU training.
 
 | Boundary | Responsibility |
 | --- | --- |
-| Replay | `CompiledTrainingRuntime` and `CompiledTrainingStep` provide one seam across CPU momentum-SGD, CPU AdamW, and Metal AdamW without an optimizer or backend enum. AdamW extension traits retain accumulation, clipping, loss-scaling, moment, and optimizer-step inspection. |
+| Replay | `CompiledTrainingRuntime` and `CompiledTrainingStep` provide one seam across interpreter/native CPU momentum-SGD, interpreter/native CPU AdamW, and Metal AdamW without an optimizer or backend enum. AdamW extension traits retain accumulation, clipping, loss-scaling, moment, and optimizer-step inspection. |
 | Batch policy | `CompiledInputBatch` shares one fixed schema and conversion among `with_input_batch`, `step_batch`, and `evaluate_batch`, avoiding repeated string maps and rank-zero learning-rate tensors without exposing recurrent state or changing the exact-map replay ABI. |
 | Persistence | `CompiledCheckpointRuntime` isolates portable persistence. Optimizer-typed `CompiledTrainingResumeBundle<C>` aliases atomically pair AdamW or momentum-SGD executables with complete-module checkpoints. `SessionTarget<P>` keeps preparation polymorphic while preserving each concrete session, error, and ownership mode. |
 | Module publication | The CPU reference proves exact uninterrupted-versus-restored checkpoint and module state. A frozen tied embedding/output stays outside optimizer and checkpoint state and remains byte-, version-, and flag-identical through finish while another parameter changes. |

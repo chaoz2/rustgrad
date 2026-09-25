@@ -25,6 +25,7 @@ mod momentum_module_plan;
 mod momentum_plan;
 mod native_cpu_adamw_runtime;
 mod native_cpu_evidence;
+mod native_cpu_momentum_runtime;
 mod native_cpu_preparation;
 mod native_cpu_programs;
 mod objective;
@@ -98,6 +99,7 @@ use self::native_cpu_adamw_runtime::{
 };
 use self::native_cpu_evidence::native_preparation_wall_time;
 pub use self::native_cpu_evidence::*;
+pub use self::native_cpu_momentum_runtime::NativeCpuCompiledMomentumSgd;
 use self::native_cpu_programs::*;
 pub use self::objective::{
     CompiledAdamWGraph, CompiledAdamWIgnoreIndexContext, CompiledAdamWObjective,

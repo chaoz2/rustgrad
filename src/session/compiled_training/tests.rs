@@ -4789,6 +4789,134 @@ fn momentum_plan_prepares_independent_cpu_runtimes() {
 }
 
 #[test]
+fn momentum_plan_prepares_strict_native_replay_with_exact_checkpoint_state() {
+    let plan =
+        CompiledMomentumSgdPlan::compile(config(), initial_parameters(), build_tinybob).unwrap();
+    let identity = plan.capture_identity();
+    let mut interpreted = plan.prepare_cpu().unwrap();
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let mut native = plan.prepare(&target).unwrap();
+
+    let preparation = native.preparation_report();
+    assert_eq!(preparation.main().capture_identity(), identity);
+    assert!(preparation.main().is_vectorized());
+    assert!(preparation.accumulation().is_none());
+    assert!(preparation.partial_flush().is_none());
+    assert!(preparation.zero_grad().is_none());
+    assert!(preparation.evaluation().is_none());
+    assert_eq!(preparation.recurrent_state_count(), 4);
+
+    let initial = native.checkpoint().unwrap();
+    assert!(native.step_inner(batch(), lr(), Some(0)).is_err());
+    assert_eq!(native.checkpoint().unwrap(), initial);
+
+    let expected = interpreted.step(batch(), lr()).unwrap();
+    let actual = native.step(batch(), lr()).unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(actual.step(), expected.step());
+    assert_eq!(actual.capture_identity(), expected.capture_identity());
+    assert_eq!(actual.report().successful_invocation(), 1);
+    assert_eq!(actual.report().fallback_count(), 0);
+    assert_eq!(
+        native.checkpoint().unwrap(),
+        interpreted.checkpoint().unwrap()
+    );
+
+    let expected = interpreted.commit_step(batch(), lr()).unwrap();
+    let actual = native.commit_step(batch(), lr()).unwrap();
+    assert!(expected.outputs().is_empty());
+    assert!(actual.outputs().is_empty());
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.report().successful_invocation(), 2);
+    assert_eq!(actual.report().fallback_count(), 0);
+    assert_eq!(
+        native.checkpoint().unwrap(),
+        interpreted.checkpoint().unwrap()
+    );
+
+    let checkpoint = plan.prepare_cpu().unwrap().checkpoint().unwrap();
+    native.restore_checkpoint_in_place(&checkpoint).unwrap();
+    assert_eq!(native.checkpoint().unwrap(), checkpoint);
+    assert_eq!(
+        native.preparation_report().main().capture_identity(),
+        identity
+    );
+}
+
+#[test]
+fn momentum_cpu_targets_preserve_non_finite_policy_across_retry_and_restore() {
+    let config = CompiledMomentumSgdConfig::new(0.9)
+        .unwrap()
+        .with_input("x", Shape::from([]), DType::F32)
+        .unwrap();
+    let plan = CompiledMomentumSgdPlan::compile(
+        config,
+        [TrainingParameterInit::new("weight", TensorData::scalar(1.0)).unwrap()],
+        |graph, inputs, parameters| {
+            Ok((
+                graph.mul(inputs["x"], parameters["weight"])?,
+                BTreeMap::new(),
+            ))
+        },
+    )
+    .unwrap();
+    let invalid = || BTreeMap::from([("x".into(), TensorData::scalar(f32::NAN))]);
+    let valid = || BTreeMap::from([("x".into(), TensorData::scalar(2.0))]);
+    let rejecting =
+        CpuSessionTarget::new().with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut interpreted = plan.prepare(&rejecting).unwrap();
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor)
+        .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
+    let mut native = plan.prepare(&target).unwrap();
+    assert_eq!(
+        interpreted.non_finite_policy(),
+        CpuNonFinitePolicy::RejectTransition
+    );
+    assert_eq!(
+        native.non_finite_policy(),
+        CpuNonFinitePolicy::RejectTransition
+    );
+    let initial = interpreted.checkpoint().unwrap();
+    assert!(interpreted.step(invalid(), lr()).is_err());
+    assert!(native.step(invalid(), lr()).is_err());
+    assert_eq!(interpreted.checkpoint().unwrap(), initial);
+    assert_eq!(native.checkpoint().unwrap(), initial);
+
+    let expected = interpreted.step(valid(), lr()).unwrap();
+    let actual = native.step(valid(), lr()).unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.report().successful_invocation(), 1);
+    assert_eq!(actual.report().fallback_count(), 0);
+    assert_eq!(
+        native.checkpoint().unwrap(),
+        interpreted.checkpoint().unwrap()
+    );
+
+    interpreted.restore_checkpoint_in_place(&initial).unwrap();
+    native.restore_checkpoint_in_place(&initial).unwrap();
+    assert_eq!(
+        interpreted.non_finite_policy(),
+        CpuNonFinitePolicy::RejectTransition
+    );
+    assert_eq!(
+        native.non_finite_policy(),
+        CpuNonFinitePolicy::RejectTransition
+    );
+    assert!(interpreted.step(invalid(), lr()).is_err());
+    assert!(native.step(invalid(), lr()).is_err());
+
+    let mut propagating = plan.prepare_cpu().unwrap();
+    assert_eq!(
+        propagating.non_finite_policy(),
+        CpuNonFinitePolicy::Propagate
+    );
+    assert!(propagating.step(invalid(), lr()).is_ok());
+}
+
+#[test]
 fn momentum_plan_restores_checkpoint_without_recompiling_or_mutating_source() {
     let plan =
         CompiledMomentumSgdPlan::compile(config(), initial_parameters(), build_tinybob).unwrap();

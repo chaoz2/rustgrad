@@ -613,6 +613,70 @@ impl CompiledAdamWStep for CompiledAdamWStepResult {
     }
 }
 
+/// One committed strict-native CPU training step and its replay evidence.
+///
+/// This result is intentionally optimizer-neutral. Optimizers with additional
+/// progress or policy reports expose a more specific result type.
+pub struct NativeCpuCompiledTrainingStepResult {
+    pub(super) inner: CompiledTrainingStepResult,
+    pub(super) report: NativeCpuRunReport,
+}
+
+impl NativeCpuCompiledTrainingStepResult {
+    pub fn loss(&self) -> &TensorData {
+        self.inner.loss()
+    }
+
+    pub fn loss_aggregation_weight(&self) -> u64 {
+        self.inner.loss_aggregation_weight()
+    }
+
+    pub fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        self.inner.outputs()
+    }
+
+    pub fn output(&self, name: &str) -> Option<&TensorData> {
+        self.inner.output(name)
+    }
+
+    pub fn step(&self) -> u64 {
+        self.inner.step()
+    }
+
+    pub fn capture_identity(&self) -> u64 {
+        self.inner.capture_identity()
+    }
+
+    pub fn report(&self) -> &NativeCpuRunReport {
+        &self.report
+    }
+}
+
+impl CompiledTrainingStep for NativeCpuCompiledTrainingStepResult {
+    fn loss(&self) -> &TensorData {
+        NativeCpuCompiledTrainingStepResult::loss(self)
+    }
+
+    fn loss_aggregation_weight(&self) -> u64 {
+        NativeCpuCompiledTrainingStepResult::loss_aggregation_weight(self)
+    }
+
+    fn outputs(&self) -> &BTreeMap<String, TensorData> {
+        NativeCpuCompiledTrainingStepResult::outputs(self)
+    }
+
+    fn step(&self) -> u64 {
+        NativeCpuCompiledTrainingStepResult::step(self)
+    }
+
+    fn capture_identity(&self) -> u64 {
+        NativeCpuCompiledTrainingStepResult::capture_identity(self)
+    }
+}
+
+/// Strict-native CPU momentum-SGD step result.
+pub type NativeCpuCompiledMomentumSgdStepResult = NativeCpuCompiledTrainingStepResult;
+
 /// One committed strict-native CPU AdamW step and its replay evidence.
 pub struct NativeCpuCompiledAdamWStepResult {
     pub(super) inner: CompiledAdamWStepResult,
