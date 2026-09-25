@@ -32,7 +32,7 @@ impl ProgramWire {
         &self,
         identity: u64,
         captures: &ProgramCaptures,
-    ) -> Result<CompiledAdamWProgramArtifactInfo> {
+    ) -> Result<CompiledTrainingProgramArtifactInfo> {
         let capture_identity = captures
             .main
             .initial_recurrent_cursor()
@@ -58,8 +58,9 @@ impl ProgramWire {
                     .ok_or_else(|| training("compiled evaluation artifact identity mismatch"))
             })
             .transpose()?;
-        Ok(CompiledAdamWProgramArtifactInfo {
+        Ok(CompiledTrainingProgramArtifactInfo {
             format_version: self.format_version,
+            optimizer: self.optimizer(),
             identity,
             capture_identity,
             accumulation_capture_identity: captures
@@ -83,21 +84,33 @@ impl ProgramWire {
 
     fn validate_format_inventory(&self) -> Result<()> {
         if self.format_version == LEGACY_FORMAT_VERSION {
-            if self.metal.is_some() {
-                return Err(training(
-                    "compiled v1 program artifact cannot contain a Metal recipe",
-                ));
+            if self.metal.is_some() || !matches!(&self.optimizer, OptimizerPolicyWire::AdamW { .. })
+            {
+                return Err(training("compiled v1 program artifact inventory differs"));
             }
-        } else if self.format_version == FORMAT_VERSION {
+        } else if self.format_version == METAL_FORMAT_VERSION {
             let metal = self
                 .metal
                 .as_ref()
                 .ok_or_else(|| training("compiled v2 program artifact Metal recipe is absent"))?;
-            if metal.partial_flush.is_some() != self.partial_flush.is_some()
+            if !matches!(&self.optimizer, OptimizerPolicyWire::AdamW { .. })
+                || metal.partial_flush.is_some() != self.partial_flush.is_some()
                 || metal.evaluation.is_some() != self.evaluation.is_some()
             {
                 return Err(training(
                     "compiled program artifact Metal recipe inventory differs",
+                ));
+            }
+        } else if self.format_version == OPTIMIZER_FORMAT_VERSION {
+            if !matches!(&self.optimizer, OptimizerPolicyWire::MomentumSgd { .. })
+                || self.metal.is_some()
+                || self.accumulation.is_some()
+                || self.partial_flush.is_some()
+                || self.zero_grad.is_some()
+                || self.evaluation.is_some()
+            {
+                return Err(training(
+                    "compiled v3 momentum-SGD artifact inventory differs",
                 ));
             }
         } else {
@@ -107,7 +120,7 @@ impl ProgramWire {
     }
 
     fn validate_metal_host_policy(&self, captures: &ProgramCaptures) -> Result<()> {
-        if self.format_version != FORMAT_VERSION {
+        if self.format_version != METAL_FORMAT_VERSION {
             return Ok(());
         }
         let expected_names = self
@@ -147,7 +160,9 @@ impl ProgramWire {
         Ok(())
     }
 
-    pub(super) fn validate(&self) -> Result<(CompiledAdamWProgramArtifactInfo, ProgramCaptures)> {
+    pub(super) fn validate(
+        &self,
+    ) -> Result<(CompiledTrainingProgramArtifactInfo, ProgramCaptures)> {
         self.validate_format_inventory()?;
         let canonical = serde_json::to_vec(self)
             .map_err(|error| training(format!("compiled program artifact validation: {error}")))?;
@@ -161,11 +176,18 @@ impl ProgramWire {
         self.validate_auxiliary_programs(&main, &captures)?;
         self.validate_evaluation(captures.main.as_ref(), captures.evaluation.as_deref())?;
         self.validate_sibling_identities(&info)?;
-        self.validate_adamw_policy()?;
+        self.validate_optimizer_policy()?;
         Ok((info, captures))
     }
 
-    fn validate_policy(&self, info: &CompiledAdamWProgramArtifactInfo) -> Result<()> {
+    fn optimizer(&self) -> CompiledTrainingOptimizer {
+        match &self.optimizer {
+            OptimizerPolicyWire::AdamW { .. } => CompiledTrainingOptimizer::AdamW,
+            OptimizerPolicyWire::MomentumSgd { .. } => CompiledTrainingOptimizer::MomentumSgd,
+        }
+    }
+
+    fn validate_policy(&self, info: &CompiledTrainingProgramArtifactInfo) -> Result<()> {
         if info.capture_identity == 0 || self.gradient_accumulation_steps == 0 {
             return Err(training("compiled program artifact policy is inconsistent"));
         }
@@ -225,11 +247,13 @@ impl ProgramWire {
             .keys()
             .map(String::as_str)
             .ne(trainable_parameters)
-            || self
-                .adamw
-                .weight_decay_exclusions
-                .iter()
-                .any(|name| !self.main.parameter_buffers.contains_key(name))
+            || match &self.optimizer {
+                OptimizerPolicyWire::AdamW { adamw } => adamw
+                    .weight_decay_exclusions
+                    .iter()
+                    .any(|name| !self.main.parameter_buffers.contains_key(name)),
+                OptimizerPolicyWire::MomentumSgd { .. } => false,
+            }
         {
             return Err(training(
                 "compiled program artifact parameter policy differs",
@@ -554,7 +578,10 @@ impl ProgramWire {
         Ok(())
     }
 
-    fn validate_sibling_identities(&self, info: &CompiledAdamWProgramArtifactInfo) -> Result<()> {
+    fn validate_sibling_identities(
+        &self,
+        info: &CompiledTrainingProgramArtifactInfo,
+    ) -> Result<()> {
         let sibling_identities = [
             info.accumulation_capture_identity,
             info.flush_capture_identity,
@@ -578,16 +605,47 @@ impl ProgramWire {
         Ok(())
     }
 
-    fn validate_adamw_policy(&self) -> Result<()> {
+    fn validate_optimizer_policy(&self) -> Result<()> {
+        if self.optimizer() == CompiledTrainingOptimizer::MomentumSgd {
+            let optimizer_states = decode_key_map(&self.main.optimizer_buffers)?;
+            let expected = self
+                .main
+                .parameter_buffers
+                .keys()
+                .map(RecurrentStateKey::momentum)
+                .collect::<BTreeSet<_>>();
+            if optimizer_states.keys().cloned().collect::<BTreeSet<_>>() != expected
+                || !self.main.workload_buffers.is_empty()
+                || self.gradient_accumulation_steps != 1
+                || self.token_weight_policy.is_some()
+                || self.allow_zero_valid_token_microbatches
+                || self.max_gradient_norm_bits.is_some()
+                || self.clip_report
+                || self.window_loss_report
+                || self.loss_scale_bits != 1.0f32.to_bits()
+                || self.dropout.is_some()
+                || !self.host_token_inputs.is_empty()
+                || !self.frozen_parameters.is_empty()
+                || !matches!(&self.learning_rate, LearningRateWire::External)
+            {
+                return Err(training(
+                    "compiled momentum-SGD artifact policy is inconsistent",
+                ));
+            }
+            return Ok(());
+        }
+        let OptimizerPolicyWire::AdamW { adamw: policy } = &self.optimizer else {
+            return Err(training("compiled program artifact AdamW policy is absent"));
+        };
         let mut adamw = CompiledAdamWConfig::new(
-            f32::from_bits(self.adamw.beta1_bits),
-            f32::from_bits(self.adamw.beta2_bits),
-            f32::from_bits(self.adamw.eps_bits),
-            f32::from_bits(self.adamw.weight_decay_bits),
+            f32::from_bits(policy.beta1_bits),
+            f32::from_bits(policy.beta2_bits),
+            f32::from_bits(policy.eps_bits),
+            f32::from_bits(policy.weight_decay_bits),
         )?;
-        adamw = adamw
-            .with_weight_decay_exclusions(self.adamw.weight_decay_exclusions.iter().cloned())?;
-        if adamw.weight_decay_exclusions != self.adamw.weight_decay_exclusions {
+        adamw =
+            adamw.with_weight_decay_exclusions(policy.weight_decay_exclusions.iter().cloned())?;
+        if adamw.weight_decay_exclusions != policy.weight_decay_exclusions {
             return Err(training("compiled program artifact AdamW policy differs"));
         }
         Ok(())

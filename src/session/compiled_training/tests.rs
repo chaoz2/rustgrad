@@ -6481,9 +6481,15 @@ fn single_step_ignore_index_artifact_restores_for_native_evaluation() {
     let artifact = owner.program_artifact().unwrap();
     assert_eq!(owner.program_artifact().unwrap(), artifact);
     assert_eq!(artifact.info().format_version(), 1);
+    assert_eq!(
+        artifact.info().optimizer(),
+        CompiledTrainingOptimizer::AdamW
+    );
     assert_eq!(artifact.as_bytes()[4], 1);
     program_artifact::rewrite_json_for_test(&artifact, |json| {
         assert!(json.get("metal").is_none());
+        assert!(json.get("adamw").is_some());
+        assert!(json.get("momentum_sgd").is_none());
     });
     let mut source = owner.prepare(&CpuSessionTarget).unwrap();
 
@@ -9513,6 +9519,76 @@ fn complete_momentum_module_checkpoint_restores_topology_and_immutable_state() {
     assert!(tensors.contains_key("optimizer_checkpoint"));
     assert_eq!(tensors["immutable.1"], source_frozen);
     assert_eq!(tensors["immutable.2"], source_buffer);
+}
+
+#[test]
+fn momentum_program_artifact_restores_without_rebuilding_the_training_graph() {
+    let config = CompiledMomentumSgdConfig::new(0.9)
+        .unwrap()
+        .with_input("x", [2], DType::F32)
+        .unwrap();
+    let source = TiedFrozenModule::new([1.0, -1.0]);
+    let owner = CompiledModuleMomentumSgdPlan::compile(config, source, build_tied_frozen).unwrap();
+    let artifact = owner.program_artifact().unwrap();
+    assert_eq!(artifact.info().format_version(), 3);
+    assert_eq!(artifact.as_bytes()[4], 3);
+    assert_eq!(
+        artifact.info().optimizer(),
+        CompiledTrainingOptimizer::MomentumSgd
+    );
+    assert_eq!(
+        CompiledTrainingProgramArtifact::from_bytes(artifact.as_bytes().to_vec()).unwrap(),
+        artifact
+    );
+    program_artifact::rewrite_json_for_test(&artifact, |json| {
+        assert!(json.get("adamw").is_none());
+        assert_eq!(json["momentum_sgd"], serde_json::json!({}));
+    });
+
+    let mut uninterrupted = owner.prepare(&CpuSessionTarget).unwrap();
+    let first_inputs =
+        BTreeMap::from([("x".into(), TensorData::new([2], vec![0.5, -0.25]).unwrap())]);
+    uninterrupted
+        .step(first_inputs, TensorData::scalar(0.01))
+        .unwrap();
+    let checkpoint = uninterrupted.module_checkpoint().unwrap();
+
+    let destination = TiedFrozenModule::new([9.0, -7.0]);
+    let destination_identity = destination.shared.id();
+    let restored = CompiledModuleMomentumSgdPlan::restore_from_program_artifact(
+        destination,
+        &artifact,
+        &checkpoint,
+    )
+    .unwrap();
+    assert_eq!(
+        restored.capture_identity(),
+        artifact.info().capture_identity()
+    );
+    assert_eq!(restored.step_count(), 1);
+    assert_eq!(restored.program_artifact().unwrap(), artifact);
+
+    let mut resumed = restored.prepare(&CpuSessionTarget).unwrap();
+    assert_eq!(resumed.module_checkpoint().unwrap(), checkpoint);
+    let next_inputs =
+        BTreeMap::from([("x".into(), TensorData::new([2], vec![-0.5, 0.375]).unwrap())]);
+    let expected = uninterrupted
+        .step(next_inputs.clone(), TensorData::scalar(0.02))
+        .unwrap();
+    let actual = resumed.step(next_inputs, TensorData::scalar(0.02)).unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(
+        resumed.module_checkpoint().unwrap(),
+        uninterrupted.module_checkpoint().unwrap()
+    );
+    let destination = resumed.finish().unwrap();
+    assert_eq!(destination.shared.id(), destination_identity);
+
+    let (corrupt_bytes, _) = program_artifact::rewrite_json_for_test(&artifact, |json| {
+        json["gradient_accumulation_steps"] = serde_json::Value::from(2);
+    });
+    assert!(CompiledTrainingProgramArtifact::from_bytes(corrupt_bytes).is_err());
 }
 
 #[test]
