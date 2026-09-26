@@ -221,6 +221,65 @@ pub(super) struct CompiledTrainingPhaseCapture {
     pub(super) recurrent_capture: CompiledRecurrentCapture,
     pub(super) state_buffers: BTreeMap<RecurrentStateKey, u64>,
     pub(super) recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
+    pub(super) capture_measurement: RecurrentCaptureStageMeasurement,
+}
+
+pub(super) struct RecurrentCaptureStageMeasurement {
+    alias_planning_wall_time: Duration,
+    preview_schedule_count: usize,
+    final_schedule_wall_time: Duration,
+    pure_capture_binding_wall_time: Duration,
+    effect_assembly_sealing_wall_time: Duration,
+    recurrent_authentication_wall_time: Duration,
+    cursor_projection_wall_time: Option<Duration>,
+    recurrent_state_count: usize,
+}
+
+impl RecurrentCaptureStageMeasurement {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        alias_planning_wall_time: Duration,
+        preview_schedule_count: usize,
+        final_schedule_wall_time: Duration,
+        pure_capture_binding_wall_time: Duration,
+        effect_assembly_sealing_wall_time: Duration,
+        recurrent_authentication_wall_time: Duration,
+        cursor_projection_wall_time: Option<Duration>,
+        recurrent_state_count: usize,
+    ) -> Self {
+        Self {
+            alias_planning_wall_time,
+            preview_schedule_count,
+            final_schedule_wall_time,
+            pure_capture_binding_wall_time,
+            effect_assembly_sealing_wall_time,
+            recurrent_authentication_wall_time,
+            cursor_projection_wall_time,
+            recurrent_state_count,
+        }
+    }
+
+    pub(super) fn with_cursor_projection(mut self, wall_time: Duration) -> Self {
+        self.cursor_projection_wall_time = Some(wall_time);
+        self
+    }
+
+    pub(super) fn finish(
+        self,
+        phase_wall_time: Duration,
+    ) -> Result<CompiledTrainingRecurrentCaptureObservation> {
+        CompiledTrainingRecurrentCaptureObservation::new(
+            phase_wall_time,
+            self.alias_planning_wall_time,
+            self.preview_schedule_count,
+            self.final_schedule_wall_time,
+            self.pure_capture_binding_wall_time,
+            self.effect_assembly_sealing_wall_time,
+            self.recurrent_authentication_wall_time,
+            self.cursor_projection_wall_time,
+            self.recurrent_state_count,
+        )
+    }
 }
 
 pub(super) struct CompiledTrainingPhaseInput<'a> {
@@ -257,8 +316,12 @@ pub(super) fn capture_training_phase(
         .iter()
         .map(|spec| updates[&spec.key])
         .collect::<Vec<_>>();
+    let mut alias_planning_wall_time = Duration::ZERO;
     let ordered_updates = if materialize_state_passthroughs {
-        materialize_compiled_state_aliases(graph, &ordered_updates)?
+        let state_alias_started = Instant::now();
+        let materialized = materialize_compiled_state_aliases(graph, &ordered_updates)?;
+        alias_planning_wall_time = state_alias_started.elapsed();
+        materialized
     } else {
         ordered_updates
     };
@@ -271,8 +334,12 @@ pub(super) fn capture_training_phase(
         .iter()
         .map(|spec| InferenceStateLink::new(state_nodes[&spec.key], updates[&spec.key]))
         .collect::<Vec<_>>();
+    let public_alias_started = Instant::now();
     let public_requested =
         materialize_compiled_recurrent_public_aliases(graph, public_requested, &state_links)?;
+    alias_planning_wall_time = alias_planning_wall_time
+        .checked_add(public_alias_started.elapsed())
+        .ok_or_else(|| training("compiled alias planning duration overflows"))?;
     let initial_state = specs
         .iter()
         .map(|spec| (spec.input_name.clone(), spec.value.clone()))
@@ -286,7 +353,9 @@ pub(super) fn capture_training_phase(
     for node in &requested {
         checked_descriptor(graph.shape(*node)?, graph.dtype(*node)?)?;
     }
+    let final_schedule_started = Instant::now();
     let pure = schedule_many(graph, &requested).map_err(schedule_error)?;
+    let final_schedule_wall_time = final_schedule_started.elapsed();
     if let Some(item) = pure.items.iter().find(|item| item.boundary.is_some()) {
         return Err(training(format!(
             "compiled pure prefix has an unsupported boundary at node {}",
@@ -300,6 +369,7 @@ pub(super) fn capture_training_phase(
         .collect::<BTreeMap<_, _>>();
     let recurrent_store_groups =
         resolve_recurrent_store_groups(recurrent_store_groups, &updates, &state_buffers)?;
+    let pure_capture_binding_started = Instant::now();
     let mut captured = CapturedSchedule::capture(graph, &pure, &requested[..public_output_count])
         .map_err(replay_error)?;
     if captured.requested.len() != public_output_count {
@@ -308,6 +378,8 @@ pub(super) fn capture_training_phase(
 
     let state_bindings = collect_state_bindings(&pure, state_by_input)?;
     let pure = bind_schedule_states(pure, state_bindings).map_err(schedule_error)?;
+    let pure_capture_binding_wall_time = pure_capture_binding_started.elapsed();
+    let effect_assembly_sealing_started = Instant::now();
     let mut effects = EffectGraph::default();
     let mut effect_bindings = Vec::with_capacity(updates.len());
     for (ordinal, spec) in specs.iter().enumerate() {
@@ -344,6 +416,8 @@ pub(super) fn capture_training_phase(
     let capture =
         CapturedMixedSchedule::from_parts(captured, &mixed, states).map_err(replay_error)?;
     validate_external_binding_ownership(&capture, external_input_names.iter())?;
+    let effect_assembly_sealing_wall_time = effect_assembly_sealing_started.elapsed();
+    let recurrent_authentication_started = Instant::now();
     let recurrent_capture = CompiledRecurrentCapture::from_canonical_mixed(
         graph,
         &capture,
@@ -351,11 +425,22 @@ pub(super) fn capture_training_phase(
         &state_links,
         initial_state,
     )?;
+    let recurrent_authentication_wall_time = recurrent_authentication_started.elapsed();
     Ok(CompiledTrainingPhaseCapture {
         capture,
         recurrent_capture,
         state_buffers,
         recurrent_store_groups,
+        capture_measurement: RecurrentCaptureStageMeasurement::new(
+            alias_planning_wall_time,
+            if materialize_state_passthroughs { 3 } else { 2 },
+            final_schedule_wall_time,
+            pure_capture_binding_wall_time,
+            effect_assembly_sealing_wall_time,
+            recurrent_authentication_wall_time,
+            None,
+            specs.len(),
+        ),
     })
 }
 
@@ -363,7 +448,7 @@ impl CompiledRecurrentPhasePlan {
     pub(super) fn compile_state_only_reset(
         training_plan: &CompiledTrainingPlan,
         state_buffers: BTreeMap<RecurrentStateKey, u64>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, RecurrentCaptureStageMeasurement)> {
         let mut graph = Graph::new();
         let mut state_by_input = BTreeMap::new();
         let mut specs = Vec::with_capacity(state_buffers.len());
@@ -396,6 +481,7 @@ impl CompiledRecurrentPhasePlan {
             .iter()
             .map(|(_, key, ..)| key.clone())
             .collect::<Vec<_>>();
+        let alias_planning_started = Instant::now();
         let materialized = materialize_compiled_state_aliases(
             &mut graph,
             &successor_keys
@@ -403,6 +489,7 @@ impl CompiledRecurrentPhasePlan {
                 .map(|key| successors[key])
                 .collect::<Vec<_>>(),
         )?;
+        let alias_planning_wall_time = alias_planning_started.elapsed();
         for (key, successor) in successor_keys.into_iter().zip(materialized) {
             successors.insert(key, successor);
         }
@@ -421,16 +508,21 @@ impl CompiledRecurrentPhasePlan {
         for node in &requested {
             checked_descriptor(graph.shape(*node)?, graph.dtype(*node)?)?;
         }
+        let final_schedule_started = Instant::now();
         let pure = schedule_many(&graph, &requested).map_err(schedule_error)?;
+        let final_schedule_wall_time = final_schedule_started.elapsed();
         if let Some(item) = pure.items.iter().find(|item| item.boundary.is_some()) {
             return Err(training(format!(
                 "compiled zero-grad has an unsupported boundary at node {}",
                 item.node.index()
             )));
         }
+        let pure_capture_binding_started = Instant::now();
         let mut captured = CapturedSchedule::capture(&graph, &pure, &[]).map_err(replay_error)?;
         let state_bindings = collect_state_bindings(&pure, &state_by_input)?;
         let pure = bind_schedule_states(pure, state_bindings).map_err(schedule_error)?;
+        let pure_capture_binding_wall_time = pure_capture_binding_started.elapsed();
+        let effect_assembly_sealing_started = Instant::now();
         let mut effects = EffectGraph::default();
         let mut effect_bindings = Vec::with_capacity(specs.len());
         for (ordinal, (_, key, value, _, buffer)) in specs.iter().enumerate() {
@@ -468,6 +560,8 @@ impl CompiledRecurrentPhasePlan {
         let capture = CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
             .map_err(replay_error)?;
         validate_external_binding_ownership(&capture, std::iter::empty::<&String>())?;
+        let effect_assembly_sealing_wall_time = effect_assembly_sealing_started.elapsed();
+        let recurrent_authentication_started = Instant::now();
         let recurrent_capture = CompiledRecurrentCapture::from_canonical_mixed(
             &graph,
             &capture,
@@ -475,22 +569,37 @@ impl CompiledRecurrentPhasePlan {
             &state_links,
             initial_state,
         )?;
+        let recurrent_authentication_wall_time = recurrent_authentication_started.elapsed();
+        let cursor_projection_started = Instant::now();
         let cursor_projection = PreparedRecurrentCursorProjection::prepare(
             &training_plan.capture,
             &capture,
             state_buffers.values().copied(),
         )
         .map_err(replay_error)?;
+        let cursor_projection_wall_time = cursor_projection_started.elapsed();
         let capture_identity = cursor_projection.target_capture_identity();
-        Ok(Self {
-            capture: Arc::new(capture),
-            recurrent_capture,
-            state_buffers,
-            cursor_projection: Arc::new(cursor_projection),
-            capture_identity,
-            admission: CompiledRecurrentPhaseAdmission::Replace {
-                store_groups: Vec::new(),
+        Ok((
+            Self {
+                capture: Arc::new(capture),
+                recurrent_capture,
+                state_buffers,
+                cursor_projection: Arc::new(cursor_projection),
+                capture_identity,
+                admission: CompiledRecurrentPhaseAdmission::Replace {
+                    store_groups: Vec::new(),
+                },
             },
-        })
+            RecurrentCaptureStageMeasurement::new(
+                alias_planning_wall_time,
+                1,
+                final_schedule_wall_time,
+                pure_capture_binding_wall_time,
+                effect_assembly_sealing_wall_time,
+                recurrent_authentication_wall_time,
+                Some(cursor_projection_wall_time),
+                specs.len(),
+            ),
+        ))
     }
 }

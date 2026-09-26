@@ -11,7 +11,10 @@ mod program_report;
 mod report;
 mod step_phases;
 
-pub use compile_phase::{NativeTrainingCompilePhase, NativeTrainingCompilePhaseReport};
+pub use compile_phase::{
+    NativeTrainingCompilePhase, NativeTrainingCompilePhaseReport,
+    NativeTrainingRecurrentCaptureReport,
+};
 #[cfg(test)]
 use compiler_evidence::NativeTrainingCompilerProcessKind;
 use compiler_evidence::{
@@ -24,7 +27,7 @@ use inspection::ProgramInspection;
 pub use inspection::{
     CompiledAdamWInspection, CompiledTrainingCompileObservation,
     CompiledTrainingCompilePhaseObservation, CompiledTrainingInspection,
-    NativeTrainingPreparationTiming,
+    CompiledTrainingRecurrentCaptureObservation, NativeTrainingPreparationTiming,
 };
 pub use program_report::NativeTrainingProgramReport;
 use report::CheckpointReport;
@@ -67,7 +70,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V19: u32 = 19;
 const NATIVE_TRAINING_REPORT_FORMAT_V20: u32 = 20;
 const NATIVE_TRAINING_REPORT_FORMAT_V21: u32 = 21;
 const NATIVE_TRAINING_REPORT_FORMAT_V22: u32 = 22;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 23;
+const NATIVE_TRAINING_REPORT_FORMAT_V23: u32 = 23;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 24;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Copy, Debug)]

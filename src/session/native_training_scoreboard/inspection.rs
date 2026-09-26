@@ -10,7 +10,8 @@ use super::{
     NATIVE_TRAINING_REPORT_FORMAT_V16, NATIVE_TRAINING_REPORT_FORMAT_V17,
     NATIVE_TRAINING_REPORT_FORMAT_V18, NATIVE_TRAINING_REPORT_FORMAT_V19,
     NATIVE_TRAINING_REPORT_FORMAT_V20, NATIVE_TRAINING_REPORT_FORMAT_V21,
-    NATIVE_TRAINING_REPORT_FORMAT_V22, NATIVE_TRAINING_REPORT_FORMAT_VERSION, invalid,
+    NATIVE_TRAINING_REPORT_FORMAT_V22, NATIVE_TRAINING_REPORT_FORMAT_V23,
+    NATIVE_TRAINING_REPORT_FORMAT_VERSION, invalid,
 };
 use crate::{BenchmarkDuration, ExecutionPlanSummary, Result};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ use std::time::Duration;
 pub(super) struct ProgramInspection {
     pub(super) capture_identity: u64,
     pub(super) execution_plan: ExecutionPlanSummary,
+    pub(super) recurrent_state_count: Option<usize>,
 }
 
 /// Exact host wall-time partition for preparing one strict-native CPU program.
@@ -106,6 +108,7 @@ impl NativeTrainingPreparationTiming {
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
                 | NATIVE_TRAINING_REPORT_FORMAT_V22
+                | NATIVE_TRAINING_REPORT_FORMAT_V23
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(total),
                 Some(linker),
@@ -134,6 +137,7 @@ impl NativeTrainingPreparationTiming {
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
                 | NATIVE_TRAINING_REPORT_FORMAT_V22
+                | NATIVE_TRAINING_REPORT_FORMAT_V23
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 _,
                 _,
@@ -225,6 +229,130 @@ impl Eq for CompiledTrainingInspection {}
 /// Source-compatible AdamW name for optimizer-neutral training inspection.
 pub type CompiledAdamWInspection = CompiledTrainingInspection;
 
+/// Disjoint host-wall attribution inside one recurrent capture construction.
+///
+/// These observations never enter capture, program, checkpoint, or cache
+/// identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledTrainingRecurrentCaptureObservation {
+    alias_planning_wall_time: Duration,
+    preview_schedule_count: usize,
+    final_schedule_wall_time: Duration,
+    pure_capture_binding_wall_time: Duration,
+    effect_assembly_sealing_wall_time: Duration,
+    recurrent_authentication_wall_time: Duration,
+    cursor_projection_wall_time: Option<Duration>,
+    residual_wall_time: Duration,
+    recurrent_state_count: usize,
+}
+
+impl CompiledTrainingRecurrentCaptureObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        total: Duration,
+        alias_planning_wall_time: Duration,
+        preview_schedule_count: usize,
+        final_schedule_wall_time: Duration,
+        pure_capture_binding_wall_time: Duration,
+        effect_assembly_sealing_wall_time: Duration,
+        recurrent_authentication_wall_time: Duration,
+        cursor_projection_wall_time: Option<Duration>,
+        recurrent_state_count: usize,
+    ) -> Result<Self> {
+        let measured = [
+            Some(alias_planning_wall_time),
+            Some(final_schedule_wall_time),
+            Some(pure_capture_binding_wall_time),
+            Some(effect_assembly_sealing_wall_time),
+            Some(recurrent_authentication_wall_time),
+            cursor_projection_wall_time,
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(Duration::ZERO, |total, duration| {
+            total.checked_add(duration)
+        })
+        .ok_or_else(|| invalid("compiled recurrent capture timing overflows"))?;
+        let residual_wall_time = total
+            .checked_sub(measured)
+            .ok_or_else(|| invalid("compiled recurrent capture stages exceed phase wall time"))?;
+        Ok(Self {
+            alias_planning_wall_time,
+            preview_schedule_count,
+            final_schedule_wall_time,
+            pure_capture_binding_wall_time,
+            effect_assembly_sealing_wall_time,
+            recurrent_authentication_wall_time,
+            cursor_projection_wall_time,
+            residual_wall_time,
+            recurrent_state_count,
+        })
+    }
+
+    /// Host wall time spent planning public/state aliases and preview schedules.
+    pub fn alias_planning_wall_time(&self) -> Duration {
+        self.alias_planning_wall_time
+    }
+
+    /// Exact number of preview schedule passes used by alias planning.
+    pub const fn preview_schedule_count(&self) -> usize {
+        self.preview_schedule_count
+    }
+
+    /// Host wall time spent building the final pure schedule.
+    pub fn final_schedule_wall_time(&self) -> Duration {
+        self.final_schedule_wall_time
+    }
+
+    /// Host wall time spent capturing the pure schedule and binding recurrent states.
+    pub fn pure_capture_binding_wall_time(&self) -> Duration {
+        self.pure_capture_binding_wall_time
+    }
+
+    /// Host wall time spent assembling effects and sealing the mixed capture.
+    pub fn effect_assembly_sealing_wall_time(&self) -> Duration {
+        self.effect_assembly_sealing_wall_time
+    }
+
+    /// Host wall time spent authenticating the canonical recurrent capture.
+    pub fn recurrent_authentication_wall_time(&self) -> Duration {
+        self.recurrent_authentication_wall_time
+    }
+
+    /// Host wall time spent projecting an auxiliary cursor from the main capture.
+    pub fn cursor_projection_wall_time(&self) -> Option<Duration> {
+        self.cursor_projection_wall_time
+    }
+
+    /// Remaining phase time outside the explicitly measured recurrent stages.
+    pub fn residual_wall_time(&self) -> Duration {
+        self.residual_wall_time
+    }
+
+    /// Number of logical recurrent states authenticated by this capture.
+    pub const fn recurrent_state_count(&self) -> usize {
+        self.recurrent_state_count
+    }
+
+    /// Checked sum of the disjoint substage and residual durations.
+    pub fn measured_wall_time(&self) -> Option<Duration> {
+        [
+            Some(self.alias_planning_wall_time),
+            Some(self.final_schedule_wall_time),
+            Some(self.pure_capture_binding_wall_time),
+            Some(self.effect_assembly_sealing_wall_time),
+            Some(self.recurrent_authentication_wall_time),
+            self.cursor_projection_wall_time,
+            Some(self.residual_wall_time),
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(Duration::ZERO, |total, duration| {
+            total.checked_add(duration)
+        })
+    }
+}
+
 /// One backend-neutral compiled-training construction phase observed before
 /// target preparation. Counts describe the immutable graph or schedule at the
 /// end of the phase; neither durations nor counts enter program identities.
@@ -233,6 +361,7 @@ pub struct CompiledTrainingCompilePhaseObservation {
     wall_time: Duration,
     graph_node_count: Option<usize>,
     logical_schedule_item_count: Option<usize>,
+    recurrent_capture: Option<CompiledTrainingRecurrentCaptureObservation>,
 }
 
 impl CompiledTrainingCompilePhaseObservation {
@@ -241,6 +370,7 @@ impl CompiledTrainingCompilePhaseObservation {
             wall_time,
             graph_node_count: Some(graph_node_count),
             logical_schedule_item_count: None,
+            recurrent_capture: None,
         }
     }
 
@@ -249,6 +379,20 @@ impl CompiledTrainingCompilePhaseObservation {
             wall_time,
             graph_node_count: None,
             logical_schedule_item_count: Some(logical_schedule_item_count),
+            recurrent_capture: None,
+        }
+    }
+
+    pub(crate) const fn recurrent_schedule(
+        wall_time: Duration,
+        logical_schedule_item_count: usize,
+        recurrent_capture: CompiledTrainingRecurrentCaptureObservation,
+    ) -> Self {
+        Self {
+            wall_time,
+            graph_node_count: None,
+            logical_schedule_item_count: Some(logical_schedule_item_count),
+            recurrent_capture: Some(recurrent_capture),
         }
     }
 
@@ -262,6 +406,11 @@ impl CompiledTrainingCompilePhaseObservation {
 
     pub const fn logical_schedule_item_count(&self) -> Option<usize> {
         self.logical_schedule_item_count
+    }
+
+    /// Returns the recurrent capture partition for a recurrent phase.
+    pub const fn recurrent_capture(&self) -> Option<CompiledTrainingRecurrentCaptureObservation> {
+        self.recurrent_capture
     }
 }
 
@@ -373,24 +522,31 @@ impl CompiledTrainingCompileObservation {
 impl CompiledTrainingInspection {
     pub(crate) fn new(
         initial_replay_step: u64,
-        main: (u64, ExecutionPlanSummary),
-        accumulation: Option<(u64, ExecutionPlanSummary)>,
-        partial_flush: Option<(u64, ExecutionPlanSummary)>,
-        zero_grad: Option<(u64, ExecutionPlanSummary)>,
+        main: (u64, ExecutionPlanSummary, usize),
+        accumulation: Option<(u64, ExecutionPlanSummary, usize)>,
+        partial_flush: Option<(u64, ExecutionPlanSummary, usize)>,
+        zero_grad: Option<(u64, ExecutionPlanSummary, usize)>,
         evaluation: Option<(u64, ExecutionPlanSummary)>,
         recurrent_state: (usize, usize),
     ) -> Self {
-        let program = |(capture_identity, execution_plan)| ProgramInspection {
+        let recurrent_program =
+            |(capture_identity, execution_plan, recurrent_state_count)| ProgramInspection {
+                capture_identity,
+                execution_plan,
+                recurrent_state_count: Some(recurrent_state_count),
+            };
+        let evaluation_program = |(capture_identity, execution_plan)| ProgramInspection {
             capture_identity,
             execution_plan,
+            recurrent_state_count: None,
         };
         Self {
             initial_replay_step,
-            main: program(main),
-            accumulation: accumulation.map(program),
-            partial_flush: partial_flush.map(program),
-            zero_grad: zero_grad.map(program),
-            evaluation: evaluation.map(program),
+            main: recurrent_program(main),
+            accumulation: accumulation.map(recurrent_program),
+            partial_flush: partial_flush.map(recurrent_program),
+            zero_grad: zero_grad.map(recurrent_program),
+            evaluation: evaluation.map(evaluation_program),
             recurrent_state_count: recurrent_state.0,
             recurrent_state_bytes: recurrent_state.1,
             compile_phases: None,

@@ -148,13 +148,16 @@ impl CompiledAdamWPlan {
         let topology = CompiledTrainingWindowTopology::from_config(&config);
         let (partial_flush, partial_flush_phase) = if topology.accumulating() {
             let started = Instant::now();
-            let plan = CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config)?;
-            let phase = CompiledTrainingCompilePhaseObservation::schedule(
-                started.elapsed(),
+            let (plan, measurement) =
+                CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config)?;
+            let wall_time = started.elapsed();
+            let phase = CompiledTrainingCompilePhaseObservation::recurrent_schedule(
+                wall_time,
                 plan.phase()
                     .recurrent_capture
                     .execution_plan()
                     .schedule_item_count,
+                measurement.finish(wall_time)?,
             );
             (Some(plan), Some(phase))
         } else {
@@ -162,13 +165,16 @@ impl CompiledAdamWPlan {
         };
         let (zero_grad, zero_grad_phase) = if topology.accumulating() {
             let started = Instant::now();
-            let plan = CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner, topology)?;
-            let phase = CompiledTrainingCompilePhaseObservation::schedule(
-                started.elapsed(),
+            let (plan, measurement) =
+                CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner, topology)?;
+            let wall_time = started.elapsed();
+            let phase = CompiledTrainingCompilePhaseObservation::recurrent_schedule(
+                wall_time,
                 plan.phase()
                     .recurrent_capture
                     .execution_plan()
                     .schedule_item_count,
+                measurement.finish(wall_time)?,
             );
             (Some(plan), Some(phase))
         } else {
@@ -582,13 +588,16 @@ impl CompiledAdamWPlan {
             .ok_or_else(|| training("compiled dropout configuration produced no state"))?;
         let (partial_flush, partial_flush_phase) = if topology.accumulating() {
             let started = Instant::now();
-            let plan = CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config)?;
-            let phase = CompiledTrainingCompilePhaseObservation::schedule(
-                started.elapsed(),
+            let (plan, measurement) =
+                CompiledAdamWAuxiliaryPlan::compile_partial_flush(&inner, &config)?;
+            let wall_time = started.elapsed();
+            let phase = CompiledTrainingCompilePhaseObservation::recurrent_schedule(
+                wall_time,
                 plan.phase()
                     .recurrent_capture
                     .execution_plan()
                     .schedule_item_count,
+                measurement.finish(wall_time)?,
             );
             (Some(plan), Some(phase))
         } else {
@@ -596,13 +605,16 @@ impl CompiledAdamWPlan {
         };
         let (zero_grad, zero_grad_phase) = if topology.accumulating() {
             let started = Instant::now();
-            let plan = CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner, topology)?;
-            let phase = CompiledTrainingCompilePhaseObservation::schedule(
-                started.elapsed(),
+            let (plan, measurement) =
+                CompiledAdamWAuxiliaryPlan::compile_zero_grad(&inner, topology)?;
+            let wall_time = started.elapsed();
+            let phase = CompiledTrainingCompilePhaseObservation::recurrent_schedule(
+                wall_time,
                 plan.phase()
                     .recurrent_capture
                     .execution_plan()
                     .schedule_item_count,
+                measurement.finish(wall_time)?,
             );
             (Some(plan), Some(phase))
         } else {
@@ -858,6 +870,7 @@ impl CompiledAdamWPlan {
         let main = (
             self.capture_identity(),
             self.inner.recurrent_capture.execution_plan().clone(),
+            self.inner.state_values.len(),
         );
         let accumulation = self.inner.accumulation.as_ref().map(|transition| {
             (
@@ -867,6 +880,7 @@ impl CompiledAdamWPlan {
                     .recurrent_capture
                     .execution_plan()
                     .clone(),
+                transition.phase().state_buffers.len(),
             )
         });
         let partial_flush = self.partial_flush.as_ref().map(|transition| {
@@ -877,6 +891,7 @@ impl CompiledAdamWPlan {
                     .recurrent_capture
                     .execution_plan()
                     .clone(),
+                transition.phase().state_buffers.len(),
             )
         });
         let zero_grad = self.zero_grad.as_ref().map(|transition| {
@@ -887,6 +902,7 @@ impl CompiledAdamWPlan {
                     .recurrent_capture
                     .execution_plan()
                     .clone(),
+                transition.phase().state_buffers.len(),
             )
         });
         let evaluation = self.evaluation.as_ref().map(|evaluation| {

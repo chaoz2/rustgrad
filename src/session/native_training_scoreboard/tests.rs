@@ -1,3 +1,4 @@
+use super::compile_phase::{CompilePhaseValidationContext, CompileProgramInventory};
 use super::*;
 
 fn zero_duration() -> BenchmarkDuration {
@@ -30,16 +31,37 @@ fn zero_compile_phase(
         wall_time: zero_duration(),
         graph_node_count,
         logical_schedule_item_count,
+        recurrent_capture: None,
+    }
+}
+
+fn zero_recurrent_capture(
+    preview_schedule_count: u64,
+    cursor_projection: bool,
+    recurrent_state_count: u64,
+) -> NativeTrainingRecurrentCaptureReport {
+    NativeTrainingRecurrentCaptureReport {
+        alias_planning_wall_time: zero_duration(),
+        preview_schedule_count,
+        final_schedule_wall_time: zero_duration(),
+        pure_capture_binding_wall_time: zero_duration(),
+        effect_assembly_sealing_wall_time: zero_duration(),
+        recurrent_authentication_wall_time: zero_duration(),
+        cursor_projection_wall_time: cursor_projection.then_some(zero_duration()),
+        residual_wall_time: zero_duration(),
+        recurrent_state_count,
     }
 }
 
 fn zero_compile_phases(main_schedule_item_count: u64) -> NativeTrainingCompilePhaseReport {
+    let mut main_capture = zero_compile_phase(None, Some(main_schedule_item_count));
+    main_capture.recurrent_capture = Some(zero_recurrent_capture(2, false, 4));
     NativeTrainingCompilePhaseReport {
         compile_count: 1,
         objective_forward: zero_compile_phase(Some(1), None),
         autograd: zero_compile_phase(Some(2), None),
         optimizer_lowering: zero_compile_phase(Some(3), None),
-        main_capture: zero_compile_phase(None, Some(main_schedule_item_count)),
+        main_capture,
         accumulation_capture: None,
         partial_flush: None,
         zero_grad: None,
@@ -79,7 +101,7 @@ fn inspection_equality_is_logical_not_compile_observational() {
     let inspection = |compile_phases| {
         CompiledAdamWInspection::new(
             0,
-            (7, empty_execution_plan_summary()),
+            (7, empty_execution_plan_summary(), 4),
             None,
             None,
             None,
@@ -352,6 +374,40 @@ fn remove_render_capsule_evidence(json: &mut serde_json::Value) {
 
 fn remove_compile_phase_evidence(json: &mut serde_json::Value) {
     json.as_object_mut().unwrap().remove("compile_phases");
+    remove_program_recurrent_state_evidence(json);
+}
+
+fn remove_recurrent_capture_evidence(json: &mut serde_json::Value) {
+    let phases = json["compile_phases"].as_object_mut().unwrap();
+    for phase in [
+        "main_capture",
+        "accumulation_capture",
+        "partial_flush",
+        "zero_grad",
+        "evaluation",
+    ] {
+        if let Some(phase) = phases
+            .get_mut(phase)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            phase.remove("recurrent_capture");
+        }
+    }
+    remove_program_recurrent_state_evidence(json);
+}
+
+fn remove_program_recurrent_state_evidence(json: &mut serde_json::Value) {
+    for program in [
+        "main",
+        "accumulation",
+        "partial_flush",
+        "zero_grad",
+        "evaluation",
+    ] {
+        if let Some(program) = json[program].as_object_mut() {
+            program.remove("recurrent_state_count");
+        }
+    }
 }
 
 fn remove_dispatch_segmentation_evidence(json: &mut serde_json::Value) {
@@ -397,6 +453,7 @@ fn zero_report() -> NativeTrainingReport {
             vectorized: true,
             execution_plan_identity: 13,
             logical_schedule_item_count: 2,
+            recurrent_state_count: None,
             peak_logical_temporary_allocation_count: 1,
             peak_logical_temporary_bytes: 4,
             native_item_count: 2,
@@ -506,6 +563,7 @@ fn phase_specialized_report() -> NativeTrainingReport {
     let mut report = zero_report();
     report.format_version = NATIVE_TRAINING_REPORT_FORMAT_VERSION;
     report.compile_phases = Some(zero_compile_phases(report.main.logical_schedule_item_count));
+    report.main.recurrent_state_count = Some(4);
     report.prepare_parallel_render_overlap_wall_time = Some(zero_duration());
     report.prepare_max_parallel_render_job_count = Some(0);
     report.prepare_render_capsule_hit_count = Some(2);
@@ -576,6 +634,14 @@ fn phase_specialized_report() -> NativeTrainingReport {
                 .logical_schedule_item_count,
         ),
     ));
+    report
+        .compile_phases
+        .as_mut()
+        .unwrap()
+        .accumulation_capture
+        .as_mut()
+        .unwrap()
+        .recurrent_capture = Some(zero_recurrent_capture(3, true, 4));
     report.accumulation_replay_traffic = Some(
         NativeCpuReplayTraffic::new(2, 12, 16, 8)
             .with_recurrent_inventory(2, 8, 2, 8)
@@ -1478,7 +1544,38 @@ fn version_twenty_two_decodes_without_compile_phases_and_current_requires_them()
     remove_compile_phase_evidence(&mut current);
     assert!(
         NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&current).unwrap()).is_err(),
-        "v23 requires compile-phase evidence"
+        "current report requires compile-phase evidence"
+    );
+}
+
+#[test]
+fn version_twenty_three_decodes_without_recurrent_capture_breakdown() {
+    let report = phase_specialized_report();
+    let mut legacy = serde_json::to_value(&report).unwrap();
+    legacy["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V23);
+    assert!(
+        NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&legacy).unwrap()).is_err(),
+        "v23 rejects v24 recurrent capture evidence"
+    );
+    remove_recurrent_capture_evidence(&mut legacy);
+    let decoded =
+        NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V23);
+    assert!(decoded.main().recurrent_state_count().is_none());
+    assert!(
+        decoded
+            .compile_phases()
+            .unwrap()
+            .main_capture()
+            .recurrent_capture()
+            .is_none()
+    );
+
+    let mut current = serde_json::to_value(report).unwrap();
+    remove_recurrent_capture_evidence(&mut current);
+    assert!(
+        NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&current).unwrap()).is_err(),
+        "v24 requires role-aligned recurrent capture evidence"
     );
 }
 
@@ -1491,8 +1588,22 @@ fn current_report_authenticates_compile_phase_partition_and_inventory() {
     phases.autograd.wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
     phases.optimizer_lowering.wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
     phases.main_capture.wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+    phases
+        .main_capture
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .residual_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
     phases.accumulation_capture.as_mut().unwrap().wall_time =
         BenchmarkDuration::from_duration(Duration::from_nanos(1));
+    phases
+        .accumulation_capture
+        .as_mut()
+        .unwrap()
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .residual_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
     phases.residual_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(4));
     assert!(report.validate().is_ok());
 
@@ -1523,12 +1634,188 @@ fn current_report_authenticates_compile_phase_partition_and_inventory() {
         .compile_phases
         .as_mut()
         .unwrap()
+        .main_capture
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .preview_schedule_count = 3;
+    assert!(
+        report.validate().is_err(),
+        "main preview inventory is exact"
+    );
+
+    let mut report = phase_specialized_report();
+    report
+        .compile_phases
+        .as_mut()
+        .unwrap()
+        .main_capture
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .cursor_projection_wall_time = Some(zero_duration());
+    assert!(report.validate().is_err(), "main has no cursor projection");
+
+    let mut report = phase_specialized_report();
+    report
+        .compile_phases
+        .as_mut()
+        .unwrap()
+        .accumulation_capture
+        .as_mut()
+        .unwrap()
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .cursor_projection_wall_time = None;
+    assert!(
+        report.validate().is_err(),
+        "accumulation cursor projection is required"
+    );
+
+    let mut report = phase_specialized_report();
+    report
+        .compile_phases
+        .as_mut()
+        .unwrap()
+        .main_capture
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .recurrent_state_count = 3;
+    assert!(report.validate().is_err(), "main state inventory is exact");
+
+    let mut report = phase_specialized_report();
+    report
+        .compile_phases
+        .as_mut()
+        .unwrap()
+        .main_capture
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .alias_planning_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+    assert!(
+        report.validate().is_err(),
+        "recurrent capture stage partition is exact"
+    );
+
+    let mut report = phase_specialized_report();
+    report
+        .compile_phases
+        .as_mut()
+        .unwrap()
         .objective_forward
         .wall_time = BenchmarkDuration {
         secs: u64::MAX,
         nanos: 999_999_999,
     };
     assert!(report.validate().is_err(), "compile phase sums are checked");
+}
+
+#[test]
+fn version_twenty_four_authenticates_exact_auxiliary_recurrent_state_counts() {
+    let report = phase_specialized_report();
+    let main = report.main.clone();
+    let accumulation = report.accumulation.clone().unwrap();
+    let mut partial_flush = accumulation.clone();
+    partial_flush.recurrent_state_count = Some(3);
+    let mut zero_grad = accumulation.clone();
+    zero_grad.recurrent_state_count = Some(2);
+    let mut phases = report.compile_phases.unwrap();
+    let mut partial_flush_phase = phases.accumulation_capture.unwrap();
+    partial_flush_phase
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .recurrent_state_count = 3;
+    phases.partial_flush = Some(partial_flush_phase);
+    let mut zero_grad_phase = phases.accumulation_capture.unwrap();
+    let zero_grad_capture = zero_grad_phase.recurrent_capture.as_mut().unwrap();
+    zero_grad_capture.preview_schedule_count = 1;
+    zero_grad_capture.recurrent_state_count = 2;
+    phases.zero_grad = Some(zero_grad_phase);
+    let validation_context = || CompilePhaseValidationContext {
+        require_recurrent_capture: true,
+        compile_wall_time: zero_duration(),
+        recurrent_state_count: 4,
+        programs: CompileProgramInventory {
+            main: &main,
+            accumulation: Some(&accumulation),
+            partial_flush: Some(&partial_flush),
+            zero_grad: Some(&zero_grad),
+            evaluation: None,
+        },
+    };
+    assert!(phases.validate(validation_context()).is_ok());
+
+    let mut smaller_partial = phases.clone();
+    smaller_partial
+        .partial_flush
+        .as_mut()
+        .unwrap()
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .recurrent_state_count = 2;
+    assert!(
+        smaller_partial.validate(validation_context()).is_err(),
+        "an in-range partial-flush count cannot replace its retained inventory"
+    );
+
+    let mut smaller_zero_grad = phases;
+    smaller_zero_grad
+        .zero_grad
+        .as_mut()
+        .unwrap()
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .recurrent_state_count = 1;
+    assert!(
+        smaller_zero_grad.validate(validation_context()).is_err(),
+        "an in-range zero-grad count cannot replace its retained inventory"
+    );
+}
+
+#[test]
+fn version_twenty_four_rejects_invalid_and_overflowing_nested_durations() {
+    let mut invalid = phase_specialized_report();
+    invalid
+        .compile_phases
+        .as_mut()
+        .unwrap()
+        .main_capture
+        .recurrent_capture
+        .as_mut()
+        .unwrap()
+        .alias_planning_wall_time = BenchmarkDuration {
+        secs: 0,
+        nanos: 1_000_000_000,
+    };
+    assert!(
+        invalid.validate().is_err(),
+        "a malformed nested duration must reject"
+    );
+
+    let mut overflowing = phase_specialized_report();
+    let capture = overflowing
+        .compile_phases
+        .as_mut()
+        .unwrap()
+        .main_capture
+        .recurrent_capture
+        .as_mut()
+        .unwrap();
+    capture.alias_planning_wall_time = BenchmarkDuration {
+        secs: u64::MAX,
+        nanos: 999_999_999,
+    };
+    capture.final_schedule_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+    assert!(
+        overflowing.validate().is_err(),
+        "nested duration summation must reject overflow"
+    );
 }
 
 #[test]
@@ -2051,8 +2338,14 @@ fn current_report_prefix_source_indices_compact_absent_optional_programs() {
     let mut report = phase_specialized_report();
     let evaluation = report.accumulation.take();
     report.evaluation = evaluation;
+    report.evaluation.as_mut().unwrap().recurrent_state_count = None;
     let compile_phases = report.compile_phases.as_mut().unwrap();
     compile_phases.evaluation = compile_phases.accumulation_capture.take();
+    compile_phases
+        .evaluation
+        .as_mut()
+        .unwrap()
+        .recurrent_capture = None;
     report.accumulation_replay_traffic = None;
     report.accumulation_replay_executed_native_item_count = None;
     report.accumulation_schedule_cache_keys.clear();

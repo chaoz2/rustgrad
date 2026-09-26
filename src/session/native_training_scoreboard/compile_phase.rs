@@ -6,6 +6,7 @@
 
 use super::inspection::{
     CompiledTrainingCompileObservation, CompiledTrainingCompilePhaseObservation,
+    CompiledTrainingRecurrentCaptureObservation,
 };
 use super::program_report::NativeTrainingProgramReport;
 use super::{count, invalid};
@@ -24,6 +25,143 @@ pub struct NativeTrainingCompilePhase {
     pub(super) graph_node_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) logical_schedule_item_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) recurrent_capture: Option<NativeTrainingRecurrentCaptureReport>,
+}
+
+/// Disjoint host-wall attribution inside one recurrent phase capture.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTrainingRecurrentCaptureReport {
+    pub(super) alias_planning_wall_time: BenchmarkDuration,
+    pub(super) preview_schedule_count: u64,
+    pub(super) final_schedule_wall_time: BenchmarkDuration,
+    pub(super) pure_capture_binding_wall_time: BenchmarkDuration,
+    pub(super) effect_assembly_sealing_wall_time: BenchmarkDuration,
+    pub(super) recurrent_authentication_wall_time: BenchmarkDuration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cursor_projection_wall_time: Option<BenchmarkDuration>,
+    pub(super) residual_wall_time: BenchmarkDuration,
+    pub(super) recurrent_state_count: u64,
+}
+
+impl NativeTrainingRecurrentCaptureReport {
+    fn from_observation(observation: CompiledTrainingRecurrentCaptureObservation) -> Result<Self> {
+        Ok(Self {
+            alias_planning_wall_time: BenchmarkDuration::from_duration(
+                observation.alias_planning_wall_time(),
+            ),
+            preview_schedule_count: count(
+                observation.preview_schedule_count(),
+                "recurrent preview schedule",
+            )?,
+            final_schedule_wall_time: BenchmarkDuration::from_duration(
+                observation.final_schedule_wall_time(),
+            ),
+            pure_capture_binding_wall_time: BenchmarkDuration::from_duration(
+                observation.pure_capture_binding_wall_time(),
+            ),
+            effect_assembly_sealing_wall_time: BenchmarkDuration::from_duration(
+                observation.effect_assembly_sealing_wall_time(),
+            ),
+            recurrent_authentication_wall_time: BenchmarkDuration::from_duration(
+                observation.recurrent_authentication_wall_time(),
+            ),
+            cursor_projection_wall_time: observation
+                .cursor_projection_wall_time()
+                .map(BenchmarkDuration::from_duration),
+            residual_wall_time: BenchmarkDuration::from_duration(observation.residual_wall_time()),
+            recurrent_state_count: count(
+                observation.recurrent_state_count(),
+                "recurrent capture state",
+            )?,
+        })
+    }
+
+    fn validate(
+        self,
+        phase_wall_time: Duration,
+        expected_preview_schedule_count: u64,
+        cursor_projection: bool,
+        expected_state_count: u64,
+    ) -> Result<()> {
+        if self.preview_schedule_count != expected_preview_schedule_count
+            || self.cursor_projection_wall_time.is_some() != cursor_projection
+            || self.recurrent_state_count != expected_state_count
+        {
+            return Err(invalid("compiled recurrent capture inventory differs"));
+        }
+        let total = [
+            Some(self.alias_planning_wall_time),
+            Some(self.final_schedule_wall_time),
+            Some(self.pure_capture_binding_wall_time),
+            Some(self.effect_assembly_sealing_wall_time),
+            Some(self.recurrent_authentication_wall_time),
+            self.cursor_projection_wall_time,
+            Some(self.residual_wall_time),
+        ]
+        .into_iter()
+        .flatten()
+        .try_fold(Duration::ZERO, |total, duration| {
+            let duration = duration
+                .to_duration()
+                .map_err(|_| invalid("invalid recurrent capture duration"))?;
+            total
+                .checked_add(duration)
+                .ok_or_else(|| invalid("compiled recurrent capture duration overflows"))
+        })?;
+        if total != phase_wall_time {
+            return Err(invalid(
+                "compiled recurrent capture timing partition differs",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Host wall time spent planning public/state aliases and their preview schedules.
+    pub const fn alias_planning_wall_time(&self) -> BenchmarkDuration {
+        self.alias_planning_wall_time
+    }
+
+    /// Exact number of preview schedule passes used by alias planning.
+    pub const fn preview_schedule_count(&self) -> u64 {
+        self.preview_schedule_count
+    }
+
+    /// Host wall time spent building the final pure schedule.
+    pub const fn final_schedule_wall_time(&self) -> BenchmarkDuration {
+        self.final_schedule_wall_time
+    }
+
+    /// Host wall time spent capturing the pure schedule and binding recurrent states.
+    pub const fn pure_capture_binding_wall_time(&self) -> BenchmarkDuration {
+        self.pure_capture_binding_wall_time
+    }
+
+    /// Host wall time spent assembling effects and sealing the mixed capture.
+    pub const fn effect_assembly_sealing_wall_time(&self) -> BenchmarkDuration {
+        self.effect_assembly_sealing_wall_time
+    }
+
+    /// Host wall time spent authenticating the canonical recurrent capture.
+    pub const fn recurrent_authentication_wall_time(&self) -> BenchmarkDuration {
+        self.recurrent_authentication_wall_time
+    }
+
+    /// Host wall time spent projecting an auxiliary cursor from the main capture.
+    pub const fn cursor_projection_wall_time(&self) -> Option<BenchmarkDuration> {
+        self.cursor_projection_wall_time
+    }
+
+    /// Remaining phase time outside the explicitly measured recurrent stages.
+    pub const fn residual_wall_time(&self) -> BenchmarkDuration {
+        self.residual_wall_time
+    }
+
+    /// Number of logical recurrent states authenticated by this capture.
+    pub const fn recurrent_state_count(&self) -> u64 {
+        self.recurrent_state_count
+    }
 }
 
 impl NativeTrainingCompilePhase {
@@ -40,6 +178,10 @@ impl NativeTrainingCompilePhase {
                 .logical_schedule_item_count()
                 .map(|value| count(value, "compiled logical schedule item"))
                 .transpose()?,
+            recurrent_capture: observation
+                .recurrent_capture()
+                .map(NativeTrainingRecurrentCaptureReport::from_observation)
+                .transpose()?,
         })
     }
 
@@ -51,7 +193,10 @@ impl NativeTrainingCompilePhase {
 
     fn validate_graph(self) -> Result<()> {
         self.duration()?;
-        if self.graph_node_count.is_none() || self.logical_schedule_item_count.is_some() {
+        if self.graph_node_count.is_none()
+            || self.logical_schedule_item_count.is_some()
+            || self.recurrent_capture.is_some()
+        {
             return Err(invalid("compiled graph phase inventory differs"));
         }
         Ok(())
@@ -78,6 +223,11 @@ impl NativeTrainingCompilePhase {
     pub const fn logical_schedule_item_count(&self) -> Option<u64> {
         self.logical_schedule_item_count
     }
+
+    /// Recurrent capture substage partition for a training phase, when recorded.
+    pub const fn recurrent_capture(&self) -> Option<NativeTrainingRecurrentCaptureReport> {
+        self.recurrent_capture
+    }
 }
 
 /// Exact partition of one caller-observed backend-neutral training compile.
@@ -100,6 +250,21 @@ pub struct NativeTrainingCompilePhaseReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) evaluation: Option<NativeTrainingCompilePhase>,
     pub(super) residual_wall_time: BenchmarkDuration,
+}
+
+pub(super) struct CompileProgramInventory<'a> {
+    pub(super) main: &'a NativeTrainingProgramReport,
+    pub(super) accumulation: Option<&'a NativeTrainingProgramReport>,
+    pub(super) partial_flush: Option<&'a NativeTrainingProgramReport>,
+    pub(super) zero_grad: Option<&'a NativeTrainingProgramReport>,
+    pub(super) evaluation: Option<&'a NativeTrainingProgramReport>,
+}
+
+pub(super) struct CompilePhaseValidationContext<'a> {
+    pub(super) require_recurrent_capture: bool,
+    pub(super) compile_wall_time: BenchmarkDuration,
+    pub(super) recurrent_state_count: u64,
+    pub(super) programs: CompileProgramInventory<'a>,
 }
 
 impl NativeTrainingCompilePhaseReport {
@@ -150,15 +315,20 @@ impl NativeTrainingCompilePhaseReport {
         })
     }
 
-    pub(super) fn validate(
-        &self,
-        compile_wall_time: BenchmarkDuration,
-        main: &NativeTrainingProgramReport,
-        accumulation: Option<&NativeTrainingProgramReport>,
-        partial_flush: Option<&NativeTrainingProgramReport>,
-        zero_grad: Option<&NativeTrainingProgramReport>,
-        evaluation: Option<&NativeTrainingProgramReport>,
-    ) -> Result<()> {
+    pub(super) fn validate(&self, context: CompilePhaseValidationContext<'_>) -> Result<()> {
+        let CompilePhaseValidationContext {
+            require_recurrent_capture,
+            compile_wall_time,
+            recurrent_state_count,
+            programs:
+                CompileProgramInventory {
+                    main,
+                    accumulation,
+                    partial_flush,
+                    zero_grad,
+                    evaluation,
+                },
+        } = context;
         if self.compile_count != 1 {
             return Err(invalid("compiled training compile count differs"));
         }
@@ -188,6 +358,83 @@ impl NativeTrainingCompilePhaseReport {
                 }
                 (None, None) => {}
                 _ => return Err(invalid("compiled phase program inventory differs")),
+            }
+        }
+        let recurrent_phases = [
+            self.main_capture,
+            self.accumulation_capture.unwrap_or(self.main_capture),
+            self.partial_flush.unwrap_or(self.main_capture),
+            self.zero_grad.unwrap_or(self.main_capture),
+        ];
+        if !require_recurrent_capture {
+            if recurrent_phases
+                .into_iter()
+                .any(|phase| phase.recurrent_capture.is_some())
+                || self
+                    .evaluation
+                    .is_some_and(|phase| phase.recurrent_capture.is_some())
+            {
+                return Err(invalid(
+                    "legacy compiled phase has recurrent capture evidence",
+                ));
+            }
+        } else {
+            let main_state_count = main
+                .recurrent_state_count
+                .ok_or_else(|| invalid("main recurrent-state inventory is absent"))?;
+            if main_state_count != recurrent_state_count {
+                return Err(invalid("main recurrent-state inventory differs"));
+            }
+            let main = self
+                .main_capture
+                .recurrent_capture
+                .ok_or_else(|| invalid("main recurrent capture evidence is absent"))?;
+            main.validate(self.main_capture.duration()?, 2, false, main_state_count)?;
+            match (self.accumulation_capture, accumulation) {
+                (Some(phase), Some(program)) => {
+                    let state_count = program.recurrent_state_count.ok_or_else(|| {
+                        invalid("accumulation recurrent-state inventory is absent")
+                    })?;
+                    let capture = phase.recurrent_capture.ok_or_else(|| {
+                        invalid("accumulation recurrent capture evidence is absent")
+                    })?;
+                    capture.validate(phase.duration()?, 3, true, state_count)?;
+                }
+                (None, None) => {}
+                _ => return Err(invalid("accumulation recurrent-state inventory differs")),
+            }
+            match (self.partial_flush, partial_flush) {
+                (Some(phase), Some(program)) => {
+                    let state_count = program.recurrent_state_count.ok_or_else(|| {
+                        invalid("partial-flush recurrent-state inventory is absent")
+                    })?;
+                    let capture = phase.recurrent_capture.ok_or_else(|| {
+                        invalid("partial-flush recurrent capture evidence is absent")
+                    })?;
+                    capture.validate(phase.duration()?, 3, true, state_count)?;
+                }
+                (None, None) => {}
+                _ => return Err(invalid("partial-flush recurrent-state inventory differs")),
+            }
+            match (self.zero_grad, zero_grad) {
+                (Some(phase), Some(program)) => {
+                    let state_count = program
+                        .recurrent_state_count
+                        .ok_or_else(|| invalid("zero-grad recurrent-state inventory is absent"))?;
+                    phase
+                        .recurrent_capture
+                        .ok_or_else(|| invalid("zero-grad recurrent capture evidence is absent"))?
+                        .validate(phase.duration()?, 1, true, state_count)?;
+                }
+                (None, None) => {}
+                _ => return Err(invalid("zero-grad recurrent-state inventory differs")),
+            }
+            if self
+                .evaluation
+                .is_some_and(|phase| phase.recurrent_capture.is_some())
+                || evaluation.is_some_and(|program| program.recurrent_state_count.is_some())
+            {
+                return Err(invalid("evaluation has recurrent capture evidence"));
             }
         }
         let total = [

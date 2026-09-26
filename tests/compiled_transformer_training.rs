@@ -6948,6 +6948,28 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
         .unwrap()
         .measured_wall_time()
         .unwrap();
+    let compile_phases = inspection.compile_phases().unwrap();
+    let main_capture = compile_phases.main_capture().recurrent_capture().unwrap();
+    assert_eq!(main_capture.preview_schedule_count(), 2);
+    assert!(main_capture.cursor_projection_wall_time().is_none());
+    assert_eq!(
+        main_capture.recurrent_state_count(),
+        inspection.recurrent_state_count()
+    );
+    assert_eq!(
+        main_capture.measured_wall_time(),
+        Some(compile_phases.main_capture().wall_time())
+    );
+    for (phase, preview_schedule_count) in [
+        (compile_phases.accumulation_capture().unwrap(), 3),
+        (compile_phases.partial_flush().unwrap(), 3),
+        (compile_phases.zero_grad().unwrap(), 1),
+    ] {
+        let recurrent = phase.recurrent_capture().unwrap();
+        assert_eq!(recurrent.preview_schedule_count(), preview_schedule_count);
+        assert!(recurrent.cursor_projection_wall_time().is_some());
+        assert_eq!(recurrent.measured_wall_time(), Some(phase.wall_time()));
+    }
 
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
@@ -7016,6 +7038,48 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     );
     assert_eq!(scoreboard.report().unwrap(), observed_checkpoint_report);
     let report = scoreboard.report().unwrap();
+    let reported_compile_phases = report.compile_phases().unwrap();
+    for (observed, reported, program) in [
+        (
+            compile_phases.main_capture(),
+            reported_compile_phases.main_capture(),
+            report.main(),
+        ),
+        (
+            compile_phases.accumulation_capture().unwrap(),
+            reported_compile_phases.accumulation_capture().unwrap(),
+            report.accumulation().unwrap(),
+        ),
+        (
+            compile_phases.partial_flush().unwrap(),
+            reported_compile_phases.partial_flush().unwrap(),
+            report.partial_flush().unwrap(),
+        ),
+        (
+            compile_phases.zero_grad().unwrap(),
+            reported_compile_phases.zero_grad().unwrap(),
+            report.zero_grad().unwrap(),
+        ),
+    ] {
+        let observed = observed.recurrent_capture().unwrap();
+        let reported = reported.recurrent_capture().unwrap();
+        assert_eq!(
+            reported.preview_schedule_count(),
+            u64::try_from(observed.preview_schedule_count()).unwrap()
+        );
+        assert_eq!(
+            reported.recurrent_state_count(),
+            u64::try_from(observed.recurrent_state_count()).unwrap()
+        );
+        assert_eq!(
+            program.recurrent_state_count(),
+            Some(reported.recurrent_state_count())
+        );
+        assert_eq!(
+            reported.cursor_projection_wall_time().is_some(),
+            observed.cursor_projection_wall_time().is_some()
+        );
+    }
     let bytes = report.to_json_bytes().unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(report.successful_replay_count(), 3);

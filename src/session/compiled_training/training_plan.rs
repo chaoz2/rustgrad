@@ -288,9 +288,12 @@ impl CompiledTrainingPlan {
                 materialize_state_passthroughs: false,
             },
         )?;
-        let main_capture = CompiledTrainingCompilePhaseObservation::schedule(
-            main_started.elapsed(),
+        let main_wall_time = main_started.elapsed();
+        let main_recurrent_capture = main.capture_measurement.finish(main_wall_time)?;
+        let main_capture = CompiledTrainingCompilePhaseObservation::recurrent_schedule(
+            main_wall_time,
             main.recurrent_capture.execution_plan().schedule_item_count,
+            main_recurrent_capture,
         );
         let (accumulation, accumulation_capture) = if let Some(updates) = sibling_updates {
             let accumulation_started = Instant::now();
@@ -311,14 +314,19 @@ impl CompiledTrainingPlan {
                     materialize_state_passthroughs: true,
                 },
             )?;
+            let cursor_projection_started = Instant::now();
             let cursor_projection = PreparedRecurrentCursorProjection::prepare(
                 &main.capture,
                 &phase.capture,
                 phase.state_buffers.values().copied(),
             )
             .map_err(replay_error)?;
+            let cursor_projection_wall_time = cursor_projection_started.elapsed();
             let capture_identity = cursor_projection.target_capture_identity();
             let schedule_item_count = phase.recurrent_capture.execution_plan().schedule_item_count;
+            let capture_measurement = phase
+                .capture_measurement
+                .with_cursor_projection(cursor_projection_wall_time);
             let plan = CompiledTrainingSiblingPlan {
                 phase: CompiledRecurrentPhasePlan {
                     capture: Arc::new(phase.capture),
@@ -329,11 +337,14 @@ impl CompiledTrainingPlan {
                     admission: CompiledRecurrentPhaseAdmission::RetainUnchanged,
                 },
             };
+            let accumulation_wall_time = accumulation_started.elapsed();
+            let recurrent_capture = capture_measurement.finish(accumulation_wall_time)?;
             (
                 Some(plan),
-                Some(CompiledTrainingCompilePhaseObservation::schedule(
-                    accumulation_started.elapsed(),
+                Some(CompiledTrainingCompilePhaseObservation::recurrent_schedule(
+                    accumulation_wall_time,
                     schedule_item_count,
+                    recurrent_capture,
                 )),
             )
         } else {
@@ -623,7 +634,7 @@ impl CompiledAdamWAuxiliaryPlan {
     pub(super) fn compile_partial_flush(
         training_plan: &CompiledTrainingPlan,
         config: &CompiledAdamWConfig,
-    ) -> Result<Self> {
+    ) -> Result<(Self, RecurrentCaptureStageMeasurement)> {
         let topology = CompiledTrainingWindowTopology::from_config(config);
         if !topology.accumulating() {
             return Err(training(
@@ -777,7 +788,9 @@ impl CompiledAdamWAuxiliaryPlan {
             .iter()
             .map(|key| updates[key])
             .collect::<Vec<_>>();
+        let alias_planning_started = Instant::now();
         let successors = materialize_compiled_state_aliases(&mut graph, &successors)?;
+        let mut alias_planning_wall_time = alias_planning_started.elapsed();
         for (key, successor) in successor_keys.into_iter().zip(successors) {
             updates.insert(key, successor);
         }
@@ -801,29 +814,38 @@ impl CompiledAdamWAuxiliaryPlan {
         );
         let outputs = CompiledAdamWAuxiliaryOutputSchema::from_nodes(&graph, &observations)?;
         let public_requested = outputs.node_ids(&observations)?;
+        let alias_planning_started = Instant::now();
         let public_requested = materialize_compiled_recurrent_public_aliases(
             &mut graph,
             &public_requested,
             &state_links,
         )?;
+        alias_planning_wall_time = alias_planning_wall_time
+            .checked_add(alias_planning_started.elapsed())
+            .ok_or_else(|| training("compiled alias planning duration overflows"))?;
         let public_output_count = public_requested.len();
         let mut requested = public_requested.clone();
         requested.extend(specs.iter().map(|(_, key, ..)| updates[key]));
         for node in &requested {
             checked_descriptor(graph.shape(*node)?, graph.dtype(*node)?)?;
         }
+        let final_schedule_started = Instant::now();
         let pure = schedule_many(&graph, &requested).map_err(schedule_error)?;
+        let final_schedule_wall_time = final_schedule_started.elapsed();
         if let Some(item) = pure.items.iter().find(|item| item.boundary.is_some()) {
             return Err(training(format!(
                 "compiled partial flush has an unsupported boundary at node {}",
                 item.node.index()
             )));
         }
+        let pure_capture_binding_started = Instant::now();
         let mut captured =
             CapturedSchedule::capture(&graph, &pure, &requested[..public_output_count])
                 .map_err(replay_error)?;
         let state_bindings = collect_state_bindings(&pure, &state_by_input)?;
         let pure = bind_schedule_states(pure, state_bindings).map_err(schedule_error)?;
+        let pure_capture_binding_wall_time = pure_capture_binding_started.elapsed();
+        let effect_assembly_sealing_started = Instant::now();
         let mut effects = EffectGraph::default();
         let mut effect_bindings = Vec::with_capacity(specs.len());
         for (ordinal, (_, key, value, _, buffer)) in specs.iter().enumerate() {
@@ -861,6 +883,8 @@ impl CompiledAdamWAuxiliaryPlan {
         let capture = CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
             .map_err(replay_error)?;
         validate_external_binding_ownership(&capture, std::iter::empty::<&String>())?;
+        let effect_assembly_sealing_wall_time = effect_assembly_sealing_started.elapsed();
+        let recurrent_authentication_started = Instant::now();
         let recurrent_capture = CompiledRecurrentCapture::from_canonical_mixed(
             &graph,
             &capture,
@@ -868,41 +892,57 @@ impl CompiledAdamWAuxiliaryPlan {
             &state_links,
             initial_state,
         )?;
+        let recurrent_authentication_wall_time = recurrent_authentication_started.elapsed();
+        let cursor_projection_started = Instant::now();
         let cursor_projection = PreparedRecurrentCursorProjection::prepare(
             &training_plan.capture,
             &capture,
             state_buffers.values().copied(),
         )
         .map_err(replay_error)?;
+        let cursor_projection_wall_time = cursor_projection_started.elapsed();
         let capture_identity = cursor_projection.target_capture_identity();
+        let recurrent_state_count = specs.len();
         let recurrent_store_groups = resolve_recurrent_store_groups(
             &adamw_recurrent_store_group_specs(parameters.keys(), topology),
             &updates,
             &state_buffers,
         )?;
-        Ok(Self {
-            phase: CompiledRecurrentPhasePlan {
-                capture: Arc::new(capture),
-                recurrent_capture,
-                state_buffers,
-                cursor_projection: Arc::new(cursor_projection),
-                capture_identity,
-                admission: CompiledRecurrentPhaseAdmission::Replace {
-                    store_groups: recurrent_store_groups,
+        Ok((
+            Self {
+                phase: CompiledRecurrentPhasePlan {
+                    capture: Arc::new(capture),
+                    recurrent_capture,
+                    state_buffers,
+                    cursor_projection: Arc::new(cursor_projection),
+                    capture_identity,
+                    admission: CompiledRecurrentPhaseAdmission::Replace {
+                        store_groups: recurrent_store_groups,
+                    },
                 },
+                state_input_keys: specs
+                    .into_iter()
+                    .map(|(input, key, ..)| (input, key))
+                    .collect(),
+                outputs,
             },
-            state_input_keys: specs
-                .into_iter()
-                .map(|(input, key, ..)| (input, key))
-                .collect(),
-            outputs,
-        })
+            RecurrentCaptureStageMeasurement::new(
+                alias_planning_wall_time,
+                3,
+                final_schedule_wall_time,
+                pure_capture_binding_wall_time,
+                effect_assembly_sealing_wall_time,
+                recurrent_authentication_wall_time,
+                Some(cursor_projection_wall_time),
+                recurrent_state_count,
+            ),
+        ))
     }
 
     pub(super) fn compile_zero_grad(
         training_plan: &CompiledTrainingPlan,
         topology: CompiledTrainingWindowTopology,
-    ) -> Result<Self> {
+    ) -> Result<(Self, RecurrentCaptureStageMeasurement)> {
         if !topology.accumulating() {
             return Err(training(
                 "compiled AdamW zero-grad requires gradient accumulation",
@@ -920,19 +960,21 @@ impl CompiledAdamWAuxiliaryPlan {
             ));
         }
 
-        Ok(Self {
-            phase: CompiledRecurrentPhasePlan::compile_state_only_reset(
-                training_plan,
-                state_buffers,
-            )?,
-            state_input_keys: training_plan
-                .state_input_keys
-                .iter()
-                .filter(|(_, key)| is_adamw_accumulation_reset_state(key))
-                .map(|(input, key)| (input.clone(), key.clone()))
-                .collect(),
-            outputs: CompiledAdamWAuxiliaryOutputSchema::from_report_flags(false, false),
-        })
+        let (phase, capture_measurement) =
+            CompiledRecurrentPhasePlan::compile_state_only_reset(training_plan, state_buffers)?;
+        Ok((
+            Self {
+                phase,
+                state_input_keys: training_plan
+                    .state_input_keys
+                    .iter()
+                    .filter(|(_, key)| is_adamw_accumulation_reset_state(key))
+                    .map(|(input, key)| (input.clone(), key.clone()))
+                    .collect(),
+                outputs: CompiledAdamWAuxiliaryOutputSchema::from_report_flags(false, false),
+            },
+            capture_measurement,
+        ))
     }
 }
 
