@@ -682,18 +682,14 @@ impl CompiledAdamWAuxiliaryPlan {
         if parameters.len() != training_plan.parameter_buffers.len() {
             return Err(training("compiled partial flush parameter schema differs"));
         }
-        let accumulation_index_key =
-            RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex);
+        let accumulation_index_key = adamw_global_key(AdamWGlobalState::AccumulationIndex);
         let index = state_nodes
             .get(&accumulation_index_key)
             .copied()
             .ok_or_else(|| training("compiled partial flush accumulation index is absent"))?;
-        let token_count_key =
-            topology
-                .retains_token_count()
-                .then_some(RecurrentStateKey::adamw_global(
-                    AdamWGlobalState::AccumulatedTokenCount,
-                ));
+        let token_count_key = topology
+            .retains_token_count()
+            .then_some(adamw_global_key(AdamWGlobalState::AccumulatedTokenCount));
         let divisor = match &token_count_key {
             Some(key) => {
                 let count = state_nodes.get(key).copied().ok_or_else(|| {
@@ -709,8 +705,7 @@ impl CompiledAdamWAuxiliaryPlan {
             config.allow_zero_valid_token_microbatches,
         )?;
         let window_loss_report = if config.window_loss_report {
-            let numerator_key =
-                RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedLossNumerator);
+            let numerator_key = adamw_global_key(AdamWGlobalState::AccumulatedLossNumerator);
             let numerator = state_nodes.get(&numerator_key).copied().ok_or_else(|| {
                 training("compiled partial flush accumulated loss numerator is absent")
             })?;
@@ -731,7 +726,7 @@ impl CompiledAdamWAuxiliaryPlan {
         let mut gradients = BTreeMap::new();
         for name in parameters.keys() {
             let accumulator_key =
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
+                adamw_parameter_key(name, AdamWParameterState::GradientAccumulator);
             let accumulator = state_nodes
                 .get(&accumulator_key)
                 .copied()
@@ -766,8 +761,7 @@ impl CompiledAdamWAuxiliaryPlan {
             updates.insert(key.clone(), scalar_f32(&mut graph, 0.0)?);
         }
         for name in parameters.keys() {
-            let key =
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
+            let key = adamw_parameter_key(name, AdamWParameterState::GradientAccumulator);
             let accumulator = state_nodes
                 .get(&key)
                 .copied()
@@ -917,7 +911,7 @@ impl CompiledAdamWAuxiliaryPlan {
         let state_buffers = training_plan
             .optimizer_buffers
             .iter()
-            .filter(|(key, _)| key.is_accumulation_reset_state())
+            .filter(|(key, _)| is_adamw_accumulation_reset_state(key))
             .map(|(key, buffer)| (key.clone(), *buffer))
             .collect::<BTreeMap<_, _>>();
         if state_buffers.is_empty() {
@@ -934,7 +928,7 @@ impl CompiledAdamWAuxiliaryPlan {
             state_input_keys: training_plan
                 .state_input_keys
                 .iter()
-                .filter(|(_, key)| key.is_accumulation_reset_state())
+                .filter(|(_, key)| is_adamw_accumulation_reset_state(key))
                 .map(|(input, key)| (input.clone(), key.clone()))
                 .collect(),
             outputs: CompiledAdamWAuxiliaryOutputSchema::from_report_flags(false, false),

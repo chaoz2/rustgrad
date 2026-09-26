@@ -1100,7 +1100,7 @@ fn compiled_dropout_rejects_counter_exhaustion_before_replay() {
     let replay_step = u64::MAX / 2;
     let mut values = plan.inner.state_values.clone();
     values.insert(
-        RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
+        adamw_global_key(AdamWGlobalState::Step),
         TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(replay_step)]).unwrap(),
     );
     values.insert(
@@ -2474,9 +2474,9 @@ fn adamw_lowering_resolves_ordered_recurrent_store_keys() {
     let specs = adamw_recurrent_store_group_specs(["weight".to_string()].iter(), accumulating);
     let expected_keys = vec![
         RecurrentStateKey::parameter("weight"),
-        RecurrentStateKey::adamw_parameter("weight", AdamWParameterState::FirstMoment),
-        RecurrentStateKey::adamw_parameter("weight", AdamWParameterState::SecondMoment),
-        RecurrentStateKey::adamw_parameter("weight", AdamWParameterState::GradientAccumulator),
+        adamw_parameter_key("weight", AdamWParameterState::FirstMoment),
+        adamw_parameter_key("weight", AdamWParameterState::SecondMoment),
+        adamw_parameter_key("weight", AdamWParameterState::GradientAccumulator),
     ];
     assert_eq!(specs[0].members, expected_keys);
 
@@ -2653,40 +2653,32 @@ fn adamw_window_topology_matrix_matches_state_phases_checkpoint_and_artifact() {
                 let has_state =
                     |key: RecurrentStateKey| owner.plan.inner.state_values.contains_key(&key);
                 assert!(has_state(RecurrentStateKey::parameter("weight")));
-                assert!(has_state(RecurrentStateKey::adamw_parameter(
+                assert!(has_state(adamw_parameter_key(
                     "weight",
                     AdamWParameterState::FirstMoment,
                 )));
-                assert!(has_state(RecurrentStateKey::adamw_parameter(
+                assert!(has_state(adamw_parameter_key(
                     "weight",
                     AdamWParameterState::SecondMoment,
                 )));
                 assert_eq!(
-                    has_state(RecurrentStateKey::adamw_parameter(
+                    has_state(adamw_parameter_key(
                         "weight",
                         AdamWParameterState::GradientAccumulator,
                     )),
                     accumulating
                 );
-                assert!(has_state(RecurrentStateKey::adamw_global(
-                    AdamWGlobalState::Step,
-                )));
+                assert!(has_state(adamw_global_key(AdamWGlobalState::Step,)));
                 assert_eq!(
-                    has_state(RecurrentStateKey::adamw_global(
-                        AdamWGlobalState::AccumulationIndex,
-                    )),
+                    has_state(adamw_global_key(AdamWGlobalState::AccumulationIndex,)),
                     accumulating
                 );
                 assert_eq!(
-                    has_state(RecurrentStateKey::adamw_global(
-                        AdamWGlobalState::AccumulatedTokenCount,
-                    )),
+                    has_state(adamw_global_key(AdamWGlobalState::AccumulatedTokenCount,)),
                     accumulating && token_weighted
                 );
                 assert_eq!(
-                    has_state(RecurrentStateKey::adamw_global(
-                        AdamWGlobalState::AccumulatedLossNumerator,
-                    )),
+                    has_state(adamw_global_key(AdamWGlobalState::AccumulatedLossNumerator,)),
                     window_loss_report
                 );
                 assert_eq!(owner.plan.inner.accumulation.is_some(), accumulating);
@@ -2794,6 +2786,22 @@ fn adamw_window_topology_matrix_matches_state_phases_checkpoint_and_artifact() {
                         );
                     }
                 });
+                if accumulation_steps == 1
+                    && matches!(token_policy, TokenPolicy::None)
+                    && !window_loss_report
+                {
+                    let (bytes, _) = program_artifact::rewrite_json_for_test(&artifact, |json| {
+                        let states = json["main"]["optimizer_buffers"].as_object_mut().unwrap();
+                        let buffer = states.remove("slot:weight:first_moment").unwrap();
+                        states.insert("slot:weight:momentum".into(), buffer);
+                    });
+                    let error = CompiledTrainingProgramArtifact::from_bytes(bytes).unwrap_err();
+                    assert!(matches!(
+                        error,
+                        Error::SessionTraining { reason }
+                            if reason == "compiled recurrent state key is invalid"
+                    ));
+                }
             }
         }
     }
@@ -3137,7 +3145,7 @@ fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
             .phase()
             .state_buffers
             .keys()
-            .all(RecurrentStateKey::is_accumulation_reset_state)
+            .all(is_adamw_accumulation_reset_state)
     );
     let mut overflow = plan.prepare_cpu().unwrap();
     overflow.step(batch(), lr()).unwrap();
@@ -3239,7 +3247,7 @@ fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
         .phase()
         .state_buffers
         .iter()
-        .filter(|(key, _)| !key.is_accumulation_reset_state())
+        .filter(|(key, _)| !is_adamw_accumulation_reset_state(key))
         .map(|(_, buffer)| *buffer)
         .collect::<BTreeSet<_>>();
     assert!(!expected_retained_buffers.is_empty());
@@ -3458,6 +3466,64 @@ fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
         actual.outputs(),
         expected.outputs(),
     );
+    let reset_transition = plan.zero_grad.as_ref().unwrap().clone();
+    let before_decoder_failure = interpreted.checkpoint().unwrap();
+    let before_decoder_cursor = interpreted.inner.cursor.clone();
+    let decoder_error = interpreted
+        .inner
+        .replay_recurrent_phase(
+            reset_transition.phase(),
+            RecurrentPhaseReplayRequest {
+                learning_rate: None,
+                non_finite_policy: CpuNonFinitePolicy::Propagate,
+                injected_failure: None,
+            },
+            |_| -> std::result::Result<(), String> {
+                Err("test auxiliary decoder rejected staged outputs".to_owned())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        decoder_error,
+        Error::SessionTraining {
+            reason: "compiled replay: Execute(\"test auxiliary decoder rejected staged outputs\")"
+                .into(),
+        }
+    );
+    assert_eq!(interpreted.inner.cursor, before_decoder_cursor);
+    assert_eq!(interpreted.checkpoint().unwrap(), before_decoder_failure);
+
+    let before_native_decoder_failure = native.checkpoint().unwrap();
+    let before_native_decoder_cursor = native.inner.inner.cursor.clone();
+    let decoder_error = {
+        let prepared = native.zero_grad_replay.as_mut().unwrap();
+        native.inner.inner.replay_recurrent_phase_native(
+            reset_transition.phase(),
+            RecurrentPhaseReplayRequest {
+                learning_rate: None,
+                non_finite_policy: CpuNonFinitePolicy::Propagate,
+                injected_failure: None,
+            },
+            NativeReplayContext::new(&executor, prepared),
+            1,
+            |_| -> std::result::Result<(), String> {
+                Err("test native auxiliary decoder rejected staged outputs".to_owned())
+            },
+        )
+    }
+    .unwrap_err();
+    assert_eq!(
+        decoder_error,
+        Error::SessionTraining {
+            reason:
+                "compiled replay: Execute(\"test native auxiliary decoder rejected staged outputs\")"
+                    .into(),
+        }
+    );
+    assert_eq!(native.inner.inner.cursor, before_native_decoder_cursor);
+    assert_eq!(native.checkpoint().unwrap(), before_native_decoder_failure);
+    assert_eq!(native.successful_zero_grads, 0);
+
     let before_failed_reset = native.checkpoint().unwrap();
     let before_failed_reset_counts = native_recurrent_test_counts(&native);
     assert_eq!(native.successful_zero_grads, 0);
@@ -4757,7 +4823,7 @@ fn optimizer_neutral_plan_renders_momentum_through_shared_metal_core() {
         metal
             .state_input_keys
             .values()
-            .filter_map(RecurrentStateKey::momentum_parameter_name)
+            .filter_map(momentum_parameter_name)
             .collect::<Vec<_>>(),
         ["weight"]
     );
@@ -9098,7 +9164,7 @@ fn adamw_accumulation_failure_preserves_the_partial_frontier() {
 
     let cursor = compiled.inner.cursor.clone();
     let malformed = BTreeMap::from([(
-        RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
+        adamw_global_key(AdamWGlobalState::AccumulationIndex),
         TensorData::scalar(0.0),
     )]);
     let step = compiled.step_count();
@@ -9158,7 +9224,7 @@ fn adamw_zero_grad_discards_only_the_partial_window_and_resumes_exactly() {
     assert_eq!(cancelled.second_moment_versions().unwrap(), second_versions);
     let state_versions_after_reset = cancelled.inner.plan().unwrap().state_versions;
     for (key, before) in &state_versions_before_reset {
-        let expected = if key.is_accumulation_reset_state() {
+        let expected = if is_adamw_accumulation_reset_state(key) {
             before.checked_add(1).unwrap()
         } else {
             *before
@@ -9750,6 +9816,19 @@ fn momentum_program_artifact_restores_without_rebuilding_the_training_graph() {
         assert!(json.get("adamw").is_none());
         assert_eq!(json["momentum_sgd"], serde_json::json!({}));
     });
+    for foreign_role in ["first_moment", "unknown_optimizer_role"] {
+        let (bytes, _) = program_artifact::rewrite_json_for_test(&artifact, |json| {
+            let states = json["main"]["optimizer_buffers"].as_object_mut().unwrap();
+            let buffer = states.remove("slot:shared:momentum").unwrap();
+            states.insert(format!("slot:shared:{foreign_role}"), buffer);
+        });
+        let error = CompiledTrainingProgramArtifact::from_bytes(bytes).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::SessionTraining { reason }
+                if reason == "compiled recurrent state key is invalid"
+        ));
+    }
 
     let mut uninterrupted = owner.prepare(&CpuSessionTarget).unwrap();
     let first_inputs =

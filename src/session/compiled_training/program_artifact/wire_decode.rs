@@ -2,19 +2,43 @@
 
 use super::*;
 
+pub(super) fn optimizer_state_schema(optimizer: &OptimizerPolicyWire) -> OptimizerStateSchema {
+    match optimizer {
+        OptimizerPolicyWire::AdamW { .. } => ADAMW_STATE_SCHEMA,
+        OptimizerPolicyWire::MomentumSgd { .. } => MOMENTUM_STATE_SCHEMA,
+    }
+}
+
+pub(super) fn optimizer_resets_state(
+    optimizer: &OptimizerPolicyWire,
+    key: &RecurrentStateKey,
+) -> bool {
+    match optimizer {
+        OptimizerPolicyWire::AdamW { .. } => is_adamw_accumulation_reset_state(key),
+        OptimizerPolicyWire::MomentumSgd { .. } => false,
+    }
+}
+
 pub(super) fn decode_key_map(
     map: &BTreeMap<String, u64>,
+    schema: OptimizerStateSchema,
 ) -> Result<BTreeMap<RecurrentStateKey, u64>> {
     map.iter()
-        .map(|(key, buffer)| Ok((RecurrentStateKey::from_canonical(key)?, *buffer)))
+        .map(|(key, buffer)| Ok((RecurrentStateKey::from_canonical(key, schema)?, *buffer)))
         .collect()
 }
 
 pub(super) fn decode_input_key_map(
     map: &BTreeMap<String, String>,
+    schema: OptimizerStateSchema,
 ) -> Result<BTreeMap<String, RecurrentStateKey>> {
     map.iter()
-        .map(|(input, key)| Ok((input.clone(), RecurrentStateKey::from_canonical(key)?)))
+        .map(|(input, key)| {
+            Ok((
+                input.clone(),
+                RecurrentStateKey::from_canonical(key, schema)?,
+            ))
+        })
         .collect()
 }
 
@@ -75,8 +99,9 @@ pub(super) fn decode_manifest(
 pub(super) fn validate_phase_capture(
     wire: &PhaseWire,
     capture: &CapturedMixedSchedule,
+    schema: OptimizerStateSchema,
 ) -> Result<BTreeMap<RecurrentStateKey, u64>> {
-    let state_buffers = decode_key_map(&wire.state_buffers)?;
+    let state_buffers = decode_key_map(&wire.state_buffers, schema)?;
     let frontier = capture
         .initial_recurrent_cursor()
         .map_err(replay_error)?
@@ -113,7 +138,7 @@ pub(super) fn validate_phase_capture(
             Ok(inputs)
         },
     )?;
-    let input_keys = decode_input_key_map(&wire.state_input_keys)?;
+    let input_keys = decode_input_key_map(&wire.state_input_keys, schema)?;
     if captured_inputs.keys().ne(input_keys.keys())
         || input_keys
             .iter()
@@ -131,10 +156,11 @@ pub(super) fn decode_auxiliary(
     wire: &PhaseWire,
     capture: Arc<CapturedMixedSchedule>,
     admitted_recurrent: Option<CompiledRecurrentCapture>,
+    schema: OptimizerStateSchema,
 ) -> Result<CompiledAdamWAuxiliaryPlan> {
     #[cfg(test)]
     update_decode_counts(|counts| counts.topology_phase_validations += 1);
-    let state_buffers = validate_phase_capture(wire, capture.as_ref())?;
+    let state_buffers = validate_phase_capture(wire, capture.as_ref(), schema)?;
     let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
         wire.clip_report,
         wire.window_loss_report,
@@ -168,7 +194,7 @@ pub(super) fn decode_auxiliary(
                     .collect::<Result<_>>()?,
             },
         },
-        state_input_keys: decode_input_key_map(&wire.state_input_keys)?,
+        state_input_keys: decode_input_key_map(&wire.state_input_keys, schema)?,
         outputs,
     })
 }

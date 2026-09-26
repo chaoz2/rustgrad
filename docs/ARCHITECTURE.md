@@ -931,11 +931,25 @@ private optimizer-program interface separates optimizer state and update math
 from the shared execution machinery:
 
 - The compiler, capture, replay, and effect-commit engine are shared.
+- The private `CpuCompiledTrainingProgram` owns recurrent CPU execution and
+  state, not optimizer policy. Its phase request carries the learning-rate
+  input, nonfinite policy, and failure injection; optimizer adapters decode
+  phase outputs inside checked replay, before recurrent state is committed.
+  Decoder rejection therefore leaves the frontier unchanged.
 - After lowering, an optimizer-neutral Metal core owns recurrent rendering,
   resource preparation, input validation, output projection, evaluation,
   scoreboard observation, and semantic state snapshots.
 - The AdamW facade adds progress and policy interpretation plus its portable
   checkpoint.
+
+The private `state_schema` module distinguishes parameters, per-parameter
+optimizer slots, global optimizer state, and workload state. Optimizer roles
+are opaque to that common layer: `optimizer_lowering` owns their allowed
+schemas, descriptors, selection, and reset policy. Artifact decoding receives
+the selected optimizer schema and rejects unknown or cross-optimizer roles.
+Canonical key spelling and ordering remain unchanged, including parameter
+names containing punctuation, so this ownership split does not alter valid
+capture or checkpoint identities.
 
 | Contract | Architectural owner |
 |---|---|

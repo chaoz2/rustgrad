@@ -87,7 +87,9 @@ impl CpuCompiledAdamW {
         let topology = CompiledTrainingWindowTopology::from_contract(&self.contract);
         let retained = if topology.retains_token_count() {
             self.inner
-                .global_snapshot(AdamWGlobalState::AccumulatedTokenCount)?
+                .optimizer_state_snapshot(&adamw_global_key(
+                    AdamWGlobalState::AccumulatedTokenCount,
+                ))?
                 .scalar_at(0)
                 .as_u64()
         } else {
@@ -112,7 +114,7 @@ impl CpuCompiledAdamW {
         }
         let retained = self
             .inner
-            .global_snapshot(AdamWGlobalState::AccumulatedTokenCount)?
+            .optimizer_state_snapshot(&adamw_global_key(AdamWGlobalState::AccumulatedTokenCount))?
             .scalar_at(0)
             .as_u64();
         if retained == 0 {
@@ -414,20 +416,24 @@ impl CpuCompiledAdamW {
     }
 
     pub fn first_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.inner
-            .adamw_state_snapshots(AdamWParameterState::FirstMoment)
+        self.inner.optimizer_state_snapshots(|key| {
+            parameter_for_adamw_state(key, AdamWParameterState::FirstMoment).map(str::to_owned)
+        })
     }
 
     pub fn second_moment_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.inner
-            .adamw_state_snapshots(AdamWParameterState::SecondMoment)
+        self.inner.optimizer_state_snapshots(|key| {
+            parameter_for_adamw_state(key, AdamWParameterState::SecondMoment).map(str::to_owned)
+        })
     }
 
     /// Partial F32 gradient sums retained between microbatches. The map is
     /// empty when accumulation is disabled (`steps == 1`).
     pub fn gradient_accumulator_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.inner
-            .adamw_state_snapshots(AdamWParameterState::GradientAccumulator)
+        self.inner.optimizer_state_snapshots(|key| {
+            parameter_for_adamw_state(key, AdamWParameterState::GradientAccumulator)
+                .map(str::to_owned)
+        })
     }
 
     /// Number of microbatches currently retained toward the next update.
@@ -457,11 +463,17 @@ impl CpuCompiledAdamW {
             .zero_grad
             .as_ref()
             .ok_or_else(|| training("compiled AdamW zero-grad capture is absent"))?;
-        let reports = self.inner.replay_auxiliary_transition(
-            transition,
-            None,
-            CpuNonFinitePolicy::Propagate,
-            injected_failure,
+        let output_schema = transition.outputs.clone();
+        let reports = self.inner.replay_recurrent_phase(
+            transition.phase(),
+            RecurrentPhaseReplayRequest {
+                learning_rate: None,
+                non_finite_policy: CpuNonFinitePolicy::Propagate,
+                injected_failure,
+            },
+            move |outputs| {
+                output_schema.validate_and_decode(outputs, CpuNonFinitePolicy::Propagate)
+            },
         )?;
         debug_assert!(reports.clip_report.is_none());
         debug_assert!(reports.window_loss.is_none());
@@ -517,11 +529,16 @@ impl CpuCompiledAdamW {
             .partial_flush
             .as_ref()
             .ok_or_else(|| training("compiled AdamW partial flush capture is absent"))?;
-        let reports = self.inner.replay_auxiliary_transition(
-            transition,
-            learning_rate,
-            self.non_finite_policy,
-            injected_failure,
+        let output_schema = transition.outputs.clone();
+        let non_finite_policy = self.non_finite_policy;
+        let reports = self.inner.replay_recurrent_phase(
+            transition.phase(),
+            RecurrentPhaseReplayRequest {
+                learning_rate,
+                non_finite_policy,
+                injected_failure,
+            },
+            move |outputs| output_schema.validate_and_decode(outputs, non_finite_policy),
         )?;
         result.clip_report = reports.clip_report;
         result.window_loss_report = reports
@@ -550,13 +567,15 @@ impl CpuCompiledAdamW {
     }
 
     pub fn first_moment_versions(&self) -> Result<BTreeMap<String, u64>> {
-        self.inner
-            .adamw_state_versions(AdamWParameterState::FirstMoment)
+        self.inner.optimizer_state_versions(|key| {
+            parameter_for_adamw_state(key, AdamWParameterState::FirstMoment).map(str::to_owned)
+        })
     }
 
     pub fn second_moment_versions(&self) -> Result<BTreeMap<String, u64>> {
-        self.inner
-            .adamw_state_versions(AdamWParameterState::SecondMoment)
+        self.inner.optimizer_state_versions(|key| {
+            parameter_for_adamw_state(key, AdamWParameterState::SecondMoment).map(str::to_owned)
+        })
     }
 
     pub(super) fn snapshot_plan(&self) -> Result<CompiledAdamWPlan> {
@@ -632,7 +651,9 @@ impl CpuCompiledAdamW {
             .map(|_| {
                 Ok(self
                     .inner
-                    .global_snapshot(AdamWGlobalState::AccumulatedTokenCount)?
+                    .optimizer_state_snapshot(&adamw_global_key(
+                        AdamWGlobalState::AccumulatedTokenCount,
+                    ))?
                     .scalar_at(0)
                     .as_u64())
             })
@@ -652,8 +673,9 @@ impl CpuCompiledAdamW {
         let accumulated_loss_numerator = topology
             .retains_window_numerator()
             .then(|| {
-                self.inner
-                    .global_snapshot(AdamWGlobalState::AccumulatedLossNumerator)
+                self.inner.optimizer_state_snapshot(&adamw_global_key(
+                    AdamWGlobalState::AccumulatedLossNumerator,
+                ))
             })
             .transpose()?;
         let bytes = encode_adamw_checkpoint(

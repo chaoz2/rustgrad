@@ -503,7 +503,7 @@ impl MetalCompiledAdamW {
             .collect::<BTreeMap<_, _>>();
         let mut replacements = BTreeMap::new();
         for (input, key) in &self.inner.state_input_keys {
-            if key.is_accumulation_reset_state() {
+            if is_adamw_accumulation_reset_state(key) {
                 let desc = state_inputs
                     .get(input.as_str())
                     .ok_or_else(|| training("compiled Metal reset state is absent"))?;
@@ -517,7 +517,7 @@ impl MetalCompiledAdamW {
             .inner
             .state_input_keys
             .values()
-            .filter(|key| key.is_accumulation_reset_state())
+            .filter(|key| is_adamw_accumulation_reset_state(key))
             .count();
         if replacements.len() != expected
             || !replacements
@@ -594,7 +594,7 @@ impl MetalCompiledAdamW {
             false,
         );
         let optimizer_step = states
-            .get(&RecurrentStateKey::adamw_global(AdamWGlobalState::Step))
+            .get(&adamw_global_key(AdamWGlobalState::Step))
             .ok_or_else(|| training("compiled Metal optimizer step is absent"))?
             .scalar_at(0)
             .as_u64();
@@ -602,9 +602,7 @@ impl MetalCompiledAdamW {
             0
         } else {
             states
-                .get(&RecurrentStateKey::adamw_global(
-                    AdamWGlobalState::AccumulationIndex,
-                ))
+                .get(&adamw_global_key(AdamWGlobalState::AccumulationIndex))
                 .ok_or_else(|| training("compiled Metal accumulation index is absent"))?
                 .scalar_at(0)
                 .as_u64()
@@ -817,8 +815,7 @@ fn metal_adamw_state_snapshots(
     Ok(states
         .into_iter()
         .filter_map(|(key, value)| {
-            key.parameter_for_adamw_state(state)
-                .map(|name| (name.to_owned(), value))
+            parameter_for_adamw_state(&key, state).map(|name| (name.to_owned(), value))
         })
         .collect())
 }

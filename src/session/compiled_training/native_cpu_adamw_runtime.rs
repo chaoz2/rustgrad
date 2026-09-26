@@ -409,13 +409,18 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .partial_flush_replay
             .as_mut()
             .ok_or_else(|| training("compiled native CPU partial flush preparation is absent"))?;
-        let (reports, report) = self.inner.inner.replay_auxiliary_transition_native(
-            transition,
-            learning_rate,
-            self.inner.non_finite_policy,
+        let output_schema = transition.outputs.clone();
+        let non_finite_policy = self.inner.non_finite_policy;
+        let (reports, report) = self.inner.inner.replay_recurrent_phase_native(
+            transition.phase(),
+            RecurrentPhaseReplayRequest {
+                learning_rate,
+                non_finite_policy,
+                injected_failure,
+            },
             NativeReplayContext::new(self.executor, prepared),
             successful_invocation,
-            injected_failure,
+            move |outputs| output_schema.validate_and_decode(outputs, non_finite_policy),
         )?;
         result.clip_report = reports.clip_report;
         result.window_loss_report = reports
@@ -510,13 +515,19 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             .zero_grad_replay
             .as_mut()
             .ok_or_else(|| training("compiled native CPU zero-grad preparation is absent"))?;
-        let (reports, _) = self.inner.inner.replay_auxiliary_transition_native(
-            transition,
-            None,
-            CpuNonFinitePolicy::Propagate,
+        let output_schema = transition.outputs.clone();
+        let (reports, _) = self.inner.inner.replay_recurrent_phase_native(
+            transition.phase(),
+            RecurrentPhaseReplayRequest {
+                learning_rate: None,
+                non_finite_policy: CpuNonFinitePolicy::Propagate,
+                injected_failure,
+            },
             NativeReplayContext::new(self.executor, prepared),
             successful_invocation,
-            injected_failure,
+            move |outputs| {
+                output_schema.validate_and_decode(outputs, CpuNonFinitePolicy::Propagate)
+            },
         )?;
         debug_assert!(reports.clip_report.is_none());
         debug_assert!(reports.window_loss.is_none());
