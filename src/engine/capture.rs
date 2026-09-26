@@ -602,6 +602,14 @@ impl CapturedSchedule {
     /// Serializes this graph-independent executable schedule with bounded,
     /// checksummed typed descriptors and exact constant storage.
     pub fn to_bytes(&self) -> Result<Vec<u8>, ReplayError> {
+        self.validate_serialization_operation_eligibility()?;
+        crate::schedule::artifact::encode(self).map_err(|e| ReplayError::Corrupt(e.to_string()))
+    }
+
+    /// Checks operation-level eligibility shared by current capture encoders
+    /// and trusted derived-capture authentication. This is not a substitute
+    /// for full structural, identity, or artifact-envelope validation.
+    pub(crate) fn validate_serialization_operation_eligibility(&self) -> Result<(), ReplayError> {
         if self
             .items
             .iter()
@@ -611,7 +619,7 @@ impl CapturedSchedule {
                 "static sort capture serialization is unsupported".into(),
             ));
         }
-        crate::schedule::artifact::encode(self).map_err(|e| ReplayError::Corrupt(e.to_string()))
+        Ok(())
     }
 
     /// Validates and reconstructs a graph-independent executable schedule.

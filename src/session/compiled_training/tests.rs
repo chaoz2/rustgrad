@@ -1216,24 +1216,81 @@ fn build_tied_frozen(
 fn recurrent_training_phases_derive_from_one_canonical_mixed_capture() {
     let before = canonical_recurrent_capture_counts();
     let module = TiedFrozenModule::new([1.0, -1.0]);
-    let plan = with_canonical_recurrent_reference(|| {
-        CompiledAdamWPlan::compile_module_graph(
-            module_config().with_gradient_accumulation(3).unwrap(),
-            &module,
-            |module, graph, inputs| {
+    let (single, accumulated) = with_canonical_recurrent_reference(|| {
+        let compile = |config| {
+            CompiledAdamWPlan::compile_module_graph(config, &module, |module, graph, inputs| {
                 let (loss, outputs) = build_tied_frozen(module, graph, inputs)?;
                 Ok(CompiledAdamWGraph::scalar(loss, outputs))
-            },
-        )
+            })
+        };
+        Ok::<_, Error>((
+            compile(module_config())?,
+            compile(module_config().with_gradient_accumulation(3)?)?,
+        ))
     })
     .unwrap();
     let counts = canonical_recurrent_capture_delta(before, canonical_recurrent_capture_counts());
 
-    assert_eq!(counts.canonical, 4);
-    assert_eq!(counts.reference, 4);
-    assert!(plan.inner.accumulation.is_some());
-    assert!(plan.partial_flush.is_some());
-    assert!(plan.zero_grad.is_some());
+    assert_eq!(counts.canonical, 5);
+    assert_eq!(counts.reference, 5);
+    assert!(single.inner.accumulation.is_none());
+    assert!(single.partial_flush.is_none());
+    assert!(single.zero_grad.is_none());
+    assert!(accumulated.inner.accumulation.is_some());
+    assert!(accumulated.partial_flush.is_some());
+    assert!(accumulated.zero_grad.is_some());
+
+    let mut captures = vec![
+        single.inner.capture.as_ref(),
+        accumulated.inner.capture.as_ref(),
+    ];
+    captures.push(
+        accumulated
+            .inner
+            .accumulation
+            .as_ref()
+            .unwrap()
+            .phase()
+            .capture
+            .as_ref(),
+    );
+    captures.push(
+        accumulated
+            .partial_flush
+            .as_ref()
+            .unwrap()
+            .phase()
+            .capture
+            .as_ref(),
+    );
+    captures.push(
+        accumulated
+            .zero_grad
+            .as_ref()
+            .unwrap()
+            .phase()
+            .capture
+            .as_ref(),
+    );
+    for capture in captures {
+        recurrent_prefix_matches_codec_reference(capture).unwrap();
+        let decoded = CapturedMixedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();
+        recurrent_prefix_matches_codec_reference(&decoded).unwrap();
+    }
+
+    let mut malformed = accumulated.inner.capture.as_ref().clone();
+    assert!(
+        malformed
+            .schedule
+            .items
+            .iter()
+            .all(|item| { item.outputs.iter().all(|output| output.id != u64::MAX) })
+    );
+    malformed.value_bindings[0].producer_output.id = u64::MAX;
+    assert!(recurrent_prefix_error_matches_codec_reference(&malformed));
+    assert!(recurrent_prefix_item_key_error_matches_codec_reference(
+        accumulated.inner.capture.as_ref()
+    ));
 }
 
 fn tied_token_mean_config() -> CompiledAdamWConfig {
