@@ -81,11 +81,12 @@ pub(crate) use inference::{
 pub use native_training_scoreboard::{
     CompiledAdamWInspection, CompiledTrainingCompileObservation,
     CompiledTrainingCompilePhaseObservation, CompiledTrainingInspection,
-    NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeTrainingCompilePhase,
-    NativeTrainingCompilePhaseReport, NativeTrainingFirstStepReport,
-    NativeTrainingPreparationTiming, NativeTrainingProgramReport, NativeTrainingReplayTiming,
-    NativeTrainingReport, NativeTrainingScoreboard, NativeTrainingStepPhase,
-    NativeTrainingStepPhaseReport, NativeTrainingWarmStepReport,
+    CompiledTrainingRecurrentCaptureObservation, NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+    NativeTrainingCompilePhase, NativeTrainingCompilePhaseReport, NativeTrainingFirstStepReport,
+    NativeTrainingPreparationTiming, NativeTrainingProgramReport,
+    NativeTrainingRecurrentCaptureReport, NativeTrainingReplayTiming, NativeTrainingReport,
+    NativeTrainingScoreboard, NativeTrainingStepPhase, NativeTrainingStepPhaseReport,
+    NativeTrainingWarmStepReport,
 };
 pub use target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,
