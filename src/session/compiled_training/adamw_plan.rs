@@ -33,10 +33,10 @@ pub(super) struct AdamWPlanCaptureAllocations {
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AdamWPlanTopologyAllocations {
-    pub(super) main: (usize, usize),
-    pub(super) accumulation: Option<(usize, usize, usize)>,
-    pub(super) partial_flush: Option<(usize, usize, usize)>,
-    pub(super) zero_grad: Option<(usize, usize, usize)>,
+    pub(super) main: (usize, usize, usize),
+    pub(super) accumulation: Option<(usize, usize, usize, usize)>,
+    pub(super) partial_flush: Option<(usize, usize, usize, usize)>,
+    pub(super) zero_grad: Option<(usize, usize, usize, usize)>,
     pub(super) evaluation: Option<(usize, usize)>,
 }
 
@@ -663,6 +663,7 @@ impl CompiledAdamWPlan {
         let phase = |phase: &CompiledRecurrentPhasePlan| {
             (
                 Arc::as_ptr(&phase.capture) as usize,
+                Arc::as_ptr(&phase.recurrent_frontier) as usize,
                 phase.recurrent_capture.execution_plan_allocation_identity(),
                 Arc::as_ptr(&phase.cursor_projection) as usize,
             )
@@ -670,6 +671,7 @@ impl CompiledAdamWPlan {
         AdamWPlanTopologyAllocations {
             main: (
                 Arc::as_ptr(&self.inner.capture) as usize,
+                Arc::as_ptr(&self.inner.recurrent_frontier) as usize,
                 self.inner
                     .recurrent_capture
                     .execution_plan_allocation_identity(),
@@ -874,7 +876,7 @@ impl CompiledAdamWPlan {
         );
         let accumulation = self.inner.accumulation.as_ref().map(|transition| {
             (
-                transition.phase().capture_identity,
+                transition.phase().capture_identity(),
                 transition
                     .phase()
                     .recurrent_capture
@@ -947,7 +949,7 @@ impl CompiledAdamWPlan {
         self.inner
             .accumulation
             .as_ref()
-            .map(|transition| transition.phase().capture_identity)
+            .map(|transition| transition.phase().capture_identity())
     }
 
     /// Stable identity of the state-only flush capture, when accumulation is

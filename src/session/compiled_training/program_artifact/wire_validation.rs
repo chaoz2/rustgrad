@@ -33,17 +33,7 @@ impl ProgramWire {
         identity: u64,
         captures: &ProgramCaptures,
     ) -> Result<CompiledTrainingProgramArtifactInfo> {
-        let capture_identity = captures
-            .main
-            .initial_recurrent_cursor()
-            .map_err(replay_error)?
-            .capture_identity();
-        let phase_identity = |capture: &CapturedMixedSchedule| -> Result<u64> {
-            Ok(capture
-                .initial_recurrent_cursor()
-                .map_err(replay_error)?
-                .capture_identity())
-        };
+        let capture_identity = captures.main.capture_identity();
         let evaluation_capture_identity = captures
             .evaluation
             .as_ref()
@@ -66,18 +56,15 @@ impl ProgramWire {
             accumulation_capture_identity: captures
                 .accumulation
                 .as_ref()
-                .map(|capture| phase_identity(capture.as_ref()))
-                .transpose()?,
+                .map(|frontier| frontier.capture_identity()),
             flush_capture_identity: captures
                 .partial_flush
                 .as_ref()
-                .map(|capture| phase_identity(capture.as_ref()))
-                .transpose()?,
+                .map(|frontier| frontier.capture_identity()),
             zero_grad_capture_identity: captures
                 .zero_grad
                 .as_ref()
-                .map(|capture| phase_identity(capture.as_ref()))
-                .transpose()?,
+                .map(|frontier| frontier.capture_identity()),
             evaluation_capture_identity,
         })
     }
@@ -385,11 +372,15 @@ impl ProgramWire {
         Ok(())
     }
 
-    fn validate_main(&self, main_capture: &CapturedMixedSchedule) -> Result<ValidatedMain> {
+    fn validate_main(
+        &self,
+        main_frontier: &AuthenticatedRecurrentFrontier,
+    ) -> Result<ValidatedMain> {
+        let main_capture = main_frontier.capture();
         self.validate_main_inventory()?;
         let captured_states = validate_phase_capture(
             &self.main.phase,
-            main_capture,
+            main_frontier,
             optimizer_state_schema(&self.optimizer),
         )?;
         self.validate_parameter_policy()?;
@@ -427,13 +418,17 @@ impl ProgramWire {
         &self,
         main: &ValidatedMain,
         phase: &PhaseWire,
-        capture: &CapturedMixedSchedule,
+        recurrent_frontier: &AuthenticatedRecurrentFrontier,
     ) -> Result<()> {
+        let capture = recurrent_frontier.capture();
         if phase.clip_report || phase.window_loss_report {
             return Err(training("compiled accumulation artifact exposes reports"));
         }
-        let states =
-            validate_phase_capture(phase, capture, optimizer_state_schema(&self.optimizer))?;
+        let states = validate_phase_capture(
+            phase,
+            recurrent_frontier,
+            optimizer_state_schema(&self.optimizer),
+        )?;
         if states != main.states
             || capture.schedule.requested.len() != 1 + self.main.output_names.len()
             || phase_external_inputs(capture, phase).ne(self.main.inputs.keys().cloned())
@@ -449,8 +444,9 @@ impl ProgramWire {
         &self,
         main: &ValidatedMain,
         phase: &PhaseWire,
-        capture: &CapturedMixedSchedule,
+        recurrent_frontier: &AuthenticatedRecurrentFrontier,
     ) -> Result<()> {
+        let capture = recurrent_frontier.capture();
         let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
             phase.clip_report,
             phase.window_loss_report,
@@ -461,8 +457,11 @@ impl ProgramWire {
                 "compiled zero-grad artifact exposes update outputs",
             ));
         }
-        let states =
-            validate_phase_capture(phase, capture, optimizer_state_schema(&self.optimizer))?;
+        let states = validate_phase_capture(
+            phase,
+            recurrent_frontier,
+            optimizer_state_schema(&self.optimizer),
+        )?;
         if states != main.zero_grad_states
             || !capture.schedule.requested.is_empty()
             || phase_external_inputs(capture, phase).next().is_some()
@@ -476,15 +475,19 @@ impl ProgramWire {
         &self,
         main: &ValidatedMain,
         phase: &PhaseWire,
-        capture: &CapturedMixedSchedule,
+        recurrent_frontier: &AuthenticatedRecurrentFrontier,
     ) -> Result<()> {
+        let capture = recurrent_frontier.capture();
         let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
             phase.clip_report,
             phase.window_loss_report,
         );
         outputs.validate_report_flags(self.clip_report, self.window_loss_report)?;
-        let states =
-            validate_phase_capture(phase, capture, optimizer_state_schema(&self.optimizer))?;
+        let states = validate_phase_capture(
+            phase,
+            recurrent_frontier,
+            optimizer_state_schema(&self.optimizer),
+        )?;
         let expected_outputs = outputs.observations.len();
         let has_learning_rate = capture
             .schedule
@@ -513,21 +516,21 @@ impl ProgramWire {
         main: &ValidatedMain,
         captures: &ProgramCaptures,
     ) -> Result<()> {
-        if let (Some(phase), Some(capture)) = (&self.accumulation, &captures.accumulation) {
-            self.validate_accumulation(main, phase, capture.as_ref())?;
+        if let (Some(phase), Some(frontier)) = (&self.accumulation, &captures.accumulation) {
+            self.validate_accumulation(main, phase, frontier.as_ref())?;
         }
-        if let (Some(phase), Some(capture)) = (&self.zero_grad, &captures.zero_grad) {
-            self.validate_zero_grad(main, phase, capture.as_ref())?;
+        if let (Some(phase), Some(frontier)) = (&self.zero_grad, &captures.zero_grad) {
+            self.validate_zero_grad(main, phase, frontier.as_ref())?;
         }
-        if let (Some(phase), Some(capture)) = (&self.partial_flush, &captures.partial_flush) {
-            self.validate_partial_flush(main, phase, capture.as_ref())?;
+        if let (Some(phase), Some(frontier)) = (&self.partial_flush, &captures.partial_flush) {
+            self.validate_partial_flush(main, phase, frontier.as_ref())?;
         }
         Ok(())
     }
 
     fn validate_evaluation(
         &self,
-        main_capture: &CapturedMixedSchedule,
+        main_frontier: &AuthenticatedRecurrentFrontier,
         capture: Option<&CapturedSchedule>,
     ) -> Result<()> {
         if let (Some(evaluation), Some(capture)) = (&self.evaluation, capture) {
@@ -547,10 +550,8 @@ impl ProgramWire {
                 .iter()
                 .map(|input| input.name.clone())
                 .collect::<BTreeSet<_>>();
-            let main_descriptors = main_capture
-                .initial_recurrent_cursor()
-                .map_err(replay_error)?
-                .frontier()
+            let main_descriptors = main_frontier
+                .initial_frontier()
                 .iter()
                 .map(|state| (state.buffer, (state.shape.clone(), state.dtype)))
                 .collect::<BTreeMap<_, _>>();

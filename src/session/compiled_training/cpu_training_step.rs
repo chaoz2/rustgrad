@@ -373,7 +373,7 @@ impl CpuCompiledTrainingProgram {
             .as_ref()
             .expect("strict-native recurrent replay returns a native trace");
         let report = native_cpu_run_report(
-            transition.phase().capture_identity,
+            transition.phase().capture_identity(),
             native,
             traffic,
             executor_wall_time,

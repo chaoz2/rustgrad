@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod recurrent_frontier;
+pub(crate) use recurrent_frontier::AuthenticatedRecurrentFrontier;
+
 const MAGIC: &[u8; 4] = b"RGSM";
 /// v3 adopts canonical schedule item/state-binding keys. v1-v2 retain opaque
 /// historical keys and are upgraded only after their stored envelope passes.
@@ -30,6 +33,7 @@ pub(crate) struct PreparedReplayValidationCounts {
     pub(crate) schedule_rekeys: usize,
     pub(crate) identity_serializations: usize,
     pub(crate) recurrent_frontier_plans: usize,
+    pub(crate) recurrent_frontier_authentications: usize,
     pub(crate) cursor_projection_preparations: usize,
     pub(crate) recurrent_bank_layouts: usize,
 }
@@ -43,6 +47,7 @@ std::thread_local! {
                 schedule_rekeys: 0,
                 identity_serializations: 0,
                 recurrent_frontier_plans: 0,
+                recurrent_frontier_authentications: 0,
                 cursor_projection_preparations: 0,
                 recurrent_bank_layouts: 0,
             })
@@ -229,6 +234,7 @@ pub(crate) enum RecurrentCursorProjectionError {
 }
 
 impl PreparedRecurrentCursorProjection {
+    #[cfg(test)]
     pub(crate) fn prepare(
         source: &CapturedMixedSchedule,
         target: &CapturedMixedSchedule,
@@ -242,6 +248,38 @@ impl PreparedRecurrentCursorProjection {
         let target_capture_identity = identity(target)?;
         let source_schema = recurrent_initial_frontier(source)?;
         let target_schema = recurrent_initial_frontier(target)?;
+        Self::from_authenticated_parts(
+            source_capture_identity,
+            target_capture_identity,
+            source_schema,
+            target_schema,
+            target_buffers,
+        )
+    }
+
+    pub(crate) fn prepare_authenticated(
+        source: &AuthenticatedRecurrentFrontier,
+        target: &AuthenticatedRecurrentFrontier,
+        target_buffers: impl IntoIterator<Item = u64>,
+    ) -> Result<Self, ReplayError> {
+        #[cfg(test)]
+        record_prepared_replay_validation(|counts| counts.cursor_projection_preparations += 1);
+        Self::from_authenticated_parts(
+            source.capture_identity(),
+            target.capture_identity(),
+            source.initial_frontier().to_vec(),
+            target.initial_frontier().to_vec(),
+            target_buffers,
+        )
+    }
+
+    fn from_authenticated_parts(
+        source_capture_identity: u64,
+        target_capture_identity: u64,
+        source_schema: Vec<BufferState>,
+        target_schema: Vec<BufferState>,
+        target_buffers: impl IntoIterator<Item = u64>,
+    ) -> Result<Self, ReplayError> {
         let mut target_buffer_set = BTreeSet::new();
         for buffer in target_buffers {
             if !target_buffer_set.insert(buffer) {
@@ -286,10 +324,6 @@ impl PreparedRecurrentCursorProjection {
             target_schema: target_schema.into_boxed_slice(),
             target_to_source: target_to_source.into_boxed_slice(),
         })
-    }
-
-    pub(crate) const fn target_capture_identity(&self) -> u64 {
-        self.target_capture_identity
     }
 
     #[cfg(test)]
@@ -3579,23 +3613,59 @@ mod recurrent_tests {
     #[test]
     fn prepared_cursor_projection_reuses_authenticated_schema_without_capture_work() {
         let (capture, _runtime) = fixture(331);
-        let mut source = capture.initial_recurrent_cursor().unwrap();
-        reset_prepared_replay_validation_counts();
-        let projection =
+        let raw_projection =
             PreparedRecurrentCursorProjection::prepare(&capture, &capture, [331]).unwrap();
-        let preparation = prepared_replay_validation_counts();
-        assert_eq!(preparation.cursor_projection_preparations, 1);
-        assert!(preparation.mixed_capture_validations > 0);
-        assert!(preparation.schedule_rekeys > 0);
-        assert!(preparation.identity_serializations > 0);
-        assert!(preparation.recurrent_frontier_plans > 0);
+        let capture = std::sync::Arc::new(capture);
+        reset_prepared_replay_validation_counts();
+        let authenticated = AuthenticatedRecurrentFrontier::authenticate(capture.clone()).unwrap();
+        assert_eq!(
+            authenticated.capture_allocation_identity(),
+            std::sync::Arc::as_ptr(&capture) as usize,
+            "the schema must own the exact capture allocation it authenticates"
+        );
+        let authentication = prepared_replay_validation_counts();
+        assert_eq!(authentication.recurrent_frontier_authentications, 1);
+        assert_eq!(authentication.mixed_capture_validations, 1);
+        assert_eq!(authentication.schedule_rekeys, 1);
+        assert_eq!(authentication.identity_serializations, 1);
+        assert_eq!(authentication.recurrent_frontier_plans, 1);
+        reset_prepared_replay_validation_counts();
+        let projection = PreparedRecurrentCursorProjection::prepare_authenticated(
+            &authenticated,
+            &authenticated,
+            [331],
+        )
+        .unwrap();
+        assert_eq!(
+            projection.source_capture_identity,
+            raw_projection.source_capture_identity
+        );
+        assert_eq!(
+            projection.target_capture_identity,
+            raw_projection.target_capture_identity
+        );
+        assert_eq!(projection.source_schema, raw_projection.source_schema);
+        assert_eq!(projection.target_schema, raw_projection.target_schema);
+        assert_eq!(projection.target_to_source, raw_projection.target_to_source);
+        assert_eq!(
+            prepared_replay_validation_counts(),
+            PreparedReplayValidationCounts {
+                cursor_projection_preparations: 1,
+                ..Default::default()
+            }
+        );
         assert!(matches!(
-            PreparedRecurrentCursorProjection::prepare(&capture, &capture, [331, 331]),
+            PreparedRecurrentCursorProjection::prepare_authenticated(
+                &authenticated,
+                &authenticated,
+                [331, 331]
+            ),
             Err(ReplayError::Descriptor(message))
                 if message == "prepared recurrent cursor projection target buffer repeats"
         ));
         reset_prepared_replay_validation_counts();
 
+        let mut source = authenticated.initial_cursor();
         source.frontier[0].version = 53;
         let mut first = projection.project(&source).unwrap();
         assert_eq!(first.cursor().capture_identity(), source.capture_identity());
@@ -3643,6 +3713,82 @@ mod recurrent_tests {
         ));
         assert_eq!(source.frontier()[0].version, 18);
         assert_eq!(prepared_replay_validation_counts(), Default::default());
+    }
+
+    #[test]
+    fn raw_cursor_projection_preserves_capture_validation_error_order() {
+        let (valid, _runtime) = fixture(332);
+        let mut bad_source = valid.clone();
+        bad_source.schedule.requested.push(u64::MAX);
+        let mut bad_target = valid.clone();
+        bad_target.schedule.requested.push(u64::MAX - 1);
+
+        reset_prepared_replay_validation_counts();
+        assert!(matches!(
+            PreparedRecurrentCursorProjection::prepare(&bad_source, &bad_target, [332, 332]),
+            Err(ReplayError::Corrupt(_))
+        ));
+        let source_failure = prepared_replay_validation_counts();
+        assert_eq!(source_failure.mixed_capture_validations, 1);
+        assert_eq!(source_failure.identity_serializations, 0);
+        assert_eq!(source_failure.recurrent_frontier_plans, 0);
+
+        reset_prepared_replay_validation_counts();
+        assert!(matches!(
+            PreparedRecurrentCursorProjection::prepare(&valid, &bad_target, [332, 332]),
+            Err(ReplayError::Corrupt(_))
+        ));
+        let target_failure = prepared_replay_validation_counts();
+        assert_eq!(target_failure.mixed_capture_validations, 2);
+        assert_eq!(target_failure.identity_serializations, 0);
+        assert_eq!(target_failure.recurrent_frontier_plans, 0);
+    }
+
+    #[test]
+    fn mixed_capture_identity_ignores_the_stored_schedule_identity_field() {
+        let (capture, _runtime) = fixture(333);
+        let expected = identity(&capture).unwrap();
+        let mut changed = capture.clone();
+        changed.schedule.identity ^= u64::MAX;
+        assert_eq!(identity(&changed).unwrap(), expected);
+        assert_eq!(
+            changed.to_bytes_without_identity().unwrap(),
+            capture.to_bytes_without_identity().unwrap()
+        );
+    }
+
+    #[test]
+    fn authenticated_frontier_keeps_same_descriptor_programs_associated() {
+        let (first, _runtime) = fixture(334);
+        let mut second = first.clone();
+        second
+            .schedule
+            .inputs
+            .iter_mut()
+            .find(|input| input.name == "delta")
+            .unwrap()
+            .name = "other_delta".into();
+        crate::schedule::rekey_schedule_items(
+            &mut second.schedule.items,
+            &second.state_bindings,
+            None,
+        )
+        .unwrap();
+        let first = std::sync::Arc::new(first);
+        let second = std::sync::Arc::new(second);
+        let first = AuthenticatedRecurrentFrontier::authenticate(first).unwrap();
+        let second = AuthenticatedRecurrentFrontier::authenticate(second).unwrap();
+        assert_eq!(first.initial_frontier(), second.initial_frontier());
+        assert_ne!(first.capture_identity(), second.capture_identity());
+
+        let projection =
+            PreparedRecurrentCursorProjection::prepare_authenticated(&first, &second, [334])
+                .unwrap();
+        assert_eq!(projection.source_capture_identity, first.capture_identity());
+        assert_eq!(
+            projection.target_capture_identity,
+            second.capture_identity()
+        );
     }
 }
 
@@ -4421,9 +4567,9 @@ fn validate(value: &CapturedMixedSchedule, validate_keys: bool) -> Result<(), Re
 fn identity(value: &CapturedMixedSchedule) -> Result<u64, ReplayError> {
     #[cfg(test)]
     record_prepared_replay_validation(|counts| counts.identity_serializations += 1);
-    let mut clone = value.clone();
-    clone.schedule.identity = 0;
-    let bytes = clone.to_bytes_without_identity()?;
+    // The mixed-capture payload deliberately excludes the ordinary capture's
+    // identity field, so hashing does not need to clone the immutable program.
+    let bytes = value.to_bytes_without_identity()?;
     Ok(bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
     }))

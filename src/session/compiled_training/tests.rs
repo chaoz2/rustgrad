@@ -2162,6 +2162,7 @@ fn assert_no_hot_phase_capture_work() {
     assert_eq!(counts.schedule_rekeys, 0);
     assert_eq!(counts.identity_serializations, 0);
     assert_eq!(counts.recurrent_frontier_plans, 0);
+    assert_eq!(counts.recurrent_frontier_authentications, 0);
 }
 
 #[test]
@@ -3175,12 +3176,19 @@ fn native_cpu_adamw_materializes_transpose_colliding_with_dense_recurrent_parame
 
 #[test]
 fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
+    crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
     let plan = CompiledAdamWPlan::compile(
         accumulated_adamw_config(3),
         initial_parameters(),
         build_tinybob,
     )
     .unwrap();
+    assert_eq!(
+        crate::engine::mixed_capture::prepared_replay_validation_counts()
+            .recurrent_frontier_authentications,
+        4,
+        "main, accumulation, partial-flush, and zero-grad each authenticate once"
+    );
     let accumulation_transition = plan.inner.accumulation.as_ref().unwrap();
     assert!(
         accumulation_transition
@@ -6805,8 +6813,21 @@ fn single_step_ignore_index_artifact_restores_for_native_evaluation() {
     assert_eq!(builds.get(), 1);
     assert_eq!(owner.accumulation_capture_identity(), None);
     assert_eq!(owner.flush_capture_identity(), None);
+    crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
     let artifact = owner.program_artifact().unwrap();
+    assert_eq!(
+        crate::engine::mixed_capture::prepared_replay_validation_counts()
+            .recurrent_frontier_authentications,
+        1,
+        "a single-step artifact must authenticate its one recurrent role once"
+    );
     assert_eq!(owner.program_artifact().unwrap(), artifact);
+    assert_eq!(
+        crate::engine::mixed_capture::prepared_replay_validation_counts()
+            .recurrent_frontier_authentications,
+        2,
+        "an independent artifact admission must authenticate exactly one recurrent role"
+    );
     assert_eq!(artifact.info().format_version(), 1);
     assert_eq!(
         artifact.info().optimizer(),
@@ -8844,7 +8865,7 @@ fn adamw_partial_accumulation_checkpoint_resumes_exactly() {
             .inner
             .accumulation
             .as_ref()
-            .map(|transition| transition.phase().capture_identity)
+            .map(|transition| transition.phase().capture_identity())
     );
     let mut malformed_metadata = metadata;
     let accumulation_identity = checkpoint.info().accumulation_capture_identity().unwrap();
@@ -9873,6 +9894,21 @@ fn momentum_program_artifact_restores_without_rebuilding_the_training_graph() {
         assert!(json.get("adamw").is_none());
         assert_eq!(json["momentum_sgd"], serde_json::json!({}));
     });
+    let (malformed_capture, _) = program_artifact::rewrite_json_for_test(&artifact, |json| {
+        let capture = json["main"]["phase"]["capture"].as_array_mut().unwrap();
+        let last = capture.last_mut().unwrap();
+        *last = serde_json::Value::from(last.as_u64().unwrap() ^ 1);
+    });
+    let first_admission =
+        CompiledTrainingProgramArtifact::from_bytes(malformed_capture.clone()).unwrap_err();
+    let retried_admission =
+        CompiledTrainingProgramArtifact::from_bytes(malformed_capture).unwrap_err();
+    assert_eq!(first_admission, retried_admission);
+    assert_eq!(
+        CompiledTrainingProgramArtifact::from_bytes(artifact.as_bytes().to_vec()).unwrap(),
+        artifact,
+        "failed eager frontier admission must not poison a later independent decode"
+    );
     for foreign_role in ["first_moment", "unknown_optimizer_role"] {
         let (bytes, _) = program_artifact::rewrite_json_for_test(&artifact, |json| {
             let states = json["main"]["optimizer_buffers"].as_object_mut().unwrap();
@@ -10786,9 +10822,12 @@ fn compiled_resume_bundle_seals_one_decode_and_training_topology_for_restore() {
         .unwrap()
         .into_bytes();
 
+    crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
     let before = program_artifact::portable_resume_decode_counts();
     let bundle = CompiledAdamWResumeBundle::from_bytes(encoded).unwrap();
     let after_load = program_artifact::portable_resume_decode_counts();
+    let after_load_frontiers = crate::engine::mixed_capture::prepared_replay_validation_counts();
+    assert_eq!(after_load_frontiers.recurrent_frontier_authentications, 4);
     assert_eq!(after_load.program_wire - before.program_wire, 1);
     assert_eq!(after_load.mixed_captures - before.mixed_captures, 4);
     assert_eq!(
@@ -10857,6 +10896,19 @@ fn compiled_resume_bundle_seals_one_decode_and_training_topology_for_restore() {
     assert_eq!(
         after_topology.cursor_projections,
         after_load.cursor_projections + 3
+    );
+    let after_topology_frontiers =
+        crate::engine::mixed_capture::prepared_replay_validation_counts();
+    assert_eq!(
+        after_topology_frontiers.cursor_projection_preparations,
+        after_load_frontiers.cursor_projection_preparations + 3,
+        "the three auxiliary roles must build exactly one prepared projection each"
+    );
+    let mut expected_topology_frontiers = after_load_frontiers;
+    expected_topology_frontiers.cursor_projection_preparations += 3;
+    assert_eq!(
+        after_topology_frontiers, expected_topology_frontiers,
+        "admitted topology sealing and repeated restores must reuse all expensive authenticated frontier evidence"
     );
     assert_eq!(
         restored.plan.topology_allocations(),

@@ -13,16 +13,16 @@ pub(super) enum CompiledRecurrentPhaseAdmission {
 #[derive(Clone)]
 pub(super) struct CompiledRecurrentPhasePlan {
     pub(super) capture: Arc<CapturedMixedSchedule>,
+    pub(super) recurrent_frontier: Arc<AuthenticatedRecurrentFrontier>,
     pub(super) recurrent_capture: CompiledRecurrentCapture,
     pub(super) state_buffers: BTreeMap<RecurrentStateKey, u64>,
     pub(super) cursor_projection: Arc<PreparedRecurrentCursorProjection>,
-    pub(super) capture_identity: u64,
     pub(super) admission: CompiledRecurrentPhaseAdmission,
 }
 
 impl CompiledRecurrentPhasePlan {
     pub(super) fn capture_identity(&self) -> u64 {
-        self.capture_identity
+        self.recurrent_frontier.capture_identity()
     }
 
     pub(super) fn store_groups(&self) -> &[crate::engine::RecurrentStoreGroupManifest] {
@@ -212,7 +212,7 @@ pub(super) fn resolve_recurrent_store_groups(
 }
 
 pub(super) struct CompiledTrainingPhaseCapture {
-    pub(super) capture: CapturedMixedSchedule,
+    pub(super) recurrent_frontier: Arc<AuthenticatedRecurrentFrontier>,
     pub(super) recurrent_capture: CompiledRecurrentCapture,
     pub(super) state_buffers: BTreeMap<RecurrentStateKey, u64>,
     pub(super) recurrent_store_groups: Vec<crate::engine::RecurrentStoreGroupManifest>,
@@ -408,21 +408,25 @@ pub(super) fn capture_training_phase(
     .map_err(schedule_error)?;
     captured.items = mixed.items.clone();
     let states = effect_states(&effects)?;
-    let capture =
-        CapturedMixedSchedule::from_parts(captured, &mixed, states).map_err(replay_error)?;
-    validate_external_binding_ownership(&capture, external_input_names.iter())?;
+    let capture = Arc::new(
+        CapturedMixedSchedule::from_parts(captured, &mixed, states).map_err(replay_error)?,
+    );
+    validate_external_binding_ownership(capture.as_ref(), external_input_names.iter())?;
     let effect_assembly_sealing_wall_time = effect_assembly_sealing_started.elapsed();
     let recurrent_authentication_started = Instant::now();
     let recurrent_capture = CompiledRecurrentCapture::from_canonical_mixed(
         graph,
-        &capture,
+        capture.as_ref(),
         &public_requested,
         &state_links,
         initial_state,
     )?;
+    let recurrent_frontier = Arc::new(
+        AuthenticatedRecurrentFrontier::authenticate(capture.clone()).map_err(replay_error)?,
+    );
     let recurrent_authentication_wall_time = recurrent_authentication_started.elapsed();
     Ok(CompiledTrainingPhaseCapture {
-        capture,
+        recurrent_frontier,
         recurrent_capture,
         state_buffers,
         recurrent_store_groups,
@@ -552,35 +556,39 @@ impl CompiledRecurrentPhasePlan {
         )
         .map_err(schedule_error)?;
         captured.items = mixed.items.clone();
-        let capture = CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
-            .map_err(replay_error)?;
-        validate_external_binding_ownership(&capture, std::iter::empty::<&String>())?;
+        let capture = Arc::new(
+            CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
+                .map_err(replay_error)?,
+        );
+        validate_external_binding_ownership(capture.as_ref(), std::iter::empty::<&String>())?;
         let effect_assembly_sealing_wall_time = effect_assembly_sealing_started.elapsed();
         let recurrent_authentication_started = Instant::now();
         let recurrent_capture = CompiledRecurrentCapture::from_canonical_mixed(
             &graph,
-            &capture,
+            capture.as_ref(),
             &[],
             &state_links,
             initial_state,
         )?;
+        let recurrent_frontier = Arc::new(
+            AuthenticatedRecurrentFrontier::authenticate(capture.clone()).map_err(replay_error)?,
+        );
         let recurrent_authentication_wall_time = recurrent_authentication_started.elapsed();
         let cursor_projection_started = Instant::now();
-        let cursor_projection = PreparedRecurrentCursorProjection::prepare(
-            &training_plan.capture,
-            &capture,
+        let cursor_projection = PreparedRecurrentCursorProjection::prepare_authenticated(
+            training_plan.recurrent_frontier.as_ref(),
+            recurrent_frontier.as_ref(),
             state_buffers.values().copied(),
         )
         .map_err(replay_error)?;
         let cursor_projection_wall_time = cursor_projection_started.elapsed();
-        let capture_identity = cursor_projection.target_capture_identity();
         Ok((
             Self {
-                capture: Arc::new(capture),
+                capture: recurrent_frontier.capture_arc(),
+                recurrent_frontier,
                 recurrent_capture,
                 state_buffers,
                 cursor_projection: Arc::new(cursor_projection),
-                capture_identity,
                 admission: CompiledRecurrentPhaseAdmission::Replace {
                     store_groups: Vec::new(),
                 },

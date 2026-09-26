@@ -685,7 +685,7 @@ impl CpuCompiledAdamW {
                     .inner
                     .accumulation
                     .as_ref()
-                    .map(|transition| transition.phase().capture_identity),
+                    .map(|transition| transition.phase().capture_identity()),
                 replay_step: self.progress.replay_step,
                 optimizer_step: self.progress.optimizer_step,
                 accumulation_steps: self.contract.gradient_accumulation_steps,

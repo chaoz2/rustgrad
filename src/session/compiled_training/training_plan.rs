@@ -10,6 +10,7 @@ pub(super) use evaluation::*;
 #[derive(Clone)]
 pub(super) struct CompiledTrainingPlan {
     pub(super) capture: Arc<CapturedMixedSchedule>,
+    pub(super) recurrent_frontier: Arc<AuthenticatedRecurrentFrontier>,
     pub(super) recurrent_capture: Arc<CompiledRecurrentCapture>,
     pub(super) inputs: BTreeMap<String, (Shape, DType)>,
     pub(super) phase_outputs: CompiledTrainingPhaseOutputSchema,
@@ -315,25 +316,24 @@ impl CompiledTrainingPlan {
                 },
             )?;
             let cursor_projection_started = Instant::now();
-            let cursor_projection = PreparedRecurrentCursorProjection::prepare(
-                &main.capture,
-                &phase.capture,
+            let cursor_projection = PreparedRecurrentCursorProjection::prepare_authenticated(
+                main.recurrent_frontier.as_ref(),
+                phase.recurrent_frontier.as_ref(),
                 phase.state_buffers.values().copied(),
             )
             .map_err(replay_error)?;
             let cursor_projection_wall_time = cursor_projection_started.elapsed();
-            let capture_identity = cursor_projection.target_capture_identity();
             let schedule_item_count = phase.recurrent_capture.execution_plan().schedule_item_count;
             let capture_measurement = phase
                 .capture_measurement
                 .with_cursor_projection(cursor_projection_wall_time);
             let plan = CompiledTrainingSiblingPlan {
                 phase: CompiledRecurrentPhasePlan {
-                    capture: Arc::new(phase.capture),
+                    capture: phase.recurrent_frontier.capture_arc(),
+                    recurrent_frontier: phase.recurrent_frontier,
                     recurrent_capture: phase.recurrent_capture,
                     state_buffers: phase.state_buffers,
                     cursor_projection: Arc::new(cursor_projection),
-                    capture_identity,
                     admission: CompiledRecurrentPhaseAdmission::RetainUnchanged,
                 },
             };
@@ -351,12 +351,8 @@ impl CompiledTrainingPlan {
             (None, None)
         };
         if let Some(accumulation) = &accumulation {
-            let main_identity = main
-                .capture
-                .initial_recurrent_cursor()
-                .map_err(replay_error)?
-                .capture_identity();
-            if accumulation.phase().capture_identity == main_identity {
+            let main_identity = main.recurrent_frontier.capture_identity();
+            if accumulation.phase().capture_identity() == main_identity {
                 return Err(training(
                     "compiled accumulation capture identity is not distinct",
                 ));
@@ -377,7 +373,8 @@ impl CompiledTrainingPlan {
         );
         Ok((
             Self {
-                capture: Arc::new(main.capture),
+                capture: main.recurrent_frontier.capture_arc(),
+                recurrent_frontier: main.recurrent_frontier,
                 recurrent_capture: Arc::new(main.recurrent_capture),
                 inputs: optimizer.inputs().clone(),
                 phase_outputs,
@@ -401,11 +398,7 @@ impl CompiledTrainingPlan {
     }
 
     pub(super) fn capture_identity(&self) -> Result<u64> {
-        Ok(self
-            .capture
-            .initial_recurrent_cursor()
-            .map_err(replay_error)?
-            .capture_identity())
+        Ok(self.recurrent_frontier.capture_identity())
     }
 
     pub(super) fn recurrent_capture(&self) -> Result<CapturedStatefulInference> {
@@ -549,10 +542,8 @@ impl CompiledTrainingPlan {
         self.state_versions = versions;
         self.step = step;
         let frontier = self
-            .capture
-            .initial_recurrent_cursor()
-            .map_err(replay_error)?
-            .frontier()
+            .recurrent_frontier
+            .initial_frontier()
             .iter()
             .cloned()
             .map(|mut state| {
@@ -567,7 +558,9 @@ impl CompiledTrainingPlan {
                 Ok(state)
             })
             .collect::<Result<Vec<_>>>()?;
-        MixedReplayCursor::resume(&self.capture, frontier).map_err(replay_error)?;
+        self.recurrent_frontier
+            .resume_cursor(frontier)
+            .map_err(replay_error)?;
         Ok(self)
     }
 
@@ -602,12 +595,10 @@ impl CompiledTrainingPlan {
         runtime
             .register_initial_states(initial_states)
             .map_err(runtime_error)?;
-        let cursor = self
-            .capture
-            .initial_recurrent_cursor()
-            .map_err(replay_error)?;
+        let cursor = self.recurrent_frontier.initial_cursor();
         let mut program = CpuCompiledTrainingProgram {
             capture: self.capture.clone(),
+            recurrent_frontier: self.recurrent_frontier.clone(),
             recurrent_capture: self.recurrent_capture.clone(),
             runtime,
             cursor,
@@ -880,28 +871,32 @@ impl CompiledAdamWAuxiliaryPlan {
         )
         .map_err(schedule_error)?;
         captured.items = mixed.items.clone();
-        let capture = CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
-            .map_err(replay_error)?;
-        validate_external_binding_ownership(&capture, std::iter::empty::<&String>())?;
+        let capture = Arc::new(
+            CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
+                .map_err(replay_error)?,
+        );
+        validate_external_binding_ownership(capture.as_ref(), std::iter::empty::<&String>())?;
         let effect_assembly_sealing_wall_time = effect_assembly_sealing_started.elapsed();
         let recurrent_authentication_started = Instant::now();
         let recurrent_capture = CompiledRecurrentCapture::from_canonical_mixed(
             &graph,
-            &capture,
+            capture.as_ref(),
             &public_requested,
             &state_links,
             initial_state,
         )?;
+        let recurrent_frontier = Arc::new(
+            AuthenticatedRecurrentFrontier::authenticate(capture.clone()).map_err(replay_error)?,
+        );
         let recurrent_authentication_wall_time = recurrent_authentication_started.elapsed();
         let cursor_projection_started = Instant::now();
-        let cursor_projection = PreparedRecurrentCursorProjection::prepare(
-            &training_plan.capture,
-            &capture,
+        let cursor_projection = PreparedRecurrentCursorProjection::prepare_authenticated(
+            training_plan.recurrent_frontier.as_ref(),
+            recurrent_frontier.as_ref(),
             state_buffers.values().copied(),
         )
         .map_err(replay_error)?;
         let cursor_projection_wall_time = cursor_projection_started.elapsed();
-        let capture_identity = cursor_projection.target_capture_identity();
         let recurrent_state_count = specs.len();
         let recurrent_store_groups = resolve_recurrent_store_groups(
             &adamw_recurrent_store_group_specs(parameters.keys(), topology),
@@ -911,11 +906,11 @@ impl CompiledAdamWAuxiliaryPlan {
         Ok((
             Self {
                 phase: CompiledRecurrentPhasePlan {
-                    capture: Arc::new(capture),
+                    capture: recurrent_frontier.capture_arc(),
+                    recurrent_frontier,
                     recurrent_capture,
                     state_buffers,
                     cursor_projection: Arc::new(cursor_projection),
-                    capture_identity,
                     admission: CompiledRecurrentPhaseAdmission::Replace {
                         store_groups: recurrent_store_groups,
                     },

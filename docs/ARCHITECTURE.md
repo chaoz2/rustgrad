@@ -974,6 +974,9 @@ Each derived recurrent prefix is rekeyed, assigned its canonical identity,
 checked for serialization-ineligible operations, and validated directly before
 its execution summary is built. Artifact-origin RGSM bytes retain their full
 bounded decoder and checksum admission; no capture or artifact identity changes.
+Each immutable recurrent role also owns one capture-bound authenticated identity
+and version-zero frontier. Sibling projection, cursor restoration, and artifact
+inspection reuse that witness; raw replay APIs still perform full validation.
 
 ###### Program inventory
 
