@@ -1721,6 +1721,14 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     assert!(compile_phases.partial_flush().is_some());
     assert!(compile_phases.zero_grad().is_some());
     assert!(compile_phases.evaluation().is_some());
+    assert!(compile_phases.main_capture().recurrent_capture().is_some());
+    assert!(
+        compile_phases
+            .evaluation()
+            .unwrap()
+            .recurrent_capture()
+            .is_none()
+    );
     assert!(compile_phases.measured_wall_time().unwrap() <= compile_wall_time);
 
     let executor = CapturedReplayExecutor::default();
@@ -1882,9 +1890,22 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let validated_scoreboard = match scoreboard {
         Some(scoreboard) => {
             let report = scoreboard.report()?;
-            let reported_compile = report.compile_phases().expect("v23 reports compile phases");
+            let reported_compile = report.compile_phases().expect("v24 reports compile phases");
             assert_eq!(reported_compile.compile_count(), 1);
             assert!(reported_compile.evaluation().is_some());
+            assert!(
+                reported_compile
+                    .main_capture()
+                    .recurrent_capture()
+                    .is_some()
+            );
+            assert!(
+                reported_compile
+                    .evaluation()
+                    .unwrap()
+                    .recurrent_capture()
+                    .is_none()
+            );
             assert_eq!(report.fallback_count(), 0);
             assert_eq!(report.successful_replay_count(), REPLAYS);
             assert_eq!(

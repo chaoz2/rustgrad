@@ -12,7 +12,8 @@ use super::super::compiled_training::{
 use super::{
     NATIVE_TRAINING_REPORT_FORMAT_V19, NATIVE_TRAINING_REPORT_FORMAT_V20,
     NATIVE_TRAINING_REPORT_FORMAT_V21, NATIVE_TRAINING_REPORT_FORMAT_V22,
-    NATIVE_TRAINING_REPORT_FORMAT_VERSION, NativeTrainingProgramReport, count, invalid,
+    NATIVE_TRAINING_REPORT_FORMAT_V23, NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+    NativeTrainingProgramReport, count, invalid,
 };
 use crate::cpu_jit::NativeCompilerProcessKind;
 use crate::{BenchmarkDuration, Result};
@@ -659,6 +660,7 @@ pub(super) fn validate_compiler_process_evidence(
                 NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
                 | NATIVE_TRAINING_REPORT_FORMAT_V22
+                | NATIVE_TRAINING_REPORT_FORMAT_V23
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(bytes),
             ) => {
@@ -734,6 +736,7 @@ pub(super) fn validate_compiler_process_evidence(
             NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
                 | NATIVE_TRAINING_REPORT_FORMAT_V22
+                | NATIVE_TRAINING_REPORT_FORMAT_V23
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION
         ) {
             let rendered = program

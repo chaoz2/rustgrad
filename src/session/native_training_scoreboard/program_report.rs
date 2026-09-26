@@ -16,7 +16,7 @@ use super::{
     NATIVE_TRAINING_REPORT_FORMAT_V17, NATIVE_TRAINING_REPORT_FORMAT_V18,
     NATIVE_TRAINING_REPORT_FORMAT_V19, NATIVE_TRAINING_REPORT_FORMAT_V20,
     NATIVE_TRAINING_REPORT_FORMAT_V21, NATIVE_TRAINING_REPORT_FORMAT_V22,
-    NATIVE_TRAINING_REPORT_FORMAT_VERSION, count, invalid,
+    NATIVE_TRAINING_REPORT_FORMAT_V23, NATIVE_TRAINING_REPORT_FORMAT_VERSION, count, invalid,
 };
 use crate::Result;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,8 @@ pub struct NativeTrainingProgramReport {
     pub(super) vectorized: bool,
     pub(super) execution_plan_identity: u64,
     pub(super) logical_schedule_item_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) recurrent_state_count: Option<u64>,
     pub(super) peak_logical_temporary_allocation_count: u64,
     pub(super) peak_logical_temporary_bytes: u64,
     pub(super) native_item_count: u64,
@@ -105,6 +107,10 @@ impl NativeTrainingProgramReport {
             vectorized: preparation.is_vectorized(),
             execution_plan_identity: plan.identity,
             logical_schedule_item_count: count(plan.schedule_item_count, "schedule item")?,
+            recurrent_state_count: inspection
+                .recurrent_state_count
+                .map(|value| count(value, "program recurrent state"))
+                .transpose()?,
             peak_logical_temporary_allocation_count: count(
                 plan.peak_logical_allocations,
                 "peak logical allocation",
@@ -175,6 +181,17 @@ impl NativeTrainingProgramReport {
     }
 
     pub(super) fn validate(&self, format_version: u32) -> Result<()> {
+        match (format_version, self.recurrent_state_count) {
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V23, None) => {}
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(count)) if count != 0 => {}
+            (1..=NATIVE_TRAINING_REPORT_FORMAT_V23, Some(_)) => {
+                return Err(invalid(
+                    "legacy native program has recurrent-state inventory",
+                ));
+            }
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, None) => {}
+            _ => return Err(invalid("native program recurrent-state inventory differs")),
+        }
         if self
             .cache_hit_count
             .checked_add(self.cache_miss_count)
@@ -367,6 +384,7 @@ impl NativeTrainingProgramReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V20
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
                 | NATIVE_TRAINING_REPORT_FORMAT_V22
+                | NATIVE_TRAINING_REPORT_FORMAT_V23
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self, format_version)?,
@@ -398,6 +416,11 @@ impl NativeTrainingProgramReport {
 
     pub const fn logical_schedule_item_count(&self) -> u64 {
         self.logical_schedule_item_count
+    }
+
+    /// Logical recurrent states owned by this training program, if any.
+    pub const fn recurrent_state_count(&self) -> Option<u64> {
+        self.recurrent_state_count
     }
 
     pub const fn peak_logical_temporary_allocation_count(&self) -> u64 {

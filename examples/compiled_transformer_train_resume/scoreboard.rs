@@ -74,6 +74,32 @@ pub(super) fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Err
     assert!(compile_phases.partial_flush().is_some());
     assert!(compile_phases.zero_grad().is_some());
     assert!(compile_phases.evaluation().is_none());
+    let main_capture = compile_phases
+        .main_capture()
+        .recurrent_capture()
+        .expect("main capture has recurrent stage evidence");
+    assert_eq!(main_capture.preview_schedule_count(), 2);
+    assert!(main_capture.cursor_projection_wall_time().is_none());
+    assert_eq!(
+        main_capture.measured_wall_time(),
+        Some(compile_phases.main_capture().wall_time())
+    );
+    assert_eq!(
+        main_capture.recurrent_state_count(),
+        inspection.recurrent_state_count()
+    );
+    for (phase, previews) in [
+        (compile_phases.accumulation_capture().unwrap(), 3),
+        (compile_phases.partial_flush().unwrap(), 3),
+        (compile_phases.zero_grad().unwrap(), 1),
+    ] {
+        let recurrent = phase
+            .recurrent_capture()
+            .expect("auxiliary capture has recurrent stage evidence");
+        assert_eq!(recurrent.preview_schedule_count(), previews);
+        assert!(recurrent.cursor_projection_wall_time().is_some());
+        assert_eq!(recurrent.measured_wall_time(), Some(phase.wall_time()));
+    }
     assert!(compile_phases.measured_wall_time().unwrap() <= compile_wall_time);
     assert_eq!(
         u64::try_from(inspection.recurrent_state_count())?,
@@ -371,9 +397,27 @@ pub(super) fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Err
     let checkpoint_wall_time = checkpoint_started.elapsed();
     scoreboard.observe_checkpoint(&checkpoint, checkpoint_wall_time)?;
     let report = scoreboard.report()?;
-    let reported_compile = report.compile_phases().expect("v23 reports compile phases");
+    let reported_compile = report.compile_phases().expect("v24 reports compile phases");
     assert_eq!(reported_compile.compile_count(), 1);
     assert!(reported_compile.evaluation().is_none());
+    let reported_main_capture = reported_compile
+        .main_capture()
+        .recurrent_capture()
+        .expect("v24 reports main recurrent capture stages");
+    assert_eq!(reported_main_capture.preview_schedule_count(), 2);
+    assert!(
+        reported_main_capture
+            .cursor_projection_wall_time()
+            .is_none()
+    );
+    assert_eq!(
+        reported_main_capture.recurrent_state_count(),
+        report.recurrent_state_count()
+    );
+    assert_eq!(
+        report.main().recurrent_state_count(),
+        Some(report.recurrent_state_count())
+    );
     let executed_native_items = report
         .main_replay_executed_native_item_count()
         .expect("current native CPU scoreboard reports executed JIT items");

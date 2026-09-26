@@ -287,7 +287,7 @@ if (
 native = objective.get("native")
 if not isinstance(native, dict):
     raise SystemExit("larger Transformer native evidence is absent")
-if scoreboard.get("format_version") != 23 or scoreboard.get("initial_replay_step") != 0:
+if scoreboard.get("format_version") != 24 or scoreboard.get("initial_replay_step") != 0:
     raise SystemExit("larger Transformer scoreboard identity is invalid")
 compile_phases = scoreboard.get("compile_phases")
 compile_phase_names = {
@@ -335,9 +335,12 @@ capture_programs = {
 }
 for phase_name, program in capture_programs.items():
     phase = compile_phases.get(phase_name)
+    expected_phase_fields = {"wall_time", "logical_schedule_item_count"}
+    if phase_name != "evaluation":
+        expected_phase_fields.add("recurrent_capture")
     if (
         not isinstance(phase, dict)
-        or set(phase) != {"wall_time", "logical_schedule_item_count"}
+        or set(phase) != expected_phase_fields
         or not isinstance(program, dict)
         or type(phase.get("logical_schedule_item_count")) is not int
         or phase["logical_schedule_item_count"] <= 0
@@ -347,6 +350,63 @@ for phase_name, program in capture_programs.items():
     ):
         raise SystemExit(f"larger Transformer {phase_name} compile phase is invalid")
     compile_phase_total_ns += duration_nanos(phase["wall_time"])
+
+recurrent_phase_names = ["main_capture", "accumulation_capture", "partial_flush", "zero_grad"]
+expected_preview_counts = [2, 3, 3, 1]
+recurrent_state_counts = []
+recurrent_fields = {
+    "alias_planning_wall_time",
+    "preview_schedule_count",
+    "final_schedule_wall_time",
+    "pure_capture_binding_wall_time",
+    "effect_assembly_sealing_wall_time",
+    "recurrent_authentication_wall_time",
+    "residual_wall_time",
+    "recurrent_state_count",
+}
+for ordinal, (phase_name, expected_previews) in enumerate(
+    zip(recurrent_phase_names, expected_preview_counts)
+):
+    phase = compile_phases[phase_name]
+    recurrent = phase.get("recurrent_capture")
+    expected_fields = set(recurrent_fields)
+    if ordinal != 0:
+        expected_fields.add("cursor_projection_wall_time")
+    if not isinstance(recurrent, dict) or set(recurrent) != expected_fields:
+        raise SystemExit(f"larger Transformer {phase_name} recurrent capture is invalid")
+    if (
+        type(recurrent.get("preview_schedule_count")) is not int
+        or recurrent["preview_schedule_count"] != expected_previews
+    ):
+        raise SystemExit(f"larger Transformer {phase_name} preview inventory differs")
+    state_count = recurrent.get("recurrent_state_count")
+    if type(state_count) is not int or state_count <= 0:
+        raise SystemExit(f"larger Transformer {phase_name} state inventory is invalid")
+    program_state_count = capture_programs[phase_name].get("recurrent_state_count")
+    if type(program_state_count) is not int or program_state_count != state_count:
+        raise SystemExit(f"larger Transformer {phase_name} program state inventory differs")
+    recurrent_state_counts.append(state_count)
+    timing_fields = [
+        "alias_planning_wall_time",
+        "final_schedule_wall_time",
+        "pure_capture_binding_wall_time",
+        "effect_assembly_sealing_wall_time",
+        "recurrent_authentication_wall_time",
+        "residual_wall_time",
+    ]
+    if ordinal != 0:
+        timing_fields.append("cursor_projection_wall_time")
+    timing_total = sum(duration_nanos(recurrent.get(field)) for field in timing_fields)
+    if timing_total != duration_nanos(phase["wall_time"]):
+        raise SystemExit(f"larger Transformer {phase_name} timing does not balance")
+if recurrent_state_counts[0] != scoreboard.get("recurrent_logical_state_count"):
+    raise SystemExit("larger Transformer main recurrent state inventory differs")
+if recurrent_state_counts[1] != recurrent_state_counts[0]:
+    raise SystemExit("larger Transformer accumulation recurrent state inventory differs")
+if not (recurrent_state_counts[3] <= recurrent_state_counts[2] <= recurrent_state_counts[1]):
+    raise SystemExit("larger Transformer auxiliary recurrent state inventory differs")
+if "recurrent_state_count" in scoreboard_evaluation:
+    raise SystemExit("larger Transformer evaluation claims recurrent state inventory")
 
 residual_compile_ns = duration_nanos(compile_phases.get("residual_wall_time"))
 compile_wall_ns = duration_nanos(scoreboard.get("compile_wall_time"))

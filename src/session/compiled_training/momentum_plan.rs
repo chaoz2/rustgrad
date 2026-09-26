@@ -245,6 +245,7 @@ impl CompiledMomentumSgdPlan {
             (
                 self.capture_identity(),
                 self.inner.recurrent_capture.execution_plan().clone(),
+                self.inner.state_values.len(),
             ),
             None,
             None,
