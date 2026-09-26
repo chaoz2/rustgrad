@@ -12,6 +12,7 @@ pub mod execution_summary;
 mod identity;
 pub mod mixed;
 mod ownership;
+mod scalar_fallback;
 pub use execution_summary::{
     ExecutionPlanItemSummary, ExecutionPlanSummary, ExecutionPlanSummaryError,
 };
@@ -20,6 +21,7 @@ pub use mixed::{
     combine as combine_mixed_schedules,
 };
 use ownership::{ScheduleOwnershipPlan, sort_sibling};
+use scalar_fallback::OrdinaryScalarFallbackRehearsals;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BufferDesc {
@@ -2066,48 +2068,6 @@ fn checked_scalar_alias_fusion(
     }))
 }
 
-fn ordinary_scalar_fallback_loads(
-    graph: &Graph,
-    output: NodeId,
-    roots: &BTreeSet<usize>,
-    external: &BTreeSet<usize>,
-) -> Result<BTreeSet<usize>, ScheduleError> {
-    if !scalar_alias_output(graph.op(output).map_err(ScheduleError::Graph)?) {
-        return Ok(BTreeSet::new());
-    }
-    let materialized = scalar_alias_materialized(output, roots, external, &BTreeSet::new());
-    let kernel = match graph.op(output).map_err(ScheduleError::Graph)? {
-        Op::Reduce { .. } => {
-            crate::kernel::lower_graph_reduction_with_materialized(graph, output, &materialized)
-        }
-        _ => crate::kernel::lower_graph_elementwise_with_materialized(graph, output, &materialized),
-    }
-    .map_err(ScheduleError::UOp)?;
-    let kernel = crate::uop::normalize_kernel(&kernel).map_err(ScheduleError::UOp)?;
-    let topology = kernel.topological().map_err(ScheduleError::UOp)?;
-    let mut loads = BTreeSet::new();
-    for value in topology {
-        if !matches!(value.operation(), crate::Operation::Load) {
-            continue;
-        }
-        let index = value
-            .sources()
-            .first()
-            .ok_or_else(|| ScheduleError::Binding("ordinary scalar Load index is absent".into()))?;
-        let buffer = match index.operation() {
-            crate::Operation::Index(crate::IndexValue::Buffer { buffer, .. })
-            | crate::Operation::Index(crate::IndexValue::View { buffer, .. }) => *buffer,
-            _ => {
-                return Err(ScheduleError::Binding(
-                    "ordinary scalar Load index is not a buffer descriptor".into(),
-                ));
-            }
-        };
-        loads.insert(usize::try_from(buffer).map_err(|_| ScheduleError::Overflow)?);
-    }
-    Ok(loads)
-}
-
 /// Returns the fully rehearsed scalar kernel when one dense Contiguous output
 /// may own its sole-use producer's computation. `None` is the conservative
 /// explicit-copy fallback; malformed canonical plans still reject scheduling.
@@ -2896,11 +2856,14 @@ fn schedule_many_with_external(
         .collect::<BTreeSet<_>>();
     let mut scalar_alias_reserved = epilogue_reserved;
     let scalar_alias_fusions = if policy.redirect_contiguous {
+        let mut fallback_rehearsals =
+            OrdinaryScalarFallbackRehearsals::new(graph, &roots, &external);
         // Proposal acceptance and ordinary fallback are both load-bearing.
         // Grow one monotone reservation frontier until every root is evaluated
         // against every other root's exact current load inventory; mutate
         // ownership only after that fixed point is stable.
         loop {
+            fallback_rehearsals.begin_fixed_point_pass();
             let mut next_reserved = scalar_alias_reserved.clone();
             let mut next_loads = scalar_alias_loads.clone();
             let mut next_fusions = BTreeMap::new();
@@ -2933,12 +2896,7 @@ fn schedule_many_with_external(
                 if next_fusions.contains_key(&root) || proposed_removals.contains(&root) {
                     continue;
                 }
-                let loads = ordinary_scalar_fallback_loads(
-                    graph,
-                    NodeId::from_index(root),
-                    &roots,
-                    &external,
-                )?;
+                let loads = fallback_rehearsals.load_nodes(NodeId::from_index(root))?;
                 if !loads.is_empty() {
                     next_reserved.insert(root);
                     next_reserved.extend(loads.iter().copied());
