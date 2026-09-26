@@ -1,9 +1,259 @@
 use crate::{
-    Backend, BufferDesc, CpuBackend, DType, Graph, ScheduleItem, ScheduledOutputs, Shape,
+    Backend, BufferDesc, CpuBackend, DType, Graph, Scalar, ScheduleItem, ScheduledOutputs, Shape,
     TensorData, UOp, plan_temporary_reuse, schedule, schedule_many,
     schedule_with_external_materializations,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+fn assert_requested_ownership_preview_matches_final(
+    case: &str,
+    graph: &Graph,
+    requested: &[crate::NodeId],
+) {
+    let preview = crate::schedule::requested_schedule_ownership(graph, requested).unwrap();
+    let scheduled = schedule_many(graph, requested).unwrap();
+    let final_owners = scheduled
+        .items
+        .iter()
+        .flat_map(|item| item.outputs.iter())
+        .map(|output| crate::NodeId::from_index(output.id as usize))
+        .collect::<BTreeSet<_>>();
+    let final_passthroughs = scheduled
+        .requested_passthroughs
+        .iter()
+        .map(|passthrough| passthrough.requested)
+        .collect::<BTreeSet<_>>();
+    let normalized_requested = requested
+        .iter()
+        .map(|requested| graph.contiguous_backward_owner(*requested).unwrap())
+        .collect::<BTreeSet<_>>();
+    let final_requested_owners = final_owners
+        .intersection(&normalized_requested)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let legacy_unowned = requested
+        .iter()
+        .copied()
+        .filter(|requested| !final_owners.contains(requested))
+        .collect::<BTreeSet<_>>();
+    let preview_unowned = requested
+        .iter()
+        .copied()
+        .filter(|requested| !preview.scheduled().contains(requested))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        preview.scheduled(),
+        &final_requested_owners,
+        "{case}: requested scheduled ownership differs"
+    );
+    assert_eq!(
+        preview.passthroughs(),
+        &final_passthroughs,
+        "{case}: requested passthrough ownership differs"
+    );
+    assert_eq!(
+        preview_unowned, legacy_unowned,
+        "{case}: compile-local materialization requests differ"
+    );
+}
+
+#[test]
+fn requested_ownership_preview_matches_final_scheduler_frontier() {
+    let mut sources = Graph::new();
+    let input = sources.input_dtype("input", [2, 2], DType::F32);
+    let constant = sources.constant(TensorData::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap());
+    let lazy_full = sources
+        .lazy_full_with_dtype([2, 2], Scalar::F(3.0), DType::F32)
+        .unwrap();
+    assert_requested_ownership_preview_matches_final(
+        "input, constant, and lazy full",
+        &sources,
+        &[input, constant, lazy_full, lazy_full],
+    );
+
+    let mut aliases = Graph::new();
+    let input = aliases.input_dtype("input", [2, 2], DType::F32);
+    let static_view = aliases.permute(input, [1, 0]).unwrap();
+    let producer = aliases.square(input).unwrap();
+    let computed_view = aliases.permute(producer, [1, 0]).unwrap();
+    let backward_view = aliases.contiguous_backward(computed_view).unwrap();
+    assert_requested_ownership_preview_matches_final(
+        "static, computed, and contiguous-backward requested views",
+        &aliases,
+        &[static_view, computed_view, backward_view, computed_view],
+    );
+    let backward_preview =
+        crate::schedule::requested_schedule_ownership(&aliases, &[backward_view]).unwrap();
+    assert!(!backward_preview.scheduled().contains(&backward_view));
+    assert!(backward_preview.passthroughs().contains(&computed_view));
+
+    let weight = aliases.constant(TensorData::new([2, 2], vec![0.5, -0.5, 1.5, -1.5]).unwrap());
+    let product = aliases.matmul(computed_view, weight).unwrap();
+    assert_requested_ownership_preview_matches_final(
+        "direct payload operand",
+        &aliases,
+        &[computed_view, product],
+    );
+    let copied = aliases.contiguous(computed_view).unwrap();
+    assert_requested_ownership_preview_matches_final(
+        "movement operand",
+        &aliases,
+        &[computed_view, copied],
+    );
+
+    let first = aliases.contiguous_backward(producer).unwrap();
+    let second = aliases.contiguous_backward(first).unwrap();
+    let preview = crate::schedule::requested_schedule_ownership(&aliases, &[second]).unwrap();
+    assert!(!preview.scheduled().contains(&first));
+    assert!(!preview.scheduled().contains(&second));
+    assert!(preview.scheduled().contains(&producer));
+    assert_requested_ownership_preview_matches_final(
+        "contiguous-backward normalized owner",
+        &aliases,
+        &[second, second],
+    );
+
+    let (values, indices) = aliases.sort(input, 1, false).unwrap();
+    let requested_values = aliases.contiguous_backward(values).unwrap();
+    assert_requested_ownership_preview_matches_final(
+        "paired sort selectors",
+        &aliases,
+        &[requested_values, indices, requested_values],
+    );
+
+    let mut zero = Graph::new();
+    let input = zero.input_dtype("input", [0, 2], DType::F32);
+    let producer = zero.square(input).unwrap();
+    let view = zero.permute(producer, [1, 0]).unwrap();
+    assert_requested_ownership_preview_matches_final("zero-domain computed view", &zero, &[view]);
+}
+
+#[test]
+fn requested_ownership_preview_preserves_frontier_errors_but_is_not_executable_validation() {
+    let graph = Graph::new();
+    let absent = crate::NodeId::from_index(0);
+    let preview_error = crate::schedule::requested_schedule_ownership(&graph, &[absent])
+        .expect_err("absent requested output must fail ownership planning");
+    let schedule_error = schedule_many(&graph, &[absent])
+        .expect_err("absent requested output must fail full scheduling");
+    assert_eq!(preview_error, schedule_error);
+
+    let mut missing_sort_sibling = Graph::new();
+    let input = missing_sort_sibling.input_dtype("input", [2], DType::F32);
+    let values = missing_sort_sibling.push(
+        crate::Op::Sort {
+            input,
+            axis: 0,
+            descending: false,
+            pair: 7,
+            output: crate::SortOutput::Values,
+        },
+        Shape::from([2]),
+        DType::F32,
+    );
+    let preview_error =
+        crate::schedule::requested_schedule_ownership(&missing_sort_sibling, &[values])
+            .expect_err("an incomplete sort pair must fail ownership planning");
+    let schedule_error = schedule_many(&missing_sort_sibling, &[values])
+        .expect_err("an incomplete sort pair must fail full scheduling");
+    assert_eq!(
+        preview_error,
+        crate::schedule::ScheduleError::Binding("sort pair sibling is absent".into())
+    );
+    assert_eq!(preview_error, schedule_error);
+
+    let mut malformed = Graph::new();
+    let lhs = malformed.input_dtype("lhs", [2, 3], DType::F32);
+    let rhs = malformed.input_dtype("rhs", [4, 2], DType::F32);
+    let output = malformed.push(
+        crate::Op::Matmul { lhs, rhs },
+        Shape::from([2, 2]),
+        DType::F32,
+    );
+    let preview = crate::schedule::requested_schedule_ownership(&malformed, &[output])
+        .expect("ownership planning deliberately stops before kernel validation");
+    assert!(preview.scheduled().contains(&output));
+    assert!(schedule_many(&malformed, &[output]).is_err());
+}
+
+#[test]
+fn requested_ownership_preview_is_nonmutating_and_identity_neutral() {
+    let mut graph = Graph::new();
+    let input = graph.input_dtype("input", [2, 2], DType::F32);
+    let producer = graph.square(input).unwrap();
+    let output = graph.permute(producer, [1, 0]).unwrap();
+    let legacy_graph = graph.clone();
+    let before = schedule_many(&legacy_graph, &[output]).unwrap();
+    let before_inventory = before
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.node,
+                std::mem::discriminant(item.kernel.operation()),
+                item.outputs
+                    .iter()
+                    .map(|output| output.id)
+                    .collect::<Vec<_>>(),
+                item.cache_key,
+            )
+        })
+        .collect::<Vec<_>>();
+    let before_bytes = crate::CapturedSchedule::capture(&legacy_graph, &before, &[output])
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    let _ = crate::schedule::requested_schedule_ownership(&graph, &[output]).unwrap();
+
+    let after = schedule_many(&graph, &[output]).unwrap();
+    let after_inventory = after
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.node,
+                std::mem::discriminant(item.kernel.operation()),
+                item.outputs
+                    .iter()
+                    .map(|output| output.id)
+                    .collect::<Vec<_>>(),
+                item.cache_key,
+            )
+        })
+        .collect::<Vec<_>>();
+    let after_bytes = crate::CapturedSchedule::capture(&graph, &after, &[output])
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    assert_eq!(after_inventory, before_inventory);
+    assert_eq!(
+        after.requested_materializations,
+        before.requested_materializations
+    );
+    assert_eq!(after_bytes, before_bytes);
+
+    let mut external_graph = Graph::new();
+    let input = external_graph.input_dtype("input", [2, 2], DType::F32);
+    let producer = external_graph.square(input).unwrap();
+    let output = external_graph.neg(producer).unwrap();
+    let before =
+        schedule_with_external_materializations(&external_graph, &[output], &[producer]).unwrap();
+    let _ = crate::schedule::requested_schedule_ownership(&external_graph, &[output]).unwrap();
+    let after =
+        schedule_with_external_materializations(&external_graph, &[output], &[producer]).unwrap();
+    assert_eq!(after.items.len(), 1);
+    assert_eq!(after.items[0].node, before.items[0].node);
+    assert_eq!(after.items[0].cache_key, before.items[0].cache_key);
+    assert_eq!(
+        after.items[0].external_materializations,
+        before.items[0].external_materializations
+    );
+    assert_eq!(
+        after.items[0].input_bindings,
+        before.items[0].input_bindings
+    );
+}
 
 fn buffer(id: u64, bytes: usize, alignment: usize) -> BufferDesc {
     BufferDesc {
