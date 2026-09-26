@@ -2601,8 +2601,20 @@ control delimiters.
 `schedule/mod.rs` is a non-mutating deterministic planning view over a requested
 Graph output. It classifies pure elementwise regions, records typed buffer
 descriptors and cache keys, and lowers scalar or rank-N elementwise chains to
-a single ranged UOp sink. Static sum/mean/product/min/max reductions fuse a pure
-producer and expose one exact scalar Init→Accumulate→Finalize UOp chain. The
+a single ranged UOp sink. The private `ScheduleOwnershipPlan` is the canonical
+front half of that planning:
+it normalizes `ContiguousBackward`, traverses needed values and paired `Sort`
+selectors, validates requested passthroughs, protects direct-payload and
+movement operands, and selects initial roots. Compiled recurrent capture uses a
+crate-private projection of that plan only to classify requested physical
+owners and passthroughs. The projection stops before fusion rehearsal, UOp
+lowering, and cache-key construction; it is not executable validation, and a
+late kernel error may therefore be deferred on the compile-local graph. The
+full schedule, capture, and ABI validation still complete before a compiled
+plan is published.
+
+Static sum/mean/product/min/max reductions fuse a pure producer and expose one
+exact scalar Init→Accumulate→Finalize UOp chain. The
 backend-neutral `NativeReductionPlan` validates that topology, geometry, and
 source/accumulator/output dtype contract before the portable interpreter or a
 renderer can traverse separate output and reduction domains. Historical RGUA

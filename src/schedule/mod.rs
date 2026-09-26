@@ -6,42 +6,12 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
 };
-
-/// Graph operands whose scheduled payload ABI names the exact dense NodeId.
-/// These operations cannot reconstruct an intervening computed alias through
-/// the ordinary scalar IndexView path.
-fn op_direct_payload_operands(graph: &Graph, op: &Op) -> Result<Vec<NodeId>, ScheduleError> {
-    let operands = match op {
-        Op::Matmul { lhs, rhs } => vec![*lhs, *rhs],
-        Op::PrefixScan { input, .. } | Op::Sort { input, .. } | Op::TensorGuard { input, .. } => {
-            vec![*input]
-        }
-        Op::Threefry { counter, key } => vec![*counter, *key],
-        Op::Conv2d {
-            input,
-            weight,
-            bias,
-            ..
-        } => [Some(*input), Some(*weight), *bias]
-            .into_iter()
-            .flatten()
-            .collect(),
-        _ => Vec::new(),
-    };
-    operands
-        .into_iter()
-        .map(|node| {
-            graph
-                .contiguous_backward_owner(node)
-                .map_err(ScheduleError::Graph)
-        })
-        .collect()
-}
 pub mod artifact;
 pub(crate) mod dynamic;
 pub mod execution_summary;
 mod identity;
 pub mod mixed;
+mod ownership;
 pub use execution_summary::{
     ExecutionPlanItemSummary, ExecutionPlanSummary, ExecutionPlanSummaryError,
 };
@@ -49,6 +19,7 @@ pub use mixed::{
     ScheduleStateBinding, ScheduleValueBinding, bind_states as bind_schedule_states,
     combine as combine_mixed_schedules,
 };
+use ownership::{ScheduleOwnershipPlan, sort_sibling};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BufferDesc {
@@ -2567,6 +2538,16 @@ pub fn schedule_many(graph: &Graph, outputs: &[NodeId]) -> Result<Schedule, Sche
     schedule_many_with_external(graph, outputs, &BTreeSet::new(), SchedulePolicy::ORDINARY)
 }
 
+/// Projects only canonical requested-output ownership. This is a scheduler
+/// planning aid, not executable validation: callers must still construct and
+/// validate the final schedule before publishing a compiled plan.
+pub(crate) fn requested_schedule_ownership(
+    graph: &Graph,
+    outputs: &[NodeId],
+) -> Result<ownership::RequestedScheduleOwnership, ScheduleError> {
+    ScheduleOwnershipPlan::build(graph, outputs, &BTreeSet::new())?.requested_ownership(graph)
+}
+
 /// Symbolic families retain explicit computed-affine producer and movement
 /// boundaries; a terminal requested view remains a separately authenticated
 /// zero-kernel alias of that producer.
@@ -2721,45 +2702,6 @@ impl SchedulePolicy {
     };
 }
 
-fn mark_needed(
-    graph: &Graph,
-    output: NodeId,
-    needed: &mut BTreeSet<usize>,
-    consumers: &mut [usize],
-    external: &BTreeSet<usize>,
-) -> Result<(), ScheduleError> {
-    enum Frame {
-        Node(NodeId),
-        Edge(NodeId),
-    }
-
-    let mut stack = vec![Frame::Node(output)];
-    while let Some(frame) = stack.pop() {
-        match frame {
-            Frame::Node(node) => {
-                if !needed.insert(node.index()) || external.contains(&node.index()) {
-                    continue;
-                }
-                let op = graph.op(node).map_err(ScheduleError::Graph)?;
-                let children = if supported(op) {
-                    op.value_inputs()
-                } else {
-                    Vec::new()
-                };
-                stack.extend(children.into_iter().rev().map(Frame::Edge));
-            }
-            Frame::Edge(child) => {
-                let child = graph
-                    .contiguous_backward_owner(child)
-                    .map_err(ScheduleError::Graph)?;
-                consumers[child.index()] += 1;
-                stack.push(Frame::Node(child));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn schedule_many_with_external(
     graph: &Graph,
     outputs: &[NodeId],
@@ -2775,271 +2717,19 @@ fn schedule_many_with_external(
             state_bindings: vec![],
         });
     }
-    let outputs = outputs
-        .iter()
-        .map(|node| {
-            graph
-                .contiguous_backward_owner(*node)
-                .map_err(ScheduleError::Graph)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let external = external
-        .iter()
-        .map(|index| {
-            graph
-                .contiguous_backward_owner(NodeId::from_index(*index))
-                .map(NodeId::index)
-                .map_err(ScheduleError::Graph)
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    let mut needed = BTreeSet::new();
-    let mut consumers = vec![0usize; graph.node_count()];
-    for output in &outputs {
-        graph.op(*output).map_err(ScheduleError::Graph)?;
-        mark_needed(graph, *output, &mut needed, &mut consumers, &external)?;
-    }
-    // Sort selectors are one coupled producer. Preserve the user-requested
-    // node as an observable output while making its sibling available to the
-    // same schedule item and its downstream consumers.
-    let sort_siblings = |id: NodeId| -> Result<Option<NodeId>, ScheduleError> {
-        let Op::Sort { pair, output, .. } = graph.op(id).map_err(ScheduleError::Graph)? else {
-            return Ok(None);
-        };
-        let want = match output {
-            crate::SortOutput::Values => crate::SortOutput::Indices,
-            crate::SortOutput::Indices => crate::SortOutput::Values,
-        };
-        (0..graph.node_count())
-            .map(NodeId::from_index)
-            .find(|candidate| {
-                matches!(
-                    graph.op(*candidate),
-                    Ok(Op::Sort { pair: candidate_pair, output: candidate_output, .. })
-                        if candidate_pair == pair && *candidate_output == want
-                )
-            })
-            .map(Some)
-            .ok_or_else(|| ScheduleError::Binding("sort pair sibling is absent".into()))
-    };
-    let marked = needed.iter().copied().collect::<Vec<_>>();
-    for index in marked {
-        if let Some(sibling) = sort_siblings(NodeId::from_index(index))? {
-            needed.insert(sibling.index());
-        }
-    }
-    let requested: BTreeSet<usize> = outputs.iter().map(|id| id.index()).collect();
-    let mut requested_passthroughs = Vec::new();
-    let mut requested_passthrough_ids = BTreeSet::new();
-    for &requested_node in &outputs {
-        if requested_passthrough_ids.contains(&requested_node.index())
-            || matches!(
-                graph.op(requested_node).map_err(ScheduleError::Graph)?,
-                Op::Input { .. } | Op::Constant(_)
-            )
-        {
-            continue;
-        }
-        let Ok(rangeified) = crate::rangeify::static_view(graph, requested_node)
-            .or_else(|_| crate::rangeify::computed_view(graph, requested_node))
-        else {
-            continue;
-        };
-        if rangeified.source == requested_node {
-            continue;
-        }
-        let requested_shape = graph.shape(requested_node).map_err(ScheduleError::Graph)?;
-        let requested_dtype = graph.dtype(requested_node).map_err(ScheduleError::Graph)?;
-        let source_dtype = graph
-            .dtype(rangeified.source)
-            .map_err(ScheduleError::Graph)?;
-        if rangeified.view.logical_shape != *requested_shape || requested_dtype != source_dtype {
-            return Err(ScheduleError::Binding(
-                "requested passthrough graph descriptor is invalid".into(),
-            ));
-        }
-        let mut desc = buffer(graph, rangeified.source, true)?;
-        desc.view = Some(rangeified.view);
-        let passthrough = RequestedPassthrough {
-            requested: requested_node,
-            source: rangeified.source,
-            desc,
-        };
-        passthrough.validate_against_graph(graph)?;
-        requested_passthrough_ids.insert(requested_node.index());
-        requested_passthroughs.push(passthrough);
-    }
-    // Direct-payload operations authenticate dense operand identities in
-    // their typed plan. Keep every computed operand materialized even when a
-    // requested alias could otherwise publish its producer directly.
-    let direct_payload_operands = needed
-        .iter()
-        .map(|index| {
-            let op = graph
-                .op(NodeId::from_index(*index))
-                .map_err(ScheduleError::Graph)?;
-            op_direct_payload_operands(graph, op)
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .map(NodeId::index)
-        .filter(|index| {
-            !matches!(
-                graph.op(NodeId::from_index(*index)),
-                Ok(Op::Input { .. } | Op::Constant(_))
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    // Materializing movement kernels name their exact pointer ABI. In
-    // particular, a contiguous boundary over an affine view consumes the
-    // rangeified storage source rather than first materializing the view.
-    let mut movement_operand_owners = BTreeMap::<usize, BTreeSet<usize>>::new();
-    for index in &needed {
-        let id = NodeId::from_index(*index);
-        let plan = match crate::MovementKernelPlan::from_scheduled_graph(graph, id) {
-            Ok(plan) => plan,
-            Err(crate::MovementPlanError::NotMovement) => continue,
-            Err(error) => return Err(ScheduleError::Binding(error.to_string())),
-        };
-        for input in plan.input_operands() {
-            if !matches!(graph.op(input.node), Ok(Op::Input { .. } | Op::Constant(_))) {
-                movement_operand_owners
-                    .entry(input.node.index())
-                    .or_default()
-                    .insert(*index);
-            }
-        }
-    }
-    let movement_operands = movement_operand_owners
-        .keys()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    // A computed affine view normally materializes as its own dense movement
-    // item, while a terminal requested alias keeps only its physical source.
-    // Either way that source must remain a schedule root when the view is its
-    // only consumer, so the copy or final projection has an owned input ABI.
-    let computed_view_sources = needed
-        .iter()
-        .filter_map(|index| {
-            let id = NodeId::from_index(*index);
-            matches!(
-                graph.op(id),
-                Ok(Op::Shrink { .. }
-                    | Op::Reshape { .. }
-                    | Op::Permute { .. }
-                    | Op::Expand { .. }
-                    | Op::Stride { .. })
-            )
-            .then(|| {
-                crate::rangeify::computed_view(graph, id)
-                    .map(|view| view.source)
-                    .or_else(|_| {
-                        let shape = graph
-                            .shape(id)
-                            .map_err(|_| crate::rangeify::RangeifyError::Invalid)?;
-                        crate::rangeify::projected_source(graph, id, shape)
-                    })
-                    .ok()
-            })
-            .flatten()
-            .map(|source| source.index())
-        })
-        .collect::<BTreeSet<_>>();
-    // A computed affine alias of a caller-owned materialization does not own
-    // another physical buffer merely because one scalar root reads it more
-    // than once. Keep the named external producer as the exact ABI boundary;
-    // downstream kernels reconstruct the alias with one IndexView. Requested
-    // aliases remain roots because their dense value is independently
-    // observable.
-    let external_view_aliases = needed
-        .iter()
-        .filter(|index| !requested.contains(index))
-        // Specialized payloads name their operands directly rather than
-        // consuming scalar IndexView nodes. Preserve those exact operand
-        // roots even when their storage source is caller-owned; the payload
-        // must depend on the intervening materialization.
-        .filter(|index| {
-            !direct_payload_operands.contains(index) && !movement_operands.contains(index)
-        })
-        .filter_map(|index| {
-            let id = NodeId::from_index(*index);
-            crate::rangeify::computed_view(graph, id)
-                .map(|view| view.source)
-                .or_else(|_| {
-                    let shape = graph
-                        .shape(id)
-                        .map_err(|_| crate::rangeify::RangeifyError::Invalid)?;
-                    crate::rangeify::projected_source(graph, id, shape)
-                })
-                .ok()
-                .filter(|source| external.contains(&source.index()))
-                .map(|_| *index)
-        })
-        .collect::<BTreeSet<_>>();
-    // Direct-payload kernels own dense operand IDs and cannot consume a
-    // source-backed affine alias through the scalar IndexView path. If the
-    // same alias is requested, retain its existing materialization root
-    // rather than publishing conflicting passthrough/output ownership.
-    requested_passthroughs.retain(|passthrough| {
-        let id = passthrough.requested.index();
-        !direct_payload_operands.contains(&id) && !movement_operands.contains(&id)
-    });
-    requested_passthrough_ids = requested_passthroughs
-        .iter()
-        .map(|passthrough| passthrough.requested.index())
-        .collect();
-    let requested_passthrough_sources = requested_passthroughs
-        .iter()
-        .map(|passthrough| passthrough.source.index())
-        .collect::<BTreeSet<_>>();
-    let mut roots: BTreeSet<usize> = needed
-        .iter()
-        .copied()
-        .filter(|index| {
-            let id = NodeId::from_index(*index);
-            !external.contains(index)
-                && !external_view_aliases.contains(index)
-                && !requested_passthrough_ids.contains(index)
-                // Inputs and constants are caller/graph-owned values, not
-                // scheduled producers. A requested source value is retained
-                // by capture as an explicit passthrough instead of becoming
-                // a fake in-place kernel whose input and output IDs alias.
-                && !matches!(graph.op(id), Ok(Op::Input { .. } | Op::Constant(_)))
-                && !matches!(
-                    graph.op(id),
-                    Ok(Op::Sort {
-                        output: crate::SortOutput::Indices,
-                        ..
-                    })
-                )
-                && (requested.contains(index)
-                    || direct_payload_operands.contains(index)
-                    || movement_operands.contains(index)
-                    || computed_view_sources.contains(index)
-                    || (consumers[*index] > 1
-                        && !matches!(graph.op(id), Ok(Op::Input { .. } | Op::Constant(_))))
-                    || matches!(
-                        graph.op(id),
-                        Ok(Op::Random { .. }
-                            | Op::ShapeIota { .. }
-                            | Op::Threefry { .. }
-                            | Op::Reduce { .. }
-                            | Op::PrefixScan { .. }
-                            | Op::Sort { .. }
-                            | Op::Matmul { .. }
-                            | Op::Conv2d { .. }
-                            | Op::Bitcast { .. }
-                            | Op::Contiguous { .. }
-                            | Op::Pad { .. }
-                            | Op::Concat { .. }
-                            | Op::Gather { .. }
-                            | Op::Scatter { .. }
-                            | Op::ScatterPositions { .. }
-                            | Op::ScatterPositionsVjp { .. })
-                    )
-                    || !matches!(graph.op(id), Ok(op) if supported(op)))
-        })
-        .collect();
+    let ScheduleOwnershipPlan {
+        outputs,
+        external,
+        consumers,
+        requested,
+        requested_passthroughs,
+        direct_payload_operands,
+        movement_operand_owners,
+        movement_operands,
+        requested_passthrough_sources,
+        mut roots,
+        ..
+    } = ScheduleOwnershipPlan::build(graph, outputs, external)?;
     let fusion_candidates = roots
         .iter()
         .copied()
@@ -3312,7 +3002,7 @@ fn schedule_many_with_external(
         .map(|(item, node)| (*node, item as u64))
         .collect();
     for (item, node) in roots.iter().copied().enumerate() {
-        if let Some(sibling) = sort_siblings(NodeId::from_index(node))? {
+        if let Some(sibling) = sort_sibling(graph, NodeId::from_index(node))? {
             node_to_item.insert(sibling.index(), item as u64);
         }
     }
@@ -3368,7 +3058,7 @@ fn schedule_many_with_external(
             .map(|leaf| buffer(graph, NodeId::from_index(leaf), true))
             .collect::<Result<Vec<_>, _>>()?;
         let output = buffer(graph, node, false)?;
-        let paired_output = sort_siblings(node)?
+        let paired_output = sort_sibling(graph, node)?
             .map(|sibling| buffer(graph, sibling, false))
             .transpose()?;
         let kernel = if boundary.is_none() {
@@ -3711,7 +3401,7 @@ mod ownership_traversal_tests {
                 let duplicated = graph.add(deep, deep).unwrap();
                 let mut needed = BTreeSet::new();
                 let mut consumers = vec![0usize; graph.node_count()];
-                mark_needed(
+                ownership::mark_needed(
                     &graph,
                     duplicated,
                     &mut needed,
@@ -3726,7 +3416,7 @@ mod ownership_traversal_tests {
                 let external = chain[chain.len() / 2];
                 needed.clear();
                 consumers.fill(0);
-                mark_needed(
+                ownership::mark_needed(
                     &graph,
                     deep,
                     &mut needed,

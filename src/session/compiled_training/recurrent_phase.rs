@@ -104,29 +104,24 @@ pub(super) fn compiled_requested_aliases(
     graph: &Graph,
     requested: &[NodeId],
 ) -> Result<BTreeSet<NodeId>> {
-    Ok(schedule_many(graph, requested)
-        .map_err(schedule_error)?
-        .requested_passthroughs
-        .iter()
-        .map(|alias| alias.requested)
-        .collect())
+    Ok(
+        crate::schedule::requested_schedule_ownership(graph, requested)
+            .map_err(schedule_error)?
+            .passthroughs()
+            .clone(),
+    )
 }
 
 pub(super) fn compiled_unowned_requests(
     graph: &Graph,
     requested: &[NodeId],
 ) -> Result<BTreeSet<NodeId>> {
-    let preview = schedule_many(graph, requested).map_err(schedule_error)?;
-    let owners = preview
-        .items
-        .iter()
-        .flat_map(|item| item.outputs.iter())
-        .map(|output| output.id)
-        .collect::<BTreeSet<_>>();
+    let preview =
+        crate::schedule::requested_schedule_ownership(graph, requested).map_err(schedule_error)?;
     Ok(requested
         .iter()
         .copied()
-        .filter(|node| !owners.contains(&(node.index() as u64)))
+        .filter(|node| !preview.scheduled().contains(node))
         .collect())
 }
 
@@ -603,3 +598,7 @@ impl CompiledRecurrentPhasePlan {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "recurrent_phase_tests.rs"]
+mod ownership_preview_tests;
