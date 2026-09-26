@@ -206,6 +206,11 @@ struct AuthenticatedRecurrentPrefix {
 
 impl AuthenticatedRecurrentPrefix {
     fn from_mixed(capture: &CapturedMixedSchedule) -> Result<Self> {
+        let pure = Self::derive_canonical_capture(capture)?;
+        Self::authenticate_directly(pure)
+    }
+
+    fn derive_canonical_capture(capture: &CapturedMixedSchedule) -> Result<CapturedSchedule> {
         let split = capture
             .schedule
             .items
@@ -241,6 +246,24 @@ impl AuthenticatedRecurrentPrefix {
             .map_err(schedule_error)?;
         pure.identity = crate::schedule::artifact::identity(&pure)
             .map_err(|error| training(format!("compiled artifact capture identity: {error}")))?;
+        Ok(pure)
+    }
+
+    fn authenticate_directly(pure: CapturedSchedule) -> Result<Self> {
+        pure.validate_serialization_operation_eligibility()
+            .map_err(replay_error)?;
+        crate::schedule::artifact::validate_capture(&pure)
+            .map_err(|error| replay_error(crate::ReplayError::Corrupt(error.to_string())))?;
+        let execution_plan = ExecutionPlanSummary::from_capture(&pure, true)
+            .map_err(|error| training(format!("compiled artifact execution summary: {error}")))?;
+        Ok(Self {
+            capture: pure,
+            execution_plan,
+        })
+    }
+
+    #[cfg(test)]
+    fn authenticate_via_codec(pure: CapturedSchedule) -> Result<Self> {
         let pure = CapturedSchedule::from_bytes(&pure.to_bytes().map_err(replay_error)?)
             .map_err(replay_error)?;
         let execution_plan = ExecutionPlanSummary::from_capture(&pure, true)
@@ -250,6 +273,60 @@ impl AuthenticatedRecurrentPrefix {
             execution_plan,
         })
     }
+}
+
+#[cfg(test)]
+pub(super) fn recurrent_prefix_matches_codec_reference(
+    capture: &CapturedMixedSchedule,
+) -> Result<()> {
+    let direct = AuthenticatedRecurrentPrefix::from_mixed(capture)?;
+    let codec = AuthenticatedRecurrentPrefix::authenticate_via_codec(
+        AuthenticatedRecurrentPrefix::derive_canonical_capture(capture)?,
+    )?;
+    if direct.capture.to_bytes().map_err(replay_error)?
+        != codec.capture.to_bytes().map_err(replay_error)?
+        || direct.capture.identity != codec.capture.identity
+        || direct.capture.requested != codec.capture.requested
+        || direct.capture.inputs != codec.capture.inputs
+        || direct.execution_plan != codec.execution_plan
+    {
+        return Err(training(
+            "direct recurrent prefix authentication differs from codec reference",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn recurrent_prefix_error_matches_codec_reference(
+    capture: &CapturedMixedSchedule,
+) -> bool {
+    let direct = AuthenticatedRecurrentPrefix::from_mixed(capture).err();
+    let codec = AuthenticatedRecurrentPrefix::derive_canonical_capture(capture)
+        .and_then(AuthenticatedRecurrentPrefix::authenticate_via_codec)
+        .err();
+    direct.is_some() && direct == codec
+}
+
+#[cfg(test)]
+pub(super) fn recurrent_prefix_item_key_error_matches_codec_reference(
+    capture: &CapturedMixedSchedule,
+) -> bool {
+    let Ok(mut pure) = AuthenticatedRecurrentPrefix::derive_canonical_capture(capture) else {
+        return false;
+    };
+    let Some(item) = pure.items.first_mut() else {
+        return false;
+    };
+    item.cache_key ^= 1;
+    recurrent_capture_authentication_error_matches_codec_reference(pure)
+}
+
+#[cfg(test)]
+fn recurrent_capture_authentication_error_matches_codec_reference(pure: CapturedSchedule) -> bool {
+    let direct = AuthenticatedRecurrentPrefix::authenticate_directly(pure.clone()).err();
+    let codec = AuthenticatedRecurrentPrefix::authenticate_via_codec(pure).err();
+    direct.is_some() && direct == codec
 }
 
 #[cfg(test)]
@@ -408,5 +485,21 @@ impl CompiledEvaluationCapture {
             .ok_or_else(|| training("compiled evaluation capture is absent"))?
             .portable_recipe(PortableInferenceHostPolicy::FixedGathers)
             .map_err(captured_inference_error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_recurrent_authentication_preserves_sort_codec_rejection() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 2], crate::DType::F32);
+        let (values, indices) = graph.sort(input, -1, false).unwrap();
+        let schedule = crate::schedule_many(&graph, &[values, indices]).unwrap();
+        let capture = CapturedSchedule::capture(&graph, &schedule, &[values, indices]).unwrap();
+
+        assert!(recurrent_capture_authentication_error_matches_codec_reference(capture));
     }
 }

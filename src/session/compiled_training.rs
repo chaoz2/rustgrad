@@ -59,7 +59,9 @@ use self::capture::{CompiledEvaluationCapture, CompiledRecurrentCapture};
 #[cfg(test)]
 use self::capture::{
     canonical_recurrent_capture_counts, canonical_recurrent_capture_delta,
-    with_canonical_recurrent_reference,
+    recurrent_prefix_error_matches_codec_reference,
+    recurrent_prefix_item_key_error_matches_codec_reference,
+    recurrent_prefix_matches_codec_reference, with_canonical_recurrent_reference,
 };
 pub use self::cpu_adamw_runtime::CpuCompiledAdamW;
 use self::cpu_adamw_runtime::{PendingAdamWStep, adamw_step_result};

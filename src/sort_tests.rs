@@ -221,5 +221,13 @@ fn sort_artifact_trace_rejection_and_invalid_axis_are_explicit() {
         &[values, indices],
     )
     .unwrap();
-    assert!(capture.to_bytes().is_err());
+    let expected = "static sort capture serialization is unsupported";
+    assert!(matches!(
+        capture.validate_serialization_operation_eligibility(),
+        Err(crate::ReplayError::Unsupported(message)) if message == expected
+    ));
+    assert!(matches!(
+        capture.to_bytes(),
+        Err(crate::ReplayError::Unsupported(message)) if message == expected
+    ));
 }

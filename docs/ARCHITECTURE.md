@@ -970,6 +970,11 @@ and capture the pure loss/output/update prefix plus ordered parameter and
 optimizer-state stores. AdamW keeps first and second moments and its U64 step
 counter in that recurrent frontier.
 
+Each derived recurrent prefix is rekeyed, assigned its canonical identity,
+checked for serialization-ineligible operations, and validated directly before
+its execution summary is built. Artifact-origin RGSM bytes retain their full
+bounded decoder and checksum admission; no capture or artifact identity changes.
+
 ###### Program inventory
 
 | Program | Captured role |
