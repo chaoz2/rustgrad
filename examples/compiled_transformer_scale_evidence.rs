@@ -1,13 +1,12 @@
 //! Manual, resource-bounded evidence for a larger fixed-shape compiled
 //! Transformer training run on strict-native CPU.
 //!
-//! This example is intentionally excluded from ordinary CI execution. The
-//! `native-transformer-scale-evidence` workflow runs it at an exact reviewed
-//! commit and uploads its authenticated scoreboard, objective facts, and host
-//! provenance. A separate no-dropout replay checks two dense gradient
-//! projections, while a fresh executor restores the replay-three portable
-//! bundle through the same isolated durable cache and partitions its warm
-//! preparation by program role. Neither affects the cold six-replay timing
+//! Ordinary CI runs the bounded `lifecycle-only` mode. The manual
+//! `native-transformer-scale-evidence` workflow additionally runs this example
+//! at an exact reviewed commit and uploads its authenticated scoreboard,
+//! objective facts, and host provenance. That full mode adds a no-dropout replay
+//! with two dense gradient projections plus a fresh-executor warm restore through
+//! the same isolated durable cache. Neither affects the cold six-replay timing
 //! sample. Timings are observations, never pass/fail thresholds.
 
 use rustgrad::nn::{Embedding, LayerNorm, Mode, StateKind};
@@ -19,7 +18,8 @@ use rustgrad::{
     CompiledEvaluationRuntime, CompiledInputBatch, CompiledInputSpec,
     CompiledModuleAdamWCheckpoint, CompiledModuleAdamWPlan, CompiledMultiStepLr,
     CompiledTrainingRuntime, CpuBackend, DType, Error as RustGradError, Graph, LossOptions, Module,
-    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult, NativeCpuProgramPreparationReport,
+    NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult,
+    NativeCpuCompiledTrainingPreparationReport, NativeCpuProgramPreparationReport,
     NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Op, Parameter, ParameterSnapshot,
     Reduction, Result, Scalar, TensorData, TrainingDropoutProvider, TransformerBlock,
     sparse_categorical_cross_entropy,
@@ -32,7 +32,7 @@ use std::{
     error::Error,
     fs,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 const BATCH: usize = 4;
@@ -57,6 +57,8 @@ const GRADIENT_PROBE_TOLERANCE: f64 = 3e-2;
 const GRADIENT_PROBE_DIRECTION_GAIN: f64 = 8.0;
 const SCALE_SEED: u64 = 0x5ca1_e000;
 const WARM_RESUME_SEED: u64 = 0x5ca1_f000;
+const SCALE_LIFECYCLE_EVIDENCE_VERSION: u64 = 1;
+const SCALE_LIFECYCLE_RESUME_BUNDLE_MAX_BYTES: u64 = 256 << 20;
 
 struct ScaleTransformer {
     tokens: Embedding,
@@ -401,6 +403,226 @@ struct ScaleEvaluationFrontierEvidence {
 }
 
 #[derive(Serialize)]
+struct ScaleLifecycleWorkloadEvidence {
+    batch: usize,
+    time: usize,
+    vocabulary: usize,
+    embedding: usize,
+    heads: usize,
+    feed_forward: usize,
+    blocks: usize,
+    accumulation_steps: u64,
+    replays: u64,
+}
+
+#[derive(Serialize)]
+struct ScaleLifecycleNativeEvidence {
+    compile_count: u64,
+    capture_identity: u64,
+    evaluation_capture_identity: u64,
+    prepared_roles: [&'static str; 5],
+    initial_prepared_role_count: usize,
+    initial_fallback_count: usize,
+    uninterrupted_replay_fallback_count: usize,
+    restored_prepared_role_count: usize,
+    restored_fallback_count: usize,
+    restored_replay_fallback_count: usize,
+}
+
+#[derive(Serialize)]
+struct ScaleLifecyclePendingResumeEvidence {
+    replay: u64,
+    optimizer_step: u64,
+    accumulation_index: u64,
+    checkpoint_bytes: u64,
+    module_checkpoint_bytes: u64,
+    resume_bundle_bytes: u64,
+    resume_bundle_checksum_fnv1a64: u64,
+    exact_encoded_round_trip: bool,
+}
+
+#[derive(Serialize)]
+struct ScaleLifecycleContinuationEvidence {
+    replay_from: u64,
+    replay_to: u64,
+    exact_loss_and_checkpoint_continuation: bool,
+    different_initialization: bool,
+    evaluation_state_neutral: bool,
+    tied_output_head_is_canonical: bool,
+    frozen_position_state_preserved: bool,
+    target_owned_module_published: bool,
+    module_visit_count: usize,
+    canonical_state_count: usize,
+}
+
+#[derive(Serialize)]
+struct ScaleLifecycleEvidence {
+    schema_version: u64,
+    workload: ScaleLifecycleWorkloadEvidence,
+    native: ScaleLifecycleNativeEvidence,
+    replay_progress: Vec<ScaleReplayProgressEvidence>,
+    evaluation_trajectory: Vec<ScaleEvaluationFrontierEvidence>,
+    pending_resume: ScaleLifecyclePendingResumeEvidence,
+    continuation: ScaleLifecycleContinuationEvidence,
+}
+
+impl ScaleLifecycleEvidence {
+    fn validate(&self) -> std::result::Result<(), Box<dyn Error>> {
+        if self.schema_version != SCALE_LIFECYCLE_EVIDENCE_VERSION {
+            return Err("scale lifecycle evidence version differs".into());
+        }
+        let workload = &self.workload;
+        if (
+            workload.batch,
+            workload.time,
+            workload.vocabulary,
+            workload.embedding,
+            workload.heads,
+            workload.feed_forward,
+            workload.blocks,
+            workload.accumulation_steps,
+            workload.replays,
+        ) != (
+            BATCH,
+            TIME,
+            VOCAB,
+            EMBEDDING,
+            HEADS,
+            FEED_FORWARD,
+            2,
+            ACCUMULATION_STEPS,
+            REPLAYS,
+        ) {
+            return Err("scale lifecycle workload differs".into());
+        }
+        if self.native.compile_count != 1
+            || self.native.capture_identity == 0
+            || self.native.evaluation_capture_identity == 0
+            || self.native.capture_identity == self.native.evaluation_capture_identity
+            || self.native.prepared_roles
+                != [
+                    "main",
+                    "accumulation",
+                    "partial_flush",
+                    "zero_grad",
+                    "evaluation",
+                ]
+            || self.native.initial_prepared_role_count != 5
+            || self.native.initial_fallback_count != 0
+            || self.native.uninterrupted_replay_fallback_count != 0
+            || self.native.restored_prepared_role_count != 5
+            || self.native.restored_fallback_count != 0
+            || self.native.restored_replay_fallback_count != 0
+        {
+            return Err("scale lifecycle native preparation evidence differs".into());
+        }
+        if self.replay_progress.len() != usize::try_from(REPLAYS)? {
+            return Err("scale lifecycle replay inventory differs".into());
+        }
+        for (index, progress) in self.replay_progress.iter().enumerate() {
+            let replay = u64::try_from(index)?
+                .checked_add(1)
+                .ok_or("replay overflow")?;
+            if progress.replay != replay
+                || progress.optimizer_step != replay / ACCUMULATION_STEPS
+                || progress.accumulation_index != replay % ACCUMULATION_STEPS
+                || progress.did_update != (replay % ACCUMULATION_STEPS == 0)
+            {
+                return Err("scale lifecycle replay progress differs".into());
+            }
+        }
+        if self.evaluation_trajectory.len() != 4 {
+            return Err("scale lifecycle evaluation inventory differs".into());
+        }
+        for (frontier, (replay, optimizer_step)) in
+            self.evaluation_trajectory
+                .iter()
+                .zip([(0, 0), (2, 1), (4, 2), (6, 3)])
+        {
+            if frontier.replay != replay
+                || frontier.optimizer_step != optimizer_step
+                || frontier.accumulation_index != 0
+                || !frontier.checkpoint_state_neutral
+                || !frontier.token_mean_loss.is_finite()
+                || frontier.samples.len() != 2
+            {
+                return Err("scale lifecycle evaluation frontier differs".into());
+            }
+            for (sample, expected_tokens) in frontier.samples.iter().zip([22, 16]) {
+                if sample.valid_token_count != expected_tokens
+                    || sample.capture_identity != self.native.evaluation_capture_identity
+                    || !sample.token_mean_loss.is_finite()
+                    || sample.native_fallback_count != 0
+                    || sample.executed_native_item_count == 0
+                    || sample.module_dispatch_count == 0
+                {
+                    return Err("scale lifecycle evaluation sample differs".into());
+                }
+            }
+            let recomputed = (frontier.samples[0].token_mean_loss * 22.0
+                + frontier.samples[1].token_mean_loss * 16.0)
+                / 38.0;
+            if recomputed.to_bits() != frontier.token_mean_loss.to_bits() {
+                return Err("scale lifecycle weighted evaluation differs".into());
+            }
+        }
+        let initial_loss = self
+            .evaluation_trajectory
+            .first()
+            .ok_or("scale lifecycle initial evaluation is absent")?
+            .token_mean_loss;
+        let final_loss = self
+            .evaluation_trajectory
+            .last()
+            .ok_or("scale lifecycle final evaluation is absent")?
+            .token_mean_loss;
+        if final_loss >= initial_loss {
+            return Err("scale lifecycle objective did not decrease".into());
+        }
+        let pending = &self.pending_resume;
+        if pending.replay != CHECKPOINT_REPLAY
+            || pending.optimizer_step != 1
+            || pending.accumulation_index != 1
+            || pending.checkpoint_bytes == 0
+            || pending.module_checkpoint_bytes == 0
+            || pending.resume_bundle_bytes == 0
+            || pending.resume_bundle_bytes > SCALE_LIFECYCLE_RESUME_BUNDLE_MAX_BYTES
+            || !pending.exact_encoded_round_trip
+        {
+            return Err("scale lifecycle pending resume evidence differs".into());
+        }
+        let continuation = &self.continuation;
+        if continuation.replay_from != CHECKPOINT_REPLAY + 1
+            || continuation.replay_to != REPLAYS
+            || !continuation.exact_loss_and_checkpoint_continuation
+            || !continuation.different_initialization
+            || !continuation.evaluation_state_neutral
+            || !continuation.tied_output_head_is_canonical
+            || !continuation.frozen_position_state_preserved
+            || !continuation.target_owned_module_published
+            || continuation.module_visit_count != 37
+            || continuation.canonical_state_count != 36
+        {
+            return Err("scale lifecycle continuation evidence differs".into());
+        }
+        Ok(())
+    }
+
+    fn canonical_bytes(&self) -> std::result::Result<Vec<u8>, Box<dyn Error>> {
+        self.validate()?;
+        let mut bytes = serde_json::to_vec(self)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+}
+
+fn scale_lifecycle_checksum(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+#[derive(Serialize)]
 struct ScaleWarmProgramPreparationEvidence {
     total_wall_time_ns: u64,
     layout_wall_time_ns: u64,
@@ -483,6 +705,65 @@ struct ScaleWarmResumeInput<'a> {
     expected_final_checkpoint: &'a CompiledModuleAdamWCheckpoint,
     expected_final_model: &'a ScaleTransformer,
     expected_final_loss: f64,
+}
+
+struct ScaleResumeContractInput<'a> {
+    resume_bundle: &'a CompiledAdamWResumeBundle,
+    inspection: &'a CompiledAdamWInspection,
+    capture_identity: u64,
+    evaluation_capture_identity: u64,
+    continuation: &'a [ScaleContinuation],
+    expected_final_checkpoint: &'a CompiledModuleAdamWCheckpoint,
+    expected_final_model: &'a ScaleTransformer,
+    expected_final_loss: f64,
+    measurement: ScaleResumeMeasurement,
+}
+
+struct ScaleResumeContractResult<E> {
+    preparation_evidence: E,
+    owner_restore_wall_time: Option<Duration>,
+    preparation_wall_time: Option<Duration>,
+    module_visit_count: usize,
+    canonical_state_count: usize,
+    replay_fallback_count: usize,
+}
+
+struct ScaleLifecyclePreparationObservation {
+    program_count: usize,
+    fallback_count: usize,
+}
+
+struct ScaleWarmPreparationObservation {
+    evidence: ScaleWarmPreparationEvidence,
+    program_count: usize,
+    loaded_module_count: usize,
+    durable_artifact_cache_hit_count: usize,
+    durable_artifact_cache_miss_count: usize,
+    render_capsule_hit_count: usize,
+    render_capsule_miss_count: usize,
+    local_render_job_count: usize,
+    compiler_invocation_count: usize,
+    linker_invocation_count: usize,
+    fallback_count: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ScaleResumeMeasurement {
+    Record,
+    Omit,
+}
+
+struct ScaleEvidencePaths {
+    git_sha: String,
+    scoreboard: PathBuf,
+    objective: PathBuf,
+    resume_bundle: PathBuf,
+    module_checkpoint: PathBuf,
+}
+
+enum ScaleRunMode {
+    Full(ScaleEvidencePaths),
+    LifecycleOnly { evidence: PathBuf },
 }
 
 fn scale_module_state_witness(model: &ScaleTransformer) -> Vec<ScaleModuleStateWitness> {
@@ -872,120 +1153,13 @@ fn collect_scale_gradient_evidence() -> Result<ScaleGradientEvidence> {
     })
 }
 
-fn collect_scale_warm_resume_evidence(
-    input: ScaleWarmResumeInput<'_>,
-) -> std::result::Result<ScaleWarmResumeEvidence, Box<dyn Error>> {
-    let ScaleWarmResumeInput {
-        resume_bundle_path,
-        module_checkpoint_path,
-        saved_bundle,
-        inspection,
-        capture_identity,
-        evaluation_capture_identity,
-        continuation,
-        expected_final_checkpoint,
-        expected_final_model,
-        expected_final_loss,
-    } = input;
-    let decode_started = Instant::now();
-    let resume_bundle = CompiledAdamWResumeBundle::load_file(resume_bundle_path)?;
-    let artifact_decode_wall_time_ns = duration_nanos(decode_started.elapsed())?;
-    let persisted_checkpoint = CompiledModuleAdamWCheckpoint::load_file(module_checkpoint_path)?;
-    assert_eq!(&resume_bundle, saved_bundle);
-    assert_eq!(resume_bundle.checkpoint(), &persisted_checkpoint);
-    assert_eq!(
-        resume_bundle.checkpoint().as_bytes(),
-        persisted_checkpoint.as_bytes()
-    );
-
-    let destination = ScaleTransformer::new(WARM_RESUME_SEED)?;
-    let destination_initial = destination.state_dict()?;
-    assert_ne!(destination_initial, expected_final_model.state_dict()?);
-    assert_ne!(
-        destination.positions.weight.value()?,
-        expected_final_model.positions.weight.value()?,
-        "the policy-frozen position table must come from a different initialization"
-    );
-    let destination_states = scale_module_state_witness(&destination);
-    let destination_tied_identity = destination.tokens.weight.id();
-    assert_eq!(destination_states.len(), 37);
-    assert_eq!(destination_initial.tensors().len(), 36);
-    assert_eq!(
-        destination_states
-            .iter()
-            .find(|state| state.name == "lm_head.weight")
-            .expect("the destination exposes the tied output head")
-            .snapshot
-            .identity,
-        destination_tied_identity
-    );
-
-    let owner_restore_started = Instant::now();
-    let restored_plan =
-        CompiledModuleAdamWPlan::restore_from_resume_bundle(destination, &resume_bundle)
-            .map_err(|error| error.into_parts().1)?;
-    let owner_restore_wall_time_ns = duration_nanos(owner_restore_started.elapsed())?;
-    assert_eq!(restored_plan.capture_identity(), capture_identity);
-    assert_eq!(
-        restored_plan.evaluation_capture_identity(),
-        Some(evaluation_capture_identity)
-    );
-    let restored_inspection = restored_plan.inspection()?;
-    assert_eq!(restored_inspection.initial_replay_step(), CHECKPOINT_REPLAY);
-    assert_eq!(restored_inspection.main(), inspection.main());
-    assert_eq!(
-        restored_inspection.accumulation(),
-        inspection.accumulation()
-    );
-    assert_eq!(
-        restored_inspection.partial_flush(),
-        inspection.partial_flush()
-    );
-    assert_eq!(restored_inspection.zero_grad(), inspection.zero_grad());
-    assert_eq!(restored_inspection.evaluation(), inspection.evaluation());
-    assert_eq!(
-        restored_inspection.recurrent_state_count(),
-        inspection.recurrent_state_count()
-    );
-    assert_eq!(
-        restored_inspection.recurrent_state_bytes(),
-        inspection.recurrent_state_bytes()
-    );
-    assert_eq!(
-        restored_plan.program_artifact()?.as_bytes(),
-        resume_bundle.program_artifact().as_bytes()
-    );
-    assert_scale_module_witness_unchanged(&destination_states)?;
-
-    let warm_executor = CapturedReplayExecutor::default();
-    let warm_target = NativeCpuSessionTarget::new(&warm_executor).vectorized(true);
-    let preparation_started = Instant::now();
-    let mut resumed = restored_plan
-        .prepare(&warm_target)
-        .map_err(|error| error.into_parts().1)?;
-    let preparation_wall_time = preparation_started.elapsed();
-    let preparation_wall_time_ns = duration_nanos(preparation_wall_time)?;
-    assert_scale_module_witness_unchanged(&destination_states)?;
-    assert_eq!(
-        resumed.checkpoint()?,
-        resume_bundle.checkpoint().optimizer_checkpoint().clone()
-    );
-
-    let preparation = resumed.native_cpu_preparation_report();
+fn collect_scale_warm_preparation(
+    preparation: &NativeCpuCompiledTrainingPreparationReport,
+    preparation_wall_time: Duration,
+) -> std::result::Result<ScaleWarmPreparationObservation, Box<dyn Error>> {
     assert_eq!(preparation.compiler_process_count(), 0);
-    let main = preparation.main();
-    let accumulation = preparation
-        .accumulation()
-        .expect("the scale workload has an accumulation program");
-    let partial_flush = preparation
-        .partial_flush()
-        .expect("the scale workload has a partial-flush program");
-    let zero_grad = preparation
-        .zero_grad()
-        .expect("the scale workload has a zero-grad program");
-    let evaluation = preparation
-        .evaluation()
-        .expect("the scale workload has an evaluation program");
+    let [main, accumulation, partial_flush, zero_grad, evaluation] =
+        scale_preparation_programs(preparation);
     let programs = [main, accumulation, partial_flush, zero_grad, evaluation];
     let program_count = programs.len();
     let mut loaded_module_count = 0_usize;
@@ -1078,27 +1252,256 @@ fn collect_scale_warm_resume_evidence(
     let effective_render_fraction =
         effective_render_wall_time.as_secs_f64() / preparation_wall_time.as_secs_f64();
     assert!(effective_render_fraction.is_finite());
-    let warm_preparation = ScaleWarmPreparationEvidence {
-        main: main_preparation,
-        accumulation: accumulation_preparation,
-        partial_flush: partial_flush_preparation,
-        zero_grad: zero_grad_preparation,
-        evaluation: evaluation_preparation,
-        summed_program_wall_time_ns: duration_nanos(summed_program_wall_time)?,
-        runtime_overhead_wall_time_ns: duration_nanos(runtime_overhead_wall_time)?,
-        module_overlap_wall_time_ns: duration_nanos(module_overlap_wall_time)?,
-        render_overlap_wall_time_ns: duration_nanos(render_overlap_wall_time)?,
-        effective_render_wall_time_ns: duration_nanos(effective_render_wall_time)?,
-        effective_render_fraction,
+
+    Ok(ScaleWarmPreparationObservation {
+        evidence: ScaleWarmPreparationEvidence {
+            main: main_preparation,
+            accumulation: accumulation_preparation,
+            partial_flush: partial_flush_preparation,
+            zero_grad: zero_grad_preparation,
+            evaluation: evaluation_preparation,
+            summed_program_wall_time_ns: duration_nanos(summed_program_wall_time)?,
+            runtime_overhead_wall_time_ns: duration_nanos(runtime_overhead_wall_time)?,
+            module_overlap_wall_time_ns: duration_nanos(module_overlap_wall_time)?,
+            render_overlap_wall_time_ns: duration_nanos(render_overlap_wall_time)?,
+            effective_render_wall_time_ns: duration_nanos(effective_render_wall_time)?,
+            effective_render_fraction,
+        },
+        program_count,
+        loaded_module_count,
+        durable_artifact_cache_hit_count,
+        durable_artifact_cache_miss_count,
+        render_capsule_hit_count,
+        render_capsule_miss_count,
+        local_render_job_count,
+        compiler_invocation_count,
+        linker_invocation_count,
+        fallback_count,
+    })
+}
+
+fn collect_scale_warm_resume_evidence(
+    input: ScaleWarmResumeInput<'_>,
+) -> std::result::Result<ScaleWarmResumeEvidence, Box<dyn Error>> {
+    let ScaleWarmResumeInput {
+        resume_bundle_path,
+        module_checkpoint_path,
+        saved_bundle,
+        inspection,
+        capture_identity,
+        evaluation_capture_identity,
+        continuation,
+        expected_final_checkpoint,
+        expected_final_model,
+        expected_final_loss,
+    } = input;
+    let decode_started = Instant::now();
+    let resume_bundle = CompiledAdamWResumeBundle::load_file(resume_bundle_path)?;
+    let artifact_decode_wall_time_ns = duration_nanos(decode_started.elapsed())?;
+    let persisted_checkpoint = CompiledModuleAdamWCheckpoint::load_file(module_checkpoint_path)?;
+    assert_eq!(&resume_bundle, saved_bundle);
+    assert_eq!(resume_bundle.checkpoint(), &persisted_checkpoint);
+    assert_eq!(
+        resume_bundle.checkpoint().as_bytes(),
+        persisted_checkpoint.as_bytes()
+    );
+
+    let contract = run_scale_resume_contract(
+        ScaleResumeContractInput {
+            resume_bundle: &resume_bundle,
+            inspection,
+            capture_identity,
+            evaluation_capture_identity,
+            continuation,
+            expected_final_checkpoint,
+            expected_final_model,
+            expected_final_loss,
+            measurement: ScaleResumeMeasurement::Record,
+        },
+        |preparation, wall_time| {
+            collect_scale_warm_preparation(
+                preparation,
+                wall_time.expect("warm resume records preparation wall time"),
+            )
+        },
+    )?;
+    let preparation = contract.preparation_evidence;
+    Ok(ScaleWarmResumeEvidence {
+        replay_from: CHECKPOINT_REPLAY,
+        replay_to: REPLAYS,
+        resume_bundle_bytes: resume_bundle.as_bytes().len(),
+        module_checkpoint_bytes: persisted_checkpoint.as_bytes().len(),
+        artifact_decode_wall_time_ns,
+        owner_restore_wall_time_ns: duration_nanos(
+            contract
+                .owner_restore_wall_time
+                .expect("warm resume records owner-restore wall time"),
+        )?,
+        preparation_wall_time_ns: duration_nanos(
+            contract
+                .preparation_wall_time
+                .expect("warm resume records preparation wall time"),
+        )?,
+        preparation: preparation.evidence,
+        capture_identity,
+        evaluation_capture_identity,
+        program_count: preparation.program_count,
+        loaded_module_count: preparation.loaded_module_count,
+        durable_artifact_cache_hit_count: preparation.durable_artifact_cache_hit_count,
+        durable_artifact_cache_miss_count: preparation.durable_artifact_cache_miss_count,
+        render_capsule_hit_count: preparation.render_capsule_hit_count,
+        render_capsule_miss_count: preparation.render_capsule_miss_count,
+        local_render_job_count: preparation.local_render_job_count,
+        compiler_invocation_count: preparation.compiler_invocation_count,
+        linker_invocation_count: preparation.linker_invocation_count,
+        fallback_count: preparation.fallback_count,
+        module_visit_count: contract.module_visit_count,
+        canonical_state_count: contract.canonical_state_count,
+        artifact_checkpoint_authenticated: true,
+        topology_authenticated: true,
+        different_initialization: true,
+        fresh_executor: true,
+        exact_continuation: true,
+        evaluation_state_neutral: true,
+        target_owned_module_published: true,
+    })
+}
+
+fn scale_preparation_programs(
+    preparation: &NativeCpuCompiledTrainingPreparationReport,
+) -> [&NativeCpuProgramPreparationReport; 5] {
+    [
+        preparation.main(),
+        preparation
+            .accumulation()
+            .expect("the scale workload has an accumulation program"),
+        preparation
+            .partial_flush()
+            .expect("the scale workload has a partial-flush program"),
+        preparation
+            .zero_grad()
+            .expect("the scale workload has a zero-grad program"),
+        preparation
+            .evaluation()
+            .expect("the scale workload has an evaluation program"),
+    ]
+}
+
+fn run_scale_resume_contract<E>(
+    input: ScaleResumeContractInput<'_>,
+    observe_preparation: impl FnOnce(
+        &NativeCpuCompiledTrainingPreparationReport,
+        Option<Duration>,
+    ) -> std::result::Result<E, Box<dyn Error>>,
+) -> std::result::Result<ScaleResumeContractResult<E>, Box<dyn Error>> {
+    let ScaleResumeContractInput {
+        resume_bundle,
+        inspection,
+        capture_identity,
+        evaluation_capture_identity,
+        continuation,
+        expected_final_checkpoint,
+        expected_final_model,
+        expected_final_loss,
+        measurement,
+    } = input;
+    let destination = ScaleTransformer::new(WARM_RESUME_SEED)?;
+    let destination_initial = destination.state_dict()?;
+    assert_ne!(destination_initial, expected_final_model.state_dict()?);
+    assert_ne!(
+        destination.positions.weight.value()?,
+        expected_final_model.positions.weight.value()?,
+        "the policy-frozen position table must come from a different initialization"
+    );
+    let destination_states = scale_module_state_witness(&destination);
+    let destination_tied_identity = destination.tokens.weight.id();
+    assert_eq!(destination_states.len(), 37);
+    assert_eq!(destination_initial.tensors().len(), 36);
+    assert_eq!(
+        destination_states
+            .iter()
+            .find(|state| state.name == "lm_head.weight")
+            .expect("the destination exposes the tied output head")
+            .snapshot
+            .identity,
+        destination_tied_identity
+    );
+
+    let owner_restore_started = match measurement {
+        ScaleResumeMeasurement::Record => Some(Instant::now()),
+        ScaleResumeMeasurement::Omit => None,
     };
+    let restored_plan =
+        CompiledModuleAdamWPlan::restore_from_resume_bundle(destination, resume_bundle)
+            .map_err(|error| error.into_parts().1)?;
+    let owner_restore_wall_time = owner_restore_started.map(|started| started.elapsed());
+    assert_eq!(restored_plan.capture_identity(), capture_identity);
+    assert_eq!(
+        restored_plan.evaluation_capture_identity(),
+        Some(evaluation_capture_identity)
+    );
+    let restored_inspection = restored_plan.inspection()?;
+    assert_eq!(restored_inspection.initial_replay_step(), CHECKPOINT_REPLAY);
+    assert_eq!(restored_inspection.main(), inspection.main());
+    assert_eq!(
+        restored_inspection.accumulation(),
+        inspection.accumulation()
+    );
+    assert_eq!(
+        restored_inspection.partial_flush(),
+        inspection.partial_flush()
+    );
+    assert_eq!(restored_inspection.zero_grad(), inspection.zero_grad());
+    assert_eq!(restored_inspection.evaluation(), inspection.evaluation());
+    assert_eq!(
+        restored_inspection.recurrent_state_count(),
+        inspection.recurrent_state_count()
+    );
+    assert_eq!(
+        restored_inspection.recurrent_state_bytes(),
+        inspection.recurrent_state_bytes()
+    );
+    assert_eq!(
+        restored_plan.program_artifact()?.as_bytes(),
+        resume_bundle.program_artifact().as_bytes()
+    );
+    assert_scale_module_witness_unchanged(&destination_states)?;
+
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let preparation_started = match measurement {
+        ScaleResumeMeasurement::Record => Some(Instant::now()),
+        ScaleResumeMeasurement::Omit => None,
+    };
+    let mut resumed = restored_plan
+        .prepare(&target)
+        .map_err(|error| error.into_parts().1)?;
+    let preparation_wall_time = preparation_started.map(|started| started.elapsed());
+    assert_scale_module_witness_unchanged(&destination_states)?;
+    assert_eq!(
+        resumed.checkpoint()?,
+        resume_bundle.checkpoint().optimizer_checkpoint().clone()
+    );
+    let preparation = resumed.native_cpu_preparation_report();
+    let preparation_evidence = observe_preparation(preparation, preparation_wall_time)?;
+    let programs = scale_preparation_programs(preparation);
+    assert_eq!(programs.len(), 5);
+    for program in &programs {
+        assert!(program.native_item_count() > 0);
+        assert_eq!(program.fallback_count(), 0);
+    }
 
     assert_eq!(
         continuation.len(),
         usize::try_from(REPLAYS - CHECKPOINT_REPLAY)?
     );
+    let mut replay_fallback_count = 0_usize;
     for expected in continuation {
         let step = resumed.step_batch_commit_only_scheduled(ScaleBatch::new(expected.replay)?)?;
         assert_strict_native(&step);
+        replay_fallback_count = replay_fallback_count
+            .checked_add(step.report().fallback_count())
+            .expect("the fixed continuation fallback inventory cannot overflow");
         assert_eq!(step.loss(), &expected.loss);
         assert_eq!(resumed.checkpoint()?, expected.optimizer_checkpoint);
         assert_eq!(resumed.module_checkpoint()?, expected.module_checkpoint);
@@ -1106,8 +1509,8 @@ fn collect_scale_warm_resume_evidence(
     assert_eq!(resumed.module_checkpoint()?, *expected_final_checkpoint);
 
     let before_evaluation = resumed.module_checkpoint()?;
-    let warm_final_loss = mean_evaluation_loss(&mut resumed, evaluation_capture_identity)?;
-    assert_eq!(warm_final_loss.to_bits(), expected_final_loss.to_bits());
+    let resumed_final_loss = mean_evaluation_loss(&mut resumed, evaluation_capture_identity)?;
+    assert_eq!(resumed_final_loss.to_bits(), expected_final_loss.to_bits());
     assert_eq!(resumed.module_checkpoint()?, before_evaluation);
     let (resumed_model, resumed_final_checkpoint) = resumed
         .finish_with_module_checkpoint()
@@ -1140,9 +1543,11 @@ fn collect_scale_warm_resume_evidence(
                 .snapshot
                 .version
                 .checked_add(1)
-                .expect("successful warm publication cannot overflow a version")
+                .expect("successful lifecycle publication cannot overflow a version")
         );
     }
+    let module_visit_count = resumed_states.len();
+    let canonical_state_count = resumed_model.state_dict()?.tensors().len();
     assert_eq!(resumed_model.tokens.weight.id(), destination_tied_identity);
     assert_eq!(
         resumed_states
@@ -1153,37 +1558,13 @@ fn collect_scale_warm_resume_evidence(
             .identity,
         destination_tied_identity
     );
-
-    Ok(ScaleWarmResumeEvidence {
-        replay_from: CHECKPOINT_REPLAY,
-        replay_to: REPLAYS,
-        resume_bundle_bytes: resume_bundle.as_bytes().len(),
-        module_checkpoint_bytes: persisted_checkpoint.as_bytes().len(),
-        artifact_decode_wall_time_ns,
-        owner_restore_wall_time_ns,
-        preparation_wall_time_ns,
-        preparation: warm_preparation,
-        capture_identity,
-        evaluation_capture_identity,
-        program_count,
-        loaded_module_count,
-        durable_artifact_cache_hit_count,
-        durable_artifact_cache_miss_count,
-        render_capsule_hit_count,
-        render_capsule_miss_count,
-        local_render_job_count,
-        compiler_invocation_count,
-        linker_invocation_count,
-        fallback_count,
-        module_visit_count: resumed_states.len(),
-        canonical_state_count: resumed_model.state_dict()?.tensors().len(),
-        artifact_checkpoint_authenticated: true,
-        topology_authenticated: true,
-        different_initialization: true,
-        fresh_executor: true,
-        exact_continuation: true,
-        evaluation_state_neutral: true,
-        target_owned_module_published: true,
+    Ok(ScaleResumeContractResult {
+        preparation_evidence,
+        owner_restore_wall_time,
+        preparation_wall_time,
+        module_visit_count,
+        canonical_state_count,
+        replay_fallback_count,
     })
 }
 
@@ -1274,19 +1655,39 @@ fn required_path(name: &str) -> std::result::Result<PathBuf, Box<dyn Error>> {
     Ok(PathBuf::from(value))
 }
 
-fn main() -> std::result::Result<(), Box<dyn Error>> {
-    let git_sha = env::var("RUSTGRAD_EVIDENCE_GIT_SHA")?;
-    if git_sha.len() != 40
-        || !git_sha
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err("RUSTGRAD_EVIDENCE_GIT_SHA must be a lowercase full Git SHA".into());
+fn scale_run_mode() -> std::result::Result<ScaleRunMode, Box<dyn Error>> {
+    let mut arguments = env::args().skip(1);
+    match (arguments.next().as_deref(), arguments.next()) {
+        (None, None) => {
+            let git_sha = env::var("RUSTGRAD_EVIDENCE_GIT_SHA")?;
+            if git_sha.len() != 40
+                || !git_sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("RUSTGRAD_EVIDENCE_GIT_SHA must be a lowercase full Git SHA".into());
+            }
+            Ok(ScaleRunMode::Full(ScaleEvidencePaths {
+                git_sha,
+                scoreboard: required_path("RUSTGRAD_LARGER_SCOREBOARD_PATH")?,
+                objective: required_path("RUSTGRAD_LARGER_OBJECTIVE_PATH")?,
+                resume_bundle: required_path("RUSTGRAD_LARGER_RESUME_BUNDLE_PATH")?,
+                module_checkpoint: required_path("RUSTGRAD_LARGER_MODULE_CHECKPOINT_PATH")?,
+            }))
+        }
+        (Some("lifecycle-only"), Some(evidence)) if arguments.next().is_none() => {
+            Ok(ScaleRunMode::LifecycleOnly {
+                evidence: PathBuf::from(evidence),
+            })
+        }
+        _ => {
+            Err("usage: compiled_transformer_scale_evidence [lifecycle-only EVIDENCE.json]".into())
+        }
     }
-    let scoreboard_path = required_path("RUSTGRAD_LARGER_SCOREBOARD_PATH")?;
-    let objective_path = required_path("RUSTGRAD_LARGER_OBJECTIVE_PATH")?;
-    let resume_bundle_path = required_path("RUSTGRAD_LARGER_RESUME_BUNDLE_PATH")?;
-    let module_checkpoint_path = required_path("RUSTGRAD_LARGER_MODULE_CHECKPOINT_PATH")?;
+}
+
+fn main() -> std::result::Result<(), Box<dyn Error>> {
+    let mode = scale_run_mode()?;
 
     let compile_started = Instant::now();
     let plan = CompiledModuleAdamWPlan::compile_graph_with_dropout_and_ignore_index(
@@ -1330,25 +1731,25 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         .map_err(|error| error.into_parts().1)?;
     let prepare_wall_time = prepare_started.elapsed();
     let preparation = runtime.native_cpu_preparation_report();
-    for program in [
-        Some(preparation.main()),
-        preparation.accumulation(),
-        preparation.partial_flush(),
-        preparation.zero_grad(),
-        preparation.evaluation(),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    let initial_preparation_programs = scale_preparation_programs(preparation);
+    let initial_prepared_role_count = initial_preparation_programs.len();
+    let initial_fallback_count = initial_preparation_programs
+        .iter()
+        .map(|program| program.fallback_count())
+        .sum::<usize>();
+    for program in initial_preparation_programs {
         assert!(program.native_item_count() > 0);
         assert_eq!(program.fallback_count(), 0);
     }
-    let mut scoreboard = NativeTrainingScoreboard::new(
-        inspection.clone(),
-        preparation,
-        compile_wall_time,
-        prepare_wall_time,
-    )?;
+    let mut scoreboard = match &mode {
+        ScaleRunMode::Full(_) => Some(NativeTrainingScoreboard::new(
+            inspection.clone(),
+            preparation,
+            compile_wall_time,
+            prepare_wall_time,
+        )?),
+        ScaleRunMode::LifecycleOnly { .. } => None,
+    };
 
     let mut evaluation_trajectory = vec![evaluate_scale_frontier(
         &mut runtime,
@@ -1364,15 +1765,21 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let mut saved_resume_bundle = None;
     let mut continuation = Vec::new();
     let mut replay_progress = Vec::new();
+    let mut uninterrupted_replay_fallback_count = 0_usize;
     for replay in 1..=REPLAYS {
         let step = runtime.step_batch_commit_only_scheduled(ScaleBatch::new(replay)?)?;
         assert_strict_native(&step);
+        uninterrupted_replay_fallback_count = uninterrupted_replay_fallback_count
+            .checked_add(step.report().fallback_count())
+            .expect("the fixed replay fallback inventory cannot overflow");
         assert_eq!(step.did_update(), replay % ACCUMULATION_STEPS == 0);
         assert_eq!(step.optimizer_step(), replay / ACCUMULATION_STEPS);
         assert_eq!(step.accumulation_index(), replay % ACCUMULATION_STEPS);
         assert_eq!(step.clip_report().is_some(), step.did_update());
         assert_eq!(step.window_loss_report().is_some(), step.did_update());
-        scoreboard.record_step(&step)?;
+        if let Some(scoreboard) = &mut scoreboard {
+            scoreboard.record_step(&step)?;
+        }
         replay_progress.push(ScaleReplayProgressEvidence {
             replay,
             optimizer_step: step.optimizer_step(),
@@ -1402,8 +1809,10 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
                 program_artifact.clone(),
                 module_checkpoint.clone(),
             )?;
-            resume_bundle.save_file(&resume_bundle_path)?;
-            module_checkpoint.save_file(&module_checkpoint_path)?;
+            if let ScaleRunMode::Full(paths) = &mode {
+                resume_bundle.save_file(&paths.resume_bundle)?;
+                module_checkpoint.save_file(&paths.module_checkpoint)?;
+            }
             pending_checkpoint_bytes = Some(u64::try_from(checkpoint.as_bytes().len())?);
             pending_module_checkpoint_bytes =
                 Some(u64::try_from(module_checkpoint.as_bytes().len())?);
@@ -1424,9 +1833,14 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
             });
         }
     }
-    let terminal_checkpoint_started = Instant::now();
-    let uninterrupted_final = runtime.checkpoint()?;
-    scoreboard.observe_checkpoint(&uninterrupted_final, terminal_checkpoint_started.elapsed())?;
+    let uninterrupted_final = if let Some(scoreboard) = &mut scoreboard {
+        let terminal_checkpoint_started = Instant::now();
+        let checkpoint = runtime.checkpoint()?;
+        scoreboard.observe_checkpoint(&checkpoint, terminal_checkpoint_started.elapsed())?;
+        checkpoint
+    } else {
+        runtime.checkpoint()?
+    };
     assert_eq!(uninterrupted_final.info().replay_step(), REPLAYS);
     assert_eq!(uninterrupted_final.info().optimizer_step(), 3);
     assert_eq!(uninterrupted_final.info().accumulation_index(), 0);
@@ -1465,28 +1879,33 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         "larger compiled Transformer loss did not decrease: {initial_loss} -> {final_loss}"
     );
 
-    let report = scoreboard.report()?;
-    let reported_compile = report.compile_phases().expect("v23 reports compile phases");
-    assert_eq!(reported_compile.compile_count(), 1);
-    assert!(reported_compile.evaluation().is_some());
-    assert_eq!(report.fallback_count(), 0);
-    assert_eq!(report.successful_replay_count(), REPLAYS);
-    assert_eq!(
-        report.recurrent_state_count(),
-        u64::try_from(inspection.recurrent_state_count())?
-    );
-    assert_eq!(
-        report.recurrent_state_bytes(),
-        u64::try_from(inspection.recurrent_state_bytes())?
-    );
-    let terminal_checkpoint_bytes = report
-        .checkpoint_byte_count()
-        .expect("the scoreboard records the terminal checkpoint");
-    assert_eq!(
-        terminal_checkpoint_bytes,
-        u64::try_from(uninterrupted_final.as_bytes().len())?
-    );
-    fs::write(&scoreboard_path, report.to_json_bytes()?)?;
+    let validated_scoreboard = match scoreboard {
+        Some(scoreboard) => {
+            let report = scoreboard.report()?;
+            let reported_compile = report.compile_phases().expect("v23 reports compile phases");
+            assert_eq!(reported_compile.compile_count(), 1);
+            assert!(reported_compile.evaluation().is_some());
+            assert_eq!(report.fallback_count(), 0);
+            assert_eq!(report.successful_replay_count(), REPLAYS);
+            assert_eq!(
+                report.recurrent_state_count(),
+                u64::try_from(inspection.recurrent_state_count())?
+            );
+            assert_eq!(
+                report.recurrent_state_bytes(),
+                u64::try_from(inspection.recurrent_state_bytes())?
+            );
+            let terminal_checkpoint_bytes = report
+                .checkpoint_byte_count()
+                .expect("the scoreboard records the terminal checkpoint");
+            assert_eq!(
+                terminal_checkpoint_bytes,
+                u64::try_from(uninterrupted_final.as_bytes().len())?
+            );
+            Some((report, terminal_checkpoint_bytes))
+        }
+        None => None,
+    };
 
     let expected_final_module_checkpoint = runtime.module_checkpoint()?;
     assert_eq!(
@@ -1509,9 +1928,115 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     );
     let saved_resume_bundle =
         saved_resume_bundle.expect("replay three persists one portable resume bundle");
+    if let ScaleRunMode::LifecycleOnly { evidence: path } = &mode {
+        let resume_bundle_bytes = saved_resume_bundle.as_bytes().to_vec();
+        let resume_bundle_byte_count = u64::try_from(resume_bundle_bytes.len())?;
+        if resume_bundle_byte_count > SCALE_LIFECYCLE_RESUME_BUNDLE_MAX_BYTES {
+            return Err("scale lifecycle resume bundle exceeds its evidence byte bound".into());
+        }
+        let resume_bundle_checksum = scale_lifecycle_checksum(&resume_bundle_bytes);
+        let decoded_resume_bundle =
+            CompiledAdamWResumeBundle::from_bytes(resume_bundle_bytes.clone())?;
+        assert_eq!(
+            decoded_resume_bundle.as_bytes(),
+            resume_bundle_bytes.as_slice()
+        );
+        assert_eq!(decoded_resume_bundle, saved_resume_bundle);
+
+        let contract = run_scale_resume_contract(
+            ScaleResumeContractInput {
+                resume_bundle: &decoded_resume_bundle,
+                inspection: &inspection,
+                capture_identity,
+                evaluation_capture_identity,
+                continuation: &continuation,
+                expected_final_checkpoint: &expected_final_module_checkpoint,
+                expected_final_model: &expected_final_model,
+                expected_final_loss: final_loss,
+                measurement: ScaleResumeMeasurement::Omit,
+            },
+            |preparation, wall_time| {
+                assert!(wall_time.is_none());
+                let programs = scale_preparation_programs(preparation);
+                Ok(ScaleLifecyclePreparationObservation {
+                    program_count: programs.len(),
+                    fallback_count: programs
+                        .iter()
+                        .map(|program| program.fallback_count())
+                        .sum(),
+                })
+            },
+        )?;
+        let lifecycle_evidence = ScaleLifecycleEvidence {
+            schema_version: SCALE_LIFECYCLE_EVIDENCE_VERSION,
+            workload: ScaleLifecycleWorkloadEvidence {
+                batch: BATCH,
+                time: TIME,
+                vocabulary: VOCAB,
+                embedding: EMBEDDING,
+                heads: HEADS,
+                feed_forward: FEED_FORWARD,
+                blocks: 2,
+                accumulation_steps: ACCUMULATION_STEPS,
+                replays: REPLAYS,
+            },
+            native: ScaleLifecycleNativeEvidence {
+                compile_count: compile_phases.compile_count(),
+                capture_identity,
+                evaluation_capture_identity,
+                prepared_roles: [
+                    "main",
+                    "accumulation",
+                    "partial_flush",
+                    "zero_grad",
+                    "evaluation",
+                ],
+                initial_prepared_role_count,
+                initial_fallback_count,
+                uninterrupted_replay_fallback_count,
+                restored_prepared_role_count: contract.preparation_evidence.program_count,
+                restored_fallback_count: contract.preparation_evidence.fallback_count,
+                restored_replay_fallback_count: contract.replay_fallback_count,
+            },
+            replay_progress,
+            evaluation_trajectory,
+            pending_resume: ScaleLifecyclePendingResumeEvidence {
+                replay: CHECKPOINT_REPLAY,
+                optimizer_step: 1,
+                accumulation_index: 1,
+                checkpoint_bytes: pending_checkpoint_bytes,
+                module_checkpoint_bytes: pending_module_checkpoint_bytes,
+                resume_bundle_bytes: resume_bundle_byte_count,
+                resume_bundle_checksum_fnv1a64: resume_bundle_checksum,
+                exact_encoded_round_trip: true,
+            },
+            continuation: ScaleLifecycleContinuationEvidence {
+                replay_from: CHECKPOINT_REPLAY + 1,
+                replay_to: REPLAYS,
+                exact_loss_and_checkpoint_continuation: true,
+                different_initialization: true,
+                evaluation_state_neutral: true,
+                tied_output_head_is_canonical: true,
+                frozen_position_state_preserved: true,
+                target_owned_module_published: true,
+                module_visit_count: contract.module_visit_count,
+                canonical_state_count: contract.canonical_state_count,
+            },
+        };
+        let lifecycle_bytes = lifecycle_evidence.canonical_bytes()?;
+        assert_eq!(lifecycle_bytes, lifecycle_evidence.canonical_bytes()?);
+        fs::write(path, lifecycle_bytes)?;
+        return Ok(());
+    }
+    let ScaleRunMode::Full(paths) = &mode else {
+        unreachable!("the lifecycle-only mode returned above")
+    };
+    let (report, terminal_checkpoint_bytes) = validated_scoreboard
+        .expect("full scale evidence validates one native scoreboard before publication");
+    fs::write(&paths.scoreboard, report.to_json_bytes()?)?;
     let warm_resume_evidence = collect_scale_warm_resume_evidence(ScaleWarmResumeInput {
-        resume_bundle_path: &resume_bundle_path,
-        module_checkpoint_path: &module_checkpoint_path,
+        resume_bundle_path: &paths.resume_bundle,
+        module_checkpoint_path: &paths.module_checkpoint,
         saved_bundle: &saved_resume_bundle,
         inspection: &inspection,
         capture_identity,
@@ -1529,7 +2054,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
 
     let objective = json!({
         "schema_version": 6,
-        "git_sha": git_sha,
+        "git_sha": &paths.git_sha,
         "workload": {
             "batch": BATCH,
             "time": TIME,
@@ -1579,6 +2104,6 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     });
     let mut objective_bytes = serde_json::to_vec_pretty(&objective)?;
     objective_bytes.push(b'\n');
-    fs::write(&objective_path, objective_bytes)?;
+    fs::write(&paths.objective, objective_bytes)?;
     Ok(())
 }
