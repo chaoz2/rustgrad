@@ -107,6 +107,23 @@ jobs:
           path: native-cpu-training-scoreboard.json
           if-no-files-found: error
           retention-days: 30
+      - name: Larger compiled Transformer strict-native lifecycle smoke
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence=native-transformer-scale-lifecycle.json
+          cargo run --quiet --example compiled_transformer_scale_evidence -- lifecycle-only "$evidence"
+          python3 .github/scripts/check-transformer-scale-lifecycle-evidence.py "$evidence"
+      - name: Upload larger compiled Transformer lifecycle evidence
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-transformer-scale-lifecycle-${{ github.sha }}
+          path: native-transformer-scale-lifecycle.json
+          if-no-files-found: error
+          retention-days: 30
       - run: cargo test --doc
 
   native-transformer-release-scoreboard:
