@@ -23,7 +23,8 @@ use compiler_evidence::{
 use inspection::ProgramInspection;
 pub use inspection::{
     CompiledAdamWInspection, CompiledTrainingCompileObservation,
-    CompiledTrainingCompilePhaseObservation, NativeTrainingPreparationTiming,
+    CompiledTrainingCompilePhaseObservation, CompiledTrainingInspection,
+    NativeTrainingPreparationTiming,
 };
 pub use program_report::NativeTrainingProgramReport;
 use report::CheckpointReport;
@@ -36,8 +37,8 @@ pub use step_phases::{
 #[cfg(test)]
 use super::NativeCpuDispatchSegmentation;
 use super::{
-    CompiledAdamWCheckpoint, NativeCpuCompiledAdamWPreparationReport,
-    NativeCpuCompiledAdamWStepResult, NativeCpuProgramPreparationReport, NativeCpuReplayTraffic,
+    CompiledTrainingCheckpointEvidence, NativeCpuCompiledTrainingPreparationReport,
+    NativeCpuCompiledTrainingStep, NativeCpuProgramPreparationReport, NativeCpuReplayTraffic,
     NativeCpuRunReport,
 };
 #[cfg(test)]
@@ -104,7 +105,7 @@ pub struct NativeTrainingScoreboard {
     prepare_module_overlaps: Vec<NativeTrainingModuleOverlap>,
     prepare_program_pair_overlaps: Vec<NativeTrainingProgramPairOverlap>,
     prepare_translation_units: Vec<NativeTrainingTranslationUnit>,
-    inspection: CompiledAdamWInspection,
+    inspection: CompiledTrainingInspection,
     main: NativeTrainingProgramReport,
     accumulation: Option<NativeTrainingProgramReport>,
     partial_flush: Option<NativeTrainingProgramReport>,
@@ -129,8 +130,8 @@ impl NativeTrainingScoreboard {
     /// `prepare_wall_time` similarly encloses every attached program's
     /// measured preparation time.
     pub fn new(
-        inspection: CompiledAdamWInspection,
-        preparation: &NativeCpuCompiledAdamWPreparationReport,
+        inspection: CompiledTrainingInspection,
+        preparation: &NativeCpuCompiledTrainingPreparationReport,
         compile_wall_time: Duration,
         prepare_wall_time: Duration,
     ) -> Result<Self> {
@@ -321,10 +322,10 @@ impl NativeTrainingScoreboard {
         Ok(())
     }
 
-    /// Records and classifies one successful compiled AdamW training step using
-    /// only its authenticated public `did_update` result. Partial flushes are
-    /// deliberately outside this training-step scoreboard.
-    pub fn record_step(&mut self, step: &NativeCpuCompiledAdamWStepResult) -> Result<()> {
+    /// Records and classifies one successful compiled training step using only
+    /// its authenticated public update result. Partial flushes are deliberately
+    /// outside this training-step scoreboard.
+    pub fn record_step(&mut self, step: &impl NativeCpuCompiledTrainingStep) -> Result<()> {
         if self.recording_mode == ReplayRecordingMode::Raw {
             return Err(invalid("cannot mix raw and classified replay samples"));
         }
@@ -333,8 +334,8 @@ impl NativeTrainingScoreboard {
         } else {
             NativeTrainingStepPhase::AccumulationOnly
         };
-        let (timing, executed) = self.validate_replay(step.report(), phase)?;
-        self.commit_replay(step.report(), timing, executed, phase);
+        let (timing, executed) = self.validate_replay(step.native_report(), phase)?;
+        self.commit_replay(step.native_report(), timing, executed, phase);
         self.replay_step_phases.push(phase);
         self.recording_mode = ReplayRecordingMode::Phased;
         Ok(())
@@ -491,10 +492,9 @@ impl NativeTrainingScoreboard {
 
     pub fn observe_checkpoint(
         &mut self,
-        checkpoint: &CompiledAdamWCheckpoint,
+        checkpoint: &impl CompiledTrainingCheckpointEvidence,
         wall_time: Duration,
     ) -> Result<()> {
-        let info = checkpoint.info();
         let replay_count = self.replay_timings.len() as u64;
         let expected_step = self
             .inspection
@@ -505,16 +505,16 @@ impl NativeTrainingScoreboard {
             .accumulation
             .as_ref()
             .map(|program| program.capture_identity);
-        if info.capture_identity() != self.main.capture_identity
-            || info.replay_step() != expected_step
-            || info.accumulation_capture_identity() != expected_accumulation_identity
+        if checkpoint.capture_identity() != self.main.capture_identity
+            || checkpoint.replay_step() != expected_step
+            || checkpoint.accumulation_capture_identity() != expected_accumulation_identity
         {
             return Err(invalid("checkpoint does not match recorded replays"));
         }
         self.checkpoint = Some(CheckpointReport {
-            capture_identity: info.capture_identity(),
-            replay_step: info.replay_step(),
-            byte_count: count(checkpoint.as_bytes().len(), "checkpoint byte")?,
+            capture_identity: checkpoint.capture_identity(),
+            replay_step: checkpoint.replay_step(),
+            byte_count: count(checkpoint.encoded_byte_count()?, "checkpoint byte")?,
             wall_time: BenchmarkDuration::from_duration(wall_time),
         });
         Ok(())

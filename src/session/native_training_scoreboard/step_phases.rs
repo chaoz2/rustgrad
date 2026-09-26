@@ -6,7 +6,7 @@ use crate::{BenchmarkDuration, BenchmarkLatencySummary, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Observable outcome of one successful compiled AdamW main replay.
+/// Observable outcome of one successful compiled-training main replay.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeTrainingStepPhase {
@@ -16,7 +16,7 @@ pub enum NativeTrainingStepPhase {
     OptimizerCommit,
 }
 
-/// Phase timings for the first successful compiled AdamW main replay.
+/// Phase timings for the first successful compiled-training main replay.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeTrainingFirstStepReport {
@@ -79,7 +79,7 @@ impl NativeTrainingFirstStepReport {
     }
 }
 
-/// Timing summary for one class of successful warm compiled AdamW replays.
+/// Timing summary for one class of successful warm compiled-training replays.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeTrainingWarmStepReport {

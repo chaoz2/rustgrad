@@ -11,6 +11,7 @@ use super::*;
 pub struct CompiledMomentumSgdPlan {
     pub(super) inner: CompiledTrainingPlan,
     program_identity: u64,
+    compile_phases: Option<CompiledTrainingCompileObservation>,
 }
 
 impl CompiledMomentumSgdPlan {
@@ -26,11 +27,9 @@ impl CompiledMomentumSgdPlan {
             &BTreeMap<String, NodeId>,
         ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
     {
-        Self::from_inner(CompiledTrainingPlan::compile(
-            MomentumProgram { config },
-            parameters,
-            build,
-        )?)
+        let (inner, compile_phases) =
+            CompiledTrainingPlan::compile_observed(MomentumProgram { config }, parameters, build)?;
+        Self::from_compiled_inner(inner, compile_phases)
     }
 
     /// Compiles a module forward without allocating a runtime or taking
@@ -174,6 +173,7 @@ impl CompiledMomentumSgdPlan {
                 .inner
                 .restore_frontier_with_versions(checkpoint.step, values, versions)?,
             program_identity: self.program_identity,
+            compile_phases: self.compile_phases,
         })
     }
 
@@ -230,11 +230,53 @@ impl CompiledMomentumSgdPlan {
         self.inner.step
     }
 
+    /// Returns immutable logical work and recurrent-state facts without
+    /// preparing a runtime or exposing the raw mixed capture.
+    pub fn inspection(&self) -> Result<CompiledTrainingInspection> {
+        let recurrent_state = checked_recurrent_state_extent(
+            self.inner
+                .state_values
+                .values()
+                .map(checked_bytes)
+                .collect::<Result<Vec<_>>>()?,
+        )?;
+        Ok(CompiledTrainingInspection::new(
+            self.step_count(),
+            (
+                self.capture_identity(),
+                self.inner.recurrent_capture.execution_plan().clone(),
+            ),
+            None,
+            None,
+            None,
+            None,
+            recurrent_state,
+        )
+        .with_compile_phases(self.compile_phases.clone()))
+    }
+
+    /// Backend-neutral graph/autograd/lowering/capture observations retained
+    /// by the freshly compiled plan. Artifact-restored plans deliberately
+    /// carry no synthetic compilation evidence.
+    pub fn compile_phases(&self) -> Option<&CompiledTrainingCompileObservation> {
+        self.compile_phases.as_ref()
+    }
+
+    fn from_compiled_inner(
+        inner: CompiledTrainingPlan,
+        compile_phases: CompiledTrainingCompileObservation,
+    ) -> Result<Self> {
+        let mut plan = Self::from_inner(inner)?;
+        plan.compile_phases = Some(compile_phases);
+        Ok(plan)
+    }
+
     pub(super) fn from_inner(inner: CompiledTrainingPlan) -> Result<Self> {
         let program_identity = inner.capture_identity()?;
         Ok(Self {
             inner,
             program_identity,
+            compile_phases: None,
         })
     }
 }

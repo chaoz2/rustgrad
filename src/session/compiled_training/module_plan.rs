@@ -605,7 +605,7 @@ impl<M: Module> CompiledModuleTrainingPlan<M, CompiledAdamWPlan, Option<u64>> {
 
     /// Returns the owned plan's immutable logical work and recurrent-state
     /// inspection without exposing its sealed module.
-    pub fn inspection(&self) -> Result<CompiledAdamWInspection> {
+    pub fn inspection(&self) -> Result<CompiledTrainingInspection> {
         self.plan.inspection()
     }
 

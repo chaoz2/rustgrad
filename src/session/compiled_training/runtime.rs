@@ -88,6 +88,55 @@ pub trait CompiledCheckpointParameterSnapshot {
     fn checkpoint_parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>>;
 }
 
+/// Optimizer-neutral checkpoint facts consumed by training evidence tooling.
+///
+/// This deliberately exposes only authenticated replay identity and encoded
+/// size. Concrete checkpoint types retain their optimizer-specific tensors,
+/// versions, and codecs through their inherent APIs.
+pub trait CompiledTrainingCheckpointEvidence {
+    fn capture_identity(&self) -> u64;
+
+    fn replay_step(&self) -> u64;
+
+    fn accumulation_capture_identity(&self) -> Option<u64> {
+        None
+    }
+
+    fn encoded_byte_count(&self) -> Result<usize>;
+}
+
+impl CompiledTrainingCheckpointEvidence for CompiledAdamWCheckpoint {
+    fn capture_identity(&self) -> u64 {
+        self.info().capture_identity()
+    }
+
+    fn replay_step(&self) -> u64 {
+        self.info().replay_step()
+    }
+
+    fn accumulation_capture_identity(&self) -> Option<u64> {
+        self.info().accumulation_capture_identity()
+    }
+
+    fn encoded_byte_count(&self) -> Result<usize> {
+        Ok(self.as_bytes().len())
+    }
+}
+
+impl CompiledTrainingCheckpointEvidence for CompiledMomentumSgdCheckpoint {
+    fn capture_identity(&self) -> u64 {
+        CompiledMomentumSgdCheckpoint::capture_identity(self)
+    }
+
+    fn replay_step(&self) -> u64 {
+        CompiledMomentumSgdCheckpoint::step(self)
+    }
+
+    fn encoded_byte_count(&self) -> Result<usize> {
+        Ok(self.to_bytes()?.len())
+    }
+}
+
 impl CompiledCheckpointParameterSnapshot for CompiledAdamWCheckpoint {
     fn checkpoint_parameter_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
         Ok(decode_adamw_checkpoint(self.as_bytes())?.parameters)
@@ -106,6 +155,28 @@ impl CompiledCheckpointParameterSnapshot for CompiledMomentumSgdCheckpoint {
 /// live state. A failed restore leaves the runtime unchanged.
 pub trait CompiledCheckpointRestoreRuntime: CompiledCheckpointRuntime {
     fn restore_checkpoint_in_place(&mut self, checkpoint: &Self::Checkpoint) -> Result<()>;
+}
+
+/// One strict-native CPU result consumable by optimizer-neutral evidence.
+pub trait NativeCpuCompiledTrainingStep: CompiledTrainingStep {
+    /// Exact report produced by the successful replay.
+    fn native_report(&self) -> &NativeCpuRunReport;
+
+    /// Whether this replay committed an optimizer update. Optimizers without
+    /// accumulation always return `true`.
+    fn did_update(&self) -> bool;
+}
+
+/// Shared strict-native CPU runtime diagnostics.
+///
+/// Optimizer-specific extensions continue to expose moments, clipping,
+/// accumulation, and other policy state without entering this base contract.
+pub trait NativeCpuCompiledTrainingRuntime:
+    CompiledTrainingRuntime<Step: NativeCpuCompiledTrainingStep>
+{
+    fn native_preparation_report(&self) -> &NativeCpuCompiledTrainingPreparationReport;
+
+    fn non_finite_policy(&self) -> CpuNonFinitePolicy;
 }
 
 /// AdamW-specific policy and recurrent-state inspection.

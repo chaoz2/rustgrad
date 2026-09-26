@@ -847,7 +847,7 @@ impl CompiledAdamWPlan {
 
     /// Returns immutable logical work and recurrent-state facts without
     /// preparing a runtime or exposing the raw mixed capture.
-    pub fn inspection(&self) -> Result<CompiledAdamWInspection> {
+    pub fn inspection(&self) -> Result<CompiledTrainingInspection> {
         let recurrent_state = checked_recurrent_state_extent(
             self.inner
                 .state_values
@@ -895,7 +895,7 @@ impl CompiledAdamWPlan {
                 evaluation.inference.execution_plan().clone(),
             )
         });
-        Ok(CompiledAdamWInspection::new(
+        Ok(CompiledTrainingInspection::new(
             self.step_count(),
             main,
             accumulation,

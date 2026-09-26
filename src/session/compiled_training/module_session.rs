@@ -312,11 +312,13 @@ impl<'a, M> CompiledModuleTrainingSession<M, NativeCpuCompiledAdamW<'a>> {
     pub fn dropout_block_counter(&self) -> Result<Option<u64>> {
         self.runtime.dropout_block_counter()
     }
+}
 
+impl<M, R: NativeCpuCompiledTrainingRuntime> CompiledModuleTrainingSession<M, R> {
     /// Returns strict-native CPU preparation evidence without exposing the
     /// sealed module or mutable runtime internals.
-    pub fn native_cpu_preparation_report(&self) -> &NativeCpuCompiledAdamWPreparationReport {
-        self.runtime.preparation_report()
+    pub fn native_cpu_preparation_report(&self) -> &NativeCpuCompiledTrainingPreparationReport {
+        self.runtime.native_preparation_report()
     }
 }
 

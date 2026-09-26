@@ -163,8 +163,8 @@ use self::window_progress::{
 };
 use super::inference::{PortableCapturedInferenceRecipe, PortableInferenceHostPolicy};
 use super::native_training_scoreboard::{
-    CompiledAdamWInspection, CompiledTrainingCompileObservation,
-    CompiledTrainingCompilePhaseObservation,
+    CompiledTrainingCompileObservation, CompiledTrainingCompilePhaseObservation,
+    CompiledTrainingInspection,
 };
 use super::target::{
     ConfiguredCpuSessionTarget, CpuNonFinitePolicy, CpuSessionTarget, MetalSessionTarget,

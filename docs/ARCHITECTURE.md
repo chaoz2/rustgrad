@@ -1663,6 +1663,12 @@ through a three-replay window with a finite global norm limit.
   loss plus its exact cross-batch aggregation weight, named outputs, capture
   identity, replay progress, and parameter snapshots or publishes them into an
   exact module schema.
+- `CompiledTrainingInspection`, `NativeCpuCompiledTrainingRuntime`,
+  `NativeCpuCompiledTrainingStep`, and
+  `CompiledTrainingCheckpointEvidence` form the strict-native evidence seam.
+  The same `NativeTrainingScoreboard` consumes momentum-SGD and AdamW without
+  erasing optimizer-specific state or reports; the historical
+  `CompiledAdamWInspection` name remains an alias.
 - `CompiledInputBatch` couples a fixed external schema with binding conversion.
   `with_input_batch` registers it, `step_batch` supplies an external scalar F32
   learning rate, and `evaluate_batch` reuses the domain batch. Conversion

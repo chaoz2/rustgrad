@@ -188,14 +188,14 @@ impl NativeTrainingPreparationTiming {
     }
 }
 
-/// Immutable logical work and recurrent-state facts for one compiled AdamW
+/// Immutable logical work and recurrent-state facts for one compiled training
 /// plan. Inspection prepares no target and exposes no capture.
 ///
 /// Equality compares only that logical topology. Optional compile-phase
 /// observations describe one construction and remain independently
 /// inspectable, but do not make equivalent plans unequal.
 #[derive(Clone, Debug)]
-pub struct CompiledAdamWInspection {
+pub struct CompiledTrainingInspection {
     pub(super) initial_replay_step: u64,
     pub(super) main: ProgramInspection,
     pub(super) accumulation: Option<ProgramInspection>,
@@ -207,7 +207,7 @@ pub struct CompiledAdamWInspection {
     pub(super) compile_phases: Option<CompiledTrainingCompileObservation>,
 }
 
-impl PartialEq for CompiledAdamWInspection {
+impl PartialEq for CompiledTrainingInspection {
     fn eq(&self, other: &Self) -> bool {
         self.initial_replay_step == other.initial_replay_step
             && self.main == other.main
@@ -220,7 +220,10 @@ impl PartialEq for CompiledAdamWInspection {
     }
 }
 
-impl Eq for CompiledAdamWInspection {}
+impl Eq for CompiledTrainingInspection {}
+
+/// Source-compatible AdamW name for optimizer-neutral training inspection.
+pub type CompiledAdamWInspection = CompiledTrainingInspection;
 
 /// One backend-neutral compiled-training construction phase observed before
 /// target preparation. Counts describe the immutable graph or schedule at the
@@ -367,7 +370,7 @@ impl CompiledTrainingCompileObservation {
     }
 }
 
-impl CompiledAdamWInspection {
+impl CompiledTrainingInspection {
     pub(crate) fn new(
         initial_replay_step: u64,
         main: (u64, ExecutionPlanSummary),

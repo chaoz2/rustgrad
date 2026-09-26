@@ -51,28 +51,6 @@ impl CompiledAdamWAuxiliaryPlan {
 }
 
 impl CompiledTrainingPlan {
-    /// Compiles one exact static training program.
-    ///
-    /// `build` receives the declared external inputs and detached parameter
-    /// graph inputs. It returns one scalar F32 loss and deterministically named
-    /// detached outputs. All parameter gradients are constructed by exactly
-    /// one [`Graph::gradient_default`] traversal.
-    pub(super) fn compile<F, O>(
-        optimizer: O,
-        parameters: impl IntoIterator<Item = TrainingParameterInit>,
-        build: F,
-    ) -> Result<Self>
-    where
-        O: CompiledOptimizerProgram,
-        F: FnOnce(
-            &mut Graph,
-            &BTreeMap<String, NodeId>,
-            &BTreeMap<String, NodeId>,
-        ) -> Result<(NodeId, BTreeMap<String, NodeId>)>,
-    {
-        Self::compile_observed(optimizer, parameters, build).map(|(plan, _)| plan)
-    }
-
     pub(super) fn compile_observed<F, O>(
         optimizer: O,
         parameters: impl IntoIterator<Item = TrainingParameterInit>,

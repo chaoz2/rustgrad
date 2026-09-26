@@ -4725,7 +4725,7 @@ fn malformed_observation_value_rejects_during_staged_validation() {
 
 #[test]
 fn optimizer_neutral_plan_renders_momentum_through_shared_metal_core() {
-    let plan = CompiledTrainingPlan::compile(
+    let (plan, _) = CompiledTrainingPlan::compile_observed(
         MomentumProgram {
             config: CompiledMomentumSgdConfig::new(0.9).unwrap(),
         },
@@ -4793,10 +4793,39 @@ fn momentum_plan_prepares_strict_native_replay_with_exact_checkpoint_state() {
     let plan =
         CompiledMomentumSgdPlan::compile(config(), initial_parameters(), build_tinybob).unwrap();
     let identity = plan.capture_identity();
+    let inspection = plan.inspection().unwrap();
+    let compile_phases = inspection
+        .compile_phases()
+        .expect("fresh momentum compilation retains phase evidence");
+    assert_eq!(compile_phases.compile_count(), 1);
+    assert!(compile_phases.accumulation_capture().is_none());
+    assert!(compile_phases.partial_flush().is_none());
+    assert!(compile_phases.zero_grad().is_none());
+    assert!(compile_phases.evaluation().is_none());
+    assert_eq!(inspection.main().0, identity);
+    assert!(inspection.accumulation().is_none());
+    assert!(inspection.partial_flush().is_none());
+    assert!(inspection.zero_grad().is_none());
+    assert!(inspection.evaluation().is_none());
+    let compile_wall_time = compile_phases.measured_wall_time().unwrap();
     let mut interpreted = plan.prepare_cpu().unwrap();
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
     let mut native = plan.prepare(&target).unwrap();
+    fn assert_native_training_runtime<R: NativeCpuCompiledTrainingRuntime>(runtime: &R) {
+        assert_eq!(
+            runtime.native_preparation_report().main().fallback_count(),
+            0
+        );
+    }
+    assert_native_training_runtime(&native);
+    let mut scoreboard = crate::NativeTrainingScoreboard::new(
+        inspection,
+        native.native_preparation_report(),
+        compile_wall_time,
+        native.native_preparation_report().main().wall_time(),
+    )
+    .unwrap();
 
     let preparation = native.preparation_report();
     assert_eq!(preparation.main().capture_identity(), identity);
@@ -4819,17 +4848,61 @@ fn momentum_plan_prepares_strict_native_replay_with_exact_checkpoint_state() {
     assert_eq!(actual.capture_identity(), expected.capture_identity());
     assert_eq!(actual.report().successful_invocation(), 1);
     assert_eq!(actual.report().fallback_count(), 0);
+    scoreboard.record_step(&actual).unwrap();
     assert_eq!(
         native.checkpoint().unwrap(),
         interpreted.checkpoint().unwrap()
     );
+
+    let expected = interpreted.step(batch(), lr()).unwrap();
+    let actual = native.step(batch(), lr()).unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert_eq!(actual.outputs(), expected.outputs());
+    assert_eq!(actual.step(), expected.step());
+    assert_eq!(actual.capture_identity(), expected.capture_identity());
+    assert_eq!(actual.report().successful_invocation(), 2);
+    assert_eq!(actual.report().fallback_count(), 0);
+    scoreboard.record_step(&actual).unwrap();
+    assert_eq!(
+        native.checkpoint().unwrap(),
+        interpreted.checkpoint().unwrap()
+    );
+
+    let observed_checkpoint = native.checkpoint().unwrap();
+    fn assert_checkpoint_evidence(checkpoint: &impl CompiledTrainingCheckpointEvidence) {
+        assert!(checkpoint.capture_identity() != 0);
+        assert_eq!(checkpoint.accumulation_capture_identity(), None);
+        assert!(checkpoint.encoded_byte_count().unwrap() > 0);
+    }
+    assert_checkpoint_evidence(&observed_checkpoint);
+    scoreboard
+        .observe_checkpoint(&observed_checkpoint, Duration::ZERO)
+        .unwrap();
+    let report = scoreboard.report().unwrap();
+    assert_eq!(report.successful_replay_count(), 2);
+    assert!(report.accumulation().is_none());
+    assert!(report.partial_flush().is_none());
+    assert!(report.zero_grad().is_none());
+    assert!(report.evaluation().is_none());
+    assert_eq!(report.fallback_count(), 0);
+    assert_eq!(
+        report.checkpoint_byte_count(),
+        Some(u64::try_from(observed_checkpoint.to_bytes().unwrap().len()).unwrap())
+    );
+    let phases = report.step_phases().unwrap();
+    assert_eq!(
+        phases.first().phase(),
+        crate::NativeTrainingStepPhase::OptimizerCommit
+    );
+    assert_eq!(phases.warm_optimizer_commit().unwrap().sample_count(), 1);
+    assert!(phases.warm_accumulation_only().is_none());
 
     let expected = interpreted.commit_step(batch(), lr()).unwrap();
     let actual = native.commit_step(batch(), lr()).unwrap();
     assert!(expected.outputs().is_empty());
     assert!(actual.outputs().is_empty());
     assert_eq!(actual.loss(), expected.loss());
-    assert_eq!(actual.report().successful_invocation(), 2);
+    assert_eq!(actual.report().successful_invocation(), 3);
     assert_eq!(actual.report().fallback_count(), 0);
     assert_eq!(
         native.checkpoint().unwrap(),
@@ -4920,6 +4993,7 @@ fn momentum_cpu_targets_preserve_non_finite_policy_across_retry_and_restore() {
 fn momentum_plan_restores_checkpoint_without_recompiling_or_mutating_source() {
     let plan =
         CompiledMomentumSgdPlan::compile(config(), initial_parameters(), build_tinybob).unwrap();
+    let compile_phases = plan.compile_phases().cloned().unwrap();
     let mut trained = plan.prepare_cpu().unwrap();
     trained.step(batch(), lr()).unwrap();
     let checkpoint = trained.checkpoint().unwrap();
@@ -4928,6 +5002,8 @@ fn momentum_plan_restores_checkpoint_without_recompiling_or_mutating_source() {
     assert_eq!(plan.step_count(), 0);
     assert_eq!(restored.step_count(), checkpoint.step());
     assert_eq!(restored.capture_identity(), plan.capture_identity());
+    assert_eq!(restored.compile_phases(), Some(&compile_phases));
+    assert_eq!(restored.inspection().unwrap().initial_replay_step(), 1);
 
     let resumed = restored.prepare_cpu().unwrap();
     assert_eq!(resumed.checkpoint().unwrap(), checkpoint);
@@ -9657,6 +9733,8 @@ fn momentum_program_artifact_restores_without_rebuilding_the_training_graph() {
         .unwrap();
     let source = TiedFrozenModule::new([1.0, -1.0]);
     let owner = CompiledModuleMomentumSgdPlan::compile(config, source, build_tied_frozen).unwrap();
+    let source_inspection = owner.inspection().unwrap();
+    assert!(source_inspection.compile_phases().is_some());
     let artifact = owner.program_artifact().unwrap();
     assert_eq!(artifact.info().format_version(), 3);
     assert_eq!(artifact.as_bytes()[4], 3);
@@ -9706,6 +9784,20 @@ fn momentum_program_artifact_restores_without_rebuilding_the_training_graph() {
     );
     assert_eq!(restored.step_count(), 1);
     assert_eq!(restored.program_artifact().unwrap(), artifact);
+    let restored_inspection = restored.inspection().unwrap();
+    assert_eq!(restored_inspection.initial_replay_step(), 1);
+    assert!(restored_inspection.compile_phases().is_none());
+    assert_eq!(restored_inspection.main().0, restored.capture_identity());
+    assert_eq!(restored_inspection.main(), source_inspection.main());
+    assert_eq!(
+        restored_inspection.recurrent_state_count(),
+        source_inspection.recurrent_state_count()
+    );
+    assert_eq!(
+        restored_inspection.recurrent_state_bytes(),
+        source_inspection.recurrent_state_bytes()
+    );
+    assert!(restored_inspection.accumulation().is_none());
 
     let mut resumed = restored.prepare(&CpuSessionTarget).unwrap();
     assert_eq!(resumed.module_checkpoint().unwrap(), checkpoint);
