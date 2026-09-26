@@ -64,7 +64,7 @@ use self::capture::{
 pub use self::cpu_adamw_runtime::CpuCompiledAdamW;
 use self::cpu_adamw_runtime::{PendingAdamWStep, adamw_step_result};
 pub use self::cpu_momentum_runtime::CpuCompiledMomentumSgd;
-use self::cpu_training_program::CpuCompiledTrainingProgram;
+use self::cpu_training_program::{CpuCompiledTrainingProgram, RecurrentPhaseReplayRequest};
 use self::cpu_training_step::{CompiledStepOutputSelection, CompiledStepReplayRequest};
 pub use self::dropout::{CompiledDropoutConfig, CompiledDropoutKey};
 use self::dropout::{CompiledDropoutState, CompiledDropoutStream, expected_dropout_counter};
@@ -113,17 +113,18 @@ use self::objective::{
     validate_retained_token_count, validate_token_weight, validate_token_weight_policy,
 };
 use self::observation::{
-    CompiledAdamWAuxiliaryOutputSchema, CompiledAdamWAuxiliaryReports,
-    CompiledAdamWWindowLossNodes, CompiledTrainingLossOutput, CompiledTrainingObservationSchema,
-    CompiledTrainingPhaseOutputSchema, adamw_observation_nodes, adamw_observation_schema,
-    validate_adamw_observation_schema, validate_observation_value_descriptor,
-    validate_staged_observations,
+    CompiledAdamWAuxiliaryOutputSchema, CompiledAdamWWindowLossNodes, CompiledTrainingLossOutput,
+    CompiledTrainingObservationSchema, CompiledTrainingPhaseOutputSchema, adamw_observation_nodes,
+    adamw_observation_schema, validate_adamw_observation_schema,
+    validate_observation_value_descriptor, validate_staged_observations,
 };
 use self::optimizer_lowering::{
-    AdamWProgram, CompiledOptimizerLowering, CompiledOptimizerLoweringContext,
-    CompiledOptimizerProgram, MomentumProgram, RecurrentStoreGroupSpec,
-    adamw_recurrent_store_group_specs, clip_gradients_by_global_norm, lower_adamw_learning_rate,
-    lower_adamw_update_candidates, scalar_f32,
+    ADAMW_STATE_SCHEMA, AdamWGlobalState, AdamWParameterState, AdamWProgram,
+    CompiledOptimizerLowering, CompiledOptimizerLoweringContext, CompiledOptimizerProgram,
+    MOMENTUM_STATE_SCHEMA, MomentumProgram, RecurrentStoreGroupSpec, adamw_global_key,
+    adamw_parameter_key, adamw_recurrent_store_group_specs, clip_gradients_by_global_norm,
+    is_adamw_accumulation_reset_state, lower_adamw_learning_rate, lower_adamw_update_candidates,
+    momentum_key, momentum_parameter_name, parameter_for_adamw_state, scalar_f32,
 };
 pub use self::policy::{CompiledAdamWConfig, CompiledMomentumSgdConfig, CompiledMultiStepLr};
 use self::policy::{
@@ -146,7 +147,7 @@ pub use self::resume_bundle::{
 pub use self::runtime::*;
 #[cfg(test)]
 use self::state_schema::INTERNAL_PREFIX;
-use self::state_schema::{AdamWGlobalState, AdamWParameterState, RecurrentStateKey, StateSpec};
+use self::state_schema::{OptimizerStateSchema, RecurrentStateKey, StateSpec};
 use self::training_plan::*;
 use self::validation::{
     canonical_parameters, checked_bytes, checked_descriptor, checked_recurrent_state_extent,
@@ -387,7 +388,7 @@ fn validate_cpu_adamw_state(
     accumulation_steps: u64,
 ) -> Result<()> {
     let optimizer_step = inner
-        .global_snapshot(AdamWGlobalState::Step)?
+        .optimizer_state_snapshot(&adamw_global_key(AdamWGlobalState::Step))?
         .scalar_at(0)
         .as_u64();
     let topology =
@@ -396,7 +397,7 @@ fn validate_cpu_adamw_state(
         0
     } else {
         inner
-            .global_snapshot(AdamWGlobalState::AccumulationIndex)?
+            .optimizer_state_snapshot(&adamw_global_key(AdamWGlobalState::AccumulationIndex))?
             .scalar_at(0)
             .as_u64()
     };

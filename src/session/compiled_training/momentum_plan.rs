@@ -154,7 +154,7 @@ impl CompiledMomentumSgdPlan {
                 checkpoint
                     .momenta
                     .iter()
-                    .map(|(name, value)| (RecurrentStateKey::momentum(name), value.clone())),
+                    .map(|(name, value)| (momentum_key(name), value.clone())),
             )
             .collect();
         let versions = checkpoint
@@ -165,7 +165,7 @@ impl CompiledMomentumSgdPlan {
                 checkpoint
                     .momentum_versions
                     .iter()
-                    .map(|(name, version)| (RecurrentStateKey::momentum(name), *version)),
+                    .map(|(name, version)| (momentum_key(name), *version)),
             )
             .collect();
         Ok(Self {

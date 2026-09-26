@@ -277,24 +277,34 @@ impl ProgramWire {
     }
 
     fn expected_main_states(&self) -> Result<ValidatedMain> {
+        let optimizer_schema = optimizer_state_schema(&self.optimizer);
         let expected_main_states = self
             .main
             .parameter_buffers
             .iter()
             .map(|(name, buffer)| (RecurrentStateKey::parameter(name), *buffer))
-            .chain(decode_key_map(&self.main.optimizer_buffers)?)
-            .chain(decode_key_map(&self.main.workload_buffers)?)
+            .chain(decode_key_map(
+                &self.main.optimizer_buffers,
+                optimizer_schema,
+            )?)
+            .chain(decode_key_map(
+                &self.main.workload_buffers,
+                optimizer_schema,
+            )?)
             .collect::<BTreeMap<_, _>>();
         let expected_flush_states = self
             .main
             .parameter_buffers
             .iter()
             .map(|(name, buffer)| (RecurrentStateKey::parameter(name), *buffer))
-            .chain(decode_key_map(&self.main.optimizer_buffers)?)
+            .chain(decode_key_map(
+                &self.main.optimizer_buffers,
+                optimizer_schema,
+            )?)
             .collect::<BTreeMap<_, _>>();
         let expected_zero_grad_states = expected_flush_states
             .iter()
-            .filter(|(key, _)| key.is_accumulation_reset_state())
+            .filter(|(key, _)| optimizer_resets_state(&self.optimizer, key))
             .map(|(key, buffer)| (key.clone(), *buffer))
             .collect::<BTreeMap<_, _>>();
         Ok(ValidatedMain {
@@ -318,7 +328,10 @@ impl ProgramWire {
         {
             return Err(training("compiled program artifact state schema differs"));
         }
-        let input_keys = decode_input_key_map(&self.main.state_input_keys)?;
+        let input_keys = decode_input_key_map(
+            &self.main.state_input_keys,
+            optimizer_state_schema(&self.optimizer),
+        )?;
         if input_keys.iter().any(|(input, key)| {
             self.main.state_input_buffers.get(input) != expected.states.get(key)
         }) || self.main.state_input_buffers.len() != input_keys.len()
@@ -374,7 +387,11 @@ impl ProgramWire {
 
     fn validate_main(&self, main_capture: &CapturedMixedSchedule) -> Result<ValidatedMain> {
         self.validate_main_inventory()?;
-        let captured_states = validate_phase_capture(&self.main.phase, main_capture)?;
+        let captured_states = validate_phase_capture(
+            &self.main.phase,
+            main_capture,
+            optimizer_state_schema(&self.optimizer),
+        )?;
         self.validate_parameter_policy()?;
         self.validate_main_output_schema(main_capture)?;
         let expected_states = self.expected_main_states()?;
@@ -415,7 +432,8 @@ impl ProgramWire {
         if phase.clip_report || phase.window_loss_report {
             return Err(training("compiled accumulation artifact exposes reports"));
         }
-        let states = validate_phase_capture(phase, capture)?;
+        let states =
+            validate_phase_capture(phase, capture, optimizer_state_schema(&self.optimizer))?;
         if states != main.states
             || capture.schedule.requested.len() != 1 + self.main.output_names.len()
             || phase_external_inputs(capture, phase).ne(self.main.inputs.keys().cloned())
@@ -443,7 +461,8 @@ impl ProgramWire {
                 "compiled zero-grad artifact exposes update outputs",
             ));
         }
-        let states = validate_phase_capture(phase, capture)?;
+        let states =
+            validate_phase_capture(phase, capture, optimizer_state_schema(&self.optimizer))?;
         if states != main.zero_grad_states
             || !capture.schedule.requested.is_empty()
             || phase_external_inputs(capture, phase).next().is_some()
@@ -464,7 +483,8 @@ impl ProgramWire {
             phase.window_loss_report,
         );
         outputs.validate_report_flags(self.clip_report, self.window_loss_report)?;
-        let states = validate_phase_capture(phase, capture)?;
+        let states =
+            validate_phase_capture(phase, capture, optimizer_state_schema(&self.optimizer))?;
         let expected_outputs = outputs.observations.len();
         let has_learning_rate = capture
             .schedule
@@ -607,12 +627,13 @@ impl ProgramWire {
 
     fn validate_optimizer_policy(&self) -> Result<()> {
         if self.optimizer() == CompiledTrainingOptimizer::MomentumSgd {
-            let optimizer_states = decode_key_map(&self.main.optimizer_buffers)?;
+            let optimizer_states =
+                decode_key_map(&self.main.optimizer_buffers, MOMENTUM_STATE_SCHEMA)?;
             let expected = self
                 .main
                 .parameter_buffers
                 .keys()
-                .map(RecurrentStateKey::momentum)
+                .map(|name| momentum_key(name))
                 .collect::<BTreeSet<_>>();
             if optimizer_states.keys().cloned().collect::<BTreeSet<_>>() != expected
                 || !self.main.workload_buffers.is_empty()
@@ -729,7 +750,7 @@ fn validate_native_manifests(
     for ((name, parameter_buffer), manifest) in parameters.iter().zip(&phase.adamw_native_updates) {
         let state_buffer = |state| {
             states
-                .get(&RecurrentStateKey::adamw_parameter(name, state))
+                .get(&adamw_parameter_key(name, state))
                 .copied()
                 .ok_or_else(|| training("compiled program artifact AdamW state is absent"))
         };

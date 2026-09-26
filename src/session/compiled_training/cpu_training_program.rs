@@ -26,6 +26,12 @@ pub(super) struct CpuAuxiliaryReplay {
     pub(super) provided: BTreeMap<String, TensorData>,
 }
 
+pub(super) struct RecurrentPhaseReplayRequest {
+    pub(super) learning_rate: Option<TensorData>,
+    pub(super) non_finite_policy: CpuNonFinitePolicy,
+    pub(super) injected_failure: Option<u64>,
+}
+
 impl CpuCompiledTrainingProgram {
     pub(super) fn preflight_native(
         &self,
@@ -138,64 +144,30 @@ impl CpuCompiledTrainingProgram {
         self.versions(&self.parameter_buffers)
     }
 
-    pub(super) fn adamw_state_snapshots(
+    pub(super) fn optimizer_state_snapshots<F>(
         &self,
-        state: AdamWParameterState,
-    ) -> Result<BTreeMap<String, TensorData>> {
-        let buffers = self
-            .optimizer_buffers
-            .iter()
-            .filter_map(|(key, buffer)| {
-                key.parameter_for_adamw_state(state)
-                    .map(|name| (name.to_owned(), *buffer))
-            })
-            .collect::<BTreeMap<_, _>>();
-        self.snapshots(&buffers)
+        select_name: F,
+    ) -> Result<BTreeMap<String, TensorData>>
+    where
+        F: FnMut(&RecurrentStateKey) -> Option<String>,
+    {
+        self.snapshots(&self.selected_optimizer_buffers(select_name))
     }
 
-    pub(super) fn adamw_state_versions(
+    pub(super) fn optimizer_state_versions<F>(
         &self,
-        state: AdamWParameterState,
-    ) -> Result<BTreeMap<String, u64>> {
-        let buffers = self
-            .optimizer_buffers
-            .iter()
-            .filter_map(|(key, buffer)| {
-                key.parameter_for_adamw_state(state)
-                    .map(|name| (name.to_owned(), *buffer))
-            })
-            .collect::<BTreeMap<_, _>>();
-        self.versions(&buffers)
+        select_name: F,
+    ) -> Result<BTreeMap<String, u64>>
+    where
+        F: FnMut(&RecurrentStateKey) -> Option<String>,
+    {
+        self.versions(&self.selected_optimizer_buffers(select_name))
     }
 
-    pub(super) fn momentum_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        let buffers = self
-            .optimizer_buffers
-            .iter()
-            .filter_map(|(key, buffer)| {
-                key.momentum_parameter_name()
-                    .map(|name| (name.to_owned(), *buffer))
-            })
-            .collect::<BTreeMap<_, _>>();
-        self.snapshots(&buffers)
-    }
-
-    pub(super) fn momentum_versions(&self) -> Result<BTreeMap<String, u64>> {
-        let buffers = self
-            .optimizer_buffers
-            .iter()
-            .filter_map(|(key, buffer)| {
-                key.momentum_parameter_name()
-                    .map(|name| (name.to_owned(), *buffer))
-            })
-            .collect::<BTreeMap<_, _>>();
-        self.versions(&buffers)
-    }
-
-    pub(super) fn global_snapshot(&self, state: AdamWGlobalState) -> Result<TensorData> {
+    pub(super) fn optimizer_state_snapshot(&self, key: &RecurrentStateKey) -> Result<TensorData> {
         let buffer = self
             .optimizer_buffers
-            .get(&RecurrentStateKey::adamw_global(state))
+            .get(key)
             .ok_or_else(|| training("compiled global optimizer state is absent"))?;
         let state = self.current_state(*buffer)?;
         Ok(self
@@ -324,18 +296,23 @@ impl CpuCompiledTrainingProgram {
         })
     }
 
-    pub(super) fn replay_auxiliary_transition(
+    pub(super) fn replay_recurrent_phase<T, F>(
         &mut self,
-        transition: &CompiledAdamWAuxiliaryPlan,
-        learning_rate: Option<TensorData>,
-        non_finite_policy: CpuNonFinitePolicy,
-        injected_failure: Option<u64>,
-    ) -> Result<CompiledAdamWAuxiliaryReports> {
-        let mut prepared = self.prepare_auxiliary_replay(transition.phase(), learning_rate)?;
-        let output_schema = transition.outputs.clone();
-        let mut reports = None;
-        let _replay = transition
-            .phase()
+        phase: &CompiledRecurrentPhasePlan,
+        request: RecurrentPhaseReplayRequest,
+        decode: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&[TensorData]) -> std::result::Result<T, String>,
+    {
+        let RecurrentPhaseReplayRequest {
+            learning_rate,
+            non_finite_policy,
+            injected_failure,
+        } = request;
+        let mut prepared = self.prepare_auxiliary_replay(phase, learning_rate)?;
+        let mut decoded = None;
+        let _replay = phase
             .capture
             .replay_recurrent_checked(
                 &mut self.runtime,
@@ -344,12 +321,12 @@ impl CpuCompiledTrainingProgram {
                 injected_failure,
                 |outputs, successors| {
                     validate_staged_transition(outputs, successors, non_finite_policy, false)?;
-                    reports = Some(output_schema.validate_and_decode(outputs, non_finite_policy)?);
+                    decoded = Some(decode(outputs)?);
                     Ok(())
                 },
             )
             .map_err(replay_error)?;
-        let reports = reports.expect("compiled auxiliary outputs were authenticated before commit");
+        let decoded = decoded.expect("compiled phase outputs were authenticated before commit");
         #[cfg(debug_assertions)]
         {
             let mut committed = _replay.committed.clone();
@@ -357,7 +334,7 @@ impl CpuCompiledTrainingProgram {
             debug_assert_eq!(committed, prepared.cursor.cursor().frontier());
         }
         prepared.cursor.publish(&mut self.cursor);
-        Ok(reports)
+        Ok(decoded)
     }
 
     pub(super) fn preflight_native_auxiliary_transition(
@@ -470,19 +447,25 @@ impl CpuCompiledTrainingProgram {
         Ok(PreparedNativeCpuProgram { report, replay })
     }
 
-    pub(super) fn replay_auxiliary_transition_native(
+    pub(super) fn replay_recurrent_phase_native<T, F>(
         &mut self,
-        transition: &CompiledAdamWAuxiliaryPlan,
-        learning_rate: Option<TensorData>,
-        non_finite_policy: CpuNonFinitePolicy,
+        phase: &CompiledRecurrentPhasePlan,
+        request: RecurrentPhaseReplayRequest,
         native: NativeReplayContext<'_>,
         successful_invocation: u64,
-        injected_failure: Option<u64>,
-    ) -> Result<(CompiledAdamWAuxiliaryReports, NativeCpuRunReport)> {
+        decode: F,
+    ) -> Result<(T, NativeCpuRunReport)>
+    where
+        F: FnOnce(&[TensorData]) -> std::result::Result<T, String>,
+    {
         let started = Instant::now();
-        let mut prepared = self.prepare_auxiliary_replay(transition.phase(), learning_rate)?;
-        let output_schema = transition.outputs.clone();
-        let mut reports = None;
+        let RecurrentPhaseReplayRequest {
+            learning_rate,
+            non_finite_policy,
+            injected_failure,
+        } = request;
+        let mut prepared = self.prepare_auxiliary_replay(phase, learning_rate)?;
+        let mut decoded = None;
         let replay = native
             .replay_recurrent_checked(
                 &mut self.runtime,
@@ -496,7 +479,7 @@ impl CpuCompiledTrainingProgram {
                         non_finite_policy,
                         false,
                     )?;
-                    reports = Some(output_schema.validate_and_decode(outputs, non_finite_policy)?);
+                    decoded = Some(decode(outputs)?);
                     Ok(())
                 },
             )
@@ -504,13 +487,13 @@ impl CpuCompiledTrainingProgram {
         let traffic = replay.traffic;
         let executor_wall_time = replay.executor_wall_time;
         let replay = replay.replay;
-        let reports = reports.expect("compiled auxiliary outputs were authenticated before commit");
+        let decoded = decoded.expect("compiled phase outputs were authenticated before commit");
         let native = replay
             .native_trace
             .as_ref()
             .expect("strict-native recurrent replay returns a native trace");
         let report = native_cpu_run_report(
-            transition.capture_identity(),
+            phase.capture_identity(),
             native,
             traffic,
             executor_wall_time,
@@ -524,7 +507,17 @@ impl CpuCompiledTrainingProgram {
             debug_assert_eq!(committed, prepared.cursor.cursor().frontier());
         }
         prepared.cursor.publish(&mut self.cursor);
-        Ok((reports, report))
+        Ok((decoded, report))
+    }
+
+    fn selected_optimizer_buffers<F>(&self, mut select_name: F) -> BTreeMap<String, u64>
+    where
+        F: FnMut(&RecurrentStateKey) -> Option<String>,
+    {
+        self.optimizer_buffers
+            .iter()
+            .filter_map(|(key, buffer)| select_name(key).map(|name| (name, *buffer)))
+            .collect()
     }
 
     fn snapshots(&self, buffers: &BTreeMap<String, u64>) -> Result<BTreeMap<String, TensorData>> {

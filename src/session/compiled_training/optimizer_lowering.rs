@@ -4,7 +4,9 @@ use super::observation::{
     CompiledAdamWClipNodes, CompiledAdamWWindowLossNodes, CompiledTrainingObservationNode,
     adamw_observation_nodes,
 };
-use super::{AdamWGlobalState, AdamWParameterState, RecurrentStateKey, StateSpec};
+use super::state_schema::{
+    INTERNAL_PREFIX, OptimizerStateRole, OptimizerStateSchema, RecurrentStateKey, StateSpec,
+};
 use super::{
     CompiledAdamWConfig, CompiledLearningRatePolicy, CompiledMomentumSgdConfig,
     CompiledTrainingWindowTopology, lower_token_batch_count, materialize_compiled_output_alias,
@@ -12,6 +14,128 @@ use super::{
 };
 use crate::{CompareOp, DType, Error, Graph, NodeId, Result, Scalar, Shape, TensorData};
 use std::collections::BTreeMap;
+
+const MOMENTUM_ROLE: OptimizerStateRole = OptimizerStateRole::new("momentum");
+const MOMENTUM_PARAMETER_ROLES: &[OptimizerStateRole] = &[MOMENTUM_ROLE];
+pub(super) const MOMENTUM_STATE_SCHEMA: OptimizerStateSchema =
+    OptimizerStateSchema::new(MOMENTUM_PARAMETER_ROLES, &[]);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AdamWParameterState {
+    FirstMoment,
+    SecondMoment,
+    GradientAccumulator,
+}
+
+impl AdamWParameterState {
+    const fn role(self) -> OptimizerStateRole {
+        OptimizerStateRole::new(match self {
+            Self::FirstMoment => "first_moment",
+            Self::SecondMoment => "second_moment",
+            Self::GradientAccumulator => "gradient_accumulator",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AdamWGlobalState {
+    Step,
+    AccumulationIndex,
+    AccumulatedTokenCount,
+    AccumulatedLossNumerator,
+}
+
+impl AdamWGlobalState {
+    const fn role(self) -> OptimizerStateRole {
+        OptimizerStateRole::new(match self {
+            Self::Step => "step",
+            Self::AccumulationIndex => "accumulation_index",
+            Self::AccumulatedTokenCount => "accumulated_token_count",
+            Self::AccumulatedLossNumerator => "accumulated_loss_numerator",
+        })
+    }
+}
+
+const ADAMW_PARAMETER_ROLES: &[OptimizerStateRole] = &[
+    AdamWParameterState::FirstMoment.role(),
+    AdamWParameterState::SecondMoment.role(),
+    AdamWParameterState::GradientAccumulator.role(),
+];
+const ADAMW_GLOBAL_ROLES: &[OptimizerStateRole] = &[
+    AdamWGlobalState::Step.role(),
+    AdamWGlobalState::AccumulationIndex.role(),
+    AdamWGlobalState::AccumulatedTokenCount.role(),
+    AdamWGlobalState::AccumulatedLossNumerator.role(),
+];
+pub(super) const ADAMW_STATE_SCHEMA: OptimizerStateSchema =
+    OptimizerStateSchema::new(ADAMW_PARAMETER_ROLES, ADAMW_GLOBAL_ROLES);
+
+pub(super) fn momentum_key(name: &str) -> RecurrentStateKey {
+    RecurrentStateKey::optimizer_parameter(name, MOMENTUM_ROLE)
+}
+
+pub(super) fn adamw_parameter_key(name: &str, state: AdamWParameterState) -> RecurrentStateKey {
+    RecurrentStateKey::optimizer_parameter(name, state.role())
+}
+
+pub(super) fn adamw_global_key(state: AdamWGlobalState) -> RecurrentStateKey {
+    RecurrentStateKey::optimizer_global(state.role())
+}
+
+pub(super) fn momentum_parameter_name(key: &RecurrentStateKey) -> Option<&str> {
+    key.parameter_for_optimizer_role(MOMENTUM_ROLE)
+}
+
+pub(super) fn parameter_for_adamw_state(
+    key: &RecurrentStateKey,
+    state: AdamWParameterState,
+) -> Option<&str> {
+    key.parameter_for_optimizer_role(state.role())
+}
+
+pub(super) fn is_adamw_accumulation_reset_state(key: &RecurrentStateKey) -> bool {
+    key.parameter_for_optimizer_role(AdamWParameterState::GradientAccumulator.role())
+        .is_some()
+        || key.is_optimizer_global(AdamWGlobalState::AccumulationIndex.role())
+        || key.is_optimizer_global(AdamWGlobalState::AccumulatedTokenCount.role())
+        || key.is_optimizer_global(AdamWGlobalState::AccumulatedLossNumerator.role())
+}
+
+fn momentum_state_spec(ordinal: usize, name: &str, value: &TensorData) -> Result<StateSpec> {
+    Ok(StateSpec {
+        key: momentum_key(name),
+        input_name: format!("{INTERNAL_PREFIX}momentum_{ordinal}"),
+        value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
+        requires_grad: false,
+    })
+}
+
+fn adamw_parameter_state_spec(
+    ordinal: usize,
+    name: &str,
+    value: &TensorData,
+    state: AdamWParameterState,
+) -> Result<StateSpec> {
+    Ok(StateSpec {
+        key: adamw_parameter_key(name, state),
+        input_name: format!("{INTERNAL_PREFIX}{}_{ordinal}", state.role().canonical()),
+        value: TensorData::zeros_with_dtype(value.shape().clone(), DType::F32)?,
+        requires_grad: false,
+    })
+}
+
+fn adamw_global_state_spec(state: AdamWGlobalState) -> Result<StateSpec> {
+    let dtype = match state {
+        AdamWGlobalState::AccumulatedLossNumerator => DType::F32,
+        _ => DType::U64,
+    };
+    Ok(StateSpec {
+        key: adamw_global_key(state),
+        input_name: format!("{INTERNAL_PREFIX}adamw_{}", state.role().canonical()),
+        value: TensorData::zeros_with_dtype(Shape::from([]), dtype)?,
+        requires_grad: false,
+    })
+}
 
 pub(super) trait CompiledOptimizerProgram {
     fn name(&self) -> &'static str;
@@ -65,9 +189,9 @@ pub(super) fn adamw_recurrent_store_group_specs<'a>(
         .map(|name| RecurrentStoreGroupSpec {
             members: vec![
                 RecurrentStateKey::parameter(name),
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment),
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment),
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator),
+                adamw_parameter_key(name, AdamWParameterState::FirstMoment),
+                adamw_parameter_key(name, AdamWParameterState::SecondMoment),
+                adamw_parameter_key(name, AdamWParameterState::GradientAccumulator),
             ],
         })
         .collect()
@@ -99,7 +223,7 @@ impl CompiledOptimizerProgram for MomentumProgram {
         let mut specs = Vec::with_capacity(parameters.len() * 2);
         for (ordinal, (name, value)) in parameters.iter().enumerate() {
             specs.push(StateSpec::parameter(ordinal, name, value.clone()));
-            specs.push(StateSpec::momentum(ordinal, name, value)?);
+            specs.push(momentum_state_spec(ordinal, name, value)?);
         }
         Ok(specs)
     }
@@ -119,7 +243,7 @@ impl CompiledOptimizerProgram for MomentumProgram {
         let momentum = scalar_f32(graph, self.config.momentum)?;
         let mut updates = BTreeMap::new();
         for (name, parameter) in parameters {
-            let momentum_key = RecurrentStateKey::momentum(name);
+            let momentum_key = momentum_key(name);
             let slot = states[&momentum_key];
             let retained = graph.mul(momentum, slot)?;
             let next_momentum = graph.add(retained, gradients[name])?;
@@ -164,10 +288,10 @@ impl CompiledOptimizerProgram for AdamWProgram {
                 AdamWParameterState::FirstMoment,
                 AdamWParameterState::SecondMoment,
             ] {
-                specs.push(StateSpec::adamw_parameter(ordinal, name, value, state)?);
+                specs.push(adamw_parameter_state_spec(ordinal, name, value, state)?);
             }
             if topology.accumulating() {
-                specs.push(StateSpec::adamw_parameter(
+                specs.push(adamw_parameter_state_spec(
                     ordinal,
                     name,
                     value,
@@ -175,19 +299,19 @@ impl CompiledOptimizerProgram for AdamWProgram {
                 )?);
             }
         }
-        specs.push(StateSpec::adamw_global(AdamWGlobalState::Step)?);
+        specs.push(adamw_global_state_spec(AdamWGlobalState::Step)?);
         if topology.accumulating() {
-            specs.push(StateSpec::adamw_global(
+            specs.push(adamw_global_state_spec(
                 AdamWGlobalState::AccumulationIndex,
             )?);
         }
         if topology.retains_token_count() {
-            specs.push(StateSpec::adamw_global(
+            specs.push(adamw_global_state_spec(
                 AdamWGlobalState::AccumulatedTokenCount,
             )?);
         }
         if topology.retains_window_numerator() {
-            specs.push(StateSpec::adamw_global(
+            specs.push(adamw_global_state_spec(
                 AdamWGlobalState::AccumulatedLossNumerator,
             )?);
         }
@@ -254,8 +378,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
                 states,
             )?;
             let window_loss_report = if self.config.window_loss_report {
-                let numerator_key =
-                    RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedLossNumerator);
+                let numerator_key = adamw_global_key(AdamWGlobalState::AccumulatedLossNumerator);
                 match token_count {
                     Some(token_count) => {
                         let zero = state_dependent_zero(graph, states[&numerator_key])?;
@@ -298,9 +421,8 @@ impl CompiledOptimizerProgram for AdamWProgram {
             Scalar::U(self.config.gradient_accumulation_steps),
             DType::U64,
         )?;
-        let accumulation_index_key =
-            RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex);
-        let step_key = RecurrentStateKey::adamw_global(AdamWGlobalState::Step);
+        let accumulation_index_key = adamw_global_key(AdamWGlobalState::AccumulationIndex);
+        let step_key = adamw_global_key(AdamWGlobalState::Step);
         let next_index = graph.add(states[&accumulation_index_key], one_u64)?;
         let commit = graph.compare(CompareOp::Eq, next_index, threshold)?;
         let reset_index = graph.select(commit, zero_u64, next_index)?;
@@ -316,8 +438,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
                     policy,
                     &self.config.inputs,
                 )?;
-                let count_key =
-                    RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedTokenCount);
+                let count_key = adamw_global_key(AdamWGlobalState::AccumulatedTokenCount);
                 let total_count = graph.add(states[&count_key], batch_count.exact)?;
                 let divisor = graph.cast(total_count, DType::F32)?;
                 Ok::<_, Error>((batch_count.float, count_key, total_count, divisor))
@@ -333,8 +454,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
             self.config.allow_zero_valid_token_microbatches,
         )?;
         let window_loss = if self.config.window_loss_report {
-            let numerator_key =
-                RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedLossNumerator);
+            let numerator_key = adamw_global_key(AdamWGlobalState::AccumulatedLossNumerator);
             let contribution = match &weighted_count {
                 Some((batch_count, ..)) => graph.mul(loss, *batch_count)?,
                 None => loss,
@@ -357,8 +477,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
                 Some((batch_count, ..)) => graph.mul(*gradient, *batch_count)?,
                 None => *gradient,
             };
-            let key =
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
+            let key = adamw_parameter_key(name, AdamWParameterState::GradientAccumulator);
             let accumulated = graph.add(states[&key], gradient)?;
             let averaged = graph.div(accumulated, divisor)?;
             accumulated_gradients.insert(name.clone(), accumulated);
@@ -388,7 +507,7 @@ impl CompiledOptimizerProgram for AdamWProgram {
         }
         for name in parameters.keys() {
             let accumulator_key =
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
+                adamw_parameter_key(name, AdamWParameterState::GradientAccumulator);
             accumulation_updates.insert(accumulator_key, accumulated_gradients[name]);
         }
 
@@ -406,12 +525,10 @@ impl CompiledOptimizerProgram for AdamWProgram {
             graph.select(commit, candidates[&step_key], states[&step_key])?,
         );
         for (name, parameter) in parameters {
-            let first_key =
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment);
-            let second_key =
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment);
+            let first_key = adamw_parameter_key(name, AdamWParameterState::FirstMoment);
+            let second_key = adamw_parameter_key(name, AdamWParameterState::SecondMoment);
             let accumulator_key =
-                RecurrentStateKey::adamw_parameter(name, AdamWParameterState::GradientAccumulator);
+                adamw_parameter_key(name, AdamWParameterState::GradientAccumulator);
             let accumulator_shape = graph.shape(accumulated_gradients[name])?.clone();
             let zero = graph.lazy_full_with_dtype(accumulator_shape, Scalar::I(0), DType::F32)?;
             let next_accumulator = graph.select(commit, zero, accumulated_gradients[name])?;
@@ -458,7 +575,7 @@ pub(super) fn lower_adamw_learning_rate(
     let CompiledLearningRatePolicy::MultiStep(schedule) = &config.learning_rate else {
         return Ok(external_learning_rate);
     };
-    let step_key = RecurrentStateKey::adamw_global(AdamWGlobalState::Step);
+    let step_key = adamw_global_key(AdamWGlobalState::Step);
     let completed_step = states
         .get(&step_key)
         .copied()
@@ -586,7 +703,7 @@ pub(super) fn lower_adamw_update_candidates(
     states: &BTreeMap<RecurrentStateKey, NodeId>,
 ) -> Result<BTreeMap<RecurrentStateKey, NodeId>> {
     let one_u64 = graph.full_with_dtype(Shape::from([]), Scalar::U(1), DType::U64)?;
-    let step_key = RecurrentStateKey::adamw_global(AdamWGlobalState::Step);
+    let step_key = adamw_global_key(AdamWGlobalState::Step);
     let next_step = graph.add(states[&step_key], one_u64)?;
     let step_f32 = graph.cast(next_step, DType::F32)?;
     let one = scalar_f32(graph, 1.0)?;
@@ -606,9 +723,8 @@ pub(super) fn lower_adamw_update_candidates(
     let mut updates = BTreeMap::from([(step_key, next_step)]);
     for (name, parameter) in parameters {
         let gradient = gradients[name];
-        let first_key = RecurrentStateKey::adamw_parameter(name, AdamWParameterState::FirstMoment);
-        let second_key =
-            RecurrentStateKey::adamw_parameter(name, AdamWParameterState::SecondMoment);
+        let first_key = adamw_parameter_key(name, AdamWParameterState::FirstMoment);
+        let second_key = adamw_parameter_key(name, AdamWParameterState::SecondMoment);
         let retained_first = graph.mul(beta1, states[&first_key])?;
         let fresh_first = graph.mul(one_minus_beta1, gradient)?;
         let next_first = graph.add(retained_first, fresh_first)?;
@@ -647,4 +763,146 @@ fn validate_parameter_update(graph: &Graph, parameter: NodeId, update: NodeId) -
         return Err(training("compiled optimizer update descriptor mismatch"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optimizer_schemas_round_trip_exact_roles_and_reject_cross_optimizer_keys() {
+        let parameter = "block:weight:with:punctuation";
+        let momentum = momentum_key(parameter);
+        assert_eq!(
+            RecurrentStateKey::from_canonical(momentum.canonical_name(), MOMENTUM_STATE_SCHEMA)
+                .unwrap(),
+            momentum
+        );
+        assert!(
+            RecurrentStateKey::from_canonical(momentum.canonical_name(), ADAMW_STATE_SCHEMA)
+                .is_err()
+        );
+
+        for state in [
+            AdamWParameterState::FirstMoment,
+            AdamWParameterState::SecondMoment,
+            AdamWParameterState::GradientAccumulator,
+        ] {
+            let key = adamw_parameter_key(parameter, state);
+            assert_eq!(
+                RecurrentStateKey::from_canonical(key.canonical_name(), ADAMW_STATE_SCHEMA)
+                    .unwrap(),
+                key
+            );
+            assert!(
+                RecurrentStateKey::from_canonical(key.canonical_name(), MOMENTUM_STATE_SCHEMA)
+                    .is_err()
+            );
+        }
+        for state in [
+            AdamWGlobalState::Step,
+            AdamWGlobalState::AccumulationIndex,
+            AdamWGlobalState::AccumulatedTokenCount,
+            AdamWGlobalState::AccumulatedLossNumerator,
+        ] {
+            let key = adamw_global_key(state);
+            assert_eq!(
+                RecurrentStateKey::from_canonical(key.canonical_name(), ADAMW_STATE_SCHEMA)
+                    .unwrap(),
+                key
+            );
+            assert!(
+                RecurrentStateKey::from_canonical(key.canonical_name(), MOMENTUM_STATE_SCHEMA)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn optimizer_state_specs_preserve_legacy_names_dtypes_and_reset_selection() {
+        let value = TensorData::new([2], vec![1.0, -1.0]).unwrap();
+        let parameter = StateSpec::parameter(7, "weight", value.clone());
+        assert_eq!(parameter.key.canonical_name(), "parameter:weight");
+        assert_eq!(
+            parameter.input_name,
+            "__rustgrad_compiled_training_parameter_7"
+        );
+        assert!(parameter.requires_grad);
+        let momentum = momentum_state_spec(7, "weight", &value).unwrap();
+        assert_eq!(momentum.key.canonical_name(), "slot:weight:momentum");
+        assert_eq!(
+            momentum.input_name,
+            "__rustgrad_compiled_training_momentum_7"
+        );
+        assert_eq!(momentum.value.dtype(), DType::F32);
+        assert_eq!(momentum.value.shape(), &Shape::from([2]));
+        assert!(!momentum.requires_grad);
+        assert!(!is_adamw_accumulation_reset_state(&momentum.key));
+
+        for (state, suffix, reset) in [
+            (AdamWParameterState::FirstMoment, "first_moment", false),
+            (AdamWParameterState::SecondMoment, "second_moment", false),
+            (
+                AdamWParameterState::GradientAccumulator,
+                "gradient_accumulator",
+                true,
+            ),
+        ] {
+            let spec = adamw_parameter_state_spec(7, "weight", &value, state).unwrap();
+            assert_eq!(spec.key.canonical_name(), format!("slot:weight:{suffix}"));
+            assert_eq!(
+                spec.input_name,
+                format!("__rustgrad_compiled_training_{suffix}_7")
+            );
+            assert_eq!(spec.value.dtype(), DType::F32);
+            assert_eq!(spec.value.shape(), &Shape::from([2]));
+            assert!(!spec.requires_grad);
+            assert_eq!(is_adamw_accumulation_reset_state(&spec.key), reset);
+        }
+
+        for (state, suffix, dtype, reset) in [
+            (AdamWGlobalState::Step, "step", DType::U64, false),
+            (
+                AdamWGlobalState::AccumulationIndex,
+                "accumulation_index",
+                DType::U64,
+                true,
+            ),
+            (
+                AdamWGlobalState::AccumulatedTokenCount,
+                "accumulated_token_count",
+                DType::U64,
+                true,
+            ),
+            (
+                AdamWGlobalState::AccumulatedLossNumerator,
+                "accumulated_loss_numerator",
+                DType::F32,
+                true,
+            ),
+        ] {
+            let spec = adamw_global_state_spec(state).unwrap();
+            assert_eq!(spec.key.canonical_name(), format!("global:{suffix}"));
+            assert_eq!(
+                spec.input_name,
+                format!("__rustgrad_compiled_training_adamw_{suffix}")
+            );
+            assert_eq!(spec.value.dtype(), dtype);
+            assert_eq!(spec.value.shape(), &Shape::from([]));
+            assert!(!spec.requires_grad);
+            assert_eq!(is_adamw_accumulation_reset_state(&spec.key), reset);
+        }
+        let dropout = StateSpec::dropout_counter().unwrap();
+        assert_eq!(
+            dropout.key.canonical_name(),
+            "workload:dropout_block_counter"
+        );
+        assert_eq!(
+            dropout.input_name,
+            "__rustgrad_compiled_training_dropout_block_counter"
+        );
+        assert_eq!(dropout.value.dtype(), DType::U64);
+        assert_eq!(dropout.value.shape(), &Shape::from([]));
+        assert!(!dropout.requires_grad);
+    }
 }

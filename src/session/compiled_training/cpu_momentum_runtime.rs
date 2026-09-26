@@ -5,7 +5,8 @@ use super::{
     CompiledCheckpointRestoreRuntime, CompiledCheckpointRuntime, CompiledMomentumSgdCheckpoint,
     CompiledMomentumSgdConfig, CompiledMomentumSgdPlan, CompiledMomentumSgdStepResult,
     CompiledStepOutputSelection, CompiledStepReplayRequest, CompiledTrainingCommitOnlyRuntime,
-    CompiledTrainingRuntime, CpuNonFinitePolicy, TrainingParameterInit, training,
+    CompiledTrainingRuntime, CpuNonFinitePolicy, TrainingParameterInit, momentum_parameter_name,
+    training,
 };
 use crate::{Graph, Module, NodeId, Result, TensorData};
 use std::collections::BTreeMap;
@@ -151,7 +152,8 @@ impl CpuCompiledMomentumSgd {
     }
 
     pub fn momentum_snapshots(&self) -> Result<BTreeMap<String, TensorData>> {
-        self.inner.momentum_snapshots()
+        self.inner
+            .optimizer_state_snapshots(|key| momentum_parameter_name(key).map(str::to_owned))
     }
 
     pub fn parameter_versions(&self) -> Result<BTreeMap<String, u64>> {
@@ -159,7 +161,8 @@ impl CpuCompiledMomentumSgd {
     }
 
     pub fn momentum_versions(&self) -> Result<BTreeMap<String, u64>> {
-        self.inner.momentum_versions()
+        self.inner
+            .optimizer_state_versions(|key| momentum_parameter_name(key).map(str::to_owned))
     }
 
     /// Snapshots the exact persistent parameter/momentum frontier once.
@@ -176,7 +179,7 @@ impl CpuCompiledMomentumSgd {
             if let Some(name) = key.parameter_name() {
                 parameters.insert(name.to_owned(), value);
                 parameter_versions.insert(name.to_owned(), version);
-            } else if let Some(name) = key.momentum_parameter_name() {
+            } else if let Some(name) = momentum_parameter_name(&key) {
                 momenta.insert(name.to_owned(), value);
                 momentum_versions.insert(name.to_owned(), version);
             } else {

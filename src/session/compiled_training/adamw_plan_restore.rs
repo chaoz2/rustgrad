@@ -162,27 +162,24 @@ impl CompiledAdamWPlan {
             .collect::<BTreeMap<_, _>>();
         for (name, value) in &decoded.first_moments {
             values.insert(
-                RecurrentStateKey::adamw_parameter(name.clone(), AdamWParameterState::FirstMoment),
+                adamw_parameter_key(name, AdamWParameterState::FirstMoment),
                 value.clone(),
             );
         }
         for (name, value) in &decoded.second_moments {
             values.insert(
-                RecurrentStateKey::adamw_parameter(name.clone(), AdamWParameterState::SecondMoment),
+                adamw_parameter_key(name, AdamWParameterState::SecondMoment),
                 value.clone(),
             );
         }
         for (name, value) in &decoded.gradient_accumulators {
             values.insert(
-                RecurrentStateKey::adamw_parameter(
-                    name.clone(),
-                    AdamWParameterState::GradientAccumulator,
-                ),
+                adamw_parameter_key(name, AdamWParameterState::GradientAccumulator),
                 value.clone(),
             );
         }
         values.insert(
-            RecurrentStateKey::adamw_global(AdamWGlobalState::Step),
+            adamw_global_key(AdamWGlobalState::Step),
             TensorData::from_scalars(
                 Shape::from([]),
                 DType::U64,
@@ -191,7 +188,7 @@ impl CompiledAdamWPlan {
         );
         if topology.accumulating() {
             values.insert(
-                RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulationIndex),
+                adamw_global_key(AdamWGlobalState::AccumulationIndex),
                 TensorData::from_scalars(
                     Shape::from([]),
                     DType::U64,
@@ -201,13 +198,13 @@ impl CompiledAdamWPlan {
         }
         if let Some(count) = decoded.accumulated_token_count {
             values.insert(
-                RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedTokenCount),
+                adamw_global_key(AdamWGlobalState::AccumulatedTokenCount),
                 TensorData::from_scalars(Shape::from([]), DType::U64, [Scalar::U(count)])?,
             );
         }
         if let Some(numerator) = &decoded.accumulated_loss_numerator {
             values.insert(
-                RecurrentStateKey::adamw_global(AdamWGlobalState::AccumulatedLossNumerator),
+                adamw_global_key(AdamWGlobalState::AccumulatedLossNumerator),
                 numerator.clone(),
             );
         }
@@ -240,7 +237,7 @@ impl CompiledAdamWPlan {
             .map(|key| {
                 let version = if self.inner.workload_buffers.contains_key(&key) {
                     decoded.replay_step
-                } else if key.is_accumulation_reset_state() {
+                } else if is_adamw_accumulation_reset_state(&key) {
                     reset_version
                 } else {
                     optimizer_version

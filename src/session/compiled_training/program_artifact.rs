@@ -15,7 +15,7 @@ mod wire_validation;
 
 use self::wire_decode::{
     decode_auxiliary, decode_input_key_map, decode_key_map, decode_manifest,
-    validate_phase_capture, zero_frontier,
+    optimizer_resets_state, optimizer_state_schema, validate_phase_capture, zero_frontier,
 };
 use self::wire_encode::{module_wire, momentum_program_wire, program_wire};
 
@@ -1350,13 +1350,15 @@ fn seal_admitted_training_topology(
     wire: &ProgramWire,
     captures: &ProgramCaptures,
 ) -> Result<AdmittedTrainingTopology> {
+    let optimizer_schema = optimizer_state_schema(&wire.optimizer);
     let capture = captures.main.clone();
     #[cfg(test)]
     update_decode_counts(|counts| counts.topology_phase_validations += 1);
-    let main_state_buffers = validate_phase_capture(&wire.main.phase, capture.as_ref())?;
+    let main_state_buffers =
+        validate_phase_capture(&wire.main.phase, capture.as_ref(), optimizer_schema)?;
     let parameter_buffers = wire.main.parameter_buffers.clone();
-    let optimizer_buffers = decode_key_map(&wire.main.optimizer_buffers)?;
-    let workload_buffers = decode_key_map(&wire.main.workload_buffers)?;
+    let optimizer_buffers = decode_key_map(&wire.main.optimizer_buffers, optimizer_schema)?;
+    let workload_buffers = decode_key_map(&wire.main.workload_buffers, optimizer_schema)?;
     let expected_state_buffers = parameter_buffers
         .iter()
         .map(|(name, buffer)| (RecurrentStateKey::parameter(name), *buffer))
@@ -1375,7 +1377,7 @@ fn seal_admitted_training_topology(
         return Err(training("compiled program artifact state map mismatch"));
     }
     let (state_values, state_versions) = zero_frontier(&capture, &main_state_buffers)?;
-    let state_input_keys = decode_input_key_map(&wire.main.state_input_keys)?;
+    let state_input_keys = decode_input_key_map(&wire.main.state_input_keys, optimizer_schema)?;
     let recurrent_capture = Arc::new(match &captures.metal_main_recurrent {
         Some(recurrent) => recurrent.clone(),
         None => CompiledRecurrentCapture::from_artifact(capture.as_ref(), None)?,
@@ -1388,7 +1390,8 @@ fn seal_admitted_training_topology(
             let phase_capture = admitted_capture.clone();
             #[cfg(test)]
             update_decode_counts(|counts| counts.topology_phase_validations += 1);
-            let state_buffers = validate_phase_capture(phase, phase_capture.as_ref())?;
+            let state_buffers =
+                validate_phase_capture(phase, phase_capture.as_ref(), optimizer_schema)?;
             let cursor_projection = PreparedRecurrentCursorProjection::prepare(
                 capture.as_ref(),
                 phase_capture.as_ref(),
@@ -1497,6 +1500,7 @@ fn seal_admitted_training_topology(
                 phase,
                 capture.clone(),
                 captures.metal_partial_flush_recurrent.clone(),
+                optimizer_schema,
             )
         })
         .transpose()?;
@@ -1505,7 +1509,13 @@ fn seal_admitted_training_topology(
         .as_ref()
         .zip(captures.zero_grad.as_ref())
         .map(|(phase, capture)| {
-            decode_auxiliary(inner.capture.as_ref(), phase, capture.clone(), None)
+            decode_auxiliary(
+                inner.capture.as_ref(),
+                phase,
+                capture.clone(),
+                None,
+                optimizer_schema,
+            )
         })
         .transpose()?;
     let OptimizerPolicyWire::AdamW { adamw } = &wire.optimizer else {
