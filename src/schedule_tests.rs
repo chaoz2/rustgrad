@@ -3943,6 +3943,68 @@ fn single_reduction_epilogue_is_one_item_without_intermediate_storage() {
 }
 
 #[test]
+fn reduction_epilogue_use_analysis_runs_once_per_candidate_deterministically() {
+    let mut graph = Graph::new();
+    let left_input = graph.input("left", Shape::from([2, 3]));
+    let left_reduction = graph.sum(left_input, 1).unwrap();
+    let one = graph.constant(TensorData::new(Shape::new([]), vec![1.0]).unwrap());
+    let left = graph.add(left_reduction, one).unwrap();
+    let right_input = graph.input("right", Shape::from([2, 3]));
+    let right_reduction = graph.sum(right_input, 1).unwrap();
+    let two = graph.constant(TensorData::new(Shape::new([]), vec![2.0]).unwrap());
+    let right = graph.mul(right_reduction, two).unwrap();
+    let requested = [right, left];
+
+    crate::kernel::reset_reduction_epilogue_use_analysis_count();
+    let first = schedule_many(&graph, &requested).unwrap();
+    assert_eq!(crate::kernel::reduction_epilogue_use_analysis_count(), 2);
+    assert_eq!(
+        first.items.iter().map(|item| item.node).collect::<Vec<_>>(),
+        vec![left, right]
+    );
+    assert!(
+        first
+            .items
+            .iter()
+            .all(|item| item.node != left_reduction && item.node != right_reduction)
+    );
+    let first_bytes = crate::CapturedSchedule::capture(&graph, &first, &requested)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    crate::kernel::reset_reduction_epilogue_use_analysis_count();
+    let second = schedule_many(&graph, &requested).unwrap();
+    assert_eq!(crate::kernel::reduction_epilogue_use_analysis_count(), 2);
+    let second_bytes = crate::CapturedSchedule::capture(&graph, &second, &requested)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+
+    assert_eq!(second_bytes, first_bytes);
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|item| item.node)
+            .collect::<Vec<_>>(),
+        first.items.iter().map(|item| item.node).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|item| item.cache_key)
+            .collect::<Vec<_>>(),
+        first
+            .items
+            .iter()
+            .map(|item| item.cache_key)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn reduction_epilogue_fusion_respects_requested_shared_and_shape_boundaries() {
     let mut graph = Graph::new();
     let x = graph.input("x", Shape::from([2, 3]));
@@ -3950,8 +4012,10 @@ fn reduction_epilogue_fusion_respects_requested_shared_and_shape_boundaries() {
     let one = graph.constant(TensorData::new(Shape::new([]), vec![1.0]).unwrap());
     let epilogue = graph.add(reduced, one).unwrap();
 
+    crate::kernel::reset_reduction_epilogue_use_analysis_count();
     let requested = schedule_many(&graph, &[reduced, epilogue]).unwrap();
     assert_eq!(requested.items.len(), 2);
+    assert_eq!(crate::kernel::reduction_epilogue_use_analysis_count(), 0);
 
     let other = graph.mul(reduced, one).unwrap();
     let shared = schedule_many(&graph, &[epilogue, other]).unwrap();

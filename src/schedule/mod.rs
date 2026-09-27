@@ -1463,6 +1463,15 @@ struct ReductionEpilogueFusion {
     kernel: UOp,
 }
 
+/// One graph-eligible fusion root and its reusable immutable edge analysis.
+/// Caller ownership policy is deliberately evaluated by the scheduler rather
+/// than retained in the graph-semantic witness.
+struct ReductionEpilogueFusionCandidate<'graph> {
+    root: usize,
+    reduction: usize,
+    uses: crate::kernel::ReductionEpilogueNodeUses<'graph>,
+}
+
 /// A reduction epilogue rehearsed against the immutable pre-fusion roots.
 /// Root removal is deferred until every rehearsal has contributed its exact
 /// load inventory, so selection order cannot delete another epilogue's input.
@@ -2706,23 +2715,28 @@ fn schedule_many_with_external(
         .iter()
         .copied()
         .filter_map(|root| {
-            let reduction =
-                match crate::kernel::single_reduction_epilogue(graph, NodeId::from_index(root)) {
-                    Ok(Some(reduction)) => reduction,
+            let epilogue =
+                match crate::kernel::eligible_reduction_epilogue(graph, NodeId::from_index(root)) {
+                    Ok(Some(epilogue)) => epilogue,
                     Ok(None) => return None,
                     Err(error) => return Some(Err(ScheduleError::UOp(error))),
                 };
-            (roots.contains(&reduction.index())
-                && !requested.contains(&reduction.index())
-                && !requested_passthrough_sources.contains(&reduction.index())
-                && !external.contains(&reduction.index())
-                && crate::kernel::reduction_epilogue_node_uses(
-                    graph,
-                    NodeId::from_index(root),
-                    reduction,
-                )
-                .is_ok_and(|uses| uses == consumers[reduction.index()]))
-            .then_some(Ok((root, reduction.index())))
+            let reduction = epilogue.reduction();
+            if !roots.contains(&reduction.index())
+                || requested.contains(&reduction.index())
+                || requested_passthrough_sources.contains(&reduction.index())
+                || external.contains(&reduction.index())
+            {
+                return None;
+            }
+            let uses = epilogue.analyze_node_uses().ok()?;
+            uses.node_uses(reduction)
+                .is_ok_and(|count| count == consumers[reduction.index()])
+                .then_some(Ok(ReductionEpilogueFusionCandidate {
+                    root,
+                    reduction: reduction.index(),
+                    uses,
+                }))
         })
         .collect::<Result<Vec<_>, ScheduleError>>()?;
     // The nearest observable root owns fusion. An outer epilogue must load a
@@ -2732,74 +2746,68 @@ fn schedule_many_with_external(
     // candidate owns every one of its graph uses.
     let fusion_candidates = fusion_candidates
         .into_iter()
-        .filter(|(root, reduction)| {
+        .filter(|candidate| {
             roots
                 .iter()
                 .chain(&requested)
                 .chain(&requested_passthrough_sources)
                 .chain(&external)
-                .filter(|nested| **nested != *root && **nested != *reduction)
+                .filter(|nested| **nested != candidate.root && **nested != candidate.reduction)
                 .all(|nested| {
-                    crate::kernel::reduction_epilogue_node_uses(
-                        graph,
-                        NodeId::from_index(*root),
-                        NodeId::from_index(*nested),
-                    )
-                    .is_ok_and(|uses| {
-                        uses == 0
-                            || (!requested.contains(nested)
-                                && !requested_passthrough_sources.contains(nested)
-                                && !external.contains(nested)
-                                && uses == consumers[*nested])
-                    })
+                    candidate
+                        .uses
+                        .node_uses(NodeId::from_index(*nested))
+                        .is_ok_and(|count| {
+                            count == 0
+                                || (!requested.contains(nested)
+                                    && !requested_passthrough_sources.contains(nested)
+                                    && !external.contains(nested)
+                                    && count == consumers[*nested])
+                        })
                 })
         })
         .collect::<Vec<_>>();
-    let selected_epilogues = fusion_candidates
-        .iter()
-        .copied()
-        .filter(|(root, reduction)| {
-            !fusion_candidates.iter().any(|(outer, outer_reduction)| {
-                outer != root
-                    && outer_reduction == reduction
-                    && crate::kernel::reduction_epilogue_node_uses(
-                        graph,
-                        NodeId::from_index(*outer),
-                        NodeId::from_index(*root),
-                    )
-                    .is_ok_and(|uses| uses != 0 && uses == consumers[*root])
-            })
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
     let mut rehearsed_epilogues = BTreeMap::<usize, ReductionEpilogueRehearsal>::new();
-    for (root, reduction) in selected_epilogues {
-        let mut candidates = BTreeSet::from([reduction]);
+    for candidate in fusion_candidates.iter().filter(|candidate| {
+        !fusion_candidates.iter().any(|outer| {
+            outer.root != candidate.root
+                && outer.reduction == candidate.reduction
+                && outer
+                    .uses
+                    .node_uses(NodeId::from_index(candidate.root))
+                    .is_ok_and(|uses| uses != 0 && uses == consumers[candidate.root])
+        })
+    }) {
+        let mut candidates = BTreeSet::from([candidate.reduction]);
         for nested in roots.iter().copied() {
-            if nested != root
+            if nested != candidate.root
                 && !requested.contains(&nested)
                 && !requested_passthrough_sources.contains(&nested)
                 && !external.contains(&nested)
                 && !direct_payload_operands.contains(&nested)
                 && !movement_operands.contains(&nested)
-                && crate::kernel::reduction_epilogue_node_uses(
-                    graph,
-                    NodeId::from_index(root),
-                    NodeId::from_index(nested),
-                )
-                .is_ok_and(|uses| uses != 0 && uses == consumers[nested])
+                && candidate
+                    .uses
+                    .node_uses(NodeId::from_index(nested))
+                    .is_ok_and(|count| count != 0 && count == consumers[nested])
             {
                 candidates.insert(nested);
             }
         }
-        let Some(fusion) =
-            rehearse_reduction_epilogue(graph, root, reduction, &roots, &external, &candidates)
-        else {
+        let Some(fusion) = rehearse_reduction_epilogue(
+            graph,
+            candidate.root,
+            candidate.reduction,
+            &roots,
+            &external,
+            &candidates,
+        ) else {
             continue;
         };
         rehearsed_epilogues.insert(
-            root,
+            candidate.root,
             ReductionEpilogueRehearsal {
-                reduction,
+                reduction: candidate.reduction,
                 candidates,
                 fusion,
             },
