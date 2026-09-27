@@ -4264,20 +4264,41 @@ mod recurrent_tests {
         assert!(matches!(admitted_stale, ReplayError::Execute(_)));
         assert_eq!(prepared_replay_validation_counts(), Default::default());
 
-        let raw_input_error =
-            match capture.preflight_recurrent_native(&runtime, &advanced, &invalid_inputs, false) {
-                Ok(_) => panic!("raw native preflight accepted absent external input"),
+        let advanced_values = frontier_values(&runtime, &advanced);
+        let executor = CapturedReplayExecutor::default();
+        let raw_input_preflight = capture
+            .preflight_recurrent_native(&runtime, &advanced, &invalid_inputs, false)
+            .unwrap();
+        let raw_input_error = {
+            let (pure, bound) = raw_input_preflight.pure_and_inputs();
+            match executor.preflight_native_items(pure, bound) {
+                Ok(_) => panic!("raw native item preflight accepted absent external input"),
                 Err(error) => error,
-            };
+            }
+        };
         reset_prepared_replay_validation_counts();
-        let admitted_input_error =
-            match authenticated.preflight_native(&runtime, &advanced, &invalid_inputs, false) {
-                Ok(_) => panic!("authenticated native preflight accepted absent external input"),
+        let admitted_input_preflight = authenticated
+            .preflight_native(&runtime, &advanced, &invalid_inputs, false)
+            .unwrap();
+        let admitted_input_error = {
+            let (pure, bound) = admitted_input_preflight.pure_and_inputs();
+            match executor.preflight_native_items(pure, bound) {
+                Ok(_) => {
+                    panic!("authenticated native item preflight accepted absent external input")
+                }
                 Err(error) => error,
-            };
+            }
+        };
         assert_eq!(admitted_input_error, raw_input_error);
-        assert!(matches!(admitted_input_error, ReplayError::Missing(_)));
-        assert_eq!(prepared_replay_validation_counts(), Default::default());
+        assert_eq!(admitted_input_error, ReplayError::Missing("delta".into()));
+        assert_eq!(
+            prepared_replay_validation_counts(),
+            PreparedReplayValidationCounts {
+                native_trace_serializations: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(frontier_values(&runtime, &advanced), advanced_values);
     }
 
     #[test]
