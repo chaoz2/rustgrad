@@ -164,6 +164,7 @@ def fixture(support, root):
 
 
 def check(support):
+    check_capsule_phases(support)
     cases = (
         "valid", "timing", "checkpoint", "capture", "cache-miss", "hardware", "missing",
         "malformed-projection", "malformed-dropout", "malformed-duration",
@@ -208,5 +209,44 @@ def check(support):
             assert comparable is (case in ("valid", "timing")), (case, manifest)
             assert len(manifest["trials"]) == 4
             if case in ("capture", "cache-miss", "missing") or case.startswith("malformed-"):
+                assert manifest["trials"][1]["status"] == "invalid", case
+                assert manifest["trials"][1]["files"], case
+
+
+def check_capsule_phases(support):
+    fields = ("recipe_wall_time_ns", "file_read_wall_time_ns",
+              "decode_wall_time_ns", "authentication_wall_time_ns")
+    for case in ("valid", "timing", "missing", "order", "bool", "negative",
+                 "overflow", "exceeds", "mixed-version"):
+        with tempfile.TemporaryDirectory(prefix="rustgrad-capsule-phases-") as temporary:
+            root = pathlib.Path(temporary).resolve()
+            arguments = fixture(support, root)
+            for directory in sorted(root.glob("trial-*")):
+                path = directory / "objective-evidence.json"
+                objective = json.loads(path.read_text())
+                objective["schema_version"] = 9
+                phases = [{"program_index": index, **dict.fromkeys(fields, 0)}
+                          for index in range(5)]
+                objective["warm_resume"]["preparation"]["capsule_phases"] = phases
+                if directory.name == "trial-02-candidate":
+                    if case == "timing":
+                        phases[0][fields[0]] = 1
+                    elif case == "missing":
+                        phases.pop()
+                    elif case == "order":
+                        phases[1]["program_index"] = 0
+                    elif case in ("bool", "negative", "overflow", "exceeds"):
+                        phases[0][fields[0]] = {
+                            "bool": True, "negative": -1,
+                            "overflow": 2**64, "exceeds": 2**64 - 1,
+                        }[case]
+                    elif case == "mixed-version":
+                        objective["schema_version"] = 8
+                        del objective["warm_resume"]["preparation"]["capsule_phases"]
+                support.write_json(path, objective)
+                checksums(support, directory)
+            manifest, comparable = support.VALIDATOR.compare(arguments)
+            assert comparable is (case in ("valid", "timing")), (case, manifest)
+            if case not in ("valid", "timing", "mixed-version"):
                 assert manifest["trials"][1]["status"] == "invalid", case
                 assert manifest["trials"][1]["files"], case

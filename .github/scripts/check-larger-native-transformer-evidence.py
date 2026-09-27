@@ -183,6 +183,10 @@ def _warm_timing_projection(warm: dict[str, Any]) -> dict[str, int]:
                 collect_durations(f"{prefix}.{key}", entry)
 
     collect_durations("preparation.prepare_finalization", preparation["prepare_finalization"])
+    for phase in preparation.get("capsule_phases", []):
+        for field, value in phase.items():
+            if field.endswith("_wall_time_ns"):
+                result[f"preparation.capsule.{phase['program_index']}.{field}"] = value
     if any(type(value) is not int or value < 0 for value in result.values()):
         raise LargerEvidenceError("larger Transformer warm timing projection differs")
     return result
@@ -249,7 +253,7 @@ def validate_larger_evidence(
         except PREPARATION_EVIDENCE.PreparationEvidenceError:
             return None
 
-    if objective.get("schema_version") != 8 or objective.get("git_sha") != expected_sha:
+    if objective.get("schema_version") not in (8, 9) or objective.get("git_sha") != expected_sha:
         raise LargerEvidenceError("larger Transformer objective provenance is invalid")
     expected_workload = {
         "batch": 4,
@@ -600,10 +604,13 @@ def validate_larger_evidence(
         "effective_render_wall_time_ns",
         "effective_render_fraction",
     }
+    preparation_details = {"prepare_finalization"}
+    if objective["schema_version"] == 9:
+        preparation_details.add("capsule_phases")
     if (
         not isinstance(preparation, dict)
         or set(preparation)
-        != set(preparation_roles) | preparation_totals | {"prepare_finalization"}
+        != set(preparation_roles) | preparation_totals | preparation_details
     ):
         raise LargerEvidenceError("larger Transformer warm preparation evidence is invalid")
     phase_fields = {
@@ -702,6 +709,27 @@ def validate_larger_evidence(
         or preparation["effective_render_wall_time_ns"] != effective_render
     ):
         raise LargerEvidenceError("larger Transformer warm effective render timing is invalid")
+    if objective["schema_version"] == 9:
+        phases = preparation.get("capsule_phases")
+        fields = ("recipe_wall_time_ns", "file_read_wall_time_ns",
+                  "decode_wall_time_ns", "authentication_wall_time_ns")
+        if type(phases) is not list or len(phases) != 5:
+            raise LargerEvidenceError("larger Transformer capsule phase inventory differs")
+        total = 0
+        for index, phase in enumerate(phases):
+            if (type(phase) is not dict or set(phase) != {"program_index", *fields}
+                    or type(phase.get("program_index")) is not int
+                    or phase["program_index"] != index):
+                raise LargerEvidenceError("larger Transformer capsule phase order differs")
+            for field in fields:
+                value = phase[field]
+                if type(value) is not int or not 0 <= value <= 2**64 - 1:
+                    raise LargerEvidenceError("larger Transformer capsule phase timing is invalid")
+                total += value
+        enclosing = duration_nanos(preparation["prepare_finalization"].get(
+            "render_batch_orchestration_wall_time"))
+        if enclosing is None or total > enclosing:
+            raise LargerEvidenceError("larger Transformer capsule phases exceed batch")
     render_fraction = preparation.get("effective_render_fraction")
     if (
         not isinstance(render_fraction, (int, float))

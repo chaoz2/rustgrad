@@ -1458,6 +1458,21 @@ That remainder is accounted separately in preparation overhead; post-render
 planning remains in explicit unattributed time. These are observations, not a
 performance threshold or speedup claim.
 
+Per-program native render-capsule diagnostics additionally observe recipe
+construction, bounded file reading (including path resolution), decoding and
+checksum validation, current-program authentication, and encoding/persistence.
+Unattempted phases are `None`, not zero; attempted failures retain their elapsed
+time and original admission status. These sequential intervals are nested
+inside render-batch orchestration, not additional preparation work. Timers
+change no capsule bytes, cache keys, fallback order, or validation policy.
+The larger-training objective schema v9 exports the five warm-hit programs'
+recipe/read/decode/authentication nanoseconds in program order and rejects a
+phase sum larger than the enclosing orchestration interval. Warm hits do not
+write capsules. The evidence reader retains v8 support; comparisons reject
+mixed schema versions rather than inventing missing measurements. The ordinary
+scoreboard remains v26; this extra detail belongs to the separate warm-resume
+objective evidence, not its cold preparation report.
+
 The executor-host remainder includes workspace, binding, input/output, and any
 conservative per-entry execution outside sealed dispatcher segments. It is not
 a per-kernel profile.

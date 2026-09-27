@@ -502,6 +502,11 @@ pub(crate) struct NativeRenderCapsuleDiagnostic {
     pub(crate) program_index: usize,
     pub(crate) load: NativeRenderCapsuleLoadStatus,
     pub(crate) store: NativeRenderCapsuleStoreStatus,
+    pub(crate) recipe_wall_time: Duration,
+    pub(crate) file_read_wall_time: Option<Duration>,
+    pub(crate) decode_wall_time: Option<Duration>,
+    pub(crate) authentication_wall_time: Option<Duration>,
+    pub(crate) store_wall_time: Option<Duration>,
 }
 
 const MAX_PARALLEL_NATIVE_RENDER_JOB_COUNT: usize = 2;
@@ -644,24 +649,35 @@ fn render_schedule_modules(
         .iter()
         .enumerate()
         .map(|(ordinal, (items, layouts, store_groups))| {
-            render_capsule::capsule_recipe(
+            let started = Instant::now();
+            let recipe = render_capsule::capsule_recipe(
                 backend,
                 ordinal,
                 programs.len(),
                 items,
                 layouts,
                 store_groups,
-            )
+            );
+            (recipe, started.elapsed())
         })
         .collect::<Vec<_>>();
     let mut results = Vec::with_capacity(programs.len());
     let mut capsule_diagnostics = Vec::with_capacity(programs.len());
-    for (ordinal, ((items, layouts, store_groups), recipe)) in
+    for (ordinal, ((items, layouts, store_groups), (recipe, recipe_wall_time))) in
         programs.iter().zip(&recipes).enumerate()
     {
+        let mut timing = render_capsule::CapsuleLoadTimings::default();
         let load = match recipe {
             Some(recipe) => {
-                match render_capsule::load_capsule(backend, recipe, items, layouts, store_groups) {
+                let (result, observed) = render_capsule::load_capsule_observed(
+                    backend,
+                    recipe,
+                    items,
+                    layouts,
+                    store_groups,
+                );
+                timing = observed;
+                match result {
                     Ok(rendered) => {
                         results.push(NativeScheduleRenderResult {
                             ordinal,
@@ -680,6 +696,11 @@ fn render_schedule_modules(
             program_index: ordinal,
             load,
             store: render_capsule::CapsuleStoreStatus::NotAttempted,
+            recipe_wall_time: *recipe_wall_time,
+            file_read_wall_time: timing.file_read,
+            decode_wall_time: timing.decode,
+            authentication_wall_time: timing.authentication,
+            store_wall_time: None,
         });
     }
     let hits = results
@@ -777,8 +798,13 @@ fn render_schedule_modules(
         .collect::<Result<Vec<_>, JitBackendError>>()?;
     for (ordinal, module) in rendered.iter().enumerate() {
         if rendered_locally[ordinal] {
-            capsule_diagnostics[ordinal].store = match recipes[ordinal].as_ref() {
-                Some(recipe) => render_capsule::store_capsule(recipe, module),
+            capsule_diagnostics[ordinal].store = match recipes[ordinal].0.as_ref() {
+                Some(recipe) => {
+                    let started = Instant::now();
+                    let status = render_capsule::store_capsule(recipe, module);
+                    capsule_diagnostics[ordinal].store_wall_time = Some(started.elapsed());
+                    status
+                }
                 None => render_capsule::CapsuleStoreStatus::RecipeUnavailable,
             };
         }
@@ -2668,6 +2694,23 @@ mod tests {
     use crate::{DType, Scalar, Shape};
 
     fn assert_render_batch_partition(batch: &NativeScheduleRenderBatch) {
+        let capsule_time = batch
+            .capsule_diagnostics
+            .iter()
+            .try_fold(Duration::ZERO, |total, diagnostic| {
+                [
+                    Some(diagnostic.recipe_wall_time),
+                    diagnostic.file_read_wall_time,
+                    diagnostic.decode_wall_time,
+                    diagnostic.authentication_wall_time,
+                    diagnostic.store_wall_time,
+                ]
+                .into_iter()
+                .flatten()
+                .try_fold(total, |total, phase| total.checked_add(phase))
+            })
+            .unwrap();
+        assert!(capsule_time <= batch.orchestration_wall_time);
         let rendered = batch
             .rendered
             .iter()
@@ -3400,6 +3443,10 @@ mod tests {
         assert!(cold.capsule_diagnostics.iter().all(|diagnostic| {
             diagnostic.load == render_capsule::CapsuleLoadStatus::FileUnavailable
                 && diagnostic.store == render_capsule::CapsuleStoreStatus::Stored
+                && diagnostic.file_read_wall_time.is_some()
+                && diagnostic.decode_wall_time.is_none()
+                && diagnostic.authentication_wall_time.is_none()
+                && diagnostic.store_wall_time.is_some()
         }));
         assert!(cold.max_parallel_job_count > 0);
 
@@ -3417,6 +3464,10 @@ mod tests {
         assert!(warm.capsule_diagnostics.iter().all(|diagnostic| {
             diagnostic.load == render_capsule::CapsuleLoadStatus::Hit
                 && diagnostic.store == render_capsule::CapsuleStoreStatus::NotAttempted
+                && diagnostic.file_read_wall_time.is_some()
+                && diagnostic.decode_wall_time.is_some()
+                && diagnostic.authentication_wall_time.is_some()
+                && diagnostic.store_wall_time.is_none()
         }));
         assert_eq!(warm.max_parallel_job_count, 0);
         assert_eq!(warm.parallel_overlap_wall_time, Duration::ZERO);
@@ -3459,12 +3510,17 @@ mod tests {
         ] {
             render_capsule::mutate_capsule_with_valid_checksum(&recipes[0], mutation);
             let repaired = render_schedule_modules(&backend, &programs()).unwrap();
+            assert_render_batch_partition(&repaired);
             assert_eq!(repaired.capsule_hit_count, 1);
             assert_eq!(repaired.capsule_miss_count, 1);
             assert_eq!(repaired.local_render_job_count, 1);
             assert!(repaired.capsule_diagnostics.iter().any(|diagnostic| {
                 diagnostic.load == render_capsule::CapsuleLoadStatus::AuthenticationRejected
                     && diagnostic.store == render_capsule::CapsuleStoreStatus::Stored
+                    && diagnostic.file_read_wall_time.is_some()
+                    && diagnostic.decode_wall_time.is_some()
+                    && diagnostic.authentication_wall_time.is_some()
+                    && diagnostic.store_wall_time.is_some()
             }));
             assert_eq!(repaired.max_parallel_job_count, 1);
             assert!(repaired.rendered[1].render_wall_time.is_zero());
@@ -3496,12 +3552,17 @@ mod tests {
         corrupted[0] ^= 1;
         std::fs::write(&path, corrupted).unwrap();
         let recovered = render_schedule_modules(&backend, &programs()).unwrap();
+        assert_render_batch_partition(&recovered);
         assert_eq!(recovered.capsule_hit_count, 1);
         assert_eq!(recovered.capsule_miss_count, 1);
         assert_eq!(recovered.local_render_job_count, 1);
         assert!(recovered.capsule_diagnostics.iter().any(|diagnostic| {
             diagnostic.load == render_capsule::CapsuleLoadStatus::DecodeRejected
                 && diagnostic.store == render_capsule::CapsuleStoreStatus::Stored
+                && diagnostic.file_read_wall_time.is_some()
+                && diagnostic.decode_wall_time.is_some()
+                && diagnostic.authentication_wall_time.is_none()
+                && diagnostic.store_wall_time.is_some()
         }));
         assert_eq!(recovered.max_parallel_job_count, 1);
         assert!(recovered.rendered[1].render_wall_time.is_zero());
