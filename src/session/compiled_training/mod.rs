@@ -60,7 +60,7 @@ use self::capture::{CompiledEvaluationCapture, CompiledRecurrentCapture};
 #[cfg(test)]
 use self::capture::{
     canonical_recurrent_capture_counts, canonical_recurrent_capture_delta,
-    recurrent_prefix_error_matches_codec_reference,
+    recurrent_prefix_error_matches_codec_reference, recurrent_prefix_identity_serialization_counts,
     recurrent_prefix_item_key_error_matches_codec_reference,
     recurrent_prefix_matches_codec_reference, with_canonical_recurrent_reference,
 };

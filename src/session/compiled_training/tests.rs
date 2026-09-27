@@ -1272,6 +1272,10 @@ fn recurrent_training_phases_derive_from_one_canonical_mixed_capture() {
             .capture
             .as_ref(),
     );
+    assert_eq!(
+        recurrent_prefix_identity_serialization_counts(captures[0]).unwrap(),
+        (1, 3, 1)
+    );
     for capture in captures {
         recurrent_prefix_matches_codec_reference(capture).unwrap();
         let decoded = CapturedMixedSchedule::from_bytes(&capture.to_bytes().unwrap()).unwrap();

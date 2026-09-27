@@ -113,6 +113,22 @@ impl ExecutionPlanSummary {
     ) -> Result<Self, ExecutionPlanSummaryError> {
         crate::schedule::artifact::validate_capture(capture)
             .map_err(|error| captured_summary_error(error.to_string()))?;
+        Self::from_validated_capture(capture, reuse_enabled)
+    }
+
+    /// Reuses a private owned artifact proof while retaining the schedule and
+    /// memory-plan validations performed by `from_validated_capture`.
+    pub(crate) fn from_authenticated_fresh_capture(
+        capture: &super::artifact::AuthenticatedFreshCapture,
+        reuse_enabled: bool,
+    ) -> Result<Self, ExecutionPlanSummaryError> {
+        Self::from_validated_capture(capture.capture(), reuse_enabled)
+    }
+
+    fn from_validated_capture(
+        capture: &CapturedSchedule,
+        reuse_enabled: bool,
+    ) -> Result<Self, ExecutionPlanSummaryError> {
         let requested_materializations = super::physical_requested_materializations(
             &capture.items,
             &capture.requested_passthroughs,
