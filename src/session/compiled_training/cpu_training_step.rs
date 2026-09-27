@@ -312,9 +312,7 @@ impl CpuCompiledTrainingProgram {
                 &mut self.cursor,
                 &provided,
                 transaction.injected_failure(),
-                |outputs, successors| {
-                    transaction.validate_transition(outputs, successors.iter().copied())
-                },
+                |outputs, successors| transaction.validate_transition(outputs, successors),
             ),
             CompiledStepOutputSelection::CommitOnly => native.replay_recurrent_projected_checked(
                 &mut self.runtime,
@@ -322,9 +320,7 @@ impl CpuCompiledTrainingProgram {
                 &provided,
                 commit_only_projection,
                 transaction.injected_failure(),
-                |outputs, successors| {
-                    transaction.validate_transition(outputs, successors.iter().copied())
-                },
+                |outputs, successors| transaction.validate_transition(outputs, successors),
             ),
         }
         .map_err(replay_error)?;
@@ -403,9 +399,7 @@ impl CpuCompiledTrainingProgram {
                 prepared.cursor.cursor_mut(),
                 &prepared.provided,
                 transaction.injected_failure(),
-                |outputs, successors| {
-                    transaction.validate_transition(outputs, successors.iter().copied())
-                },
+                |outputs, successors| transaction.validate_transition(outputs, successors),
             ),
             CompiledStepOutputSelection::CommitOnly => native.replay_recurrent_projected_checked(
                 &mut self.runtime,
@@ -413,9 +407,7 @@ impl CpuCompiledTrainingProgram {
                 &prepared.provided,
                 commit_only_projection,
                 transaction.injected_failure(),
-                |outputs, successors| {
-                    transaction.validate_transition(outputs, successors.iter().copied())
-                },
+                |outputs, successors| transaction.validate_transition(outputs, successors),
             ),
         }
         .map_err(replay_error)?;
