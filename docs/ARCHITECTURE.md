@@ -1437,8 +1437,7 @@ include the excluded warmup and are not presented as the 96 measured samples.
 ##### Manual same-runner training comparison
 
 The manual native-Transformer comparison workflow is an evidence adapter over
-that unchanged cold scoreboard plus 96-sample warm sidecar. It has not yet
-produced comparison evidence.
+that unchanged cold scoreboard plus 96-sample warm sidecar.
 
 | Boundary | Contract |
 |---|---|
@@ -1447,6 +1446,22 @@ produced comparison evidence.
 | Workload | Both revisions execute the existing cold preparation/training evidence and the same one-window warmup plus 32 measured windows; sample counts, phase timings, checkpoint validation, and zero-fallback semantics remain in the existing schemas. |
 | Provenance and admission | Raw files remain artifacts. Each trial records its source commit, evidence-file identity, binary identity, Cargo profile, Rust toolchain, and runner provenance. The comparator retains semantic facts and rejects sets whose workload, schema, optimizer/capture, build, or runner facts are not comparable. |
 | Interpretation | Timings are observations with no threshold or speedup claim. Repeat workflow runs are required to assess runner noise; a matching hardware model alone does not establish comparability. |
+
+Both completed comparisons admitted the same exact baseline
+`188aea10f80df9a86833ff6603167dd431719f1a` and candidate
+`3809c9538d36eaa35d718b58fe5422c18c563d83` with `status="comparable"`, no
+rejection reasons, and all comparator-retained semantic facts matched.
+
+| Run and raw artifact | Runner | Accumulation median of trial medians | Optimizer-commit median of trial medians | Median of the two per-trial p95s |
+|---|---|---:|---:|---|
+| [36309496583](https://github.com/chaoz2/rustgrad/actions/runs/36309496583), `10928930485` | EPYC 9V74 | 49.354 → 48.240 µs | 71.717 → 68.395 µs | Accumulation 57.206 → 58.683 µs; commit 82.559 → 78.102 µs. |
+| [36309990498](https://github.com/chaoz2/rustgrad/actions/runs/36309990498), `10929400773` | EPYC 7763 | 64.735 → 63.776 µs | 92.089 → 90.281 µs | Accumulation 80.014 → 79.027 µs; commit 106.564 → 104.685 µs. |
+
+The repeat artifact's 12 declared raw-file hashes and lengths were independently
+verified; identical content across repeated roles is valid. Candidate medians
+were lower in both phases in both runs, but tail and component observations
+remain noisy. The different runner models make pooling invalid, and these
+serial A-B-B-A observations support no broad or causal speedup claim.
 
 Commit-only replay omits caller-named outputs while retaining loss and enabled
 validation/report scalars. Prefix reuse retains four fail-closed contracts:
