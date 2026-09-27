@@ -10,7 +10,7 @@ use super::{
     RenderedScheduleEntry, RenderedScheduleModule, validate_native_layout,
 };
 use crate::cpu_jit::{
-    ABI_VERSION, BufferAbi, KernelAbi, KernelPointerAbi, NativeMatmulLayouts,
+    ABI_VERSION, BufferAbi, JitError, KernelAbi, KernelPointerAbi, NativeMatmulLayouts,
     NativeMatmulOperandLayout, NativeOutputInitialization, QuantizedBufferAbi, RenderedC,
 };
 use crate::{GgmlType, QuantizedBufferDesc, ScheduleItem, Shape, VectorPlan};
@@ -657,6 +657,59 @@ fn authenticates_store_group_abi(
             .all(|buffer| !buffer.mutable)
 }
 
+struct OrdinaryRenderWitness {
+    logical_index: usize,
+    schedule_cache_key: u64,
+    vectorized: bool,
+    kernel: crate::UOp,
+    vector: VectorPlan,
+    authentication: crate::cpu_jit::NativeRenderAuthentication,
+}
+
+impl OrdinaryRenderWitness {
+    fn new(
+        backend: &CpuJitBackend,
+        logical_index: usize,
+        item: &ScheduleItem,
+    ) -> Result<Self, JitError> {
+        let authentication =
+            crate::cpu_jit::NativeRenderAuthentication::new(&item.kernel, backend.vectorized)?;
+        let vector = if backend.vectorized {
+            authentication.vector().clone()
+        } else {
+            VectorPlan {
+                lanes: 1,
+                enabled: false,
+                reason: "scalar policy disabled vector lanes".into(),
+            }
+        };
+        Ok(Self {
+            logical_index,
+            schedule_cache_key: item.cache_key,
+            vectorized: backend.vectorized,
+            kernel: item.kernel.clone(),
+            vector,
+            authentication,
+        })
+    }
+
+    fn authenticates(
+        &self,
+        backend: &CpuJitBackend,
+        logical_index: usize,
+        item: &ScheduleItem,
+        entry: &RenderedScheduleEntry,
+    ) -> bool {
+        self.logical_index == logical_index
+            && self.schedule_cache_key == item.cache_key
+            && self.vectorized == backend.vectorized
+            && self.kernel.shares_node_with(&item.kernel)
+            && entry.logical_indices == [logical_index]
+            && entry.vector == self.vector
+            && self.authentication.cache_key(&entry.rendered.source) == entry.rendered.cache_key
+    }
+}
+
 fn authenticate_module(
     backend: &CpuJitBackend,
     module: &RenderedScheduleModule,
@@ -788,21 +841,12 @@ fn authenticate_module(
                 return false;
             }
         } else {
-            let expected_vector = if backend.vectorized {
-                match crate::CpuJit::vector_plan(&item.kernel) {
-                    Ok(vector) => vector,
-                    Err(_) => return false,
-                }
-            } else {
-                VectorPlan {
-                    lanes: 1,
-                    enabled: false,
-                    reason: "scalar policy disabled vector lanes".into(),
-                }
+            let expected = match OrdinaryRenderWitness::new(backend, index, item) {
+                Ok(expected) => expected,
+                Err(_) => return false,
             };
-            if entry.logical_indices != [index]
+            if !expected.authenticates(backend, index, item, entry)
                 || entry.native_layouts != [layout.clone()]
-                || entry.vector != expected_vector
                 || entry.output_initialization
                     != crate::cpu_jit::native_output_initialization(&item.kernel)
                 || entry.native_cache_key
@@ -814,12 +858,6 @@ fn authenticate_module(
                 || backend
                     .validate_rendered_schedule_item(item, &entry.rendered)
                     .is_err()
-                || !crate::cpu_jit::native_rendered_cache_key(
-                    &item.kernel,
-                    backend.vectorized,
-                    &entry.rendered.source,
-                )
-                .is_ok_and(|expected| expected == entry.rendered.cache_key)
                 || !authenticates_item_abi(item, &entry.rendered.abi)
             {
                 return false;
@@ -1053,6 +1091,45 @@ pub(super) fn mutate_capsule_with_valid_checksum(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_render_witness_is_bound_to_exact_owner_role_and_vector_policy() {
+        let mut graph = crate::Graph::new();
+        let input = graph.input_dtype("witness_input", [8], crate::DType::F32);
+        let first = graph.square(input).unwrap();
+        let second = graph.neg(input).unwrap();
+        let first_schedule = crate::schedule(&graph, first).unwrap();
+        let second_schedule = crate::schedule(&graph, second).unwrap();
+        let item = &first_schedule.items[0];
+        let layout = super::super::schedule_native_layout(item).unwrap();
+        let backend = CpuJitBackend::new(crate::JitFallback::Error).vectorized(true);
+        let (vector, rendered, _) = backend.render_schedule_kernel(item, &layout).unwrap();
+        let entry = RenderedScheduleEntry {
+            logical_indices: vec![0],
+            native_layouts: vec![layout],
+            vector,
+            native_cache_key: format!("{}-schedule-{:016x}", rendered.cache_key, item.cache_key),
+            output_initialization: crate::cpu_jit::native_output_initialization(&item.kernel),
+            rendered,
+        };
+        let witness = OrdinaryRenderWitness::new(&backend, 0, item).unwrap();
+        assert!(witness.authenticates(&backend, 0, item, &entry));
+        assert!(!witness.authenticates(&backend, 1, item, &entry));
+
+        let mut different_root = second_schedule.items[0].clone();
+        different_root.cache_key = item.cache_key;
+        assert_eq!(
+            crate::CpuJit::vector_plan(&different_root.kernel).unwrap(),
+            crate::CpuJit::vector_plan(&item.kernel).unwrap(),
+            "cross-root rejection must not rely on a different vector plan"
+        );
+        assert!(!witness.authenticates(&backend, 0, &different_root, &entry));
+
+        let scalar = CpuJitBackend::new(crate::JitFallback::Error);
+        assert!(!witness.authenticates(&scalar, 0, item, &entry));
+        let scalar_witness = OrdinaryRenderWitness::new(&scalar, 0, item).unwrap();
+        assert!(!scalar_witness.authenticates(&backend, 0, item, &entry));
+    }
 
     #[test]
     fn rendered_payload_accepts_vector_source_lines_and_rejects_invalid_lines() {
