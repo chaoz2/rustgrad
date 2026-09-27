@@ -1655,6 +1655,10 @@ for momentum-SGD.
 
 - It owns deterministic RGSM/RGSA bytes for the main capture and every present
   accumulation, partial-flush, `zero_grad`, and evaluation sibling.
+  Schedule admission reconstructs dense kernel bindings once through the
+  item's binding validator; quantized resource equality remains a separate
+  check. Neither serialized identities nor malformed-binding error precedence
+  changes by avoiding a second dense reconstruction of the immutable item.
 - It includes each program's input/output, recurrent-buffer, optimizer,
   dropout, learning-rate, token-weight, freeze/tie, and native-update schemas.
 - RGAP v2 additionally retains bounded, checksummed Metal recipes for the main,
