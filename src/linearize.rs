@@ -1240,14 +1240,16 @@ pub(crate) fn project_lane_instruction(
     Ok(Some(instruction))
 }
 
-struct LaneProducerIds {
+struct LaneProducerIds<'a> {
+    _producers: &'a [UOp],
     owners: BTreeMap<usize, u32>,
     structural: BTreeMap<String, u32>,
 }
 
-impl LaneProducerIds {
-    fn new(nodes: &[UOp]) -> Self {
+impl<'a> LaneProducerIds<'a> {
+    fn new(nodes: &'a [UOp]) -> Self {
         let mut ids = Self {
+            _producers: nodes,
             owners: BTreeMap::new(),
             structural: BTreeMap::new(),
         };
@@ -1262,7 +1264,7 @@ impl LaneProducerIds {
     }
 
     fn get(&self, source: &UOp) -> Option<u32> {
-        // The caller retains all immutable producers throughout projection.
+        // The retained borrow keeps immutable producer identities alive.
         // Equal nodes excluded by structural deduplication still use its key.
         self.owners
             .get(&source.node_identity())
