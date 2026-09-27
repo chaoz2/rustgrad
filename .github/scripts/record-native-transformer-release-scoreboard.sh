@@ -1,23 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${GITHUB_SHA:?GITHUB_SHA must identify the measured revision}"
+: "${GITHUB_SHA:?GITHUB_SHA must identify the workflow revision}"
 : "${RUNNER_TEMP:?RUNNER_TEMP must provide isolated runner storage}"
+# Manual same-runner comparisons set all three overrides. Their absence keeps
+# the main-push release evidence path and Cargo invocation byte-for-byte stable.
+measured_sha="${RUSTGRAD_NATIVE_SCOREBOARD_MEASURED_SHA:-$GITHUB_SHA}"
+output_dir="${RUSTGRAD_NATIVE_SCOREBOARD_OUTPUT_DIR:-native-cpu-training-scoreboard-release}"
+prebuilt_binary="${RUSTGRAD_NATIVE_SCOREBOARD_BINARY:-}"
+
 if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "GITHUB_SHA must be a lowercase full Git SHA" >&2
   exit 1
 fi
-
-actual_sha="$(git rev-parse HEAD)"
-if [[ "$actual_sha" != "$GITHUB_SHA" ]]; then
-  echo "checked-out revision does not match GITHUB_SHA" >&2
+if [[ ! "$measured_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "measured revision must be a lowercase full Git SHA" >&2
+  exit 1
+fi
+if [[ -z "$output_dir" || "$output_dir" == "." || "$output_dir" == ".." ]]; then
+  echo "release scoreboard output directory must be explicit" >&2
   exit 1
 fi
 
-output_dir="native-cpu-training-scoreboard-release"
+actual_sha="$(git rev-parse HEAD)"
+if [[ "$actual_sha" != "$measured_sha" ]]; then
+  echo "checked-out revision does not match measured revision" >&2
+  exit 1
+fi
+
 scoreboard_path="${output_dir}/native-cpu-training-scoreboard.json"
 steady_path="${output_dir}/native-cpu-training-steady-replays.json"
 provenance_path="${output_dir}/provenance.txt"
+
+prebuilt_binary_sha256=""
+if [[ -n "$prebuilt_binary" ]]; then
+  if [[ "$prebuilt_binary" != /* || ! -f "$prebuilt_binary" || -L "$prebuilt_binary" || ! -x "$prebuilt_binary" ]]; then
+    echo "prebuilt scoreboard binary must be an absolute executable regular file" >&2
+    exit 1
+  fi
+  prebuilt_binary_sha256="$(sha256sum -- "$prebuilt_binary" | awk '{ print $1 }')"
+  if [[ ! "$prebuilt_binary_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "prebuilt scoreboard binary digest is invalid" >&2
+    exit 1
+  fi
+fi
 
 if [[ -e "$output_dir" || -L "$output_dir" ]]; then
   echo "release scoreboard output already exists: $output_dir" >&2
@@ -25,7 +51,7 @@ if [[ -e "$output_dir" || -L "$output_dir" ]]; then
 fi
 mkdir -- "$output_dir"
 
-measurement_tmpdir="$(mktemp -d "${RUNNER_TEMP%/}/rustgrad-native-scoreboard-${GITHUB_SHA}.XXXXXX")"
+measurement_tmpdir="$(mktemp -d "${RUNNER_TEMP%/}/rustgrad-native-scoreboard-${measured_sha}.XXXXXX")"
 cleanup() {
   rm -rf -- "$measurement_tmpdir"
 }
@@ -66,6 +92,10 @@ write_lscpu_field() {
 {
   printf 'schema_version=1\n'
   printf 'git_sha=%s\n' "$actual_sha"
+  if [[ -n "$prebuilt_binary" ]]; then
+    printf 'prebuilt_binary_source_sha=%s\n' "$actual_sha"
+    printf 'prebuilt_binary_sha256=%s\n' "$prebuilt_binary_sha256"
+  fi
   printf 'cargo_profile=release\n'
   printf 'temporary_cache=fresh_sha_scoped\n'
   printf 'steady_measurement_file=native-cpu-training-steady-replays.json\n'
@@ -96,12 +126,19 @@ write_lscpu_field() {
   cc --version
 } > "$provenance_path"
 
-TMPDIR="$measurement_tmpdir" CARGO_INCREMENTAL=0 RUSTFLAGS="-D warnings" \
-  RUSTGRAD_REQUIRE_COLD_NATIVE_SCOREBOARD=1 \
-  cargo run --locked --release --quiet \
-    --example compiled_transformer_train_resume -- native-cpu-scoreboard \
+if [[ -n "$prebuilt_binary" ]]; then
+  TMPDIR="$measurement_tmpdir" RUSTGRAD_REQUIRE_COLD_NATIVE_SCOREBOARD=1 \
+    "$prebuilt_binary" native-cpu-scoreboard \
       --steady-evidence "$steady_path" "$actual_sha" release \
-  | tee "$scoreboard_path"
+    | tee "$scoreboard_path"
+else
+  TMPDIR="$measurement_tmpdir" CARGO_INCREMENTAL=0 RUSTFLAGS="-D warnings" \
+    RUSTGRAD_REQUIRE_COLD_NATIVE_SCOREBOARD=1 \
+    cargo run --locked --release --quiet \
+      --example compiled_transformer_train_resume -- native-cpu-scoreboard \
+        --steady-evidence "$steady_path" "$actual_sha" release \
+    | tee "$scoreboard_path"
+fi
 
 if [[ ! -s "$scoreboard_path" || ! -s "$steady_path" || ! -s "$provenance_path" ]]; then
   echo "release scoreboard evidence must contain all three nonempty files" >&2
