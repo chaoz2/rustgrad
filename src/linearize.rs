@@ -1030,8 +1030,23 @@ impl LinearKernel {
 }
 
 fn producer_order(node: &UOp, seen: &mut BTreeSet<String>, output: &mut Vec<UOp>) {
+    visit_producers(node, &mut BTreeSet::new(), seen, output);
+}
+
+fn visit_producers(
+    node: &UOp,
+    visited: &mut BTreeSet<usize>,
+    seen: &mut BTreeSet<String>,
+    output: &mut Vec<UOp>,
+) {
+    // The root retains every immutable node throughout this walk. Identity
+    // skips repeated DAG edges, but structural deduplication below still picks
+    // exactly the same first producer for separately allocated equal nodes.
+    if !visited.insert(node.node_identity()) {
+        return;
+    }
     for source in node.sources() {
-        producer_order(source, seen, output);
+        visit_producers(source, visited, seen, output);
     }
     if seen.insert(format!("{node:?}")) {
         output.push(node.clone());
@@ -1533,6 +1548,54 @@ mod tests {
             UOp::from_operation(Operation::Store, None, vec![output, load]),
             UOp::from_operation(Operation::EndRange, None, vec![range]),
         ])
+    }
+
+    #[test]
+    fn producer_order_preserves_legacy_order_without_revisiting_shared_subtrees() {
+        fn legacy(node: &UOp, seen: &mut BTreeSet<String>, out: &mut Vec<UOp>) -> usize {
+            let visits = 1 + node
+                .sources()
+                .iter()
+                .map(|source| legacy(source, seen, out))
+                .sum::<usize>();
+            if seen.insert(format!("{node:?}")) {
+                out.push(node.clone());
+            }
+            visits
+        }
+
+        let ty = UType::scalar(DType::I32);
+        let mut shared = UOp::constant(1, ty);
+        for _ in 0..8 {
+            shared = UOp::from_operation(
+                Operation::GraphBinary(crate::BinaryOp::Add),
+                Some(ty),
+                vec![shared.clone(), shared],
+            );
+        }
+        let separate_equal = UOp::sink(vec![UOp::constant(1, ty), UOp::constant(1, ty)]);
+        for (name, root, unique_nodes, legacy_visits) in [
+            ("shared", shared, 9, 511),
+            ("separate equal", separate_equal, 3, 3),
+        ] {
+            let mut expected = Vec::new();
+            assert_eq!(
+                legacy(&root, &mut BTreeSet::new(), &mut expected),
+                legacy_visits
+            );
+            let mut actual = Vec::new();
+            let mut visited = BTreeSet::new();
+            visit_producers(&root, &mut visited, &mut BTreeSet::new(), &mut actual);
+            assert_eq!(visited.len(), unique_nodes, "{name}");
+            assert_eq!(actual.len(), expected.len(), "{name}");
+            assert!(
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .all(|(a, b)| a.shares_node_with(b)),
+                "{name}"
+            );
+        }
     }
 
     #[test]
