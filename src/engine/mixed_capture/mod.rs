@@ -2413,7 +2413,7 @@ impl CapturedMixedSchedule {
         if !r.done() {
             return Err(ReplayError::Corrupt("RGSM trailing bytes".into()));
         }
-        let mut schedule = CapturedSchedule {
+        let schedule = CapturedSchedule {
             items,
             inputs,
             constants,
@@ -2424,8 +2424,8 @@ impl CapturedMixedSchedule {
             symbolic: None,
             specialized_from: None,
         };
-        let decoded = Self {
-            schedule: schedule.clone(),
+        let mut decoded = Self {
+            schedule,
             value_bindings,
             state_bindings,
             states,
@@ -2441,19 +2441,20 @@ impl CapturedMixedSchedule {
         }
         if legacy {
             crate::schedule::rekey_schedule_items(
-                &mut schedule.items,
+                &mut decoded.schedule.items,
                 &decoded.state_bindings,
                 None,
             )
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         }
-        let mut upgraded = Self {
-            schedule,
-            ..decoded
-        };
-        upgraded.schedule.identity = identity(&upgraded)?;
-        validate(&upgraded, true)?;
-        Ok(upgraded)
+        decoded.schedule.identity = identity(&decoded)?;
+        // Current payloads already passed the same structural/key checks and
+        // remain unchanged. Only legacy rekeying needs another validation;
+        // the schedule identity above is not consumed by structural admission.
+        if legacy {
+            validate(&decoded, true)?;
+        }
+        Ok(decoded)
     }
 
     /// Replays a decoded mixed artifact against caller-owned persistent state.
@@ -4605,7 +4606,13 @@ mod tests {
         let captured = captured_effect();
         let bytes = captured.to_bytes().unwrap();
         assert_eq!(bytes, captured.to_bytes().unwrap());
+        reset_prepared_replay_validation_counts();
         let decoded = CapturedMixedSchedule::from_bytes(&bytes).unwrap();
+        let counts = prepared_replay_validation_counts();
+        assert_eq!(counts.mixed_capture_validations, 1);
+        assert_eq!(counts.schedule_rekeys, 1);
+        assert_eq!(counts.identity_serializations, 1);
+        assert_eq!(decoded.to_bytes().unwrap(), bytes);
         assert_eq!(decoded.schedule.items.len(), 1);
         assert!(decoded.schedule.items[0].is_effect());
         assert_eq!(decoded.states, captured.states);
@@ -4908,7 +4915,12 @@ mod tests {
             writer.bytes(&payload).unwrap();
             let sum = checksum(&writer.out);
             writer.u32(sum).unwrap();
+            reset_prepared_replay_validation_counts();
             let decoded = CapturedMixedSchedule::from_bytes(&writer.out).unwrap();
+            let counts = prepared_replay_validation_counts();
+            assert_eq!(counts.mixed_capture_validations, 2);
+            assert_eq!(counts.schedule_rekeys, 1);
+            assert_eq!(counts.identity_serializations, 1);
             assert_eq!(decoded.to_bytes().unwrap()[4], VERSION);
             assert_ne!(
                 decoded
@@ -4938,6 +4950,31 @@ mod tests {
             CapturedMixedSchedule::from_bytes(&writer.out),
             Err(ReplayError::Corrupt(message)) if message.contains("cache identity")
         ));
+    }
+
+    #[test]
+    fn current_rgsm_keeps_structural_then_identity_error_order() {
+        for bad_key in [false, true] {
+            let mut capture = captured_effect();
+            if bad_key {
+                capture.schedule.items[0].cache_key ^= 1;
+            }
+            let payload = capture.to_bytes_without_identity().unwrap();
+            let mut writer = Writer::new();
+            writer.bytes(MAGIC).unwrap();
+            writer.u8(VERSION).unwrap();
+            writer.u64(fnv1a(&payload) ^ 1).unwrap();
+            writer.bytes(&payload).unwrap();
+            let sum = checksum(&writer.out);
+            writer.u32(sum).unwrap();
+            reset_prepared_replay_validation_counts();
+            let error = CapturedMixedSchedule::from_bytes(&writer.out).unwrap_err();
+            assert!(matches!(error, ReplayError::Corrupt(message)
+                if message == if bad_key { "RGSM item cache identity" } else { "RGSM identity" }));
+            let counts = prepared_replay_validation_counts();
+            assert_eq!(counts.mixed_capture_validations, 1);
+            assert_eq!(counts.identity_serializations, 0);
+        }
     }
 
     #[test]
