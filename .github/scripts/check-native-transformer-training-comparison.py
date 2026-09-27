@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -80,9 +81,30 @@ class EvidenceError(ValueError):
     pass
 
 
+def load_preparation_evidence_module() -> Any:
+    path = pathlib.Path(__file__).resolve().with_name(
+        "native_training_preparation_evidence.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "rustgrad_native_training_preparation_evidence", path
+    )
+    require(spec is not None and spec.loader is not None, "preparation validator is absent")
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise EvidenceError(message)
+
+
+PREPARATION_EVIDENCE = load_preparation_evidence_module()
 
 
 def exact_int(value: Any, label: str, *, minimum: int = 0) -> int:
@@ -123,11 +145,10 @@ def load_json(path: pathlib.Path) -> tuple[dict[str, Any], bytes]:
 
 
 def duration_ns(value: Any, label: str) -> int:
-    require(type(value) is dict and set(value) == {"secs", "nanos"}, f"{label} duration differs")
-    secs = exact_int(value["secs"], f"{label}.secs")
-    nanos = exact_int(value["nanos"], f"{label}.nanos")
-    require(nanos < 1_000_000_000, f"{label}.nanos is out of range")
-    return secs * 1_000_000_000 + nanos
+    try:
+        return PREPARATION_EVIDENCE.duration_ns(value, label)
+    except PREPARATION_EVIDENCE.PreparationEvidenceError as error:
+        raise EvidenceError(str(error)) from error
 
 
 def parse_provenance(raw: bytes, expected_sha: str, binary_digest: str) -> dict[str, Any]:
@@ -370,7 +391,8 @@ def scoreboard_program(value: Any, label: str) -> dict[str, Any]:
 
 
 def validate_scoreboard(value: dict[str, Any]) -> dict[str, Any]:
-    require(exact_int(value.get("format_version"), "scoreboard format") == 24, "scoreboard format differs")
+    format_version = exact_int(value.get("format_version"), "scoreboard format")
+    require(format_version in (24, 25), "scoreboard format differs")
     require(exact_int(value.get("initial_replay_step"), "scoreboard initial replay") == 0, "scoreboard initial replay differs")
     require(exact_int(value.get("successful_replay_count"), "scoreboard replay count") == 3, "scoreboard replay count differs")
     require(exact_int(value.get("fallback_count"), "scoreboard fallback count") == 0, "scoreboard fallback is nonzero")
@@ -384,8 +406,18 @@ def validate_scoreboard(value: dict[str, Any]) -> dict[str, Any]:
     }
     for field, expected in cold_prepare.items():
         require(value.get(field) == expected and type(value.get(field)) is int, f"scoreboard cold {field} differs")
+    raw_programs = {
+        role: value.get(role)
+        for role in ("main", "accumulation", "partial_flush", "zero_grad", "evaluation")
+    }
+    try:
+        PREPARATION_EVIDENCE.validate_preparation_finalization(
+            value, format_version, raw_programs
+        )
+    except PREPARATION_EVIDENCE.PreparationEvidenceError as error:
+        raise EvidenceError(str(error)) from error
     programs = {
-        role: scoreboard_program(value.get(role), role)
+        role: scoreboard_program(raw_programs[role], role)
         for role in ("main", "accumulation", "partial_flush", "zero_grad")
     }
     require(value.get("evaluation") is None, "scoreboard unexpectedly includes evaluation")
@@ -401,6 +433,8 @@ def validate_scoreboard(value: dict[str, Any]) -> dict[str, Any]:
         for key, entry in traffic.items():
             exact_int(entry, f"scoreboard {field}.{key}")
     stable = copy.deepcopy(value)
+    stable.pop("format_version")
+    stable.pop("prepare_finalization", None)
     for field in (
         "compile_wall_time",
         "prepare_wall_time",

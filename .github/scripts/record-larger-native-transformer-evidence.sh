@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
 : "${GITHUB_SHA:?GITHUB_SHA must identify the measured revision}"
 : "${RUNNER_TEMP:?RUNNER_TEMP must provide isolated runner storage}"
 if [[ ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -130,11 +132,32 @@ python3 - \
   "$scoreboard_path" \
   "$actual_sha" \
   "$resume_bundle_path" \
-  "$module_checkpoint_path" <<'PY'
+  "$module_checkpoint_path" \
+  "$script_dir/native_training_preparation_evidence.py" <<'PY'
+import importlib.util
 import json
 import math
 import pathlib
 import sys
+
+def load_preparation_evidence_module(path):
+    spec = importlib.util.spec_from_file_location(
+        "rustgrad_native_training_preparation_evidence", path
+    )
+    if spec is None or spec.loader is None:
+        raise SystemExit("native preparation evidence validator is absent")
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+PREPARATION_EVIDENCE = load_preparation_evidence_module(
+    pathlib.Path(sys.argv[6]).resolve()
+)
 
 objective = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 scoreboard = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
@@ -150,20 +173,12 @@ def phase_sample_count(report):
     return wall_time.get("sample_count") if isinstance(wall_time, dict) else None
 
 def duration_nanos(value):
-    if not isinstance(value, dict) or set(value) != {"secs", "nanos"}:
+    try:
+        return PREPARATION_EVIDENCE.duration_ns(value, "larger Transformer")
+    except PREPARATION_EVIDENCE.PreparationEvidenceError:
         return None
-    secs = value.get("secs")
-    nanos = value.get("nanos")
-    if (
-        type(secs) is not int
-        or secs < 0
-        or type(nanos) is not int
-        or not 0 <= nanos < 1_000_000_000
-    ):
-        return None
-    return secs * 1_000_000_000 + nanos
 
-if objective.get("schema_version") != 6 or objective.get("git_sha") != sys.argv[3]:
+if objective.get("schema_version") != 7 or objective.get("git_sha") != sys.argv[3]:
     raise SystemExit("larger Transformer objective provenance is invalid")
 expected_workload = {
     "batch": 4,
@@ -287,8 +302,20 @@ if (
 native = objective.get("native")
 if not isinstance(native, dict):
     raise SystemExit("larger Transformer native evidence is absent")
-if scoreboard.get("format_version") != 24 or scoreboard.get("initial_replay_step") != 0:
+if scoreboard.get("format_version") != 25 or scoreboard.get("initial_replay_step") != 0:
     raise SystemExit("larger Transformer scoreboard identity is invalid")
+preparation_programs = {
+    role: scoreboard.get(role)
+    for role in ["main", "accumulation", "partial_flush", "zero_grad", "evaluation"]
+}
+if any(not isinstance(program, dict) for program in preparation_programs.values()):
+    raise SystemExit("larger Transformer preparation program inventory is invalid")
+try:
+    PREPARATION_EVIDENCE.validate_preparation_finalization(
+        scoreboard, 25, preparation_programs
+    )
+except PREPARATION_EVIDENCE.PreparationEvidenceError as error:
+    raise SystemExit(f"larger Transformer preparation evidence is invalid: {error}") from error
 compile_phases = scoreboard.get("compile_phases")
 compile_phase_names = {
     "compile_count",
@@ -501,7 +528,8 @@ preparation_totals = {
 }
 if (
     not isinstance(preparation, dict)
-    or set(preparation) != set(preparation_roles) | preparation_totals
+    or set(preparation)
+    != set(preparation_roles) | preparation_totals | {"prepare_finalization"}
 ):
     raise SystemExit("larger Transformer warm preparation evidence is invalid")
 phase_fields = {
@@ -550,6 +578,41 @@ if (
 whole_preparation = warm.get("preparation_wall_time_ns")
 if type(whole_preparation) is not int or whole_preparation <= 0:
     raise SystemExit("larger Transformer warm whole preparation timing is invalid")
+def benchmark_duration(nanos):
+    return {
+        "secs": nanos // 1_000_000_000,
+        "nanos": nanos % 1_000_000_000,
+    }
+
+warm_programs = {
+    role: {
+        "preparation_timing": {
+            "total": benchmark_duration(preparation[role]["total_wall_time_ns"])
+        }
+    }
+    for role in preparation_roles
+}
+warm_partition = {
+    "prepare_finalization": preparation["prepare_finalization"],
+    "prepare_wall_time": benchmark_duration(whole_preparation),
+    "prepare_runtime_overhead_wall_time": benchmark_duration(
+        preparation["runtime_overhead_wall_time_ns"]
+    ),
+    "prepare_parallel_module_overlap_wall_time": benchmark_duration(
+        preparation["module_overlap_wall_time_ns"]
+    ),
+    "prepare_parallel_render_overlap_wall_time": benchmark_duration(
+        preparation["render_overlap_wall_time_ns"]
+    ),
+}
+try:
+    PREPARATION_EVIDENCE.validate_preparation_finalization(
+        warm_partition, 25, warm_programs
+    )
+except PREPARATION_EVIDENCE.PreparationEvidenceError as error:
+    raise SystemExit(
+        f"larger Transformer warm preparation finalization is invalid: {error}"
+    ) from error
 reconstructed_preparation = (
     preparation["runtime_overhead_wall_time_ns"]
     + program_total
