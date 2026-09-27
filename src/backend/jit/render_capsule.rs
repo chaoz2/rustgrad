@@ -583,17 +583,25 @@ fn authenticates_rendered_payload(rendered: &RenderedC) -> bool {
 }
 
 fn authenticates_item_abi(item: &ScheduleItem, abi: &KernelAbi) -> bool {
+    // This is the ordinary capsule-hit conjunction: authenticate the lowered
+    // schedule bindings once, then derive and compare their exact native ABI.
+    // Cold rendering retains CpuJitBackend::validate_rendered_schedule_item.
+    if !item.outputs.is_single() || item.validate_input_bindings().is_err() {
+        return false;
+    }
     let dense_inputs = item
         .ordered_inputs()
         .iter()
-        .map(|binding| {
+        .enumerate()
+        .map(|(index, binding)| {
+            (binding.abi_index == index).then_some(())?;
+            let itemsize = binding.desc.dtype.itemsize();
+            let elements = binding.desc.bytes.checked_div(itemsize)?;
+            (elements.checked_mul(itemsize) == Some(binding.desc.bytes)).then_some(())?;
             Some(BufferAbi {
                 id: binding.desc.id,
                 dtype: binding.desc.dtype,
-                elements: binding
-                    .desc
-                    .bytes
-                    .checked_div(binding.desc.dtype.itemsize())?,
+                elements,
                 mutable: false,
             })
         })
@@ -638,7 +646,8 @@ fn authenticates_item_abi(item: &ScheduleItem, abi: &KernelAbi) -> bool {
         .map(|(_, pointer)| pointer)
         .collect::<Vec<_>>();
     pointer_order.push(KernelPointerAbi::Dense(dense_inputs.len() - 1));
-    abi.buffers == dense_inputs
+    abi.symbol_count == 0
+        && abi.buffers == dense_inputs
         && abi.quantized_buffers == quantized
         && abi.pointer_order == pointer_order
 }
@@ -945,9 +954,6 @@ fn authenticate_module(
                         entry.rendered.cache_key, item.cache_key
                     )
                 || validate_native_layout(item, layout).is_err()
-                || backend
-                    .validate_rendered_schedule_item(item, &entry.rendered)
-                    .is_err()
                 || !authenticates_item_abi(item, &entry.rendered.abi)
                 || !item_witness.authenticates(index, item, layout)
             {
@@ -1193,6 +1199,94 @@ pub(super) fn mutate_capsule_with_valid_checksum(
 mod tests {
     use super::*;
 
+    fn legacy_authenticates_item_abi(item: &ScheduleItem, abi: &KernelAbi) -> bool {
+        let dense_inputs = item
+            .ordered_inputs()
+            .iter()
+            .map(|binding| {
+                Some(BufferAbi {
+                    id: binding.desc.id,
+                    dtype: binding.desc.dtype,
+                    elements: binding
+                        .desc
+                        .bytes
+                        .checked_div(binding.desc.dtype.itemsize())?,
+                    mutable: false,
+                })
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(mut dense_inputs) = dense_inputs else {
+            return false;
+        };
+        let Ok(output_elements) = item.primary_output().shape.numel() else {
+            return false;
+        };
+        dense_inputs.push(BufferAbi {
+            id: item.primary_output().id,
+            dtype: item.primary_output().dtype,
+            elements: output_elements,
+            mutable: true,
+        });
+        let quantized = item
+            .ordered_quantized_inputs()
+            .iter()
+            .map(|binding| QuantizedBufferAbi {
+                id: binding.input_node.index() as u64,
+                desc: binding.desc.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut inputs =
+            item.ordered_inputs()
+                .iter()
+                .enumerate()
+                .map(|(ordinal, binding)| (binding.abi_index, KernelPointerAbi::Dense(ordinal)))
+                .chain(item.ordered_quantized_inputs().iter().enumerate().map(
+                    |(ordinal, binding)| (binding.abi_index, KernelPointerAbi::Quantized(ordinal)),
+                ))
+                .collect::<Vec<_>>();
+        inputs.sort_by_key(|(index, _)| *index);
+        let mut pointer_order = inputs
+            .into_iter()
+            .map(|(_, pointer)| pointer)
+            .collect::<Vec<_>>();
+        pointer_order.push(KernelPointerAbi::Dense(dense_inputs.len() - 1));
+        abi.buffers == dense_inputs
+            && abi.quantized_buffers == quantized
+            && abi.pointer_order == pointer_order
+    }
+
+    fn legacy_authenticates_ordinary_entry(
+        backend: &CpuJitBackend,
+        item: &ScheduleItem,
+        rendered: &RenderedC,
+    ) -> bool {
+        authenticates_rendered_payload(rendered)
+            && backend
+                .validate_rendered_schedule_item(item, rendered)
+                .is_ok()
+            && legacy_authenticates_item_abi(item, &rendered.abi)
+    }
+
+    fn fused_authenticates_ordinary_entry(item: &ScheduleItem, rendered: &RenderedC) -> bool {
+        authenticates_rendered_payload(rendered) && authenticates_item_abi(item, &rendered.abi)
+    }
+
+    fn assert_ordinary_authentication_parity(
+        backend: &CpuJitBackend,
+        label: &str,
+        item: &ScheduleItem,
+        rendered: &RenderedC,
+        expected: bool,
+    ) {
+        let legacy = legacy_authenticates_ordinary_entry(backend, item, rendered);
+        assert_eq!(legacy, expected, "legacy conjunction: {label}");
+        assert_eq!(
+            fused_authenticates_ordinary_entry(item, rendered),
+            legacy,
+            "fused authentication: {label}"
+        );
+    }
+
     fn legacy_recipe_bytes(
         backend: &CpuJitBackend,
         program_index: usize,
@@ -1233,6 +1327,197 @@ mod tests {
             write_output_initialization(&mut writer, group.output_initialization)?;
         }
         Some(writer.0)
+    }
+
+    #[test]
+    fn fused_ordinary_abi_authentication_matches_the_frozen_legacy_conjunction() {
+        let mut graph = crate::Graph::new();
+        let input = graph.input_dtype("ordinary_abi_input", [8], crate::DType::F32);
+        let output = graph.square(input).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let item = schedule.items[0].clone();
+        let layout = super::super::schedule_native_layout(&item).unwrap();
+        let backend = CpuJitBackend::new(crate::JitFallback::Error).vectorized(true);
+        let (_, rendered, _) = backend.render_schedule_kernel(&item, &layout).unwrap();
+        assert_ordinary_authentication_parity(&backend, "valid", &item, &rendered, true);
+
+        let mutations: [(&str, fn(&mut RenderedC)); 13] = [
+            ("empty source", |value| value.source.clear()),
+            ("ABI version", |value| {
+                value.abi.version = value.abi.version.saturating_add(1);
+            }),
+            ("symbol inventory", |value| value.abi.symbol_count = 1),
+            ("dense input id", |value| value.abi.buffers[0].id ^= 1),
+            ("dense input dtype", |value| {
+                value.abi.buffers[0].dtype = crate::DType::F64;
+            }),
+            ("dense input elements", |value| {
+                value.abi.buffers[0].elements = value.abi.buffers[0].elements.saturating_add(1);
+            }),
+            ("dense input mutability", |value| {
+                value.abi.buffers[0].mutable = true;
+            }),
+            ("output id", |value| {
+                value.abi.buffers.last_mut().unwrap().id ^= 1;
+            }),
+            ("output dtype", |value| {
+                value.abi.buffers.last_mut().unwrap().dtype = crate::DType::F64;
+            }),
+            ("output elements", |value| {
+                let output = value.abi.buffers.last_mut().unwrap();
+                output.elements = output.elements.saturating_add(1);
+            }),
+            ("output mutability", |value| {
+                value.abi.buffers.last_mut().unwrap().mutable = false;
+            }),
+            ("dense buffer order", |value| value.abi.buffers.reverse()),
+            ("pointer order", |value| value.abi.pointer_order.reverse()),
+        ];
+        for (label, mutate) in mutations {
+            let mut invalid = rendered.clone();
+            mutate(&mut invalid);
+            assert_ordinary_authentication_parity(&backend, label, &item, &invalid, false);
+        }
+
+        let mut binding_kernel_mismatch = item.clone();
+        binding_kernel_mismatch.input_bindings[0].desc.id ^= 1;
+        assert_ordinary_authentication_parity(
+            &backend,
+            "binding and kernel mismatch",
+            &binding_kernel_mismatch,
+            &rendered,
+            false,
+        );
+
+        let mut inconsistent_bytes = item.clone();
+        inconsistent_bytes.boundary = Some(crate::ScheduleBoundary::NonScalarUOpBridge);
+        inconsistent_bytes.input_bindings[0].desc.bytes = inconsistent_bytes.input_bindings[0]
+            .desc
+            .bytes
+            .saturating_add(1);
+        inconsistent_bytes.inputs[0] = inconsistent_bytes.input_bindings[0].desc.clone();
+        assert!(inconsistent_bytes.validate_input_bindings().is_ok());
+        assert_ordinary_authentication_parity(
+            &backend,
+            "non-divisible dense descriptor bytes",
+            &inconsistent_bytes,
+            &rendered,
+            false,
+        );
+
+        let mut invalid_abi_ordinal = item.clone();
+        invalid_abi_ordinal.input_bindings[0].abi_index = 1;
+        assert_ordinary_authentication_parity(
+            &backend,
+            "dense ABI ordinal",
+            &invalid_abi_ordinal,
+            &rendered,
+            false,
+        );
+
+        let mut multiple_outputs = item.clone();
+        let mut second_output = multiple_outputs.primary_output().clone();
+        second_output.id ^= u64::MAX;
+        multiple_outputs.outputs = crate::ScheduledOutputs::new(vec![
+            multiple_outputs.primary_output().clone(),
+            second_output,
+        ])
+        .unwrap();
+        assert_ordinary_authentication_parity(
+            &backend,
+            "multiple outputs",
+            &multiple_outputs,
+            &rendered,
+            false,
+        );
+    }
+
+    #[test]
+    fn fused_ordinary_abi_authentication_preserves_quantized_pointer_order() {
+        let mut graph = crate::Graph::new();
+        let input = graph.input_dtype("dense_abi_input", [8], crate::DType::F32);
+        let quantized = graph.input("quantized_abi_input", [1, 32]);
+        let output = graph.square(input).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let mut item = schedule.items[0].clone();
+        item.boundary = Some(crate::ScheduleBoundary::NonScalarUOpBridge);
+        item.quantized_input_bindings
+            .push(crate::QuantizedScheduleInputBinding {
+                input_node: quantized,
+                desc: crate::QuantizedBufferDesc {
+                    ggml_type: crate::GgmlType::Q4_0,
+                    logical_shape: crate::Shape::new([1, 32]),
+                    block_elements: 32,
+                    block_bytes: 18,
+                    bytes: 18,
+                    alignment: 1,
+                    identity: 7,
+                },
+                abi_index: 1,
+            });
+        assert!(item.validate_input_bindings().is_ok());
+        let output_elements = item.primary_output().shape.numel().unwrap();
+        let abi = KernelAbi {
+            version: ABI_VERSION,
+            buffers: vec![
+                BufferAbi {
+                    id: item.input_bindings[0].desc.id,
+                    dtype: item.input_bindings[0].desc.dtype,
+                    elements: 8,
+                    mutable: false,
+                },
+                BufferAbi {
+                    id: item.primary_output().id,
+                    dtype: item.primary_output().dtype,
+                    elements: output_elements,
+                    mutable: true,
+                },
+            ],
+            quantized_buffers: vec![QuantizedBufferAbi {
+                id: quantized.index() as u64,
+                desc: item.quantized_input_bindings[0].desc.clone(),
+            }],
+            pointer_order: vec![
+                KernelPointerAbi::Dense(0),
+                KernelPointerAbi::Quantized(0),
+                KernelPointerAbi::Dense(1),
+            ],
+            symbol_count: 0,
+        };
+        let rendered = RenderedC {
+            source: "void kernel(void) {}".into(),
+            source_map: BTreeMap::new(),
+            abi,
+            cache_key: "0123456789abcdef".into(),
+        };
+        let backend = CpuJitBackend::new(crate::JitFallback::Error);
+        assert_ordinary_authentication_parity(
+            &backend,
+            "valid quantized pointer order",
+            &item,
+            &rendered,
+            true,
+        );
+
+        let mut reordered = rendered.clone();
+        reordered.abi.pointer_order.swap(0, 1);
+        assert_ordinary_authentication_parity(
+            &backend,
+            "reordered quantized pointer",
+            &item,
+            &reordered,
+            false,
+        );
+
+        let mut wrong_descriptor = rendered.clone();
+        wrong_descriptor.abi.quantized_buffers[0].desc.identity ^= 1;
+        assert_ordinary_authentication_parity(
+            &backend,
+            "quantized descriptor",
+            &item,
+            &wrong_descriptor,
+            false,
+        );
     }
 
     #[test]
