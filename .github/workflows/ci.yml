@@ -22,6 +22,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: python3 .github/scripts/test-native-transformer-training-comparison.py
       - run: cargo fmt --check
       - run: cargo check --all-targets
       - run: cargo clippy --all-targets -- -D warnings

@@ -1,0 +1,169 @@
+name: Native Transformer Training Comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_sha:
+        description: Exact lowercase 40-character ancestor commit SHA
+        required: true
+        type: string
+      candidate_sha:
+        description: Exact reviewed lowercase 40-character candidate commit SHA
+        required: true
+        type: string
+
+concurrency:
+  group: native-transformer-training-comparison-${{ inputs.baseline_sha }}-${{ inputs.candidate_sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Same-runner native training comparison
+    runs-on: ubuntu-24.04
+    environment: native-transformer-scale-evidence
+    timeout-minutes: 75
+    env:
+      BASELINE_SHA: ${{ inputs.baseline_sha }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Validate requested revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "baseline_sha must be a lowercase full Git SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "candidate_sha must be a lowercase full Git SHA" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_SHA:-}" != "$CANDIDATE_SHA" ]]; then
+            echo "workflow dispatch revision does not match candidate_sha" >&2
+            exit 1
+          fi
+          if [[ "$BASELINE_SHA" == "$CANDIDATE_SHA" ]]; then
+            echo "baseline and candidate revisions must differ" >&2
+            exit 1
+          fi
+      - name: Check out exact candidate revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          path: candidate-source
+          persist-credentials: false
+      - name: Check out exact baseline revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.baseline_sha }}
+          fetch-depth: 1
+          path: baseline-source
+          persist-credentials: false
+      - name: Authenticate exact sources and ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C candidate-source rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(git -C baseline-source rev-parse HEAD)" = "$BASELINE_SHA"
+          git -C candidate-source merge-base --is-ancestor "$BASELINE_SHA" "$CANDIDATE_SHA"
+          test -z "$(git -C candidate-source status --short)"
+          test -z "$(git -C baseline-source status --short)"
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05
+        with:
+          toolchain: 1.89.0
+      - name: Validate comparison tooling fixtures
+        shell: bash
+        run: python3 candidate-source/.github/scripts/test-native-transformer-training-comparison.py
+      - name: Build both release executables before measurement
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_root="$RUNNER_TEMP/native-transformer-comparison-build"
+          mkdir -- "$build_root"
+          cargo build --locked --release \
+            --manifest-path baseline-source/Cargo.toml \
+            --target-dir "$build_root/baseline" \
+            --example compiled_transformer_train_resume
+          cargo build --locked --release \
+            --manifest-path candidate-source/Cargo.toml \
+            --target-dir "$build_root/candidate" \
+            --example compiled_transformer_train_resume
+          baseline_binary="$build_root/baseline/release/examples/compiled_transformer_train_resume"
+          candidate_binary="$build_root/candidate/release/examples/compiled_transformer_train_resume"
+          evidence_root="$GITHUB_WORKSPACE/native-transformer-training-comparison"
+          mkdir -- "$evidence_root"
+          python3 candidate-source/.github/scripts/write-native-transformer-training-build-manifest.py \
+            --baseline-sha "$BASELINE_SHA" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --baseline-binary "$baseline_binary" \
+            --candidate-binary "$candidate_binary" \
+            --output "$evidence_root/build-manifest.json"
+      - name: Record fixed ABBA trials with isolated native caches
+        shell: bash
+        run: |
+          set -uo pipefail
+          build_root="$RUNNER_TEMP/native-transformer-comparison-build"
+          evidence_root="$GITHUB_WORKSPACE/native-transformer-training-comparison"
+          recorder="$GITHUB_WORKSPACE/candidate-source/.github/scripts/record-native-transformer-release-scoreboard.sh"
+          measurement_failed=0
+
+          record_trial() {
+            local ordinal="$1"
+            local role="$2"
+            local source_sha source_dir binary output
+            if [[ "$role" == baseline ]]; then
+              source_sha="$BASELINE_SHA"
+              source_dir="$GITHUB_WORKSPACE/baseline-source"
+              binary="$build_root/baseline/release/examples/compiled_transformer_train_resume"
+            else
+              source_sha="$CANDIDATE_SHA"
+              source_dir="$GITHUB_WORKSPACE/candidate-source"
+              binary="$build_root/candidate/release/examples/compiled_transformer_train_resume"
+            fi
+            output="$evidence_root/trial-${ordinal}-${role}"
+            (
+              cd "$source_dir"
+              RUSTGRAD_NATIVE_SCOREBOARD_MEASURED_SHA="$source_sha" \
+              RUSTGRAD_NATIVE_SCOREBOARD_OUTPUT_DIR="$output" \
+              RUSTGRAD_NATIVE_SCOREBOARD_BINARY="$binary" \
+              bash "$recorder"
+            ) || measurement_failed=1
+          }
+
+          record_trial 01 baseline
+          record_trial 02 candidate
+          record_trial 03 candidate
+          record_trial 04 baseline
+          printf '%s\n' "$measurement_failed" > "$evidence_root/measurement-failed.txt"
+          exit "$measurement_failed"
+      - name: Validate and compare immutable evidence
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          build_root="$RUNNER_TEMP/native-transformer-comparison-build"
+          evidence_root="$GITHUB_WORKSPACE/native-transformer-training-comparison"
+          python3 candidate-source/.github/scripts/check-native-transformer-training-comparison.py \
+            --root "$evidence_root" \
+            --baseline-sha "$BASELINE_SHA" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --baseline-binary "$build_root/baseline/release/examples/compiled_transformer_train_resume" \
+            --candidate-binary "$build_root/candidate/release/examples/compiled_transformer_train_resume" \
+            --build-manifest "$evidence_root/build-manifest.json" \
+            --output "$evidence_root/comparison.json"
+      - name: Upload raw trials and comparison manifest
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-transformer-training-comparison-${{ inputs.baseline_sha }}-${{ inputs.candidate_sha }}
+          path: native-transformer-training-comparison/
+          if-no-files-found: error
+          retention-days: 30
