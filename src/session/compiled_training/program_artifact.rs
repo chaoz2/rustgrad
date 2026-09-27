@@ -834,12 +834,9 @@ impl ProgramCaptures {
     fn decode_phase(phase: &PhaseWire) -> Result<Arc<AuthenticatedRecurrentFrontier>> {
         #[cfg(test)]
         update_decode_counts(|counts| counts.mixed_captures += 1);
-        let capture =
-            Arc::new(CapturedMixedSchedule::from_bytes(&phase.capture).map_err(replay_error)?);
-        let frontier = Arc::new(
-            AuthenticatedRecurrentFrontier::authenticate(capture.clone()).map_err(replay_error)?,
-        );
-        Ok(frontier)
+        AuthenticatedRecurrentFrontier::from_bytes(&phase.capture)
+            .map(Arc::new)
+            .map_err(replay_error)
     }
 
     fn decode_evaluation(evaluation: &EvaluationWire) -> Result<Arc<CapturedSchedule>> {

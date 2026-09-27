@@ -11100,6 +11100,8 @@ fn compiled_resume_bundle_seals_one_decode_and_training_topology_for_restore() {
     let after_load = program_artifact::portable_resume_decode_counts();
     let after_load_frontiers = crate::engine::mixed_capture::prepared_replay_validation_counts();
     assert_eq!(after_load_frontiers.recurrent_frontier_authentications, 4);
+    assert_eq!(after_load_frontiers.mixed_capture_validations, 4);
+    assert_eq!(after_load_frontiers.identity_serializations, 4);
     assert_eq!(after_load.program_wire - before.program_wire, 1);
     assert_eq!(after_load.mixed_captures - before.mixed_captures, 4);
     assert_eq!(

@@ -4625,6 +4625,48 @@ mod tests {
     }
 
     #[test]
+    fn decoded_frontier_retains_admission_and_immutable_capture_ownership() {
+        let bytes = captured_effect().to_bytes().unwrap();
+        reset_prepared_replay_validation_counts();
+        let admitted = AuthenticatedRecurrentFrontier::from_bytes(&bytes).unwrap();
+        let counts = prepared_replay_validation_counts();
+        assert_eq!(counts.mixed_capture_validations, 1);
+        assert_eq!(counts.schedule_rekeys, 1);
+        assert_eq!(counts.identity_serializations, 1);
+        assert_eq!(counts.recurrent_frontier_authentications, 1);
+        assert_eq!(counts.recurrent_frontier_plans, 1);
+
+        let reference = AuthenticatedRecurrentFrontier::authenticate(Arc::new(
+            CapturedMixedSchedule::from_bytes(&bytes).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(admitted.capture_identity(), reference.capture_identity());
+        assert_eq!(admitted.initial_cursor(), reference.initial_cursor());
+        assert_eq!(admitted.capture().to_bytes().unwrap(), bytes);
+
+        // A caller can modify its own copy, never the retained proof's capture.
+        let mut detached = admitted.capture_arc();
+        Arc::make_mut(&mut detached).schedule.items[0].cache_key ^= 1;
+        assert!(AuthenticatedRecurrentFrontier::authenticate(detached).is_err());
+        assert_eq!(admitted.capture().to_bytes().unwrap(), bytes);
+
+        let foreign =
+            AuthenticatedRecurrentFrontier::from_bytes(&captured_two_effects().to_bytes().unwrap())
+                .unwrap();
+        assert!(foreign.validate_cursor(&admitted.initial_cursor()).is_err());
+
+        let mut corrupt = bytes.clone();
+        corrupt[HEADER_LEN] ^= 1;
+        for invalid in [&bytes[..8], corrupt.as_slice()] {
+            assert_eq!(
+                AuthenticatedRecurrentFrontier::from_bytes(invalid).err(),
+                CapturedMixedSchedule::from_bytes(invalid).err()
+            );
+            assert!(AuthenticatedRecurrentFrontier::from_bytes(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn rgsm_rejects_unserialized_symbolic_and_specialization_metadata() {
         let base = captured_effect();
         let mixed = Schedule {
@@ -4931,6 +4973,20 @@ mod tests {
                     .collect::<Vec<_>>(),
                 opaque
             );
+            reset_prepared_replay_validation_counts();
+            let frontier = AuthenticatedRecurrentFrontier::from_bytes(&writer.out).unwrap();
+            let counts = prepared_replay_validation_counts();
+            assert_eq!(counts.mixed_capture_validations, 2);
+            assert_eq!(counts.identity_serializations, 1);
+            assert_eq!(frontier.capture_identity(), decoded.schedule.identity);
+            assert_eq!(
+                frontier.capture().to_bytes().unwrap(),
+                decoded.to_bytes().unwrap()
+            );
+            assert_eq!(
+                frontier.initial_cursor(),
+                decoded.initial_recurrent_cursor().unwrap()
+            );
         }
     }
 
@@ -4969,10 +5025,14 @@ mod tests {
             writer.u32(sum).unwrap();
             reset_prepared_replay_validation_counts();
             let error = CapturedMixedSchedule::from_bytes(&writer.out).unwrap_err();
+            let frontier_error = AuthenticatedRecurrentFrontier::from_bytes(&writer.out)
+                .err()
+                .unwrap();
+            assert_eq!(frontier_error, error);
             assert!(matches!(error, ReplayError::Corrupt(message)
                 if message == if bad_key { "RGSM item cache identity" } else { "RGSM identity" }));
             let counts = prepared_replay_validation_counts();
-            assert_eq!(counts.mixed_capture_validations, 1);
+            assert_eq!(counts.mixed_capture_validations, 2);
             assert_eq!(counts.identity_serializations, 0);
         }
     }

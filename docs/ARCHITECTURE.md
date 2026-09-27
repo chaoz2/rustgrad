@@ -762,8 +762,13 @@ interpreter replay injects caller-owned snapshots and performs the same single
 pool-wide `EffectRuntime` commit. Current RGSM decode owns its schedule through
 one structural/key admission, envelope identity verification, and canonical
 identity assignment; it does not clone or revalidate an unchanged schedule.
-Legacy versions retain post-rekey validation. Public replay and recurrent
-frontier admission still validate their caller-supplied captures independently.
+Legacy versions retain post-rekey validation. Compiled program loading retains
+that admission directly in an immutable recurrent frontier: a private byte
+constructor owns the validated capture and its canonical identity without an
+intervening caller-mutable value. It still derives the recurrent state schema
+before publication. Public replay and recurrent frontier admission from
+caller-supplied captures continue to validate independently; no unchecked
+capture constructor is exposed across the subsystem boundary.
 Strict native CPU replay preflights the whole
 artifact, runs its supported pure prefix through the existing native JIT cache,
 and commits only detached outputs through that same transaction. Its stable
