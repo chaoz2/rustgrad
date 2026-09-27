@@ -53,14 +53,12 @@ impl AuthenticatedRecurrentFrontier {
         }
     }
 
-    pub(crate) fn resume_cursor(
-        &self,
-        frontier: impl IntoIterator<Item = BufferState>,
-    ) -> Result<MixedReplayCursor, ReplayError> {
-        let cursor = MixedReplayCursor {
-            capture_identity: self.capture_identity,
-            frontier: canonical_frontier(frontier)?,
-        };
+    pub(super) fn validate_cursor(&self, cursor: &MixedReplayCursor) -> Result<(), ReplayError> {
+        if cursor.capture_identity != self.capture_identity {
+            return Err(ReplayError::Descriptor(
+                "recurrent cursor belongs to a different mixed capture".into(),
+            ));
+        }
         if cursor.frontier.len() != self.initial_frontier.len() {
             return Err(ReplayError::Descriptor(
                 "recurrent cursor state frontier is incomplete".into(),
@@ -78,7 +76,66 @@ impl AuthenticatedRecurrentFrontier {
                 ));
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn resume_cursor(
+        &self,
+        frontier: impl IntoIterator<Item = BufferState>,
+    ) -> Result<MixedReplayCursor, ReplayError> {
+        let cursor = MixedReplayCursor {
+            capture_identity: self.capture_identity,
+            frontier: canonical_frontier(frontier)?,
+        };
+        self.validate_cursor(&cursor)?;
         Ok(cursor)
+    }
+
+    pub(crate) fn preflight_native(
+        &self,
+        runtime: &crate::EffectRuntime,
+        cursor: &MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        vectorized: bool,
+    ) -> Result<RecurrentNativePreparation, ReplayError> {
+        self.preflight_native_impl(runtime, cursor, provided, vectorized, false)
+    }
+
+    pub(crate) fn preflight_native_retaining_unchanged(
+        &self,
+        runtime: &crate::EffectRuntime,
+        cursor: &MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        vectorized: bool,
+    ) -> Result<RecurrentNativePreparation, ReplayError> {
+        self.preflight_native_impl(runtime, cursor, provided, vectorized, true)
+    }
+
+    fn preflight_native_impl(
+        &self,
+        runtime: &crate::EffectRuntime,
+        cursor: &MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        vectorized: bool,
+        retain_unchanged: bool,
+    ) -> Result<RecurrentNativePreparation, ReplayError> {
+        self.validate_cursor(cursor)?;
+        let capture = self.capture();
+        let starts = recurrent_rebase_starts(capture, cursor)?;
+        let replacements = PreparedRecurrentReplacementPlan::from_authenticated(self)?;
+        let candidates = recurrent_preflight_candidates(runtime, cursor)?;
+        let bound = BoundMixedCapture::bind_authenticated(self, &candidates, starts, provided)?;
+        capture.finish_recurrent_native_preflight(
+            bound.inputs,
+            replacements,
+            || self.native_replay_trace(vectorized),
+            retain_unchanged,
+        )
+    }
+
+    fn native_replay_trace(&self, vectorized: bool) -> Result<NativeMixedReplayTrace, ReplayError> {
+        self.capture
+            .native_replay_trace_from_identity(self.capture_identity, vectorized)
     }
 
     #[cfg(test)]

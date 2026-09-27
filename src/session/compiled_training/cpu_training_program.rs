@@ -52,8 +52,8 @@ impl CpuCompiledTrainingProgram {
             );
         }
         let mut preparation = self
-            .capture
-            .preflight_recurrent_native(&self.runtime, &self.cursor, &provided, vectorized)
+            .recurrent_frontier
+            .preflight_native(&self.runtime, &self.cursor, &provided, vectorized)
             .map_err(replay_error)?;
         let commit_only = self.phase_outputs.selected_requested(
             &self.capture.schedule.requested,
@@ -373,8 +373,8 @@ impl CpuCompiledTrainingProgram {
             .transpose()?;
         let prepared = self.prepare_auxiliary_replay(transition, learning_rate)?;
         let preparation = transition
-            .capture
-            .preflight_recurrent_native(
+            .recurrent_frontier
+            .preflight_native(
                 &self.runtime,
                 prepared.cursor.cursor(),
                 &prepared.provided,
@@ -401,8 +401,8 @@ impl CpuCompiledTrainingProgram {
         )?;
         let mut preparation = transition
             .phase()
-            .capture
-            .preflight_recurrent_native_retaining_unchanged(
+            .recurrent_frontier
+            .preflight_native_retaining_unchanged(
                 &self.runtime,
                 prepared.cursor.cursor(),
                 &prepared.provided,

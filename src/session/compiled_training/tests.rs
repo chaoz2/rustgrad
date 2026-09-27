@@ -3204,6 +3204,72 @@ fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
             .all(|input| input.name != LEARNING_RATE_INPUT),
         "the accumulation-only graph must not retain external learning-rate work"
     );
+    let retention_cpu = plan.prepare_cpu().unwrap();
+    let retention_replay = retention_cpu
+        .inner
+        .prepare_phase_replay(
+            &accumulation_transition.phase().cursor_projection,
+            zero_inputs(&retention_cpu.inner.inputs).unwrap(),
+        )
+        .unwrap();
+    let raw_retention = accumulation_transition
+        .phase()
+        .capture
+        .preflight_recurrent_native_retaining_unchanged(
+            &retention_cpu.inner.runtime,
+            retention_replay.cursor.cursor(),
+            &retention_replay.provided,
+            false,
+        )
+        .unwrap();
+    let authenticated_retention = accumulation_transition
+        .phase()
+        .recurrent_frontier
+        .preflight_native_retaining_unchanged(
+            &retention_cpu.inner.runtime,
+            retention_replay.cursor.cursor(),
+            &retention_replay.provided,
+            false,
+        )
+        .unwrap();
+    assert!(!raw_retention.retained_recurrent_states().is_empty());
+    assert_eq!(
+        authenticated_retention.retained_recurrent_states(),
+        raw_retention.retained_recurrent_states()
+    );
+    let main_inputs = zero_inputs(&retention_cpu.inner.inputs).unwrap();
+    let mut foreign_cursor = retention_cpu.inner.cursor.clone();
+    foreign_cursor.capture_identity ^= u64::MAX;
+    let mut incomplete_cursor = retention_cpu.inner.cursor.clone();
+    incomplete_cursor.frontier.pop();
+    let mut reordered_cursor = retention_cpu.inner.cursor.clone();
+    assert!(reordered_cursor.frontier.len() > 1);
+    reordered_cursor.frontier.swap(0, 1);
+    for (case, malformed) in [
+        ("foreign", foreign_cursor),
+        ("incomplete", incomplete_cursor),
+        ("reordered", reordered_cursor),
+    ] {
+        let raw_error = match retention_cpu.inner.capture.preflight_recurrent_native(
+            &retention_cpu.inner.runtime,
+            &malformed,
+            &main_inputs,
+            false,
+        ) {
+            Ok(_) => panic!("raw native preflight accepted the {case} cursor"),
+            Err(error) => error,
+        };
+        let authenticated_error = match retention_cpu.inner.recurrent_frontier.preflight_native(
+            &retention_cpu.inner.runtime,
+            &malformed,
+            &main_inputs,
+            false,
+        ) {
+            Ok(_) => panic!("authenticated native preflight accepted the {case} cursor"),
+            Err(error) => error,
+        };
+        assert_eq!(authenticated_error, raw_error, "{case} cursor error");
+    }
     let reset_transition = plan.zero_grad.as_ref().unwrap();
     assert_eq!(
         reset_transition.phase().state_buffers.len(),
@@ -11092,12 +11158,18 @@ fn compiled_resume_bundle_seals_one_decode_and_training_topology_for_restore() {
     let mut independent = independently_restored
         .prepare(&NativeCpuSessionTarget::new(&executor))
         .unwrap();
+    let native_preparation_counts =
+        crate::engine::mixed_capture::prepared_replay_validation_counts();
     assert_eq!(
-        crate::engine::mixed_capture::prepared_replay_validation_counts()
-            .recurrent_output_projection_builds,
-        6,
+        native_preparation_counts.recurrent_output_projection_builds, 6,
         "restored N=3 main/accumulation schemas plus recurrent auxiliary roles must seal once"
     );
+    assert_eq!(native_preparation_counts.mixed_capture_validations, 0);
+    assert_eq!(native_preparation_counts.schedule_rekeys, 0);
+    assert_eq!(native_preparation_counts.identity_serializations, 0);
+    assert_eq!(native_preparation_counts.native_trace_serializations, 4);
+    assert_eq!(native_preparation_counts.recurrent_frontier_plans, 0);
+    assert_eq!(native_preparation_counts.recurrent_bank_layouts, 4);
     let preparation = independent.native_cpu_preparation_report();
     assert_eq!(preparation.main().capture_identity(), inspection.main().0);
     assert_eq!(preparation.main().execution_plan(), inspection.main().1);
