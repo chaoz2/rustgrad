@@ -7,6 +7,7 @@
 mod compile_phase;
 mod compiler_evidence;
 mod inspection;
+mod preparation_phase;
 mod program_report;
 mod report;
 mod step_phases;
@@ -28,6 +29,14 @@ pub use inspection::{
     CompiledAdamWInspection, CompiledTrainingCompileObservation,
     CompiledTrainingCompilePhaseObservation, CompiledTrainingInspection,
     CompiledTrainingRecurrentCaptureObservation, NativeTrainingPreparationTiming,
+};
+pub use preparation_phase::{
+    NativeTrainingPreparationFinalizationReport, NativeTrainingProgramFinalizationReport,
+};
+#[cfg(test)]
+use preparation_phase::{
+    move_accumulation_finalization_to_evaluation, set_zero_stage_finalization_partition,
+    zero_preparation_finalization,
 };
 pub use program_report::NativeTrainingProgramReport;
 use report::CheckpointReport;
@@ -71,7 +80,8 @@ const NATIVE_TRAINING_REPORT_FORMAT_V20: u32 = 20;
 const NATIVE_TRAINING_REPORT_FORMAT_V21: u32 = 21;
 const NATIVE_TRAINING_REPORT_FORMAT_V22: u32 = 22;
 const NATIVE_TRAINING_REPORT_FORMAT_V23: u32 = 23;
-pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 24;
+const NATIVE_TRAINING_REPORT_FORMAT_V24: u32 = 24;
+pub const NATIVE_TRAINING_REPORT_FORMAT_VERSION: u32 = 25;
 const MAX_REPLAY_SAMPLES: usize = 10_000;
 
 #[derive(Clone, Copy, Debug)]
@@ -95,6 +105,7 @@ pub struct NativeTrainingScoreboard {
     compile_phases: NativeTrainingCompilePhaseReport,
     prepare_wall_time: Duration,
     prepare_runtime_overhead_wall_time: Duration,
+    prepare_finalization: NativeTrainingPreparationFinalizationReport,
     prepare_parallel_module_overlap_wall_time: Duration,
     prepare_parallel_render_overlap_wall_time: Duration,
     prepare_max_parallel_render_job_count: u64,
@@ -269,11 +280,16 @@ impl NativeTrainingScoreboard {
         let prepare_runtime_overhead_wall_time = prepare_wall_time
             .checked_sub(effective_program_prepare_wall_time)
             .ok_or_else(|| invalid("native program preparation exceeds whole prepare time"))?;
+        let prepare_finalization = NativeTrainingPreparationFinalizationReport::from_preparation(
+            preparation,
+            prepare_wall_time,
+        )?;
         Ok(Self {
             compile_wall_time,
             compile_phases,
             prepare_wall_time,
             prepare_runtime_overhead_wall_time,
+            prepare_finalization,
             prepare_parallel_module_overlap_wall_time,
             prepare_parallel_render_overlap_wall_time,
             prepare_max_parallel_render_job_count,
@@ -567,6 +583,7 @@ impl NativeTrainingScoreboard {
             prepare_runtime_overhead_wall_time: Some(BenchmarkDuration::from_duration(
                 self.prepare_runtime_overhead_wall_time,
             )),
+            prepare_finalization: Some(self.prepare_finalization.clone()),
             prepare_parallel_module_overlap_wall_time: Some(BenchmarkDuration::from_duration(
                 self.prepare_parallel_module_overlap_wall_time,
             )),

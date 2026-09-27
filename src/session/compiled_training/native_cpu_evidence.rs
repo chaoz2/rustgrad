@@ -853,6 +853,7 @@ pub struct NativeCpuCompiledTrainingPreparationReport {
     pub(super) program_pair_overlaps: Vec<NativeCpuProgramPairOverlap>,
     pub(super) translation_units: Vec<NativeCpuTranslationUnitEvidence>,
     pub(super) render_capsule_diagnostics: Vec<NativeCpuRenderCapsuleDiagnostic>,
+    pub(super) finalization_phases: NativeCpuPreparationFinalizationPhases,
 }
 
 impl NativeCpuCompiledTrainingPreparationReport {
@@ -861,7 +862,14 @@ impl NativeCpuCompiledTrainingPreparationReport {
         reports: NativeCpuTrainingPrograms<NativeCpuProgramPreparationReport>,
         recurrent_state: (usize, usize),
         compilation: crate::backend::NativeScheduleCompilationBatch,
+        finalization: NativeCpuPreparationFinalizationObservation,
     ) -> Result<Self> {
+        let finalization_phases = NativeCpuPreparationFinalizationPhases::from_observation(
+            finalization,
+            &reports,
+            compilation.parallel_work_overlap_wall_time,
+            compilation.parallel_render_overlap_wall_time,
+        )?;
         let NativeCpuTrainingPrograms {
             main,
             accumulation,
@@ -912,6 +920,7 @@ impl NativeCpuCompiledTrainingPreparationReport {
                 .map(NativeCpuTranslationUnitEvidence::from_native)
                 .collect(),
             render_capsule_diagnostics,
+            finalization_phases,
         })
     }
 
@@ -1013,6 +1022,12 @@ impl NativeCpuCompiledTrainingPreparationReport {
 
     pub(crate) fn translation_units(&self) -> &[NativeCpuTranslationUnitEvidence] {
         &self.translation_units
+    }
+
+    /// Instrumented host-finalization stages outside the existing per-program
+    /// layout/render/compiler partitions.
+    pub const fn finalization_phases(&self) -> &NativeCpuPreparationFinalizationPhases {
+        &self.finalization_phases
     }
 }
 

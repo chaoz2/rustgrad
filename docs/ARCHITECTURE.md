@@ -1398,19 +1398,30 @@ times. Wall times do not participate in identity.
 `CompiledAdamWPlan::inspection` exposes immutable execution-plan summaries for
 the main and optional accumulation/flush/zero-grad/evaluation programs plus
 checked logical recurrent state bytes without preparing a target or exposing a
-capture. The separate `NativeTrainingScoreboard` v24 validates strict-native
+capture. The separate `NativeTrainingScoreboard` v25 validates strict-native
 preparation and successful training-step reports for internal consistency,
 then emits bounded versioned JSON. This JSON is unsigned; protected-CI artifact
 metadata and the exact commit establish its provenance.
 
 | Evidence | Meaning |
 |---|---|
-| Preparation phases | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions, including capsule hit/miss/local-render counts and bounded render concurrency. |
+| Preparation phases | Exact layout, render, compiler-process, module-load, overlap, and residual-host partitions, including capsule hit/miss/local-render counts and bounded render concurrency. V25 adds one checked instrumented preparation prefix with bootstrap, role-aligned pre-layout admission and workspace construction, recurrent finalization for recurrent roles, report-input assembly, and explicit unattributed time; the outer caller remainder remains separate. |
 | Compiler work | Combined/object/link inventories, cumulative versus effective wall time, bounded per-program process intervals/permit waits, and build-plan-aligned translation-unit identity/count/source-byte records. Equal unit identities identify link-compatible generated content; no object reuse occurs. The derived last-finishing process identifies any post-main auxiliary tail without claiming a speedup. |
 | Module reuse | Referenced modules, the unique/shared-prefix entry partition, and exact overlap for every ordered earlier-program/later-program pair, split into contiguous prefix and additional scattered target entries/source bytes. This is evidence for future reuse, not object reuse today. |
 | Execution | Logical schedule/cache inventory, physical rendered/executed entries, actual module-dispatch calls, and mutually exclusive reasons each sealed dispatch segment ends. |
 | Replay traffic | Owned external imports, borrowed/retained/replaced recurrent bytes, and logical CPU egress materialization count/bytes. CPU egress is not a device transfer. |
 | Timing | Caller-observed compile, prepare, and checkpoint time; a checked backend-neutral objective/forward, autograd, optimizer-lowering, per-program capture, and wrapper-residual compile partition; nested recurrent captures further partition alias previews, final scheduling, pure capture/state binding, effect assembly/mixed sealing, authentication, optional auxiliary cursor projection, and residual time. Bounded first/steady replay, executor/recurrent-overhead, and native-dispatcher/executor-host partitions remain separate. No threshold or speedup is claimed. |
+
+The V25 instrumented preparation prefix starts before CPU bootstrap and stops
+before final report and session construction. Effective existing program time,
+bootstrap, per-role stages, report-input assembly, and explicit unattributed
+time partition that prefix. The outer remainder completes caller-observed
+preparation and includes report closing, runtime/session construction, and
+owned-module validation and teardown; it is not merely caller timer overhead.
+The legacy overhead remains that outer remainder plus the prefix's non-program
+stages. Maintained larger-training evidence exports the same validated
+partition for warm bundle preparation; artifact decode and owner restoration
+occur before preparation and are excluded.
 
 The executor-host remainder includes workspace, binding, input/output, and any
 conservative per-entry execution outside sealed dispatcher segments. It is not
@@ -1423,7 +1434,7 @@ themselves add dispatch segments or reached-module evidence.
 
 ##### Replay phases and wire versions
 
-V1-v23 JSON remains readable. The current wire additions are:
+V1-v24 JSON remains readable. The current wire additions are:
 
 | Version | Added contract |
 |---|---|
@@ -1439,8 +1450,9 @@ V1-v23 JSON remains readable. The current wire additions are:
 | V22 | Exact render-capsule hit, miss, and local-render job counts. V1-v21 reports omit this evidence. |
 | V23 | One compile plus typed objective/forward, autograd, optimizer/update lowering, main/optional accumulation/flush/zero-grad/evaluation capture timings and inventories; checked phases plus residual equal caller-observed compile wall time. V1-v22 reports omit this evidence. |
 | V24 | Main, accumulation, partial-flush, and zero-grad capture phases add a checked disjoint recurrent-capture timing partition, exact preview-pass counts, recurrent-state counts cross-authenticated against independently retained per-program inventory, and role-authenticated cursor-projection presence. Evaluation remains aggregate and has no recurrent inventory. V23 reports retain compile phases without these fields. |
+| V25 | Adds one checked instrumented preparation prefix: effective existing program preparation plus bootstrap, role-aligned pre-layout admission and workspace construction, recurrent finalization for main/accumulation/partial-flush/zero-grad but not evaluation, report-input assembly, and explicit unattributed time. A separate outer-remainder duration completes caller-observed preparation; the legacy overhead remains the exact sum of that remainder and the prefix's non-program intervals. V1-v24 reports omit this evidence. |
 
-V24 is emitted for raw and classified recording. Classified steps use only
+V25 is emitted for raw and classified recording. Classified steps use only
 `did_update`; the first replay stays separate, and warm accumulation-only and
 optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
 classification. A scoreboard rejects mixed recording modes without consuming a

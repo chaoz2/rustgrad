@@ -7,6 +7,8 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         inner: CpuCompiledAdamW,
         executor: &'a CapturedReplayExecutor,
         vectorized: bool,
+        runtime_started: Instant,
+        bootstrap_wall_time: Duration,
     ) -> Result<Self> {
         let external_learning_rate = matches!(
             &inner.contract.learning_rate,
@@ -252,6 +254,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 ));
             }
         };
+        let assembly_started = Instant::now();
         let (recurrent_state_count, recurrent_state_bytes) = checked_recurrent_state_extent(
             inner
                 .inner
@@ -264,23 +267,56 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             report: main_report,
             replay: main_replay,
             commit_only_projection: main_commit_only_projection,
+            finalization_phases: main_finalization_phases,
         } = main;
-        let (accumulation_report, accumulation_replay, accumulation_commit_only_projection) =
-            match accumulation {
+        let (
+            accumulation_report,
+            accumulation_replay,
+            accumulation_commit_only_projection,
+            accumulation_finalization_phases,
+        ) = match accumulation {
+            Some(prepared) => (
+                Some(prepared.report),
+                Some(prepared.replay),
+                Some(prepared.commit_only_projection),
+                Some(prepared.finalization_phases),
+            ),
+            None => (None, None, None, None),
+        };
+        let (partial_flush_report, partial_flush_replay, partial_flush_finalization_phases) =
+            match partial_flush {
                 Some(prepared) => (
                     Some(prepared.report),
                     Some(prepared.replay),
-                    Some(prepared.commit_only_projection),
+                    Some(prepared.finalization_phases),
                 ),
                 None => (None, None, None),
             };
-        let (partial_flush_report, partial_flush_replay) = partial_flush
-            .map(|prepared| (prepared.report, prepared.replay))
-            .unzip();
-        let (zero_grad_report, zero_grad_replay) = zero_grad
-            .map(|prepared| (prepared.report, prepared.replay))
-            .unzip();
+        let (zero_grad_report, zero_grad_replay, zero_grad_finalization_phases) = match zero_grad {
+            Some(prepared) => (
+                Some(prepared.report),
+                Some(prepared.replay),
+                Some(prepared.finalization_phases),
+            ),
+            None => (None, None, None),
+        };
         let evaluation_report = evaluation.as_ref().map(|prepared| prepared.report.clone());
+        let evaluation_finalization_phases = evaluation
+            .as_ref()
+            .map(|prepared| prepared.finalization_phases);
+        let assembly_wall_time = assembly_started.elapsed();
+        let finalization = NativeCpuPreparationFinalizationObservation {
+            instrumented_wall_time: runtime_started.elapsed(),
+            bootstrap_wall_time,
+            programs: NativeCpuTrainingPrograms {
+                main: main_finalization_phases,
+                accumulation: accumulation_finalization_phases,
+                partial_flush: partial_flush_finalization_phases,
+                zero_grad: zero_grad_finalization_phases,
+                evaluation: evaluation_finalization_phases,
+            },
+            report_input_assembly_wall_time: assembly_wall_time,
+        };
         let preparation = NativeCpuCompiledTrainingPreparationReport::from_compilation(
             &roles,
             NativeCpuTrainingPrograms {
@@ -292,6 +328,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             },
             (recurrent_state_count, recurrent_state_bytes),
             compilation,
+            finalization,
         )?;
         Ok(Self {
             inner,

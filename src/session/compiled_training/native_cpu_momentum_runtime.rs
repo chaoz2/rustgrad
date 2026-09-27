@@ -20,6 +20,8 @@ impl<'a> NativeCpuCompiledMomentumSgd<'a> {
         inner: CpuCompiledMomentumSgd,
         executor: &'a CapturedReplayExecutor,
         vectorized: bool,
+        runtime_started: Instant,
+        bootstrap_wall_time: Duration,
     ) -> Result<Self> {
         let (mut main_preparation, main_commit_only_projection, main_residual) =
             inner.inner.preflight_native(vectorized, true)?;
@@ -60,12 +62,14 @@ impl<'a> NativeCpuCompiledMomentumSgd<'a> {
             report: main_report,
             replay: main_replay,
             commit_only_projection,
+            finalization_phases: main_finalization_phases,
         } = inner.inner.finish_native(
             main_preparation,
             main_commit_only_projection,
             main_plan,
             main_residual,
         )?;
+        let assembly_started = Instant::now();
         let main_commit_only_projection = commit_only_projection;
         let (recurrent_state_count, recurrent_state_bytes) = checked_recurrent_state_extent(
             inner
@@ -75,6 +79,19 @@ impl<'a> NativeCpuCompiledMomentumSgd<'a> {
                 .iter()
                 .map(|state| state.bytes),
         )?;
+        let assembly_wall_time = assembly_started.elapsed();
+        let finalization = NativeCpuPreparationFinalizationObservation {
+            instrumented_wall_time: runtime_started.elapsed(),
+            bootstrap_wall_time,
+            programs: NativeCpuTrainingPrograms {
+                main: main_finalization_phases,
+                accumulation: None,
+                partial_flush: None,
+                zero_grad: None,
+                evaluation: None,
+            },
+            report_input_assembly_wall_time: assembly_wall_time,
+        };
         let preparation = NativeCpuCompiledTrainingPreparationReport::from_compilation(
             &roles,
             NativeCpuTrainingPrograms {
@@ -86,6 +103,7 @@ impl<'a> NativeCpuCompiledMomentumSgd<'a> {
             },
             (recurrent_state_count, recurrent_state_bytes),
             compilation,
+            finalization,
         )?;
 
         Ok(Self {

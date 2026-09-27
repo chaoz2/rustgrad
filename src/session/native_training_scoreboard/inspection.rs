@@ -11,7 +11,7 @@ use super::{
     NATIVE_TRAINING_REPORT_FORMAT_V18, NATIVE_TRAINING_REPORT_FORMAT_V19,
     NATIVE_TRAINING_REPORT_FORMAT_V20, NATIVE_TRAINING_REPORT_FORMAT_V21,
     NATIVE_TRAINING_REPORT_FORMAT_V22, NATIVE_TRAINING_REPORT_FORMAT_V23,
-    NATIVE_TRAINING_REPORT_FORMAT_VERSION, invalid,
+    NATIVE_TRAINING_REPORT_FORMAT_V24, NATIVE_TRAINING_REPORT_FORMAT_VERSION, invalid,
 };
 use crate::{BenchmarkDuration, ExecutionPlanSummary, Result};
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,7 @@ impl NativeTrainingPreparationTiming {
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
                 | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_V23
+                | NATIVE_TRAINING_REPORT_FORMAT_V24
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(total),
                 Some(linker),
@@ -138,6 +139,7 @@ impl NativeTrainingPreparationTiming {
                 | NATIVE_TRAINING_REPORT_FORMAT_V21
                 | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_V23
+                | NATIVE_TRAINING_REPORT_FORMAT_V24
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 _,
                 _,

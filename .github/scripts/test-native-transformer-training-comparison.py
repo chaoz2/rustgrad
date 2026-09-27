@@ -3,19 +3,38 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
 import pathlib
 import stat
+import sys
 import tempfile
 from types import SimpleNamespace
 
-SCRIPT = pathlib.Path(__file__).with_name("check-native-transformer-training-comparison.py")
-SPEC = importlib.util.spec_from_file_location("native_training_comparison", SCRIPT)
-assert SPEC is not None and SPEC.loader is not None
-VALIDATOR = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(VALIDATOR)
+
+def load_script_module(name: str, path: pathlib.Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+VALIDATOR = load_script_module(
+    "native_training_comparison",
+    pathlib.Path(__file__).with_name("check-native-transformer-training-comparison.py"),
+)
+PREPARATION_EVIDENCE = load_script_module(
+    "native_training_preparation_evidence",
+    pathlib.Path(__file__).with_name("native_training_preparation_evidence.py"),
+)
 
 BASELINE_SHA = "1" * 40
 CANDIDATE_SHA = "2" * 40
@@ -151,7 +170,7 @@ def scoreboard_program(capture_identity: int) -> dict[str, object]:
         "object_compile_count": 1,
         "linker_invocation_count": 0,
         "dispatch_segmentation": {"segment_count": 1},
-        "preparation_timing": {"total_wall_time": duration(10)},
+        "preparation_timing": {"total": duration(10)},
     }
 
 
@@ -196,15 +215,111 @@ def warm_step_phase() -> dict[str, object]:
     }
 
 
-def scoreboard() -> dict[str, object]:
+def preparation_finalization() -> dict[str, object]:
+    program_phase = {
+        "pre_layout_admission_wall_time": duration(1),
+        "workspace_construction_wall_time": duration(1),
+        "recurrent_finalization_wall_time": duration(1),
+    }
+    return {
+        "instrumented_wall_time": duration(90),
+        "outer_remainder_wall_time": duration(10),
+        "bootstrap_wall_time": duration(5),
+        "main": dict(program_phase),
+        "accumulation": dict(program_phase),
+        "partial_flush": dict(program_phase),
+        "zero_grad": dict(program_phase),
+        "report_input_assembly_wall_time": duration(3),
+        "unattributed_wall_time": duration(40),
+    }
+
+
+def warm_preparation_partition() -> tuple[dict[str, object], dict[str, object]]:
+    recurrent_phase = {
+        "pre_layout_admission_wall_time": duration(1),
+        "workspace_construction_wall_time": duration(1),
+        "recurrent_finalization_wall_time": duration(1),
+    }
+    programs = {
+        role: scoreboard_program(index)
+        for index, role in enumerate(
+            ("main", "accumulation", "partial_flush", "zero_grad", "evaluation"),
+            start=1,
+        )
+    }
+    evidence = {
+        "prepare_wall_time": duration(110),
+        "prepare_runtime_overhead_wall_time": duration(70),
+        "prepare_parallel_module_overlap_wall_time": duration(10),
+        "prepare_parallel_render_overlap_wall_time": duration(0),
+        "prepare_finalization": {
+            "instrumented_wall_time": duration(100),
+            "outer_remainder_wall_time": duration(10),
+            "bootstrap_wall_time": duration(5),
+            "main": dict(recurrent_phase),
+            "accumulation": dict(recurrent_phase),
+            "partial_flush": dict(recurrent_phase),
+            "zero_grad": dict(recurrent_phase),
+            "evaluation": {
+                "pre_layout_admission_wall_time": duration(1),
+                "workspace_construction_wall_time": duration(1),
+            },
+            "report_input_assembly_wall_time": duration(3),
+            "unattributed_wall_time": duration(38),
+        },
+    }
+    return evidence, programs
+
+
+def require_preparation_error(
+    evidence: dict[str, object], programs: dict[str, object], message: str
+) -> None:
+    try:
+        PREPARATION_EVIDENCE.validate_preparation_finalization(
+            evidence, 25, programs
+        )
+    except PREPARATION_EVIDENCE.PreparationEvidenceError as error:
+        assert message in str(error)
+        return
+    raise AssertionError("invalid preparation evidence was accepted")
+
+
+def check_warm_preparation_fixtures() -> None:
+    evidence, programs = warm_preparation_partition()
+    PREPARATION_EVIDENCE.validate_preparation_finalization(evidence, 25, programs)
+
+    invalid = copy.deepcopy(evidence)
+    invalid["prepare_finalization"]["evaluation"][
+        "recurrent_finalization_wall_time"
+    ] = duration(0)
+    require_preparation_error(invalid, programs, "evaluation finalization fields differ")
+
+    invalid = copy.deepcopy(evidence)
+    invalid["prepare_finalization"].pop("evaluation")
+    require_preparation_error(invalid, programs, "finalization fields differ")
+
+    invalid = copy.deepcopy(evidence)
+    maximum = {"secs": (1 << 64) - 1, "nanos": 999_999_999}
+    assert PREPARATION_EVIDENCE.duration_ns(maximum, "maximum") > 0
+    invalid["prepare_finalization"]["main"][
+        "pre_layout_admission_wall_time"
+    ] = maximum
+    require_preparation_error(invalid, programs, "duration overflows")
+
+
+def scoreboard(format_version: int) -> dict[str, object]:
     programs = {
         "main": scoreboard_program(1),
         "accumulation": scoreboard_program(2),
         "partial_flush": scoreboard_program(3),
         "zero_grad": scoreboard_program(4),
     }
-    return {
-        "format_version": 24,
+    value = {
+        "format_version": format_version,
+        "prepare_wall_time": duration(100),
+        "prepare_runtime_overhead_wall_time": duration(70),
+        "prepare_parallel_module_overlap_wall_time": duration(10),
+        "prepare_parallel_render_overlap_wall_time": duration(0),
         "prepare_max_parallel_render_job_count": 2,
         "prepare_render_capsule_hit_count": 0,
         "prepare_render_capsule_miss_count": 4,
@@ -292,6 +407,9 @@ def scoreboard() -> dict[str, object]:
         "host_to_device": None,
         "device_to_host": None,
     }
+    if format_version == 25:
+        value["prepare_finalization"] = preparation_finalization()
+    return value
 
 
 def provenance(source_sha: str, binary_digest: str) -> str:
@@ -352,7 +470,11 @@ def fixture(root: pathlib.Path) -> SimpleNamespace:
         source_sha = BASELINE_SHA if role == "baseline" else CANDIDATE_SHA
         directory = root / f"trial-{ordinal:02d}-{role}"
         directory.mkdir()
-        write_json(directory / "native-cpu-training-scoreboard.json", scoreboard())
+        format_version = 24 if role == "baseline" else 25
+        write_json(
+            directory / "native-cpu-training-scoreboard.json",
+            scoreboard(format_version),
+        )
         write_json(directory / "native-cpu-training-steady-replays.json", sidecar(source_sha))
         (directory / "provenance.txt").write_text(provenance(source_sha, digests[role]), encoding="utf-8")
     build_manifest = root / "build-manifest.json"
@@ -410,6 +532,7 @@ def run_case(mutator=None, expected: bool = True, invalid_trial: int | None = No
 
 
 def main() -> None:
+    check_warm_preparation_fixtures()
     run_case()
 
     def change_timing_only(root: pathlib.Path) -> None:
@@ -444,6 +567,9 @@ def main() -> None:
             "finish_offset": duration(2),
             "post_main_tail": duration(1),
         }
+        finalization = value["prepare_finalization"]
+        finalization["main"]["pre_layout_admission_wall_time"] = duration(2)
+        finalization["unattributed_wall_time"] = duration(39)
         write_json(path, value)
         path = root / "trial-02-candidate/native-cpu-training-steady-replays.json"
         value = json.loads(path.read_text())
@@ -456,6 +582,49 @@ def main() -> None:
         write_json(path, value)
 
     run_case(change_timing_only)
+
+    def remove_finalization(root: pathlib.Path) -> None:
+        path = root / "trial-02-candidate/native-cpu-training-scoreboard.json"
+        value = json.loads(path.read_text())
+        value.pop("prepare_finalization")
+        write_json(path, value)
+
+    run_case(remove_finalization, expected=False, invalid_trial=2)
+
+    def break_finalization_partition(root: pathlib.Path) -> None:
+        path = root / "trial-02-candidate/native-cpu-training-scoreboard.json"
+        value = json.loads(path.read_text())
+        value["prepare_finalization"]["unattributed_wall_time"] = duration(41)
+        write_json(path, value)
+
+    run_case(break_finalization_partition, expected=False, invalid_trial=2)
+
+    def remove_finalization_role(root: pathlib.Path) -> None:
+        path = root / "trial-02-candidate/native-cpu-training-scoreboard.json"
+        value = json.loads(path.read_text())
+        value["prepare_finalization"].pop("zero_grad")
+        write_json(path, value)
+
+    run_case(remove_finalization_role, expected=False, invalid_trial=2)
+
+    def overflow_finalization(root: pathlib.Path) -> None:
+        path = root / "trial-02-candidate/native-cpu-training-scoreboard.json"
+        value = json.loads(path.read_text())
+        value["prepare_finalization"]["bootstrap_wall_time"] = {
+            "secs": 1 << 64,
+            "nanos": 0,
+        }
+        write_json(path, value)
+
+    run_case(overflow_finalization, expected=False, invalid_trial=2)
+
+    def add_finalization_to_legacy(root: pathlib.Path) -> None:
+        path = root / "trial-01-baseline/native-cpu-training-scoreboard.json"
+        value = json.loads(path.read_text())
+        value["prepare_finalization"] = preparation_finalization()
+        write_json(path, value)
+
+    run_case(add_finalization_to_legacy, expected=False, invalid_trial=1)
 
     def change_phase(root: pathlib.Path) -> None:
         path = root / "trial-02-candidate/native-cpu-training-scoreboard.json"

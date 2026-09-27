@@ -7038,6 +7038,47 @@ fn compiled_transformer_native_cpu_scoreboard_is_bounded_and_authenticated() {
     );
     assert_eq!(scoreboard.report().unwrap(), observed_checkpoint_report);
     let report = scoreboard.report().unwrap();
+    let preparation_finalization = report
+        .prepare_finalization()
+        .expect("v25 reports native preparation finalization");
+    assert!(
+        preparation_finalization
+            .main()
+            .recurrent_finalization_wall_time()
+            .is_some()
+    );
+    assert!(
+        preparation_finalization
+            .accumulation()
+            .and_then(|phase| phase.recurrent_finalization_wall_time())
+            .is_some()
+    );
+    assert!(
+        preparation_finalization
+            .partial_flush()
+            .and_then(|phase| phase.recurrent_finalization_wall_time())
+            .is_some()
+    );
+    assert!(
+        preparation_finalization
+            .zero_grad()
+            .and_then(|phase| phase.recurrent_finalization_wall_time())
+            .is_some()
+    );
+    assert!(preparation_finalization.evaluation().is_none());
+    assert_eq!(
+        preparation_finalization
+            .instrumented_wall_time()
+            .to_duration()
+            .unwrap()
+            .checked_add(
+                preparation_finalization
+                    .outer_remainder_wall_time()
+                    .to_duration()
+                    .unwrap()
+            ),
+        Some(report.prepare_wall_time().to_duration().unwrap())
+    );
     let reported_compile_phases = report.compile_phases().unwrap();
     for (observed, reported, program) in [
         (

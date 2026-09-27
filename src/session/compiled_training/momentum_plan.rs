@@ -203,8 +203,17 @@ impl CompiledMomentumSgdPlan {
         &self,
         target: &NativeCpuSessionTarget<'a>,
     ) -> Result<NativeCpuCompiledMomentumSgd<'a>> {
+        let runtime_started = Instant::now();
+        let bootstrap_started = Instant::now();
         let inner = self.prepare_cpu_with_non_finite_policy(target.non_finite_policy())?;
-        NativeCpuCompiledMomentumSgd::prepare(inner, target.executor(), target.is_vectorized())
+        let bootstrap_wall_time = bootstrap_started.elapsed();
+        NativeCpuCompiledMomentumSgd::prepare(
+            inner,
+            target.executor(),
+            target.is_vectorized(),
+            runtime_started,
+            bootstrap_wall_time,
+        )
     }
 
     /// Prepares this plan through a concrete target without introducing a

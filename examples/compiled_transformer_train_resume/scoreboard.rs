@@ -399,13 +399,52 @@ pub(super) fn run_native_cpu_scoreboard(
     let checkpoint_wall_time = checkpoint_started.elapsed();
     scoreboard.observe_checkpoint(&checkpoint, checkpoint_wall_time)?;
     let report = scoreboard.report()?;
-    let reported_compile = report.compile_phases().expect("v24 reports compile phases");
+    let reported_compile = report.compile_phases().expect("v25 reports compile phases");
+    let preparation_finalization = report
+        .prepare_finalization()
+        .expect("v25 reports native preparation finalization");
+    assert!(
+        preparation_finalization
+            .main()
+            .recurrent_finalization_wall_time()
+            .is_some()
+    );
+    assert!(
+        preparation_finalization
+            .accumulation()
+            .and_then(|phase| phase.recurrent_finalization_wall_time())
+            .is_some()
+    );
+    assert!(
+        preparation_finalization
+            .partial_flush()
+            .and_then(|phase| phase.recurrent_finalization_wall_time())
+            .is_some()
+    );
+    assert!(
+        preparation_finalization
+            .zero_grad()
+            .and_then(|phase| phase.recurrent_finalization_wall_time())
+            .is_some()
+    );
+    assert!(preparation_finalization.evaluation().is_none());
+    assert_eq!(
+        preparation_finalization
+            .instrumented_wall_time()
+            .to_duration()?
+            .checked_add(
+                preparation_finalization
+                    .outer_remainder_wall_time()
+                    .to_duration()?
+            ),
+        Some(report.prepare_wall_time().to_duration()?)
+    );
     assert_eq!(reported_compile.compile_count(), 1);
     assert!(reported_compile.evaluation().is_none());
     let reported_main_capture = reported_compile
         .main_capture()
         .recurrent_capture()
-        .expect("v24 reports main recurrent capture stages");
+        .expect("v25 reports main recurrent capture stages");
     assert_eq!(reported_main_capture.preview_schedule_count(), 2);
     assert!(
         reported_main_capture

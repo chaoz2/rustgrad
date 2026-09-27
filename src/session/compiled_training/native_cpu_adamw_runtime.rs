@@ -6,17 +6,20 @@ pub(super) struct PreparedNativeCpuProgram {
     pub(super) report: NativeCpuProgramPreparationReport,
     pub(super) replay: PreparedRecurrentNativeReplay,
     pub(super) commit_only_projection: PreparedRecurrentOutputProjectionHandle,
+    pub(super) finalization_phases: NativeCpuProgramFinalizationPhases,
 }
 
 pub(super) struct PreparedNativeCpuAuxiliaryProgram {
     pub(super) report: NativeCpuProgramPreparationReport,
     pub(super) replay: PreparedRecurrentNativeReplay,
+    pub(super) finalization_phases: NativeCpuProgramFinalizationPhases,
 }
 
 pub(super) struct PreparedNativeCpuEvaluation {
     pub(super) report: NativeCpuProgramPreparationReport,
     pub(super) plan: PlannedNativeItems,
     pub(super) parameter_inputs: Vec<PreparedNativeEvaluationParameterInput>,
+    pub(super) finalization_phases: NativeCpuProgramFinalizationPhases,
 }
 
 pub(super) struct NativeCpuEvaluationPreparation {

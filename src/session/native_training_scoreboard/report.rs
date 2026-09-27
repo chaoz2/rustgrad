@@ -5,6 +5,7 @@ use super::compiler_evidence::{
     NativeTrainingCompilerCriticalTail, NativeTrainingCompilerProcessTiming,
     NativeTrainingModuleOverlap, NativeTrainingProgramPairOverlap, NativeTrainingTranslationUnit,
 };
+use super::preparation_phase::NativeTrainingPreparationFinalizationReport;
 use super::program_report::NativeTrainingProgramReport;
 use super::step_phases::NativeTrainingStepPhaseReport;
 use super::{
@@ -93,6 +94,8 @@ pub struct NativeTrainingReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) prepare_runtime_overhead_wall_time: Option<BenchmarkDuration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) prepare_finalization: Option<NativeTrainingPreparationFinalizationReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) prepare_parallel_module_overlap_wall_time: Option<BenchmarkDuration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) prepare_parallel_render_overlap_wall_time: Option<BenchmarkDuration>,
@@ -180,6 +183,13 @@ impl NativeTrainingReport {
     /// Whole-prepare time outside the attached native program preparations.
     pub const fn prepare_runtime_overhead_wall_time(&self) -> Option<BenchmarkDuration> {
         self.prepare_runtime_overhead_wall_time
+    }
+
+    /// Checked host-finalization partition for scoreboard v25 and newer.
+    pub const fn prepare_finalization(
+        &self,
+    ) -> Option<&NativeTrainingPreparationFinalizationReport> {
+        self.prepare_finalization.as_ref()
     }
 
     /// Exact overlap among complete native module compiler/loader jobs.
