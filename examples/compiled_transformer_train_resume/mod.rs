@@ -782,18 +782,23 @@ where
 
 mod checkpoint;
 mod scoreboard;
+mod steady_measurement;
 
 use checkpoint::{
     CrossProcessBackend, run_cpu_file_resume, run_cpu_reuse, run_cross_process_consumer,
     run_cross_process_producer, run_exact_resume, run_native_cpu_file_resume,
 };
 use scoreboard::run_native_cpu_scoreboard;
+use steady_measurement::SteadyMeasurementRequest;
 
 pub(crate) fn run() -> std::result::Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
     let mode = arguments.next().unwrap_or_else(|| "cpu".to_owned());
     match mode.as_str() {
-        "native-cpu-scoreboard" => run_native_cpu_scoreboard()?,
+        "native-cpu-scoreboard" => {
+            let measurement = SteadyMeasurementRequest::from_arguments(&mut arguments)?;
+            run_native_cpu_scoreboard(measurement)?;
+        }
         "cpu-reuse" => run_cpu_reuse()?,
         "cpu-file-resume" => run_cpu_file_resume()?,
         "native-cpu-file-resume" => run_native_cpu_file_resume()?,
