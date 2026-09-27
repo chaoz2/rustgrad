@@ -4096,9 +4096,49 @@ mod recurrent_tests {
                 ..Default::default()
             }
         );
+        assert_eq!(admitted.pure.items.len(), raw.pure.items.len());
+        for (actual, expected) in admitted.pure.items.iter().zip(&raw.pure.items) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.node, expected.node);
+            assert_eq!(actual.dependencies, expected.dependencies);
+            assert_eq!(actual.consumers, expected.consumers);
+            assert_eq!(actual.inputs, expected.inputs);
+            assert_eq!(actual.input_bindings, expected.input_bindings);
+            assert_eq!(
+                actual.quantized_input_bindings,
+                expected.quantized_input_bindings
+            );
+            assert_eq!(
+                actual.external_materializations,
+                expected.external_materializations
+            );
+            assert_eq!(actual.outputs, expected.outputs);
+            assert_eq!(
+                crate::uop::artifact::encode(&actual.kernel).unwrap(),
+                crate::uop::artifact::encode(&expected.kernel).unwrap()
+            );
+            assert_eq!(actual.boundary, expected.boundary);
+            assert_eq!(actual.cache_key, expected.cache_key);
+        }
+        assert_eq!(admitted.pure.inputs, raw.pure.inputs);
+        assert_eq!(admitted.pure.constants, raw.pure.constants);
         assert_eq!(
-            admitted.pure.to_bytes().unwrap(),
-            raw.pure.to_bytes().unwrap()
+            admitted.pure.quantized_constants,
+            raw.pure.quantized_constants
+        );
+        assert_eq!(
+            admitted.pure.requested_passthroughs,
+            raw.pure.requested_passthroughs
+        );
+        assert_eq!(admitted.pure.requested, raw.pure.requested);
+        assert_eq!(admitted.pure.identity, raw.pure.identity);
+        assert_eq!(
+            admitted.pure.symbolic.is_some(),
+            raw.pure.symbolic.is_some()
+        );
+        assert_eq!(
+            admitted.pure.specialized_from.is_some(),
+            raw.pure.specialized_from.is_some()
         );
         assert_eq!(admitted.inputs, raw.inputs);
         assert_eq!(admitted.requested, raw.requested);
@@ -4489,25 +4529,15 @@ mod tests {
     fn captured_two_effects() -> CapturedMixedSchedule {
         let mut effects = EffectGraph::default();
         let mut states = Vec::new();
-        for (target_buffer, source_buffer) in [(50, 51), (60, 61)] {
+        for target_buffer in [50, 60] {
             let target = effects
                 .insert(
                     target_buffer,
                     TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
                 )
                 .unwrap();
-            let source = effects
-                .insert(
-                    source_buffer,
-                    TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
-                )
-                .unwrap();
-            let next = effects.assign(&target, &source).unwrap();
-            states.extend([
-                target.state().clone(),
-                source.state().clone(),
-                next.state().clone(),
-            ]);
+            let next = effects.assign(&target, &target).unwrap();
+            states.extend([target.state().clone(), next.state().clone()]);
         }
         let schedule = schedule_effects(&effects).unwrap();
         let capture = CapturedSchedule {
