@@ -46,6 +46,31 @@ assert_eq!(session.realize(&gradient)?.to_vec_f64(), vec![60.0, 60.0]);
 The same session exposes common static CPU operations for model arithmetic,
 activations, reductions, movement, indexing, and first-order gradients.
 
+## Compile once, train, and resume
+
+RustGrad's central near-term workflow is a fixed-shape
+`forward → loss → backward → AdamW update` program compiled once and
+replayed against persistent state. The maintained
+[`compiled_transformer_train_resume`](examples/compiled_transformer_train_resume.rs)
+example exercises masked causal Transformer training end to end:
+
+- parameters, optimizer moments, gradient windows, and dropout progress survive
+  between replays;
+- tied and frozen parameters, clipping, accumulation, partial-window commit, and
+  reset remain part of the captured lifecycle;
+- portable checkpoints restore into an owned module and continue exactly; and
+- the interpreter and strict-native CPU paths execute the same program without
+  silent fallback.
+
+Strict Metal shares the capture and failure-atomic recurrent-state foundation
+for its admitted policy subset. CPU-only policies still fail closed, and live
+Apple-hardware training evidence remains an explicit follow-up rather than an
+implied claim.
+
+See [Compiled recurrent training](docs/ARCHITECTURE.md#compiled-recurrent-training)
+for ownership, resume, and backend boundaries. The
+[compatibility ledger](docs/COMPATIBILITY.md) records the executable evidence.
+
 ## Build and run a module
 
 RustGrad modules own deterministic parameter state independently of any one
@@ -82,33 +107,12 @@ layers:
 - [`examples/llama_chat.rs`](examples/llama_chat.rs)
 - [`examples/metal_scoreboard.rs`](examples/metal_scoreboard.rs)
 
-### Repeated compiled training
-
-RustGrad can compile a fixed-shape
-`forward → loss → backward → optimizer update` program once and replay new
-batches against persistent model and optimizer state. The maintained
-[`compiled_transformer_train_resume`](examples/compiled_transformer_train_resume.rs)
-example demonstrates the complete masked Transformer training lifecycle.
-
-- Compile once and replay new batches while state stays persistent and each
-  transition commits atomically.
-- Resume exactly from an in-process plan or a portable checkpoint rebuilt into
-  the same model topology.
-- Inspect execution plans and versioned evidence without treating
-  observational timings as performance thresholds.
-
-See [Compiled recurrent training](docs/ARCHITECTURE.md#compiled-recurrent-training)
-for runtime ownership, resume modes, evidence, and backend boundaries. The
-[compatibility ledger](docs/COMPATIBILITY.md) records the supported surface.
-
-## Run ResNet on a persistent Metal session
+## Bounded accelerator inference
 
 The typed ResNet facade builds and captures the complete Eval/F32 graph, freezes
 its parameters, and binds the plan to one explicitly selected Metal device.
 Preparation uploads residents once; repeated runs stage only the image and
-download logits. The graph, capture, memory plan, input schemas, rendered MSL,
-and reports remain inspectable, and unsupported work returns an error instead
-of using CPU fallback.
+download logits. Unsupported work returns an error instead of selecting CPU.
 
 ```rust,no_run
 use rustgrad::nn::{ResNet, ResNetConfig, ResNetMetalPlan};
@@ -131,85 +135,21 @@ println!("steady run: {:?}", second.report());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The lower-level session and opt-in v8 scoreboard distinguish kernel encodes
-from compute-command submissions and waits, and report an optional exact sum of
-completed compute-command `GPUStartTime`/`GPUEndTime` intervals. Unavailable,
-invalid, or unrepresentable timestamp sets remain absent rather than becoming
-zero. Copy command buffers are excluded; command time is not end-to-end
-throughput, physical bus traffic, allocator RSS, or energy.
+GGUF Llama has a separate typed prompt-to-tokens Metal facade for supported
+dense and packed models. It owns the validated model, tokenizer, chat template,
+resident weights, and fixed-capacity K/V state for one selected device. The
+maintained [`llama_prompt`](examples/llama_prompt.rs),
+[`llama_chat`](examples/llama_chat.rs), and
+[`metal_llama_generate`](examples/metal_llama_generate.rs) examples show the
+supported local workflows.
 
-Dense-or-packed F32 GGUF Llama models also have a typed persistent Metal
-prompt-to-tokens facade. One GGUF parse owns the matching model, tokenizer, and
-chat template; planning binds them to an explicitly selected device, uploads
-Q4_0/Q8_0/Q4_K/Q6_K or dense weights once, and retains fixed-capacity K/V state.
-The local-file loader retains one immutable file-byte owner, and packed weights
-refer to their validated ranges instead of copying each tensor payload. The
-initial read remains ordinary owned file I/O; this is not an mmap claim.
-
-```rust,no_run
-use std::num::NonZeroUsize;
-
-use rustgrad::{LlamaMetalGreedyPlan, LlamaPromptWorkflow, MetalSessionTarget};
-use rustgrad::runtime::metal::MetalRuntime;
-
-let device = MetalRuntime::load()?.device(0)?;
-let target = MetalSessionTarget::new(device, 64)?;
-let workflow = LlamaPromptWorkflow::from_path("model.gguf")?;
-let plan = LlamaMetalGreedyPlan::builder_on(workflow, &target)
-    .with_prefill_span(NonZeroUsize::new(8).unwrap())
-    .build()?;
-
-// Capture, rendering, schemas, selected device, and zero-fallback facts are
-// inspectable before prepare creates resources or uploads the model.
-assert_eq!(plan.summary().fallback_count, 0);
-assert_eq!(plan.selected_device_owner_id(), target.device().owner_id());
-let mut session = target.prepare(plan)?;
-let output = session.generate_text("Hello", 32)?;
-println!("{}", output.generation().decoded());
-session.reset_sequence()?;
-let independent = session.generate_text("Goodbye", 32)?;
-println!("{}", independent.generation().decoded());
-# Ok::<(), Box<dyn std::error::Error>>(())
-```
-
-`reset_sequence` retains the selected device, compiled pipelines, resident
-weights, and K/V allocations while logically rewinding causal state for an
-independent prompt. Scoreboard-bound sessions reject reset so each evidence
-envelope remains single-sequence.
-
-Attach a scoreboard context to `MetalSessionTarget` before `target.prepare(plan)`
-when one independent sequence needs authenticated execution evidence.
-Generation output always carries its typed workload evidence; neither planning
-nor preparation can silently select the CPU implementation.
-
-The greedy facade reduces finite logits on device and downloads one checked I32
-token per selecting invocation. An opt-in fixed span executes complete prompt
-chunks while sharing the same resident weights, K/V cache, and command queue.
-Its opt-in execution scoreboard reuses the same authenticated v2 workload
-envelope as the host-logits facade: each physical program keeps its own v8
-session report and identity while the envelope records exact global order and
-closed prompt-prefill or steady-decode phases. The maintained
-`metal_llama_generate` CLI uses this scoreboard-capable device-greedy path, so
-every selecting invocation retains only one checked four-byte token.
-`LlamaMetalPlan` remains the separate host-logits/Gumbel API. Checked phase
-rates are narrowly host-run or optional compute-command observations, not
-end-to-end, physical-transfer, allocator/RSS, live-hardware, or speedup
-measurements.
-Commits are atomic per device invocation, but a later failure does not roll
-back an already committed prefix.
-Current protected evidence is semantic-mock only; the maintained
-`metal_llama_generate` example is the manual live-lane entry point:
-
-```text
-cargo run --release --example metal_llama_generate -- model.gguf "Hello"
-```
-
-The protected harness pins model bytes and expected greedy IDs, then emits a
-create-new scoreboard, provenance attestation, and checksum manifest. It remains
-dormant until its external runner, environment, and model are provisioned;
-live-device correctness and performance evidence remain explicit follow-ups.
-Operators can use the [protected live Metal lane guide](docs/METAL_LIVE.md) for
-the fail-closed provisioning, exact-SHA dispatch, and evidence checklist.
+Both Metal facades keep capture, selected-device ownership, fallback count, and
+execution evidence inspectable. Timing fields are observations, not claims
+about end-to-end throughput, physical transfers, memory use, energy, or
+speedup. Protected coverage is semantic unless a provisioned live lane says
+otherwise; no live Apple-GPU comparison is currently published. See the
+[Metal runtime boundary](docs/ARCHITECTURE.md#metal-runtime-boundary) and the
+[protected live Metal lane guide](docs/METAL_LIVE.md) for the precise contracts.
 
 ## How the system fits together
 
