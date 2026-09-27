@@ -1336,7 +1336,19 @@ atomic publication. An engine-private ordered borrowed successor view then
 follows the sealed bank layout directly, avoiding a per-call
 `Vec<&TensorData>` adapter and a second immutable layout scan. The view remains
 call-scoped: live owner, lease, generation, cursor/version, post-stage
-descriptor, finite-value, rollback, and retry checks are unchanged. Each
+descriptor, finite-value, rollback, and retry checks are unchanged.
+
+CPU native preparation reuses the same `Arc`-owned authenticated recurrent
+capture, canonical capture identity, and version-zero frontier when deriving
+replacement bindings and seeding the native replay trace. It therefore does
+not repeat immutable capture validation, rekeying, canonical capture-identity
+serialization, or initial-frontier construction. Native trace/source identity
+serialization remains per preparation. Every call still authenticates the
+live cursor identity, completeness, descriptors, and version floor; snapshots
+the current effect runtime; validates caller inputs; and retains output,
+successor, transaction, and failure-publication checks. Raw
+`CapturedMixedSchedule` preflight and untrusted artifact decoding continue
+through their full validating paths with unchanged error ordering. Each
 prepared recurrent output mode also seals one
 private workspace-owned native egress plan. That plan authenticates the exact
 workspace and immutable selected-output owner while retaining physical source

@@ -36,6 +36,7 @@ pub(crate) struct PreparedReplayValidationCounts {
     pub(crate) mixed_capture_validations: usize,
     pub(crate) schedule_rekeys: usize,
     pub(crate) identity_serializations: usize,
+    pub(crate) native_trace_serializations: usize,
     pub(crate) recurrent_frontier_plans: usize,
     pub(crate) recurrent_frontier_authentications: usize,
     pub(crate) cursor_projection_preparations: usize,
@@ -51,6 +52,7 @@ std::thread_local! {
                 mixed_capture_validations: 0,
                 schedule_rekeys: 0,
                 identity_serializations: 0,
+                native_trace_serializations: 0,
                 recurrent_frontier_plans: 0,
                 recurrent_frontier_authentications: 0,
                 cursor_projection_preparations: 0,
@@ -867,14 +869,14 @@ impl RecurrentNativePreparation {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PreparedRecurrentReplacement {
     step: u64,
     producer: u64,
     buffer: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PreparedRecurrentReplacementPlan {
     external_inputs: BTreeSet<String>,
     state_inputs: BTreeMap<String, u64>,
@@ -1324,6 +1326,15 @@ impl PreparedRecurrentBankLayout {
 }
 
 impl PreparedRecurrentReplacementPlan {
+    fn from_authenticated(
+        authenticated: &AuthenticatedRecurrentFrontier,
+    ) -> Result<Self, ReplayError> {
+        Self::from_capture_and_frontier(
+            authenticated.capture(),
+            authenticated.initial_frontier().to_vec(),
+        )
+    }
+
     fn authenticate_retained_recurrent_states(
         &self,
         pure: &CapturedSchedule,
@@ -1427,12 +1438,20 @@ impl PreparedRecurrentReplacementPlan {
         Ok(())
     }
 
+    #[cfg(test)]
     fn from_capture(capture: &CapturedMixedSchedule) -> Result<Self, ReplayError> {
         // Prepared replacement metadata authenticates the capture's immutable
         // version-zero descriptor floor, never the cursor used at preparation.
         // The same sealed replay can therefore accept any matching resumed
         // frontier whose versions remain at or above this canonical floor.
         let frontier = recurrent_initial_frontier(capture)?;
+        Self::from_capture_and_frontier(capture, frontier)
+    }
+
+    fn from_capture_and_frontier(
+        capture: &CapturedMixedSchedule,
+        frontier: Vec<BufferState>,
+    ) -> Result<Self, ReplayError> {
         let frontier_by_buffer = frontier
             .iter()
             .map(|state| (state.buffer, state))
@@ -1576,6 +1595,24 @@ impl<'a> BoundMixedCapture<'a> {
         provided: &BTreeMap<String, crate::TensorData>,
     ) -> Result<Self, ReplayError> {
         validate(capture, true)?;
+        Self::bind_admitted(capture, candidates, starts, provided)
+    }
+
+    fn bind_authenticated(
+        authenticated: &'a AuthenticatedRecurrentFrontier,
+        candidates: &BTreeMap<BufferState, crate::TensorData>,
+        starts: BTreeMap<u64, BufferState>,
+        provided: &BTreeMap<String, crate::TensorData>,
+    ) -> Result<Self, ReplayError> {
+        Self::bind_admitted(authenticated.capture(), candidates, starts, provided)
+    }
+
+    fn bind_admitted(
+        capture: &'a CapturedMixedSchedule,
+        candidates: &BTreeMap<BufferState, crate::TensorData>,
+        starts: BTreeMap<u64, BufferState>,
+        provided: &BTreeMap<String, crate::TensorData>,
+    ) -> Result<Self, ReplayError> {
         let inputs = bind_persistent_inputs(
             &capture.schedule.inputs,
             &capture.state_bindings,
@@ -1946,6 +1983,7 @@ impl CapturedMixedSchedule {
         preparation.finish(plan)
     }
 
+    #[cfg(test)]
     pub(crate) fn preflight_recurrent_native(
         &self,
         runtime: &crate::EffectRuntime,
@@ -1956,6 +1994,7 @@ impl CapturedMixedSchedule {
         self.preflight_recurrent_native_impl(runtime, cursor, provided, vectorized, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn preflight_recurrent_native_retaining_unchanged(
         &self,
         runtime: &crate::EffectRuntime,
@@ -1966,6 +2005,7 @@ impl CapturedMixedSchedule {
         self.preflight_recurrent_native_impl(runtime, cursor, provided, vectorized, true)
     }
 
+    #[cfg(test)]
     fn preflight_recurrent_native_impl(
         &self,
         runtime: &crate::EffectRuntime,
@@ -1978,17 +2018,26 @@ impl CapturedMixedSchedule {
         validate_recurrent_cursor(self, cursor)?;
         let starts = recurrent_rebase_starts(self, cursor)?;
         let replacements = PreparedRecurrentReplacementPlan::from_capture(self)?;
-        let mut candidates = BTreeMap::new();
-        for state in &cursor.frontier {
-            let value = runtime
-                .snapshot(state)
-                .map_err(|error| ReplayError::Execute(format!("recurrent preflight: {error:?}")))?
-                .tensor()
-                .clone();
-            candidates.insert(state.clone(), value);
-        }
+        let candidates = recurrent_preflight_candidates(runtime, cursor)?;
         let bound = BoundMixedCapture::bind(self, &candidates, starts, provided)?;
-        let inputs = bound.inputs;
+        self.finish_recurrent_native_preflight(
+            bound.inputs,
+            replacements,
+            || self.native_replay_trace(vectorized),
+            retain_unchanged,
+        )
+    }
+
+    fn finish_recurrent_native_preflight<F>(
+        &self,
+        inputs: BTreeMap<String, crate::TensorData>,
+        replacements: PreparedRecurrentReplacementPlan,
+        replay: F,
+        retain_unchanged: bool,
+    ) -> Result<RecurrentNativePreparation, ReplayError>
+    where
+        F: FnOnce() -> Result<NativeMixedReplayTrace, ReplayError>,
+    {
         let mut pure = self.schedule.clone();
         let split = pure
             .items
@@ -2020,7 +2069,7 @@ impl CapturedMixedSchedule {
             requested,
             output_projection_requests,
             replacements,
-            replay: self.native_replay_trace(vectorized)?,
+            replay: replay()?,
             retained_recurrent_states,
         })
     }
@@ -2624,6 +2673,16 @@ impl CapturedMixedSchedule {
     ) -> Result<NativeMixedReplayTrace, ReplayError> {
         validate(self, true)?;
         let artifact_identity = identity(self)?;
+        self.native_replay_trace_from_identity(artifact_identity, vectorized)
+    }
+
+    fn native_replay_trace_from_identity(
+        &self,
+        artifact_identity: u64,
+        vectorized: bool,
+    ) -> Result<NativeMixedReplayTrace, ReplayError> {
+        #[cfg(test)]
+        record_prepared_replay_validation(|counts| counts.native_trace_serializations += 1);
         let pure_item_cache_keys = self
             .schedule
             .items
@@ -2965,6 +3024,24 @@ fn validate_recurrent_cursor(
         }
     }
     Ok(())
+}
+
+fn recurrent_preflight_candidates(
+    runtime: &crate::EffectRuntime,
+    cursor: &MixedReplayCursor,
+) -> Result<BTreeMap<BufferState, crate::TensorData>, ReplayError> {
+    cursor
+        .frontier
+        .iter()
+        .map(|state| {
+            let value = runtime
+                .snapshot(state)
+                .map_err(|error| ReplayError::Execute(format!("recurrent preflight: {error:?}")))?
+                .tensor()
+                .clone();
+            Ok((state.clone(), value))
+        })
+        .collect()
 }
 
 fn recurrent_rebase_starts(
@@ -3989,6 +4066,242 @@ mod recurrent_tests {
     }
 
     #[test]
+    fn authenticated_native_preflight_matches_raw_without_reauthenticating_capture() {
+        let (capture, mut runtime) = fixture(334);
+        let cursor = capture.initial_recurrent_cursor().unwrap();
+        let inputs = delta(1.0);
+        let initial_values = frontier_values(&runtime, &cursor);
+
+        reset_prepared_replay_validation_counts();
+        let raw = capture
+            .preflight_recurrent_native(&runtime, &cursor, &inputs, true)
+            .unwrap();
+        let raw_counts = prepared_replay_validation_counts();
+        assert_eq!(raw_counts.mixed_capture_validations, 3);
+        assert_eq!(raw_counts.schedule_rekeys, 3);
+        assert_eq!(raw_counts.identity_serializations, 2);
+        assert_eq!(raw_counts.native_trace_serializations, 1);
+        assert_eq!(raw_counts.recurrent_frontier_plans, 2);
+
+        let capture = Arc::new(capture);
+        let authenticated = AuthenticatedRecurrentFrontier::authenticate(capture.clone()).unwrap();
+        reset_prepared_replay_validation_counts();
+        let admitted = authenticated
+            .preflight_native(&runtime, &cursor, &inputs, true)
+            .unwrap();
+        assert_eq!(
+            prepared_replay_validation_counts(),
+            PreparedReplayValidationCounts {
+                native_trace_serializations: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(admitted.pure.items.len(), raw.pure.items.len());
+        for (actual, expected) in admitted.pure.items.iter().zip(&raw.pure.items) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.node, expected.node);
+            assert_eq!(actual.dependencies, expected.dependencies);
+            assert_eq!(actual.consumers, expected.consumers);
+            assert_eq!(actual.inputs, expected.inputs);
+            assert_eq!(actual.input_bindings, expected.input_bindings);
+            assert_eq!(
+                actual.quantized_input_bindings,
+                expected.quantized_input_bindings
+            );
+            assert_eq!(
+                actual.external_materializations,
+                expected.external_materializations
+            );
+            assert_eq!(actual.outputs, expected.outputs);
+            assert_eq!(
+                crate::uop::artifact::encode(&actual.kernel).unwrap(),
+                crate::uop::artifact::encode(&expected.kernel).unwrap()
+            );
+            assert_eq!(actual.boundary, expected.boundary);
+            assert_eq!(actual.cache_key, expected.cache_key);
+        }
+        assert_eq!(admitted.pure.inputs, raw.pure.inputs);
+        assert_eq!(admitted.pure.constants, raw.pure.constants);
+        assert_eq!(
+            admitted.pure.quantized_constants,
+            raw.pure.quantized_constants
+        );
+        assert_eq!(
+            admitted.pure.requested_passthroughs,
+            raw.pure.requested_passthroughs
+        );
+        assert_eq!(admitted.pure.requested, raw.pure.requested);
+        assert_eq!(admitted.pure.identity, raw.pure.identity);
+        assert_eq!(
+            admitted.pure.symbolic.is_some(),
+            raw.pure.symbolic.is_some()
+        );
+        assert_eq!(
+            admitted.pure.specialized_from.is_some(),
+            raw.pure.specialized_from.is_some()
+        );
+        assert_eq!(admitted.inputs, raw.inputs);
+        assert_eq!(admitted.requested, raw.requested);
+        assert_eq!(
+            admitted.output_projection_requests,
+            raw.output_projection_requests
+        );
+        assert_eq!(admitted.replacements, raw.replacements);
+        assert_eq!(admitted.replay, raw.replay);
+        assert_eq!(
+            admitted.retained_recurrent_states,
+            raw.retained_recurrent_states
+        );
+        let repeated = authenticated
+            .preflight_native(&runtime, &cursor, &inputs, true)
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &admitted.output_projection_requests[0],
+            &repeated.output_projection_requests[0]
+        ));
+        assert_eq!(repeated.replay, admitted.replay);
+        assert_eq!(
+            prepared_replay_validation_counts(),
+            PreparedReplayValidationCounts {
+                native_trace_serializations: 2,
+                ..Default::default()
+            }
+        );
+
+        let raw_scalar = capture
+            .preflight_recurrent_native(&runtime, &cursor, &inputs, false)
+            .unwrap();
+        reset_prepared_replay_validation_counts();
+        let admitted_scalar = authenticated
+            .preflight_native(&runtime, &cursor, &inputs, false)
+            .unwrap();
+        assert_eq!(admitted_scalar.replay, raw_scalar.replay);
+        assert_eq!(
+            prepared_replay_validation_counts(),
+            PreparedReplayValidationCounts {
+                native_trace_serializations: 1,
+                ..Default::default()
+            }
+        );
+
+        let mut malformed = cursor.clone();
+        malformed.frontier[0].bytes += DType::F32.itemsize();
+        let raw_error =
+            match capture.preflight_recurrent_native(&runtime, &malformed, &inputs, false) {
+                Ok(_) => panic!("raw native preflight accepted a malformed cursor"),
+                Err(error) => error,
+            };
+        reset_prepared_replay_validation_counts();
+        let admitted_error =
+            match authenticated.preflight_native(&runtime, &malformed, &inputs, false) {
+                Ok(_) => panic!("authenticated native preflight accepted a malformed cursor"),
+                Err(error) => error,
+            };
+        assert_eq!(admitted_error, raw_error);
+        assert_eq!(prepared_replay_validation_counts(), Default::default());
+        assert_eq!(frontier_values(&runtime, &cursor), initial_values);
+
+        let mut advanced = cursor.clone();
+        capture
+            .replay_recurrent(&mut runtime, &mut advanced, &inputs, None)
+            .unwrap();
+        let raw_advanced = capture
+            .preflight_recurrent_native(&runtime, &advanced, &inputs, true)
+            .unwrap();
+        reset_prepared_replay_validation_counts();
+        let admitted_advanced = authenticated
+            .preflight_native(&runtime, &advanced, &inputs, true)
+            .unwrap();
+        assert_eq!(admitted_advanced.inputs, raw_advanced.inputs);
+        let state_input = capture
+            .schedule
+            .inputs
+            .iter()
+            .find(|input| input.node == capture.state_bindings[0].input_node)
+            .unwrap();
+        assert_eq!(
+            admitted_advanced
+                .inputs
+                .as_ref()
+                .unwrap()
+                .get(&state_input.name)
+                .unwrap(),
+            runtime.snapshot(&advanced.frontier[0]).unwrap().tensor()
+        );
+        assert_eq!(
+            prepared_replay_validation_counts(),
+            PreparedReplayValidationCounts {
+                native_trace_serializations: 1,
+                ..Default::default()
+            }
+        );
+
+        let mut stale_runtime = EffectRuntime::new();
+        stale_runtime
+            .register_initial_snapshots(vec![(
+                cursor.frontier[0].clone(),
+                initial_values[0].clone(),
+            )])
+            .unwrap();
+        let invalid_inputs = BTreeMap::new();
+        let raw_stale = match capture.preflight_recurrent_native(
+            &stale_runtime,
+            &advanced,
+            &invalid_inputs,
+            false,
+        ) {
+            Ok(_) => panic!("raw native preflight accepted a stale runtime"),
+            Err(error) => error,
+        };
+        reset_prepared_replay_validation_counts();
+        let admitted_stale =
+            match authenticated.preflight_native(&stale_runtime, &advanced, &invalid_inputs, false)
+            {
+                Ok(_) => panic!("authenticated native preflight accepted a stale runtime"),
+                Err(error) => error,
+            };
+        assert_eq!(admitted_stale, raw_stale);
+        assert!(matches!(admitted_stale, ReplayError::Execute(_)));
+        assert_eq!(prepared_replay_validation_counts(), Default::default());
+
+        let advanced_values = frontier_values(&runtime, &advanced);
+        let executor = CapturedReplayExecutor::default();
+        let raw_input_preflight = capture
+            .preflight_recurrent_native(&runtime, &advanced, &invalid_inputs, false)
+            .unwrap();
+        let raw_input_error = {
+            let (pure, bound) = raw_input_preflight.pure_and_inputs();
+            match executor.preflight_native_items(pure, bound) {
+                Ok(_) => panic!("raw native item preflight accepted absent external input"),
+                Err(error) => error,
+            }
+        };
+        reset_prepared_replay_validation_counts();
+        let admitted_input_preflight = authenticated
+            .preflight_native(&runtime, &advanced, &invalid_inputs, false)
+            .unwrap();
+        let admitted_input_error = {
+            let (pure, bound) = admitted_input_preflight.pure_and_inputs();
+            match executor.preflight_native_items(pure, bound) {
+                Ok(_) => {
+                    panic!("authenticated native item preflight accepted absent external input")
+                }
+                Err(error) => error,
+            }
+        };
+        assert_eq!(admitted_input_error, raw_input_error);
+        assert_eq!(admitted_input_error, ReplayError::Missing("delta".into()));
+        assert_eq!(
+            prepared_replay_validation_counts(),
+            PreparedReplayValidationCounts {
+                native_trace_serializations: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(frontier_values(&runtime, &advanced), advanced_values);
+    }
+
+    #[test]
     fn prepared_cursor_projection_reuses_authenticated_schema_without_capture_work() {
         let (capture, _runtime) = fixture(331);
         let raw_projection =
@@ -4232,6 +4545,59 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn captured_two_effects() -> CapturedMixedSchedule {
+        let mut effects = EffectGraph::default();
+        let mut states = Vec::new();
+        for target_buffer in [50, 60] {
+            let target = effects
+                .insert(
+                    target_buffer,
+                    TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+                )
+                .unwrap();
+            let next = effects.assign(&target, &target).unwrap();
+            states.extend([target.state().clone(), next.state().clone()]);
+        }
+        let schedule = schedule_effects(&effects).unwrap();
+        let capture = CapturedSchedule {
+            items: schedule.items.clone(),
+            inputs: vec![],
+            constants: BTreeMap::new(),
+            quantized_constants: BTreeMap::new(),
+            requested_passthroughs: vec![],
+            requested: vec![],
+            identity: 0,
+            symbolic: None,
+            specialized_from: None,
+        };
+        CapturedMixedSchedule::from_parts(capture, &schedule, states).unwrap()
+    }
+
+    #[test]
+    fn authenticated_cursor_admission_matches_raw_for_malformed_two_state_frontiers() {
+        let capture = Arc::new(captured_two_effects());
+        let authenticated = AuthenticatedRecurrentFrontier::authenticate(capture.clone()).unwrap();
+        let cursor = authenticated.initial_cursor();
+        assert_eq!(cursor.frontier.len(), 2);
+
+        let mut foreign = cursor.clone();
+        foreign.capture_identity ^= u64::MAX;
+        let mut incomplete = cursor.clone();
+        incomplete.frontier.pop();
+        let mut reordered = cursor.clone();
+        reordered.frontier.swap(0, 1);
+
+        for (case, malformed) in [
+            ("foreign", foreign),
+            ("incomplete", incomplete),
+            ("reordered", reordered),
+        ] {
+            let raw_error = validate_recurrent_cursor(capture.as_ref(), &malformed).unwrap_err();
+            let authenticated_error = authenticated.validate_cursor(&malformed).unwrap_err();
+            assert_eq!(authenticated_error, raw_error, "{case} cursor error");
+        }
     }
 
     #[test]
