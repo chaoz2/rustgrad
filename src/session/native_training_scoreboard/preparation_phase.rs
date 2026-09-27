@@ -320,7 +320,7 @@ impl NativeTrainingPreparationFinalizationReport {
 pub(super) fn zero_preparation_finalization(
     accumulation: bool,
 ) -> NativeTrainingPreparationFinalizationReport {
-    let program = |recurrent| NativeTrainingProgramFinalizationReport {
+    let program = |recurrent: bool| NativeTrainingProgramFinalizationReport {
         pre_layout_admission_wall_time: BenchmarkDuration::from_duration(Duration::ZERO),
         workspace_construction_wall_time: BenchmarkDuration::from_duration(Duration::ZERO),
         recurrent_finalization_wall_time: recurrent
