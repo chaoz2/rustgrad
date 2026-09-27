@@ -330,14 +330,9 @@ impl CpuCompiledTrainingProgram {
         .map_err(replay_error)?;
         let traffic = replay.traffic;
         let executor_wall_time = replay.executor_wall_time;
-        let replay = replay.replay;
-        let native = replay
-            .native_trace
-            .as_ref()
-            .expect("strict-native recurrent replay returns a native trace");
         let report = native_cpu_run_report(
             self.capture_identity(),
-            native,
+            &replay.native_trace,
             traffic,
             executor_wall_time,
             next_step,
@@ -426,14 +421,9 @@ impl CpuCompiledTrainingProgram {
         .map_err(replay_error)?;
         let traffic = replay.traffic;
         let executor_wall_time = replay.executor_wall_time;
-        let replay = replay.replay;
-        let native = replay
-            .native_trace
-            .as_ref()
-            .expect("strict-native recurrent replay returns a native trace");
         let report = native_cpu_run_report(
             transition.phase().capture_identity(),
-            native,
+            &replay.native_trace,
             traffic,
             executor_wall_time,
             0,
