@@ -1391,10 +1391,17 @@ times. Wall times do not participate in identity.
   rendering. During ordinary capsule authentication, vector-plan and
   cache-discriminator checks share one current-item analysis bound to the exact
   root and scalar/vector policy. Cold rendering uses the same policy
-  implementation while retaining validation order. Source-dependent keys and
-  ABI, layout,
+  implementation while retaining validation order. Source-dependent keys, ABI,
+  layout,
   output-initialization, and role inventories retain their existing checks;
   the analysis is not a persistent proof and changes no schema or identity.
+  Recipe construction also retains a call-local witness for each item's
+  output-initialization policy and each store group's derived ABI plus exact
+  root/member binding. Authentication reuses both; final publication reuses
+  only authenticated output initialization. Decoded source, vector, ABI,
+  layout, output-initialization, and mutation checks, plus downstream
+  prepared-item authentication, remain unchanged. The witness is not persisted
+  and changes no wire, key, version, API, schema, or identity.
   Missing, stale, or corrupt sidecars fall back in program order. No measured
   speedup is claimed.
 - **Cleanup and identity.** Chunk sources and objects are cleaned on every
