@@ -1341,7 +1341,8 @@ mod tests {
         let (_, rendered, _) = backend.render_schedule_kernel(&item, &layout).unwrap();
         assert_ordinary_authentication_parity(&backend, "valid", &item, &rendered, true);
 
-        let mutations: [(&str, fn(&mut RenderedC)); 13] = [
+        type RenderedMutation = fn(&mut RenderedC);
+        let mutations: [(&str, RenderedMutation); 13] = [
             ("empty source", |value| value.source.clear()),
             ("ABI version", |value| {
                 value.abi.version = value.abi.version.saturating_add(1);
