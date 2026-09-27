@@ -20,9 +20,10 @@ use rustgrad::{
     CompiledTrainingRuntime, CpuBackend, DType, Error as RustGradError, Graph, LossOptions, Module,
     NativeCpuCompiledAdamW, NativeCpuCompiledAdamWStepResult,
     NativeCpuCompiledTrainingPreparationReport, NativeCpuProgramPreparationReport,
-    NativeCpuSessionTarget, NativeTrainingScoreboard, NodeId, Op, Parameter, ParameterSnapshot,
-    Reduction, Result, Scalar, TensorData, TrainingDropoutProvider, TransformerBlock,
-    sparse_categorical_cross_entropy,
+    NativeCpuSessionTarget, NativeTrainingPreparationFinalizationReport,
+    NativeTrainingProgramFinalizationReport, NativeTrainingScoreboard, NodeId, Op, Parameter,
+    ParameterSnapshot, Reduction, Result, Scalar, TensorData, TrainingDropoutProvider,
+    TransformerBlock, sparse_categorical_cross_entropy,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -645,6 +646,7 @@ struct ScaleWarmPreparationEvidence {
     render_overlap_wall_time_ns: u64,
     effective_render_wall_time_ns: u64,
     effective_render_fraction: f64,
+    prepare_finalization: NativeTrainingPreparationFinalizationReport,
 }
 
 #[derive(Serialize)]
@@ -1153,11 +1155,63 @@ fn collect_scale_gradient_evidence() -> Result<ScaleGradientEvidence> {
     })
 }
 
+fn scale_warm_finalization_wall_time(
+    phase: &NativeTrainingProgramFinalizationReport,
+) -> Result<Duration> {
+    [
+        Some(phase.pre_layout_admission_wall_time()),
+        Some(phase.workspace_construction_wall_time()),
+        phase.recurrent_finalization_wall_time(),
+    ]
+    .into_iter()
+    .flatten()
+    .try_fold(Duration::ZERO, |total, duration| {
+        total
+            .checked_add(
+                duration
+                    .to_duration()
+                    .map_err(|_| RustGradError::InvalidIndex)?,
+            )
+            .ok_or(RustGradError::InvalidIndex)
+    })
+}
+
 fn collect_scale_warm_preparation(
     preparation: &NativeCpuCompiledTrainingPreparationReport,
     preparation_wall_time: Duration,
 ) -> std::result::Result<ScaleWarmPreparationObservation, Box<dyn Error>> {
     assert_eq!(preparation.compiler_process_count(), 0);
+    let finalization = preparation.finalization_phases();
+    assert!(finalization.instrumented_wall_time() <= preparation_wall_time);
+    assert!(
+        finalization
+            .main()
+            .recurrent_finalization_wall_time()
+            .is_some()
+    );
+    assert!(
+        finalization
+            .accumulation()
+            .and_then(|phase| phase.recurrent_finalization_wall_time())
+            .is_some()
+    );
+    assert!(
+        finalization
+            .partial_flush()
+            .and_then(|phase| phase.recurrent_finalization_wall_time())
+            .is_some()
+    );
+    assert!(
+        finalization
+            .zero_grad()
+            .and_then(|phase| phase.recurrent_finalization_wall_time())
+            .is_some()
+    );
+    assert!(
+        finalization
+            .evaluation()
+            .is_some_and(|phase| phase.recurrent_finalization_wall_time().is_none())
+    );
     let [main, accumulation, partial_flush, zero_grad, evaluation] =
         scale_preparation_programs(preparation);
     let programs = [main, accumulation, partial_flush, zero_grad, evaluation];
@@ -1252,6 +1306,43 @@ fn collect_scale_warm_preparation(
     let effective_render_fraction =
         effective_render_wall_time.as_secs_f64() / preparation_wall_time.as_secs_f64();
     assert!(effective_render_fraction.is_finite());
+    let prepare_finalization = NativeTrainingPreparationFinalizationReport::from_preparation(
+        preparation,
+        preparation_wall_time,
+    )?;
+    let measured_finalization_wall_time = std::iter::once(prepare_finalization.main())
+        .chain(prepare_finalization.accumulation())
+        .chain(prepare_finalization.partial_flush())
+        .chain(prepare_finalization.zero_grad())
+        .chain(prepare_finalization.evaluation())
+        .try_fold(Duration::ZERO, |total, phase| {
+            total
+                .checked_add(scale_warm_finalization_wall_time(phase)?)
+                .ok_or(RustGradError::InvalidIndex)
+        })?;
+    let reconstructed_runtime_overhead_wall_time = [
+        prepare_finalization
+            .outer_remainder_wall_time()
+            .to_duration()?,
+        prepare_finalization.bootstrap_wall_time().to_duration()?,
+        measured_finalization_wall_time,
+        prepare_finalization
+            .report_input_assembly_wall_time()
+            .to_duration()?,
+        prepare_finalization
+            .unattributed_wall_time()
+            .to_duration()?,
+    ]
+    .into_iter()
+    .try_fold(Duration::ZERO, |total, duration| {
+        total
+            .checked_add(duration)
+            .ok_or(RustGradError::InvalidIndex)
+    })?;
+    assert_eq!(
+        reconstructed_runtime_overhead_wall_time,
+        runtime_overhead_wall_time
+    );
 
     Ok(ScaleWarmPreparationObservation {
         evidence: ScaleWarmPreparationEvidence {
@@ -1266,6 +1357,7 @@ fn collect_scale_warm_preparation(
             render_overlap_wall_time_ns: duration_nanos(render_overlap_wall_time)?,
             effective_render_wall_time_ns: duration_nanos(effective_render_wall_time)?,
             effective_render_fraction,
+            prepare_finalization,
         },
         program_count,
         loaded_module_count,
@@ -1890,7 +1982,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let validated_scoreboard = match scoreboard {
         Some(scoreboard) => {
             let report = scoreboard.report()?;
-            let reported_compile = report.compile_phases().expect("v24 reports compile phases");
+            let reported_compile = report.compile_phases().expect("v25 reports compile phases");
             assert_eq!(reported_compile.compile_count(), 1);
             assert!(reported_compile.evaluation().is_some());
             assert!(
@@ -2074,7 +2166,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let gradient_evidence = collect_scale_gradient_evidence()?;
 
     let objective = json!({
-        "schema_version": 6,
+        "schema_version": 7,
         "git_sha": &paths.git_sha,
         "workload": {
             "batch": BATCH,

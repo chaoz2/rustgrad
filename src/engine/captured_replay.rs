@@ -850,6 +850,8 @@ pub(crate) struct PlannedNativeItems {
     schedule_cache_keys: Vec<u64>,
     recurrent_store_groups: Vec<RecurrentStoreGroupManifest>,
     retained_recurrent_states: Vec<NativeRecurrentStateRetention>,
+    pre_layout_admission_wall_time: Duration,
+    workspace_construction_wall_time: Duration,
     #[cfg(test)]
     recurrent_store_group_admissions: Vec<RecurrentStoreGroupAdmissionDiagnostic>,
     #[cfg(test)]
@@ -862,6 +864,7 @@ pub(crate) struct NativeItemPlanDraft {
     native_store_groups: Vec<crate::backend::NativeStoreGroup>,
     admitted_recurrent_store_groups: Vec<RecurrentStoreGroupManifest>,
     retained_recurrent_states: Vec<NativeRecurrentStateRetention>,
+    pre_layout_admission_wall_time: Duration,
     #[cfg(test)]
     recurrent_store_group_admissions: Vec<RecurrentStoreGroupAdmissionDiagnostic>,
 }
@@ -1070,6 +1073,14 @@ impl PlannedNativeItems {
 
     pub(crate) fn module_preparation(&self) -> crate::backend::NativeScheduleModulePreparation {
         self.module_preparation
+    }
+
+    pub(crate) const fn pre_layout_admission_wall_time(&self) -> Duration {
+        self.pre_layout_admission_wall_time
+    }
+
+    pub(crate) const fn workspace_construction_wall_time(&self) -> Duration {
+        self.workspace_construction_wall_time
     }
 
     pub(crate) fn dispatch_segmentation(
@@ -1879,6 +1890,7 @@ impl CapturedReplayExecutor {
         #[cfg(test)]
         self.native_item_plan_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let admission_started = Instant::now();
         reject_multi_output_items(capture)?;
         validate_inputs(capture, provided)?;
         if capture
@@ -1890,6 +1902,7 @@ impl CapturedReplayExecutor {
                 "ordinary captured native replay cannot execute effect items".into(),
             ));
         }
+        let pre_layout_admission_wall_time = admission_started.elapsed();
         let started = Instant::now();
         let layouts = native_schedule_layouts(capture)?;
         let admitted = recurrent_store_groups(capture, &layouts, manifests)?;
@@ -1901,6 +1914,7 @@ impl CapturedReplayExecutor {
             native_store_groups,
             admitted_recurrent_store_groups,
             retained_recurrent_states: Vec::new(),
+            pre_layout_admission_wall_time,
             #[cfg(test)]
             recurrent_store_group_admissions: admitted.diagnostics,
         })
@@ -1990,7 +2004,9 @@ impl CapturedReplayExecutor {
             .zip(prepared)
             .map(|((capture, draft), (items, mut module_preparation))| {
                 module_preparation.layout_wall_time = draft.layout_wall_time;
+                let workspace_started = Instant::now();
                 let workspace = NativeReplayWorkspace::new(capture, &items)?;
+                let workspace_construction_wall_time = workspace_started.elapsed();
                 Ok(PlannedNativeItems {
                     items,
                     logical_item_count: capture.items.len(),
@@ -2002,6 +2018,8 @@ impl CapturedReplayExecutor {
                     schedule_cache_keys: capture.items.iter().map(|item| item.cache_key).collect(),
                     recurrent_store_groups: draft.admitted_recurrent_store_groups,
                     retained_recurrent_states: draft.retained_recurrent_states,
+                    pre_layout_admission_wall_time: draft.pre_layout_admission_wall_time,
+                    workspace_construction_wall_time,
                     #[cfg(test)]
                     recurrent_store_group_admissions: draft.recurrent_store_group_admissions,
                     #[cfg(test)]

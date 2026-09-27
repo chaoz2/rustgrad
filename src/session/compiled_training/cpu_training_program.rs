@@ -73,7 +73,15 @@ impl CpuCompiledTrainingProgram {
         plan: PlannedNativeItems,
         residual_wall_time: Duration,
     ) -> Result<PreparedNativeCpuProgram> {
+        let pre_layout_admission_wall_time = plan.pre_layout_admission_wall_time();
+        let workspace_construction_wall_time = plan.workspace_construction_wall_time();
+        let finalization_started = Instant::now();
         let replay = preparation.finish(plan).map_err(replay_error)?;
+        let finalization_phases = NativeCpuProgramFinalizationPhases::from_intervals(
+            pre_layout_admission_wall_time,
+            workspace_construction_wall_time,
+            Some(finalization_started.elapsed()),
+        );
         let trace = replay.preparation_trace();
         let wall_time = native_preparation_wall_time(trace.module, residual_wall_time)?;
         let report = NativeCpuProgramPreparationReport {
@@ -96,6 +104,7 @@ impl CpuCompiledTrainingProgram {
             report,
             replay,
             commit_only_projection,
+            finalization_phases,
         })
     }
 
@@ -427,7 +436,15 @@ impl CpuCompiledTrainingProgram {
         plan: PlannedNativeItems,
         residual_wall_time: Duration,
     ) -> Result<PreparedNativeCpuAuxiliaryProgram> {
+        let pre_layout_admission_wall_time = plan.pre_layout_admission_wall_time();
+        let workspace_construction_wall_time = plan.workspace_construction_wall_time();
+        let finalization_started = Instant::now();
         let replay = preparation.finish(plan).map_err(replay_error)?;
+        let finalization_phases = NativeCpuProgramFinalizationPhases::from_intervals(
+            pre_layout_admission_wall_time,
+            workspace_construction_wall_time,
+            Some(finalization_started.elapsed()),
+        );
         let trace = replay.preparation_trace();
         let wall_time = native_preparation_wall_time(trace.module, residual_wall_time)?;
         let report = NativeCpuProgramPreparationReport {
@@ -446,7 +463,11 @@ impl CpuCompiledTrainingProgram {
             wall_time,
         };
         report.validate_work()?;
-        Ok(PreparedNativeCpuAuxiliaryProgram { report, replay })
+        Ok(PreparedNativeCpuAuxiliaryProgram {
+            report,
+            replay,
+            finalization_phases,
+        })
     }
 
     pub(super) fn finish_native_accumulation(
@@ -457,7 +478,15 @@ impl CpuCompiledTrainingProgram {
         plan: PlannedNativeItems,
         residual_wall_time: Duration,
     ) -> Result<PreparedNativeCpuProgram> {
+        let pre_layout_admission_wall_time = plan.pre_layout_admission_wall_time();
+        let workspace_construction_wall_time = plan.workspace_construction_wall_time();
+        let finalization_started = Instant::now();
         let replay = preparation.finish(plan).map_err(replay_error)?;
+        let finalization_phases = NativeCpuProgramFinalizationPhases::from_intervals(
+            pre_layout_admission_wall_time,
+            workspace_construction_wall_time,
+            Some(finalization_started.elapsed()),
+        );
         let trace = replay.preparation_trace();
         let wall_time = native_preparation_wall_time(trace.module, residual_wall_time)?;
         let report = NativeCpuProgramPreparationReport {
@@ -484,6 +513,7 @@ impl CpuCompiledTrainingProgram {
             report,
             replay,
             commit_only_projection,
+            finalization_phases,
         })
     }
 

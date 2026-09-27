@@ -735,8 +735,17 @@ impl CompiledAdamWPlan {
         &self,
         target: &NativeCpuSessionTarget<'a>,
     ) -> Result<NativeCpuCompiledAdamW<'a>> {
+        let runtime_started = Instant::now();
+        let bootstrap_started = Instant::now();
         let inner = self.prepare_cpu_with_non_finite_policy(target.non_finite_policy())?;
-        NativeCpuCompiledAdamW::prepare(inner, target.executor(), target.is_vectorized())
+        let bootstrap_wall_time = bootstrap_started.elapsed();
+        NativeCpuCompiledAdamW::prepare(
+            inner,
+            target.executor(),
+            target.is_vectorized(),
+            runtime_started,
+            bootstrap_wall_time,
+        )
     }
 
     /// Prepares this authenticated plan through a concrete session target.

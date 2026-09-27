@@ -353,6 +353,11 @@ impl CompiledEvaluationPlan {
         plan: PlannedNativeItems,
     ) -> Result<PreparedNativeCpuEvaluation> {
         let capture = self.inference.capture();
+        let finalization_phases = NativeCpuProgramFinalizationPhases::from_intervals(
+            plan.pre_layout_admission_wall_time(),
+            plan.workspace_construction_wall_time(),
+            None,
+        );
         let module_preparation = plan.module_preparation();
         let work = NativeCpuPreparationWork::from_module(module_preparation);
         let execution_plan = ExecutionPlanSummary::from_capture(capture, true)
@@ -382,6 +387,7 @@ impl CompiledEvaluationPlan {
             report,
             plan,
             parameter_inputs: preparation.parameter_inputs,
+            finalization_phases,
         };
         prepared.validate(self.capture_identity, capture, parameter_buffers)?;
         Ok(prepared)
