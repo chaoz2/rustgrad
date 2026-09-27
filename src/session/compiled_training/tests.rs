@@ -3237,39 +3237,6 @@ fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
         authenticated_retention.retained_recurrent_states(),
         raw_retention.retained_recurrent_states()
     );
-    let main_inputs = zero_inputs(&retention_cpu.inner.inputs).unwrap();
-    let mut foreign_cursor = retention_cpu.inner.cursor.clone();
-    foreign_cursor.capture_identity ^= u64::MAX;
-    let mut incomplete_cursor = retention_cpu.inner.cursor.clone();
-    incomplete_cursor.frontier.pop();
-    let mut reordered_cursor = retention_cpu.inner.cursor.clone();
-    assert!(reordered_cursor.frontier.len() > 1);
-    reordered_cursor.frontier.swap(0, 1);
-    for (case, malformed) in [
-        ("foreign", foreign_cursor),
-        ("incomplete", incomplete_cursor),
-        ("reordered", reordered_cursor),
-    ] {
-        let raw_error = match retention_cpu.inner.capture.preflight_recurrent_native(
-            &retention_cpu.inner.runtime,
-            &malformed,
-            &main_inputs,
-            false,
-        ) {
-            Ok(_) => panic!("raw native preflight accepted the {case} cursor"),
-            Err(error) => error,
-        };
-        let authenticated_error = match retention_cpu.inner.recurrent_frontier.preflight_native(
-            &retention_cpu.inner.runtime,
-            &malformed,
-            &main_inputs,
-            false,
-        ) {
-            Ok(_) => panic!("authenticated native preflight accepted the {case} cursor"),
-            Err(error) => error,
-        };
-        assert_eq!(authenticated_error, raw_error, "{case} cursor error");
-    }
     let reset_transition = plan.zero_grad.as_ref().unwrap();
     assert_eq!(
         reset_transition.phase().state_buffers.len(),

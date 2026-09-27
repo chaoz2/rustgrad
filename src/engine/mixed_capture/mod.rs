@@ -1438,6 +1438,7 @@ impl PreparedRecurrentReplacementPlan {
         Ok(())
     }
 
+    #[cfg(test)]
     fn from_capture(capture: &CapturedMixedSchedule) -> Result<Self, ReplayError> {
         // Prepared replacement metadata authenticates the capture's immutable
         // version-zero descriptor floor, never the cursor used at preparation.
@@ -4483,6 +4484,69 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn captured_two_effects() -> CapturedMixedSchedule {
+        let mut effects = EffectGraph::default();
+        let mut states = Vec::new();
+        for (target_buffer, source_buffer) in [(50, 51), (60, 61)] {
+            let target = effects
+                .insert(
+                    target_buffer,
+                    TensorData::from_storage([2], Storage::F32(vec![0.0, 0.0])).unwrap(),
+                )
+                .unwrap();
+            let source = effects
+                .insert(
+                    source_buffer,
+                    TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
+                )
+                .unwrap();
+            let next = effects.assign(&target, &source).unwrap();
+            states.extend([
+                target.state().clone(),
+                source.state().clone(),
+                next.state().clone(),
+            ]);
+        }
+        let schedule = schedule_effects(&effects).unwrap();
+        let capture = CapturedSchedule {
+            items: schedule.items.clone(),
+            inputs: vec![],
+            constants: BTreeMap::new(),
+            quantized_constants: BTreeMap::new(),
+            requested_passthroughs: vec![],
+            requested: vec![],
+            identity: 0,
+            symbolic: None,
+            specialized_from: None,
+        };
+        CapturedMixedSchedule::from_parts(capture, &schedule, states).unwrap()
+    }
+
+    #[test]
+    fn authenticated_cursor_admission_matches_raw_for_malformed_two_state_frontiers() {
+        let capture = Arc::new(captured_two_effects());
+        let authenticated = AuthenticatedRecurrentFrontier::authenticate(capture.clone()).unwrap();
+        let cursor = authenticated.initial_cursor();
+        assert_eq!(cursor.frontier.len(), 2);
+
+        let mut foreign = cursor.clone();
+        foreign.capture_identity ^= u64::MAX;
+        let mut incomplete = cursor.clone();
+        incomplete.frontier.pop();
+        let mut reordered = cursor.clone();
+        reordered.frontier.swap(0, 1);
+
+        for (case, malformed) in [
+            ("foreign", foreign),
+            ("incomplete", incomplete),
+            ("reordered", reordered),
+        ] {
+            let raw_error = validate_recurrent_cursor(capture.as_ref(), &malformed).unwrap_err();
+            let authenticated_error = authenticated.validate_cursor(&malformed).unwrap_err();
+            assert_eq!(authenticated_error, raw_error, "{case} cursor error");
+        }
     }
 
     #[test]
