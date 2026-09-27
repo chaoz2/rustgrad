@@ -11,11 +11,15 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 mod recurrent_frontier;
 pub(crate) use recurrent_frontier::AuthenticatedRecurrentFrontier;
+mod output_projection;
+use output_projection::PreparedRecurrentOutputProjection;
+pub(crate) use output_projection::PreparedRecurrentOutputProjectionHandle;
 
 const MAGIC: &[u8; 4] = b"RGSM";
 /// v3 adopts canonical schedule item/state-binding keys. v1-v2 retain opaque
@@ -36,6 +40,7 @@ pub(crate) struct PreparedReplayValidationCounts {
     pub(crate) recurrent_frontier_authentications: usize,
     pub(crate) cursor_projection_preparations: usize,
     pub(crate) recurrent_bank_layouts: usize,
+    pub(crate) recurrent_output_projection_builds: usize,
 }
 
 #[cfg(test)]
@@ -50,6 +55,7 @@ std::thread_local! {
                 recurrent_frontier_authentications: 0,
                 cursor_projection_preparations: 0,
                 recurrent_bank_layouts: 0,
+                recurrent_output_projection_builds: 0,
             })
         };
 }
@@ -446,22 +452,44 @@ impl<'a> NativeReplayContext<'a> {
     where
         F: FnOnce(&[crate::TensorData], &[&crate::TensorData]) -> Result<(), String>,
     {
-        self.replay_recurrent_selected_checked(
+        self.replay_recurrent_selected_checked_impl(
             runtime,
             cursor,
             provided,
-            None,
+            NativeRecurrentOutputSelection::Full,
             injected_failure,
             validate_transition,
         )
     }
 
-    pub(crate) fn replay_recurrent_selected_checked<F>(
+    pub(crate) fn replay_recurrent_projected_checked<F>(
         self,
         runtime: &mut crate::EffectRuntime,
         cursor: &mut MixedReplayCursor,
         provided: &BTreeMap<String, crate::TensorData>,
-        selected_requested: Option<&[u64]>,
+        projection: &PreparedRecurrentOutputProjectionHandle,
+        injected_failure: Option<u64>,
+        validate_transition: F,
+    ) -> Result<NativeMixedReplayResult, ReplayError>
+    where
+        F: FnOnce(&[crate::TensorData], &[&crate::TensorData]) -> Result<(), String>,
+    {
+        self.replay_recurrent_selected_checked_impl(
+            runtime,
+            cursor,
+            provided,
+            NativeRecurrentOutputSelection::Prepared(projection),
+            injected_failure,
+            validate_transition,
+        )
+    }
+
+    fn replay_recurrent_selected_checked_impl<F>(
+        self,
+        runtime: &mut crate::EffectRuntime,
+        cursor: &mut MixedReplayCursor,
+        provided: &BTreeMap<String, crate::TensorData>,
+        selection: NativeRecurrentOutputSelection<'_>,
         injected_failure: Option<u64>,
         validate_transition: F,
     ) -> Result<NativeMixedReplayResult, ReplayError>
@@ -486,14 +514,35 @@ impl<'a> NativeReplayContext<'a> {
             trace,
             plan,
             pure,
-            requested,
             banks: bank_layout,
+            output_projections,
         } = prepared;
-        let all_requested = requested.as_slice();
-        let requested = selected_requested.unwrap_or(all_requested);
-        validate_requested_selection(all_requested, requested)?;
+        let projection = match selection {
+            NativeRecurrentOutputSelection::Full => {
+                output_projections.first().ok_or_else(|| {
+                    ReplayError::Corrupt(
+                        "prepared recurrent full output projection is absent".into(),
+                    )
+                })?
+            }
+            NativeRecurrentOutputSelection::Prepared(handle) => {
+                if handle.capture_identity() != trace.replay.artifact_identity {
+                    return Err(ReplayError::Corrupt(
+                        "prepared recurrent output projection belongs to a different capture"
+                            .into(),
+                    ));
+                }
+                output_projections
+                    .iter()
+                    .find(|projection| projection.is_owned_by(handle))
+                    .ok_or_else(|| {
+                        ReplayError::Corrupt(
+                            "prepared recurrent output projection owner mismatch".into(),
+                        )
+                    })?
+            }
+        };
         bank_layout.validate_external_inputs(provided)?;
-        let public = requested.iter().copied().collect::<BTreeSet<_>>();
         let staged = runtime.transact_recurrent_native_full_frontier(
             current,
             &next,
@@ -531,7 +580,7 @@ impl<'a> NativeReplayContext<'a> {
                         pure,
                         plan,
                         &mut borrowed,
-                        Some(&public),
+                        Some(projection.public()),
                         |workspace, borrowed| {
                             for (ordinal, (binding, mode)) in bank_layout
                                 .banks
@@ -601,19 +650,9 @@ impl<'a> NativeReplayContext<'a> {
                     let (values, traffic) = executed?;
                     (values, traffic, executor_wall_time)
                 };
-                let outputs = requested
-                    .iter()
-                    .map(|id| {
-                        if bank_layout.successor_outputs.contains(id) {
-                            // A public state successor was materialized as an
-                            // independent snapshot; preserve it while the inactive
-                            // recurrent bank becomes authoritative.
-                            values.tensor(*id, "requested mixed output").cloned()
-                        } else {
-                            values.take_tensor(*id, "requested mixed output")
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                // Public state successors remain independent snapshots while
+                // the inactive recurrent bank becomes authoritative.
+                let outputs = projection.extract(&mut values)?;
                 let successor_values = banks
                     .iter()
                     .zip(bank_layout.banks.iter())
@@ -701,20 +740,44 @@ pub(crate) struct PreparedRecurrentNativeReplay {
     trace: NativeMixedPreparationTrace,
     plan: super::captured_replay::SealedPlannedNativeItems,
     pure: CapturedSchedule,
-    requested: Vec<u64>,
     banks: PreparedRecurrentBankLayout,
+    output_projections: Vec<PreparedRecurrentOutputProjection>,
+}
+
+enum NativeRecurrentOutputSelection<'a> {
+    Full,
+    Prepared(&'a PreparedRecurrentOutputProjectionHandle),
 }
 
 pub(crate) struct RecurrentNativePreparation {
     pure: CapturedSchedule,
     inputs: Option<BTreeMap<String, crate::TensorData>>,
     requested: Vec<u64>,
+    output_projection_requests: Vec<Arc<[u64]>>,
     replacements: PreparedRecurrentReplacementPlan,
     replay: NativeMixedReplayTrace,
     retained_recurrent_states: Vec<super::captured_replay::NativeRecurrentStateRetention>,
 }
 
 impl RecurrentNativePreparation {
+    pub(crate) fn seal_output_projection(
+        &mut self,
+        selected: &[u64],
+    ) -> Result<PreparedRecurrentOutputProjectionHandle, ReplayError> {
+        validate_requested_selection(&self.requested, selected)?;
+        let requested = Arc::<[u64]>::from(selected);
+        self.output_projection_requests.push(Arc::clone(&requested));
+        Ok(PreparedRecurrentOutputProjectionHandle::new(
+            self.replay.artifact_identity,
+            Arc::clone(
+                self.output_projection_requests
+                    .first()
+                    .expect("native recurrent preparation owns its full output projection"),
+            ),
+            requested,
+        ))
+    }
+
     pub(crate) fn pure(&self) -> &CapturedSchedule {
         &self.pure
     }
@@ -758,6 +821,7 @@ impl RecurrentNativePreparation {
             self.pure,
             self.requested,
             self.replacements,
+            self.output_projection_requests,
         )
     }
 }
@@ -826,6 +890,7 @@ impl PreparedRecurrentNativeReplay {
         pure: CapturedSchedule,
         requested: Vec<u64>,
         replacements: PreparedRecurrentReplacementPlan,
+        output_projection_requests: Vec<Arc<[u64]>>,
     ) -> Result<Self, ReplayError> {
         replacements.authenticate_recurrent_store_groups(plan.recurrent_store_groups())?;
         replacements
@@ -848,12 +913,36 @@ impl PreparedRecurrentNativeReplay {
                 "prepared recurrent native plan inventory mismatch".into(),
             ));
         }
+        if output_projection_requests
+            .first()
+            .is_none_or(|full| full.as_ref() != requested.as_slice())
+        {
+            return Err(ReplayError::Corrupt(
+                "prepared recurrent full output projection mismatch".into(),
+            ));
+        }
+        let output_projections = output_projection_requests
+            .iter()
+            .map(|selected| {
+                PreparedRecurrentOutputProjection::prepare(
+                    Arc::clone(selected),
+                    &requested,
+                    &banks.successor_outputs,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(test)]
+        record_prepared_replay_validation(|counts| {
+            counts.recurrent_output_projection_builds = counts
+                .recurrent_output_projection_builds
+                .saturating_add(output_projections.len());
+        });
         Ok(Self {
             trace,
             plan,
             pure,
-            requested,
             banks,
+            output_projections,
         })
     }
 
@@ -1855,10 +1944,13 @@ impl CapturedMixedSchedule {
         } else {
             Vec::new()
         };
+        let requested = self.schedule.requested.clone();
+        let output_projection_requests = vec![Arc::<[u64]>::from(requested.as_slice())];
         Ok(RecurrentNativePreparation {
             pure,
             inputs: Some(inputs),
-            requested: self.schedule.requested.clone(),
+            requested,
+            output_projection_requests,
             replacements,
             replay: self.native_replay_trace(vectorized)?,
             retained_recurrent_states,
@@ -3564,6 +3656,51 @@ mod recurrent_tests {
         assert_eq!(host_transactions.ordered_full_frontier_transactions, 5);
         assert_eq!(host_transactions.request_map_builds, 0);
         assert_eq!(host_transactions.ordinal_sorts, 0);
+    }
+
+    #[test]
+    fn prepared_output_projection_rejects_same_capture_foreign_owner_before_transaction() {
+        let (capture, mut runtime) = fixture(654);
+        let executor = CapturedReplayExecutor::default();
+        let mut cursor = capture.initial_recurrent_cursor().unwrap();
+        let inputs = delta(1.0);
+
+        let mut foreign_preparation = capture
+            .preflight_recurrent_native(&runtime, &cursor, &inputs, false)
+            .unwrap();
+        let foreign = foreign_preparation.seal_output_projection(&[]).unwrap();
+
+        let mut local_preparation = capture
+            .preflight_recurrent_native(&runtime, &cursor, &inputs, false)
+            .unwrap();
+        local_preparation.seal_output_projection(&[]).unwrap();
+        let plan = {
+            let (pure, provided) = local_preparation.pure_and_inputs();
+            executor.plan_native_items(pure, provided, false).unwrap()
+        };
+        let mut prepared = local_preparation.finish(plan).unwrap();
+        crate::host_buffer::reset_host_bank_transaction_test_counts();
+        let initial_cursor = cursor.clone();
+        let initial_values = frontier_values(&runtime, &cursor);
+        assert!(matches!(
+            NativeReplayContext::new(&executor, &mut prepared)
+                .replay_recurrent_projected_checked(
+                    &mut runtime,
+                    &mut cursor,
+                    &inputs,
+                    &foreign,
+                    None,
+                    |_, _| Ok(())
+                ),
+            Err(ReplayError::Corrupt(message))
+                if message == "prepared recurrent output projection owner mismatch"
+        ));
+        assert_eq!(cursor, initial_cursor);
+        assert_eq!(frontier_values(&runtime, &cursor), initial_values);
+        assert_eq!(
+            crate::host_buffer::host_bank_transaction_test_counts(),
+            crate::host_buffer::HostBankTransactionTestCounts::default()
+        );
     }
 
     #[test]

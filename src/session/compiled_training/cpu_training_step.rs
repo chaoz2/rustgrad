@@ -37,11 +37,16 @@ struct TrainingStepTransaction {
 
 struct AuthenticatedTrainingStep {
     transaction: TrainingStepTransaction,
-    selected_requested: Option<Vec<u64>>,
+    output_projection: AuthenticatedTrainingOutputProjection,
     named_output_count: usize,
     observations: Option<CompiledTrainingObservationSchema>,
     include_observations: bool,
     validate_commit_observations: bool,
+}
+
+enum AuthenticatedTrainingOutputProjection {
+    Dynamic(Option<Vec<u64>>),
+    Prepared,
 }
 
 struct CompletedTrainingStep {
@@ -71,31 +76,52 @@ impl TrainingStepTransaction {
         include_observations: bool,
         validate_commit_observations: bool,
     ) -> Result<AuthenticatedTrainingStep> {
+        let selected_requested = if self.output_selection.includes_named_outputs() {
+            None
+        } else {
+            Some(outputs.selected_requested(
+                &capture.schedule.requested,
+                self.output_selection,
+                include_observations,
+            )?)
+        };
+        if selected_requested.is_none() {
+            let expected = outputs.selected_len(true, include_observations)?;
+            if capture.schedule.requested.len() != expected {
+                return Err(training(
+                    "compiled requested output layout does not match its authenticated capture",
+                ));
+            }
+        }
+        Ok(AuthenticatedTrainingStep {
+            transaction: self,
+            output_projection: AuthenticatedTrainingOutputProjection::Dynamic(selected_requested),
+            named_output_count: outputs.named_outputs.len(),
+            observations: include_observations.then(|| outputs.observations.clone()),
+            include_observations,
+            validate_commit_observations,
+        })
+    }
+
+    fn authenticate_prepared_outputs(
+        self,
+        capture: &CapturedMixedSchedule,
+        outputs: &CompiledTrainingPhaseOutputSchema,
+        prepared_projection: &PreparedRecurrentOutputProjectionHandle,
+        include_observations: bool,
+        validate_commit_observations: bool,
+    ) -> Result<AuthenticatedTrainingStep> {
         let expected = outputs.selected_len(true, include_observations)?;
-        if capture.schedule.requested.len() != expected {
+        if capture.schedule.requested.len() != expected
+            || !prepared_projection.authenticates_requested(&capture.schedule.requested)
+        {
             return Err(training(
                 "compiled requested output layout does not match its authenticated capture",
             ));
         }
-        let selected_requested = if self.output_selection.includes_named_outputs() {
-            None
-        } else {
-            let mut selected =
-                Vec::with_capacity(outputs.selected_len(false, include_observations)?);
-            selected.push(capture.schedule.requested[0]);
-            selected.extend(
-                capture
-                    .schedule
-                    .requested
-                    .iter()
-                    .skip(1 + outputs.named_outputs.len())
-                    .copied(),
-            );
-            Some(selected)
-        };
         Ok(AuthenticatedTrainingStep {
             transaction: self,
-            selected_requested,
+            output_projection: AuthenticatedTrainingOutputProjection::Prepared,
             named_output_count: outputs.named_outputs.len(),
             observations: include_observations.then(|| outputs.observations.clone()),
             include_observations,
@@ -110,7 +136,16 @@ impl AuthenticatedTrainingStep {
     }
 
     fn selected_requested(&self) -> Option<&[u64]> {
-        self.selected_requested.as_deref()
+        match &self.output_projection {
+            AuthenticatedTrainingOutputProjection::Dynamic(selected) => selected.as_deref(),
+            AuthenticatedTrainingOutputProjection::Prepared => {
+                unreachable!("prepared native output projection has no dynamic selection")
+            }
+        }
+    }
+
+    fn output_selection(&self) -> CompiledStepOutputSelection {
+        self.transaction.output_selection
     }
 
     fn injected_failure(&self) -> Option<u64> {
@@ -258,29 +293,41 @@ impl CpuCompiledTrainingProgram {
         request: CompiledStepReplayRequest,
         validate_commit_observations: bool,
         native: NativeReplayContext<'_>,
+        commit_only_projection: &PreparedRecurrentOutputProjectionHandle,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
         let admitted = self.admit_training_step(request)?;
         let (provided, transaction) = admitted.into_main_bindings();
         let started = Instant::now();
-        let transaction = transaction.authenticate_outputs(
+        let transaction = transaction.authenticate_prepared_outputs(
             &self.capture,
             &self.phase_outputs,
+            commit_only_projection,
             true,
             validate_commit_observations,
         )?;
         let next_step = transaction.next_step();
-        let replay = native
-            .replay_recurrent_selected_checked(
+        let replay = match transaction.output_selection() {
+            CompiledStepOutputSelection::All => native.replay_recurrent_checked(
                 &mut self.runtime,
                 &mut self.cursor,
                 &provided,
-                transaction.selected_requested(),
                 transaction.injected_failure(),
                 |outputs, successors| {
                     transaction.validate_transition(outputs, successors.iter().copied())
                 },
-            )
-            .map_err(replay_error)?;
+            ),
+            CompiledStepOutputSelection::CommitOnly => native.replay_recurrent_projected_checked(
+                &mut self.runtime,
+                &mut self.cursor,
+                &provided,
+                commit_only_projection,
+                transaction.injected_failure(),
+                |outputs, successors| {
+                    transaction.validate_transition(outputs, successors.iter().copied())
+                },
+            ),
+        }
+        .map_err(replay_error)?;
         let traffic = replay.traffic;
         let executor_wall_time = replay.executor_wall_time;
         let replay = replay.replay;
@@ -341,30 +388,42 @@ impl CpuCompiledTrainingProgram {
         transition: &CompiledTrainingSiblingPlan,
         request: CompiledStepReplayRequest,
         native: NativeReplayContext<'_>,
+        commit_only_projection: &PreparedRecurrentOutputProjectionHandle,
     ) -> Result<(CompiledTrainingStepResult, NativeCpuRunReport)> {
         let admitted = self.admit_training_step(request)?;
         let (provided, transaction) = admitted.into_accumulation_bindings();
         let started = Instant::now();
         let mut prepared =
             self.prepare_phase_replay(&transition.phase().cursor_projection, provided)?;
-        let transaction = transaction.authenticate_outputs(
+        let transaction = transaction.authenticate_prepared_outputs(
             &transition.phase().capture,
             &self.phase_outputs,
+            commit_only_projection,
             false,
             false,
         )?;
-        let replay = native
-            .replay_recurrent_selected_checked(
+        let replay = match transaction.output_selection() {
+            CompiledStepOutputSelection::All => native.replay_recurrent_checked(
                 &mut self.runtime,
                 prepared.cursor.cursor_mut(),
                 &prepared.provided,
-                transaction.selected_requested(),
                 transaction.injected_failure(),
                 |outputs, successors| {
                     transaction.validate_transition(outputs, successors.iter().copied())
                 },
-            )
-            .map_err(replay_error)?;
+            ),
+            CompiledStepOutputSelection::CommitOnly => native.replay_recurrent_projected_checked(
+                &mut self.runtime,
+                prepared.cursor.cursor_mut(),
+                &prepared.provided,
+                commit_only_projection,
+                transaction.injected_failure(),
+                |outputs, successors| {
+                    transaction.validate_transition(outputs, successors.iter().copied())
+                },
+            ),
+        }
+        .map_err(replay_error)?;
         let traffic = replay.traffic;
         let executor_wall_time = replay.executor_wall_time;
         let replay = replay.replay;

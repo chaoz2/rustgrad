@@ -38,7 +38,11 @@ impl CpuCompiledTrainingProgram {
         &self,
         vectorized: bool,
         external_learning_rate: bool,
-    ) -> Result<(RecurrentNativePreparation, Duration)> {
+    ) -> Result<(
+        RecurrentNativePreparation,
+        PreparedRecurrentOutputProjectionHandle,
+        Duration,
+    )> {
         let started = Instant::now();
         let mut provided = zero_inputs(&self.inputs)?;
         if external_learning_rate {
@@ -47,16 +51,25 @@ impl CpuCompiledTrainingProgram {
                 TensorData::zeros_with_dtype(Shape::from([]), DType::F32)?,
             );
         }
-        let preparation = self
+        let mut preparation = self
             .capture
             .preflight_recurrent_native(&self.runtime, &self.cursor, &provided, vectorized)
             .map_err(replay_error)?;
-        Ok((preparation, started.elapsed()))
+        let commit_only = self.phase_outputs.selected_requested(
+            &self.capture.schedule.requested,
+            CompiledStepOutputSelection::CommitOnly,
+            true,
+        )?;
+        let commit_only = preparation
+            .seal_output_projection(&commit_only)
+            .map_err(replay_error)?;
+        Ok((preparation, commit_only, started.elapsed()))
     }
 
     pub(super) fn finish_native(
         &self,
         preparation: RecurrentNativePreparation,
+        commit_only_projection: PreparedRecurrentOutputProjectionHandle,
         plan: PlannedNativeItems,
         residual_wall_time: Duration,
     ) -> Result<PreparedNativeCpuProgram> {
@@ -79,7 +92,11 @@ impl CpuCompiledTrainingProgram {
             wall_time,
         };
         report.validate_work()?;
-        Ok(PreparedNativeCpuProgram { report, replay })
+        Ok(PreparedNativeCpuProgram {
+            report,
+            replay,
+            commit_only_projection,
+        })
     }
 
     pub(super) fn step_count(&self) -> u64 {
@@ -370,14 +387,18 @@ impl CpuCompiledTrainingProgram {
         &self,
         transition: &CompiledTrainingSiblingPlan,
         vectorized: bool,
-    ) -> Result<(RecurrentNativePreparation, Duration)> {
+    ) -> Result<(
+        RecurrentNativePreparation,
+        PreparedRecurrentOutputProjectionHandle,
+        Duration,
+    )> {
         debug_assert!(transition.phase().retains_unchanged());
         let started = Instant::now();
         let prepared = self.prepare_phase_replay(
             &transition.phase().cursor_projection,
             zero_inputs(&self.inputs)?,
         )?;
-        let preparation = transition
+        let mut preparation = transition
             .phase()
             .capture
             .preflight_recurrent_native_retaining_unchanged(
@@ -387,7 +408,15 @@ impl CpuCompiledTrainingProgram {
                 vectorized,
             )
             .map_err(replay_error)?;
-        Ok((preparation, started.elapsed()))
+        let commit_only = self.phase_outputs.selected_requested(
+            &transition.phase().capture.schedule.requested,
+            CompiledStepOutputSelection::CommitOnly,
+            false,
+        )?;
+        let commit_only = preparation
+            .seal_output_projection(&commit_only)
+            .map_err(replay_error)?;
+        Ok((preparation, commit_only, started.elapsed()))
     }
 
     pub(super) fn finish_native_auxiliary_transition(
@@ -396,7 +425,7 @@ impl CpuCompiledTrainingProgram {
         preparation: RecurrentNativePreparation,
         plan: PlannedNativeItems,
         residual_wall_time: Duration,
-    ) -> Result<PreparedNativeCpuProgram> {
+    ) -> Result<PreparedNativeCpuAuxiliaryProgram> {
         let replay = preparation.finish(plan).map_err(replay_error)?;
         let trace = replay.preparation_trace();
         let wall_time = native_preparation_wall_time(trace.module, residual_wall_time)?;
@@ -416,13 +445,14 @@ impl CpuCompiledTrainingProgram {
             wall_time,
         };
         report.validate_work()?;
-        Ok(PreparedNativeCpuProgram { report, replay })
+        Ok(PreparedNativeCpuAuxiliaryProgram { report, replay })
     }
 
     pub(super) fn finish_native_accumulation(
         &self,
         transition: &CompiledTrainingSiblingPlan,
         preparation: RecurrentNativePreparation,
+        commit_only_projection: PreparedRecurrentOutputProjectionHandle,
         plan: PlannedNativeItems,
         residual_wall_time: Duration,
     ) -> Result<PreparedNativeCpuProgram> {
@@ -449,7 +479,11 @@ impl CpuCompiledTrainingProgram {
             wall_time,
         };
         report.validate_work()?;
-        Ok(PreparedNativeCpuProgram { report, replay })
+        Ok(PreparedNativeCpuProgram {
+            report,
+            replay,
+            commit_only_projection,
+        })
     }
 
     pub(super) fn replay_recurrent_phase_native<T, F>(

@@ -1321,7 +1321,9 @@ Preparation has one ordered, fail-closed pipeline:
 
 Each prepared recurrent program seals its validated RGSM identity, pure
 cache/layout inventory, canonical ordinal bank/input/replacement layout,
-ordered retain modes, retained counts/bytes, and initial frontier descriptor once.
+ordered retain modes, retained counts/bytes, initial frontier descriptor, and
+capture-bound ordered output projections once. Output projections retain logical
+requested order separately from native liveness and successor-clone metadata.
 Main, accumulation, partial-flush, and `zero_grad` hot replay repeats only
 call-dependent cursor, input, active-bank, quantized-index, successor, and
 transaction admission. Generic artifact replay retains full per-call artifact

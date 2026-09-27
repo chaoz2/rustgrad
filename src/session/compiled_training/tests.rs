@@ -3255,6 +3255,8 @@ fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
         .with_non_finite_policy(CpuNonFinitePolicy::RejectTransition);
     let mut native = target.prepare(&plan).unwrap();
     assert_eq!(executor.native_item_plan_count(), 4);
+    let projection_counts = crate::engine::mixed_capture::prepared_replay_validation_counts();
+    assert_eq!(projection_counts.recurrent_output_projection_builds, 6);
     let expected_recurrent_state_count = plan.inspection().unwrap().recurrent_state_count();
     let main_layout = native.main_replay.recurrent_bank_layout_evidence();
     let main_buffers = main_layout.buffers;
@@ -8378,6 +8380,9 @@ fn cpu_commit_only_steps_preserve_adamw_state_and_skip_named_egress() {
     let mut interpreted_commit = plan.prepare_cpu().unwrap();
     let mut native = target.prepare(&plan).unwrap();
     let mut native_commit = target.prepare(&plan).unwrap();
+    let prepared_output_projection_builds =
+        crate::engine::mixed_capture::prepared_replay_validation_counts()
+            .recurrent_output_projection_builds;
     assert_eq!(native.main_replay.zero_domain_item_count(), 1);
     assert_eq!(native_commit.main_replay.zero_domain_item_count(), 1);
     assert_eq!(
@@ -8531,6 +8536,12 @@ fn cpu_commit_only_steps_preserve_adamw_state_and_skip_named_egress() {
     );
     assert_eq!(commit_main.last_materialized_egress_count, 5);
     assert_eq!(commit_main.last_materialized_egress_bytes, 24);
+    assert_eq!(
+        crate::engine::mixed_capture::prepared_replay_validation_counts()
+            .recurrent_output_projection_builds,
+        prepared_output_projection_builds,
+        "all and commit-only main/accumulation replays must reuse their sealed projections"
+    );
 
     let mut injected = plan.prepare_cpu().unwrap();
     let mut retry_reference = plan.prepare_cpu().unwrap();
@@ -10950,9 +10961,16 @@ fn compiled_resume_bundle_seals_one_decode_and_training_topology_for_restore() {
     let inspection = independently_restored.inspection().unwrap();
     let mut restored = restored.prepare(&CpuSessionTarget::new()).unwrap();
     let executor = CapturedReplayExecutor::default();
-    let independent = independently_restored
+    crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
+    let mut independent = independently_restored
         .prepare(&NativeCpuSessionTarget::new(&executor))
         .unwrap();
+    assert_eq!(
+        crate::engine::mixed_capture::prepared_replay_validation_counts()
+            .recurrent_output_projection_builds,
+        6,
+        "restored N=3 main/accumulation schemas plus recurrent auxiliary roles must seal once"
+    );
     let preparation = independent.native_cpu_preparation_report();
     assert_eq!(preparation.main().capture_identity(), inspection.main().0);
     assert_eq!(preparation.main().execution_plan(), inspection.main().1);
@@ -10971,14 +10989,32 @@ fn compiled_resume_bundle_seals_one_decode_and_training_topology_for_restore() {
     }
     assert_eq!(restored.checkpoint().unwrap(), optimizer_checkpoint);
     assert_eq!(independent.checkpoint().unwrap(), optimizer_checkpoint);
-    restored
-        .step(
-            BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 0.25]).unwrap())]),
-            TensorData::scalar(0.01),
-        )
+    let resumed_batch =
+        || BTreeMap::from([("x".into(), TensorData::new([2], vec![1.0, 0.25]).unwrap())]);
+    let expected = restored
+        .step(resumed_batch(), TensorData::scalar(0.01))
         .unwrap();
+    assert_eq!(
+        independent.checkpoint().unwrap(),
+        optimizer_checkpoint,
+        "restored owners must retain independent mutable frontiers"
+    );
+    let actual = independent
+        .step_commit_only(resumed_batch(), TensorData::scalar(0.01))
+        .unwrap();
+    assert_eq!(actual.loss(), expected.loss());
+    assert!(actual.outputs().is_empty());
+    assert_eq!(
+        independent.checkpoint().unwrap(),
+        restored.checkpoint().unwrap()
+    );
+    assert_eq!(
+        crate::engine::mixed_capture::prepared_replay_validation_counts()
+            .recurrent_output_projection_builds,
+        6,
+        "restored native replay must reuse its sealed output projection"
+    );
     assert_ne!(restored.checkpoint().unwrap(), optimizer_checkpoint);
-    assert_eq!(independent.checkpoint().unwrap(), optimizer_checkpoint);
 }
 
 #[test]
