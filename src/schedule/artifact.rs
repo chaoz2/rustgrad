@@ -209,12 +209,12 @@ pub(crate) fn identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError>
 }
 
 #[cfg(test)]
-fn reset_identity_call_count() {
+pub(crate) fn reset_identity_call_count() {
     IDENTITY_CALL_COUNT.with(|count| count.set(0));
 }
 
 #[cfg(test)]
-fn identity_call_count() -> usize {
+pub(crate) fn identity_call_count() -> usize {
     IDENTITY_CALL_COUNT.with(Cell::get)
 }
 
@@ -1707,18 +1707,75 @@ pub(crate) fn validate_capture(c: &CapturedSchedule) -> Result<(), ArtifactError
     Ok(())
 }
 
+/// One freshly assembled capture whose canonical identity has been assigned,
+/// but whose structure has not yet been authenticated. Ownership prevents the
+/// payload from changing between those two ordered stages.
+pub(crate) struct IdentifiedFreshCapture {
+    capture: CapturedSchedule,
+}
+
+/// One freshly assembled capture whose assigned identity and complete
+/// structure have both been authenticated without a second serialization.
+pub(crate) struct AuthenticatedFreshCapture {
+    capture: CapturedSchedule,
+}
+
+pub(crate) fn begin_fresh_capture_seal(
+    mut capture: CapturedSchedule,
+) -> Result<IdentifiedFreshCapture, ArtifactError> {
+    capture.identity = identity(&capture)?;
+    Ok(IdentifiedFreshCapture { capture })
+}
+
+impl IdentifiedFreshCapture {
+    /// Preserves the operation-level eligibility gate between identity
+    /// assignment and structural authentication for derived training captures.
+    pub(crate) fn validate_serialization_operation_eligibility(
+        &self,
+    ) -> Result<(), crate::ReplayError> {
+        self.capture.validate_serialization_operation_eligibility()
+    }
+
+    pub(crate) fn authenticate(self) -> Result<AuthenticatedFreshCapture, ArtifactError> {
+        validate(&self.capture, true, true)?;
+        Ok(AuthenticatedFreshCapture {
+            capture: self.capture,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_for_codec_reference(&self) -> &CapturedSchedule {
+        &self.capture
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_inner_for_test(self) -> CapturedSchedule {
+        self.capture
+    }
+}
+
+impl AuthenticatedFreshCapture {
+    pub(super) fn capture(&self) -> &CapturedSchedule {
+        &self.capture
+    }
+
+    pub(crate) fn into_inner(self) -> CapturedSchedule {
+        self.capture
+    }
+}
+
 /// Assigns the canonical identity to one freshly assembled owned capture and
 /// validates its complete structure. Imported or subsequently mutated captures
 /// must still use [`validate_capture`] so their stored identity is authenticated.
 pub(crate) fn seal_fresh_capture(
-    mut capture: CapturedSchedule,
+    capture: CapturedSchedule,
 ) -> Result<CapturedSchedule, ArtifactError> {
     // Fresh construction historically computes the identity before structural
     // validation. Preserve that first-error ordering while ownership makes the
     // second identity serialization in `validate_capture` redundant.
-    capture.identity = identity(&capture)?;
-    validate(&capture, true, true)?;
-    Ok(capture)
+    Ok(begin_fresh_capture_seal(capture)?
+        .authenticate()?
+        .into_inner())
 }
 
 fn write_symbolic_schema(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
