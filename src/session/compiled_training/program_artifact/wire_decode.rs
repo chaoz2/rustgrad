@@ -98,14 +98,13 @@ pub(super) fn decode_manifest(
 
 pub(super) fn validate_phase_capture(
     wire: &PhaseWire,
-    capture: &CapturedMixedSchedule,
+    recurrent_frontier: &AuthenticatedRecurrentFrontier,
     schema: OptimizerStateSchema,
 ) -> Result<BTreeMap<RecurrentStateKey, u64>> {
+    let capture = recurrent_frontier.capture();
     let state_buffers = decode_key_map(&wire.state_buffers, schema)?;
-    let frontier = capture
-        .initial_recurrent_cursor()
-        .map_err(replay_error)?
-        .frontier()
+    let frontier = recurrent_frontier
+        .initial_frontier()
         .iter()
         .map(|state| state.buffer)
         .collect::<BTreeSet<_>>();
@@ -152,40 +151,39 @@ pub(super) fn validate_phase_capture(
 }
 
 pub(super) fn decode_auxiliary(
-    main: &CapturedMixedSchedule,
+    main_frontier: &AuthenticatedRecurrentFrontier,
     wire: &PhaseWire,
-    capture: Arc<CapturedMixedSchedule>,
+    recurrent_frontier: Arc<AuthenticatedRecurrentFrontier>,
     admitted_recurrent: Option<CompiledRecurrentCapture>,
     schema: OptimizerStateSchema,
 ) -> Result<CompiledAdamWAuxiliaryPlan> {
     #[cfg(test)]
     update_decode_counts(|counts| counts.topology_phase_validations += 1);
-    let state_buffers = validate_phase_capture(wire, capture.as_ref(), schema)?;
+    let state_buffers = validate_phase_capture(wire, recurrent_frontier.as_ref(), schema)?;
     let outputs = CompiledAdamWAuxiliaryOutputSchema::from_report_flags(
         wire.clip_report,
         wire.window_loss_report,
     );
     outputs.validate_report_flags(wire.clip_report, wire.window_loss_report)?;
-    let cursor_projection = PreparedRecurrentCursorProjection::prepare(
-        main,
-        capture.as_ref(),
+    let cursor_projection = PreparedRecurrentCursorProjection::prepare_authenticated(
+        main_frontier,
+        recurrent_frontier.as_ref(),
         state_buffers.values().copied(),
     )
     .map_err(replay_error)?;
     #[cfg(test)]
     update_decode_counts(|counts| counts.cursor_projections += 1);
-    let capture_identity = cursor_projection.target_capture_identity();
     let recurrent_capture = match admitted_recurrent {
         Some(recurrent) => recurrent,
-        None => CompiledRecurrentCapture::from_artifact(capture.as_ref(), None)?,
+        None => CompiledRecurrentCapture::from_artifact(recurrent_frontier.capture(), None)?,
     };
     Ok(CompiledAdamWAuxiliaryPlan {
         phase: CompiledRecurrentPhasePlan {
-            capture,
+            capture: recurrent_frontier.capture_arc(),
+            recurrent_frontier,
             recurrent_capture,
             state_buffers,
             cursor_projection: Arc::new(cursor_projection),
-            capture_identity,
             admission: CompiledRecurrentPhaseAdmission::Replace {
                 store_groups: wire
                     .adamw_native_updates
@@ -200,15 +198,14 @@ pub(super) fn decode_auxiliary(
 }
 
 pub(super) fn zero_frontier(
-    capture: &CapturedMixedSchedule,
+    recurrent_frontier: &AuthenticatedRecurrentFrontier,
     state_buffers: &BTreeMap<RecurrentStateKey, u64>,
 ) -> Result<(
     BTreeMap<RecurrentStateKey, TensorData>,
     BTreeMap<RecurrentStateKey, u64>,
 )> {
-    let cursor = capture.initial_recurrent_cursor().map_err(replay_error)?;
-    let descriptors = cursor
-        .frontier()
+    let descriptors = recurrent_frontier
+        .initial_frontier()
         .iter()
         .map(|state| (state.buffer, state))
         .collect::<BTreeMap<_, _>>();

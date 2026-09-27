@@ -730,12 +730,12 @@ struct ValidatedMain {
     zero_grad_states: BTreeMap<RecurrentStateKey, u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ProgramCaptures {
-    main: Arc<CapturedMixedSchedule>,
-    accumulation: Option<Arc<CapturedMixedSchedule>>,
-    partial_flush: Option<Arc<CapturedMixedSchedule>>,
-    zero_grad: Option<Arc<CapturedMixedSchedule>>,
+    main: Arc<AuthenticatedRecurrentFrontier>,
+    accumulation: Option<Arc<AuthenticatedRecurrentFrontier>>,
+    partial_flush: Option<Arc<AuthenticatedRecurrentFrontier>>,
+    zero_grad: Option<Arc<AuthenticatedRecurrentFrontier>>,
     evaluation: Option<Arc<CapturedSchedule>>,
     metal_main: Option<PortableCapturedInferenceRecipe>,
     metal_partial_flush: Option<PortableCapturedInferenceRecipe>,
@@ -743,6 +743,43 @@ struct ProgramCaptures {
     metal_main_recurrent: Option<CompiledRecurrentCapture>,
     metal_partial_flush_recurrent: Option<CompiledRecurrentCapture>,
     metal_evaluation_capture: Option<CompiledEvaluationCapture>,
+}
+
+impl fmt::Debug for ProgramCaptures {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProgramCaptures")
+            .field("main", &self.main.capture())
+            .field(
+                "accumulation",
+                &self
+                    .accumulation
+                    .as_ref()
+                    .map(|frontier| frontier.capture()),
+            )
+            .field(
+                "partial_flush",
+                &self
+                    .partial_flush
+                    .as_ref()
+                    .map(|frontier| frontier.capture()),
+            )
+            .field(
+                "zero_grad",
+                &self.zero_grad.as_ref().map(|frontier| frontier.capture()),
+            )
+            .field("evaluation", &self.evaluation)
+            .field("metal_main", &self.metal_main)
+            .field("metal_partial_flush", &self.metal_partial_flush)
+            .field("metal_evaluation", &self.metal_evaluation)
+            .field("metal_main_recurrent", &self.metal_main_recurrent)
+            .field(
+                "metal_partial_flush_recurrent",
+                &self.metal_partial_flush_recurrent,
+            )
+            .field("metal_evaluation_capture", &self.metal_evaluation_capture)
+            .finish()
+    }
 }
 
 struct AdmittedProgramArtifact {
@@ -794,12 +831,15 @@ impl AdmittedProgramArtifact {
 }
 
 impl ProgramCaptures {
-    fn decode_phase(phase: &PhaseWire) -> Result<Arc<CapturedMixedSchedule>> {
+    fn decode_phase(phase: &PhaseWire) -> Result<Arc<AuthenticatedRecurrentFrontier>> {
         #[cfg(test)]
         update_decode_counts(|counts| counts.mixed_captures += 1);
-        let capture = CapturedMixedSchedule::from_bytes(&phase.capture).map_err(replay_error)?;
-        capture.initial_recurrent_cursor().map_err(replay_error)?;
-        Ok(Arc::new(capture))
+        let capture =
+            Arc::new(CapturedMixedSchedule::from_bytes(&phase.capture).map_err(replay_error)?);
+        let frontier = Arc::new(
+            AuthenticatedRecurrentFrontier::authenticate(capture.clone()).map_err(replay_error)?,
+        );
+        Ok(frontier)
     }
 
     fn decode_evaluation(evaluation: &EvaluationWire) -> Result<Arc<CapturedSchedule>> {
@@ -856,13 +896,13 @@ impl ProgramCaptures {
             .transpose()?;
         let metal_main_recurrent = metal_main
             .clone()
-            .map(|recipe| CompiledRecurrentCapture::from_artifact(main.as_ref(), Some(recipe)))
+            .map(|recipe| CompiledRecurrentCapture::from_artifact(main.capture(), Some(recipe)))
             .transpose()?;
         let metal_partial_flush_recurrent = metal_partial_flush
             .clone()
             .zip(partial_flush.as_ref())
-            .map(|(recipe, capture)| {
-                CompiledRecurrentCapture::from_artifact(capture.as_ref(), Some(recipe))
+            .map(|(recipe, frontier)| {
+                CompiledRecurrentCapture::from_artifact(frontier.capture(), Some(recipe))
             })
             .transpose()?;
         let metal_evaluation_capture = metal_evaluation
@@ -1351,11 +1391,12 @@ fn seal_admitted_training_topology(
     captures: &ProgramCaptures,
 ) -> Result<AdmittedTrainingTopology> {
     let optimizer_schema = optimizer_state_schema(&wire.optimizer);
-    let capture = captures.main.clone();
+    let main_frontier = captures.main.clone();
+    let capture = main_frontier.capture_arc();
     #[cfg(test)]
     update_decode_counts(|counts| counts.topology_phase_validations += 1);
     let main_state_buffers =
-        validate_phase_capture(&wire.main.phase, capture.as_ref(), optimizer_schema)?;
+        validate_phase_capture(&wire.main.phase, main_frontier.as_ref(), optimizer_schema)?;
     let parameter_buffers = wire.main.parameter_buffers.clone();
     let optimizer_buffers = decode_key_map(&wire.main.optimizer_buffers, optimizer_schema)?;
     let workload_buffers = decode_key_map(&wire.main.workload_buffers, optimizer_schema)?;
@@ -1376,7 +1417,8 @@ fn seal_admitted_training_topology(
     if expected_state_buffers != main_state_buffers {
         return Err(training("compiled program artifact state map mismatch"));
     }
-    let (state_values, state_versions) = zero_frontier(&capture, &main_state_buffers)?;
+    let (state_values, state_versions) =
+        zero_frontier(main_frontier.as_ref(), &main_state_buffers)?;
     let state_input_keys = decode_input_key_map(&wire.main.state_input_keys, optimizer_schema)?;
     let recurrent_capture = Arc::new(match &captures.metal_main_recurrent {
         Some(recurrent) => recurrent.clone(),
@@ -1386,31 +1428,30 @@ fn seal_admitted_training_topology(
         .accumulation
         .as_ref()
         .zip(captures.accumulation.as_ref())
-        .map(|(phase, admitted_capture)| {
-            let phase_capture = admitted_capture.clone();
+        .map(|(phase, phase_frontier)| {
+            let phase_frontier = phase_frontier.clone();
             #[cfg(test)]
             update_decode_counts(|counts| counts.topology_phase_validations += 1);
             let state_buffers =
-                validate_phase_capture(phase, phase_capture.as_ref(), optimizer_schema)?;
-            let cursor_projection = PreparedRecurrentCursorProjection::prepare(
-                capture.as_ref(),
-                phase_capture.as_ref(),
+                validate_phase_capture(phase, phase_frontier.as_ref(), optimizer_schema)?;
+            let cursor_projection = PreparedRecurrentCursorProjection::prepare_authenticated(
+                main_frontier.as_ref(),
+                phase_frontier.as_ref(),
                 state_buffers.values().copied(),
             )
             .map_err(replay_error)?;
             #[cfg(test)]
             update_decode_counts(|counts| counts.cursor_projections += 1);
-            let capture_identity = cursor_projection.target_capture_identity();
             Ok(CompiledTrainingSiblingPlan {
                 phase: CompiledRecurrentPhasePlan {
                     recurrent_capture: CompiledRecurrentCapture::from_artifact(
-                        phase_capture.as_ref(),
+                        phase_frontier.capture(),
                         None,
                     )?,
-                    capture: phase_capture,
+                    capture: phase_frontier.capture_arc(),
+                    recurrent_frontier: phase_frontier,
                     state_buffers,
                     cursor_projection: Arc::new(cursor_projection),
-                    capture_identity,
                     admission: CompiledRecurrentPhaseAdmission::RetainUnchanged,
                 },
             })
@@ -1418,6 +1459,7 @@ fn seal_admitted_training_topology(
         .transpose()?;
     let inner = CompiledTrainingPlan {
         capture,
+        recurrent_frontier: main_frontier,
         recurrent_capture,
         inputs: wire.main.inputs.clone(),
         phase_outputs: CompiledTrainingPhaseOutputSchema {
@@ -1494,11 +1536,11 @@ fn seal_admitted_training_topology(
         .partial_flush
         .as_ref()
         .zip(captures.partial_flush.as_ref())
-        .map(|(phase, capture)| {
+        .map(|(phase, frontier)| {
             decode_auxiliary(
-                inner.capture.as_ref(),
+                inner.recurrent_frontier.as_ref(),
                 phase,
-                capture.clone(),
+                frontier.clone(),
                 captures.metal_partial_flush_recurrent.clone(),
                 optimizer_schema,
             )
@@ -1508,11 +1550,11 @@ fn seal_admitted_training_topology(
         .zero_grad
         .as_ref()
         .zip(captures.zero_grad.as_ref())
-        .map(|(phase, capture)| {
+        .map(|(phase, frontier)| {
             decode_auxiliary(
-                inner.capture.as_ref(),
+                inner.recurrent_frontier.as_ref(),
                 phase,
-                capture.clone(),
+                frontier.clone(),
                 None,
                 optimizer_schema,
             )

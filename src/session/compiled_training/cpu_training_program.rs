@@ -5,6 +5,7 @@ use super::*;
 /// One static CPU training program with runtime-owned recurrent state.
 pub(super) struct CpuCompiledTrainingProgram {
     pub(super) capture: Arc<CapturedMixedSchedule>,
+    pub(super) recurrent_frontier: Arc<AuthenticatedRecurrentFrontier>,
     pub(super) recurrent_capture: Arc<CompiledRecurrentCapture>,
     pub(super) runtime: EffectRuntime,
     pub(super) cursor: MixedReplayCursor,
@@ -110,6 +111,7 @@ impl CpuCompiledTrainingProgram {
             .collect::<Result<BTreeMap<_, _>>>()?;
         Ok(CompiledTrainingPlan {
             capture: self.capture.clone(),
+            recurrent_frontier: self.recurrent_frontier.clone(),
             recurrent_capture: self.recurrent_capture.clone(),
             inputs: self.inputs.clone(),
             phase_outputs: self.phase_outputs.clone(),
@@ -237,7 +239,10 @@ impl CpuCompiledTrainingProgram {
             .iter()
             .map(|(state, _)| state.clone())
             .collect::<Vec<_>>();
-        let cursor = MixedReplayCursor::resume(&self.capture, frontier).map_err(replay_error)?;
+        let cursor = self
+            .recurrent_frontier
+            .resume_cursor(frontier)
+            .map_err(replay_error)?;
         let mut runtime = EffectRuntime::new();
         runtime
             .register_initial_snapshots(snapshots)
@@ -425,7 +430,7 @@ impl CpuCompiledTrainingProgram {
         let trace = replay.preparation_trace();
         let wall_time = native_preparation_wall_time(trace.module, residual_wall_time)?;
         let report = NativeCpuProgramPreparationReport {
-            capture_identity: transition.phase().capture_identity,
+            capture_identity: transition.phase().capture_identity(),
             native_identity: trace.replay.identity,
             vectorized: trace.replay.vectorized,
             native_item_count: trace.item_count,

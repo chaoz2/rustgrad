@@ -175,8 +175,9 @@ use super::target::{
 };
 use crate::effects::runtime::RecurrentTransactionError;
 use crate::engine::mixed_capture::{
-    NativeReplayContext, PreparedRecurrentCursorProjection, PreparedRecurrentNativeReplay,
-    ProjectedRecurrentCursor, RecurrentCursorProjectionError, RecurrentNativePreparation,
+    AuthenticatedRecurrentFrontier, NativeReplayContext, PreparedRecurrentCursorProjection,
+    PreparedRecurrentNativeReplay, ProjectedRecurrentCursor, RecurrentCursorProjectionError,
+    RecurrentNativePreparation,
 };
 use crate::engine::{NativeReplayTraffic, PlannedNativeItems};
 use crate::nn::TrainingDropoutProvider;
