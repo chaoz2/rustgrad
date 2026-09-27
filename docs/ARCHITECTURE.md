@@ -1434,6 +1434,20 @@ recurrent-overhead partitions. All 99 calls and the replay-102 boundary
 checkpoint pass through a second `NativeTrainingScoreboard`; its warm summaries
 include the excluded warmup and are not presented as the 96 measured samples.
 
+##### Manual same-runner training comparison
+
+The manual native-Transformer comparison workflow is an evidence adapter over
+that unchanged cold scoreboard plus 96-sample warm sidecar. It has not yet
+produced comparison evidence.
+
+| Boundary | Contract |
+|---|---|
+| Revisions | The candidate is one exact commit and the baseline is its exact requested ancestor; symbolic or moving refs are rejected. |
+| Runner and order | One runner builds both revisions before measurement, then runs serial A-B-B-A trials. Every trial receives a fresh native cache. |
+| Workload | Both revisions execute the existing cold preparation/training evidence and the same one-window warmup plus 32 measured windows; sample counts, phase timings, checkpoint validation, and zero-fallback semantics remain in the existing schemas. |
+| Provenance and admission | Raw files remain artifacts. Each trial records its source commit, evidence-file identity, binary identity, Cargo profile, Rust toolchain, and runner provenance. The comparator retains semantic facts and rejects sets whose workload, schema, optimizer/capture, build, or runner facts are not comparable. |
+| Interpretation | Timings are observations with no threshold or speedup claim. Repeat workflow runs are required to assess runner noise; a matching hardware model alone does not establish comparability. |
+
 Commit-only replay omits caller-named outputs while retaining loss and enabled
 validation/report scalars. Prefix reuse retains four fail-closed contracts:
 
