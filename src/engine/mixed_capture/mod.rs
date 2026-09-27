@@ -570,7 +570,7 @@ impl<'a> NativeReplayContext<'a> {
                         pure,
                         plan,
                         &mut borrowed,
-                        Some(projection.public()),
+                        projection.native_egress(),
                         |workspace, borrowed| {
                             for (ordinal, (binding, mode)) in bank_layout
                                 .banks
@@ -890,7 +890,7 @@ impl PreparedRecurrentNativeReplay {
             replacements,
             plan.retained_recurrent_states(),
         )?;
-        let plan = plan.seal(&pure)?;
+        let mut plan = plan.seal(&pure)?;
         if trace.item_count != plan.item_count()
             || trace.cache_hit_count != plan.cache_hit_count()
             || trace.cache_miss_count != plan.cache_miss_count()
@@ -911,16 +911,16 @@ impl PreparedRecurrentNativeReplay {
                 "prepared recurrent full output projection mismatch".into(),
             ));
         }
-        let output_projections = output_projection_requests
-            .iter()
-            .map(|selected| {
-                PreparedRecurrentOutputProjection::prepare(
-                    Arc::clone(selected),
-                    &requested,
-                    &banks.successor_outputs,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut output_projections = Vec::with_capacity(output_projection_requests.len());
+        for selected in &output_projection_requests {
+            let native_egress = plan.prepare_egress_projection(&pure, Arc::clone(selected));
+            output_projections.push(PreparedRecurrentOutputProjection::prepare(
+                Arc::clone(selected),
+                &requested,
+                &banks.successor_outputs,
+                native_egress,
+            )?);
+        }
         #[cfg(test)]
         record_prepared_replay_validation(|counts| {
             counts.recurrent_output_projection_builds = counts
@@ -3472,6 +3472,9 @@ mod recurrent_tests {
         assert_eq!(prepared_workspace.input_validation_layout_build_count, 1);
         assert_eq!(prepared_workspace.sealed_input_validator_count, 0);
         assert!(prepared_workspace.sealed_pointer_count > 0);
+        assert_eq!(prepared_workspace.prepared_egress_projection_build_count, 1);
+        assert_eq!(prepared_workspace.prepared_egress_materialization_count, 0);
+        assert_eq!(prepared_workspace.dynamic_egress_selection_count, 0);
         assert_eq!(prepared_workspace.last_borrowed_binding_count, 0);
         assert!(prepared_workspace.borrowed_binding_capacity > 0);
         let mut overflow_cursor = cursor.clone();
@@ -3597,6 +3600,9 @@ mod recurrent_tests {
         let replay_workspace = prepared.workspace_stats();
         assert_eq!(replay_workspace.binding_layout_build_count, 1);
         assert!(replay_workspace.last_borrowed_binding_count > 0);
+        assert_eq!(replay_workspace.prepared_egress_projection_build_count, 1);
+        assert_eq!(replay_workspace.prepared_egress_materialization_count, 1);
+        assert_eq!(replay_workspace.dynamic_egress_selection_count, 0);
         assert_eq!(
             replay_workspace.borrowed_binding_capacity,
             prepared_workspace.borrowed_binding_capacity

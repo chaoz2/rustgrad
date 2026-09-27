@@ -39,6 +39,23 @@ struct WorkspaceOwner {
     binding: Option<crate::cpu_jit::NativeReplayBindingOrdinal>,
 }
 
+#[derive(Debug)]
+struct NativeEgressSelection {
+    physical: Box<[(u64, usize, crate::Shape)]>,
+    aliases: Box<[crate::RequestedPassthrough]>,
+    requested: Box<[u64]>,
+}
+
+/// Immutable native egress selection sealed for one exact workspace and one
+/// exact recurrent output selection. Tensor storage and replay bindings remain
+/// invocation-owned.
+#[derive(Debug)]
+pub(super) struct PreparedNativeEgressProjection {
+    workspace_owner: Arc<()>,
+    selected_owner: Arc<[u64]>,
+    selection: NativeEgressSelection,
+}
+
 struct WorkspaceInput {
     name: String,
     slot: usize,
@@ -242,6 +259,7 @@ impl NativeReplayTraffic {
 /// inputs borrow caller storage for one invocation, while every mutable derived
 /// value is invalidated per run.
 pub(super) struct NativeReplayWorkspace {
+    egress_owner: Arc<()>,
     buffers: Vec<crate::JitBuffer>,
     slots: Vec<WorkspaceSlot>,
     items: Vec<WorkspaceItem>,
@@ -282,6 +300,12 @@ pub(super) struct NativeReplayWorkspace {
     binding_layout_build_count: usize,
     #[cfg(test)]
     input_validation_layout_build_count: usize,
+    #[cfg(test)]
+    prepared_egress_projection_build_count: usize,
+    #[cfg(test)]
+    prepared_egress_materialization_count: usize,
+    #[cfg(test)]
+    dynamic_egress_selection_count: usize,
     #[cfg(test)]
     last_borrowed_binding_count: usize,
     #[cfg(test)]
@@ -339,6 +363,9 @@ pub(crate) struct NativeReplayWorkspaceStats {
     pub(crate) dispatch_metadata_build_count: usize,
     pub(crate) binding_layout_build_count: usize,
     pub(crate) input_validation_layout_build_count: usize,
+    pub(crate) prepared_egress_projection_build_count: usize,
+    pub(crate) prepared_egress_materialization_count: usize,
+    pub(crate) dynamic_egress_selection_count: usize,
     pub(crate) sealed_input_validator_count: usize,
     pub(crate) sealed_pointer_count: usize,
     pub(crate) sealed_dense_pointer_count: usize,
@@ -361,6 +388,7 @@ impl NativeReplayWorkspace {
         items: &[PreparedNativeDispatch],
     ) -> Result<Self, ReplayError> {
         let mut workspace = Self {
+            egress_owner: Arc::new(()),
             buffers: Vec::new(),
             slots: Vec::new(),
             items: Vec::with_capacity(items.len()),
@@ -401,6 +429,12 @@ impl NativeReplayWorkspace {
             binding_layout_build_count: 0,
             #[cfg(test)]
             input_validation_layout_build_count: 0,
+            #[cfg(test)]
+            prepared_egress_projection_build_count: 0,
+            #[cfg(test)]
+            prepared_egress_materialization_count: 0,
+            #[cfg(test)]
+            dynamic_egress_selection_count: 0,
             #[cfg(test)]
             last_borrowed_binding_count: 0,
             #[cfg(test)]
@@ -1706,37 +1740,26 @@ impl NativeReplayWorkspace {
         Ok(())
     }
 
-    pub(super) fn materialize(
-        &mut self,
+    fn select_egress(
+        &self,
         capture: &CapturedSchedule,
-        borrowed: &NativeReplayBindings<'_>,
         selected: Option<&BTreeSet<u64>>,
-    ) -> Result<ReplayValues, ReplayError> {
-        let mut values = ReplayValues::default();
-        for (buffer, slot, shape) in &self.egress {
-            let wanted = selected.is_none_or(|selected| {
-                selected.contains(buffer)
-                    || capture.requested_passthroughs.iter().any(|alias| {
-                        selected.contains(&(alias.requested.index() as u64))
-                            && alias.source.index() as u64 == *buffer
-                    })
-            });
-            if !wanted {
-                continue;
-            }
-            if !self.valid.get(*slot).copied().unwrap_or(false) {
-                return Err(ReplayError::Corrupt(format!(
-                    "native workspace egress {buffer} is unavailable"
-                )));
-            }
-            let value = match borrowed.slots.get_slot(*slot) {
-                Some(binding) => binding.tensor().clone(),
-                None => self.buffers[*slot]
-                    .to_tensor(shape.clone())
-                    .map_err(|error| ReplayError::Backend(error.to_string()))?,
-            };
-            values.insert_tensor(*buffer, value);
-        }
+    ) -> NativeEgressSelection {
+        let physical = self
+            .egress
+            .iter()
+            .filter(|(buffer, _, _)| {
+                selected.is_none_or(|selected| {
+                    selected.contains(buffer)
+                        || capture.requested_passthroughs.iter().any(|alias| {
+                            selected.contains(&(alias.requested.index() as u64))
+                                && alias.source.index() as u64 == *buffer
+                        })
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let aliases = capture
             .requested_passthroughs
             .iter()
@@ -1744,15 +1767,88 @@ impl NativeReplayWorkspace {
                 selected.is_none_or(|selected| selected.contains(&(alias.requested.index() as u64)))
             })
             .cloned()
-            .collect::<Vec<_>>();
-        values.project_requested_aliases(&aliases)?;
-        let mut materialized_egress_count = 0u64;
-        let mut materialized_egress_bytes = 0u64;
-        for requested in capture
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let requested = capture
             .requested
             .iter()
             .filter(|requested| selected.is_none_or(|selected| selected.contains(*requested)))
+            .copied()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        NativeEgressSelection {
+            physical,
+            aliases,
+            requested,
+        }
+    }
+
+    pub(super) fn prepare_egress_projection(
+        &mut self,
+        capture: &CapturedSchedule,
+        selected_owner: Arc<[u64]>,
+    ) -> PreparedNativeEgressProjection {
+        let selected = selected_owner.iter().copied().collect::<BTreeSet<_>>();
+        let projection = PreparedNativeEgressProjection {
+            workspace_owner: Arc::clone(&self.egress_owner),
+            selected_owner,
+            selection: self.select_egress(capture, Some(&selected)),
+        };
+        #[cfg(test)]
         {
+            self.prepared_egress_projection_build_count = self
+                .prepared_egress_projection_build_count
+                .saturating_add(1);
+        }
+        projection
+    }
+
+    pub(super) fn egress_projection_owns_selection(
+        projection: &PreparedNativeEgressProjection,
+        selected_owner: &Arc<[u64]>,
+    ) -> bool {
+        Arc::ptr_eq(&projection.selected_owner, selected_owner)
+    }
+
+    pub(super) fn validate_egress_projection(
+        &self,
+        projection: &PreparedNativeEgressProjection,
+    ) -> Result<(), ReplayError> {
+        if !Arc::ptr_eq(&self.egress_owner, &projection.workspace_owner) {
+            return Err(ReplayError::Corrupt(
+                "prepared native egress projection owner mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn materialize_selection<'a>(
+        buffers: &[crate::JitBuffer],
+        valid: &[bool],
+        borrowed: &NativeReplayBindings<'_>,
+        physical: impl Iterator<Item = &'a (u64, usize, crate::Shape)>,
+        aliases: &[crate::RequestedPassthrough],
+        requested: impl Iterator<Item = &'a u64>,
+    ) -> Result<(ReplayValues, u64, u64), ReplayError> {
+        let mut values = ReplayValues::default();
+        for (buffer, slot, shape) in physical {
+            if !valid.get(*slot).copied().unwrap_or(false) {
+                return Err(ReplayError::Corrupt(format!(
+                    "native workspace egress {buffer} is unavailable"
+                )));
+            }
+            let value = match borrowed.slots.get_slot(*slot) {
+                Some(binding) => binding.tensor().clone(),
+                None => buffers[*slot]
+                    .to_tensor(shape.clone())
+                    .map_err(|error| ReplayError::Backend(error.to_string()))?,
+            };
+            values.insert_tensor(*buffer, value);
+        }
+        values.project_requested_aliases(aliases)?;
+        let mut materialized_egress_count = 0u64;
+        let mut materialized_egress_bytes = 0u64;
+        for requested in requested {
             let value = values.tensor(*requested, "native requested egress")?;
             materialized_egress_count =
                 materialized_egress_count.checked_add(1).ok_or_else(|| {
@@ -1764,8 +1860,75 @@ impl NativeReplayWorkspace {
                     ReplayError::Descriptor("native materialized egress bytes overflow".into())
                 })?;
         }
-        self.current_traffic.materialized_egress_count = materialized_egress_count;
-        self.current_traffic.materialized_egress_bytes = materialized_egress_bytes;
+        Ok((values, materialized_egress_count, materialized_egress_bytes))
+    }
+
+    pub(super) fn materialize(
+        &mut self,
+        capture: &CapturedSchedule,
+        borrowed: &NativeReplayBindings<'_>,
+        selected: Option<&BTreeSet<u64>>,
+    ) -> Result<ReplayValues, ReplayError> {
+        let aliases = capture
+            .requested_passthroughs
+            .iter()
+            .filter(|alias| {
+                selected.is_none_or(|selected| selected.contains(&(alias.requested.index() as u64)))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        {
+            self.dynamic_egress_selection_count =
+                self.dynamic_egress_selection_count.saturating_add(1);
+        }
+        let selected_physical = self.egress.iter().filter(|(buffer, _, _)| {
+            selected.is_none_or(|selected| {
+                selected.contains(buffer)
+                    || capture.requested_passthroughs.iter().any(|alias| {
+                        selected.contains(&(alias.requested.index() as u64))
+                            && alias.source.index() as u64 == *buffer
+                    })
+            })
+        });
+        let selected_requested = capture
+            .requested
+            .iter()
+            .filter(|requested| selected.is_none_or(|selected| selected.contains(*requested)));
+        let (values, count, bytes) = Self::materialize_selection(
+            &self.buffers,
+            &self.valid,
+            borrowed,
+            selected_physical,
+            &aliases,
+            selected_requested,
+        )?;
+        self.current_traffic.materialized_egress_count = count;
+        self.current_traffic.materialized_egress_bytes = bytes;
+        Ok(values)
+    }
+
+    pub(super) fn materialize_prepared(
+        &mut self,
+        borrowed: &NativeReplayBindings<'_>,
+        projection: &PreparedNativeEgressProjection,
+    ) -> Result<ReplayValues, ReplayError> {
+        self.validate_egress_projection(projection)?;
+        #[cfg(test)]
+        {
+            self.prepared_egress_materialization_count =
+                self.prepared_egress_materialization_count.saturating_add(1);
+        }
+        let (values, count, bytes) = Self::materialize_selection(
+            &self.buffers,
+            &self.valid,
+            borrowed,
+            projection.selection.physical.iter(),
+            &projection.selection.aliases,
+            projection.selection.requested.iter(),
+        )?;
+        self.current_traffic.materialized_egress_count = count;
+        self.current_traffic.materialized_egress_bytes = bytes;
         Ok(values)
     }
 
@@ -1787,6 +1950,17 @@ impl NativeReplayWorkspace {
                     self.valid[*output] = false;
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn invalidate_egress(&mut self, buffer: u64) {
+        if let Some((_, slot, _)) = self
+            .egress
+            .iter()
+            .find(|(candidate, _, _)| *candidate == buffer)
+        {
+            self.valid[*slot] = false;
         }
     }
 
@@ -2012,6 +2186,9 @@ impl NativeReplayWorkspace {
             dispatch_metadata_build_count: self.dispatch_metadata_build_count,
             binding_layout_build_count: self.binding_layout_build_count,
             input_validation_layout_build_count: self.input_validation_layout_build_count,
+            prepared_egress_projection_build_count: self.prepared_egress_projection_build_count,
+            prepared_egress_materialization_count: self.prepared_egress_materialization_count,
+            dynamic_egress_selection_count: self.dynamic_egress_selection_count,
             sealed_input_validator_count,
             sealed_pointer_count,
             sealed_dense_pointer_count,
