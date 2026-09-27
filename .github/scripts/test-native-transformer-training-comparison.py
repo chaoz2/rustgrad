@@ -500,12 +500,13 @@ def fixture(root: pathlib.Path) -> SimpleNamespace:
     write_json(
         build_manifest,
         {
-            "format_version": 1,
+            "format_version": 2,
             "evidence_kind": "native_cpu_transformer_training_comparison_builds",
             "build_profile": "release",
             "cargo_locked": True,
             "cargo_incremental": "0",
             "cargo_build_jobs": "2",
+            "measurement_mode": "steady-replay",
             "cargo_target": "example:compiled_transformer_train_resume",
             "rustflags": "-D warnings",
             "toolchain": "rustc synthetic\nhost: x86_64-unknown-linux-gnu",
@@ -523,6 +524,7 @@ def fixture(root: pathlib.Path) -> SimpleNamespace:
         root=str(root),
         baseline_sha=BASELINE_SHA,
         candidate_sha=CANDIDATE_SHA,
+        measurement_mode="steady-replay",
         baseline_binary=str(binaries["baseline"]),
         candidate_binary=str(binaries["candidate"]),
         build_manifest=str(build_manifest),
@@ -550,7 +552,86 @@ def run_case(mutator=None, expected: bool = True, invalid_trial: int | None = No
             assert set(trial["files"]) == {"scoreboard", "steady", "provenance"}
 
 
+def check_warm_ratio_and_checksum_contracts() -> None:
+    for candidate, baseline, expected in (
+        (0, 0, None), (7, 0, None), (0, 7, 0.0), (3, 6, 0.5),
+    ):
+        assert VALIDATOR.warm_timing_ratio(candidate, baseline) == expected
+    for candidate, baseline in ((-1, 2), (2, -1), (True, 1), (1, False)):
+        try:
+            VALIDATOR.warm_timing_ratio(candidate, baseline)
+        except VALIDATOR.EvidenceError:
+            pass
+        else:
+            raise AssertionError("invalid warm timing was accepted")
+
+    keys = ("scoreboard", "objective", "provenance", "resume_bundle", "module_checkpoint")
+    payloads = {key: f"independent-{key}".encode() for key in keys}
+    manifest = "".join(
+        f"{hashlib.sha256(payloads[key]).hexdigest()}  {VALIDATOR.WARM_EVIDENCE_FILES[key]}\n"
+        for key in keys
+    ).encode()
+    VALIDATOR.validate_warm_checksums(manifest, payloads)
+    for key in keys:
+        changed = dict(payloads)
+        changed[key] += b"changed"
+        try:
+            VALIDATOR.validate_warm_checksums(manifest, changed)
+        except VALIDATOR.EvidenceError:
+            pass
+        else:
+            raise AssertionError(f"unauthenticated {key} was accepted")
+    for malformed in (b"", manifest + manifest, b"\xff", b"\n".join(reversed(manifest.splitlines()))):
+        try:
+            VALIDATOR.validate_warm_checksums(malformed, payloads)
+        except VALIDATOR.EvidenceError:
+            pass
+        else:
+            raise AssertionError("malformed warm checksum manifest was accepted")
+
+
+def check_larger_evidence_object_admission() -> None:
+    """Malformed roots fail before checkpoint I/O in either consumer mode."""
+    with tempfile.TemporaryDirectory() as temporary:
+        root = pathlib.Path(temporary)
+        objective_path = root / "objective.json"
+        scoreboard_path = root / "scoreboard.json"
+        preparation_path = pathlib.Path(__file__).with_name(
+            "native_training_preparation_evidence.py"
+        )
+        for field in ("objective", "scoreboard"):
+            for malformed in (None, False, 0, "evidence", []):
+                objective = malformed if field == "objective" else {}
+                scoreboard_value = malformed if field == "scoreboard" else {}
+                objective_path.write_text(json.dumps(objective), encoding="utf-8")
+                scoreboard_path.write_text(json.dumps(scoreboard_value), encoding="utf-8")
+                for comparison_projection in (False, True):
+                    try:
+                        VALIDATOR.LARGER_EVIDENCE.validate_larger_evidence(
+                            objective_path,
+                            scoreboard_path,
+                            BASELINE_SHA,
+                            root / "absent-resume.rgab",
+                            root / "absent-module.safetensors",
+                            preparation_path,
+                            comparison_projection=comparison_projection,
+                        )
+                    except VALIDATOR.LARGER_EVIDENCE.LargerEvidenceError as error:
+                        assert str(error) == (
+                            f"larger Transformer {field} must be an object"
+                        )
+                    else:
+                        raise AssertionError(f"accepted malformed {field}: {malformed!r}")
+
+
 def main() -> None:
+    warm_fixtures = load_script_module(
+        "native_training_warm_comparison_fixtures",
+        pathlib.Path(__file__).with_name("native_training_warm_comparison_fixtures.py"),
+    )
+    warm_fixtures.check(sys.modules[__name__])
+    check_larger_evidence_object_admission()
+    check_warm_ratio_and_checksum_contracts()
     check_warm_preparation_fixtures()
     run_case()
 

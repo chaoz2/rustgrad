@@ -11,9 +11,17 @@ on:
         description: Exact reviewed lowercase 40-character candidate commit SHA
         required: true
         type: string
+      measurement_mode:
+        description: Fixed evidence workload to compare
+        required: true
+        default: steady-replay
+        type: choice
+        options:
+          - steady-replay
+          - warm-resume
 
 concurrency:
-  group: native-transformer-training-comparison-${{ inputs.baseline_sha }}-${{ inputs.candidate_sha }}
+  group: native-transformer-training-comparison-${{ inputs.measurement_mode }}-${{ inputs.baseline_sha }}-${{ inputs.candidate_sha }}
   cancel-in-progress: false
 
 permissions:
@@ -28,6 +36,7 @@ jobs:
     env:
       BASELINE_SHA: ${{ inputs.baseline_sha }}
       CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      MEASUREMENT_MODE: ${{ inputs.measurement_mode }}
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
       RUSTFLAGS: -D warnings
@@ -50,6 +59,10 @@ jobs:
           fi
           if [[ "$BASELINE_SHA" == "$CANDIDATE_SHA" ]]; then
             echo "baseline and candidate revisions must differ" >&2
+            exit 1
+          fi
+          if [[ "$MEASUREMENT_MODE" != steady-replay && "$MEASUREMENT_MODE" != warm-resume ]]; then
+            echo "measurement_mode is unsupported" >&2
             exit 1
           fi
       - name: Check out exact candidate revision
@@ -88,16 +101,21 @@ jobs:
           set -euo pipefail
           build_root="$RUNNER_TEMP/native-transformer-comparison-build"
           mkdir -- "$build_root"
+          if [[ "$MEASUREMENT_MODE" == steady-replay ]]; then
+            example=compiled_transformer_train_resume
+          else
+            example=compiled_transformer_scale_evidence
+          fi
           cargo build --locked --release \
             --manifest-path baseline-source/Cargo.toml \
             --target-dir "$build_root/baseline" \
-            --example compiled_transformer_train_resume
+            --example "$example"
           cargo build --locked --release \
             --manifest-path candidate-source/Cargo.toml \
             --target-dir "$build_root/candidate" \
-            --example compiled_transformer_train_resume
-          baseline_binary="$build_root/baseline/release/examples/compiled_transformer_train_resume"
-          candidate_binary="$build_root/candidate/release/examples/compiled_transformer_train_resume"
+            --example "$example"
+          baseline_binary="$build_root/baseline/release/examples/$example"
+          candidate_binary="$build_root/candidate/release/examples/$example"
           evidence_root="$GITHUB_WORKSPACE/native-transformer-training-comparison"
           mkdir -- "$evidence_root"
           python3 candidate-source/.github/scripts/write-native-transformer-training-build-manifest.py \
@@ -105,6 +123,7 @@ jobs:
             --candidate-sha "$CANDIDATE_SHA" \
             --baseline-binary "$baseline_binary" \
             --candidate-binary "$candidate_binary" \
+            --measurement-mode "$MEASUREMENT_MODE" \
             --output "$evidence_root/build-manifest.json"
       - name: Record fixed ABBA trials with isolated native caches
         shell: bash
@@ -112,29 +131,43 @@ jobs:
           set -uo pipefail
           build_root="$RUNNER_TEMP/native-transformer-comparison-build"
           evidence_root="$GITHUB_WORKSPACE/native-transformer-training-comparison"
-          recorder="$GITHUB_WORKSPACE/candidate-source/.github/scripts/record-native-transformer-release-scoreboard.sh"
           measurement_failed=0
 
           record_trial() {
             local ordinal="$1"
             local role="$2"
-            local source_sha source_dir binary output
+            local source_sha source_dir binary output example recorder
+            if [[ "$MEASUREMENT_MODE" == steady-replay ]]; then
+              example=compiled_transformer_train_resume
+              recorder="$GITHUB_WORKSPACE/candidate-source/.github/scripts/record-native-transformer-release-scoreboard.sh"
+            else
+              example=compiled_transformer_scale_evidence
+              recorder="$GITHUB_WORKSPACE/candidate-source/.github/scripts/record-larger-native-transformer-evidence.sh"
+            fi
             if [[ "$role" == baseline ]]; then
               source_sha="$BASELINE_SHA"
               source_dir="$GITHUB_WORKSPACE/baseline-source"
-              binary="$build_root/baseline/release/examples/compiled_transformer_train_resume"
+              binary="$build_root/baseline/release/examples/$example"
             else
               source_sha="$CANDIDATE_SHA"
               source_dir="$GITHUB_WORKSPACE/candidate-source"
-              binary="$build_root/candidate/release/examples/compiled_transformer_train_resume"
+              binary="$build_root/candidate/release/examples/$example"
             fi
             output="$evidence_root/trial-${ordinal}-${role}"
             (
               cd "$source_dir"
-              RUSTGRAD_NATIVE_SCOREBOARD_MEASURED_SHA="$source_sha" \
-              RUSTGRAD_NATIVE_SCOREBOARD_OUTPUT_DIR="$output" \
-              RUSTGRAD_NATIVE_SCOREBOARD_BINARY="$binary" \
-              bash "$recorder"
+              if [[ "$MEASUREMENT_MODE" == steady-replay ]]; then
+                RUSTGRAD_NATIVE_SCOREBOARD_MEASURED_SHA="$source_sha" \
+                RUSTGRAD_NATIVE_SCOREBOARD_OUTPUT_DIR="$output" \
+                RUSTGRAD_NATIVE_SCOREBOARD_BINARY="$binary" \
+                bash "$recorder"
+              else
+                RUSTGRAD_SCALE_EVIDENCE_MEASURED_SHA="$source_sha" \
+                RUSTGRAD_SCALE_EVIDENCE_OUTPUT_DIR="$output" \
+                RUSTGRAD_SCALE_EVIDENCE_BINARY="$binary" \
+                RUSTGRAD_SCALE_EVIDENCE_WORKFLOW_TIMEOUT_MINUTES=75 \
+                bash "$recorder"
+              fi
             ) || measurement_failed=1
           }
 
@@ -151,19 +184,25 @@ jobs:
           set -uo pipefail
           build_root="$RUNNER_TEMP/native-transformer-comparison-build"
           evidence_root="$GITHUB_WORKSPACE/native-transformer-training-comparison"
+          if [[ "$MEASUREMENT_MODE" == steady-replay ]]; then
+            example=compiled_transformer_train_resume
+          else
+            example=compiled_transformer_scale_evidence
+          fi
           python3 candidate-source/.github/scripts/check-native-transformer-training-comparison.py \
             --root "$evidence_root" \
             --baseline-sha "$BASELINE_SHA" \
             --candidate-sha "$CANDIDATE_SHA" \
-            --baseline-binary "$build_root/baseline/release/examples/compiled_transformer_train_resume" \
-            --candidate-binary "$build_root/candidate/release/examples/compiled_transformer_train_resume" \
+            --baseline-binary "$build_root/baseline/release/examples/$example" \
+            --candidate-binary "$build_root/candidate/release/examples/$example" \
+            --measurement-mode "$MEASUREMENT_MODE" \
             --build-manifest "$evidence_root/build-manifest.json" \
             --output "$evidence_root/comparison.json"
       - name: Upload raw trials and comparison manifest
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: native-transformer-training-comparison-${{ inputs.baseline_sha }}-${{ inputs.candidate_sha }}
+          name: native-transformer-training-comparison-${{ inputs.measurement_mode }}-${{ inputs.baseline_sha }}-${{ inputs.candidate_sha }}
           path: native-transformer-training-comparison/
           if-no-files-found: error
           retention-days: 30
