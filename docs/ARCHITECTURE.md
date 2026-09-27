@@ -1391,8 +1391,12 @@ times. Wall times do not participate in identity.
   rendering. During ordinary capsule authentication, vector-plan and
   cache-discriminator checks share one current-item analysis bound to the exact
   root and scalar/vector policy. Cold rendering uses the same policy
-  implementation while retaining validation order. Source-dependent keys, ABI,
-  layout,
+  implementation while retaining validation order. Ordinary entry ABI
+  admission also combines exact input-binding revalidation with rendered ABI
+  derivation and comparison in one admission path. Cold rendering keeps its
+  existing validator, the former conjunction remains an independent test
+  oracle, and store-group ABI admission is unchanged. Source-dependent keys,
+  ABI, layout,
   output-initialization, and role inventories retain their existing checks;
   the analysis is not a persistent proof and changes no schema or identity.
   Recipe construction also retains a call-local witness for each item's
