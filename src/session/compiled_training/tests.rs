@@ -105,12 +105,36 @@ fn native_training_program_roles_authenticate_batch_and_plan_assignment() {
         program_index,
         load: crate::backend::NativeRenderCapsuleLoadStatus::Hit,
         store: crate::backend::NativeRenderCapsuleStoreStatus::NotAttempted,
+        recipe_wall_time: std::time::Duration::from_nanos(11),
+        file_read_wall_time: Some(std::time::Duration::from_nanos(13)),
+        decode_wall_time: Some(std::time::Duration::from_nanos(17)),
+        authentication_wall_time: Some(std::time::Duration::from_nanos(19)),
+        store_wall_time: None,
     };
     let main_evaluation = NativeCpuRenderCapsuleDiagnostic::from_ordered_native(
         &[Main, Evaluation],
         vec![capsule_diagnostic(0), capsule_diagnostic(1)],
     )
     .unwrap();
+    for diagnostic in &main_evaluation {
+        assert_eq!(
+            diagnostic.recipe_wall_time(),
+            std::time::Duration::from_nanos(11)
+        );
+        assert_eq!(
+            diagnostic.file_read_wall_time(),
+            Some(std::time::Duration::from_nanos(13))
+        );
+        assert_eq!(
+            diagnostic.decode_wall_time(),
+            Some(std::time::Duration::from_nanos(17))
+        );
+        assert_eq!(
+            diagnostic.authentication_wall_time(),
+            Some(std::time::Duration::from_nanos(19))
+        );
+        assert_eq!(diagnostic.store_wall_time(), None);
+    }
     assert_eq!(
         main_evaluation
             .iter()

@@ -634,6 +634,15 @@ struct ScaleWarmProgramPreparationEvidence {
 }
 
 #[derive(Serialize)]
+struct ScaleWarmCapsulePhaseEvidence {
+    program_index: usize,
+    recipe_wall_time_ns: u64,
+    file_read_wall_time_ns: u64,
+    decode_wall_time_ns: u64,
+    authentication_wall_time_ns: u64,
+}
+
+#[derive(Serialize)]
 struct ScaleWarmPreparationEvidence {
     main: ScaleWarmProgramPreparationEvidence,
     accumulation: ScaleWarmProgramPreparationEvidence,
@@ -647,6 +656,7 @@ struct ScaleWarmPreparationEvidence {
     effective_render_wall_time_ns: u64,
     effective_render_fraction: f64,
     prepare_finalization: NativeTrainingPreparationFinalizationReport,
+    capsule_phases: Vec<ScaleWarmCapsulePhaseEvidence>,
 }
 
 #[derive(Serialize)]
@@ -1348,6 +1358,61 @@ fn collect_scale_warm_preparation(
         runtime_overhead_wall_time
     );
 
+    let capsule_phases = preparation
+        .render_capsule_diagnostics()
+        .iter()
+        .enumerate()
+        .map(
+            |(program_index, diagnostic)| -> std::result::Result<_, Box<dyn Error>> {
+                let required = |phase: Option<Duration>| {
+                    phase.ok_or_else(|| {
+                        std::io::Error::other("warm cache hit is missing an observed phase")
+                    })
+                };
+                if diagnostic.store_wall_time().is_some() {
+                    return Err(std::io::Error::other(
+                        "warm cache hit unexpectedly stored a capsule",
+                    )
+                    .into());
+                }
+                Ok(ScaleWarmCapsulePhaseEvidence {
+                    program_index,
+                    recipe_wall_time_ns: duration_nanos(diagnostic.recipe_wall_time())?,
+                    file_read_wall_time_ns: duration_nanos(required(
+                        diagnostic.file_read_wall_time(),
+                    )?)?,
+                    decode_wall_time_ns: duration_nanos(required(diagnostic.decode_wall_time())?)?,
+                    authentication_wall_time_ns: duration_nanos(required(
+                        diagnostic.authentication_wall_time(),
+                    )?)?,
+                })
+            },
+        )
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let capsule_total = capsule_phases
+        .iter()
+        .try_fold(0u64, |total, phase| {
+            [
+                phase.recipe_wall_time_ns,
+                phase.file_read_wall_time_ns,
+                phase.decode_wall_time_ns,
+                phase.authentication_wall_time_ns,
+            ]
+            .into_iter()
+            .try_fold(total, u64::checked_add)
+        })
+        .ok_or_else(|| std::io::Error::other("capsule phase timing overflows"))?;
+    if capsule_phases.len() != 5
+        || capsule_total
+            > duration_nanos(
+                prepare_finalization
+                    .render_batch_orchestration_wall_time()
+                    .ok_or_else(|| std::io::Error::other("render batch observation is absent"))?
+                    .to_duration()?,
+            )?
+    {
+        return Err(std::io::Error::other("capsule phases exceed their enclosing batch").into());
+    }
     Ok(ScaleWarmPreparationObservation {
         evidence: ScaleWarmPreparationEvidence {
             main: main_preparation,
@@ -1362,6 +1427,7 @@ fn collect_scale_warm_preparation(
             effective_render_wall_time_ns: duration_nanos(effective_render_wall_time)?,
             effective_render_fraction,
             prepare_finalization,
+            capsule_phases,
         },
         program_count,
         loaded_module_count,
@@ -2170,7 +2236,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let gradient_evidence = collect_scale_gradient_evidence()?;
 
     let objective = json!({
-        "schema_version": 8,
+        "schema_version": 9,
         "git_sha": &paths.git_sha,
         "workload": {
             "batch": BATCH,

@@ -747,9 +747,39 @@ pub struct NativeCpuRenderCapsuleDiagnostic {
     role: NativeCpuRenderCapsuleProgramRole,
     load: NativeCpuRenderCapsuleLoadStatus,
     store: NativeCpuRenderCapsuleStoreStatus,
+    recipe_wall_time: Duration,
+    file_read_wall_time: Option<Duration>,
+    decode_wall_time: Option<Duration>,
+    authentication_wall_time: Option<Duration>,
+    store_wall_time: Option<Duration>,
 }
 
 impl NativeCpuRenderCapsuleDiagnostic {
+    /// Recipe construction, including its call-local validation witnesses.
+    pub const fn recipe_wall_time(&self) -> Duration {
+        self.recipe_wall_time
+    }
+
+    /// Bounded cache read, including path resolution; absent if no recipe exists.
+    pub const fn file_read_wall_time(&self) -> Option<Duration> {
+        self.file_read_wall_time
+    }
+
+    /// Cache decoding and checksum validation; absent if reading failed.
+    pub const fn decode_wall_time(&self) -> Option<Duration> {
+        self.decode_wall_time
+    }
+
+    /// Current-program authentication; absent if decoding failed.
+    pub const fn authentication_wall_time(&self) -> Option<Duration> {
+        self.authentication_wall_time
+    }
+
+    /// Encoding and atomic persistence after a local render; absent on a hit.
+    pub const fn store_wall_time(&self) -> Option<Duration> {
+        self.store_wall_time
+    }
+
     pub const fn role(&self) -> NativeCpuRenderCapsuleProgramRole {
         self.role
     }
@@ -769,6 +799,11 @@ impl NativeCpuRenderCapsuleDiagnostic {
         use crate::backend::{NativeRenderCapsuleLoadStatus, NativeRenderCapsuleStoreStatus};
         Self {
             role: role.render_capsule_role(),
+            recipe_wall_time: value.recipe_wall_time,
+            file_read_wall_time: value.file_read_wall_time,
+            decode_wall_time: value.decode_wall_time,
+            authentication_wall_time: value.authentication_wall_time,
+            store_wall_time: value.store_wall_time,
             load: match value.load {
                 NativeRenderCapsuleLoadStatus::Hit => NativeCpuRenderCapsuleLoadStatus::Hit,
                 NativeRenderCapsuleLoadStatus::RecipeUnavailable => {

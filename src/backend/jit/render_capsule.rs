@@ -14,6 +14,7 @@ use crate::cpu_jit::{
     NativeMatmulOperandLayout, NativeOutputInitialization, QuantizedBufferAbi, RenderedC,
 };
 use crate::{GgmlType, QuantizedBufferDesc, ScheduleItem, Shape, VectorPlan};
+use std::time::{Duration, Instant};
 use std::{collections::BTreeMap, fs};
 
 #[cfg(test)]
@@ -1054,20 +1055,57 @@ pub(super) fn capsule_recipe(
     })
 }
 
-pub(super) fn load_capsule(
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct CapsuleLoadTimings {
+    pub(super) file_read: Option<Duration>,
+    pub(super) decode: Option<Duration>,
+    pub(super) authentication: Option<Duration>,
+}
+
+fn observe<T>(elapsed: &mut Option<Duration>, work: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = work();
+    *elapsed = Some(started.elapsed());
+    result
+}
+
+pub(super) fn load_capsule_observed(
+    backend: &CpuJitBackend,
+    recipe: &CapsuleRecipe,
+    items: &[ScheduleItem],
+    layouts: &[NativeScheduleLayout],
+    store_groups: &[NativeStoreGroup],
+) -> (
+    Result<RenderedScheduleModule, CapsuleLoadStatus>,
+    CapsuleLoadTimings,
+) {
+    let mut timing = CapsuleLoadTimings::default();
+    let result = (|| {
+        let bytes = observe(&mut timing.file_read, || {
+            let path = crate::cpu_jit::native_render_capsule_path(recipe.identity);
+            crate::file_io::read_file_bytes_bounded(path, MAX_BYTES)
+        })
+        .map_err(|_| CapsuleLoadStatus::FileUnavailable)?;
+        let module = observe(&mut timing.decode, || decode(&bytes, &recipe.bytes))
+            .ok_or(CapsuleLoadStatus::DecodeRejected)?;
+        observe(&mut timing.authentication, || {
+            authenticate_module(backend, recipe, &module, items, layouts, store_groups)
+        })
+        .then_some(module)
+        .ok_or(CapsuleLoadStatus::AuthenticationRejected)
+    })();
+    (result, timing)
+}
+
+#[cfg(test)]
+fn load_capsule(
     backend: &CpuJitBackend,
     recipe: &CapsuleRecipe,
     items: &[ScheduleItem],
     layouts: &[NativeScheduleLayout],
     store_groups: &[NativeStoreGroup],
 ) -> Result<RenderedScheduleModule, CapsuleLoadStatus> {
-    let path = crate::cpu_jit::native_render_capsule_path(recipe.identity);
-    let bytes = crate::file_io::read_file_bytes_bounded(path, MAX_BYTES)
-        .map_err(|_| CapsuleLoadStatus::FileUnavailable)?;
-    let module = decode(&bytes, &recipe.bytes).ok_or(CapsuleLoadStatus::DecodeRejected)?;
-    authenticate_module(backend, recipe, &module, items, layouts, store_groups)
-        .then_some(module)
-        .ok_or(CapsuleLoadStatus::AuthenticationRejected)
+    load_capsule_observed(backend, recipe, items, layouts, store_groups).0
 }
 
 pub(super) fn store_capsule(
