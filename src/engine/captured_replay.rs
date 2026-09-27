@@ -3465,7 +3465,7 @@ mod tests {
                 if message == "prepared native egress projection owner mismatch"
         ));
         assert_eq!(local_plan.workspace_stats(), before);
-        let malformed =
+        let malformed: BTreeMap<String, TensorData> =
             BTreeMap::from([("input".into(), TensorData::new([1], vec![1.0]).unwrap())]);
         let mut borrowed = local_plan.new_bindings();
         assert!(matches!(
