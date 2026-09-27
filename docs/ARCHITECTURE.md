@@ -1419,6 +1419,11 @@ times. Wall times do not participate in identity.
   Shared subtrees are not recursively expanded again; separately allocated
   equal producers retain their original first-occurrence order and identity.
   This preserves lane numbering and validation rather than caching its result.
+  Lane projection also uses a call-local producer-identity index while its
+  immutable producer list remains alive. Each identity maps to the original
+  first structural register ID; separately allocated equal sources retain the
+  existing structural-key fallback. This avoids repeated subtree formatting
+  for retained source owners without changing register numbering or admission.
   Missing, stale, or corrupt sidecars fall back in program order. No measured
   speedup is claimed.
 - **Cleanup and identity.** Chunk sources and objects are cleaned on every

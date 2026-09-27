@@ -1240,17 +1240,47 @@ pub(crate) fn project_lane_instruction(
     Ok(Some(instruction))
 }
 
-fn lane_instructions(nodes: &[UOp]) -> Result<LaneProjection, LinearizeError> {
-    let mut ids = BTreeMap::new();
-    for (index, node) in nodes.iter().enumerate() {
-        ids.entry(format!("{node:?}")).or_insert(index as u32);
+struct LaneProducerIds<'a> {
+    _producers: &'a [UOp],
+    owners: BTreeMap<usize, u32>,
+    structural: BTreeMap<String, u32>,
+}
+
+impl<'a> LaneProducerIds<'a> {
+    fn new(nodes: &'a [UOp]) -> Self {
+        let mut ids = Self {
+            _producers: nodes,
+            owners: BTreeMap::new(),
+            structural: BTreeMap::new(),
+        };
+        for (index, node) in nodes.iter().enumerate() {
+            let id = *ids
+                .structural
+                .entry(format!("{node:?}"))
+                .or_insert(index as u32);
+            ids.owners.insert(node.node_identity(), id);
+        }
+        ids
     }
+
+    fn get(&self, source: &UOp) -> Option<u32> {
+        // The retained borrow keeps immutable producer identities alive.
+        // Equal nodes excluded by structural deduplication still use its key.
+        self.owners
+            .get(&source.node_identity())
+            .copied()
+            .or_else(|| self.structural.get(&format!("{source:?}")).copied())
+    }
+}
+
+fn lane_instructions(nodes: &[UOp]) -> Result<LaneProjection, LinearizeError> {
+    let ids = LaneProducerIds::new(nodes);
     let mut instructions = Vec::with_capacity(nodes.len());
     let mut control_operations = Vec::new();
     let mut unsupported_operations = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         let instruction = project_lane_instruction(node, index as u32, |slot, source| {
-            ids.get(&format!("{source:?}")).copied().ok_or_else(|| {
+            ids.get(source).ok_or_else(|| {
                 LinearizeError::Invalid(format!(
                     "{:?} source {slot} is unordered",
                     node.operation()
@@ -1594,6 +1624,39 @@ mod tests {
                     .zip(&expected)
                     .all(|(a, b)| a.shares_node_with(b)),
                 "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn lane_producer_ids_preserve_structural_first_occurrence() {
+        let ty = UType::scalar(DType::I32);
+        let first = UOp::constant(1, ty);
+        let equal = UOp::constant(1, ty);
+        assert!(!first.shares_node_with(&equal));
+        let add = UOp::from_operation(
+            Operation::GraphBinary(crate::BinaryOp::Add),
+            Some(ty),
+            vec![first.clone(), equal.clone()],
+        );
+        // Exercise both retained duplicates and the deduplicated producer list.
+        for nodes in [
+            vec![first.clone(), equal.clone(), add.clone()],
+            vec![first.clone(), add.clone()],
+        ] {
+            let mut legacy = BTreeMap::new();
+            for (index, node) in nodes.iter().enumerate() {
+                legacy.entry(format!("{node:?}")).or_insert(index as u32);
+            }
+            let ids = LaneProducerIds::new(&nodes);
+            for source in [&first, &equal, &add, &UOp::constant(2, ty)] {
+                assert_eq!(ids.get(source), legacy.get(&format!("{source:?}")).copied());
+            }
+            assert_eq!(ids.get(&first), Some(0));
+            assert_eq!(ids.get(&equal), Some(0));
+            assert_eq!(
+                ids.owners.contains_key(&equal.node_identity()),
+                nodes.len() == 3
             );
         }
     }
