@@ -3257,6 +3257,32 @@ fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
     assert_eq!(executor.native_item_plan_count(), 4);
     let projection_counts = crate::engine::mixed_capture::prepared_replay_validation_counts();
     assert_eq!(projection_counts.recurrent_output_projection_builds, 6);
+    assert_eq!(
+        native
+            .main_replay
+            .workspace_stats()
+            .prepared_egress_projection_build_count
+            + native
+                .accumulation_replay
+                .as_ref()
+                .unwrap()
+                .workspace_stats()
+                .prepared_egress_projection_build_count
+            + native
+                .partial_flush_replay
+                .as_ref()
+                .unwrap()
+                .workspace_stats()
+                .prepared_egress_projection_build_count
+            + native
+                .zero_grad_replay
+                .as_ref()
+                .unwrap()
+                .workspace_stats()
+                .prepared_egress_projection_build_count,
+        6,
+        "main/accumulation All+CommitOnly and full-only auxiliary egress must seal once"
+    );
     let expected_recurrent_state_count = plan.inspection().unwrap().recurrent_state_count();
     let main_layout = native.main_replay.recurrent_bank_layout_evidence();
     let main_buffers = main_layout.buffers;
@@ -3650,6 +3676,15 @@ fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
     );
     assert_eq!(used_reset_workspace.intermediate_materialization_count, 0);
     assert!(used_reset_workspace.skipped_output_clear_count > 0);
+    assert_eq!(
+        used_reset_workspace.prepared_egress_projection_build_count,
+        1
+    );
+    assert!(
+        used_reset_workspace.prepared_egress_materialization_count
+            > reset_workspace.prepared_egress_materialization_count
+    );
+    assert_eq!(used_reset_workspace.dynamic_egress_selection_count, 0);
 
     let before_empty_reset = native.checkpoint().unwrap();
     let before_empty_reset_counts = native_recurrent_test_counts(&native);
@@ -3780,6 +3815,15 @@ fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
         used_flush_workspace.borrowed_recurrent_output_bytes
     );
     assert_eq!(used_flush_workspace.intermediate_materialization_count, 0);
+    assert_eq!(
+        used_flush_workspace.prepared_egress_projection_build_count,
+        1
+    );
+    assert!(
+        used_flush_workspace.prepared_egress_materialization_count
+            > flush_workspace.prepared_egress_materialization_count
+    );
+    assert_eq!(used_flush_workspace.dynamic_egress_selection_count, 0);
     assert_eq!(native.main_replay.structure_validation_count(), 1);
     assert_eq!(
         native
@@ -8580,6 +8624,21 @@ fn cpu_commit_only_steps_preserve_adamw_state_and_skip_named_egress() {
     );
     assert_eq!(commit_accumulation.last_materialized_egress_count, 1);
     assert_eq!(commit_accumulation.last_materialized_egress_bytes, 4);
+    assert_eq!(
+        ordinary_accumulation.prepared_egress_projection_build_count,
+        2
+    );
+    assert_eq!(
+        commit_accumulation.prepared_egress_projection_build_count,
+        2
+    );
+    assert_eq!(
+        ordinary_accumulation.prepared_egress_materialization_count,
+        1
+    );
+    assert_eq!(commit_accumulation.prepared_egress_materialization_count, 1);
+    assert_eq!(ordinary_accumulation.dynamic_egress_selection_count, 0);
+    assert_eq!(commit_accumulation.dynamic_egress_selection_count, 0);
     let ordinary_main = native.main_replay.workspace_stats();
     let commit_main = native_commit.main_replay.workspace_stats();
     assert_eq!(
@@ -8592,6 +8651,12 @@ fn cpu_commit_only_steps_preserve_adamw_state_and_skip_named_egress() {
     );
     assert_eq!(commit_main.last_materialized_egress_count, 5);
     assert_eq!(commit_main.last_materialized_egress_bytes, 24);
+    assert_eq!(ordinary_main.prepared_egress_projection_build_count, 2);
+    assert_eq!(commit_main.prepared_egress_projection_build_count, 2);
+    assert_eq!(ordinary_main.prepared_egress_materialization_count, 1);
+    assert_eq!(commit_main.prepared_egress_materialization_count, 1);
+    assert_eq!(ordinary_main.dynamic_egress_selection_count, 0);
+    assert_eq!(commit_main.dynamic_egress_selection_count, 0);
     assert_eq!(
         crate::engine::mixed_capture::prepared_replay_validation_counts()
             .recurrent_output_projection_builds,
@@ -11075,6 +11140,15 @@ fn compiled_resume_bundle_seals_one_decode_and_training_topology_for_restore() {
             .recurrent_output_projection_builds,
         6,
         "restored native replay must reuse its sealed output projection"
+    );
+    assert_eq!(
+        independent
+            .runtime()
+            .main_replay
+            .workspace_stats()
+            .prepared_egress_projection_build_count,
+        2,
+        "restored main replay must seal All and CommitOnly egress once"
     );
     assert_ne!(restored.checkpoint().unwrap(), optimizer_checkpoint);
 }

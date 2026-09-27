@@ -1,7 +1,8 @@
 //! Graph-independent interpreter/native replay and deterministic batching.
 use super::capture::{CapturedSchedule, ReplayError};
 use super::native_replay_workspace::{
-    NativeReplayTraffic, NativeReplayWorkspace, ResolvedNativeReplayInput,
+    NativeReplayTraffic, NativeReplayWorkspace, PreparedNativeEgressProjection,
+    ResolvedNativeReplayInput,
 };
 use super::replay_liveness::ReplayLivenessPlan;
 use crate::backend::{
@@ -1017,6 +1018,12 @@ pub(super) struct SealedPlannedNativeItems {
     plan: PlannedNativeItems,
 }
 
+#[derive(Clone, Copy)]
+enum NativeEgressSelection<'a> {
+    Dynamic(Option<&'a BTreeSet<u64>>),
+    Prepared(&'a PreparedNativeEgressProjection),
+}
+
 impl PlannedNativeItems {
     pub(crate) fn item_count(&self) -> usize {
         self.logical_item_count
@@ -1252,6 +1259,15 @@ impl PlannedNativeItems {
 }
 
 impl SealedPlannedNativeItems {
+    pub(super) fn prepare_egress_projection(
+        &mut self,
+        capture: &CapturedSchedule,
+        selected_owner: Arc<[u64]>,
+    ) -> PreparedNativeEgressProjection {
+        self.plan
+            .workspace
+            .prepare_egress_projection(capture, selected_owner)
+    }
     pub(super) fn new_bindings<'a>(
         &self,
     ) -> super::native_replay_workspace::NativeReplayBindings<'a> {
@@ -2078,7 +2094,12 @@ impl CapturedReplayExecutor {
     ) -> Result<(ReplayValues, NativeReplayTraffic), ReplayError> {
         plan.validate_replay_structure(capture)?;
         self.execute_authenticated_native_items_resolved(
-            capture, plan, borrowed, selected, setup, resolve,
+            capture,
+            plan,
+            borrowed,
+            NativeEgressSelection::Dynamic(selected),
+            setup,
+            resolve,
         )
     }
 
@@ -2087,7 +2108,7 @@ impl CapturedReplayExecutor {
         capture: &CapturedSchedule,
         plan: &mut SealedPlannedNativeItems,
         borrowed: &mut super::native_replay_workspace::NativeReplayBindings<'a>,
-        selected: Option<&BTreeSet<u64>>,
+        projection: &PreparedNativeEgressProjection,
         setup: impl FnOnce(
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
@@ -2102,7 +2123,7 @@ impl CapturedReplayExecutor {
             capture,
             &mut plan.plan,
             borrowed,
-            selected,
+            NativeEgressSelection::Prepared(projection),
             setup,
             resolve,
         )
@@ -2122,7 +2143,7 @@ impl CapturedReplayExecutor {
             capture,
             &mut plan.plan,
             &mut borrowed,
-            None,
+            NativeEgressSelection::Dynamic(None),
             |_workspace, _borrowed| Ok(()),
             |_input_ordinal, input, _workspace| {
                 let value = provided
@@ -2139,7 +2160,7 @@ impl CapturedReplayExecutor {
         capture: &CapturedSchedule,
         plan: &mut PlannedNativeItems,
         borrowed: &mut super::native_replay_workspace::NativeReplayBindings<'a>,
-        selected: Option<&BTreeSet<u64>>,
+        egress: NativeEgressSelection<'_>,
         setup: impl FnOnce(
             &mut NativeReplayWorkspace,
             &mut super::native_replay_workspace::NativeReplayBindings<'a>,
@@ -2158,6 +2179,9 @@ impl CapturedReplayExecutor {
             resolved.push(value);
         }
         plan.workspace.validate_input_validators(&resolved)?;
+        if let NativeEgressSelection::Prepared(projection) = egress {
+            plan.workspace.validate_egress_projection(projection)?;
+        }
         plan.workspace.begin_resolved();
         setup(&mut plan.workspace, borrowed)?;
         for (input_ordinal, value) in resolved.into_iter().enumerate() {
@@ -2180,7 +2204,14 @@ impl CapturedReplayExecutor {
             &plan.items,
             borrowed,
         )?;
-        let values = plan.workspace.materialize(capture, borrowed, selected)?;
+        let values = match egress {
+            NativeEgressSelection::Dynamic(selected) => {
+                plan.workspace.materialize(capture, borrowed, selected)?
+            }
+            NativeEgressSelection::Prepared(projection) => {
+                plan.workspace.materialize_prepared(borrowed, projection)?
+            }
+        };
         Ok((values, plan.workspace.traffic()))
     }
 }
@@ -3260,6 +3291,319 @@ mod tests {
             .unwrap();
         assert_eq!(selected_traffic.materialized_egress_count, 1);
         assert_eq!(selected_traffic.materialized_egress_bytes, 16);
+
+        for (label, selected_ids, expected_values, expected_bytes) in [
+            (
+                "source",
+                vec![source.index() as u64],
+                vec![vec![1.0, 4.0, 9.0, 16.0]],
+                16,
+            ),
+            (
+                "shrunk alias",
+                vec![shrunk.index() as u64],
+                vec![vec![4.0, 9.0]],
+                8,
+            ),
+            (
+                "empty alias",
+                vec![empty.index() as u64],
+                vec![Vec::new()],
+                0,
+            ),
+            (
+                "full",
+                vec![
+                    source.index() as u64,
+                    shrunk.index() as u64,
+                    empty.index() as u64,
+                ],
+                vec![vec![1.0, 4.0, 9.0, 16.0], vec![4.0, 9.0], Vec::new()],
+                24,
+            ),
+        ] {
+            let selected = selected_ids.iter().copied().collect::<BTreeSet<_>>();
+            let mut dynamic_plan = executor
+                .plan_native_items(&capture, &bindings, false)
+                .unwrap();
+            let mut dynamic_borrowed = dynamic_plan.workspace.new_bindings();
+            let (dynamic, mut dynamic_traffic) = executor
+                .execute_planned_native_items_resolved(
+                    &capture,
+                    &mut dynamic_plan,
+                    &mut dynamic_borrowed,
+                    Some(&selected),
+                    |_workspace, _borrowed| Ok(()),
+                    |_input_ordinal, input, _workspace| {
+                        Ok(ResolvedNativeReplayInput::External(&bindings[&input.name]))
+                    },
+                )
+                .unwrap();
+
+            let prepared_plan = executor
+                .plan_native_items(&capture, &bindings, false)
+                .unwrap();
+            let mut prepared_plan = prepared_plan.seal(&capture).unwrap();
+            let prepared_egress = prepared_plan
+                .prepare_egress_projection(&capture, Arc::<[u64]>::from(selected_ids.clone()));
+            let mut prepared_borrowed = prepared_plan.new_bindings();
+            let (prepared, mut prepared_traffic) = executor
+                .execute_sealed_planned_native_items_resolved(
+                    &capture,
+                    &mut prepared_plan,
+                    &mut prepared_borrowed,
+                    &prepared_egress,
+                    |_workspace, _borrowed| Ok(()),
+                    |_input_ordinal, input, _workspace| {
+                        Ok(ResolvedNativeReplayInput::External(&bindings[&input.name]))
+                    },
+                )
+                .unwrap();
+            dynamic_traffic.native_dispatcher_wall_time = Duration::ZERO;
+            prepared_traffic.native_dispatcher_wall_time = Duration::ZERO;
+            assert_eq!(prepared_traffic, dynamic_traffic, "{label} traffic");
+            assert_eq!(
+                prepared_traffic.materialized_egress_count,
+                u64::try_from(selected_ids.len()).unwrap(),
+                "{label} logical count"
+            );
+            assert_eq!(
+                prepared_traffic.materialized_egress_bytes, expected_bytes,
+                "{label} logical bytes"
+            );
+            for (requested, expected_values) in selected_ids.into_iter().zip(expected_values) {
+                let dynamic = dynamic.tensor(requested, label).unwrap();
+                let prepared = prepared.tensor(requested, label).unwrap();
+                assert_eq!(prepared.shape(), dynamic.shape(), "{label} shape");
+                assert_eq!(
+                    prepared.values(),
+                    expected_values,
+                    "{label} expected values"
+                );
+                let Storage::F32(dynamic) = dynamic.storage() else {
+                    panic!("{label} dynamic output must remain F32")
+                };
+                let Storage::F32(prepared) = prepared.storage() else {
+                    panic!("{label} prepared output must remain F32")
+                };
+                assert_eq!(
+                    prepared
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    dynamic
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "{label} raw values"
+                );
+            }
+            let stats = prepared_plan.workspace_stats();
+            assert_eq!(stats.prepared_egress_projection_build_count, 1);
+            assert_eq!(stats.prepared_egress_materialization_count, 1);
+            assert_eq!(stats.dynamic_egress_selection_count, 0);
+        }
+
+        let alternating_plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let mut alternating_plan = alternating_plan.seal(&capture).unwrap();
+        let full_egress = alternating_plan.prepare_egress_projection(
+            &capture,
+            Arc::from([
+                source.index() as u64,
+                shrunk.index() as u64,
+                empty.index() as u64,
+            ]),
+        );
+        let reduced_egress = alternating_plan
+            .prepare_egress_projection(&capture, Arc::from([source.index() as u64]));
+        for projection in [&full_egress, &reduced_egress] {
+            let mut borrowed = alternating_plan.new_bindings();
+            executor
+                .execute_sealed_planned_native_items_resolved(
+                    &capture,
+                    &mut alternating_plan,
+                    &mut borrowed,
+                    projection,
+                    |_workspace, _borrowed| Ok(()),
+                    |_input_ordinal, input, _workspace| {
+                        Ok(ResolvedNativeReplayInput::External(&bindings[&input.name]))
+                    },
+                )
+                .unwrap();
+        }
+        let alternating_stats = alternating_plan.workspace_stats();
+        assert_eq!(alternating_stats.prepared_egress_projection_build_count, 2);
+        assert_eq!(alternating_stats.prepared_egress_materialization_count, 2);
+        assert_eq!(alternating_stats.dynamic_egress_selection_count, 0);
+
+        let local_plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let foreign_plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let mut local_plan = local_plan.seal(&capture).unwrap();
+        let mut foreign_plan = foreign_plan.seal(&capture).unwrap();
+        let foreign_egress = foreign_plan
+            .prepare_egress_projection(&capture, Arc::<[u64]>::from([source.index() as u64]));
+        let before = local_plan.workspace_stats();
+        let mut borrowed = local_plan.new_bindings();
+        assert!(matches!(
+            executor.execute_sealed_planned_native_items_resolved(
+                &capture,
+                &mut local_plan,
+                &mut borrowed,
+                &foreign_egress,
+                |_workspace, _borrowed| Ok(()),
+                |_input_ordinal, input, _workspace| {
+                    Ok(ResolvedNativeReplayInput::External(&bindings[&input.name]))
+                },
+            ),
+            Err(ReplayError::Corrupt(message))
+                if message == "prepared native egress projection owner mismatch"
+        ));
+        assert_eq!(local_plan.workspace_stats(), before);
+        let malformed: BTreeMap<String, TensorData> =
+            BTreeMap::from([("input".into(), TensorData::new([1], vec![1.0]).unwrap())]);
+        let mut borrowed = local_plan.new_bindings();
+        assert!(matches!(
+            executor.execute_sealed_planned_native_items_resolved(
+                &capture,
+                &mut local_plan,
+                &mut borrowed,
+                &foreign_egress,
+                |_workspace, _borrowed| Ok(()),
+                |_input_ordinal, input, _workspace| {
+                    Ok(ResolvedNativeReplayInput::External(&malformed[&input.name]))
+                },
+            ),
+            Err(ReplayError::Descriptor(name)) if name == "input"
+        ));
+        assert_eq!(local_plan.workspace_stats(), before);
+
+        let unavailable_selected = BTreeSet::from([shrunk.index() as u64]);
+        let unavailable_dynamic = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let mut unavailable_dynamic = unavailable_dynamic;
+        unavailable_dynamic
+            .workspace
+            .invalidate_egress(source.index() as u64);
+        let unavailable_dynamic_borrowed = unavailable_dynamic.workspace.new_bindings();
+        let dynamic_error = unavailable_dynamic
+            .workspace
+            .materialize(
+                &capture,
+                &unavailable_dynamic_borrowed,
+                Some(&unavailable_selected),
+            )
+            .unwrap_err();
+
+        let unavailable_prepared = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let mut unavailable_prepared = unavailable_prepared.seal(&capture).unwrap();
+        let unavailable_projection = unavailable_prepared
+            .prepare_egress_projection(&capture, Arc::from([shrunk.index() as u64]));
+        unavailable_prepared
+            .plan
+            .workspace
+            .invalidate_egress(source.index() as u64);
+        let unavailable_prepared_borrowed = unavailable_prepared.new_bindings();
+        let prepared_error = unavailable_prepared
+            .plan
+            .workspace
+            .materialize_prepared(&unavailable_prepared_borrowed, &unavailable_projection)
+            .unwrap_err();
+        assert!(matches!(
+            &prepared_error,
+            ReplayError::Corrupt(message)
+                if message == &format!(
+                    "native workspace egress {} is unavailable",
+                    source.index()
+                )
+        ));
+        assert_eq!(prepared_error, dynamic_error);
+    }
+
+    #[test]
+    fn prepared_native_egress_preserves_passthrough_float_bits() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("input", [3], DType::F32);
+        let alias = graph.shrink(input, [(0, 2)]).unwrap();
+        let capture = captured(&graph, &[input, alias]);
+        assert_eq!(capture.requested_passthroughs.len(), 1);
+        let input_bits = [0x8000_0000, 0x7fc0_0021, 0x3f80_0000];
+        let bindings = BTreeMap::from([(
+            "input".into(),
+            TensorData::new([3], input_bits.map(f32::from_bits).into_iter().collect()).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let selected_ids = vec![input.index() as u64, alias.index() as u64];
+        let selected = selected_ids.iter().copied().collect::<BTreeSet<_>>();
+
+        let mut dynamic_plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let mut dynamic_borrowed = dynamic_plan.workspace.new_bindings();
+        let (dynamic, _) = executor
+            .execute_planned_native_items_resolved(
+                &capture,
+                &mut dynamic_plan,
+                &mut dynamic_borrowed,
+                Some(&selected),
+                |_workspace, _borrowed| Ok(()),
+                |_input_ordinal, input, _workspace| {
+                    Ok(ResolvedNativeReplayInput::External(&bindings[&input.name]))
+                },
+            )
+            .unwrap();
+
+        let prepared_plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        let mut prepared_plan = prepared_plan.seal(&capture).unwrap();
+        let prepared_egress =
+            prepared_plan.prepare_egress_projection(&capture, Arc::from(selected_ids.as_slice()));
+        let mut prepared_borrowed = prepared_plan.new_bindings();
+        let (prepared, _) = executor
+            .execute_sealed_planned_native_items_resolved(
+                &capture,
+                &mut prepared_plan,
+                &mut prepared_borrowed,
+                &prepared_egress,
+                |_workspace, _borrowed| Ok(()),
+                |_input_ordinal, input, _workspace| {
+                    Ok(ResolvedNativeReplayInput::External(&bindings[&input.name]))
+                },
+            )
+            .unwrap();
+
+        for requested in selected_ids {
+            let expected_bits = if requested == input.index() as u64 {
+                input_bits.as_slice()
+            } else {
+                &input_bits[..2]
+            };
+            for values in [&dynamic, &prepared] {
+                let Storage::F32(values) = values
+                    .tensor(requested, "raw passthrough")
+                    .unwrap()
+                    .storage()
+                else {
+                    panic!("raw passthrough must remain F32")
+                };
+                assert_eq!(
+                    values
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    expected_bits
+                );
+            }
+        }
     }
 
     #[test]

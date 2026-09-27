@@ -2,6 +2,9 @@
 
 use super::validate_requested_selection;
 use crate::ReplayError;
+use crate::engine::native_replay_workspace::{
+    NativeReplayWorkspace, PreparedNativeEgressProjection,
+};
 use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Clone, Debug)]
@@ -45,15 +48,20 @@ struct PreparedRecurrentOutput {
     disposition: PreparedRecurrentOutputDisposition,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct PreparedRecurrentOutputProjection {
-    requested: Arc<[u64]>,
-    outputs: Box<[PreparedRecurrentOutput]>,
-    public: BTreeSet<u64>,
+    logical: PreparedRecurrentLogicalOutputProjection,
+    native_egress: PreparedNativeEgressProjection,
 }
 
-impl PreparedRecurrentOutputProjection {
-    pub(super) fn prepare(
+#[derive(Debug)]
+struct PreparedRecurrentLogicalOutputProjection {
+    requested: Arc<[u64]>,
+    outputs: Box<[PreparedRecurrentOutput]>,
+}
+
+impl PreparedRecurrentLogicalOutputProjection {
+    fn prepare(
         requested: Arc<[u64]>,
         full_requested: &[u64],
         successor_outputs: &BTreeSet<u64>,
@@ -72,23 +80,10 @@ impl PreparedRecurrentOutputProjection {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let public = requested.iter().copied().collect();
-        Ok(Self {
-            requested,
-            outputs,
-            public,
-        })
+        Ok(Self { requested, outputs })
     }
 
-    pub(super) fn is_owned_by(&self, handle: &PreparedRecurrentOutputProjectionHandle) -> bool {
-        Arc::ptr_eq(&self.requested, &handle.requested)
-    }
-
-    pub(super) fn public(&self) -> &BTreeSet<u64> {
-        &self.public
-    }
-
-    pub(super) fn extract(
+    fn extract(
         &self,
         values: &mut super::super::captured_replay::ReplayValues,
     ) -> Result<Vec<crate::TensorData>, ReplayError> {
@@ -103,6 +98,45 @@ impl PreparedRecurrentOutputProjection {
                 }
             })
             .collect()
+    }
+}
+
+impl PreparedRecurrentOutputProjection {
+    pub(super) fn prepare(
+        requested: Arc<[u64]>,
+        full_requested: &[u64],
+        successor_outputs: &BTreeSet<u64>,
+        native_egress: PreparedNativeEgressProjection,
+    ) -> Result<Self, ReplayError> {
+        let logical = PreparedRecurrentLogicalOutputProjection::prepare(
+            Arc::clone(&requested),
+            full_requested,
+            successor_outputs,
+        )?;
+        if !NativeReplayWorkspace::egress_projection_owns_selection(&native_egress, &requested) {
+            return Err(ReplayError::Corrupt(
+                "prepared native egress selection owner mismatch".into(),
+            ));
+        }
+        Ok(Self {
+            logical,
+            native_egress,
+        })
+    }
+
+    pub(super) fn is_owned_by(&self, handle: &PreparedRecurrentOutputProjectionHandle) -> bool {
+        Arc::ptr_eq(&self.logical.requested, &handle.requested)
+    }
+
+    pub(super) fn native_egress(&self) -> &PreparedNativeEgressProjection {
+        &self.native_egress
+    }
+
+    pub(super) fn extract(
+        &self,
+        values: &mut super::super::captured_replay::ReplayValues,
+    ) -> Result<Vec<crate::TensorData>, ReplayError> {
+        self.logical.extract(values)
     }
 }
 
@@ -121,7 +155,7 @@ mod tests {
     fn projection_preserves_order_duplicates_and_successor_disposition() {
         let requested = [5, 7, 5, 9];
         let selected = Arc::<[u64]>::from([5, 5, 9]);
-        let projection = PreparedRecurrentOutputProjection::prepare(
+        let projection = PreparedRecurrentLogicalOutputProjection::prepare(
             Arc::clone(&selected),
             &requested,
             &BTreeSet::from([5]),
@@ -144,7 +178,6 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(projection.public, BTreeSet::from([5, 9]));
         let successor = crate::TensorData::new([1], vec![-0.0]).unwrap();
         let ordinary = crate::TensorData::new([1], vec![f32::from_bits(0x7fc0_0011)]).unwrap();
         let mut values = crate::engine::captured_replay::ReplayValues::from_materialized(
@@ -167,15 +200,15 @@ mod tests {
             Arc::from(requested),
             Arc::from([5, 5, 9]),
         );
-        assert!(!projection.is_owned_by(&foreign));
+        assert!(!Arc::ptr_eq(&projection.requested, &foreign.requested));
         let local = PreparedRecurrentOutputProjectionHandle::new(1, Arc::from(requested), selected);
-        assert!(projection.is_owned_by(&local));
+        assert!(Arc::ptr_eq(&projection.requested, &local.requested));
     }
 
     #[test]
     fn projection_rejects_out_of_order_or_excess_duplicates() {
         assert!(
-            PreparedRecurrentOutputProjection::prepare(
+            PreparedRecurrentLogicalOutputProjection::prepare(
                 Arc::from([7, 5]),
                 &[5, 7],
                 &BTreeSet::new(),
@@ -183,7 +216,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            PreparedRecurrentOutputProjection::prepare(
+            PreparedRecurrentLogicalOutputProjection::prepare(
                 Arc::from([5, 5]),
                 &[5, 7],
                 &BTreeSet::new(),
@@ -194,9 +227,12 @@ mod tests {
 
     #[test]
     fn projection_extracts_the_logical_requested_passthrough_id() {
-        let projection =
-            PreparedRecurrentOutputProjection::prepare(Arc::from([41]), &[41], &BTreeSet::new())
-                .unwrap();
+        let projection = PreparedRecurrentLogicalOutputProjection::prepare(
+            Arc::from([41]),
+            &[41],
+            &BTreeSet::new(),
+        )
+        .unwrap();
         let source = crate::TensorData::new(
             [2],
             vec![f32::from_bits(0x8000_0000), f32::from_bits(0x7fc0_0021)],
