@@ -49,11 +49,11 @@ impl ElementwiseTopology {
         let linear = linear_kernel(root)?;
         let vector_program = vector_program(&linear)?;
         Ok(NativeCachePolicy::Ordinary(
-            vector_program
-                .b1_eligibility()
-                .is_ok()
-                .then(|| format!("b1-{}", vector_program.cache_key))
-                .unwrap_or_default(),
+            if vector_program.b1_eligibility().is_ok() {
+                format!("b1-{}", vector_program.cache_key)
+            } else {
+                String::new()
+            },
         ))
     }
 }
