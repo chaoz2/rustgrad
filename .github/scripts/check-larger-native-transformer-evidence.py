@@ -166,6 +166,8 @@ def _warm_timing_projection(warm: dict[str, Any]) -> dict[str, int]:
         )
     }
     preparation = warm["preparation"]
+    for field, value in warm.get("bundle_load_phases", {}).items():
+        result[f"bundle_load_phases.{field}"] = value
     for field, value in preparation.items():
         if field.endswith("_wall_time_ns"):
             result[f"preparation.{field}"] = value
@@ -253,7 +255,7 @@ def validate_larger_evidence(
         except PREPARATION_EVIDENCE.PreparationEvidenceError:
             return None
 
-    if objective.get("schema_version") not in (8, 9) or objective.get("git_sha") != expected_sha:
+    if objective.get("schema_version") not in (8, 9, 10) or objective.get("git_sha") != expected_sha:
         raise LargerEvidenceError("larger Transformer objective provenance is invalid")
     expected_workload = {
         "batch": 4,
@@ -605,7 +607,7 @@ def validate_larger_evidence(
         "effective_render_fraction",
     }
     preparation_details = {"prepare_finalization"}
-    if objective["schema_version"] == 9:
+    if objective["schema_version"] >= 9:
         preparation_details.add("capsule_phases")
     if (
         not isinstance(preparation, dict)
@@ -709,7 +711,7 @@ def validate_larger_evidence(
         or preparation["effective_render_wall_time_ns"] != effective_render
     ):
         raise LargerEvidenceError("larger Transformer warm effective render timing is invalid")
-    if objective["schema_version"] == 9:
+    if objective["schema_version"] >= 9:
         phases = preparation.get("capsule_phases")
         fields = ("recipe_wall_time_ns", "file_read_wall_time_ns",
                   "decode_wall_time_ns", "authentication_wall_time_ns")
@@ -767,6 +769,21 @@ def validate_larger_evidence(
     ]:
         if warm.get(field) is not True:
             raise LargerEvidenceError(f"larger Transformer warm resume {field} is invalid")
+    if objective["schema_version"] == 10:
+        phases = warm.get("bundle_load_phases")
+        fields = {"file_read_wall_time_ns", "envelope_wall_time_ns",
+                  "program_wall_time_ns", "checkpoint_wall_time_ns",
+                  "pair_admission_wall_time_ns"}
+        if type(phases) is not dict or set(phases) != fields:
+            raise LargerEvidenceError("larger Transformer bundle load phases differ")
+        if any(type(value) is not int or not 0 <= value <= 2**64 - 1
+               for value in phases.values()):
+            raise LargerEvidenceError("larger Transformer bundle load timing is invalid")
+        total = sum(phases.values())
+        if total > 2**64 - 1 or total > warm["artifact_decode_wall_time_ns"]:
+            raise LargerEvidenceError("larger Transformer bundle load phases exceed load")
+    elif "bundle_load_phases" in warm:
+        raise LargerEvidenceError("legacy larger Transformer evidence has bundle load phases")
     for field in ["capture_identity", "evaluation_capture_identity"]:
         if type(warm.get(field)) is not int or warm[field] <= 0:
             raise LargerEvidenceError(f"larger Transformer warm resume {field} is invalid")
@@ -848,6 +865,8 @@ def validate_larger_evidence(
     stable_objective = copy.deepcopy(objective)
     stable_objective.pop("git_sha")
     stable_warm = stable_objective["warm_resume"]
+    if "bundle_load_phases" in stable_warm:
+        stable_warm["bundle_load_phases"] = sorted(stable_warm["bundle_load_phases"])
     for field in (
         "artifact_decode_wall_time_ns",
         "owner_restore_wall_time_ns",

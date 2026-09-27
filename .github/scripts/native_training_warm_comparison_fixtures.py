@@ -165,6 +165,7 @@ def fixture(support, root):
 
 def check(support):
     check_capsule_phases(support)
+    check_bundle_load_phases(support)
     cases = (
         "valid", "timing", "checkpoint", "capture", "cache-miss", "hardware", "missing",
         "malformed-projection", "malformed-dropout", "malformed-duration",
@@ -243,6 +244,55 @@ def check_capsule_phases(support):
                     elif case == "mixed-version":
                         objective["schema_version"] = 8
                         del objective["warm_resume"]["preparation"]["capsule_phases"]
+                support.write_json(path, objective)
+                checksums(support, directory)
+            manifest, comparable = support.VALIDATOR.compare(arguments)
+            assert comparable is (case in ("valid", "timing")), (case, manifest)
+            if case not in ("valid", "timing", "mixed-version"):
+                assert manifest["trials"][1]["status"] == "invalid", case
+                assert manifest["trials"][1]["files"], case
+
+
+def check_bundle_load_phases(support):
+    fields = ("file_read_wall_time_ns", "envelope_wall_time_ns",
+              "program_wall_time_ns", "checkpoint_wall_time_ns",
+              "pair_admission_wall_time_ns")
+    capsule_fields = ("recipe_wall_time_ns", "file_read_wall_time_ns",
+                      "decode_wall_time_ns", "authentication_wall_time_ns")
+    for case in ("valid", "timing", "missing", "extra", "bool", "negative",
+                 "overflow", "sum-overflow", "exceeds", "mixed-version", "legacy-field"):
+        with tempfile.TemporaryDirectory(prefix="rustgrad-bundle-phases-") as temporary:
+            root = pathlib.Path(temporary).resolve()
+            arguments = fixture(support, root)
+            for directory in sorted(root.glob("trial-*")):
+                path = directory / "objective-evidence.json"
+                objective = json.loads(path.read_text())
+                objective["schema_version"] = 10
+                warm = objective["warm_resume"]
+                warm["preparation"]["capsule_phases"] = [
+                    {"program_index": index, **dict.fromkeys(capsule_fields, 0)}
+                    for index in range(5)
+                ]
+                phases = dict.fromkeys(fields, 0)
+                warm["bundle_load_phases"] = phases
+                if directory.name == "trial-02-candidate":
+                    if case == "timing":
+                        phases[fields[0]] = 1
+                    elif case == "missing":
+                        phases.pop(fields[0])
+                    elif case == "extra":
+                        phases["invented_wall_time_ns"] = 0
+                    elif case in ("bool", "negative", "overflow", "exceeds"):
+                        phases[fields[0]] = {
+                            "bool": True, "negative": -1,
+                            "overflow": 2**64, "exceeds": warm["artifact_decode_wall_time_ns"] + 1,
+                        }[case]
+                    elif case == "sum-overflow":
+                        phases.update(dict.fromkeys(fields, 2**64 - 1))
+                    elif case in ("mixed-version", "legacy-field"):
+                        objective["schema_version"] = 9
+                        if case == "mixed-version":
+                            del warm["bundle_load_phases"]
                 support.write_json(path, objective)
                 checksums(support, directory)
             manifest, comparable = support.VALIDATOR.compare(arguments)
