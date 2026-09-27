@@ -2195,12 +2195,14 @@ fn native_cpu_adamw_prepares_strictly_reuses_cache_and_commits_atomically() {
     let compile_wall_time = compile_phases.measured_wall_time().unwrap();
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let prepare_started = std::time::Instant::now();
     let mut native = target.prepare(&plan).unwrap();
+    let prepare_wall_time = prepare_started.elapsed();
     let mut scoreboard = crate::NativeTrainingScoreboard::new(
         inspection,
         native.preparation_report(),
         compile_wall_time,
-        native.preparation_report().main().wall_time(),
+        prepare_wall_time,
     )
     .unwrap();
     assert_eq!(executor.native_item_plan_count(), 1);
@@ -5025,7 +5027,9 @@ fn momentum_plan_prepares_strict_native_replay_with_exact_checkpoint_state() {
     let mut interpreted = plan.prepare_cpu().unwrap();
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let prepare_started = std::time::Instant::now();
     let mut native = plan.prepare(&target).unwrap();
+    let prepare_wall_time = prepare_started.elapsed();
     fn assert_native_training_runtime<R: NativeCpuCompiledTrainingRuntime>(runtime: &R) {
         assert_eq!(
             runtime.native_preparation_report().main().fallback_count(),
@@ -5037,7 +5041,7 @@ fn momentum_plan_prepares_strict_native_replay_with_exact_checkpoint_state() {
         inspection,
         native.native_preparation_report(),
         compile_wall_time,
-        native.native_preparation_report().main().wall_time(),
+        prepare_wall_time,
     )
     .unwrap();
 
