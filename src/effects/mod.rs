@@ -11,6 +11,7 @@ use std::{
 pub mod autograd;
 pub mod batch;
 pub mod bridge;
+mod replacement;
 pub mod runtime;
 pub mod schedule;
 pub use autograd::{
@@ -18,6 +19,7 @@ pub use autograd::{
 };
 pub use batch::{EffectBatch, EffectBatchEntry, EffectBatchSource, EffectBatchStep};
 pub use bridge::{EffectSourceBridge, PersistentInputBinding, PureEffectBinding};
+pub(crate) use replacement::{WholeBufferEffectPlan, WholeBufferEffectPlanBuilder};
 pub use runtime::{
     EffectRuntime, PersistentRuntimeStats, PersistentSlotIdentity, PersistentSnapshot, RuntimeError,
 };
@@ -50,6 +52,22 @@ pub struct EffectStep {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct EffectPlan {
     pub steps: Vec<EffectStep>,
+}
+
+/// Immutable proof that an effect plan passed the shared logical validator.
+/// The private payload prevents callers from mutating a plan after validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedEffectPlan(EffectPlan);
+
+impl ValidatedEffectPlan {
+    pub(crate) fn new(plan: EffectPlan) -> Result<Self, EffectError> {
+        plan.validate()?;
+        Ok(Self(plan))
+    }
+
+    pub(crate) fn plan(&self) -> &EffectPlan {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

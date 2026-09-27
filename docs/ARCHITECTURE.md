@@ -739,6 +739,15 @@ demand, so the schedule cannot retain mismatched kinds, payload copies, or UOp
 graphs. Those private-wire STORE/AFTER UOps lower to ordinary effect-boundary
 `ScheduleItem`s with stable dependencies; `realize_effects_persistent` uses
 that same canonical schedule rather than a parallel runtime IR.
+
+Compiled recurrent training has a narrower whole-buffer replacement path. It
+constructs the same ordered `EffectPlan` directly from already-validated state
+descriptors, seals that plan once, and derives both the effect schedule and its
+canonical state inventory from the sealed value. This avoids allocating and
+copying placeholder host payloads during compilation. The general
+`EffectGraph` view/index/runtime path, mixed-schedule validation, capture bytes,
+and cache identities remain unchanged.
+
 `schedule::mixed` adds a typed,
 immutable pure-output-to-STORE binding and transactional realization: pure
 values are owned until the pool-wide effect commit. Typed
@@ -926,7 +935,7 @@ trainer, optimizer, state format, device fallback, or persistent gradient map.
 
 ### Compiled recurrent training
 
-`session/compiled_training.rs` is the static recurrent-training seam. Its
+`session/compiled_training/mod.rs` is the static recurrent-training seam. Its
 private optimizer-program interface separates optimizer state and update math
 from the shared execution machinery:
 

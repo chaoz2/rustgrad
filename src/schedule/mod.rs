@@ -814,6 +814,18 @@ impl ScheduleItem {
 pub fn schedule_effects(graph: &crate::EffectGraph) -> Result<Schedule, ScheduleError> {
     let effect = crate::EffectSchedule::lower(graph)
         .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+    schedule_lowered_effects(effect)
+}
+
+pub(crate) fn schedule_whole_buffer_effects(
+    plan: &crate::effects::WholeBufferEffectPlan,
+) -> Result<Schedule, ScheduleError> {
+    let effect = crate::EffectSchedule::lower_validated(plan.validated())
+        .map_err(|error| ScheduleError::Binding(error.to_string()))?;
+    schedule_lowered_effects(effect)
+}
+
+fn schedule_lowered_effects(effect: crate::EffectSchedule) -> Result<Schedule, ScheduleError> {
     let mut items = Vec::new();
     for (position, node) in effect.nodes().iter().enumerate() {
         let payload = node.payload();
