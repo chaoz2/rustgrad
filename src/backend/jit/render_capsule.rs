@@ -462,7 +462,7 @@ fn recipe(
     items: &[ScheduleItem],
     layouts: &[NativeScheduleLayout],
     store_groups: &[NativeStoreGroup],
-) -> Option<Vec<u8>> {
+) -> Option<CapsuleRecipePayload> {
     if items.len() != layouts.len() {
         return None;
     }
@@ -473,7 +473,8 @@ fn recipe(
     writer.usize(program_index)?;
     writer.usize(program_count)?;
     writer.count(items.len())?;
-    for (item, layout) in items.iter().zip(layouts) {
+    let mut item_witnesses = Vec::with_capacity(items.len());
+    for (logical_index, (item, layout)) in items.iter().zip(layouts).enumerate() {
         // The schedule cache key is the stable, versioned identity of the
         // complete item, including its canonical kernel artifact, bindings,
         // descriptors, and boundary. Retain that identity rather than the
@@ -482,12 +483,18 @@ fn recipe(
         // their rendered capsule can be admitted.
         writer.u64(item.cache_key)?;
         write_layout(&mut writer, layout)?;
-        write_output_initialization(
-            &mut writer,
-            crate::cpu_jit::native_output_initialization(&item.kernel),
-        )?;
+        let output_initialization = crate::cpu_jit::native_output_initialization(&item.kernel);
+        write_output_initialization(&mut writer, output_initialization)?;
+        item_witnesses.push(CapsuleItemWitness {
+            logical_index,
+            schedule_cache_key: item.cache_key,
+            kernel: item.kernel.clone(),
+            layout: layout.clone(),
+            output_initialization,
+        });
     }
     writer.count(store_groups.len())?;
+    let mut store_group_witnesses = Vec::with_capacity(store_groups.len());
     for group in store_groups {
         writer.count(group.members.len())?;
         for member in &group.members {
@@ -498,13 +505,25 @@ fn recipe(
         // member kernels and this ordered membership. Bind its exact renderer
         // ABI without requiring that derived multi-store DAG to have a second
         // ordinary schedule-artifact representation.
-        write_abi(
-            &mut writer,
-            &crate::cpu_jit::native_store_group_abi(&group.kernel).ok()?,
-        )?;
+        let abi = crate::cpu_jit::native_store_group_abi(&group.kernel).ok()?;
+        write_abi(&mut writer, &abi)?;
         write_output_initialization(&mut writer, group.output_initialization)?;
+        store_group_witnesses.push(CapsuleStoreGroupWitness {
+            members: group
+                .members
+                .iter()
+                .map(|member| (member.logical_index, member.output_buffer))
+                .collect(),
+            kernel: group.kernel.clone(),
+            abi,
+            output_initialization: group.output_initialization,
+        });
     }
-    Some(writer.0)
+    Some(CapsuleRecipePayload {
+        bytes: writer.0,
+        item_witnesses: item_witnesses.into_boxed_slice(),
+        store_group_witnesses: store_group_witnesses.into_boxed_slice(),
+    })
 }
 
 fn authenticates_rendered_payload(rendered: &RenderedC) -> bool {
@@ -628,8 +647,9 @@ fn authenticates_store_group_abi(
     group: &NativeStoreGroup,
     items: &[ScheduleItem],
     abi: &KernelAbi,
+    expected: &KernelAbi,
 ) -> bool {
-    if !crate::cpu_jit::native_store_group_abi(&group.kernel).is_ok_and(|expected| expected == *abi)
+    if expected != abi
         || !abi.quantized_buffers.is_empty()
         || abi.pointer_order
             != (0..abi.buffers.len())
@@ -664,6 +684,53 @@ struct OrdinaryRenderWitness {
     kernel: crate::UOp,
     vector: VectorPlan,
     authentication: crate::cpu_jit::NativeRenderAuthentication,
+}
+
+struct CapsuleItemWitness {
+    logical_index: usize,
+    schedule_cache_key: u64,
+    kernel: crate::UOp,
+    layout: NativeScheduleLayout,
+    output_initialization: NativeOutputInitialization,
+}
+
+impl CapsuleItemWitness {
+    fn authenticates(
+        &self,
+        logical_index: usize,
+        item: &ScheduleItem,
+        layout: &NativeScheduleLayout,
+    ) -> bool {
+        self.logical_index == logical_index
+            && self.schedule_cache_key == item.cache_key
+            && self.kernel.shares_node_with(&item.kernel)
+            && &self.layout == layout
+    }
+}
+
+struct CapsuleStoreGroupWitness {
+    members: Box<[(usize, u64)]>,
+    kernel: crate::UOp,
+    abi: KernelAbi,
+    output_initialization: NativeOutputInitialization,
+}
+
+struct CapsuleRecipePayload {
+    bytes: Vec<u8>,
+    item_witnesses: Box<[CapsuleItemWitness]>,
+    store_group_witnesses: Box<[CapsuleStoreGroupWitness]>,
+}
+
+impl CapsuleStoreGroupWitness {
+    fn authenticates(&self, group: &NativeStoreGroup) -> bool {
+        self.kernel.shares_node_with(&group.kernel)
+            && self.output_initialization == group.output_initialization
+            && self.members.len() == group.members.len()
+            && self.members.iter().copied().eq(group
+                .members
+                .iter()
+                .map(|member| (member.logical_index, member.output_buffer)))
+    }
 }
 
 impl OrdinaryRenderWitness {
@@ -712,12 +779,19 @@ impl OrdinaryRenderWitness {
 
 fn authenticate_module(
     backend: &CpuJitBackend,
+    recipe: &CapsuleRecipe,
     module: &RenderedScheduleModule,
     items: &[ScheduleItem],
     layouts: &[NativeScheduleLayout],
     store_groups: &[NativeStoreGroup],
 ) -> bool {
     if items.len() != layouts.len() {
+        return false;
+    }
+    if recipe.vectorized != backend.vectorized
+        || recipe.item_witnesses.len() != items.len()
+        || recipe.store_group_witnesses.len() != store_groups.len()
+    {
         return false;
     }
     let mut group_anchors = std::collections::BTreeSet::new();
@@ -753,11 +827,12 @@ fn authenticate_module(
     }
     let groups = store_groups
         .iter()
-        .filter_map(|group| {
+        .zip(recipe.store_group_witnesses.iter())
+        .filter_map(|(group, witness)| {
             group
                 .members
                 .last()
-                .map(|member| (member.logical_index, group))
+                .map(|member| (member.logical_index, (group, witness)))
         })
         .collect::<BTreeMap<_, _>>();
     let grouped = group_members;
@@ -770,6 +845,7 @@ fn authenticate_module(
             if grouped.contains(&index)
                 || validate_native_layout(item, layout).is_err()
                 || backend.validate_zero_domain_schedule_item(item).is_err()
+                || !recipe.item_witnesses[index].authenticates(index, item, layout)
             {
                 return false;
             }
@@ -798,7 +874,7 @@ fn authenticate_module(
         if !authenticates_rendered_payload(&entry.rendered) {
             return false;
         }
-        if let Some(group) = groups.get(&index) {
+        if let Some((group, group_witness)) = groups.get(&index) {
             let logical_indices = group
                 .members
                 .iter()
@@ -831,7 +907,21 @@ fn authenticate_module(
                 || entry.output_initialization != group.output_initialization
                 || crate::cpu_jit::native_store_group_cache_key(&entry.rendered.source)
                     != entry.rendered.cache_key
-                || !authenticates_store_group_abi(group, items, &entry.rendered.abi)
+                || !group_witness.authenticates(group)
+                || group.members.iter().any(|member| {
+                    let logical = member.logical_index;
+                    !recipe.item_witnesses[logical].authenticates(
+                        logical,
+                        &items[logical],
+                        &layouts[logical],
+                    )
+                })
+                || !authenticates_store_group_abi(
+                    group,
+                    items,
+                    &entry.rendered.abi,
+                    &group_witness.abi,
+                )
                 || entry.native_cache_key
                     != format!(
                         "{}-native-store-group-{ordered_members}-{ordered_outputs}",
@@ -841,14 +931,14 @@ fn authenticate_module(
                 return false;
             }
         } else {
+            let item_witness = &recipe.item_witnesses[index];
             let expected = match OrdinaryRenderWitness::new(backend, index, item) {
                 Ok(expected) => expected,
                 Err(_) => return false,
             };
             if !expected.authenticates(backend, index, item, entry)
                 || entry.native_layouts != [layout.clone()]
-                || entry.output_initialization
-                    != crate::cpu_jit::native_output_initialization(&item.kernel)
+                || entry.output_initialization != item_witness.output_initialization
                 || entry.native_cache_key
                     != format!(
                         "{}-schedule-{:016x}",
@@ -859,6 +949,7 @@ fn authenticate_module(
                     .validate_rendered_schedule_item(item, &entry.rendered)
                     .is_err()
                 || !authenticates_item_abi(item, &entry.rendered.abi)
+                || !item_witness.authenticates(index, item, layout)
             {
                 return false;
             }
@@ -898,6 +989,9 @@ fn encode(recipe: &[u8], module: &RenderedScheduleModule) -> Option<Vec<u8>> {
 pub(super) struct CapsuleRecipe {
     bytes: Vec<u8>,
     identity: u64,
+    vectorized: bool,
+    item_witnesses: Box<[CapsuleItemWitness]>,
+    store_group_witnesses: Box<[CapsuleStoreGroupWitness]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -926,7 +1020,11 @@ pub(super) fn capsule_recipe(
     layouts: &[NativeScheduleLayout],
     store_groups: &[NativeStoreGroup],
 ) -> Option<CapsuleRecipe> {
-    let bytes = recipe(
+    let CapsuleRecipePayload {
+        bytes,
+        item_witnesses,
+        store_group_witnesses,
+    } = recipe(
         backend,
         program_index,
         program_count,
@@ -937,6 +1035,9 @@ pub(super) fn capsule_recipe(
     Some(CapsuleRecipe {
         identity: checksum(&bytes),
         bytes,
+        vectorized: backend.vectorized,
+        item_witnesses,
+        store_group_witnesses,
     })
 }
 
@@ -951,7 +1052,7 @@ pub(super) fn load_capsule(
     let bytes = crate::file_io::read_file_bytes_bounded(path, MAX_BYTES)
         .map_err(|_| CapsuleLoadStatus::FileUnavailable)?;
     let module = decode(&bytes, &recipe.bytes).ok_or(CapsuleLoadStatus::DecodeRejected)?;
-    authenticate_module(backend, &module, items, layouts, store_groups)
+    authenticate_module(backend, recipe, &module, items, layouts, store_groups)
         .then_some(module)
         .ok_or(CapsuleLoadStatus::AuthenticationRejected)
 }
@@ -1092,6 +1193,48 @@ pub(super) fn mutate_capsule_with_valid_checksum(
 mod tests {
     use super::*;
 
+    fn legacy_recipe_bytes(
+        backend: &CpuJitBackend,
+        program_index: usize,
+        program_count: usize,
+        items: &[ScheduleItem],
+        layouts: &[NativeScheduleLayout],
+        store_groups: &[NativeStoreGroup],
+    ) -> Option<Vec<u8>> {
+        if items.len() != layouts.len() {
+            return None;
+        }
+        let mut writer = Writer::new();
+        writer.blob(b"rustgrad-native-render-recipe-v2")?;
+        writer.string(&crate::cpu_jit::native_render_capsule_environment())?;
+        writer.bool(backend.vectorized)?;
+        writer.usize(program_index)?;
+        writer.usize(program_count)?;
+        writer.count(items.len())?;
+        for (item, layout) in items.iter().zip(layouts) {
+            writer.u64(item.cache_key)?;
+            write_layout(&mut writer, layout)?;
+            write_output_initialization(
+                &mut writer,
+                crate::cpu_jit::native_output_initialization(&item.kernel),
+            )?;
+        }
+        writer.count(store_groups.len())?;
+        for group in store_groups {
+            writer.count(group.members.len())?;
+            for member in &group.members {
+                writer.usize(member.logical_index)?;
+                writer.u64(member.output_buffer)?;
+            }
+            write_abi(
+                &mut writer,
+                &crate::cpu_jit::native_store_group_abi(&group.kernel).ok()?,
+            )?;
+            write_output_initialization(&mut writer, group.output_initialization)?;
+        }
+        Some(writer.0)
+    }
+
     #[test]
     fn ordinary_render_witness_is_bound_to_exact_owner_role_and_vector_policy() {
         let mut graph = crate::Graph::new();
@@ -1129,6 +1272,193 @@ mod tests {
         assert!(!witness.authenticates(&scalar, 0, item, &entry));
         let scalar_witness = OrdinaryRenderWitness::new(&scalar, 0, item).unwrap();
         assert!(!scalar_witness.authenticates(&backend, 0, item, &entry));
+    }
+
+    #[test]
+    fn capsule_recipe_witness_preserves_bytes_and_binds_owner_role_and_layout() {
+        let mut graph = crate::Graph::new();
+        let input = graph.input_dtype("recipe_input", [8], crate::DType::F32);
+        let first = graph.square(input).unwrap();
+        let second = graph.neg(input).unwrap();
+        let first_schedule = crate::schedule(&graph, first).unwrap();
+        let second_schedule = crate::schedule(&graph, second).unwrap();
+        let item = &first_schedule.items[0];
+        let layout = super::super::schedule_native_layout(item).unwrap();
+        let backend = CpuJitBackend::new(crate::JitFallback::Error).vectorized(true);
+        let recipe = capsule_recipe(
+            &backend,
+            0,
+            1,
+            std::slice::from_ref(item),
+            std::slice::from_ref(&layout),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.bytes,
+            legacy_recipe_bytes(
+                &backend,
+                0,
+                1,
+                std::slice::from_ref(item),
+                std::slice::from_ref(&layout),
+                &[],
+            )
+            .unwrap()
+        );
+        let witness = &recipe.item_witnesses[0];
+        assert!(witness.authenticates(0, item, &layout));
+        assert_eq!(
+            witness.output_initialization,
+            crate::cpu_jit::native_output_initialization(&item.kernel)
+        );
+        assert!(!witness.authenticates(1, item, &layout));
+
+        let mut different_owner = second_schedule.items[0].clone();
+        different_owner.cache_key = item.cache_key;
+        assert!(!witness.authenticates(0, &different_owner, &layout));
+
+        let mut different_layout = layout.clone();
+        different_layout.elided_output_source = Some(u64::MAX);
+        assert!(!witness.authenticates(0, item, &different_layout));
+
+        let module = super::super::render_schedule_module_entries(
+            &backend,
+            std::slice::from_ref(item),
+            std::slice::from_ref(&layout),
+            &[],
+        )
+        .unwrap();
+        assert!(authenticate_module(
+            &backend,
+            &recipe,
+            &module,
+            std::slice::from_ref(item),
+            std::slice::from_ref(&layout),
+            &[],
+        ));
+        assert!(!authenticate_module(
+            &backend,
+            &recipe,
+            &module,
+            std::slice::from_ref(&different_owner),
+            std::slice::from_ref(&layout),
+            &[],
+        ));
+        assert!(!authenticate_module(
+            &backend,
+            &recipe,
+            &module,
+            std::slice::from_ref(item),
+            std::slice::from_ref(&different_layout),
+            &[],
+        ));
+        let mut wrong_role = module.clone();
+        wrong_role.entries[0].logical_indices[0] = 1;
+        assert!(!authenticate_module(
+            &backend,
+            &recipe,
+            &wrong_role,
+            std::slice::from_ref(item),
+            std::slice::from_ref(&layout),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn store_group_recipe_witness_preserves_abi_and_member_ownership() {
+        let mut graph = crate::Graph::new();
+        let input = graph.input_dtype("group_recipe_input", [4], crate::DType::F32);
+        let first = graph.relu(input).unwrap();
+        let middle = graph.square(input).unwrap();
+        let last = graph.neg(input).unwrap();
+        let schedule = crate::schedule_many(&graph, &[first, middle, last]).unwrap();
+        assert_eq!(schedule.items.len(), 3);
+        let layouts = schedule
+            .items
+            .iter()
+            .map(super::super::schedule_native_layout)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let kernel = crate::kernel::fuse_native_store_group(&[
+            &schedule.items[0].kernel,
+            &schedule.items[2].kernel,
+        ])
+        .unwrap();
+        let output_initialization = crate::cpu_jit::render_native_store_group(&kernel)
+            .unwrap()
+            .1;
+        let group = NativeStoreGroup {
+            members: vec![
+                super::super::NativeStoreGroupMember {
+                    logical_index: 0,
+                    output_buffer: schedule.items[0].primary_output().id,
+                },
+                super::super::NativeStoreGroupMember {
+                    logical_index: 2,
+                    output_buffer: schedule.items[2].primary_output().id,
+                },
+            ],
+            kernel,
+            output_initialization,
+        };
+        let backend = CpuJitBackend::new(crate::JitFallback::Error);
+        let recipe = capsule_recipe(
+            &backend,
+            0,
+            1,
+            &schedule.items,
+            &layouts,
+            std::slice::from_ref(&group),
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.bytes,
+            legacy_recipe_bytes(
+                &backend,
+                0,
+                1,
+                &schedule.items,
+                &layouts,
+                std::slice::from_ref(&group),
+            )
+            .unwrap()
+        );
+        let witness = &recipe.store_group_witnesses[0];
+        assert!(witness.authenticates(&group));
+        assert_eq!(
+            witness.abi,
+            crate::cpu_jit::native_store_group_abi(&group.kernel).unwrap()
+        );
+        assert!(authenticates_store_group_abi(
+            &group,
+            &schedule.items,
+            &witness.abi,
+            &witness.abi,
+        ));
+
+        let mut reversed = group.clone();
+        reversed.members.reverse();
+        assert!(!witness.authenticates(&reversed));
+
+        let mut different_owner = group.clone();
+        different_owner.kernel = crate::kernel::fuse_native_store_group(&[
+            &schedule.items[0].kernel,
+            &schedule.items[1].kernel,
+        ])
+        .unwrap();
+        assert!(!witness.authenticates(&different_owner));
+
+        let mut changed_items = schedule.items.clone();
+        let mut changed_output = changed_items[0].primary_output().clone();
+        changed_output.id ^= 1;
+        changed_items[0].outputs = crate::ScheduledOutputs::single(changed_output);
+        assert!(!authenticates_store_group_abi(
+            &group,
+            &changed_items,
+            &witness.abi,
+            &witness.abi,
+        ));
     }
 
     #[test]
