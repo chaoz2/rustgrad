@@ -19,6 +19,8 @@ use crate::{
     CapturedSchedule, GgmlType, NodeId, QuantizedTensorData, ReplayInput, SymbolicDim,
     SymbolicExpr, SymbolicShape, SymbolicVar,
 };
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAGIC: &[u8; 4] = b"RGSA";
@@ -47,6 +49,11 @@ const MULTI_VERSION: u8 = 7;
 const MAX_ARTIFACT_BYTES: usize = 64 << 20;
 const MAX_ITEMS: usize = 1 << 16;
 const MAX_BINDINGS: usize = 1 << 16;
+
+#[cfg(test)]
+std::thread_local! {
+    static IDENTITY_CALL_COUNT: Cell<usize> = const { Cell::new(0) };
+}
 
 pub fn encode(capture: &CapturedSchedule) -> Result<Vec<u8>, ArtifactError> {
     validate(capture, true, true)?;
@@ -187,6 +194,8 @@ pub fn decode_scheduled_outputs(bytes: &[u8]) -> Result<CapturedSchedule, Artifa
 }
 
 pub(crate) fn identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
+    #[cfg(test)]
+    IDENTITY_CALL_COUNT.with(|count| count.set(count.get() + 1));
     let mut w = Writer::new();
     write_payload(&mut w, capture)?;
     if w.out
@@ -197,6 +206,16 @@ pub(crate) fn identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError>
         return Err(ArtifactError::Format("schedule length"));
     }
     Ok(fnv1a64(&w.out))
+}
+
+#[cfg(test)]
+fn reset_identity_call_count() {
+    IDENTITY_CALL_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn identity_call_count() -> usize {
+    IDENTITY_CALL_COUNT.with(Cell::get)
 }
 
 pub(crate) fn scheduled_outputs_identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
@@ -1688,6 +1707,20 @@ pub(crate) fn validate_capture(c: &CapturedSchedule) -> Result<(), ArtifactError
     Ok(())
 }
 
+/// Assigns the canonical identity to one freshly assembled owned capture and
+/// validates its complete structure. Imported or subsequently mutated captures
+/// must still use [`validate_capture`] so their stored identity is authenticated.
+pub(crate) fn seal_fresh_capture(
+    mut capture: CapturedSchedule,
+) -> Result<CapturedSchedule, ArtifactError> {
+    // Fresh construction historically computes the identity before structural
+    // validation. Preserve that first-error ordering while ownership makes the
+    // second identity serialization in `validate_capture` redundant.
+    capture.identity = identity(&capture)?;
+    validate(&capture, true, true)?;
+    Ok(capture)
+}
+
 fn write_symbolic_schema(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
     write_symbolic_schema_core(w, schema, None)?;
     write_symbolic_schema_sidecars(w, schema, true, true)
@@ -2396,6 +2429,115 @@ mod tests {
         let y = graph.square(x).unwrap();
         let schedule = crate::schedule(&graph, y).unwrap();
         CapturedSchedule::capture(&graph, &schedule, &[y]).unwrap()
+    }
+
+    fn legacy_fresh_capture_seal(
+        mut capture: CapturedSchedule,
+    ) -> Result<CapturedSchedule, ArtifactError> {
+        capture.identity = identity(&capture)?;
+        validate_capture(&capture)?;
+        Ok(capture)
+    }
+
+    fn assert_fresh_seal_success_matches_legacy(mut capture: CapturedSchedule) {
+        capture.identity = 0;
+        let sealed = seal_fresh_capture(capture.clone()).unwrap();
+        let legacy = legacy_fresh_capture_seal(capture).unwrap();
+        assert_eq!(sealed.identity, legacy.identity);
+        assert_eq!(encode(&sealed).unwrap(), encode(&legacy).unwrap());
+    }
+
+    #[test]
+    fn fresh_capture_seal_preserves_legacy_bytes_errors_and_mutation_checks() {
+        reset_identity_call_count();
+        let mut unsealed = fixture();
+        assert_eq!(identity_call_count(), 1);
+        unsealed.identity = 0;
+
+        reset_identity_call_count();
+        let sealed = seal_fresh_capture(unsealed.clone()).unwrap();
+        assert_eq!(identity_call_count(), 1);
+
+        reset_identity_call_count();
+        let legacy = legacy_fresh_capture_seal(unsealed.clone()).unwrap();
+        assert_eq!(identity_call_count(), 2);
+
+        assert_eq!(sealed.identity, legacy.identity);
+        assert_eq!(sealed.inputs, legacy.inputs);
+        assert_eq!(sealed.constants, legacy.constants);
+        assert_eq!(sealed.quantized_constants, legacy.quantized_constants);
+        assert_eq!(sealed.requested_passthroughs, legacy.requested_passthroughs);
+        assert_eq!(sealed.requested, legacy.requested);
+        assert_eq!(sealed.symbolic, legacy.symbolic);
+        assert_eq!(sealed.specialized_from, legacy.specialized_from);
+        assert_eq!(encode(&sealed).unwrap(), encode(&legacy).unwrap());
+
+        let mut invalid_item = unsealed.clone();
+        invalid_item.items[0].id = 1;
+        reset_identity_call_count();
+        let sealed_error = seal_fresh_capture(invalid_item.clone()).unwrap_err();
+        assert_eq!(identity_call_count(), 1);
+        reset_identity_call_count();
+        let legacy_error = legacy_fresh_capture_seal(invalid_item).unwrap_err();
+        assert_eq!(identity_call_count(), 1);
+        assert_eq!(sealed_error, ArtifactError::Format("item identity"));
+        assert_eq!(sealed_error, legacy_error);
+
+        let mut identity_and_structure_invalid = unsealed;
+        identity_and_structure_invalid.items[0].id = 1;
+        let mut output = identity_and_structure_invalid.items[0]
+            .primary_output()
+            .clone();
+        output.bytes += 1;
+        identity_and_structure_invalid.items[0].outputs = ScheduledOutputs::single(output);
+        let sealed_error = seal_fresh_capture(identity_and_structure_invalid.clone()).unwrap_err();
+        let legacy_error = legacy_fresh_capture_seal(identity_and_structure_invalid).unwrap_err();
+        // Identity serialization sees the invalid descriptor before structural
+        // validation can report the independently invalid item ordinal.
+        assert_eq!(sealed_error, ArtifactError::Format("buffer descriptor"));
+        assert_eq!(sealed_error, legacy_error);
+
+        let mut mutated = sealed;
+        mutated.requested.push(mutated.requested[0]);
+        assert_eq!(
+            validate_capture(&mutated),
+            Err(ArtifactError::Format("schedule identity"))
+        );
+    }
+
+    #[test]
+    fn fresh_capture_seal_preserves_quantized_and_symbolic_payload_bytes() {
+        let weight =
+            QuantizedTensorData::new(GgmlType::Q4_0, Shape::from([2, 32]), vec![0; 36]).unwrap();
+        let activation = NodeId::from_index(10);
+        let weight_node = NodeId::from_index(11);
+        let output = NodeId::from_index(12);
+        assert_fresh_seal_success_matches_legacy(
+            CapturedSchedule::capture_quantized_matmul(
+                "activation",
+                activation,
+                weight_node,
+                output,
+                Shape::from([1, 32]),
+                weight.clone(),
+            )
+            .unwrap(),
+        );
+
+        assert_fresh_seal_success_matches_legacy(
+            CapturedSchedule::capture_quantized_row_gather(
+                "indices",
+                NodeId::from_index(20),
+                NodeId::from_index(21),
+                NodeId::from_index(22),
+                Shape::from([1, 2]),
+                DType::I32,
+                weight,
+            )
+            .unwrap(),
+        );
+
+        assert_fresh_seal_success_matches_legacy(symbolic_fixture());
     }
 
     fn symbolic_fixture() -> CapturedSchedule {

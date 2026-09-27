@@ -300,7 +300,7 @@ impl CapturedSchedule {
             }
         }
         let inputs = inputs.into_values().collect::<Vec<_>>();
-        let mut capture = Self {
+        let capture = Self {
             items: schedule.items.clone(),
             inputs,
             constants,
@@ -311,11 +311,8 @@ impl CapturedSchedule {
             symbolic: None,
             specialized_from: None,
         };
-        capture.identity = crate::schedule::artifact::identity(&capture)
-            .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
-        crate::schedule::artifact::validate_capture(&capture)
-            .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
-        Ok(capture)
+        crate::schedule::artifact::seal_fresh_capture(capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))
     }
 
     /// Builds one graph-independent Llama-orientation quantized linear
@@ -409,7 +406,7 @@ impl CapturedSchedule {
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         item.validate_input_bindings()
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        let mut capture = Self {
+        let capture = Self {
             items: vec![item],
             inputs: vec![ReplayInput {
                 name: activation_name,
@@ -424,11 +421,8 @@ impl CapturedSchedule {
             symbolic: None,
             specialized_from: None,
         };
-        capture.identity = crate::schedule::artifact::identity(&capture)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        crate::schedule::artifact::validate_capture(&capture)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        Ok(capture)
+        crate::schedule::artifact::seal_fresh_capture(capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))
     }
 
     /// Builds one graph-independent packed row-gather artifact. The ordered
@@ -526,7 +520,7 @@ impl CapturedSchedule {
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         item.validate_input_bindings()
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        let mut capture = Self {
+        let capture = Self {
             items: vec![item],
             inputs: vec![ReplayInput {
                 name: indices_name,
@@ -541,11 +535,8 @@ impl CapturedSchedule {
             symbolic: None,
             specialized_from: None,
         };
-        capture.identity = crate::schedule::artifact::identity(&capture)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        crate::schedule::artifact::validate_capture(&capture)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        Ok(capture)
+        crate::schedule::artifact::seal_fresh_capture(capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))
     }
     /// Captures a symbolic shape family from one validated concrete template.
     /// The original graph is used only to derive expressions and is never
@@ -580,11 +571,8 @@ impl CapturedSchedule {
             spec,
             template_bindings,
         )?);
-        capture.identity = crate::schedule::artifact::identity(&capture)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        crate::schedule::artifact::validate_capture(&capture)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
-        Ok(capture)
+        crate::schedule::artifact::seal_fresh_capture(capture)
+            .map_err(|error| ReplayError::Corrupt(error.to_string()))
     }
     pub fn is_symbolic(&self) -> bool {
         self.symbolic.is_some()
