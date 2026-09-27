@@ -1506,16 +1506,29 @@ include the excluded warmup and are not presented as the 96 measured samples.
 
 ##### Manual same-runner training comparison
 
-The manual native-Transformer comparison workflow is an evidence adapter over
-that unchanged cold scoreboard plus 96-sample warm sidecar.
+The manual native-Transformer comparison workflow selects one fixed evidence
+workload: `steady-replay` (the unchanged cold scoreboard plus 96-sample warm
+sidecar) or `warm-resume` (the larger Transformer's fresh-executor restoration).
 
 | Boundary | Contract |
 |---|---|
 | Revisions | The candidate is one exact commit and the baseline is its exact requested ancestor; symbolic or moving refs are rejected. |
 | Runner and order | One runner builds both revisions before measurement, then runs serial A-B-B-A trials. Every trial receives a fresh native cache. |
-| Workload | Both revisions execute the existing cold preparation/training evidence and the same one-window warmup plus 32 measured windows; sample counts, phase timings, checkpoint validation, and zero-fallback semantics remain in the existing schemas. |
+| Workload | `steady-replay` retains one warmup window and 32 measured windows. `warm-resume` uses the fixed two-block, six-replay workload, with replay-3 checkpoint restoration into a fresh executor and exact continuation through replay 6. Existing workload schemas and zero-fallback contracts remain unchanged. |
 | Provenance and admission | Raw files remain artifacts. Each trial records its source commit, evidence-file identity, binary identity, Cargo profile, Rust toolchain, and runner provenance. The comparator retains semantic facts and rejects sets whose workload, schema, optimizer/capture, build, or runner facts are not comparable. |
 | Interpretation | Timings are observations with no threshold or speedup claim. Repeat workflow runs are required to assess runner noise; a matching hardware model alone does not establish comparability. |
+
+Warm-resume comparison uses the same evidence validator as the standalone
+larger-workload recorder. Each trial must authenticate five render-capsule hits
+and five durable-module hits, with no local rendering, compilation, linking, or
+fallback. Decode, owner restoration, and preparation timings remain separate.
+The comparator verifies the five-file checksum manifest, requires identical
+resume-bundle and owned-module checkpoint bytes across trials, and compares
+non-timing objective, capture, gradient-probe, and scoreboard facts. It retains
+available hashes when a trial fails. Two observations per revision yield raw
+timings and medians; a zero baseline produces a null ratio, not a fabricated
+speedup. This tooling adds no runtime API or checkpoint format and establishes
+no performance result until a protected hardware run completes.
 
 Both completed comparisons admitted the same exact baseline
 `188aea10f80df9a86833ff6603167dd431719f1a` and candidate

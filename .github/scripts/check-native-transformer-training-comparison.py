@@ -16,7 +16,7 @@ import statistics
 import sys
 from typing import Any
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 EVIDENCE_KIND = "native_cpu_transformer_training_same_runner_comparison"
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -75,6 +75,10 @@ SCOREBOARD_PROGRAM_FIELDS = (
 )
 MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_BINARY_BYTES = 512 * 1024 * 1024
+MEASUREMENT_TARGETS = {
+    "steady-replay": "example:compiled_transformer_train_resume",
+    "warm-resume": "example:compiled_transformer_scale_evidence",
+}
 
 
 class EvidenceError(ValueError):
@@ -105,6 +109,27 @@ def require(condition: bool, message: str) -> None:
 
 
 PREPARATION_EVIDENCE = load_preparation_evidence_module()
+
+
+def load_larger_evidence_module() -> Any:
+    path = pathlib.Path(__file__).resolve().with_name(
+        "check-larger-native-transformer-evidence.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "rustgrad_larger_native_transformer_evidence", path
+    )
+    require(spec is not None and spec.loader is not None, "larger evidence validator is absent")
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+LARGER_EVIDENCE = load_larger_evidence_module()
 
 
 def exact_int(value: Any, label: str, *, minimum: int = 0) -> int:
@@ -151,7 +176,12 @@ def duration_ns(value: Any, label: str) -> int:
         raise EvidenceError(str(error)) from error
 
 
-def parse_provenance(raw: bytes, expected_sha: str, binary_digest: str) -> dict[str, Any]:
+def parse_provenance(
+    raw: bytes,
+    expected_sha: str,
+    binary_digest: str,
+    measurement_mode: str,
+) -> dict[str, Any]:
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -179,23 +209,35 @@ def parse_provenance(raw: bytes, expected_sha: str, binary_digest: str) -> dict[
         return values
 
     root = key_values(sections["root"], "provenance root")
-    expected_root = {
+    common_root = {
         "schema_version",
         "git_sha",
         "prebuilt_binary_source_sha",
         "prebuilt_binary_sha256",
         "cargo_profile",
         "temporary_cache",
-        "steady_measurement_file",
-        "steady_measurement_cache_scope",
-        "steady_measurement_warmup_windows",
-        "steady_measurement_measured_windows",
         "runner_os",
         "runner_arch",
         "runner_image_os",
         "runner_image_version",
         "cpu_hardware_policy",
     }
+    mode_root = {
+        "steady-replay": {
+            "steady_measurement_file",
+            "steady_measurement_cache_scope",
+            "steady_measurement_warmup_windows",
+            "steady_measurement_measured_windows",
+        },
+        "warm-resume": {
+            "cargo_build_jobs",
+            "workflow_timeout_minutes",
+            "workload",
+            "warm_resume",
+            "timing_policy",
+        },
+    }
+    expected_root = common_root | mode_root[measurement_mode]
     require(set(root) == expected_root, "comparison provenance root fields differ")
     require(root["schema_version"] == "1", "provenance schema differs")
     require(root["git_sha"] == expected_sha, "provenance revision differs")
@@ -203,10 +245,25 @@ def parse_provenance(raw: bytes, expected_sha: str, binary_digest: str) -> dict[
     require(root["prebuilt_binary_sha256"] == binary_digest, "prebuilt binary digest differs")
     require(root["cargo_profile"] == "release", "provenance profile differs")
     require(root["temporary_cache"] == "fresh_sha_scoped", "cache provenance differs")
-    require(root["steady_measurement_file"] == "native-cpu-training-steady-replays.json", "steady filename differs")
-    require(root["steady_measurement_cache_scope"] == "same_process_warm_cache", "steady cache scope differs")
-    require(root["steady_measurement_warmup_windows"] == "1", "warmup window count differs")
-    require(root["steady_measurement_measured_windows"] == "32", "measured window count differs")
+    if measurement_mode == "steady-replay":
+        require(root["steady_measurement_file"] == "native-cpu-training-steady-replays.json", "steady filename differs")
+        require(root["steady_measurement_cache_scope"] == "same_process_warm_cache", "steady cache scope differs")
+        require(root["steady_measurement_warmup_windows"] == "1", "warmup window count differs")
+        require(root["steady_measurement_measured_windows"] == "32", "measured window count differs")
+    else:
+        require(root["cargo_build_jobs"] == "2", "warm build job count differs")
+        require(root["workflow_timeout_minutes"] == "75", "warm workflow timeout differs")
+        require(
+            root["workload"]
+            == "batch4_time8_vocab16_embedding8_heads2_ff32_blocks2_replays6",
+            "warm workload differs",
+        )
+        require(
+            root["warm_resume"]
+            == "portable_rgab_replay3_to6_fresh_executor_same_temporary_cache",
+            "warm resume policy differs",
+        )
+        require(root["timing_policy"] == "observational_no_threshold", "warm timing policy differs")
     require(root["cpu_hardware_policy"] == "required_normalized_lscpu_v1", "CPU provenance policy differs")
     cpu = key_values(sections["cpu_hardware"], "CPU provenance")
     require(
@@ -570,7 +627,13 @@ def binary_digest(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
-def validate_build_manifest(path: pathlib.Path, baseline_sha: str, candidate_sha: str, binary_digests: dict[str, str]) -> tuple[dict[str, Any], bytes]:
+def validate_build_manifest(
+    path: pathlib.Path,
+    baseline_sha: str,
+    candidate_sha: str,
+    binary_digests: dict[str, str],
+    measurement_mode: str,
+) -> tuple[dict[str, Any], bytes]:
     value, raw = load_json(path)
     require(
         set(value)
@@ -581,6 +644,7 @@ def validate_build_manifest(path: pathlib.Path, baseline_sha: str, candidate_sha
             "cargo_locked",
             "cargo_incremental",
             "cargo_build_jobs",
+            "measurement_mode",
             "cargo_target",
             "rustflags",
             "toolchain",
@@ -589,10 +653,11 @@ def validate_build_manifest(path: pathlib.Path, baseline_sha: str, candidate_sha
         },
         "build manifest fields differ",
     )
-    require(value["format_version"] == 1 and value["evidence_kind"] == "native_cpu_transformer_training_comparison_builds", "build manifest kind differs")
+    require(value["format_version"] == 2 and value["evidence_kind"] == "native_cpu_transformer_training_comparison_builds", "build manifest kind differs")
     require(value["build_profile"] == "release" and value["cargo_locked"] is True, "build mode differs")
     require(value["cargo_incremental"] == "0" and value["cargo_build_jobs"] == "2", "build environment differs")
-    require(value["cargo_target"] == "example:compiled_transformer_train_resume", "build target differs")
+    require(value["measurement_mode"] == measurement_mode, "build measurement mode differs")
+    require(value["cargo_target"] == MEASUREMENT_TARGETS[measurement_mode], "build target differs")
     require(value["rustflags"] == "-D warnings", "build rustflags differ")
     exact_str(value["toolchain"], "build toolchain")
     exact_str(value["target_triple"], "build target triple")
@@ -606,11 +671,50 @@ def validate_build_manifest(path: pathlib.Path, baseline_sha: str, candidate_sha
     return value, raw
 
 
+WARM_EVIDENCE_FILES = {
+    "scoreboard": "native-cpu-training-scoreboard.json",
+    "objective": "objective-evidence.json",
+    "provenance": "provenance.txt",
+    "resume_bundle": "replay-3-resume.rgab",
+    "module_checkpoint": "replay-3-module-checkpoint.safetensors",
+    "checksums": "sha256.txt",
+}
+
+
+def validate_warm_checksums(raw: bytes, raw_files: dict[str, bytes]) -> None:
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise EvidenceError("warm checksum manifest is not UTF-8") from error
+    expected = [
+        ("scoreboard", WARM_EVIDENCE_FILES["scoreboard"]),
+        ("objective", WARM_EVIDENCE_FILES["objective"]),
+        ("provenance", WARM_EVIDENCE_FILES["provenance"]),
+        ("resume_bundle", WARM_EVIDENCE_FILES["resume_bundle"]),
+        ("module_checkpoint", WARM_EVIDENCE_FILES["module_checkpoint"]),
+    ]
+    require(len(lines) == len(expected), "warm checksum manifest count differs")
+    for line, (key, filename) in zip(lines, expected):
+        require(
+            line == f"{sha256_bytes(raw_files[key])}  {filename}",
+            f"warm checksum differs for {filename}",
+        )
+
+
+def warm_timing_ratio(candidate: int, baseline: int) -> float | None:
+    """Zero-work cache hits have valid timings but no baseline ratio."""
+    exact_int(candidate, "candidate warm timing")
+    exact_int(baseline, "baseline warm timing")
+    return candidate / baseline if baseline else None
+
+
 def compare(arguments: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     baseline_sha = arguments.baseline_sha
     candidate_sha = arguments.candidate_sha
+    measurement_mode = arguments.measurement_mode
     require(SHA_RE.fullmatch(baseline_sha) is not None, "baseline SHA must be lowercase and full")
     require(SHA_RE.fullmatch(candidate_sha) is not None, "candidate SHA must be lowercase and full")
+    require(measurement_mode in MEASUREMENT_TARGETS, "measurement mode differs")
     root = pathlib.Path(arguments.root).resolve()
     require(root.is_dir() and not root.is_symlink(), "comparison root must be a directory")
     binaries = {
@@ -619,22 +723,34 @@ def compare(arguments: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     }
     binary_digests = {role: binary_digest(path) for role, path in binaries.items()}
     build_manifest, build_raw = validate_build_manifest(
-        pathlib.Path(arguments.build_manifest).resolve(), baseline_sha, candidate_sha, binary_digests
+        pathlib.Path(arguments.build_manifest).resolve(),
+        baseline_sha,
+        candidate_sha,
+        binary_digests,
+        measurement_mode,
     )
     reasons: list[str] = []
     trial_records: list[dict[str, Any]] = []
     stable_scoreboard: dict[str, Any] | None = None
     stable_sidecar: dict[str, Any] | None = None
+    stable_warm_objective: dict[str, Any] | None = None
+    stable_warm_artifacts: dict[str, str] | None = None
     stable_machine: dict[str, Any] | None = None
     aggregate_inputs: dict[str, list[dict[str, Any]]] = {"baseline": [], "candidate": []}
     for ordinal, (role, repetition) in enumerate(ORDER, start=1):
         expected_sha = baseline_sha if role == "baseline" else candidate_sha
         directory = root / f"trial-{ordinal:02d}-{role}"
-        files = {
-            "scoreboard": directory / "native-cpu-training-scoreboard.json",
-            "steady": directory / "native-cpu-training-steady-replays.json",
-            "provenance": directory / "provenance.txt",
-        }
+        if measurement_mode == "steady-replay":
+            files = {
+                "scoreboard": directory / "native-cpu-training-scoreboard.json",
+                "steady": directory / "native-cpu-training-steady-replays.json",
+                "provenance": directory / "provenance.txt",
+            }
+        else:
+            files = {
+                key: directory / filename
+                for key, filename in WARM_EVIDENCE_FILES.items()
+            }
         trial_record: dict[str, Any] = {
             "ordinal": ordinal,
             "revision_role": role,
@@ -663,33 +779,72 @@ def compare(arguments: argparse.Namespace) -> tuple[dict[str, Any], bool]:
             reasons.append(f"trial {ordinal}: {reason}")
             continue
         try:
-            scoreboard = decode_json(raw_files["scoreboard"], files["scoreboard"].name)
-            steady = decode_json(raw_files["steady"], files["steady"].name)
-            machine = parse_provenance(raw_files["provenance"], expected_sha, binary_digests[role])
-            scoreboard_projection = validate_scoreboard(scoreboard)
-            sidecar_projection, timing = validate_sidecar(steady, expected_sha)
-            require(
-                scoreboard_projection["checkpoint"]["capture_identity"]
-                == sidecar_projection["starting_checkpoint"]["capture_identity"],
-                "cold scoreboard and steady checkpoint captures differ",
+            machine = parse_provenance(
+                raw_files["provenance"],
+                expected_sha,
+                binary_digests[role],
+                measurement_mode,
             )
-            require(
-                scoreboard_projection["checkpoint"]["byte_count"]
-                == sidecar_projection["final_checkpoint_byte_count"],
-                "cold scoreboard and steady checkpoint byte counts differ",
-            )
-            if stable_scoreboard is None:
-                stable_scoreboard = scoreboard_projection
-                stable_sidecar = sidecar_projection
-                stable_machine = machine
+            if measurement_mode == "steady-replay":
+                scoreboard = decode_json(raw_files["scoreboard"], files["scoreboard"].name)
+                steady = decode_json(raw_files["steady"], files["steady"].name)
+                scoreboard_projection = validate_scoreboard(scoreboard)
+                sidecar_projection, timing = validate_sidecar(steady, expected_sha)
+                require(
+                    scoreboard_projection["checkpoint"]["capture_identity"]
+                    == sidecar_projection["starting_checkpoint"]["capture_identity"],
+                    "cold scoreboard and steady checkpoint captures differ",
+                )
+                require(
+                    scoreboard_projection["checkpoint"]["byte_count"]
+                    == sidecar_projection["final_checkpoint_byte_count"],
+                    "cold scoreboard and steady checkpoint byte counts differ",
+                )
+                if stable_scoreboard is None:
+                    stable_scoreboard = scoreboard_projection
+                    stable_sidecar = sidecar_projection
+                else:
+                    if scoreboard_projection != stable_scoreboard:
+                        reasons.append(f"trial {ordinal} stable scoreboard facts differ")
+                    if sidecar_projection != stable_sidecar:
+                        reasons.append(f"trial {ordinal} stable steady-workload facts differ")
+                summary = timing_summary(timing["samples"])
             else:
-                if scoreboard_projection != stable_scoreboard:
-                    reasons.append(f"trial {ordinal} stable scoreboard facts differ")
-                if sidecar_projection != stable_sidecar:
-                    reasons.append(f"trial {ordinal} stable steady-workload facts differ")
-                if machine != stable_machine:
-                    reasons.append(f"trial {ordinal} runner or toolchain provenance differs")
-            summary = timing_summary(timing["samples"])
+                validate_warm_checksums(raw_files["checksums"], raw_files)
+                try:
+                    validated = LARGER_EVIDENCE.validate_larger_evidence(
+                        files["objective"],
+                        files["scoreboard"],
+                        expected_sha,
+                        files["resume_bundle"],
+                        files["module_checkpoint"],
+                        pathlib.Path(__file__).resolve().with_name(
+                            "native_training_preparation_evidence.py"
+                        ),
+                        comparison_projection=True,
+                    )
+                except (LARGER_EVIDENCE.LargerEvidenceError, OSError, json.JSONDecodeError) as error:
+                    raise EvidenceError(str(error)) from error
+                warm_artifacts = {
+                    key: sha256_bytes(raw_files[key])
+                    for key in ("resume_bundle", "module_checkpoint")
+                }
+                if stable_scoreboard is None:
+                    stable_scoreboard = validated["stable_scoreboard"]
+                    stable_warm_objective = validated["stable_objective"]
+                    stable_warm_artifacts = warm_artifacts
+                else:
+                    if validated["stable_scoreboard"] != stable_scoreboard:
+                        reasons.append(f"trial {ordinal} stable scoreboard facts differ")
+                    if validated["stable_objective"] != stable_warm_objective:
+                        reasons.append(f"trial {ordinal} stable warm objective facts differ")
+                    if warm_artifacts != stable_warm_artifacts:
+                        reasons.append(f"trial {ordinal} warm checkpoint artifacts differ")
+                summary = validated["warm_timing"]
+            if stable_machine is None:
+                stable_machine = machine
+            elif machine != stable_machine:
+                reasons.append(f"trial {ordinal} runner or toolchain provenance differs")
             aggregate_inputs[role].append(summary)
             trial_record["status"] = "valid"
             trial_record["timing"] = summary
@@ -707,6 +862,23 @@ def compare(arguments: argparse.Namespace) -> tuple[dict[str, Any], bool]:
     def aggregate(role: str) -> dict[str, Any]:
         summaries = aggregate_inputs[role]
         require(len(summaries) == 2, f"{role} does not have two valid trials")
+        if measurement_mode == "warm-resume":
+            fields = set(summaries[0])
+            require(
+                all(set(summary) == fields for summary in summaries),
+                f"{role} warm timing fields differ",
+            )
+            return {
+                "timings": {
+                    field: {
+                        "trial_ns": [summary[field] for summary in summaries],
+                        "median_of_trials_ns": int(
+                            statistics.median(summary[field] for summary in summaries)
+                        ),
+                    }
+                    for field in sorted(fields)
+                }
+            }
         result: dict[str, Any] = {}
         for phase in ("accumulation", "commit"):
             result[phase] = {"partitions": {}}
@@ -727,13 +899,27 @@ def compare(arguments: argparse.Namespace) -> tuple[dict[str, Any], bool]:
         try:
             aggregates = {role: aggregate(role) for role in ("baseline", "candidate")}
             ratios = {}
-            for phase in ("accumulation", "commit"):
-                ratios[phase] = {"candidate_over_baseline": {}}
-                for partition in SAMPLE_PARTITIONS:
-                    baseline = aggregates["baseline"][phase]["partitions"][partition]["median_of_trial_medians_ns"]
-                    candidate = aggregates["candidate"][phase]["partitions"][partition]["median_of_trial_medians_ns"]
-                    require(baseline != 0, f"{phase} {partition} baseline timing is zero")
-                    ratios[phase]["candidate_over_baseline"][partition] = candidate / baseline
+            if measurement_mode == "warm-resume":
+                ratios["warm_resume"] = {"candidate_over_baseline": {}}
+                for field, baseline_timing in aggregates["baseline"]["timings"].items():
+                    baseline = baseline_timing["median_of_trials_ns"]
+                    candidate = aggregates["candidate"]["timings"][field][
+                        "median_of_trials_ns"
+                    ]
+                    # Warm cache hits legitimately perform no rendering or
+                    # compilation. Preserve those zero samples; their ratio
+                    # is undefined, not evidence that the trial is invalid.
+                    ratios["warm_resume"]["candidate_over_baseline"][field] = warm_timing_ratio(
+                        candidate, baseline
+                    )
+            else:
+                for phase in ("accumulation", "commit"):
+                    ratios[phase] = {"candidate_over_baseline": {}}
+                    for partition in SAMPLE_PARTITIONS:
+                        baseline = aggregates["baseline"][phase]["partitions"][partition]["median_of_trial_medians_ns"]
+                        candidate = aggregates["candidate"][phase]["partitions"][partition]["median_of_trial_medians_ns"]
+                        require(baseline != 0, f"{phase} {partition} baseline timing is zero")
+                        ratios[phase]["candidate_over_baseline"][partition] = candidate / baseline
         except EvidenceError as error:
             reasons.append(str(error))
     manifest = {
@@ -745,6 +931,7 @@ def compare(arguments: argparse.Namespace) -> tuple[dict[str, Any], bool]:
         "reasons": reasons,
         "baseline_sha": baseline_sha,
         "candidate_sha": candidate_sha,
+        "measurement_mode": measurement_mode,
         "trial_order": [role for role, _ in ORDER],
         "workflow": {
             "repository": os.environ.get("GITHUB_REPOSITORY", "unknown"),
@@ -780,6 +967,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", required=True)
     parser.add_argument("--baseline-sha", required=True)
     parser.add_argument("--candidate-sha", required=True)
+    parser.add_argument("--measurement-mode", choices=MEASUREMENT_TARGETS, default="steady-replay")
     parser.add_argument("--baseline-binary", required=True)
     parser.add_argument("--candidate-binary", required=True)
     parser.add_argument("--build-manifest", required=True)
@@ -802,6 +990,7 @@ def main() -> int:
             "reasons": [str(error)],
             "baseline_sha": arguments.baseline_sha,
             "candidate_sha": arguments.candidate_sha,
+            "measurement_mode": arguments.measurement_mode,
             "trials": [],
         }
         comparable = False

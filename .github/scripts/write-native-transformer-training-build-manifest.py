@@ -12,6 +12,10 @@ import re
 import subprocess
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
+TARGETS = {
+    "steady-replay": "compiled_transformer_train_resume",
+    "warm-resume": "compiled_transformer_scale_evidence",
+}
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -30,6 +34,7 @@ def main() -> None:
     parser.add_argument("--candidate-sha", required=True)
     parser.add_argument("--baseline-binary", required=True)
     parser.add_argument("--candidate-binary", required=True)
+    parser.add_argument("--measurement-mode", choices=TARGETS, default="steady-replay")
     parser.add_argument("--output", required=True)
     arguments = parser.parse_args()
     for label, value in (("baseline", arguments.baseline_sha), ("candidate", arguments.candidate_sha)):
@@ -52,13 +57,14 @@ def main() -> None:
     if not host:
         raise SystemExit("rustc host triple is unavailable")
     value = {
-        "format_version": 1,
+        "format_version": 2,
         "evidence_kind": "native_cpu_transformer_training_comparison_builds",
         "build_profile": "release",
         "cargo_locked": True,
         "cargo_incremental": os.environ.get("CARGO_INCREMENTAL"),
         "cargo_build_jobs": os.environ.get("CARGO_BUILD_JOBS"),
-        "cargo_target": "example:compiled_transformer_train_resume",
+        "measurement_mode": arguments.measurement_mode,
+        "cargo_target": f"example:{TARGETS[arguments.measurement_mode]}",
         "rustflags": os.environ.get("RUSTFLAGS"),
         "toolchain": rustc,
         "target_triple": host,
