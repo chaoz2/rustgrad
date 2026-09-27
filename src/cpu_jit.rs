@@ -27,7 +27,11 @@ mod render_policy;
 mod schedule_module;
 mod store_group;
 pub(crate) mod symbolic_runtime;
-pub(crate) use render_policy::NativeRenderAuthentication;
+pub(crate) use render_policy::{NativeRenderAuthentication, NativeRenderTopologyWitness};
+#[cfg(test)]
+pub(crate) use render_policy::{
+    native_render_topology_derivation_counts, reset_native_render_topology_derivation_counts,
+};
 pub(crate) use schedule_module::{
     NativeScheduleModuleBuildMode, schedule_module_cache_key,
     schedule_module_translation_unit_evidence,
@@ -2030,7 +2034,24 @@ pub(crate) fn native_output_initialization(root: &UOp) -> NativeOutputInitializa
             crate::MovementKernelKind::Scatter { .. }
             | crate::MovementKernelKind::ScatterPositions { .. } => NeedsZero,
         },
-        Operation::Sink if dense_assignment_fully_overwrites(root) => FullyOverwritten,
+        Operation::Sink => {
+            let Ok(nodes) = root.topological() else {
+                return NeedsZero;
+            };
+            native_output_initialization_from_topology(root, &nodes)
+        }
+        _ => NeedsZero,
+    }
+}
+
+pub(super) fn native_output_initialization_from_topology(
+    root: &UOp,
+    nodes: &[UOp],
+) -> NativeOutputInitialization {
+    use NativeOutputInitialization::{FullyOverwritten, NeedsZero};
+
+    match root.operation() {
+        Operation::Sink if dense_assignment_fully_overwrites(root, nodes) => FullyOverwritten,
         _ => NeedsZero,
     }
 }
@@ -2051,10 +2072,12 @@ pub(crate) fn native_output_initialization_derivation_count() -> usize {
     NATIVE_OUTPUT_INITIALIZATION_DERIVATIONS.with(std::cell::Cell::get)
 }
 
-fn dense_assignment_fully_overwrites(root: &UOp) -> bool {
-    let Ok(nodes) = root.topological() else {
-        return false;
-    };
+#[cfg(test)]
+fn record_native_output_initialization_derivation() {
+    NATIVE_OUTPUT_INITIALIZATION_DERIVATIONS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+fn dense_assignment_fully_overwrites(root: &UOp, nodes: &[UOp]) -> bool {
     if nodes.iter().any(|node| {
         matches!(
             node.operation(),
@@ -2296,7 +2319,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
             }
         }
     }
-    let policy = topology.into_render_policy(root)?;
+    let policy = topology.render_policy(root)?;
     let plan = policy.rendered_vector();
     let linear_key = policy.linear_key();
     if let Some(program) = policy.b1_program() {
