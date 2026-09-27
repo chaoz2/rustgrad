@@ -1,5 +1,5 @@
 //! Compiler-visible STORE/AFTER form for graph-adjacent effects.
-use super::{BufferState, EffectCommit, EffectError, EffectGraph};
+use super::{BufferState, EffectCommit, EffectError, EffectGraph, ValidatedEffectPlan};
 use std::{
     collections::{BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -82,8 +82,12 @@ pub struct EffectSchedule {
 
 impl EffectSchedule {
     pub fn lower(graph: &EffectGraph) -> Result<Self, EffectError> {
-        let plan = graph.plan();
-        plan.validate()?;
+        let plan = ValidatedEffectPlan::new(graph.plan())?;
+        Self::lower_validated(&plan)
+    }
+
+    pub(crate) fn lower_validated(plan: &ValidatedEffectPlan) -> Result<Self, EffectError> {
+        let plan = plan.plan();
         let mut nodes = Vec::with_capacity(plan.steps.len());
         for step in &plan.steps {
             let snapshot = step

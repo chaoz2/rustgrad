@@ -33,6 +33,7 @@ mod observation;
 mod optimizer_lowering;
 mod policy;
 mod program_artifact;
+mod recurrent_effect;
 mod recurrent_phase;
 mod resume_bundle;
 mod runtime;
@@ -140,6 +141,7 @@ pub use self::program_artifact::{
     CompiledTrainingProgramArtifact, CompiledTrainingProgramArtifactFileError,
     CompiledTrainingProgramArtifactInfo,
 };
+use self::recurrent_effect::{RecurrentEffectReplacement, seal_recurrent_effects};
 use self::recurrent_phase::*;
 pub use self::resume_bundle::{
     CompiledAdamWResumeBundle, CompiledAdamWResumeBundleFileError, CompiledMomentumSgdResumeBundle,
@@ -153,11 +155,11 @@ use self::state_schema::{OptimizerStateSchema, RecurrentStateKey, StateSpec};
 use self::training_plan::*;
 use self::validation::{
     canonical_parameters, checked_bytes, checked_descriptor, checked_recurrent_state_extent,
-    collect_state_bindings, effect_states, has_non_finite_f32, state_for,
-    validate_evaluation_inputs, validate_external_binding_ownership, validate_finite_tensors,
-    validate_learning_rate, validate_learning_rate_for_policy, validate_loss, validate_outputs,
-    validate_staged_transition, validate_step_inputs, validate_training_inputs, validate_user_name,
-    validate_weight_decay_exclusion_names, value_binding,
+    collect_state_bindings, has_non_finite_f32, state_for, validate_evaluation_inputs,
+    validate_external_binding_ownership, validate_finite_tensors, validate_learning_rate,
+    validate_learning_rate_for_policy, validate_loss, validate_outputs, validate_staged_transition,
+    validate_step_inputs, validate_training_inputs, validate_user_name,
+    validate_weight_decay_exclusion_names,
 };
 #[cfg(test)]
 use self::window_progress::validate_training_window_progress;
@@ -190,10 +192,9 @@ use crate::runtime::metal::{
 };
 use crate::{
     BufferState, CapturedMixedSchedule, CapturedReplayExecutor, CapturedSchedule,
-    CapturedStatefulInference, CompareOp, DType, EffectGraph, EffectRuntime, Error,
-    ExecutionPlanSummary, Graph, InferenceStateLink, LoadReport, MixedReplayCursor, Module,
-    NativeMixedReplayTrace, NodeId, ReplayError, Result, Scalar, Shape, TensorData,
-    bind_schedule_states, combine_mixed_schedules, schedule_effects, schedule_many,
+    CapturedStatefulInference, CompareOp, DType, EffectRuntime, Error, ExecutionPlanSummary, Graph,
+    InferenceStateLink, LoadReport, MixedReplayCursor, Module, NativeMixedReplayTrace, NodeId,
+    ReplayError, Result, Scalar, Shape, TensorData, bind_schedule_states, schedule_many,
 };
 #[cfg(test)]
 use crate::{load_safetensors, save_safetensors};
@@ -455,5 +456,5 @@ fn training(reason: impl Into<String>) -> Error {
 }
 
 #[cfg(test)]
-#[path = "compiled_training/tests.rs"]
+#[path = "tests.rs"]
 mod tests;

@@ -837,42 +837,19 @@ impl CompiledAdamWAuxiliaryPlan {
         let pure = bind_schedule_states(pure, state_bindings).map_err(schedule_error)?;
         let pure_capture_binding_wall_time = pure_capture_binding_started.elapsed();
         let effect_assembly_sealing_started = Instant::now();
-        let mut effects = EffectGraph::default();
-        let mut effect_bindings = Vec::with_capacity(specs.len());
-        for (ordinal, (_, key, value, _, buffer)) in specs.iter().enumerate() {
-            let next = updates[key];
-            if next.index() as u64 >= STATE_BUFFER_BASE {
-                return Err(training(
-                    "graph node identity overlaps persistent state namespace",
-                ));
-            }
-            let destination = effects
-                .insert(*buffer, value.clone())
-                .map_err(effect_error)?;
-            let source = effects
-                .insert(
-                    next.index() as u64,
-                    TensorData::zeros_with_dtype(value.shape().clone(), value.dtype())?,
-                )
-                .map_err(effect_error)?;
-            effects
-                .assign(&destination, &source)
-                .map_err(effect_error)?;
-            effect_bindings.push(value_binding(
-                &pure,
-                next,
-                u64::try_from(ordinal).map_err(|_| training("effect index overflow"))?,
-            )?);
-        }
-        let mixed = combine_mixed_schedules(
+        let sealed = seal_recurrent_effects(
             pure,
-            schedule_effects(&effects).map_err(schedule_error)?,
-            effect_bindings,
-        )
-        .map_err(schedule_error)?;
+            specs
+                .iter()
+                .map(|(_, key, _, input, _)| RecurrentEffectReplacement {
+                    source: updates[key],
+                    destination: state_by_input[input].clone(),
+                }),
+        )?;
+        let mixed = sealed.schedule;
         captured.items = mixed.items.clone();
         let capture = Arc::new(
-            CapturedMixedSchedule::from_parts(captured, &mixed, effect_states(&effects)?)
+            CapturedMixedSchedule::from_parts(captured, &mixed, sealed.states)
                 .map_err(replay_error)?,
         );
         validate_external_binding_ownership(capture.as_ref(), std::iter::empty::<&String>())?;

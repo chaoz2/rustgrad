@@ -2,12 +2,11 @@
 
 use super::state_schema::INTERNAL_PREFIX;
 use super::{
-    CompiledAdamWConfig, CpuNonFinitePolicy, LEARNING_RATE_INPUT, TrainingParameterInit,
-    effect_error, training,
+    CompiledAdamWConfig, CpuNonFinitePolicy, LEARNING_RATE_INPUT, TrainingParameterInit, training,
 };
 use crate::{
-    BufferState, CapturedMixedSchedule, DType, EffectGraph, Graph, NodeId, Result, Schedule,
-    ScheduleStateBinding, ScheduleValueBinding, Shape, TensorData,
+    BufferState, CapturedMixedSchedule, DType, Graph, NodeId, Result, Schedule,
+    ScheduleStateBinding, Shape, TensorData,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -209,40 +208,6 @@ pub(super) fn collect_state_bindings(
         return Err(training("compiled state input is not reachable"));
     }
     Ok(bindings)
-}
-
-pub(super) fn value_binding(
-    schedule: &Schedule,
-    node: NodeId,
-    effect_item: u64,
-) -> Result<ScheduleValueBinding> {
-    let (producer_item, producer) = schedule
-        .items
-        .iter()
-        .enumerate()
-        .find(|(_, item)| item.primary_output().id == node.index() as u64)
-        .ok_or_else(|| training("compiled update output is not materialized"))?;
-    Ok(ScheduleValueBinding {
-        producer_item: u64::try_from(producer_item)
-            .map_err(|_| training("compiled producer index overflow"))?,
-        producer_node: node,
-        producer_output: producer.primary_output().clone(),
-        abi_index: 0,
-        effect_item,
-        source_position: 0,
-    })
-}
-
-pub(super) fn effect_states(effects: &EffectGraph) -> Result<Vec<BufferState>> {
-    let plan = effects.plan();
-    plan.validate().map_err(effect_error)?;
-    let mut states = BTreeMap::new();
-    for step in plan.steps {
-        for state in step.reads.into_iter().chain([step.write]) {
-            states.insert((state.buffer, state.version), state);
-        }
-    }
-    Ok(states.into_values().collect())
 }
 
 // Runtime input and transition validation.
