@@ -1280,13 +1280,8 @@ fn validate(
                 return Err(ArtifactError::Format("input inventory"));
             }
         }
-        if item.boundary.is_none()
-            && super::input_bindings(&item.kernel, &item.inputs, item.primary_output())
-                .map_err(|_| ArtifactError::Format("kernel resources"))?
-                != item.input_bindings
-        {
-            return Err(ArtifactError::Format("kernel bindings"));
-        }
+        // validate_input_bindings already reconstructed and compared the dense
+        // ABI for this immutable item. Quantized resource equality is separate.
         if item.boundary.is_none()
             && super::quantized_input_bindings(&item.kernel)
                 .map_err(|_| ArtifactError::Format("quantized kernel resources"))?
@@ -2908,6 +2903,53 @@ mod tests {
         assert_eq!(decoded.items[0].outputs.iter().count(), 2);
         assert_eq!(decoded.items[0].outputs.iter().nth(1), Some(&secondary));
         assert!(validate_for_replay(&decoded).is_err());
+    }
+
+    #[test]
+    fn dense_binding_admission_preserves_legacy_rejections() {
+        fn legacy(item: &ScheduleItem) -> Result<(), ArtifactError> {
+            item.validate_input_bindings()
+                .map_err(|_| ArtifactError::Format("input bindings"))?;
+            if item.boundary.is_none()
+                && super::super::input_bindings(&item.kernel, &item.inputs, item.primary_output())
+                    .map_err(|_| ArtifactError::Format("kernel resources"))?
+                    != item.input_bindings
+            {
+                return Err(ArtifactError::Format("kernel bindings"));
+            }
+            Ok(())
+        }
+
+        let capture = fixture();
+        assert_eq!(legacy(&capture.items[0]), Ok(()));
+        assert_eq!(validate(&capture, true, true), Ok(()));
+        let bytes = encode(&capture).unwrap();
+        assert_eq!(encode(&decode(&bytes).unwrap()).unwrap(), bytes);
+        for case in 0..4 {
+            let mut malformed = capture.clone();
+            let bindings = &mut malformed.items[0].input_bindings;
+            match case {
+                0 => bindings[0].abi_index = 7,
+                1 => {
+                    bindings.remove(0);
+                }
+                2 => bindings.push(bindings[0].clone()),
+                3 => bindings[0].input_node = NodeId::from_index(999),
+                _ => unreachable!(),
+            }
+            let expected = legacy(&malformed.items[0]);
+            assert_eq!(
+                expected,
+                Err(ArtifactError::Format("input bindings")),
+                "case {case}"
+            );
+            assert_eq!(validate(&malformed, true, true), expected, "case {case}");
+            assert_eq!(
+                decode(&unchecked(&malformed)).unwrap_err(),
+                expected.unwrap_err(),
+                "case {case}"
+            );
+        }
     }
 
     #[test]
