@@ -10143,6 +10143,20 @@ fn momentum_program_artifact_restores_without_rebuilding_the_training_graph() {
     assert!(CompiledAdamWResumeBundle::from_bytes(bundle.as_bytes().to_vec()).is_err());
     let bundle_path = TemporaryCheckpointPath::new("compiled-momentum-sgd-resume-bundle");
     bundle.save_file(bundle_path.path()).unwrap();
+    let load_started = std::time::Instant::now();
+    let (timed_bundle, timings) =
+        CompiledMomentumSgdResumeBundle::load_file_with_timings(bundle_path.path(), usize::MAX)
+            .unwrap();
+    assert_bundle_load_timing_partition(timings, load_started.elapsed());
+    assert_eq!(timed_bundle, bundle);
+    let wrong_optimizer = CompiledAdamWResumeBundle::load_file(bundle_path.path()).unwrap_err();
+    let timed_wrong_optimizer =
+        CompiledAdamWResumeBundle::load_file_with_timings(bundle_path.path(), usize::MAX)
+            .unwrap_err();
+    assert_eq!(
+        format!("{timed_wrong_optimizer:?}"),
+        format!("{wrong_optimizer:?}")
+    );
     assert_eq!(
         CompiledMomentumSgdResumeBundle::load_file(bundle_path.path()).unwrap(),
         bundle
@@ -10676,6 +10690,25 @@ fn compiled_program_artifact_file_io_is_bounded_and_atomic() {
     );
 }
 
+fn assert_bundle_load_timing_partition(
+    timings: ResumeBundleLoadTimings,
+    whole: std::time::Duration,
+) {
+    let sum = [
+        timings.file_read,
+        timings.envelope,
+        timings.program,
+        timings.checkpoint,
+        timings.pair_admission,
+    ]
+    .into_iter()
+    .try_fold(std::time::Duration::ZERO, |sum, phase| {
+        sum.checked_add(phase)
+    })
+    .expect("load phase sum fits duration");
+    assert!(sum <= whole, "disjoint phases must fit whole load");
+}
+
 #[test]
 fn compiled_resume_bundle_preserves_exact_inner_bytes_and_atomic_file_boundary() {
     let config = module_config()
@@ -10821,6 +10854,42 @@ fn compiled_resume_bundle_preserves_exact_inner_bytes_and_atomic_file_boundary()
     bundle.save_file(&path).unwrap();
     assert_eq!(fs::read(&path).unwrap(), bundle.as_bytes());
     assert_eq!(CompiledAdamWResumeBundle::load_file(&path).unwrap(), bundle);
+    let load_started = std::time::Instant::now();
+    let (timed_bundle, timings) =
+        CompiledAdamWResumeBundle::load_file_with_timings(&path, bundle.as_bytes().len()).unwrap();
+    assert_bundle_load_timing_partition(timings, load_started.elapsed());
+    assert_eq!(timed_bundle, bundle);
+    assert_eq!(timed_bundle.as_bytes(), bundle.as_bytes());
+    let clone = timed_bundle.clone();
+    assert!(timed_bundle.shares_admission_with(&clone));
+    for (case, fixture_path, maximum) in [
+        ("limit", path.clone(), bundle.as_bytes().len() - 1),
+        ("missing", directory.path().join("missing.rgab"), usize::MAX),
+    ] {
+        let ordinary = CompiledAdamWResumeBundle::load_file_with_byte_limit(&fixture_path, maximum)
+            .unwrap_err();
+        let timed =
+            CompiledAdamWResumeBundle::load_file_with_timings(&fixture_path, maximum).unwrap_err();
+        assert_eq!(format!("{timed:?}"), format!("{ordinary:?}"), "{case}");
+    }
+    for case in ["version", "checksum", "truncated"] {
+        let mut bytes = bundle.as_bytes().to_vec();
+        match case {
+            "version" => bytes[4] = 0,
+            "checksum" => *bytes.last_mut().unwrap() ^= 1,
+            "truncated" => {
+                bytes.pop();
+            }
+            _ => unreachable!(),
+        }
+        let malformed = directory.path().join(format!("{case}.rgab"));
+        fs::write(&malformed, &bytes).unwrap();
+        let ordinary = CompiledAdamWResumeBundle::load_file(&malformed).unwrap_err();
+        let timed =
+            CompiledAdamWResumeBundle::load_file_with_timings(&malformed, usize::MAX).unwrap_err();
+        assert_eq!(format!("{timed:?}"), format!("{ordinary:?}"), "{case}");
+        assert_eq!(fs::read(&malformed).unwrap(), bytes);
+    }
     assert_eq!(
         CompiledAdamWResumeBundle::load_file_with_byte_limit(&path, bundle.as_bytes().len())
             .unwrap(),

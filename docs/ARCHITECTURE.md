@@ -1483,6 +1483,18 @@ mixed schema versions rather than inventing missing measurements. The ordinary
 scoreboard remains v26; this extra detail belongs to the separate warm-resume
 objective evidence, not its cold preparation report.
 
+Objective schema v10 additionally partitions resume-bundle loading into bounded
+file reading, envelope validation, compiled-program decode/admission, complete
+module-checkpoint decode, and pair authentication. The explicit
+`load_file_with_timings` API returns `ResumeBundleLoadTimings` only on success;
+ordinary loaders do not read the clock. Both routes share byte limits, error
+precedence, and the same admission path. Diagnostics are not serialized into
+RGAB, RGAP, checkpoints, or cache identities. The evidence reader checks the
+five disjoint durations against the enclosing load interval, retains v8/v9
+support, and rejects mixed-version comparisons. Nested decode timings include
+validation and owned-byte copies, not just parsing. These observations locate
+future work; they are not a speedup or throughput claim.
+
 The executor-host remainder includes workspace, binding, input/output, and any
 conservative per-entry execution outside sealed dispatcher segments. It is not
 a per-kernel profile.

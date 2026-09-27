@@ -151,7 +151,7 @@ use self::recurrent_phase::*;
 pub use self::resume_bundle::{
     CompiledAdamWResumeBundle, CompiledAdamWResumeBundleFileError, CompiledMomentumSgdResumeBundle,
     CompiledMomentumSgdResumeBundleFileError, CompiledTrainingResumeBundle,
-    CompiledTrainingResumeBundleFileError,
+    CompiledTrainingResumeBundleFileError, ResumeBundleLoadTimings,
 };
 pub use self::runtime::*;
 #[cfg(test)]

@@ -5,6 +5,7 @@ use super::{
 use crate::file_io::{ExactFileError, read_file_bytes_bounded, replace_file_bytes_atomically};
 use crate::{Error, Result};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{fmt, io, path::Path};
 
 const MAGIC: &[u8; 4] = b"RGAB";
@@ -12,6 +13,38 @@ const FORMAT_VERSION: u8 = 1;
 const HEADER_BYTES: usize = 21;
 const CHECKSUM_BYTES: usize = 8;
 pub(super) const MAX_BUNDLE_BYTES: usize = (1 << 30) + (256 << 20) + HEADER_BYTES + CHECKSUM_BYTES;
+
+/// Disjoint host-wall phases of a successful, explicitly timed bundle load.
+///
+/// These observations are not persisted or used for admission. Program and
+/// checkpoint phases include their nested validation and owned byte copies;
+/// the durations are not pure parser or device timings. Their sum excludes
+/// outer orchestration and is bounded by the caller's whole-load duration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeBundleLoadTimings {
+    /// Bounded file read, including allocation and metadata checks.
+    pub file_read: Duration,
+    /// Outer envelope lengths, version, and checksum admission.
+    pub envelope: Duration,
+    /// Compiled program decoding and nested capture admission.
+    pub program: Duration,
+    /// Complete-module checkpoint decoding and validation.
+    pub checkpoint: Duration,
+    /// Authentication of the admitted program/checkpoint pair.
+    pub pair_admission: Duration,
+}
+
+fn timed<T, E>(
+    slot: Option<&mut Duration>,
+    action: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let started = slot.as_ref().map(|_| Instant::now());
+    let result = action();
+    if let Some(slot) = slot {
+        *slot = started.expect("timed phase has a start").elapsed();
+    }
+    result
+}
 
 /// One deterministic file payload containing an exact compiled training
 /// program artifact and its optimizer-typed complete-module checkpoint.
@@ -170,11 +203,13 @@ fn encode<C: CompiledModuleCheckpointPayload>(
 fn decode<C: CompiledModuleCheckpointPayload>(
     bytes: &[u8],
     admit: PairAdmission<C>,
+    mut timings: Option<&mut ResumeBundleLoadTimings>,
 ) -> Result<(
     CompiledTrainingProgramArtifact,
     CompiledModuleCheckpoint<C>,
     Arc<super::program_artifact::AdmittedArtifactCheckpointPair<C>>,
 )> {
+    let envelope_started = timings.as_ref().map(|_| Instant::now());
     if bytes.len() < HEADER_BYTES + CHECKSUM_BYTES
         || bytes.len() > MAX_BUNDLE_BYTES
         || &bytes[..4] != MAGIC
@@ -222,11 +257,20 @@ fn decode<C: CompiledModuleCheckpointPayload>(
             "compiled training resume-bundle checksum mismatch",
         ));
     }
-    let program_artifact =
-        CompiledTrainingProgramArtifact::from_bytes(bytes[HEADER_BYTES..program_end].to_vec())?;
-    let checkpoint =
-        CompiledModuleCheckpoint::<C>::from_bytes(bytes[program_end..checkpoint_end].to_vec())?;
-    let admitted = admit(&program_artifact, &checkpoint)?;
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.envelope = envelope_started
+            .expect("timed envelope has a start")
+            .elapsed();
+    }
+    let program_artifact = timed(timings.as_deref_mut().map(|t| &mut t.program), || {
+        CompiledTrainingProgramArtifact::from_bytes(bytes[HEADER_BYTES..program_end].to_vec())
+    })?;
+    let checkpoint = timed(timings.as_deref_mut().map(|t| &mut t.checkpoint), || {
+        CompiledModuleCheckpoint::<C>::from_bytes(bytes[program_end..checkpoint_end].to_vec())
+    })?;
+    let admitted = timed(timings.map(|t| &mut t.pair_admission), || {
+        admit(&program_artifact, &checkpoint)
+    })?;
     Ok((program_artifact, checkpoint, admitted))
 }
 
@@ -252,7 +296,7 @@ macro_rules! impl_resume_bundle {
             /// Validates and owns deterministic resume-bundle bytes.
             pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Result<Self> {
                 let bytes = bytes.into();
-                let (program_artifact, checkpoint, admitted) = decode(&bytes, $admit)?;
+                let (program_artifact, checkpoint, admitted) = decode(&bytes, $admit, None)?;
                 Ok(Self {
                     bytes,
                     program_artifact,
@@ -277,6 +321,36 @@ macro_rules! impl_resume_bundle {
                 let bytes = read_file_bytes_bounded(path, maximum.min(MAX_BUNDLE_BYTES))
                     .map_err(file_error)?;
                 Self::from_bytes(bytes).map_err(CompiledTrainingResumeBundleFileError::Format)
+            }
+
+            /// Loads with the same bounded admission as `load_file_with_byte_limit`,
+            /// returning opt-in disjoint host-wall diagnostics on success only.
+            /// The ordinary load methods perform no timing. Errors and their
+            /// precedence are unchanged, and no partially admitted bundle escapes.
+            pub fn load_file_with_timings(
+                path: impl AsRef<Path>,
+                maximum: usize,
+            ) -> std::result::Result<
+                (Self, ResumeBundleLoadTimings),
+                CompiledTrainingResumeBundleFileError,
+            > {
+                let mut timings = ResumeBundleLoadTimings::default();
+                let bytes = timed(Some(&mut timings.file_read), || {
+                    read_file_bytes_bounded(path, maximum.min(MAX_BUNDLE_BYTES))
+                })
+                .map_err(file_error)?;
+                let (program_artifact, checkpoint, admitted) =
+                    decode(&bytes, $admit, Some(&mut timings))
+                        .map_err(CompiledTrainingResumeBundleFileError::Format)?;
+                Ok((
+                    Self {
+                        bytes,
+                        program_artifact,
+                        checkpoint,
+                        admitted,
+                    },
+                    timings,
+                ))
             }
         }
     };

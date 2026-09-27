@@ -63,7 +63,7 @@ pub use compiled_training::{
     NativeCpuProgramFinalizationPhases, NativeCpuProgramPreparationReport,
     NativeCpuRenderCapsuleDiagnostic, NativeCpuRenderCapsuleLoadStatus,
     NativeCpuRenderCapsuleProgramRole, NativeCpuRenderCapsuleStoreStatus, NativeCpuReplayTraffic,
-    NativeCpuRunReport, TrainingParameterInit,
+    NativeCpuRunReport, ResumeBundleLoadTimings, TrainingParameterInit,
 };
 pub use cpu::{
     CpuGradientStore, CpuSession, DynamicTensor, MaskedSelectOutput, MetalSessionResult,

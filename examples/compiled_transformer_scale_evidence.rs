@@ -666,6 +666,7 @@ struct ScaleWarmResumeEvidence {
     resume_bundle_bytes: usize,
     module_checkpoint_bytes: usize,
     artifact_decode_wall_time_ns: u64,
+    bundle_load_phases: ScaleBundleLoadPhases,
     owner_restore_wall_time_ns: u64,
     preparation_wall_time_ns: u64,
     preparation: ScaleWarmPreparationEvidence,
@@ -690,6 +691,15 @@ struct ScaleWarmResumeEvidence {
     exact_continuation: bool,
     evaluation_state_neutral: bool,
     target_owned_module_published: bool,
+}
+
+#[derive(Serialize)]
+struct ScaleBundleLoadPhases {
+    file_read_wall_time_ns: u64,
+    envelope_wall_time_ns: u64,
+    program_wall_time_ns: u64,
+    checkpoint_wall_time_ns: u64,
+    pair_admission_wall_time_ns: u64,
 }
 
 struct ScaleModuleStateWitness {
@@ -1458,8 +1468,16 @@ fn collect_scale_warm_resume_evidence(
         expected_final_loss,
     } = input;
     let decode_started = Instant::now();
-    let resume_bundle = CompiledAdamWResumeBundle::load_file(resume_bundle_path)?;
+    let (resume_bundle, load_timings) =
+        CompiledAdamWResumeBundle::load_file_with_timings(resume_bundle_path, usize::MAX)?;
     let artifact_decode_wall_time_ns = duration_nanos(decode_started.elapsed())?;
+    let bundle_load_phases = ScaleBundleLoadPhases {
+        file_read_wall_time_ns: duration_nanos(load_timings.file_read)?,
+        envelope_wall_time_ns: duration_nanos(load_timings.envelope)?,
+        program_wall_time_ns: duration_nanos(load_timings.program)?,
+        checkpoint_wall_time_ns: duration_nanos(load_timings.checkpoint)?,
+        pair_admission_wall_time_ns: duration_nanos(load_timings.pair_admission)?,
+    };
     let persisted_checkpoint = CompiledModuleAdamWCheckpoint::load_file(module_checkpoint_path)?;
     assert_eq!(&resume_bundle, saved_bundle);
     assert_eq!(resume_bundle.checkpoint(), &persisted_checkpoint);
@@ -1494,6 +1512,7 @@ fn collect_scale_warm_resume_evidence(
         resume_bundle_bytes: resume_bundle.as_bytes().len(),
         module_checkpoint_bytes: persisted_checkpoint.as_bytes().len(),
         artifact_decode_wall_time_ns,
+        bundle_load_phases,
         owner_restore_wall_time_ns: duration_nanos(
             contract
                 .owner_restore_wall_time
@@ -2236,7 +2255,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let gradient_evidence = collect_scale_gradient_evidence()?;
 
     let objective = json!({
-        "schema_version": 9,
+        "schema_version": 10,
         "git_sha": &paths.git_sha,
         "workload": {
             "batch": BATCH,
