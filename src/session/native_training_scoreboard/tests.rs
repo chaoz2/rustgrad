@@ -382,6 +382,12 @@ fn remove_preparation_finalization_evidence(json: &mut serde_json::Value) {
     json.as_object_mut().unwrap().remove("prepare_finalization");
 }
 
+fn remove_render_batch_timing(json: &mut serde_json::Value) {
+    let finalization = json["prepare_finalization"].as_object_mut().unwrap();
+    finalization.remove("render_batch_wall_time");
+    finalization.remove("render_batch_orchestration_wall_time");
+}
+
 fn remove_recurrent_capture_evidence(json: &mut serde_json::Value) {
     let phases = json["compile_phases"].as_object_mut().unwrap();
     for phase in [
@@ -734,6 +740,35 @@ fn phase_specialized_report() -> NativeTrainingReport {
         .with_evidence_identity(),
     ]);
     report
+}
+
+fn effective_render_wall_time(report: &NativeTrainingReport) -> Duration {
+    let render_wall_time = std::iter::once(&report.main)
+        .chain(report.accumulation.iter())
+        .chain(report.partial_flush.iter())
+        .chain(report.zero_grad.iter())
+        .chain(report.evaluation.iter())
+        .try_fold(Duration::ZERO, |total, program| {
+            total.checked_add(
+                program
+                    .preparation_timing
+                    .as_ref()
+                    .unwrap()
+                    .render
+                    .to_duration()
+                    .unwrap(),
+            )
+        })
+        .unwrap();
+    render_wall_time
+        .checked_sub(
+            report
+                .prepare_parallel_render_overlap_wall_time
+                .unwrap()
+                .to_duration()
+                .unwrap(),
+        )
+        .unwrap()
 }
 
 fn set_main_unique_rendered_entry_count(report: &mut NativeTrainingReport, count: u64) {
@@ -1309,10 +1344,12 @@ fn current_report_authenticates_chunked_compile_and_link_inventory() {
         .unwrap()
         .to_duration()
         .unwrap();
+    let effective_render = effective_render_wall_time(&report);
     set_zero_stage_finalization_partition(
         report.prepare_finalization.as_mut().unwrap(),
         prepare,
         overhead,
+        effective_render,
     );
     assert!(report.validate().is_ok());
 
@@ -1622,6 +1659,28 @@ fn version_twenty_four_decodes_without_preparation_finalization() {
 }
 
 #[test]
+fn version_twenty_five_decodes_without_render_batch_timing() {
+    let report = phase_specialized_report();
+    let mut legacy = serde_json::to_value(&report).unwrap();
+    legacy["format_version"] = serde_json::json!(NATIVE_TRAINING_REPORT_FORMAT_V25);
+    assert!(
+        NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&legacy).unwrap()).is_err(),
+        "v25 rejects v26 render-batch timing"
+    );
+    remove_render_batch_timing(&mut legacy);
+    let decoded =
+        NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert_eq!(decoded.format_version, NATIVE_TRAINING_REPORT_FORMAT_V25);
+    let finalization = decoded.prepare_finalization().unwrap();
+    assert!(finalization.render_batch_wall_time().is_none());
+    assert!(
+        finalization
+            .render_batch_orchestration_wall_time()
+            .is_none()
+    );
+}
+
+#[test]
 fn current_preparation_finalization_partition_is_exact_and_role_aligned() {
     let mut valid = serde_json::to_value(phase_specialized_report()).unwrap();
     valid["prepare_wall_time"] =
@@ -1636,11 +1695,13 @@ fn current_preparation_finalization_partition_is_exact_and_role_aligned() {
     valid["prepare_finalization"]["instrumented_wall_time"] = duration(20);
     valid["prepare_finalization"]["outer_remainder_wall_time"] = duration(10);
     valid["prepare_finalization"]["bootstrap_wall_time"] = duration(2);
+    valid["prepare_finalization"]["render_batch_wall_time"] = duration(2);
+    valid["prepare_finalization"]["render_batch_orchestration_wall_time"] = duration(2);
     valid["prepare_finalization"]["main"]["pre_layout_admission_wall_time"] = duration(3);
     valid["prepare_finalization"]["main"]["workspace_construction_wall_time"] = duration(4);
     valid["prepare_finalization"]["main"]["recurrent_finalization_wall_time"] = duration(5);
     valid["prepare_finalization"]["report_input_assembly_wall_time"] = duration(1);
-    valid["prepare_finalization"]["unattributed_wall_time"] = duration(5);
+    valid["prepare_finalization"]["unattributed_wall_time"] = duration(3);
     let decoded =
         NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&valid).unwrap()).unwrap();
     assert_eq!(
@@ -1656,6 +1717,37 @@ fn current_preparation_finalization_partition_is_exact_and_role_aligned() {
     assert!(
         NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&invalid).unwrap()).is_err(),
         "outer partition must be exact"
+    );
+
+    let mut invalid = valid.clone();
+    invalid["prepare_finalization"]["render_batch_wall_time"] = duration(3);
+    assert!(
+        NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+        "render batch must equal effective render plus orchestration"
+    );
+
+    let mut missing = valid.clone();
+    missing["prepare_finalization"]
+        .as_object_mut()
+        .unwrap()
+        .remove("render_batch_orchestration_wall_time");
+    assert!(
+        NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&missing).unwrap()).is_err(),
+        "current reports require complete render-batch timing"
+    );
+
+    let mut overflowing_batch = valid.clone();
+    let maximum = serde_json::to_value(BenchmarkDuration::from_duration(Duration::new(
+        u64::MAX,
+        999_999_999,
+    )))
+    .unwrap();
+    overflowing_batch["prepare_finalization"]["render_batch_wall_time"] = maximum.clone();
+    overflowing_batch["prepare_finalization"]["render_batch_orchestration_wall_time"] = maximum;
+    assert!(
+        NativeTrainingReport::from_json_bytes(&serde_json::to_vec(&overflowing_batch).unwrap())
+            .is_err(),
+        "render-batch orchestration must participate in checked overhead sums"
     );
 
     let mut invalid = valid.clone();
@@ -1973,10 +2065,12 @@ fn current_report_attributes_an_auxiliary_post_main_compiler_tail() {
         .unwrap()
         .to_duration()
         .unwrap();
+    let effective_render = effective_render_wall_time(&report);
     set_zero_stage_finalization_partition(
         report.prepare_finalization.as_mut().unwrap(),
         prepare,
         overhead,
+        effective_render,
     );
     assert!(report.validate().is_ok());
 }
@@ -2232,10 +2326,12 @@ fn current_report_authenticates_parallel_render_overlap_and_bound() {
         .unwrap()
         .to_duration()
         .unwrap();
+    let effective_render = effective_render_wall_time(&report);
     set_zero_stage_finalization_partition(
         report.prepare_finalization.as_mut().unwrap(),
         prepare,
         overhead,
+        effective_render,
     );
     assert!(report.validate().is_ok());
 
@@ -2304,10 +2400,12 @@ fn current_report_authenticates_parallel_render_overlap_and_bound() {
             .unwrap(),
     );
     let prepare = all_capsule_hits.prepare_wall_time.to_duration().unwrap();
+    let effective_render = effective_render_wall_time(&all_capsule_hits);
     set_zero_stage_finalization_partition(
         all_capsule_hits.prepare_finalization.as_mut().unwrap(),
         prepare,
         runtime_overhead,
+        effective_render,
     );
     assert!(all_capsule_hits.validate().is_ok());
     let exact_all_hits = all_capsule_hits.clone();

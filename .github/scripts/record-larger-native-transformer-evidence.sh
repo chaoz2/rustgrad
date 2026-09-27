@@ -178,7 +178,7 @@ def duration_nanos(value):
     except PREPARATION_EVIDENCE.PreparationEvidenceError:
         return None
 
-if objective.get("schema_version") != 7 or objective.get("git_sha") != sys.argv[3]:
+if objective.get("schema_version") != 8 or objective.get("git_sha") != sys.argv[3]:
     raise SystemExit("larger Transformer objective provenance is invalid")
 expected_workload = {
     "batch": 4,
@@ -302,7 +302,7 @@ if (
 native = objective.get("native")
 if not isinstance(native, dict):
     raise SystemExit("larger Transformer native evidence is absent")
-if scoreboard.get("format_version") != 25 or scoreboard.get("initial_replay_step") != 0:
+if scoreboard.get("format_version") != 26 or scoreboard.get("initial_replay_step") != 0:
     raise SystemExit("larger Transformer scoreboard identity is invalid")
 preparation_programs = {
     role: scoreboard.get(role)
@@ -312,7 +312,7 @@ if any(not isinstance(program, dict) for program in preparation_programs.values(
     raise SystemExit("larger Transformer preparation program inventory is invalid")
 try:
     PREPARATION_EVIDENCE.validate_preparation_finalization(
-        scoreboard, 25, preparation_programs
+        scoreboard, 26, preparation_programs
     )
 except PREPARATION_EVIDENCE.PreparationEvidenceError as error:
     raise SystemExit(f"larger Transformer preparation evidence is invalid: {error}") from error
@@ -587,7 +587,8 @@ def benchmark_duration(nanos):
 warm_programs = {
     role: {
         "preparation_timing": {
-            "total": benchmark_duration(preparation[role]["total_wall_time_ns"])
+            "total": benchmark_duration(preparation[role]["total_wall_time_ns"]),
+            "render": benchmark_duration(preparation[role]["render_wall_time_ns"]),
         }
     }
     for role in preparation_roles
@@ -607,7 +608,7 @@ warm_partition = {
 }
 try:
     PREPARATION_EVIDENCE.validate_preparation_finalization(
-        warm_partition, 25, warm_programs
+        warm_partition, 26, warm_programs
     )
 except PREPARATION_EVIDENCE.PreparationEvidenceError as error:
     raise SystemExit(

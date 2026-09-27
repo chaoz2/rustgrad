@@ -19,11 +19,13 @@ use super::super::{
     NATIVE_TRAINING_REPORT_FORMAT_V18, NATIVE_TRAINING_REPORT_FORMAT_V19,
     NATIVE_TRAINING_REPORT_FORMAT_V20, NATIVE_TRAINING_REPORT_FORMAT_V21,
     NATIVE_TRAINING_REPORT_FORMAT_V22, NATIVE_TRAINING_REPORT_FORMAT_V23,
-    NATIVE_TRAINING_REPORT_FORMAT_V24, NATIVE_TRAINING_REPORT_FORMAT_VERSION, count, invalid,
-    rate_from_total, validate_phase_partition, validate_total_duration,
+    NATIVE_TRAINING_REPORT_FORMAT_V24, NATIVE_TRAINING_REPORT_FORMAT_V25,
+    NATIVE_TRAINING_REPORT_FORMAT_VERSION, count, invalid, rate_from_total,
+    validate_phase_partition, validate_total_duration,
 };
 use super::NativeTrainingReport;
-use crate::Result;
+use crate::{BenchmarkDuration, Result};
+use std::time::Duration;
 
 pub(super) fn validate(report: &NativeTrainingReport) -> Result<()> {
     validate_header(report)?;
@@ -59,6 +61,7 @@ fn validate_header(report: &NativeTrainingReport) -> Result<()> {
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION
     ) {
         return Err(invalid("unsupported native training report version"));
@@ -94,6 +97,7 @@ fn validate_header(report: &NativeTrainingReport) -> Result<()> {
         (
             NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(phases),
         ) => phases.validate(CompilePhaseValidationContext {
@@ -114,13 +118,46 @@ fn validate_header(report: &NativeTrainingReport) -> Result<()> {
         _ => return Err(invalid("native training compile phases are absent")),
     }
     report.main.validate(report.format_version)?;
+    let effective_render_wall_time = if report.format_version >= NATIVE_TRAINING_REPORT_FORMAT_V25 {
+        let render_wall_time = std::iter::once(&report.main)
+            .chain(report.accumulation.iter())
+            .chain(report.partial_flush.iter())
+            .chain(report.zero_grad.iter())
+            .chain(report.evaluation.iter())
+            .try_fold(Duration::ZERO, |total, program| {
+                let render = program
+                    .preparation_timing()
+                    .ok_or_else(|| invalid("native preparation timing is absent"))?
+                    .render
+                    .to_duration()
+                    .map_err(|_| invalid("invalid native render duration"))?;
+                total
+                    .checked_add(render)
+                    .ok_or_else(|| invalid("native render duration overflows"))
+            })?;
+        let render_overlap = report
+            .prepare_parallel_render_overlap_wall_time
+            .ok_or_else(|| invalid("native render overlap timing is absent"))?
+            .to_duration()
+            .map_err(|_| invalid("invalid native render overlap duration"))?;
+        render_wall_time
+            .checked_sub(render_overlap)
+            .ok_or_else(|| invalid("native render overlap exceeds render time"))?
+    } else {
+        Duration::ZERO
+    };
     match (report.format_version, &report.prepare_finalization) {
         (1..=NATIVE_TRAINING_REPORT_FORMAT_V24, None) => {}
-        (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(finalization)) => finalization.validate(
+        (
+            NATIVE_TRAINING_REPORT_FORMAT_V25 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+            Some(finalization),
+        ) => finalization.validate(
+            report.format_version,
             report.prepare_wall_time,
             report
                 .prepare_runtime_overhead_wall_time
                 .ok_or_else(|| invalid("native preparation overhead is absent"))?,
+            BenchmarkDuration::from_duration(effective_render_wall_time),
             super::super::preparation_phase::PreparationProgramPresence {
                 accumulation: report.accumulation.is_some(),
                 partial_flush: report.partial_flush.is_some(),
@@ -178,6 +215,7 @@ fn validate_accumulation_inventory(report: &NativeTrainingReport) -> Result<()> 
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             None,
             None,
@@ -213,6 +251,7 @@ fn validate_accumulation_inventory(report: &NativeTrainingReport) -> Result<()> 
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(program),
             Some(traffic),
@@ -281,6 +320,7 @@ fn validate_main_replay_traffic(report: &NativeTrainingReport) -> Result<()> {
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(traffic),
         ) if traffic.borrowed_recurrent_input_bytes() == report.recurrent_logical_state_bytes
@@ -320,6 +360,7 @@ fn validate_materialized_egress(report: &NativeTrainingReport) -> Result<()> {
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION
                 if traffic.materialized_egress_count() != 0
                     && traffic.materialized_egress_bytes() != 0 => {}
@@ -338,6 +379,7 @@ fn validate_materialized_egress(report: &NativeTrainingReport) -> Result<()> {
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
                 return Err(invalid("native CPU egress evidence is absent"));
             }
@@ -379,6 +421,7 @@ fn validate_main_execution_count(report: &NativeTrainingReport) -> Result<()> {
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(executed),
         ) if executed <= report.main.rendered_entry_count => {}
@@ -461,6 +504,7 @@ fn validate_module_evidence(
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(overlaps),
         ) => {
@@ -482,6 +526,7 @@ fn validate_module_evidence(
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(overlaps),
             Some(translation_units),
@@ -543,6 +588,7 @@ fn validate_compiler_parallelism(
         | NATIVE_TRAINING_REPORT_FORMAT_V22
         | NATIVE_TRAINING_REPORT_FORMAT_V23
         | NATIVE_TRAINING_REPORT_FORMAT_V24
+        | NATIVE_TRAINING_REPORT_FORMAT_V25
         | NATIVE_TRAINING_REPORT_FORMAT_VERSION => {
             let compiler_overlap = report
                 .prepare_compiler_process_overlap_wall_time
@@ -617,6 +663,7 @@ fn validate_compiler_critical_tail(
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(timings),
             claimed_tail,
@@ -668,6 +715,7 @@ fn validate_render_capsules(report: &NativeTrainingReport) -> Result<()> {
             NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(_),
             Some(_),
@@ -728,6 +776,7 @@ fn validate_render_parallelism(report: &NativeTrainingReport) -> Result<u128> {
         (
             NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(overlap),
             Some(max_parallel),
@@ -811,6 +860,7 @@ fn validate_preparation_partition(
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(overhead),
             overlap,
@@ -835,6 +885,7 @@ fn validate_preparation_partition(
                     | NATIVE_TRAINING_REPORT_FORMAT_V22
                     | NATIVE_TRAINING_REPORT_FORMAT_V23
                     | NATIVE_TRAINING_REPORT_FORMAT_V24
+                    | NATIVE_TRAINING_REPORT_FORMAT_V25
                     | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                     Some(overlap),
                 ) => overlap
@@ -958,6 +1009,7 @@ fn validate_replay_phase_partition(report: &NativeTrainingReport) -> Result<()> 
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(executor),
             Some(overhead),
@@ -1001,6 +1053,7 @@ fn validate_dispatcher_phase_partition(report: &NativeTrainingReport) -> Result<
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(native_dispatcher),
             Some(executor_host),
@@ -1076,6 +1129,7 @@ fn validate_step_phases(report: &NativeTrainingReport) -> Result<()> {
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             Some(phases),
         ) => phases.validate(
@@ -1106,6 +1160,7 @@ fn validate_step_phases(report: &NativeTrainingReport) -> Result<()> {
             | NATIVE_TRAINING_REPORT_FORMAT_V22
             | NATIVE_TRAINING_REPORT_FORMAT_V23
             | NATIVE_TRAINING_REPORT_FORMAT_V24
+            | NATIVE_TRAINING_REPORT_FORMAT_V25
             | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             None,
         ) if report.accumulation.is_none() => {}

@@ -70,6 +70,8 @@ pub(super) struct NativeCpuPreparationFinalizationObservation {
 pub struct NativeCpuPreparationFinalizationPhases {
     instrumented_wall_time: Duration,
     bootstrap_wall_time: Duration,
+    render_batch_wall_time: Duration,
+    render_batch_orchestration_wall_time: Duration,
     main: NativeCpuProgramFinalizationPhases,
     accumulation: Option<NativeCpuProgramFinalizationPhases>,
     partial_flush: Option<NativeCpuProgramFinalizationPhases>,
@@ -85,6 +87,8 @@ impl NativeCpuPreparationFinalizationPhases {
         reports: &NativeCpuTrainingPrograms<NativeCpuProgramPreparationReport>,
         parallel_module_overlap_wall_time: Duration,
         parallel_render_overlap_wall_time: Duration,
+        render_batch_wall_time: Duration,
+        render_batch_orchestration_wall_time: Duration,
     ) -> Result<Self> {
         let NativeCpuTrainingPrograms {
             main,
@@ -121,6 +125,26 @@ impl NativeCpuPreparationFinalizationPhases {
             .checked_sub(parallel_module_overlap_wall_time)
             .and_then(|duration| duration.checked_sub(parallel_render_overlap_wall_time))
             .ok_or_else(|| training("compiled native CPU parallel overlap exceeds program time"))?;
+        let render_wall_time = std::iter::once(&reports.main)
+            .chain(reports.accumulation.iter())
+            .chain(reports.partial_flush.iter())
+            .chain(reports.zero_grad.iter())
+            .chain(reports.evaluation.iter())
+            .try_fold(Duration::ZERO, |total, report| {
+                total
+                    .checked_add(report.phases().render_wall_time())
+                    .ok_or_else(|| training("compiled native CPU render duration overflows"))
+            })?;
+        let effective_render_wall_time = render_wall_time
+            .checked_sub(parallel_render_overlap_wall_time)
+            .ok_or_else(|| training("compiled native CPU render overlap exceeds render time"))?;
+        if effective_render_wall_time.checked_add(render_batch_orchestration_wall_time)
+            != Some(render_batch_wall_time)
+        {
+            return Err(training(
+                "compiled native CPU render batch phases differ from batch time",
+            ));
+        }
         let measured_finalization_wall_time = std::iter::once(main)
             .chain(accumulation)
             .chain(partial_flush)
@@ -136,6 +160,7 @@ impl NativeCpuPreparationFinalizationPhases {
             observation.bootstrap_wall_time,
             measured_finalization_wall_time,
             observation.report_input_assembly_wall_time,
+            render_batch_orchestration_wall_time,
         ]
         .into_iter()
         .try_fold(Duration::ZERO, |total, duration| {
@@ -152,6 +177,8 @@ impl NativeCpuPreparationFinalizationPhases {
         Ok(Self {
             instrumented_wall_time: observation.instrumented_wall_time,
             bootstrap_wall_time: observation.bootstrap_wall_time,
+            render_batch_wall_time,
+            render_batch_orchestration_wall_time,
             main,
             accumulation,
             partial_flush,
@@ -172,6 +199,17 @@ impl NativeCpuPreparationFinalizationPhases {
     /// used by strict-native replay.
     pub const fn bootstrap_wall_time(&self) -> Duration {
         self.bootstrap_wall_time
+    }
+
+    /// Complete wall time of capsule admission, local rendering, and capsule
+    /// publication for the ordered native-program batch.
+    pub const fn render_batch_wall_time(&self) -> Duration {
+        self.render_batch_wall_time
+    }
+
+    /// Render-batch time outside the exact union of local renderer intervals.
+    pub const fn render_batch_orchestration_wall_time(&self) -> Duration {
+        self.render_batch_orchestration_wall_time
     }
 
     /// Finalization intervals for the optimizer-commit program.

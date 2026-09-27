@@ -483,6 +483,8 @@ pub(crate) struct NativeScheduleCompilationBatch {
     pub(crate) render_capsule_miss_count: usize,
     pub(crate) local_render_job_count: usize,
     pub(crate) parallel_render_overlap_wall_time: Duration,
+    pub(crate) render_batch_wall_time: Duration,
+    pub(crate) render_batch_orchestration_wall_time: Duration,
     pub(crate) max_parallel_render_job_count: usize,
     pub(crate) parallel_work_overlap_wall_time: Duration,
     pub(crate) compiler_process_overlap_wall_time: Duration,
@@ -524,6 +526,8 @@ struct NativeScheduleRenderBatch {
     capsule_miss_count: usize,
     local_render_job_count: usize,
     parallel_overlap_wall_time: Duration,
+    wall_time: Duration,
+    orchestration_wall_time: Duration,
     max_parallel_job_count: usize,
     capsule_diagnostics: Vec<NativeRenderCapsuleDiagnostic>,
 }
@@ -587,6 +591,23 @@ fn overlapping_wall_time(
     ))
 }
 
+fn render_batch_orchestration_wall_time(
+    batch_wall_time: Duration,
+    local_render_total_wall_time: Duration,
+    parallel_overlap_wall_time: Duration,
+) -> Result<Duration, JitBackendError> {
+    let effective_render_wall_time = local_render_total_wall_time
+        .checked_sub(parallel_overlap_wall_time)
+        .ok_or_else(|| {
+            JitBackendError::Native("native schedule render overlap exceeds duration".into())
+        })?;
+    batch_wall_time
+        .checked_sub(effective_render_wall_time)
+        .ok_or_else(|| {
+            JitBackendError::Native("native schedule render exceeds batch duration".into())
+        })
+}
+
 fn render_schedule_module_job(
     backend: &CpuJitBackend,
     job: NativeScheduleRenderJob<'_>,
@@ -618,6 +639,7 @@ fn render_schedule_modules(
         Vec<NativeStoreGroup>,
     )],
 ) -> Result<NativeScheduleRenderBatch, JitBackendError> {
+    let batch_started = Instant::now();
     let recipes = programs
         .iter()
         .enumerate()
@@ -735,6 +757,16 @@ fn render_schedule_modules(
         .collect::<Vec<_>>();
     let (parallel_overlap_wall_time, max_parallel_job_count) =
         overlapping_wall_time(&intervals, "native schedule render")?;
+    let local_render_total_wall_time =
+        intervals
+            .iter()
+            .try_fold(Duration::ZERO, |total, (start, end)| {
+                total
+                    .checked_add(end.duration_since(*start))
+                    .ok_or_else(|| {
+                        JitBackendError::Native("native schedule render duration overflow".into())
+                    })
+            })?;
     let rendered_locally = results
         .iter()
         .map(|result| result.rendered_locally)
@@ -751,12 +783,20 @@ fn render_schedule_modules(
             };
         }
     }
+    let wall_time = batch_started.elapsed();
+    let orchestration_wall_time = render_batch_orchestration_wall_time(
+        wall_time,
+        local_render_total_wall_time,
+        parallel_overlap_wall_time,
+    )?;
     Ok(NativeScheduleRenderBatch {
         rendered,
         capsule_hit_count,
         capsule_miss_count,
         local_render_job_count,
         parallel_overlap_wall_time,
+        wall_time,
+        orchestration_wall_time,
         max_parallel_job_count,
         capsule_diagnostics,
     })
@@ -1772,6 +1812,8 @@ impl CpuJitBackend {
             capsule_miss_count: render_capsule_miss_count,
             local_render_job_count,
             parallel_overlap_wall_time: parallel_render_overlap_wall_time,
+            wall_time: render_batch_wall_time,
+            orchestration_wall_time: render_batch_orchestration_wall_time,
             max_parallel_job_count: max_parallel_render_job_count,
             capsule_diagnostics: render_capsule_diagnostics,
         } = render_schedule_modules(self, &programs)?;
@@ -1974,6 +2016,8 @@ impl CpuJitBackend {
             render_capsule_miss_count,
             local_render_job_count,
             parallel_render_overlap_wall_time,
+            render_batch_wall_time,
+            render_batch_orchestration_wall_time,
             max_parallel_render_job_count,
             parallel_work_overlap_wall_time,
             compiler_process_overlap_wall_time,
@@ -2623,6 +2667,100 @@ mod tests {
     use super::*;
     use crate::{DType, Scalar, Shape};
 
+    fn assert_render_batch_partition(batch: &NativeScheduleRenderBatch) {
+        let rendered = batch
+            .rendered
+            .iter()
+            .try_fold(Duration::ZERO, |total, module| {
+                total.checked_add(module.render_wall_time)
+            })
+            .unwrap()
+            .checked_sub(batch.parallel_overlap_wall_time)
+            .unwrap();
+        assert_eq!(
+            rendered.checked_add(batch.orchestration_wall_time),
+            Some(batch.wall_time)
+        );
+    }
+
+    #[test]
+    fn render_batch_orchestration_uses_the_exact_local_render_union() {
+        let origin = Instant::now();
+        let intervals = [
+            (
+                origin,
+                origin.checked_add(Duration::from_nanos(10)).unwrap(),
+            ),
+            (
+                origin.checked_add(Duration::from_nanos(5)).unwrap(),
+                origin.checked_add(Duration::from_nanos(15)).unwrap(),
+            ),
+            (
+                origin.checked_add(Duration::from_nanos(6)).unwrap(),
+                origin.checked_add(Duration::from_nanos(8)).unwrap(),
+            ),
+            (
+                origin.checked_add(Duration::from_nanos(20)).unwrap(),
+                origin.checked_add(Duration::from_nanos(25)).unwrap(),
+            ),
+        ];
+        let (overlap, max_parallel) =
+            overlapping_wall_time(&intervals, "render union fixture").unwrap();
+        assert_eq!(overlap, Duration::from_nanos(7));
+        assert_eq!(max_parallel, 3);
+        assert_eq!(
+            render_batch_orchestration_wall_time(
+                Duration::from_nanos(30),
+                Duration::from_nanos(27),
+                overlap,
+            )
+            .unwrap(),
+            Duration::from_nanos(10),
+            "the local-render union is twenty nanoseconds"
+        );
+    }
+
+    #[test]
+    fn render_batch_orchestration_checked_partition_is_exact() {
+        assert_eq!(
+            render_batch_orchestration_wall_time(
+                Duration::from_nanos(100),
+                Duration::from_nanos(110),
+                Duration::from_nanos(20),
+            )
+            .unwrap(),
+            Duration::from_nanos(10)
+        );
+        assert_eq!(
+            render_batch_orchestration_wall_time(
+                Duration::from_nanos(42),
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .unwrap(),
+            Duration::from_nanos(42),
+            "an all-hit or empty batch has no local renderer interval"
+        );
+        assert!(
+            render_batch_orchestration_wall_time(
+                Duration::from_nanos(10),
+                Duration::from_nanos(5),
+                Duration::from_nanos(6),
+            )
+            .is_err(),
+            "render overlap cannot exceed summed local-render work"
+        );
+        assert!(
+            render_batch_orchestration_wall_time(
+                Duration::from_nanos(10),
+                Duration::from_nanos(11),
+                Duration::ZERO,
+            )
+            .is_err(),
+            "effective local rendering cannot exceed the containing batch"
+        );
+    }
+
     fn rendered_entry(cache_key: &str, logical_indices: Vec<usize>) -> RenderedScheduleEntry {
         RenderedScheduleEntry {
             native_layouts: logical_indices
@@ -3244,6 +3382,7 @@ mod tests {
         };
 
         let cold = render_schedule_modules(&backend, &programs()).unwrap();
+        assert_render_batch_partition(&cold);
         assert_eq!(cold.rendered.len(), 2);
         assert!(cold.rendered.iter().any(|module| {
             module.entries.iter().any(|entry| {
@@ -3266,6 +3405,7 @@ mod tests {
 
         crate::cpu_jit::reset_native_output_initialization_derivation_count();
         let warm = render_schedule_modules(&backend, &programs()).unwrap();
+        assert_render_batch_partition(&warm);
         assert_eq!(
             crate::cpu_jit::native_output_initialization_derivation_count(),
             1 + schedule.items.len(),
@@ -3280,6 +3420,7 @@ mod tests {
         }));
         assert_eq!(warm.max_parallel_job_count, 0);
         assert_eq!(warm.parallel_overlap_wall_time, Duration::ZERO);
+        assert_eq!(warm.orchestration_wall_time, warm.wall_time);
         assert!(
             warm.rendered
                 .iter()
@@ -3342,6 +3483,7 @@ mod tests {
 
         render_capsule::remove_capsule(&recipes[1]);
         let mixed = render_schedule_modules(&backend, &programs()).unwrap();
+        assert_render_batch_partition(&mixed);
         assert_eq!(mixed.capsule_hit_count, 1);
         assert_eq!(mixed.capsule_miss_count, 1);
         assert_eq!(mixed.local_render_job_count, 1);

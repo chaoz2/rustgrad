@@ -1325,6 +1325,10 @@ fn collect_scale_warm_preparation(
             .outer_remainder_wall_time()
             .to_duration()?,
         prepare_finalization.bootstrap_wall_time().to_duration()?,
+        prepare_finalization
+            .render_batch_orchestration_wall_time()
+            .ok_or(RustGradError::InvalidIndex)?
+            .to_duration()?,
         measured_finalization_wall_time,
         prepare_finalization
             .report_input_assembly_wall_time()
@@ -2166,7 +2170,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let gradient_evidence = collect_scale_gradient_evidence()?;
 
     let objective = json!({
-        "schema_version": 7,
+        "schema_version": 8,
         "git_sha": &paths.git_sha,
         "workload": {
             "batch": BATCH,

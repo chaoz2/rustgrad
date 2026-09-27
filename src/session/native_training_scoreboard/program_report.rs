@@ -17,7 +17,7 @@ use super::{
     NATIVE_TRAINING_REPORT_FORMAT_V19, NATIVE_TRAINING_REPORT_FORMAT_V20,
     NATIVE_TRAINING_REPORT_FORMAT_V21, NATIVE_TRAINING_REPORT_FORMAT_V22,
     NATIVE_TRAINING_REPORT_FORMAT_V23, NATIVE_TRAINING_REPORT_FORMAT_V24,
-    NATIVE_TRAINING_REPORT_FORMAT_VERSION, count, invalid,
+    NATIVE_TRAINING_REPORT_FORMAT_V25, NATIVE_TRAINING_REPORT_FORMAT_VERSION, count, invalid,
 };
 use crate::Result;
 use serde::{Deserialize, Serialize};
@@ -185,7 +185,9 @@ impl NativeTrainingProgramReport {
         match (format_version, self.recurrent_state_count) {
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V23, None) => {}
             (
-                NATIVE_TRAINING_REPORT_FORMAT_V24 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                NATIVE_TRAINING_REPORT_FORMAT_V24
+                | NATIVE_TRAINING_REPORT_FORMAT_V25
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(count),
             ) if count != 0 => {}
             (1..=NATIVE_TRAINING_REPORT_FORMAT_V23, Some(_)) => {
@@ -193,7 +195,12 @@ impl NativeTrainingProgramReport {
                     "legacy native program has recurrent-state inventory",
                 ));
             }
-            (NATIVE_TRAINING_REPORT_FORMAT_V24 | NATIVE_TRAINING_REPORT_FORMAT_VERSION, None) => {}
+            (
+                NATIVE_TRAINING_REPORT_FORMAT_V24
+                | NATIVE_TRAINING_REPORT_FORMAT_V25
+                | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
+                None,
+            ) => {}
             _ => return Err(invalid("native program recurrent-state inventory differs")),
         }
         if self
@@ -390,6 +397,7 @@ impl NativeTrainingProgramReport {
                 | NATIVE_TRAINING_REPORT_FORMAT_V22
                 | NATIVE_TRAINING_REPORT_FORMAT_V23
                 | NATIVE_TRAINING_REPORT_FORMAT_V24
+                | NATIVE_TRAINING_REPORT_FORMAT_V25
                 | NATIVE_TRAINING_REPORT_FORMAT_VERSION,
                 Some(timing),
             ) => timing.validate(self, format_version)?,
