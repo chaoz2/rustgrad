@@ -97,8 +97,8 @@ pub use self::momentum_checkpoint::CompiledMomentumSgdCheckpoint;
 pub use self::momentum_plan::CompiledMomentumSgdPlan;
 pub use self::native_cpu_adamw_runtime::NativeCpuCompiledAdamW;
 use self::native_cpu_adamw_runtime::{
-    NativeCpuEvaluationPreparation, PreparedNativeCpuEvaluation, PreparedNativeCpuProgram,
-    PreparedNativeEvaluationParameterInput,
+    NativeCpuEvaluationPreparation, PreparedNativeCpuAuxiliaryProgram, PreparedNativeCpuEvaluation,
+    PreparedNativeCpuProgram, PreparedNativeEvaluationParameterInput,
 };
 use self::native_cpu_evidence::native_preparation_wall_time;
 pub use self::native_cpu_evidence::*;
@@ -178,8 +178,8 @@ use super::target::{
 use crate::effects::runtime::RecurrentTransactionError;
 use crate::engine::mixed_capture::{
     AuthenticatedRecurrentFrontier, NativeReplayContext, PreparedRecurrentCursorProjection,
-    PreparedRecurrentNativeReplay, ProjectedRecurrentCursor, RecurrentCursorProjectionError,
-    RecurrentNativePreparation,
+    PreparedRecurrentNativeReplay, PreparedRecurrentOutputProjectionHandle,
+    ProjectedRecurrentCursor, RecurrentCursorProjectionError, RecurrentNativePreparation,
 };
 use crate::engine::{NativeReplayTraffic, PlannedNativeItems};
 use crate::nn::TrainingDropoutProvider;

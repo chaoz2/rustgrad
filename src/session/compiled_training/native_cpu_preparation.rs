@@ -18,7 +18,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             + usize::from(inner.zero_grad.is_some())
             + usize::from(inner.evaluation.is_some());
         let mut drafts = NativeCpuTrainingProgramDrafts::new();
-        let (mut main_preparation, main_residual) = inner
+        let (mut main_preparation, main_commit_only_projection, main_residual) = inner
             .inner
             .preflight_native(vectorized, external_learning_rate)?;
         {
@@ -35,7 +35,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         main_preparation.release_input_witnesses();
         let accumulation_preparation = match inner.inner.accumulation.as_ref() {
             Some(transition) => {
-                let (mut preparation, residual) = inner
+                let (mut preparation, commit_only_projection, residual) = inner
                     .inner
                     .preflight_native_accumulation(transition, vectorized)?;
                 {
@@ -50,7 +50,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     drafts.insert(NativeCpuTrainingProgramRole::Accumulation, draft)?;
                 }
                 preparation.release_input_witnesses();
-                Some((preparation, residual))
+                Some((preparation, commit_only_projection, residual))
             }
             None => None,
         };
@@ -122,7 +122,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             main_preparation.pure(),
             drafts.take(NativeCpuTrainingProgramRole::Main)?,
         )?;
-        if let Some((preparation, _)) = &accumulation_preparation {
+        if let Some((preparation, _, _)) = &accumulation_preparation {
             programs.push(
                 NativeCpuTrainingProgramRole::Accumulation,
                 preparation.pure(),
@@ -166,19 +166,28 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             zero_grad: zero_grad_plan,
             evaluation: evaluation_plan,
         } = NativeCpuTrainingPrograms::from_ordered(roles.clone(), plans)?;
-        let main = inner
-            .inner
-            .finish_native(main_preparation, main_plan, main_residual)?;
+        let main = inner.inner.finish_native(
+            main_preparation,
+            main_commit_only_projection,
+            main_plan,
+            main_residual,
+        )?;
         let accumulation = match (
             inner.inner.accumulation.as_ref(),
             accumulation_preparation,
             accumulation_plan,
         ) {
-            (Some(transition), Some((preparation, residual)), Some(plan)) => Some(
-                inner
-                    .inner
-                    .finish_native_accumulation(transition, preparation, plan, residual)?,
-            ),
+            (
+                Some(transition),
+                Some((preparation, commit_only_projection, residual)),
+                Some(plan),
+            ) => Some(inner.inner.finish_native_accumulation(
+                transition,
+                preparation,
+                commit_only_projection,
+                plan,
+                residual,
+            )?),
             (None, None, None) => None,
             _ => {
                 return Err(training(
@@ -254,10 +263,17 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
         let PreparedNativeCpuProgram {
             report: main_report,
             replay: main_replay,
+            commit_only_projection: main_commit_only_projection,
         } = main;
-        let (accumulation_report, accumulation_replay) = accumulation
-            .map(|prepared| (prepared.report, prepared.replay))
-            .unzip();
+        let (accumulation_report, accumulation_replay, accumulation_commit_only_projection) =
+            match accumulation {
+                Some(prepared) => (
+                    Some(prepared.report),
+                    Some(prepared.replay),
+                    Some(prepared.commit_only_projection),
+                ),
+                None => (None, None, None),
+            };
         let (partial_flush_report, partial_flush_replay) = partial_flush
             .map(|prepared| (prepared.report, prepared.replay))
             .unzip();
@@ -281,7 +297,9 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
             inner,
             executor,
             main_replay,
+            main_commit_only_projection,
             accumulation_replay,
+            accumulation_commit_only_projection,
             partial_flush_replay,
             zero_grad_replay,
             evaluation_replay: evaluation,

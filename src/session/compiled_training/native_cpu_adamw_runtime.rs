@@ -5,6 +5,12 @@ use super::*;
 pub(super) struct PreparedNativeCpuProgram {
     pub(super) report: NativeCpuProgramPreparationReport,
     pub(super) replay: PreparedRecurrentNativeReplay,
+    pub(super) commit_only_projection: PreparedRecurrentOutputProjectionHandle,
+}
+
+pub(super) struct PreparedNativeCpuAuxiliaryProgram {
+    pub(super) report: NativeCpuProgramPreparationReport,
+    pub(super) replay: PreparedRecurrentNativeReplay,
 }
 
 pub(super) struct PreparedNativeCpuEvaluation {
@@ -135,7 +141,9 @@ pub struct NativeCpuCompiledAdamW<'a> {
     pub(super) inner: CpuCompiledAdamW,
     pub(super) executor: &'a CapturedReplayExecutor,
     pub(super) main_replay: PreparedRecurrentNativeReplay,
+    pub(super) main_commit_only_projection: PreparedRecurrentOutputProjectionHandle,
     pub(super) accumulation_replay: Option<PreparedRecurrentNativeReplay>,
+    pub(super) accumulation_commit_only_projection: Option<PreparedRecurrentOutputProjectionHandle>,
     pub(super) partial_flush_replay: Option<PreparedRecurrentNativeReplay>,
     pub(super) zero_grad_replay: Option<PreparedRecurrentNativeReplay>,
     pub(super) evaluation_replay: Option<PreparedNativeCpuEvaluation>,
@@ -221,6 +229,7 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                 request,
                 true,
                 NativeReplayContext::new(self.executor, &mut self.main_replay),
+                &self.main_commit_only_projection,
             )?
         } else {
             let transition = self
@@ -239,6 +248,11 @@ impl<'a> NativeCpuCompiledAdamW<'a> {
                     &transition,
                     request,
                     NativeReplayContext::new(self.executor, replay),
+                    self.accumulation_commit_only_projection
+                        .as_ref()
+                        .ok_or_else(|| {
+                            training("compiled native CPU accumulation output projection is absent")
+                        })?,
                 )?
         };
         report.successful_invocation = successful_invocation;

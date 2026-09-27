@@ -10,6 +10,7 @@ pub struct NativeCpuCompiledMomentumSgd<'a> {
     pub(super) inner: CpuCompiledMomentumSgd,
     executor: &'a CapturedReplayExecutor,
     main_replay: PreparedRecurrentNativeReplay,
+    main_commit_only_projection: PreparedRecurrentOutputProjectionHandle,
     preparation: NativeCpuCompiledTrainingPreparationReport,
     successful_steps: u64,
 }
@@ -20,7 +21,7 @@ impl<'a> NativeCpuCompiledMomentumSgd<'a> {
         executor: &'a CapturedReplayExecutor,
         vectorized: bool,
     ) -> Result<Self> {
-        let (mut main_preparation, main_residual) =
+        let (mut main_preparation, main_commit_only_projection, main_residual) =
             inner.inner.preflight_native(vectorized, true)?;
         let main_draft = {
             let (pure, inputs) = main_preparation.pure_and_inputs();
@@ -58,9 +59,14 @@ impl<'a> NativeCpuCompiledMomentumSgd<'a> {
         let PreparedNativeCpuProgram {
             report: main_report,
             replay: main_replay,
-        } = inner
-            .inner
-            .finish_native(main_preparation, main_plan, main_residual)?;
+            commit_only_projection,
+        } = inner.inner.finish_native(
+            main_preparation,
+            main_commit_only_projection,
+            main_plan,
+            main_residual,
+        )?;
+        let main_commit_only_projection = commit_only_projection;
         let (recurrent_state_count, recurrent_state_bytes) = checked_recurrent_state_extent(
             inner
                 .inner
@@ -86,6 +92,7 @@ impl<'a> NativeCpuCompiledMomentumSgd<'a> {
             inner,
             executor,
             main_replay,
+            main_commit_only_projection,
             preparation,
             successful_steps: 0,
         })
@@ -144,6 +151,7 @@ impl<'a> NativeCpuCompiledMomentumSgd<'a> {
             request,
             true,
             NativeReplayContext::new(self.executor, &mut self.main_replay),
+            &self.main_commit_only_projection,
         )?;
         report.successful_invocation = successful_invocation;
         self.successful_steps = successful_invocation;

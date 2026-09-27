@@ -66,6 +66,27 @@ pub(super) struct CompiledTrainingPhaseOutputs {
 }
 
 impl CompiledTrainingPhaseOutputSchema {
+    pub(super) fn selected_requested(
+        &self,
+        requested: &[u64],
+        selection: CompiledStepOutputSelection,
+        include_observations: bool,
+    ) -> Result<Vec<u64>> {
+        let expected = self.selected_len(true, include_observations)?;
+        if requested.len() != expected {
+            return Err(training(
+                "compiled requested output layout does not match its authenticated capture",
+            ));
+        }
+        if selection.includes_named_outputs() {
+            return Ok(requested.to_vec());
+        }
+        let mut selected = Vec::with_capacity(self.selected_len(false, include_observations)?);
+        selected.push(requested[0]);
+        selected.extend(requested.iter().skip(1 + self.named_outputs.len()).copied());
+        Ok(selected)
+    }
+
     pub(super) fn selected_len(
         &self,
         include_named_outputs: bool,
@@ -467,4 +488,69 @@ pub(super) fn validate_staged_observations(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_schema_seals_role_specific_ordered_projections() {
+        let schema = CompiledTrainingPhaseOutputSchema {
+            loss: CompiledTrainingLossOutput::ScalarF32,
+            named_outputs: vec!["a".into(), "z".into()],
+            observations: CompiledTrainingObservationSchema {
+                entries: vec![
+                    CompiledTrainingObservationSpec {
+                        key: CompiledTrainingObservationKey(1),
+                        constraint: CompiledTrainingObservationConstraint::ScalarF32,
+                        descriptor_error: "first descriptor",
+                        invalid_value_error: "first value",
+                    },
+                    CompiledTrainingObservationSpec {
+                        key: CompiledTrainingObservationKey(2),
+                        constraint: CompiledTrainingObservationConstraint::ScalarU64Positive,
+                        descriptor_error: "second descriptor",
+                        invalid_value_error: "second value",
+                    },
+                ],
+            },
+        };
+        let main = [10, 20, 30, 40, 50];
+        assert_eq!(
+            schema
+                .selected_requested(&main, CompiledStepOutputSelection::All, true)
+                .unwrap(),
+            main
+        );
+        assert_eq!(
+            schema
+                .selected_requested(&main, CompiledStepOutputSelection::CommitOnly, true)
+                .unwrap(),
+            [10, 40, 50]
+        );
+
+        let accumulation = [10, 20, 30];
+        assert_eq!(
+            schema
+                .selected_requested(
+                    &accumulation,
+                    CompiledStepOutputSelection::CommitOnly,
+                    false,
+                )
+                .unwrap(),
+            [10]
+        );
+
+        let no_named = CompiledTrainingPhaseOutputSchema {
+            named_outputs: Vec::new(),
+            ..schema
+        };
+        assert_eq!(
+            no_named
+                .selected_requested(&[10, 40, 50], CompiledStepOutputSelection::CommitOnly, true,)
+                .unwrap(),
+            [10, 40, 50]
+        );
+    }
 }
