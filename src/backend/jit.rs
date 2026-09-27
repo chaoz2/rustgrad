@@ -2188,6 +2188,10 @@ impl CpuJitBackend {
                 if entry.logical_indices.len() == 1 {
                     let logical = entry.logical_indices[0];
                     let item = &items[logical];
+                    // Local rendering derives this policy from the exact item,
+                    // while a capsule hit authenticates it against that
+                    // call's exact-owned recipe witness before reaching here.
+                    let output_initialization = entry.output_initialization;
                     prepared.push(PreparedNativeDispatch::Item {
                         logical_index: logical,
                         item: PreparedScheduleItem {
@@ -2198,9 +2202,7 @@ impl CpuJitBackend {
                             vector: entry.vector,
                             schedule_cache_key: item.cache_key,
                             native_layout: layouts[logical].clone(),
-                            output_initialization: crate::cpu_jit::native_output_initialization(
-                                &item.kernel,
-                            ),
+                            output_initialization,
                         },
                     });
                     continue;
@@ -3262,7 +3264,13 @@ mod tests {
         }));
         assert!(cold.max_parallel_job_count > 0);
 
+        crate::cpu_jit::reset_native_output_initialization_derivation_count();
         let warm = render_schedule_modules(&backend, &programs()).unwrap();
+        assert_eq!(
+            crate::cpu_jit::native_output_initialization_derivation_count(),
+            1 + schedule.items.len(),
+            "warm capsule preparation derives each recipe policy once and reuses it during authentication"
+        );
         assert_eq!(warm.capsule_hit_count, 2);
         assert_eq!(warm.capsule_miss_count, 0);
         assert_eq!(warm.local_render_job_count, 0);
@@ -3284,6 +3292,17 @@ mod tests {
                 .contiguous_prefix_entry_count
                     == cold.entries.len()
             )
+        );
+        assert!(
+            warm.rendered
+                .iter()
+                .zip(&cold.rendered)
+                .all(|(warm, cold)| {
+                    warm.entries
+                        .iter()
+                        .map(|entry| entry.output_initialization)
+                        .eq(cold.entries.iter().map(|entry| entry.output_initialization))
+                })
         );
 
         for mutation in [
@@ -3308,6 +3327,17 @@ mod tests {
             }));
             assert_eq!(repaired.max_parallel_job_count, 1);
             assert!(repaired.rendered[1].render_wall_time.is_zero());
+            assert!(
+                repaired.rendered[0]
+                    .entries
+                    .iter()
+                    .map(|entry| entry.output_initialization)
+                    .eq(cold.rendered[0]
+                        .entries
+                        .iter()
+                        .map(|entry| entry.output_initialization)),
+                "fallback rendering must preserve the independently derived cold policy"
+            );
         }
 
         render_capsule::remove_capsule(&recipes[1]);

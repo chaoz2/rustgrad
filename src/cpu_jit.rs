@@ -2010,6 +2010,8 @@ fn native_scalar_operation_can_signal(operation: &Operation, output: Option<DTyp
 /// dense Store shape used by the native renderers. This never inspects emitted
 /// C and therefore cannot be fooled by spelling or formatting changes.
 pub(crate) fn native_output_initialization(root: &UOp) -> NativeOutputInitialization {
+    #[cfg(test)]
+    NATIVE_OUTPUT_INITIALIZATION_DERIVATIONS.with(|count| count.set(count.get().saturating_add(1)));
     use NativeOutputInitialization::{FullyOverwritten, NeedsZero};
 
     match root.operation() {
@@ -2031,6 +2033,22 @@ pub(crate) fn native_output_initialization(root: &UOp) -> NativeOutputInitializa
         Operation::Sink if dense_assignment_fully_overwrites(root) => FullyOverwritten,
         _ => NeedsZero,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static NATIVE_OUTPUT_INITIALIZATION_DERIVATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_native_output_initialization_derivation_count() {
+    NATIVE_OUTPUT_INITIALIZATION_DERIVATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn native_output_initialization_derivation_count() -> usize {
+    NATIVE_OUTPUT_INITIALIZATION_DERIVATIONS.with(std::cell::Cell::get)
 }
 
 fn dense_assignment_fully_overwrites(root: &UOp) -> bool {
