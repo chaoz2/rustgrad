@@ -1327,12 +1327,19 @@ schema reuses that immutable descriptor/mode inventory without reconstructing a
 detached successor frontier on canonical full-frontier replay. Each call still
 checks the cursor descriptor and next-version overflow, binds fresh runtime
 slots, leases, generations, and inactive banks, and validates successor values
-before atomic publication. Output projections retain logical requested order
-separately from native liveness and successor-clone metadata. Main,
-accumulation, partial-flush, and `zero_grad` hot replay repeats only
-call-dependent cursor, input, active-bank, quantized-index, successor, and
-transaction admission; partial frontiers retain the generic validating
-fallback. Generic artifact replay retains full per-call artifact validation.
+before atomic publication. Each prepared recurrent output mode also seals one
+private workspace-owned native egress plan. That plan authenticates the exact
+workspace and immutable selected-output owner while retaining physical source
+slots, requested-alias order, and logical requested count/byte accounting.
+Ordered output extraction remains a separate projection: it preserves logical
+request order and chooses `Take` or `CloneSuccessor` without changing
+call-local buffers or bindings. Main, accumulation, partial-flush, and
+`zero_grad` hot replay repeats only call-dependent cursor, input, active-bank,
+quantized-index, successor, and transaction admission; partial frontiers retain
+the generic validating fallback. Generic replay retains its iterator-based
+egress selection and full per-call artifact validation. This private seal adds
+no public API, wire, artifact, cache, or checkpoint format or identity, and no
+speedup is claimed.
 
 ##### Publication, evidence, and portability
 
