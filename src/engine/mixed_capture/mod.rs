@@ -549,9 +549,7 @@ impl<'a> NativeReplayContext<'a> {
                     let bank_count = banks.len();
                     let mut active = Vec::with_capacity(bank_count);
                     let mut inactive = Vec::with_capacity(bank_count);
-                    for (ordinal, (bank, binding)) in
-                        banks.iter_mut().zip(bank_layout.banks.iter()).enumerate()
-                    {
+                    for (ordinal, bank) in banks.iter_mut().enumerate() {
                         let mode = bank_layout.validate_bank(ordinal, bank)?;
                         if matches!(mode, crate::effects::runtime::RecurrentBankMode::Retain) {
                             active.push(bank.successor());
