@@ -513,12 +513,7 @@ impl CpuCompiledTrainingProgram {
                 &prepared.provided,
                 injected_failure,
                 |outputs, successors| {
-                    validate_staged_transition(
-                        outputs,
-                        successors.iter().copied(),
-                        non_finite_policy,
-                        false,
-                    )?;
+                    validate_staged_transition(outputs, successors, non_finite_policy, false)?;
                     decoded = Some(decode(outputs)?);
                     Ok(())
                 },

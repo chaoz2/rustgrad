@@ -1332,7 +1332,12 @@ successor versions one scalar at a time, publishes runtime state first, and
 consumes the transaction to advance the same cursor only after success, without
 materializing a version vector. Each call still binds fresh runtime slots,
 leases, generations, and inactive banks and validates successor values before
-atomic publication. Each prepared recurrent output mode also seals one
+atomic publication. An engine-private ordered borrowed successor view then
+follows the sealed bank layout directly, avoiding a per-call
+`Vec<&TensorData>` adapter and a second immutable layout scan. The view remains
+call-scoped: live owner, lease, generation, cursor/version, post-stage
+descriptor, finite-value, rollback, and retry checks are unchanged. Each
+prepared recurrent output mode also seals one
 private workspace-owned native egress plan. That plan authenticates the exact
 workspace and immutable selected-output owner while retaining physical source
 slots, requested-alias order, and logical requested count/byte accounting.
@@ -1467,6 +1472,24 @@ verified; identical content across repeated roles is valid. Candidate medians
 were lower in both phases in both runs, but tail and component observations
 remain noisy. The different runner models make pooling invalid, and these
 serial A-B-B-A observations support no broad or causal speedup claim.
+
+Two later comparisons measure the already-merged successor-version-removal
+change from `991022e4c9d16fcd56f33a591c7946e109dff228` to
+`58b3f298294d9eb662b9f03ae77c73dc2267b0c8`, not the borrowed-successor-view
+work documented above. Both reported `status="comparable"` with no rejection
+reasons, and all comparator-retained semantic facts matched. For each run, all
+12 declared raw-file hashes and lengths across four trials were verified and
+the timing aggregates were independently recomputed.
+
+| Run and raw artifact | Runner | Accumulation median of trial medians / median of per-trial p95s | Optimizer-commit median of trial medians / median of per-trial p95s |
+|---|---|---:|---:|
+| [36314563268](https://github.com/chaoz2/rustgrad/actions/runs/36314563268), `10930676780` | EPYC 7763 | 63.233 → 62.291 / 80.264 → 77.209 µs | 89.712 → 88.517 / 112.349 → 105.742 µs |
+| [36315341418](https://github.com/chaoz2/rustgrad/actions/runs/36315341418), `10930388541`; comparison `da2e9827a3fb3aeba7439a29b50b0b5c33dfaee05ae5e471ffe65ee96efce2fb` | Xeon 6973P-C | 65.436 → 63.295 / 78.204 → 78.106 µs | 88.999 → 87.484 / 99.787 → 101.620 µs |
+
+Candidate medians were lower in both phases in both runs, while tails were
+mixed and the second run's optimizer-commit tail was worse. The different
+runner hardware makes pooling invalid; these observations remain non-causal
+and support no broad speedup claim.
 
 Commit-only replay omits caller-named outputs while retaining loss and enabled
 validation/report scalars. Prefix reuse retains four fail-closed contracts:

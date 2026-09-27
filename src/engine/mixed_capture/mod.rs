@@ -434,6 +434,55 @@ pub(crate) struct NativeReplayContext<'a> {
     prepared: &'a mut PreparedRecurrentNativeReplay,
 }
 
+/// Ordered, call-scoped successor borrows for one admitted recurrent bank
+/// transaction. The backing banks and their tensors remain runtime-owned and
+/// cannot escape the transition validator callback.
+#[derive(Clone, Copy)]
+pub(crate) struct RecurrentSuccessorView<'banks, 'storage> {
+    banks: &'banks [crate::host_buffer::HostBufferBank<'storage>],
+}
+
+impl<'banks, 'storage> RecurrentSuccessorView<'banks, 'storage> {
+    fn new(banks: &'banks [crate::host_buffer::HostBufferBank<'storage>]) -> Self {
+        Self { banks }
+    }
+}
+
+pub(crate) struct RecurrentSuccessorIter<'banks, 'storage> {
+    banks: std::slice::Iter<'banks, crate::host_buffer::HostBufferBank<'storage>>,
+}
+
+impl<'banks, 'storage> Iterator for RecurrentSuccessorIter<'banks, 'storage> {
+    type Item = &'banks crate::TensorData;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.banks.next().map(|bank| bank.successor())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.banks.size_hint()
+    }
+}
+
+impl ExactSizeIterator for RecurrentSuccessorIter<'_, '_> {
+    fn len(&self) -> usize {
+        self.banks.len()
+    }
+}
+
+impl std::iter::FusedIterator for RecurrentSuccessorIter<'_, '_> {}
+
+impl<'banks, 'storage> IntoIterator for RecurrentSuccessorView<'banks, 'storage> {
+    type Item = &'banks crate::TensorData;
+    type IntoIter = RecurrentSuccessorIter<'banks, 'storage>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        RecurrentSuccessorIter {
+            banks: self.banks.iter(),
+        }
+    }
+}
+
 impl<'a> NativeReplayContext<'a> {
     pub(crate) const fn new(
         executor: &'a super::captured_replay::CapturedReplayExecutor,
@@ -451,7 +500,10 @@ impl<'a> NativeReplayContext<'a> {
         validate_transition: F,
     ) -> Result<NativeMixedReplayResult, ReplayError>
     where
-        F: FnOnce(&[crate::TensorData], &[&crate::TensorData]) -> Result<(), String>,
+        F: for<'banks, 'storage> FnOnce(
+            &[crate::TensorData],
+            RecurrentSuccessorView<'banks, 'storage>,
+        ) -> Result<(), String>,
     {
         self.replay_recurrent_selected_checked_impl(
             runtime,
@@ -473,7 +525,10 @@ impl<'a> NativeReplayContext<'a> {
         validate_transition: F,
     ) -> Result<NativeMixedReplayResult, ReplayError>
     where
-        F: FnOnce(&[crate::TensorData], &[&crate::TensorData]) -> Result<(), String>,
+        F: for<'banks, 'storage> FnOnce(
+            &[crate::TensorData],
+            RecurrentSuccessorView<'banks, 'storage>,
+        ) -> Result<(), String>,
     {
         self.replay_recurrent_selected_checked_impl(
             runtime,
@@ -495,7 +550,10 @@ impl<'a> NativeReplayContext<'a> {
         validate_transition: F,
     ) -> Result<NativeMixedReplayResult, ReplayError>
     where
-        F: FnOnce(&[crate::TensorData], &[&crate::TensorData]) -> Result<(), String>,
+        F: for<'banks, 'storage> FnOnce(
+            &[crate::TensorData],
+            RecurrentSuccessorView<'banks, 'storage>,
+        ) -> Result<(), String>,
     {
         let Self { executor, prepared } = self;
         let PreparedRecurrentNativeReplay {
@@ -643,15 +701,12 @@ impl<'a> NativeReplayContext<'a> {
                 // Public state successors remain independent snapshots while
                 // the inactive recurrent bank becomes authoritative.
                 let outputs = projection.extract(&mut values)?;
-                let successor_values = banks
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, bank)| {
-                        bank_layout.validate_bank(ordinal, bank)?;
-                        Ok(bank.successor())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                validate_transition(&outputs, &successor_values).map_err(ReplayError::Execute)?;
+                // Cardinality and every immutable bank ordinal/buffer/mode were
+                // authenticated before execution. Native bindings cannot alter
+                // that metadata; the host pool separately rechecks successor
+                // tensor descriptors after this callback returns.
+                validate_transition(&outputs, RecurrentSuccessorView::new(banks))
+                    .map_err(ReplayError::Execute)?;
                 if let Some(step) = injected_failure
                     && bank_layout.replacement_steps.contains(&step)
                 {
@@ -3237,6 +3292,109 @@ mod recurrent_tests {
     }
 
     #[test]
+    fn recurrent_successor_view_matches_legacy_replace_retain_order_and_retry() {
+        use crate::effects::runtime::{
+            PreparedRecurrentTransactionOwner, PreparedRecurrentTransactionSchema,
+            RecurrentBankMode, RecurrentTransactionError,
+        };
+
+        let mut runtime = EffectRuntime::new();
+        let left = runtime
+            .register(
+                301,
+                TensorData::from_storage([2], Storage::F32(vec![1.0, 2.0])).unwrap(),
+            )
+            .unwrap();
+        let right = runtime
+            .register(
+                302,
+                TensorData::from_storage([2], Storage::F32(vec![3.0, 4.0])).unwrap(),
+            )
+            .unwrap();
+        let mut frontier = vec![left, right];
+        let initial_frontier = frontier.clone();
+        let initial_values = frontier
+            .iter()
+            .map(|state| runtime.snapshot(state).unwrap().tensor().clone())
+            .collect::<Vec<_>>();
+        let owner = PreparedRecurrentTransactionOwner::new();
+        let schema = PreparedRecurrentTransactionSchema::new(
+            owner.clone(),
+            frontier.clone(),
+            vec![RecurrentBankMode::Replace, RecurrentBankMode::Retain],
+        )
+        .unwrap();
+
+        {
+            let transaction = schema.prepare(&owner, &mut frontier).unwrap();
+            assert!(matches!(
+                runtime.transact_prepared_recurrent_native_frontier(&transaction, |banks| {
+                    let (_, replacement) = banks[0].tensors();
+                    *replacement =
+                        TensorData::from_storage([2], Storage::F32(vec![5.0, 6.0])).unwrap();
+                    assert!(banks[1].is_retained());
+                    let legacy = banks
+                        .iter()
+                        .map(|bank| bank.successor())
+                        .collect::<Vec<_>>();
+                    let mut borrowed = RecurrentSuccessorView::new(banks).into_iter();
+                    assert_eq!(borrowed.len(), legacy.len());
+                    for expected in &legacy {
+                        assert!(std::ptr::eq(borrowed.next().unwrap(), *expected));
+                    }
+                    assert_eq!(borrowed.len(), 0);
+                    assert!(borrowed.next().is_none());
+                    assert!(borrowed.next().is_none());
+                    assert_eq!(legacy[0].storage(), &Storage::F32(vec![5.0, 6.0]));
+                    assert_eq!(legacy[1].storage(), &Storage::F32(vec![3.0, 4.0]));
+                    Err::<(), _>("reject successor view")
+                }),
+                Err(RecurrentTransactionError::Stage("reject successor view"))
+            ));
+        }
+        assert_eq!(frontier, initial_frontier);
+        assert_eq!(
+            initial_frontier
+                .iter()
+                .map(|state| runtime.snapshot(state).unwrap().tensor().clone())
+                .collect::<Vec<_>>(),
+            initial_values
+        );
+
+        let transaction = schema.prepare(&owner, &mut frontier).unwrap();
+        runtime
+            .transact_prepared_recurrent_native_frontier(&transaction, |banks| {
+                let (_, replacement) = banks[0].tensors();
+                *replacement = TensorData::from_storage([2], Storage::F32(vec![7.0, 8.0])).unwrap();
+                let legacy = banks
+                    .iter()
+                    .map(|bank| bank.successor())
+                    .collect::<Vec<_>>();
+                let mut borrowed = RecurrentSuccessorView::new(banks).into_iter();
+                assert_eq!(borrowed.len(), legacy.len());
+                for expected in &legacy {
+                    assert!(std::ptr::eq(borrowed.next().unwrap(), *expected));
+                }
+                assert_eq!(borrowed.len(), 0);
+                assert!(borrowed.next().is_none());
+                assert!(borrowed.next().is_none());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        transaction.advance();
+        assert_eq!(frontier[0].version, 1);
+        assert_eq!(frontier[1].version, 1);
+        assert_eq!(
+            runtime.snapshot(&frontier[0]).unwrap().tensor().storage(),
+            &Storage::F32(vec![7.0, 8.0])
+        );
+        assert_eq!(
+            runtime.snapshot(&frontier[1]).unwrap().tensor().storage(),
+            &Storage::F32(vec![3.0, 4.0])
+        );
+    }
+
+    #[test]
     fn recurrent_replay_preserves_outputs_and_advances_one_logical_frontier() {
         let (capture, mut runtime) = fixture(300);
         let artifact = capture.to_bytes().unwrap();
@@ -3575,8 +3733,10 @@ mod recurrent_tests {
                 &inputs,
                 None,
                 |outputs, successors| {
+                    let mut successors = successors.into_iter();
                     assert_eq!(outputs[0].storage(), &Storage::F32(vec![1.0, 1.0]));
-                    assert_eq!(successors[0], &outputs[0]);
+                    assert_eq!(successors.next(), Some(&outputs[0]));
+                    assert!(successors.next().is_none());
                     Ok(())
                 },
             )
