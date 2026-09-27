@@ -7466,6 +7466,7 @@ fn prepared_native_restore_accepts_frontiers_older_than_preparation() {
 
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor);
+    crate::effects::runtime::reset_prepared_recurrent_transaction_test_counts();
     let mut runtime = compile_token_evaluation_plan()
         .restore_checkpoint(&newer)
         .unwrap()
@@ -7473,6 +7474,34 @@ fn prepared_native_restore_accepts_frontiers_older_than_preparation() {
         .unwrap();
     let preparation = format!("{:?}", runtime.runtime().preparation_report());
     let native_plan_count = executor.native_item_plan_count();
+    let transaction_schema_identities = |runtime: &NativeCpuCompiledAdamW<'_>| {
+        std::iter::once(runtime.main_replay.recurrent_transaction_schema_identity())
+            .chain(
+                runtime
+                    .accumulation_replay
+                    .iter()
+                    .map(PreparedRecurrentNativeReplay::recurrent_transaction_schema_identity),
+            )
+            .chain(
+                runtime
+                    .partial_flush_replay
+                    .iter()
+                    .map(PreparedRecurrentNativeReplay::recurrent_transaction_schema_identity),
+            )
+            .chain(
+                runtime
+                    .zero_grad_replay
+                    .iter()
+                    .map(PreparedRecurrentNativeReplay::recurrent_transaction_schema_identity),
+            )
+            .collect::<Vec<_>>()
+    };
+    let transaction_schemas = transaction_schema_identities(runtime.runtime());
+    assert_eq!(transaction_schemas.len(), 4);
+    assert_eq!(
+        crate::effects::runtime::prepared_recurrent_transaction_test_counts().schema_builds,
+        4
+    );
     let workspace_stats = |runtime: &NativeCpuCompiledAdamW<'_>| {
         std::iter::once(runtime.main_replay.workspace_stats())
             .chain(
@@ -7504,6 +7533,8 @@ fn prepared_native_restore_accepts_frontiers_older_than_preparation() {
     runtime.evaluate(batch()).unwrap();
     runtime.step(batch(), TensorData::scalar(0.01)).unwrap();
     let workspaces = workspace_stats(runtime.runtime());
+    let before_restore_transactions =
+        crate::effects::runtime::prepared_recurrent_transaction_test_counts();
 
     runtime.restore_checkpoint_in_place(&older).unwrap();
     assert_eq!(runtime.checkpoint().unwrap(), older);
@@ -7513,6 +7544,16 @@ fn prepared_native_restore_accepts_frontiers_older_than_preparation() {
         preparation
     );
     assert_eq!(workspace_stats(runtime.runtime()), workspaces);
+    assert_eq!(
+        transaction_schema_identities(runtime.runtime()),
+        transaction_schemas,
+        "in-place restore must retain the exact immutable transaction schemas"
+    );
+    assert_eq!(
+        crate::effects::runtime::prepared_recurrent_transaction_test_counts(),
+        before_restore_transactions,
+        "restoring an older frontier must not rebuild or scan a prepared transaction schema"
+    );
     assert_eq!(executor.native_item_plan_count(), native_plan_count);
     assert_eq!(runtime.runtime().successful_steps, 1);
     assert_eq!(runtime.runtime().successful_evaluations, 1);
@@ -7555,6 +7596,16 @@ fn prepared_native_restore_accepts_frontiers_older_than_preparation() {
     assert_eq!(runtime.runtime().successful_zero_grads, 1);
     assert_eq!(runtime.runtime().successful_flushes, 1);
     assert_eq!(executor.native_item_plan_count(), native_plan_count);
+    assert_eq!(
+        transaction_schema_identities(runtime.runtime()),
+        transaction_schemas
+    );
+    let restored_transactions =
+        crate::effects::runtime::prepared_recurrent_transaction_test_counts();
+    assert_eq!(restored_transactions.schema_builds, 4);
+    assert_eq!(restored_transactions.cursor_descriptor_admissions, 3);
+    assert_eq!(restored_transactions.ordered_transactions, 2);
+    assert_eq!(restored_transactions.fallback_frontier_reconstructions, 1);
 
     let mut reference = compile_token_evaluation_plan()
         .restore_checkpoint(&older)
@@ -8376,6 +8427,7 @@ fn cpu_commit_only_steps_preserve_adamw_state_and_skip_named_egress() {
     };
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor);
+    crate::effects::runtime::reset_prepared_recurrent_transaction_test_counts();
     let mut interpreted = plan.prepare_cpu().unwrap();
     let mut interpreted_commit = plan.prepare_cpu().unwrap();
     let mut native = target.prepare(&plan).unwrap();
@@ -8383,6 +8435,10 @@ fn cpu_commit_only_steps_preserve_adamw_state_and_skip_named_egress() {
     let prepared_output_projection_builds =
         crate::engine::mixed_capture::prepared_replay_validation_counts()
             .recurrent_output_projection_builds;
+    let prepared_transaction_schemas =
+        crate::effects::runtime::prepared_recurrent_transaction_test_counts();
+    assert_eq!(prepared_transaction_schemas.schema_builds, 8);
+    assert_eq!(prepared_transaction_schemas.cursor_descriptor_admissions, 0);
     assert_eq!(native.main_replay.zero_domain_item_count(), 1);
     assert_eq!(native_commit.main_replay.zero_domain_item_count(), 1);
     assert_eq!(
@@ -8542,6 +8598,12 @@ fn cpu_commit_only_steps_preserve_adamw_state_and_skip_named_egress() {
         prepared_output_projection_builds,
         "all and commit-only main/accumulation replays must reuse their sealed projections"
     );
+    let repeated_transactions =
+        crate::effects::runtime::prepared_recurrent_transaction_test_counts();
+    assert_eq!(repeated_transactions.schema_builds, 8);
+    assert_eq!(repeated_transactions.cursor_descriptor_admissions, 4);
+    assert_eq!(repeated_transactions.ordered_transactions, 4);
+    assert_eq!(repeated_transactions.fallback_frontier_reconstructions, 0);
 
     let mut injected = plan.prepare_cpu().unwrap();
     let mut retry_reference = plan.prepare_cpu().unwrap();

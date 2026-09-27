@@ -11,6 +11,7 @@ use std::{
 pub mod autograd;
 pub mod batch;
 pub mod bridge;
+mod recurrent_transaction;
 mod replacement;
 pub mod runtime;
 pub mod schedule;

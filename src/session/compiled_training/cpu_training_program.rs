@@ -351,9 +351,10 @@ impl CpuCompiledTrainingProgram {
         let decoded = decoded.expect("compiled phase outputs were authenticated before commit");
         #[cfg(debug_assertions)]
         {
-            let mut committed = _replay.committed.clone();
-            committed.sort_by_key(|state| state.buffer);
-            debug_assert_eq!(committed, prepared.cursor.cursor().frontier());
+            debug_assert!(
+                self.runtime
+                    .debug_contains_frontier(prepared.cursor.cursor().frontier())
+            );
         }
         prepared.cursor.publish(&mut self.cursor);
         Ok(decoded)
@@ -525,15 +526,10 @@ impl CpuCompiledTrainingProgram {
             .map_err(replay_error)?;
         let traffic = replay.traffic;
         let executor_wall_time = replay.executor_wall_time;
-        let replay = replay.replay;
         let decoded = decoded.expect("compiled phase outputs were authenticated before commit");
-        let native = replay
-            .native_trace
-            .as_ref()
-            .expect("strict-native recurrent replay returns a native trace");
         let report = native_cpu_run_report(
             phase.capture_identity(),
-            native,
+            &replay.native_trace,
             traffic,
             executor_wall_time,
             successful_invocation,
@@ -541,9 +537,10 @@ impl CpuCompiledTrainingProgram {
         );
         #[cfg(debug_assertions)]
         {
-            let mut committed = replay.committed.clone();
-            committed.sort_by_key(|state| state.buffer);
-            debug_assert_eq!(committed, prepared.cursor.cursor().frontier());
+            debug_assert!(
+                self.runtime
+                    .debug_contains_frontier(prepared.cursor.cursor().frontier())
+            );
         }
         prepared.cursor.publish(&mut self.cursor);
         Ok((decoded, report))

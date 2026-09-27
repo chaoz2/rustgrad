@@ -1322,12 +1322,17 @@ Preparation has one ordered, fail-closed pipeline:
 Each prepared recurrent program seals its validated RGSM identity, pure
 cache/layout inventory, canonical ordinal bank/input/replacement layout,
 ordered retain modes, retained counts/bytes, initial frontier descriptor, and
-capture-bound ordered output projections once. Output projections retain logical
-requested order separately from native liveness and successor-clone metadata.
-Main, accumulation, partial-flush, and `zero_grad` hot replay repeats only
+capture-bound ordered output projections once. A private typed transaction
+schema reuses that immutable descriptor/mode inventory without reconstructing a
+detached successor frontier on canonical full-frontier replay. Each call still
+checks the cursor descriptor and next-version overflow, binds fresh runtime
+slots, leases, generations, and inactive banks, and validates successor values
+before atomic publication. Output projections retain logical requested order
+separately from native liveness and successor-clone metadata. Main,
+accumulation, partial-flush, and `zero_grad` hot replay repeats only
 call-dependent cursor, input, active-bank, quantized-index, successor, and
-transaction admission. Generic artifact replay retains full per-call artifact
-validation.
+transaction admission; partial frontiers retain the generic validating
+fallback. Generic artifact replay retains full per-call artifact validation.
 
 ##### Publication, evidence, and portability
 
