@@ -10,7 +10,7 @@ use crate::{
     Scalar, Shape, SortValue, Storage, SymbolicShape, SymbolicVar, TensorData, TensorGuardValue,
     UOp, UOpError, UType, UnaryOp,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum BufferRole {
@@ -1325,10 +1325,137 @@ pub(crate) fn single_reduction_epilogue(
     Ok((reduction != output).then_some(reduction))
 }
 
-/// Counts the exact graph edges from one eligible epilogue DAG to an internal
-/// node. Schedule construction compares this with the whole-graph consumer
-/// count so repeated predicate nodes can remain inline while any use owned by
-/// another root keeps that node materialized.
+/// A graph-borrowing proof that one output has exactly one eligible scalar
+/// reduction epilogue. Scheduler policy remains outside this graph-semantic
+/// witness, so requested and externally materialized roots cannot affect it.
+pub(crate) struct EligibleReductionEpilogue<'graph> {
+    graph: &'graph Graph,
+    output: NodeId,
+    reduction: NodeId,
+}
+
+impl<'graph> EligibleReductionEpilogue<'graph> {
+    pub(crate) fn reduction(&self) -> NodeId {
+        self.reduction
+    }
+
+    /// Counts every reachable operand edge once per unique parent while
+    /// preserving repeated operand slots. `Reduce` remains the terminal
+    /// materialization boundary. Graph nodes only reference earlier nodes, so
+    /// expanding a target cannot discover a later edge back into that target.
+    pub(crate) fn analyze_node_uses(
+        self,
+    ) -> std::result::Result<ReductionEpilogueNodeUses<'graph>, UOpError> {
+        #[cfg(test)]
+        REDUCTION_EPILOGUE_USE_ANALYSIS_COUNT.with(|count| count.set(count.get() + 1));
+
+        let mut seen = BTreeSet::new();
+        let mut uses = BTreeMap::new();
+        let mut overflowed = BTreeSet::new();
+        let mut pending = vec![self.output];
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            let op = self
+                .graph
+                .op(node)
+                .map_err(|_| UOpError::UseBeforeDefinition)?;
+            if matches!(op, Op::Reduce { .. }) {
+                continue;
+            }
+            let dtype = self
+                .graph
+                .dtype(node)
+                .map_err(|_| UOpError::UseBeforeDefinition)?;
+            let children =
+                scalar_reduction_epilogue_children(op, dtype).ok_or(UOpError::InvalidArgument)?;
+            for child in &children {
+                record_reduction_epilogue_use(&mut uses, &mut overflowed, *child);
+            }
+            pending.extend(children.into_iter().rev());
+        }
+        Ok(ReductionEpilogueNodeUses {
+            epilogue: self,
+            uses,
+            overflowed,
+        })
+    }
+}
+
+/// Authenticates the existing scalar-epilogue eligibility contract before a
+/// caller elects to pay for the reusable whole-DAG use analysis.
+pub(crate) fn eligible_reduction_epilogue(
+    graph: &Graph,
+    output: NodeId,
+) -> std::result::Result<Option<EligibleReductionEpilogue<'_>>, UOpError> {
+    Ok(
+        single_reduction_epilogue(graph, output)?.map(|reduction| EligibleReductionEpilogue {
+            graph,
+            output,
+            reduction,
+        }),
+    )
+}
+
+/// Exact incoming-edge counts for one immutable eligible epilogue DAG.
+pub(crate) struct ReductionEpilogueNodeUses<'graph> {
+    epilogue: EligibleReductionEpilogue<'graph>,
+    uses: BTreeMap<NodeId, usize>,
+    overflowed: BTreeSet<NodeId>,
+}
+
+impl ReductionEpilogueNodeUses<'_> {
+    #[cfg(test)]
+    pub(crate) fn reduction(&self) -> NodeId {
+        self.epilogue.reduction
+    }
+
+    pub(crate) fn node_uses(&self, target: NodeId) -> std::result::Result<usize, UOpError> {
+        if target == self.epilogue.output || self.overflowed.contains(&target) {
+            return Err(UOpError::InvalidArgument);
+        }
+        Ok(self.uses.get(&target).copied().unwrap_or(0))
+    }
+}
+
+fn record_reduction_epilogue_use(
+    uses: &mut BTreeMap<NodeId, usize>,
+    overflowed: &mut BTreeSet<NodeId>,
+    target: NodeId,
+) {
+    if overflowed.contains(&target) {
+        return;
+    }
+    let count = uses.entry(target).or_default();
+    if let Some(next) = count.checked_add(1) {
+        *count = next;
+    } else {
+        overflowed.insert(target);
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static REDUCTION_EPILOGUE_USE_ANALYSIS_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_reduction_epilogue_use_analysis_count() {
+    REDUCTION_EPILOGUE_USE_ANALYSIS_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn reduction_epilogue_use_analysis_count() -> usize {
+    REDUCTION_EPILOGUE_USE_ANALYSIS_COUNT.with(std::cell::Cell::get)
+}
+
+/// Independent target-stopping oracle for the historical scheduler query.
+/// Tests compare it with the reusable whole-DAG analysis so repeated operand
+/// edges, shared nodes, materialization boundaries, and errors stay exact.
+#[cfg(test)]
 pub(crate) fn reduction_epilogue_node_uses(
     graph: &Graph,
     output: NodeId,
@@ -2825,6 +2952,111 @@ mod tests {
             let uop = lower_graph_elementwise(&graph, output).unwrap();
             uop.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn reduction_epilogue_use_analysis_matches_independent_target_walk() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let reduction = graph.sum(input, 1).unwrap();
+        let repeated = graph.add(reduction, reduction).unwrap();
+        let left = graph.neg(repeated).unwrap();
+        let right = graph.mul(repeated, repeated).unwrap();
+        let output = graph.add(left, right).unwrap();
+
+        let analysis = eligible_reduction_epilogue(&graph, output)
+            .unwrap()
+            .expect("eligible reduction epilogue")
+            .analyze_node_uses()
+            .unwrap();
+        assert_eq!(analysis.reduction(), reduction);
+        for index in 0..graph.node_count() {
+            let target = NodeId::from_index(index);
+            assert_eq!(
+                analysis.node_uses(target),
+                reduction_epilogue_node_uses(&graph, output, target),
+                "target {index}"
+            );
+        }
+        let unknown = NodeId::from_index(graph.node_count() + 17);
+        assert_eq!(analysis.node_uses(unknown), Ok(0));
+        assert_eq!(reduction_epilogue_node_uses(&graph, output, unknown), Ok(0));
+        assert_eq!(analysis.node_uses(reduction), Ok(2));
+        assert_eq!(analysis.node_uses(repeated), Ok(3));
+        assert_eq!(analysis.node_uses(left), Ok(1));
+        assert_eq!(analysis.node_uses(right), Ok(1));
+        assert_eq!(analysis.node_uses(input), Ok(0));
+        assert_eq!(analysis.node_uses(output), Err(UOpError::InvalidArgument));
+    }
+
+    #[test]
+    fn reduction_epilogue_use_analysis_tracks_overflow_per_target() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let reduction = graph.sum(input, 1).unwrap();
+        let internal = graph.neg(reduction).unwrap();
+        let output = graph.neg(internal).unwrap();
+        let epilogue = eligible_reduction_epilogue(&graph, output)
+            .unwrap()
+            .expect("eligible reduction epilogue");
+        let mut uses = BTreeMap::from([(reduction, usize::MAX), (internal, 2)]);
+        let mut overflowed = BTreeSet::new();
+        record_reduction_epilogue_use(&mut uses, &mut overflowed, reduction);
+        let analysis = ReductionEpilogueNodeUses {
+            epilogue,
+            uses,
+            overflowed,
+        };
+
+        assert_eq!(
+            analysis.node_uses(reduction),
+            Err(UOpError::InvalidArgument)
+        );
+        assert_eq!(analysis.node_uses(internal), Ok(2));
+        assert_eq!(
+            analysis.node_uses(NodeId::from_index(graph.node_count() + 1)),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn reduction_epilogue_use_oracle_preserves_boundary_error_order() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", [2, 3]);
+        let reduction = graph.sum(input, 1).unwrap();
+        let unsupported = graph.reshape(reduction, [2, 1]).unwrap();
+        let missing = NodeId::from_index(graph.node_count() + 41);
+
+        assert_eq!(
+            reduction_epilogue_node_uses(&graph, missing, missing),
+            Err(UOpError::InvalidArgument)
+        );
+        assert_eq!(
+            reduction_epilogue_node_uses(&graph, missing, reduction),
+            Err(UOpError::UseBeforeDefinition)
+        );
+        assert!(matches!(
+            eligible_reduction_epilogue(&graph, missing),
+            Err(UOpError::UseBeforeDefinition)
+        ));
+        assert_eq!(
+            reduction_epilogue_node_uses(&graph, reduction, input),
+            Err(UOpError::InvalidArgument)
+        );
+        assert!(
+            eligible_reduction_epilogue(&graph, reduction)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reduction_epilogue_node_uses(&graph, unsupported, reduction),
+            Err(UOpError::InvalidArgument)
+        );
+        assert!(
+            eligible_reduction_epilogue(&graph, unsupported)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
