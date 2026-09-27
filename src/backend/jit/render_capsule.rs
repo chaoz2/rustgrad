@@ -483,14 +483,16 @@ fn recipe(
         // their rendered capsule can be admitted.
         writer.u64(item.cache_key)?;
         write_layout(&mut writer, layout)?;
-        let output_initialization = crate::cpu_jit::native_output_initialization(&item.kernel);
+        let render_topology =
+            crate::cpu_jit::NativeRenderTopologyWitness::new(&item.kernel, backend.vectorized);
+        let output_initialization = render_topology.output_initialization(&item.kernel);
         write_output_initialization(&mut writer, output_initialization)?;
         item_witnesses.push(CapsuleItemWitness {
             logical_index,
             schedule_cache_key: item.cache_key,
-            kernel: item.kernel.clone(),
             layout: layout.clone(),
             output_initialization,
+            render_topology,
         });
     }
     writer.count(store_groups.len())?;
@@ -698,9 +700,9 @@ struct OrdinaryRenderWitness {
 struct CapsuleItemWitness {
     logical_index: usize,
     schedule_cache_key: u64,
-    kernel: crate::UOp,
     layout: NativeScheduleLayout,
     output_initialization: NativeOutputInitialization,
+    render_topology: crate::cpu_jit::NativeRenderTopologyWitness,
 }
 
 impl CapsuleItemWitness {
@@ -712,7 +714,7 @@ impl CapsuleItemWitness {
     ) -> bool {
         self.logical_index == logical_index
             && self.schedule_cache_key == item.cache_key
-            && self.kernel.shares_node_with(&item.kernel)
+            && self.render_topology.owns(&item.kernel)
             && &self.layout == layout
     }
 }
@@ -747,9 +749,9 @@ impl OrdinaryRenderWitness {
         backend: &CpuJitBackend,
         logical_index: usize,
         item: &ScheduleItem,
+        topology: &crate::cpu_jit::NativeRenderTopologyWitness,
     ) -> Result<Self, JitError> {
-        let authentication =
-            crate::cpu_jit::NativeRenderAuthentication::new(&item.kernel, backend.vectorized)?;
+        let authentication = topology.authentication(&item.kernel, backend.vectorized)?;
         let vector = if backend.vectorized {
             authentication.vector().clone()
         } else {
@@ -941,7 +943,12 @@ fn authenticate_module(
             }
         } else {
             let item_witness = &recipe.item_witnesses[index];
-            let expected = match OrdinaryRenderWitness::new(backend, index, item) {
+            let expected = match OrdinaryRenderWitness::new(
+                backend,
+                index,
+                item,
+                &item_witness.render_topology,
+            ) {
                 Ok(expected) => expected,
                 Err(_) => return false,
             };
@@ -1308,10 +1315,7 @@ mod tests {
         for (item, layout) in items.iter().zip(layouts) {
             writer.u64(item.cache_key)?;
             write_layout(&mut writer, layout)?;
-            write_output_initialization(
-                &mut writer,
-                crate::cpu_jit::native_output_initialization(&item.kernel),
-            )?;
+            write_output_initialization(&mut writer, legacy_output_initialization(&item.kernel))?;
         }
         writer.count(store_groups.len())?;
         for group in store_groups {
@@ -1327,6 +1331,65 @@ mod tests {
             write_output_initialization(&mut writer, group.output_initialization)?;
         }
         Some(writer.0)
+    }
+
+    fn legacy_output_initialization(root: &crate::UOp) -> NativeOutputInitialization {
+        use crate::MovementKernelKind;
+        use crate::Operation;
+        use NativeOutputInitialization::{FullyOverwritten, NeedsZero};
+
+        match root.operation() {
+            Operation::Matmul(_)
+            | Operation::Conv2d(_)
+            | Operation::Random(_)
+            | Operation::Threefry(_) => FullyOverwritten,
+            Operation::Movement(crate::MovementValue::QuantizedRowGather(_)) => FullyOverwritten,
+            Operation::Movement(crate::MovementValue::Plan(plan)) => match &plan.kind {
+                MovementKernelKind::AffineCopy { .. }
+                | MovementKernelKind::Pad { .. }
+                | MovementKernelKind::Concat { .. }
+                | MovementKernelKind::Gather { .. }
+                | MovementKernelKind::Bitcast { .. }
+                | MovementKernelKind::Contiguous { .. } => FullyOverwritten,
+                MovementKernelKind::Scatter { .. }
+                | MovementKernelKind::ScatterPositions { .. } => NeedsZero,
+            },
+            Operation::Sink => {
+                let Ok(nodes) = root.topological() else {
+                    return NeedsZero;
+                };
+                if nodes.iter().any(|node| {
+                    matches!(
+                        node.operation(),
+                        Operation::ReduceInit(_)
+                            | Operation::ReduceAccumulate
+                            | Operation::ReduceFinalize
+                    )
+                }) {
+                    return NeedsZero;
+                }
+                let mut stores = root
+                    .sources()
+                    .iter()
+                    .filter(|node| matches!(node.operation(), Operation::Store));
+                let Some(store) = stores.next() else {
+                    return NeedsZero;
+                };
+                if stores.next().is_some() {
+                    return NeedsZero;
+                }
+                if store
+                    .sources()
+                    .first()
+                    .is_some_and(|index| crate::cpu_jit::linear_store_iteration(index).is_ok())
+                {
+                    FullyOverwritten
+                } else {
+                    NeedsZero
+                }
+            }
+            _ => NeedsZero,
+        }
     }
 
     #[test]
@@ -1541,7 +1604,9 @@ mod tests {
             output_initialization: crate::cpu_jit::native_output_initialization(&item.kernel),
             rendered,
         };
-        let witness = OrdinaryRenderWitness::new(&backend, 0, item).unwrap();
+        let topology =
+            crate::cpu_jit::NativeRenderTopologyWitness::new(&item.kernel, backend.vectorized);
+        let witness = OrdinaryRenderWitness::new(&backend, 0, item, &topology).unwrap();
         assert!(witness.authenticates(&backend, 0, item, &entry));
         assert!(!witness.authenticates(&backend, 1, item, &entry));
 
@@ -1552,11 +1617,17 @@ mod tests {
             crate::CpuJit::vector_plan(&item.kernel).unwrap(),
             "cross-root rejection must not rely on a different vector plan"
         );
+        assert!(OrdinaryRenderWitness::new(&backend, 0, &different_root, &topology).is_err());
         assert!(!witness.authenticates(&backend, 0, &different_root, &entry));
 
         let scalar = CpuJitBackend::new(crate::JitFallback::Error);
+        assert!(OrdinaryRenderWitness::new(&scalar, 0, item, &topology).is_err());
         assert!(!witness.authenticates(&scalar, 0, item, &entry));
-        let scalar_witness = OrdinaryRenderWitness::new(&scalar, 0, item).unwrap();
+        let scalar_topology =
+            crate::cpu_jit::NativeRenderTopologyWitness::new(&item.kernel, scalar.vectorized);
+        let scalar_witness =
+            OrdinaryRenderWitness::new(&scalar, 0, item, &scalar_topology).unwrap();
+        assert!(OrdinaryRenderWitness::new(&backend, 0, item, &scalar_topology).is_err());
         assert!(!scalar_witness.authenticates(&backend, 0, item, &entry));
     }
 
@@ -1571,6 +1642,14 @@ mod tests {
         let item = &first_schedule.items[0];
         let layout = super::super::schedule_native_layout(item).unwrap();
         let backend = CpuJitBackend::new(crate::JitFallback::Error).vectorized(true);
+        let module = super::super::render_schedule_module_entries(
+            &backend,
+            std::slice::from_ref(item),
+            std::slice::from_ref(&layout),
+            &[],
+        )
+        .unwrap();
+        crate::cpu_jit::reset_native_render_topology_derivation_counts();
         let recipe = capsule_recipe(
             &backend,
             0,
@@ -1580,6 +1659,11 @@ mod tests {
             &[],
         )
         .unwrap();
+        assert_eq!(
+            crate::cpu_jit::native_render_topology_derivation_counts(),
+            (1, 0),
+            "recipe derives one topology summary without eagerly deriving a linear policy"
+        );
         assert_eq!(
             recipe.bytes,
             legacy_recipe_bytes(
@@ -1608,13 +1692,6 @@ mod tests {
         different_layout.elided_output_source = Some(u64::MAX);
         assert!(!witness.authenticates(0, item, &different_layout));
 
-        let module = super::super::render_schedule_module_entries(
-            &backend,
-            std::slice::from_ref(item),
-            std::slice::from_ref(&layout),
-            &[],
-        )
-        .unwrap();
         assert!(authenticate_module(
             &backend,
             &recipe,
@@ -1623,6 +1700,11 @@ mod tests {
             std::slice::from_ref(&layout),
             &[],
         ));
+        assert_eq!(
+            crate::cpu_jit::native_render_topology_derivation_counts(),
+            (1, 1),
+            "authentication reuses recipe topology facts and derives the linear policy once"
+        );
         assert!(!authenticate_module(
             &backend,
             &recipe,
@@ -1649,6 +1731,157 @@ mod tests {
             std::slice::from_ref(&layout),
             &[],
         ));
+    }
+
+    #[test]
+    fn capsule_recipe_preserves_reduction_initialization_and_policy_failure_statuses() {
+        let backend = CpuJitBackend::new(crate::JitFallback::Error).vectorized(true);
+
+        let mut reduction_graph = crate::Graph::new();
+        let input = reduction_graph.input_dtype("recipe_reduction", [2, 4], crate::DType::F32);
+        let squared = reduction_graph.square(input).unwrap();
+        let output = reduction_graph.sum(squared, 1).unwrap();
+        let reduction_schedule = crate::schedule(&reduction_graph, output).unwrap();
+        let reduction_layouts = reduction_schedule
+            .items
+            .iter()
+            .map(super::super::schedule_native_layout)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let reduction_item = reduction_schedule
+            .items
+            .iter()
+            .find(|item| item.node == output)
+            .unwrap();
+        assert_eq!(
+            legacy_output_initialization(&reduction_item.kernel),
+            NativeOutputInitialization::NeedsZero
+        );
+        let reduction_recipe = capsule_recipe(
+            &backend,
+            0,
+            1,
+            &reduction_schedule.items,
+            &reduction_layouts,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            reduction_recipe.bytes,
+            legacy_recipe_bytes(
+                &backend,
+                0,
+                1,
+                &reduction_schedule.items,
+                &reduction_layouts,
+                &[],
+            )
+            .unwrap(),
+            "reduction NeedsZero policy must not change recipe bytes"
+        );
+
+        let mut invalid_graph = crate::Graph::new();
+        let input =
+            invalid_graph.input_dtype("policy_invalid_status_input", [8], crate::DType::F32);
+        let output = invalid_graph.neg(input).unwrap();
+        let valid_schedule = crate::schedule(&invalid_graph, output).unwrap();
+        let mut invalid_item = valid_schedule.items[0].clone();
+        let store = invalid_item
+            .kernel
+            .sources()
+            .iter()
+            .find(|node| matches!(node.operation(), crate::Operation::Store))
+            .unwrap()
+            .clone();
+        let load = invalid_item
+            .kernel
+            .topological()
+            .unwrap()
+            .into_iter()
+            .find(|node| matches!(node.operation(), crate::Operation::Load))
+            .unwrap();
+        let invalid_load =
+            crate::UOp::from_operation(crate::Operation::Load, load.ty(), Vec::new());
+        invalid_item.kernel = crate::UOp::sink(vec![store, invalid_load]);
+        let layout = super::super::schedule_native_layout(&invalid_item).unwrap();
+        crate::cpu_jit::reset_native_render_topology_derivation_counts();
+        let recipe = capsule_recipe(
+            &backend,
+            0,
+            1,
+            std::slice::from_ref(&invalid_item),
+            std::slice::from_ref(&layout),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            crate::cpu_jit::native_render_topology_derivation_counts(),
+            (1, 0),
+            "policy-invalid topology remains recipe-available without eager linear analysis"
+        );
+        assert_eq!(
+            recipe.bytes,
+            legacy_recipe_bytes(
+                &backend,
+                0,
+                1,
+                std::slice::from_ref(&invalid_item),
+                std::slice::from_ref(&layout),
+                &[],
+            )
+            .unwrap(),
+            "policy-invalid Sink must preserve the old recipe identity"
+        );
+
+        let valid_layout = super::super::schedule_native_layout(&valid_schedule.items[0]).unwrap();
+        let module = super::super::render_schedule_module_entries(
+            &backend,
+            &valid_schedule.items,
+            std::slice::from_ref(&valid_layout),
+            &[],
+        )
+        .unwrap();
+        remove_capsule(&recipe);
+        assert_eq!(
+            load_capsule(
+                &backend,
+                &recipe,
+                std::slice::from_ref(&invalid_item),
+                std::slice::from_ref(&layout),
+                &[],
+            )
+            .err()
+            .unwrap(),
+            CapsuleLoadStatus::FileUnavailable
+        );
+        assert_eq!(store_capsule(&recipe, &module), CapsuleStoreStatus::Stored);
+        fs::write(capsule_path(&recipe), b"corrupt capsule").unwrap();
+        assert_eq!(
+            load_capsule(
+                &backend,
+                &recipe,
+                std::slice::from_ref(&invalid_item),
+                std::slice::from_ref(&layout),
+                &[],
+            )
+            .err()
+            .unwrap(),
+            CapsuleLoadStatus::DecodeRejected
+        );
+        assert_eq!(store_capsule(&recipe, &module), CapsuleStoreStatus::Stored);
+        assert_eq!(
+            load_capsule(
+                &backend,
+                &recipe,
+                std::slice::from_ref(&invalid_item),
+                std::slice::from_ref(&layout),
+                &[],
+            )
+            .err()
+            .unwrap(),
+            CapsuleLoadStatus::AuthenticationRejected
+        );
+        remove_capsule(&recipe);
     }
 
     #[test]

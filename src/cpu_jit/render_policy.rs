@@ -4,6 +4,7 @@ use crate::{MatmulValue, MovementValue, Operation, UOp, VectorPlan};
 #[cfg(test)]
 thread_local! {
     static POLICY_LINEAR_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOPOLOGY_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(super) struct ElementwiseTopology {
@@ -14,6 +15,8 @@ pub(super) struct ElementwiseTopology {
 
 impl ElementwiseTopology {
     pub(super) fn new(root: &UOp, request_vector: bool) -> Result<Self, JitError> {
+        #[cfg(test)]
+        TOPOLOGY_DERIVATIONS.with(|count| count.set(count.get().saturating_add(1)));
         let nodes = root
             .topological()
             .map_err(|error| JitError::Unsupported(error.to_string()))?;
@@ -31,11 +34,8 @@ impl ElementwiseTopology {
         &self.nodes
     }
 
-    pub(super) fn into_render_policy(
-        self,
-        root: &UOp,
-    ) -> Result<ElementwiseRenderPolicy, JitError> {
-        ElementwiseRenderPolicy::from_topology(root, self)
+    pub(super) fn render_policy(&self, root: &UOp) -> Result<ElementwiseRenderPolicy, JitError> {
+        ElementwiseRenderPolicy::from_projection(root, self.request_vector, self.projected)
     }
 
     #[cfg(test)]
@@ -67,16 +67,20 @@ pub(super) struct ElementwiseRenderPolicy {
 
 impl ElementwiseRenderPolicy {
     pub(super) fn new(root: &UOp, request_vector: bool) -> Result<Self, JitError> {
-        ElementwiseTopology::new(root, request_vector)?.into_render_policy(root)
+        ElementwiseTopology::new(root, request_vector)?.render_policy(root)
     }
 
-    fn from_topology(root: &UOp, topology: ElementwiseTopology) -> Result<Self, JitError> {
-        if !topology.request_vector || topology.projected {
+    fn from_projection(
+        root: &UOp,
+        request_vector: bool,
+        projected: bool,
+    ) -> Result<Self, JitError> {
+        if !request_vector || projected {
             return Ok(Self {
                 reported_vector: VectorPlan {
                     lanes: 1,
                     enabled: false,
-                    reason: if topology.projected && topology.request_vector {
+                    reason: if projected && request_vector {
                         "projected indices use the checked scalar address dialect"
                     } else {
                         "disabled"
@@ -177,6 +181,18 @@ impl NativeRenderAuthentication {
         Ok(Self { vector, cache })
     }
 
+    fn from_elementwise_projection(
+        root: &UOp,
+        request_vector: bool,
+        projected: bool,
+    ) -> Result<Self, JitError> {
+        let policy = ElementwiseRenderPolicy::from_projection(root, request_vector, projected)?;
+        Ok(Self {
+            vector: policy.reported_vector().clone(),
+            cache: NativeCachePolicy::Ordinary(policy.cache_discriminator()),
+        })
+    }
+
     pub(crate) fn vector(&self) -> &VectorPlan {
         &self.vector
     }
@@ -184,6 +200,109 @@ impl NativeRenderAuthentication {
     pub(crate) fn cache_key(&self, source: &str) -> String {
         self.cache.key(source)
     }
+}
+
+enum NativeRenderTopologyState {
+    Legacy,
+    Elementwise { projected: bool },
+    Unavailable,
+}
+
+/// Call-local immutable facts derived from one native render-capsule recipe's
+/// topology. The node list is released immediately; the compact facts remain
+/// bound to one exact UOp owner and vector-policy request and are never
+/// serialized or retained by a prepared runtime.
+pub(crate) struct NativeRenderTopologyWitness {
+    root: UOp,
+    request_vector: bool,
+    output_initialization: super::NativeOutputInitialization,
+    state: NativeRenderTopologyState,
+}
+
+impl NativeRenderTopologyWitness {
+    pub(crate) fn new(root: &UOp, request_vector: bool) -> Self {
+        let (output_initialization, state) = if matches!(root.operation(), Operation::Sink) {
+            match ElementwiseTopology::new(root, request_vector) {
+                Ok(topology) => {
+                    #[cfg(test)]
+                    super::record_native_output_initialization_derivation();
+                    (
+                        super::native_output_initialization_from_topology(root, topology.nodes()),
+                        NativeRenderTopologyState::Elementwise {
+                            projected: topology.projected,
+                        },
+                    )
+                }
+                Err(_) => (
+                    super::NativeOutputInitialization::NeedsZero,
+                    NativeRenderTopologyState::Unavailable,
+                ),
+            }
+        } else {
+            (
+                super::native_output_initialization(root),
+                NativeRenderTopologyState::Legacy,
+            )
+        };
+        Self {
+            root: root.clone(),
+            request_vector,
+            output_initialization,
+            state,
+        }
+    }
+
+    pub(crate) fn output_initialization(&self, root: &UOp) -> super::NativeOutputInitialization {
+        if !self.root.shares_node_with(root) {
+            return super::NativeOutputInitialization::NeedsZero;
+        }
+        self.output_initialization
+    }
+
+    pub(crate) fn owns(&self, root: &UOp) -> bool {
+        self.root.shares_node_with(root)
+    }
+
+    pub(crate) fn authentication(
+        &self,
+        root: &UOp,
+        request_vector: bool,
+    ) -> Result<NativeRenderAuthentication, JitError> {
+        if self.request_vector != request_vector || !self.root.shares_node_with(root) {
+            return Err(JitError::Unsupported(
+                "native render topology owner mismatch".into(),
+            ));
+        }
+        match &self.state {
+            NativeRenderTopologyState::Legacy => {
+                NativeRenderAuthentication::new(root, request_vector)
+            }
+            NativeRenderTopologyState::Elementwise { projected } => {
+                NativeRenderAuthentication::from_elementwise_projection(
+                    root,
+                    request_vector,
+                    *projected,
+                )
+            }
+            NativeRenderTopologyState::Unavailable => Err(JitError::Unsupported(
+                "native render topology is unavailable".into(),
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_native_render_topology_derivation_counts() {
+    TOPOLOGY_DERIVATIONS.with(|count| count.set(0));
+    POLICY_LINEAR_DERIVATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn native_render_topology_derivation_counts() -> (usize, usize) {
+    (
+        TOPOLOGY_DERIVATIONS.with(std::cell::Cell::get),
+        POLICY_LINEAR_DERIVATIONS.with(std::cell::Cell::get),
+    )
 }
 
 fn dedicated_vector(root: &UOp) -> VectorPlan {
@@ -447,6 +566,12 @@ mod tests {
         let movement_output = movement_graph.contiguous(movement_view).unwrap();
         let movement = scheduled_kernel(&movement_graph, movement_output);
 
+        let mut reduction_graph = Graph::new();
+        let reduction_input = reduction_graph.input_dtype("reduction", [2, 4], DType::F32);
+        let reduction_value = reduction_graph.square(reduction_input).unwrap();
+        let reduction_output = reduction_graph.sum(reduction_value, 1).unwrap();
+        let reduction = scheduled_kernel(&reduction_graph, reduction_output);
+
         let b1_eligibility = |root: &UOp| {
             let linear = crate::LinearKernel::from_uop(root).unwrap();
             let memory_spaces = crate::MemorySpacePlan::from_linear(&linear).unwrap();
@@ -479,11 +604,26 @@ mod tests {
             ("f16-narrow", f16),
             ("bf16-narrow", bf16),
             ("projected", projected),
+            ("reduction", reduction),
             ("matmul", matmul),
             ("movement", movement),
         ] {
             let rendered = crate::CpuJit::render_vectorized(&root).unwrap();
-            let policy = NativeRenderAuthentication::new(&root, true).unwrap();
+            let legacy_output_initialization = super::super::native_output_initialization(&root);
+            let legacy_policy = NativeRenderAuthentication::new(&root, true).unwrap();
+            let topology = NativeRenderTopologyWitness::new(&root, true);
+            assert_eq!(
+                topology.output_initialization(&root),
+                legacy_output_initialization,
+                "{case} output initialization"
+            );
+            let policy = topology.authentication(&root, true).unwrap();
+            assert_eq!(policy.vector(), legacy_policy.vector(), "{case} vector");
+            assert_eq!(
+                policy.cache_key(&rendered.source),
+                legacy_policy.cache_key(&rendered.source),
+                "{case} cache"
+            );
             assert_eq!(
                 policy.vector(),
                 &legacy_vector_plan(&root).unwrap(),
@@ -502,6 +642,14 @@ mod tests {
         }
 
         let scalar = crate::CpuJit::render(&f32).unwrap();
+        let legacy_scalar_policy = NativeRenderAuthentication::new(&f32, false).unwrap();
+        let scalar_topology = NativeRenderTopologyWitness::new(&f32, false);
+        let scalar_policy = scalar_topology.authentication(&f32, false).unwrap();
+        assert_eq!(scalar_policy.vector(), legacy_scalar_policy.vector());
+        assert_eq!(
+            scalar_policy.cache_key(&scalar.source),
+            legacy_scalar_policy.cache_key(&scalar.source)
+        );
         assert_eq!(
             native_rendered_cache_key(&f32, false, &scalar.source).unwrap(),
             legacy_cache_key(&f32, false, &scalar.source).unwrap()

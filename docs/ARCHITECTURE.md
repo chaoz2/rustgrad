@@ -1406,6 +1406,14 @@ times. Wall times do not participate in identity.
   layout, output-initialization, and mutation checks, plus downstream
   prepared-item authentication, remain unchanged. The witness is not persisted
   and changes no wire, key, version, API, schema, or identity.
+  For ordinary Sink kernels, that recipe witness also retains the projected-index
+  fact derived during output-initialization traversal. The node list is dropped
+  immediately; only compact facts bound to the exact root and vector request
+  survive until batch completion. Warm authentication reuses those facts but
+  still constructs and validates the linear policy at the original admission
+  point. Cold misses do not eagerly derive linear policy. Frozen legacy recipe
+  bytes, ownership rejection, and file/decode/authentication error ordering are
+  regression-tested; removing a traversal is not a measured speedup claim.
   Missing, stale, or corrupt sidecars fall back in program order. No measured
   speedup is claimed.
 - **Cleanup and identity.** Chunk sources and objects are cleaned on every
