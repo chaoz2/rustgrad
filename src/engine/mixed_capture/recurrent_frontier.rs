@@ -16,12 +16,30 @@ pub(crate) struct AuthenticatedRecurrentFrontier {
 
 impl AuthenticatedRecurrentFrontier {
     pub(crate) fn authenticate(capture: Arc<CapturedMixedSchedule>) -> Result<Self, ReplayError> {
+        validate(capture.as_ref(), true)?;
+        let capture_identity = identity(capture.as_ref())?;
+        Self::from_admitted_capture(capture, capture_identity)
+    }
+
+    /// Retains decoder admission without exposing a mutable capture between
+    /// validation and immutable frontier ownership. Legacy migration and all
+    /// envelope checks remain owned by the canonical decoder.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, ReplayError> {
+        let capture = CapturedMixedSchedule::from_bytes(bytes)?;
+        let capture_identity = capture.schedule.identity;
+        Self::from_admitted_capture(Arc::new(capture), capture_identity)
+    }
+
+    // Both callers establish canonical structural admission and identity before
+    // reaching this private constructor; no unchecked caller-owned path exists.
+    fn from_admitted_capture(
+        capture: Arc<CapturedMixedSchedule>,
+        capture_identity: u64,
+    ) -> Result<Self, ReplayError> {
         #[cfg(test)]
         record_prepared_replay_validation(|counts| {
             counts.recurrent_frontier_authentications += 1;
         });
-        validate(capture.as_ref(), true)?;
-        let capture_identity = identity(capture.as_ref())?;
         let initial_frontier = recurrent_initial_frontier(capture.as_ref())?.into_boxed_slice();
         Ok(Self {
             capture,
