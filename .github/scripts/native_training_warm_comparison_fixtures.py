@@ -167,6 +167,7 @@ def check(support):
     cases = (
         "valid", "timing", "checkpoint", "capture", "cache-miss", "hardware", "missing",
         "malformed-projection", "malformed-dropout", "malformed-duration",
+        "malformed-utf8",
     )
     for case in cases:
         with tempfile.TemporaryDirectory(prefix="rustgrad-warm-comparison-") as temporary:
@@ -198,6 +199,8 @@ def check(support):
                 ] = None
                 support.write_json(path, board)
             support.write_json(objective_path, objective)
+            if case == "malformed-utf8":
+                objective_path.write_bytes(b"\xff")
             checksums(support, trial)
             if case == "missing":
                 objective_path.unlink()

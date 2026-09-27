@@ -217,8 +217,11 @@ def validate_larger_evidence(
         preparation_evidence_path.resolve()
     )
 
-    objective = json.loads(objective_path.read_text(encoding="utf-8"))
-    scoreboard = json.loads(scoreboard_path.read_text(encoding="utf-8"))
+    try:
+        objective = json.loads(objective_path.read_text(encoding="utf-8"))
+        scoreboard = json.loads(scoreboard_path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as error:
+        raise LargerEvidenceError("larger Transformer evidence is not UTF-8") from error
     if not isinstance(objective, dict):
         raise LargerEvidenceError("larger Transformer objective must be an object")
     if not isinstance(scoreboard, dict):
