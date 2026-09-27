@@ -759,7 +759,12 @@ STORE/AFTER UOps through the canonical UOp table plus logical state/version and
 value/state ABI sidecars, named pure inputs, detached constants, and affine
 maps. Decode completes topology/descriptor validation before graph-free
 interpreter replay injects caller-owned snapshots and performs the same single
-pool-wide `EffectRuntime` commit. Strict native CPU replay preflights the whole
+pool-wide `EffectRuntime` commit. Current RGSM decode owns its schedule through
+one structural/key admission, envelope identity verification, and canonical
+identity assignment; it does not clone or revalidate an unchanged schedule.
+Legacy versions retain post-rekey validation. Public replay and recurrent
+frontier admission still validate their caller-supplied captures independently.
+Strict native CPU replay preflights the whole
 artifact, runs its supported pure prefix through the existing native JIT cache,
 and commits only detached outputs through that same transaction. Its stable
 trace identity binds RGSM contents, ABI sidecars, pure cache keys, renderer
