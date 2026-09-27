@@ -16,6 +16,7 @@ fi
 
 output_dir="native-cpu-training-scoreboard-release"
 scoreboard_path="${output_dir}/native-cpu-training-scoreboard.json"
+steady_path="${output_dir}/native-cpu-training-steady-replays.json"
 provenance_path="${output_dir}/provenance.txt"
 
 if [[ -e "$output_dir" || -L "$output_dir" ]]; then
@@ -67,6 +68,10 @@ write_lscpu_field() {
   printf 'git_sha=%s\n' "$actual_sha"
   printf 'cargo_profile=release\n'
   printf 'temporary_cache=fresh_sha_scoped\n'
+  printf 'steady_measurement_file=native-cpu-training-steady-replays.json\n'
+  printf 'steady_measurement_cache_scope=same_process_warm_cache\n'
+  printf 'steady_measurement_warmup_windows=1\n'
+  printf 'steady_measurement_measured_windows=32\n'
   printf 'runner_os=%s\n' "${RUNNER_OS:-unknown}"
   printf 'runner_arch=%s\n' "${RUNNER_ARCH:-unknown}"
   printf 'runner_image_os=%s\n' "${ImageOS:-unknown}"
@@ -95,9 +100,10 @@ TMPDIR="$measurement_tmpdir" CARGO_INCREMENTAL=0 RUSTFLAGS="-D warnings" \
   RUSTGRAD_REQUIRE_COLD_NATIVE_SCOREBOARD=1 \
   cargo run --locked --release --quiet \
     --example compiled_transformer_train_resume -- native-cpu-scoreboard \
+      --steady-evidence "$steady_path" "$actual_sha" release \
   | tee "$scoreboard_path"
 
-if [[ ! -s "$scoreboard_path" || ! -s "$provenance_path" ]]; then
-  echo "release scoreboard evidence must contain both nonempty files" >&2
+if [[ ! -s "$scoreboard_path" || ! -s "$steady_path" || ! -s "$provenance_path" ]]; then
+  echo "release scoreboard evidence must contain all three nonempty files" >&2
   exit 1
 fi

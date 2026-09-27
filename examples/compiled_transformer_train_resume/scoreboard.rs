@@ -1,6 +1,8 @@
 use super::*;
 
-pub(super) fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Error>> {
+pub(super) fn run_native_cpu_scoreboard(
+    steady_measurement: Option<SteadyMeasurementRequest>,
+) -> std::result::Result<(), Box<dyn Error>> {
     const SAMPLES: u64 = 3;
     const EXPECTED_LOSS_WEIGHTS: [u64; SAMPLES as usize] = [5, 3, 3];
     const EXPECTED_MAIN_MODULE_DISPATCHES: usize = 1;
@@ -993,6 +995,21 @@ pub(super) fn run_native_cpu_scoreboard() -> std::result::Result<(), Box<dyn Err
         report_json["prepare_compiler_critical_tail"].is_object(),
         compiler_process_count != 0
     );
+    if let Some(request) = steady_measurement {
+        steady_measurement::record(
+            &plan,
+            &checkpoint,
+            &target,
+            compile_wall_time,
+            &builds,
+            request,
+        )?;
+        assert_eq!(
+            builds.get(),
+            1,
+            "steady measurement must reuse one compiled plan"
+        );
+    }
     print!("{}", String::from_utf8(report_bytes)?);
     Ok(())
 }

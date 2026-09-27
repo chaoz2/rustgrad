@@ -1412,6 +1412,16 @@ optimizer-commit summaries are disjoint exact partitions. Raw reports omit that
 classification. A scoreboard rejects mixed recording modes without consuming a
 sample. Partial flush remains outside the main-step sample set.
 
+The maintained example keeps that three-step scoreboard unchanged. Protected
+CI can additionally request a separate versioned raw-sample sidecar from one
+independently restored session of the same compiled plan: one complete window
+warms both replay phases, then 32 complete windows retain 64 accumulation and
+32 optimizer-commit samples. The sidecar records exact replay/invocation/sample
+ordinals and the existing total, executor, dispatcher, executor-host, and
+recurrent-overhead partitions. All 99 calls and the replay-102 boundary
+checkpoint pass through a second `NativeTrainingScoreboard`; its warm summaries
+include the excluded warmup and are not presented as the 96 measured samples.
+
 Commit-only replay omits caller-named outputs while retaining loss and enabled
 validation/report scalars. Prefix reuse retains four fail-closed contracts:
 
@@ -1438,12 +1448,14 @@ validation/report scalars. Prefix reuse retains four fail-closed contracts:
 
 ##### Protected evidence
 
-- **Correctness gate.** Protected CI retains the debug invocation as a smoke.
+- **Correctness gate.** Protected CI retains the debug invocation as a smoke
+  and executes the opt-in repeated-replay sidecar against the same compiled plan.
   Only after that matrix passes, and only on protected-main pushes, does it run
   the same bounded scoreboard once in release mode on pinned Ubuntu and Rust.
 - **Cold evidence.** The release run uses a fresh SHA-scoped temporary cache and
-  uploads JSON with exact runner, toolchain, and compiler provenance plus
-  normalized `lscpu` model, topology, and architectural identity.
+  uploads the unchanged scoreboard, the separate same-process-warm replay
+  sidecar, and exact runner, toolchain, and compiler provenance plus normalized
+  `lscpu` model, topology, and architectural identity.
 - **Admission.** Missing or ambiguous required CPU fields fail the evidence job
   instead of producing an under-specified artifact.
 - **Interpretation.** Hosted-runner durations are observational and comparable

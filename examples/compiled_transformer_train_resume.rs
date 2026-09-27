@@ -24,7 +24,7 @@
 //! |---|---|---|
 //! | Interpreter CPU | `cargo run --example compiled_transformer_train_resume -- cpu` | Replays graph-free on the host interpreter. |
 //! | Strict-native CPU | `cargo run --release --example compiled_transformer_train_resume -- native-cpu` | Replays the same capture through CPU JIT. |
-//! | CPU scoreboard | `cargo run --release --example compiled_transformer_train_resume -- native-cpu-scoreboard` | Emits the bounded strict-native evidence report. |
+//! | CPU scoreboard | `cargo run --release --example compiled_transformer_train_resume -- native-cpu-scoreboard` | Emits the bounded three-step strict-native evidence report. Protected CI additionally requests a separate repeated-replay sidecar without changing stdout. |
 //! | Strict Metal | `cargo run --release --example compiled_transformer_train_resume -- metal` | Uses the first visible Metal device with no CPU fallback. |
 
 #[path = "compiled_transformer_train_resume/mod.rs"]

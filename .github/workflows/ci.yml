@@ -98,13 +98,21 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo run --quiet --example compiled_transformer_train_resume -- native-cpu-scoreboard | tee native-cpu-training-scoreboard.json
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "${{ github.sha }}"
+          cargo run --quiet --example compiled_transformer_train_resume -- \
+            native-cpu-scoreboard \
+            --steady-evidence native-cpu-training-steady-replays-debug.json \
+            "$actual_sha" dev \
+            | tee native-cpu-training-scoreboard.json
       - name: Upload native CPU training scoreboard
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: native-cpu-training-scoreboard-${{ github.sha }}
-          path: native-cpu-training-scoreboard.json
+          path: |
+            native-cpu-training-scoreboard.json
+            native-cpu-training-steady-replays-debug.json
           if-no-files-found: error
           retention-days: 30
       - name: Larger compiled Transformer strict-native lifecycle smoke
@@ -144,6 +152,7 @@ jobs:
           name: native-cpu-training-scoreboard-release-${{ github.sha }}
           path: |
             native-cpu-training-scoreboard-release/native-cpu-training-scoreboard.json
+            native-cpu-training-scoreboard-release/native-cpu-training-steady-replays.json
             native-cpu-training-scoreboard-release/provenance.txt
           if-no-files-found: error
           retention-days: 30
