@@ -170,7 +170,7 @@ def scoreboard_program(capture_identity: int) -> dict[str, object]:
         "object_compile_count": 1,
         "linker_invocation_count": 0,
         "dispatch_segmentation": {"segment_count": 1},
-        "preparation_timing": {"total": duration(10)},
+        "preparation_timing": {"total": duration(10), "render": duration(2)},
     }
 
 
@@ -215,13 +215,13 @@ def warm_step_phase() -> dict[str, object]:
     }
 
 
-def preparation_finalization() -> dict[str, object]:
+def preparation_finalization(format_version: int) -> dict[str, object]:
     program_phase = {
         "pre_layout_admission_wall_time": duration(1),
         "workspace_construction_wall_time": duration(1),
         "recurrent_finalization_wall_time": duration(1),
     }
-    return {
+    value = {
         "instrumented_wall_time": duration(90),
         "outer_remainder_wall_time": duration(10),
         "bootstrap_wall_time": duration(5),
@@ -230,8 +230,12 @@ def preparation_finalization() -> dict[str, object]:
         "partial_flush": dict(program_phase),
         "zero_grad": dict(program_phase),
         "report_input_assembly_wall_time": duration(3),
-        "unattributed_wall_time": duration(40),
+        "unattributed_wall_time": duration(40 if format_version == 25 else 38),
     }
+    if format_version == 26:
+        value["render_batch_wall_time"] = duration(10)
+        value["render_batch_orchestration_wall_time"] = duration(2)
+    return value
 
 
 def warm_preparation_partition() -> tuple[dict[str, object], dict[str, object]]:
@@ -256,6 +260,8 @@ def warm_preparation_partition() -> tuple[dict[str, object], dict[str, object]]:
             "instrumented_wall_time": duration(100),
             "outer_remainder_wall_time": duration(10),
             "bootstrap_wall_time": duration(5),
+            "render_batch_wall_time": duration(12),
+            "render_batch_orchestration_wall_time": duration(2),
             "main": dict(recurrent_phase),
             "accumulation": dict(recurrent_phase),
             "partial_flush": dict(recurrent_phase),
@@ -265,7 +271,7 @@ def warm_preparation_partition() -> tuple[dict[str, object], dict[str, object]]:
                 "workspace_construction_wall_time": duration(1),
             },
             "report_input_assembly_wall_time": duration(3),
-            "unattributed_wall_time": duration(38),
+            "unattributed_wall_time": duration(36),
         },
     }
     return evidence, programs
@@ -276,7 +282,7 @@ def require_preparation_error(
 ) -> None:
     try:
         PREPARATION_EVIDENCE.validate_preparation_finalization(
-            evidence, 25, programs
+            evidence, 26, programs
         )
     except PREPARATION_EVIDENCE.PreparationEvidenceError as error:
         assert message in str(error)
@@ -286,7 +292,7 @@ def require_preparation_error(
 
 def check_warm_preparation_fixtures() -> None:
     evidence, programs = warm_preparation_partition()
-    PREPARATION_EVIDENCE.validate_preparation_finalization(evidence, 25, programs)
+    PREPARATION_EVIDENCE.validate_preparation_finalization(evidence, 26, programs)
 
     invalid = copy.deepcopy(evidence)
     invalid["prepare_finalization"]["evaluation"][
@@ -304,6 +310,19 @@ def check_warm_preparation_fixtures() -> None:
     invalid["prepare_finalization"]["main"][
         "pre_layout_admission_wall_time"
     ] = maximum
+    require_preparation_error(invalid, programs, "duration overflows")
+
+    invalid = copy.deepcopy(evidence)
+    invalid["prepare_finalization"]["render_batch_wall_time"] = duration(11)
+    require_preparation_error(invalid, programs, "render batch does not partition")
+
+    invalid = copy.deepcopy(evidence)
+    invalid["prepare_finalization"].pop("render_batch_orchestration_wall_time")
+    require_preparation_error(invalid, programs, "finalization fields differ")
+
+    invalid = copy.deepcopy(evidence)
+    invalid["prepare_finalization"]["render_batch_wall_time"] = maximum
+    invalid["prepare_finalization"]["render_batch_orchestration_wall_time"] = maximum
     require_preparation_error(invalid, programs, "duration overflows")
 
 
@@ -407,8 +426,8 @@ def scoreboard(format_version: int) -> dict[str, object]:
         "host_to_device": None,
         "device_to_host": None,
     }
-    if format_version == 25:
-        value["prepare_finalization"] = preparation_finalization()
+    if format_version in (25, 26):
+        value["prepare_finalization"] = preparation_finalization(format_version)
     return value
 
 
@@ -470,7 +489,7 @@ def fixture(root: pathlib.Path) -> SimpleNamespace:
         source_sha = BASELINE_SHA if role == "baseline" else CANDIDATE_SHA
         directory = root / f"trial-{ordinal:02d}-{role}"
         directory.mkdir()
-        format_version = 24 if role == "baseline" else 25
+        format_version = 25 if role == "baseline" else 26
         write_json(
             directory / "native-cpu-training-scoreboard.json",
             scoreboard(format_version),
@@ -535,6 +554,18 @@ def main() -> None:
     check_warm_preparation_fixtures()
     run_case()
 
+    def use_v24_baseline(root: pathlib.Path) -> None:
+        for ordinal, (role, _) in enumerate(VALIDATOR.ORDER, start=1):
+            if role != "baseline":
+                continue
+            path = root / f"trial-{ordinal:02d}-{role}/native-cpu-training-scoreboard.json"
+            value = json.loads(path.read_text())
+            value["format_version"] = 24
+            value.pop("prepare_finalization")
+            write_json(path, value)
+
+    run_case(use_v24_baseline)
+
     def change_timing_only(root: pathlib.Path) -> None:
         path = root / "trial-02-candidate/native-cpu-training-scoreboard.json"
         value = json.loads(path.read_text())
@@ -569,7 +600,9 @@ def main() -> None:
         }
         finalization = value["prepare_finalization"]
         finalization["main"]["pre_layout_admission_wall_time"] = duration(2)
-        finalization["unattributed_wall_time"] = duration(39)
+        finalization["render_batch_wall_time"] = duration(11)
+        finalization["render_batch_orchestration_wall_time"] = duration(3)
+        finalization["unattributed_wall_time"] = duration(36)
         write_json(path, value)
         path = root / "trial-02-candidate/native-cpu-training-steady-replays.json"
         value = json.loads(path.read_text())
@@ -599,6 +632,14 @@ def main() -> None:
 
     run_case(break_finalization_partition, expected=False, invalid_trial=2)
 
+    def break_render_batch_partition(root: pathlib.Path) -> None:
+        path = root / "trial-02-candidate/native-cpu-training-scoreboard.json"
+        value = json.loads(path.read_text())
+        value["prepare_finalization"]["render_batch_wall_time"] = duration(11)
+        write_json(path, value)
+
+    run_case(break_render_batch_partition, expected=False, invalid_trial=2)
+
     def remove_finalization_role(root: pathlib.Path) -> None:
         path = root / "trial-02-candidate/native-cpu-training-scoreboard.json"
         value = json.loads(path.read_text())
@@ -618,13 +659,14 @@ def main() -> None:
 
     run_case(overflow_finalization, expected=False, invalid_trial=2)
 
-    def add_finalization_to_legacy(root: pathlib.Path) -> None:
+    def add_render_batch_timing_to_v25(root: pathlib.Path) -> None:
         path = root / "trial-01-baseline/native-cpu-training-scoreboard.json"
         value = json.loads(path.read_text())
-        value["prepare_finalization"] = preparation_finalization()
+        value["prepare_finalization"]["render_batch_wall_time"] = duration(10)
+        value["prepare_finalization"]["render_batch_orchestration_wall_time"] = duration(2)
         write_json(path, value)
 
-    run_case(add_finalization_to_legacy, expected=False, invalid_trial=1)
+    run_case(add_render_batch_timing_to_v25, expected=False, invalid_trial=1)
 
     def change_phase(root: pathlib.Path) -> None:
         path = root / "trial-02-candidate/native-cpu-training-scoreboard.json"

@@ -42,7 +42,7 @@ def validate_preparation_finalization(
     format_version: int,
     programs: Mapping[str, Any],
 ) -> None:
-    """Validate the v24/v25 preparation timing wire contract and partitions."""
+    """Validate the v24-v26 preparation timing wire contract and partitions."""
 
     if format_version == 24:
         require(
@@ -50,7 +50,7 @@ def validate_preparation_finalization(
             "scoreboard v24 unexpectedly has preparation finalization",
         )
         return
-    require(format_version == 25, "scoreboard preparation format differs")
+    require(format_version in (25, 26), "scoreboard preparation format differs")
 
     finalization = scoreboard.get("prepare_finalization")
     require(type(finalization) is dict, "scoreboard preparation finalization is absent")
@@ -64,6 +64,13 @@ def validate_preparation_finalization(
         "unattributed_wall_time",
         *present_roles,
     }
+    if format_version == 26:
+        expected_fields.update(
+            {
+                "render_batch_wall_time",
+                "render_batch_orchestration_wall_time",
+            }
+        )
     require(
         set(finalization) == expected_fields,
         "scoreboard preparation finalization fields differ",
@@ -121,29 +128,8 @@ def validate_preparation_finalization(
         finalization["unattributed_wall_time"],
         "scoreboard finalization.unattributed_wall_time",
     )
-    require(
-        checked_duration_sum(
-            [instrumented, outer_remainder], "scoreboard whole preparation"
-        )
-        == prepare_wall_time,
-        "scoreboard instrumented preparation does not partition caller time",
-    )
-    require(
-        checked_duration_sum(
-            [
-                outer_remainder,
-                bootstrap,
-                measured_program_finalization,
-                assembly,
-                unattributed,
-            ],
-            "scoreboard preparation overhead",
-        )
-        == prepare_overhead,
-        "scoreboard finalization does not partition preparation overhead",
-    )
-
     program_totals = []
+    render_totals = []
     for role, program in programs.items():
         if type(program) is not dict:
             continue
@@ -155,6 +141,13 @@ def validate_preparation_finalization(
                 f"scoreboard {role}.preparation_timing.total",
             )
         )
+        if format_version == 26:
+            render_totals.append(
+                duration_ns(
+                    timing.get("render"),
+                    f"scoreboard {role}.preparation_timing.render",
+                )
+            )
     program_total = checked_duration_sum(
         program_totals, "scoreboard program preparation"
     )
@@ -171,6 +164,51 @@ def validate_preparation_finalization(
         "scoreboard preparation overlap exceeds program time",
     )
     effective_program = program_total - module_overlap - render_overlap
+    render_batch_orchestration = 0
+    if format_version == 26:
+        effective_render = (
+            checked_duration_sum(render_totals, "scoreboard program render")
+            - render_overlap
+        )
+        require(effective_render >= 0, "scoreboard render overlap exceeds render time")
+        render_batch = duration_ns(
+            finalization["render_batch_wall_time"],
+            "scoreboard finalization.render_batch_wall_time",
+        )
+        render_batch_orchestration = duration_ns(
+            finalization["render_batch_orchestration_wall_time"],
+            "scoreboard finalization.render_batch_orchestration_wall_time",
+        )
+        require(
+            checked_duration_sum(
+                [effective_render, render_batch_orchestration],
+                "scoreboard render batch",
+            )
+            == render_batch,
+            "scoreboard render batch does not partition local render and orchestration",
+        )
+    require(
+        checked_duration_sum(
+            [instrumented, outer_remainder], "scoreboard whole preparation"
+        )
+        == prepare_wall_time,
+        "scoreboard instrumented preparation does not partition caller time",
+    )
+    require(
+        checked_duration_sum(
+            [
+                outer_remainder,
+                bootstrap,
+                measured_program_finalization,
+                render_batch_orchestration,
+                assembly,
+                unattributed,
+            ],
+            "scoreboard preparation overhead",
+        )
+        == prepare_overhead,
+        "scoreboard finalization does not partition preparation overhead",
+    )
     require(
         checked_duration_sum(
             [effective_program, prepare_overhead], "scoreboard preparation partition"
@@ -184,6 +222,7 @@ def validate_preparation_finalization(
                 effective_program,
                 bootstrap,
                 measured_program_finalization,
+                render_batch_orchestration,
                 assembly,
                 unattributed,
             ],

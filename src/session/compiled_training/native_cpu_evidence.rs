@@ -869,6 +869,8 @@ impl NativeCpuCompiledTrainingPreparationReport {
             &reports,
             compilation.parallel_work_overlap_wall_time,
             compilation.parallel_render_overlap_wall_time,
+            compilation.render_batch_wall_time,
+            compilation.render_batch_orchestration_wall_time,
         )?;
         let NativeCpuTrainingPrograms {
             main,

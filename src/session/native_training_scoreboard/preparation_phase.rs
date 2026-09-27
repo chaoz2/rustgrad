@@ -1,6 +1,6 @@
 //! Checked host-finalization timing for strict-native training preparation.
 
-use super::invalid;
+use super::{NATIVE_TRAINING_REPORT_FORMAT_V25, NATIVE_TRAINING_REPORT_FORMAT_VERSION, invalid};
 use crate::session::compiled_training::{
     NativeCpuCompiledTrainingPreparationReport, NativeCpuPreparationFinalizationPhases,
     NativeCpuProgramFinalizationPhases,
@@ -78,6 +78,10 @@ pub struct NativeTrainingPreparationFinalizationReport {
     instrumented_wall_time: BenchmarkDuration,
     outer_remainder_wall_time: BenchmarkDuration,
     bootstrap_wall_time: BenchmarkDuration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    render_batch_wall_time: Option<BenchmarkDuration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    render_batch_orchestration_wall_time: Option<BenchmarkDuration>,
     main: NativeTrainingProgramFinalizationReport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     accumulation: Option<NativeTrainingProgramFinalizationReport>,
@@ -121,6 +125,19 @@ impl NativeTrainingPreparationFinalizationReport {
                 duration.checked_sub(preparation.parallel_render_overlap_wall_time())
             })
             .ok_or_else(|| invalid("native parallel work overlap exceeds program time"))?;
+        let render_wall_time = std::iter::once(preparation.main())
+            .chain(preparation.accumulation())
+            .chain(preparation.partial_flush())
+            .chain(preparation.zero_grad())
+            .chain(preparation.evaluation())
+            .try_fold(Duration::ZERO, |total, program| {
+                total
+                    .checked_add(program.phases().render_wall_time())
+                    .ok_or_else(|| invalid("native render duration overflows"))
+            })?;
+        let effective_render_wall_time = render_wall_time
+            .checked_sub(preparation.parallel_render_overlap_wall_time())
+            .ok_or_else(|| invalid("native render overlap exceeds render time"))?;
         let prepare_runtime_overhead_wall_time = prepare_wall_time
             .checked_sub(effective_program_wall_time)
             .ok_or_else(|| invalid("native program preparation exceeds whole prepare time"))?;
@@ -128,6 +145,7 @@ impl NativeTrainingPreparationFinalizationReport {
             preparation.finalization_phases(),
             prepare_wall_time,
             prepare_runtime_overhead_wall_time,
+            effective_render_wall_time,
             PreparationProgramPresence {
                 accumulation: preparation.accumulation().is_some(),
                 partial_flush: preparation.partial_flush().is_some(),
@@ -141,6 +159,7 @@ impl NativeTrainingPreparationFinalizationReport {
         observation: &NativeCpuPreparationFinalizationPhases,
         prepare_wall_time: Duration,
         prepare_runtime_overhead_wall_time: Duration,
+        effective_render_wall_time: Duration,
         presence: PreparationProgramPresence,
     ) -> Result<Self> {
         let outer_remainder_wall_time = prepare_wall_time
@@ -154,6 +173,12 @@ impl NativeTrainingPreparationFinalizationReport {
             bootstrap_wall_time: BenchmarkDuration::from_duration(
                 observation.bootstrap_wall_time(),
             ),
+            render_batch_wall_time: Some(BenchmarkDuration::from_duration(
+                observation.render_batch_wall_time(),
+            )),
+            render_batch_orchestration_wall_time: Some(BenchmarkDuration::from_duration(
+                observation.render_batch_orchestration_wall_time(),
+            )),
             main: NativeTrainingProgramFinalizationReport::from_observation(observation.main()),
             accumulation: observation
                 .accumulation()
@@ -175,8 +200,10 @@ impl NativeTrainingPreparationFinalizationReport {
             ),
         };
         report.validate(
+            NATIVE_TRAINING_REPORT_FORMAT_VERSION,
             BenchmarkDuration::from_duration(prepare_wall_time),
             BenchmarkDuration::from_duration(prepare_runtime_overhead_wall_time),
+            BenchmarkDuration::from_duration(effective_render_wall_time),
             presence,
         )?;
         Ok(report)
@@ -184,8 +211,10 @@ impl NativeTrainingPreparationFinalizationReport {
 
     pub(super) fn validate(
         &self,
+        format_version: u32,
         prepare_wall_time: BenchmarkDuration,
         prepare_runtime_overhead_wall_time: BenchmarkDuration,
+        effective_render_wall_time: BenchmarkDuration,
         presence: PreparationProgramPresence,
     ) -> Result<()> {
         if self.accumulation.is_some() != presence.accumulation
@@ -237,12 +266,38 @@ impl NativeTrainingPreparationFinalizationReport {
         let overhead = prepare_runtime_overhead_wall_time
             .to_duration()
             .map_err(|_| invalid("invalid native preparation overhead duration"))?;
+        let render_batch_orchestration = match (
+            format_version,
+            self.render_batch_wall_time,
+            self.render_batch_orchestration_wall_time,
+        ) {
+            (NATIVE_TRAINING_REPORT_FORMAT_V25, None, None) => Duration::ZERO,
+            (NATIVE_TRAINING_REPORT_FORMAT_VERSION, Some(batch), Some(orchestration)) => {
+                let batch = batch
+                    .to_duration()
+                    .map_err(|_| invalid("invalid native render batch duration"))?;
+                let orchestration = orchestration
+                    .to_duration()
+                    .map_err(|_| invalid("invalid native render batch orchestration duration"))?;
+                let effective_render = effective_render_wall_time
+                    .to_duration()
+                    .map_err(|_| invalid("invalid effective native render duration"))?;
+                if effective_render.checked_add(orchestration) != Some(batch) {
+                    return Err(invalid(
+                        "native render batch phases do not partition batch time",
+                    ));
+                }
+                orchestration
+            }
+            _ => return Err(invalid("native render batch timing availability differs")),
+        };
         let accounted_overhead = [
             outer_remainder,
             self.bootstrap_wall_time
                 .to_duration()
                 .map_err(|_| invalid("invalid native preparation bootstrap duration"))?,
             measured_program_finalization,
+            render_batch_orchestration,
             self.report_input_assembly_wall_time
                 .to_duration()
                 .map_err(|_| invalid("invalid report-input assembly duration"))?,
@@ -278,6 +333,16 @@ impl NativeTrainingPreparationFinalizationReport {
     /// CPU state construction and checkpoint-frontier restore time.
     pub const fn bootstrap_wall_time(&self) -> BenchmarkDuration {
         self.bootstrap_wall_time
+    }
+
+    /// Complete capsule-admission and rendering batch wall time. Absent in V25.
+    pub const fn render_batch_wall_time(&self) -> Option<BenchmarkDuration> {
+        self.render_batch_wall_time
+    }
+
+    /// Batch time outside the exact union of local renderer calls. Absent in V25.
+    pub const fn render_batch_orchestration_wall_time(&self) -> Option<BenchmarkDuration> {
+        self.render_batch_orchestration_wall_time
     }
 
     /// Finalization intervals for the optimizer-commit program.
@@ -330,6 +395,10 @@ pub(super) fn zero_preparation_finalization(
         instrumented_wall_time: BenchmarkDuration::from_duration(Duration::ZERO),
         outer_remainder_wall_time: BenchmarkDuration::from_duration(Duration::ZERO),
         bootstrap_wall_time: BenchmarkDuration::from_duration(Duration::ZERO),
+        render_batch_wall_time: Some(BenchmarkDuration::from_duration(Duration::ZERO)),
+        render_batch_orchestration_wall_time: Some(BenchmarkDuration::from_duration(
+            Duration::ZERO,
+        )),
         main: program(true),
         accumulation: accumulation.then_some(program(true)),
         partial_flush: None,
@@ -345,10 +414,15 @@ pub(super) fn set_zero_stage_finalization_partition(
     report: &mut NativeTrainingPreparationFinalizationReport,
     prepare_wall_time: Duration,
     overhead_wall_time: Duration,
+    effective_render_wall_time: Duration,
 ) {
     report.instrumented_wall_time = BenchmarkDuration::from_duration(prepare_wall_time);
     report.outer_remainder_wall_time = BenchmarkDuration::from_duration(Duration::ZERO);
     report.bootstrap_wall_time = BenchmarkDuration::from_duration(Duration::ZERO);
+    report.render_batch_wall_time =
+        Some(BenchmarkDuration::from_duration(effective_render_wall_time));
+    report.render_batch_orchestration_wall_time =
+        Some(BenchmarkDuration::from_duration(Duration::ZERO));
     report.report_input_assembly_wall_time = BenchmarkDuration::from_duration(Duration::ZERO);
     report.unattributed_wall_time = BenchmarkDuration::from_duration(overhead_wall_time);
 }

@@ -392,7 +392,7 @@ def scoreboard_program(value: Any, label: str) -> dict[str, Any]:
 
 def validate_scoreboard(value: dict[str, Any]) -> dict[str, Any]:
     format_version = exact_int(value.get("format_version"), "scoreboard format")
-    require(format_version in (24, 25), "scoreboard format differs")
+    require(format_version in (24, 25, 26), "scoreboard format differs")
     require(exact_int(value.get("initial_replay_step"), "scoreboard initial replay") == 0, "scoreboard initial replay differs")
     require(exact_int(value.get("successful_replay_count"), "scoreboard replay count") == 3, "scoreboard replay count differs")
     require(exact_int(value.get("fallback_count"), "scoreboard fallback count") == 0, "scoreboard fallback is nonzero")
