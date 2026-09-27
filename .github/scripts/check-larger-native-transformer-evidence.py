@@ -604,10 +604,13 @@ def validate_larger_evidence(
         "effective_render_wall_time_ns",
         "effective_render_fraction",
     }
+    preparation_details = {"prepare_finalization"}
+    if objective["schema_version"] == 9:
+        preparation_details.add("capsule_phases")
     if (
         not isinstance(preparation, dict)
         or set(preparation)
-        != set(preparation_roles) | preparation_totals | {"prepare_finalization"}
+        != set(preparation_roles) | preparation_totals | preparation_details
     ):
         raise LargerEvidenceError("larger Transformer warm preparation evidence is invalid")
     phase_fields = {
