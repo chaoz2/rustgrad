@@ -1388,7 +1388,15 @@ times. Wall times do not participate in identity.
   parallel on a capsule miss. A bounded checksummed sidecar binds the canonical
   typed recipe to the complete rendered payload; an exact hit revalidates the
   source key, ABI, layout, vector, initialization, and role inventories without
-  rendering. Missing, stale, or corrupt sidecars fall back in program order.
+  rendering. During ordinary capsule authentication, vector-plan and
+  cache-discriminator checks share one current-item analysis bound to the exact
+  root and scalar/vector policy. Cold rendering uses the same policy
+  implementation while retaining validation order. Source-dependent keys and
+  ABI, layout,
+  output-initialization, and role inventories retain their existing checks;
+  the analysis is not a persistent proof and changes no schema or identity.
+  Missing, stale, or corrupt sidecars fall back in program order. No measured
+  speedup is claimed.
 - **Cleanup and identity.** Chunk sources and objects are cleaned on every
   result. Chunk boundaries, process observations, and render parallelism change
   no capture, cache, checkpoint, replay, module ABI, or publication identity.

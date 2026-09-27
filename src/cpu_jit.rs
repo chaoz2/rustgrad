@@ -23,9 +23,11 @@ use std::{
 };
 #[path = "cpu_jit_random.rs"]
 mod random;
+mod render_policy;
 mod schedule_module;
 mod store_group;
 pub(crate) mod symbolic_runtime;
+pub(crate) use render_policy::NativeRenderAuthentication;
 pub(crate) use schedule_module::{
     NativeScheduleModuleBuildMode, schedule_module_cache_key,
     schedule_module_translation_unit_evidence,
@@ -1989,56 +1991,6 @@ pub(crate) use store_group::{
     native_store_group_cache_key,
 };
 
-pub(crate) fn native_rendered_cache_key(
-    root: &UOp,
-    request_vector: bool,
-    source: &str,
-) -> Result<String, JitError> {
-    let discriminator = match root.operation() {
-        Operation::PrefixScan(_) => "prefix-scan".to_owned(),
-        Operation::Random(_) => "random".to_owned(),
-        Operation::Threefry(_) => THREEFRY_RENDERER_VERSION.to_owned(),
-        Operation::Matmul(MatmulValue::Quantized(plan)) => plan.cache_key.to_string(),
-        Operation::Matmul(MatmulValue::Serial(plan)) => plan.cache_key.to_string(),
-        Operation::Matmul(MatmulValue::Tiled(payload)) => payload.matmul.cache_key.to_string(),
-        Operation::Matmul(MatmulValue::TensorCore(payload)) => payload.matmul.cache_key.to_string(),
-        Operation::Movement(MovementValue::QuantizedRowGather(plan)) => plan.cache_key.to_string(),
-        Operation::Movement(MovementValue::Plan(plan)) => format!("movement-{}", plan.cache_key),
-        Operation::Conv2d(plan) => {
-            return Ok(key(&(RENDERER_VERSION.to_owned()
-                + std::env::consts::ARCH
-                + std::env::consts::OS
-                + &plan.cache_key.to_string()
-                + source)));
-        }
-        _ => {
-            let nodes = root
-                .topological()
-                .map_err(|error| JitError::Unsupported(error.to_string()))?;
-            let request_vector = request_vector
-                && !nodes
-                    .iter()
-                    .any(crate::projected_index::ProjectedIndexPlan::is_projected);
-            if request_vector {
-                let linear = crate::LinearKernel::from_uop(root)
-                    .map_err(|error| JitError::Unsupported(error.to_string()))?;
-                let memory_spaces = crate::MemorySpacePlan::from_linear(&linear)
-                    .map_err(|error| JitError::Unsupported(error.to_string()))?;
-                let vector = crate::VectorProgram::from_linear(&linear, &memory_spaces)
-                    .map_err(|error| JitError::Unsupported(error.to_string()))?;
-                if vector.b1_eligibility().is_ok() {
-                    format!("b1-{}", vector.cache_key)
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            }
-        }
-    };
-    Ok(native_cache_key(&discriminator, source))
-}
-
 fn native_scalar_operation_can_signal(operation: &Operation, output: Option<DType>) -> bool {
     matches!(
         operation,
@@ -2109,50 +2061,7 @@ fn dense_assignment_fully_overwrites(root: &UOp) -> bool {
         .is_some_and(|index| linear_store_iteration(index).is_ok())
 }
 fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
-    if matches!(
-        root.operation(),
-        Operation::Matmul(_)
-            | Operation::Conv2d(_)
-            | Operation::Movement(_)
-            | Operation::Random(_)
-            | Operation::PrefixScan(_)
-            | Operation::Threefry(_)
-    ) {
-        return Ok(VectorPlan {
-            lanes: 1,
-            enabled: false,
-            reason: if matches!(root.operation(), Operation::PrefixScan(_)) {
-                "prefix scan uses a serial axis loop"
-            } else if matches!(root.operation(), Operation::Threefry(_)) {
-                "live Threefry uses a dedicated scalar kernel"
-            } else {
-                "static contraction uses scalar lanes"
-            }
-            .into(),
-        });
-    }
-    if root
-        .topological()
-        .map_err(|error| JitError::Unsupported(error.to_string()))?
-        .iter()
-        .any(crate::projected_index::ProjectedIndexPlan::is_projected)
-    {
-        return Ok(VectorPlan {
-            lanes: 1,
-            enabled: false,
-            reason: "projected indices use the checked scalar address dialect".into(),
-        });
-    }
-    let linear = crate::LinearKernel::from_uop(root)
-        .map_err(|error| JitError::Unsupported(error.to_string()))?;
-    linear
-        .validate()
-        .map_err(|error| JitError::Unsupported(error.to_string()))?;
-    Ok(VectorPlan {
-        lanes: linear.lanes,
-        enabled: linear.enabled,
-        reason: linear.reason,
-    })
+    render_policy::vector_plan(root)
 }
 fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, JitError> {
     if let Operation::PrefixScan(value) = root.operation() {
@@ -2187,13 +2096,8 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     if let Operation::Movement(MovementValue::Plan(plan)) = root.operation() {
         return render_movement(plan);
     }
-    let nodes = root
-        .topological()
-        .map_err(|e| JitError::Unsupported(e.to_string()))?;
-    let request_vector = request_vector
-        && !nodes
-            .iter()
-            .any(crate::projected_index::ProjectedIndexPlan::is_projected);
+    let topology = render_policy::ElementwiseTopology::new(root, request_vector)?;
+    let nodes = topology.nodes();
     let needs_erf = nodes.iter().any(|node| {
         matches!(
             node.operation(),
@@ -2227,7 +2131,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     // IDs redefine an expression's operand order.
     let mut buffers = Vec::<BufferAbi>::new();
     let mut seen = BTreeMap::<u64, usize>::new();
-    for n in &nodes {
+    for n in nodes {
         if !matches!(n.operation(), Operation::Load) {
             continue;
         }
@@ -2300,7 +2204,7 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
     // preserving same-format bytes. Validate those cases node-by-node and
     // fail closed for every other Float8 ALU graph rather than treating
     // payload bytes as numeric lanes.
-    for node in &nodes {
+    for node in nodes {
         if !matches!(
             node.operation(),
             Operation::GraphUnary(_)
@@ -2374,47 +2278,11 @@ fn render_with_policy(root: &UOp, request_vector: bool) -> Result<RenderedC, Jit
             }
         }
     }
-    let (plan, linear_key, b1_program) = if request_vector {
-        let linear = CpuJit::linearize(root)?;
-        linear
-            .validate()
-            .map_err(|error| JitError::Unsupported(error.to_string()))?;
-        let memory_spaces = crate::MemorySpacePlan::from_linear(&linear)
-            .map_err(|error| JitError::Unsupported(error.to_string()))?;
-        let vector_program = crate::VectorProgram::from_linear(&linear, &memory_spaces)
-            .map_err(|error| JitError::Unsupported(error.to_string()))?;
-        let b1 = vector_program
-            .b1_eligibility()
-            .ok()
-            .map(|_| vector_program.clone());
-        (
-            VectorPlan {
-                lanes: linear.lanes,
-                enabled: linear.enabled,
-                reason: linear.reason,
-            },
-            Some((
-                linear.cache_key,
-                linear.program.instructions.len(),
-                linear.program.peak_scalar,
-                linear.program.peak_vector,
-                vector_program.cache_key,
-            )),
-            b1,
-        )
-    } else {
-        (
-            VectorPlan {
-                lanes: 1,
-                enabled: false,
-                reason: "disabled".into(),
-            },
-            None,
-            None,
-        )
-    };
-    if let Some(program) = b1_program {
-        return render_vector_program(&program, &abi, &ids, extent);
+    let policy = topology.into_render_policy(root)?;
+    let plan = policy.rendered_vector();
+    let linear_key = policy.linear_key();
+    if let Some(program) = policy.b1_program() {
+        return render_vector_program(program, &abi, &ids, extent);
     }
     let mut lines = scalar_kernel_prologue(
         format!(
