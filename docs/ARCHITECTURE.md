@@ -1324,10 +1324,15 @@ cache/layout inventory, canonical ordinal bank/input/replacement layout,
 ordered retain modes, retained counts/bytes, initial frontier descriptor, and
 capture-bound ordered output projections once. A private typed transaction
 schema reuses that immutable descriptor/mode inventory without reconstructing a
-detached successor frontier on canonical full-frontier replay. Each call still
-checks the cursor descriptor and next-version overflow, binds fresh runtime
-slots, leases, generations, and inactive banks, and validates successor values
-before atomic publication. Each prepared recurrent output mode also seals one
+detached successor frontier on canonical full-frontier replay. Admission checks
+the prepared owner, cardinality, every cursor descriptor, and then every
+next-version overflow in that order. The admitted transaction exclusively
+borrows that exact call-scoped cursor frontier: full-frontier replay derives
+successor versions one scalar at a time, publishes runtime state first, and
+consumes the transaction to advance the same cursor only after success, without
+materializing a version vector. Each call still binds fresh runtime slots,
+leases, generations, and inactive banks and validates successor values before
+atomic publication. Each prepared recurrent output mode also seals one
 private workspace-owned native egress plan. That plan authenticates the exact
 workspace and immutable selected-output owner while retaining physical source
 slots, requested-alias order, and logical requested count/byte accounting.

@@ -23,14 +23,13 @@ impl PreparedRecurrentTransactionOwner {
 #[derive(Debug)]
 pub(crate) struct PreparedRecurrentTransactionSchema {
     owner: PreparedRecurrentTransactionOwner,
-    pub(super) initial: Box<[BufferState]>,
-    pub(super) modes: Box<[RecurrentBankMode]>,
+    initial: Box<[BufferState]>,
+    modes: Box<[RecurrentBankMode]>,
 }
 
 pub(crate) struct PreparedRecurrentTransaction<'a> {
-    pub(super) schema: &'a PreparedRecurrentTransactionSchema,
-    pub(super) current: &'a [BufferState],
-    pub(super) next_versions: Box<[u64]>,
+    schema: &'a PreparedRecurrentTransactionSchema,
+    current: &'a mut [BufferState],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,7 +115,7 @@ impl PreparedRecurrentTransactionSchema {
     pub(crate) fn prepare<'a>(
         &'a self,
         owner: &PreparedRecurrentTransactionOwner,
-        current: &'a [BufferState],
+        current: &'a mut [BufferState],
     ) -> Result<PreparedRecurrentTransaction<'a>, PreparedRecurrentTransactionError> {
         if !Arc::ptr_eq(&self.owner.0, &owner.0) {
             return Err(PreparedRecurrentTransactionError::Owner);
@@ -139,20 +138,17 @@ impl PreparedRecurrentTransactionSchema {
                 return Err(PreparedRecurrentTransactionError::Descriptor);
             }
         }
-        let next_versions = current
-            .iter()
-            .map(|state| {
-                state
-                    .version
-                    .checked_add(1)
-                    .ok_or(PreparedRecurrentTransactionError::VersionOverflow)
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_boxed_slice();
+        // Keep overflow admission as a distinct second pass. In particular,
+        // every descriptor error must win over every version overflow.
+        for state in current.iter() {
+            state
+                .version
+                .checked_add(1)
+                .ok_or(PreparedRecurrentTransactionError::VersionOverflow)?;
+        }
         Ok(PreparedRecurrentTransaction {
             schema: self,
             current,
-            next_versions,
         })
     }
 
@@ -171,7 +167,108 @@ impl PreparedRecurrentTransactionSchema {
 }
 
 impl PreparedRecurrentTransaction<'_> {
-    pub(crate) fn into_next_versions(self) -> Box<[u64]> {
-        self.next_versions
+    pub(super) fn current(&self) -> &[BufferState] {
+        &*self.current
+    }
+
+    pub(super) fn initial(&self) -> &[BufferState] {
+        &self.schema.initial
+    }
+
+    pub(super) fn modes(&self) -> &[RecurrentBankMode] {
+        &self.schema.modes
+    }
+
+    pub(super) fn successor_version(&self, ordinal: usize) -> u64 {
+        admitted_successor_version(self.current[ordinal].version)
+    }
+
+    /// Consumes the transaction and advances only the exact mutable frontier
+    /// admitted by `prepare`. Callers retain this transaction until runtime
+    /// staging succeeds, so failures cannot publish cursor progress.
+    pub(crate) fn advance(self) {
+        for state in self.current {
+            state.version = admitted_successor_version(state.version);
+        }
+    }
+}
+
+fn admitted_successor_version(version: u64) -> u64 {
+    version
+        .checked_add(1)
+        .expect("prepared recurrent version overflow was admitted")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DType, Shape};
+
+    fn state(buffer: u64, version: u64) -> BufferState {
+        BufferState {
+            buffer,
+            version,
+            shape: Shape::from([2]),
+            dtype: DType::F32,
+            bytes: 2 * DType::F32.itemsize(),
+        }
+    }
+
+    fn legacy_successor_versions(frontier: &[BufferState]) -> Vec<u64> {
+        frontier
+            .iter()
+            .map(|state| state.version.checked_add(1).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn admission_preserves_error_order_and_derives_legacy_successors_without_a_vector() {
+        reset_prepared_recurrent_transaction_test_counts();
+        let owner = PreparedRecurrentTransactionOwner::new();
+        let foreign = PreparedRecurrentTransactionOwner::new();
+        let initial = vec![state(7, 0), state(9, 4)];
+        let schema = PreparedRecurrentTransactionSchema::new(
+            owner.clone(),
+            initial.clone(),
+            vec![RecurrentBankMode::Replace, RecurrentBankMode::Retain],
+        )
+        .unwrap();
+
+        let mut incomplete = initial[..1].to_vec();
+        assert!(matches!(
+            schema.prepare(&foreign, &mut incomplete),
+            Err(PreparedRecurrentTransactionError::Owner)
+        ));
+        assert!(matches!(
+            schema.prepare(&owner, &mut incomplete),
+            Err(PreparedRecurrentTransactionError::Cardinality)
+        ));
+
+        let mut descriptor_before_overflow = initial.clone();
+        descriptor_before_overflow[0].version = u64::MAX;
+        descriptor_before_overflow[1].shape = Shape::from([1]);
+        descriptor_before_overflow[1].bytes = DType::F32.itemsize();
+        assert!(matches!(
+            schema.prepare(&owner, &mut descriptor_before_overflow),
+            Err(PreparedRecurrentTransactionError::Descriptor)
+        ));
+        descriptor_before_overflow[1] = initial[1].clone();
+        assert!(matches!(
+            schema.prepare(&owner, &mut descriptor_before_overflow),
+            Err(PreparedRecurrentTransactionError::VersionOverflow)
+        ));
+
+        let mut admitted = initial;
+        admitted[1].version = u64::MAX - 1;
+        let expected = legacy_successor_versions(&admitted);
+        let transaction = schema.prepare(&owner, &mut admitted).unwrap();
+        transaction.advance();
+        assert_eq!(
+            admitted
+                .iter()
+                .map(|state| state.version)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 }

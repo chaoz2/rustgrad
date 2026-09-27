@@ -685,11 +685,7 @@ impl<'a> NativeReplayContext<'a> {
                 return Err(ReplayError::Corrupt(reason.into()));
             }
         };
-        let next_versions = transaction.into_next_versions();
-        debug_assert_eq!(cursor.frontier.len(), next_versions.len());
-        for (state, version) in cursor.frontier.iter_mut().zip(next_versions) {
-            state.version = version;
-        }
+        transaction.advance();
         Ok(NativeMixedReplayResult {
             outputs,
             native_trace: trace.replay.clone(),
@@ -1070,10 +1066,10 @@ impl PreparedRecurrentBankLayout {
 
     fn prepare_transaction<'a>(
         &'a self,
-        cursor: &'a MixedReplayCursor,
+        cursor: &'a mut MixedReplayCursor,
     ) -> Result<crate::effects::runtime::PreparedRecurrentTransaction<'a>, ReplayError> {
         self.transaction_schema
-            .prepare(&self.transaction_owner, &cursor.frontier)
+            .prepare(&self.transaction_owner, &mut cursor.frontier)
             .map_err(|error| match error {
                 crate::effects::runtime::PreparedRecurrentTransactionError::Owner => {
                     ReplayError::Corrupt("prepared recurrent transaction owner mismatch".into())
@@ -3719,7 +3715,7 @@ mod recurrent_tests {
     fn prepared_recurrent_transaction_schema_rejects_foreign_preparation_owner() {
         let (capture, runtime) = fixture(655);
         let executor = CapturedReplayExecutor::default();
-        let cursor = capture.initial_recurrent_cursor().unwrap();
+        let mut cursor = capture.initial_recurrent_cursor().unwrap();
         let inputs = delta(1.0);
         let first = capture
             .prepare_recurrent_native(&runtime, &cursor, &inputs, &executor, false)
@@ -3733,7 +3729,7 @@ mod recurrent_tests {
             first
                 .banks
                 .transaction_schema
-                .prepare(&second.banks.transaction_owner, cursor.frontier()),
+                .prepare(&second.banks.transaction_owner, &mut cursor.frontier),
             Err(crate::effects::runtime::PreparedRecurrentTransactionError::Owner)
         ));
         assert_eq!(
