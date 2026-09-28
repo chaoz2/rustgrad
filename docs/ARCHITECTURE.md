@@ -523,6 +523,13 @@ physical registers. It owns one lane width plus scalar-tail identity instead of
 cloning masks or semantic payloads into each instruction; CPU JIT validates and
 keys this form before portable rendering.
 
+CPU render policy consumes a freshly validated lane plan from the linearizer.
+Construction retains the exact source projection through register allocation,
+so admission checks geometry and registers without deriving that projection
+twice. Public validation still reconstructs and compares the retained source:
+caller-modified plans receive no construction-time exemption. This changes
+neither rendered code nor artifact/cache identities.
+
 The static OpenCL, Metal, and WebGPU renderers project each validated pure UOp
 node through that same `LaneInstruction<R>` semantic boundary. One shared,
 exhaustive scalar-lane emitter consumes the enum's structurally fixed arity,
