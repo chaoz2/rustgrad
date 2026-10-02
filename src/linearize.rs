@@ -987,7 +987,18 @@ impl LinearKernel {
             program,
         })
     }
-    pub fn validate(&self) -> Result<(), LinearizeError> {
+    /// Validate a freshly derived plan without reconstructing its source projection.
+    pub(crate) fn from_uop_validated(source: &UOp) -> Result<Self, LinearizeError> {
+        let plan = Self::from_uop(source)?;
+        // from_uop owns the projection through linear_program, which preserves
+        // its instructions and source records. No caller can modify that proof
+        // before these remaining geometry and register checks.
+        plan.validate_geometry()?;
+        plan.validate_registers()?;
+        Ok(plan)
+    }
+
+    fn validate_geometry(&self) -> Result<(), LinearizeError> {
         if self.lanes == 0 || self.tail_mask.len() != self.lanes {
             return Err(LinearizeError::Invalid("invalid lane mask".into()));
         }
@@ -1009,6 +1020,11 @@ impl LinearKernel {
                 "a lane plan with unsupported operations cannot be enabled".into(),
             ));
         }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), LinearizeError> {
+        self.validate_geometry()?;
         let mut source_nodes = Vec::new();
         producer_order(&self.source, &mut BTreeSet::new(), &mut source_nodes);
         let expected = lane_instructions(&source_nodes)?;
@@ -1020,6 +1036,10 @@ impl LinearKernel {
                 "lane program does not match its retained source UOps".into(),
             ));
         }
+        self.validate_registers()
+    }
+
+    fn validate_registers(&self) -> Result<(), LinearizeError> {
         validate_program(
             &self.program,
             u16::try_from(if self.enabled { self.lanes } else { 1 })
@@ -1273,7 +1293,14 @@ impl<'a> LaneProducerIds<'a> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static LANE_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn lane_instructions(nodes: &[UOp]) -> Result<LaneProjection, LinearizeError> {
+    #[cfg(test)]
+    LANE_PROJECTIONS.with(|count| count.set(count.get() + 1));
     let ids = LaneProducerIds::new(nodes);
     let mut instructions = Vec::with_capacity(nodes.len());
     let mut control_operations = Vec::new();
@@ -1657,6 +1684,63 @@ mod tests {
             assert_eq!(
                 ids.owners.contains_key(&equal.node_identity()),
                 nodes.len() == 3
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_admission_matches_public_validation_with_one_projection() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", Shape::from([2, 3]));
+        let output = graph
+            .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
+            .unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let mut sources = vec![
+            scalar_copy_kernel(AddressSpace::Global),
+            projected_scalar_expand_kernel(),
+            schedule.items.last().unwrap().kernel.clone(),
+        ];
+        for length in [0, 9] {
+            let mut graph = Graph::new();
+            let input = graph.input("input", Shape::from([length]));
+            let output = graph.neg(input).unwrap();
+            sources.push(crate::lower_graph_elementwise(&graph, output).unwrap());
+        }
+        for source in sources {
+            LANE_PROJECTIONS.with(|count| count.set(0));
+            let expected = LinearKernel::from_uop(&source).unwrap();
+            expected.validate().unwrap();
+            assert_eq!(LANE_PROJECTIONS.with(|count| count.get()), 2);
+            LANE_PROJECTIONS.with(|count| count.set(0));
+            let actual = LinearKernel::from_uop_validated(&source).unwrap();
+            assert_eq!(LANE_PROJECTIONS.with(|count| count.get()), 1);
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+            assert_eq!(actual.cache_key, expected.cache_key);
+
+            let mut forged = actual.clone();
+            forged.program.control_operations.clear();
+            assert!(matches!(
+                forged.validate(),
+                Err(LinearizeError::Invalid(reason)) if reason.contains("retained source")
+            ));
+            let mut malformed = actual;
+            malformed.tail_mask.clear();
+            assert_eq!(
+                malformed.validate(),
+                Err(LinearizeError::Invalid("invalid lane mask".into()))
+            );
+        }
+        for source in [
+            scalar_copy_kernel(AddressSpace::Local),
+            UOp::constant(1, UType::scalar(DType::I32)),
+        ] {
+            let expected = LinearKernel::from_uop(&source)
+                .and_then(|plan| plan.validate().map(|()| plan))
+                .unwrap_err();
+            assert_eq!(
+                LinearKernel::from_uop_validated(&source).unwrap_err(),
+                expected
             );
         }
     }

@@ -344,9 +344,9 @@ pub(super) fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
 }
 
 fn elementwise_vector_plan(root: &UOp) -> Result<(crate::LinearKernel, VectorPlan), JitError> {
-    let linear = linear_kernel(root)?;
-    linear
-        .validate()
+    #[cfg(test)]
+    POLICY_LINEAR_DERIVATIONS.with(|count| count.set(count.get().saturating_add(1)));
+    let linear = crate::LinearKernel::from_uop_validated(root)
         .map_err(|error| JitError::Unsupported(error.to_string()))?;
     let vector = VectorPlan {
         lanes: linear.lanes,
@@ -356,8 +356,8 @@ fn elementwise_vector_plan(root: &UOp) -> Result<(crate::LinearKernel, VectorPla
     Ok((linear, vector))
 }
 
+#[cfg(test)]
 fn linear_kernel(root: &UOp) -> Result<crate::LinearKernel, JitError> {
-    #[cfg(test)]
     POLICY_LINEAR_DERIVATIONS.with(|count| count.set(count.get().saturating_add(1)));
     crate::LinearKernel::from_uop(root).map_err(|error| JitError::Unsupported(error.to_string()))
 }
