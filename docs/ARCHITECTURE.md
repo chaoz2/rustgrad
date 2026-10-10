@@ -1012,6 +1012,12 @@ roots reuse the completed UOp validation; replacement roots are validated normal
 The witness keeps the original roots alive, and no identity escapes the call or
 enters a serialized artifact. Descriptor, binding, output, ownership, dependency,
 and memory checks still run. Caller-owned schedules retain full kernel validation.
+Mixed-artifact decoding likewise retains a private, owning `DecodedKernels`
+witness from the bounded UOp decoder through schedule admission. It authorizes
+only pointer-identical roots, including across legacy metadata rekeying; all
+envelope, canonical-key, binding, effect, and ownership checks remain unchanged.
+Identity serialization still performs its own validation. The witness is local
+to decoding and neither changes the artifact format nor survives as a global cache.
 Each immutable recurrent role also owns one capture-bound authenticated identity
 and version-zero frontier. Sibling projection, cursor restoration, and artifact
 inspection reuse that witness; raw replay APIs still perform full validation.
