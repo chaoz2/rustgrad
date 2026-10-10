@@ -1006,6 +1006,12 @@ owns this proof and exposes only an immutable reference, preventing mutation
 between consumers. Public summary and memory-plan constructors still validate
 caller-owned schedules; allocation geometry and lifetime checks remain in the
 memory planner. This avoids repeated schedule validation, not artifact admission.
+For a freshly authenticated capture, the summary also borrows its immutable
+kernel-root identities while validating the projected schedule. Pointer-identical
+roots reuse the completed UOp validation; replacement roots are validated normally.
+The witness keeps the original roots alive, and no identity escapes the call or
+enters a serialized artifact. Descriptor, binding, output, ownership, dependency,
+and memory checks still run. Caller-owned schedules retain full kernel validation.
 Each immutable recurrent role also owns one capture-bound authenticated identity
 and version-zero frontier. Sibling projection, cursor restoration, and artifact
 inspection reuse that witness; raw replay APIs still perform full validation.

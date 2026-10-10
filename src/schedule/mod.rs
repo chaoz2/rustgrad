@@ -392,11 +392,20 @@ impl<'a> ValidatedSchedule<'a> {
     pub(crate) fn schedule(&self) -> &'a Schedule {
         self.0
     }
+
+    pub(super) fn with_authenticated_kernels(
+        schedule: &'a Schedule,
+        capture: &artifact::AuthenticatedFreshCapture,
+    ) -> Result<Self, ScheduleError> {
+        schedule.validate_with_authenticated_kernels(Some(capture))?;
+        Ok(Self(schedule))
+    }
 }
 
 #[cfg(test)]
 thread_local! {
     static VALIDATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static KERNEL_VALIDATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -404,10 +413,30 @@ pub(crate) fn validation_count() -> usize {
     VALIDATION_COUNT.get()
 }
 
+#[cfg(test)]
+fn kernel_validation_count() -> usize {
+    KERNEL_VALIDATION_COUNT.get()
+}
+
 impl Schedule {
     /// Validates deterministic DAG and universal effect-item invariants before
     /// a backend is allowed to inspect a kernel.
     pub fn validate(&self) -> Result<(), ScheduleError> {
+        self.validate_with_authenticated_kernels(None)
+    }
+
+    fn validate_with_authenticated_kernels(
+        &self,
+        authenticated: Option<&artifact::AuthenticatedFreshCapture>,
+    ) -> Result<(), ScheduleError> {
+        // The borrowed capture keeps these immutable Arc roots alive. Only
+        // pointer-identical DAGs inherit its proof; a replacement is validated
+        // normally even when it has the same structural shape or item ID.
+        let authenticated_roots = authenticated
+            .into_iter()
+            .flat_map(|capture| &capture.capture().items)
+            .map(|item| item.kernel.node_identity())
+            .collect::<BTreeSet<_>>();
         #[cfg(test)]
         VALIDATION_COUNT.set(VALIDATION_COUNT.get() + 1);
         let ids = self
@@ -529,7 +558,11 @@ impl Schedule {
                     }
                 }
             }
-            item.kernel.validate().map_err(ScheduleError::UOp)?;
+            if !authenticated_roots.contains(&item.kernel.node_identity()) {
+                #[cfg(test)]
+                KERNEL_VALIDATION_COUNT.set(KERNEL_VALIDATION_COUNT.get() + 1);
+                item.kernel.validate().map_err(ScheduleError::UOp)?;
+            }
             validate_item_output_bindings(item)?;
             if item.is_effect() {
                 if !item.outputs.is_single()
