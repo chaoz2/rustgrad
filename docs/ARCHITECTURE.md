@@ -1500,6 +1500,16 @@ mixed schema versions rather than inventing missing measurements. The ordinary
 scoreboard remains v26; this extra detail belongs to the separate warm-resume
 objective evidence, not its cold preparation report.
 
+Objective schema v11 additionally partitions AdamW owner restoration into
+module binding, topology sealing or cached lookup, checkpoint-frontier restore,
+and final destination validation. The opt-in
+`restore_from_resume_bundle_with_timings` returns `TrainingOwnerRestoreTimings`
+only with a successful owner. The ordinary path reads no clocks; both paths
+share admission, error ordering, destination ownership, and checkpoint formats.
+The comparator validates the exact phase fields, unsigned timing bounds, and
+their sum against caller-measured whole restore time. Timing values are
+observations, not stable identity or throughput evidence.
+
 Objective schema v10 additionally partitions resume-bundle loading into bounded
 file reading, envelope validation, compiled-program decode/admission, complete
 module-checkpoint decode, and pair authentication. The explicit

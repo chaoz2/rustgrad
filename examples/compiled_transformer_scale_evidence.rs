@@ -668,6 +668,7 @@ struct ScaleWarmResumeEvidence {
     artifact_decode_wall_time_ns: u64,
     bundle_load_phases: ScaleBundleLoadPhases,
     owner_restore_wall_time_ns: u64,
+    owner_restore_phases: ScaleOwnerRestorePhases,
     preparation_wall_time_ns: u64,
     preparation: ScaleWarmPreparationEvidence,
     capture_identity: u64,
@@ -741,9 +742,18 @@ struct ScaleResumeContractInput<'a> {
     measurement: ScaleResumeMeasurement,
 }
 
+#[derive(Serialize)]
+struct ScaleOwnerRestorePhases {
+    module_binding_wall_time_ns: u64,
+    topology_wall_time_ns: u64,
+    frontier_wall_time_ns: u64,
+    destination_validation_wall_time_ns: u64,
+}
+
 struct ScaleResumeContractResult<E> {
     preparation_evidence: E,
     owner_restore_wall_time: Option<Duration>,
+    owner_restore_phases: Option<rustgrad::TrainingOwnerRestoreTimings>,
     preparation_wall_time: Option<Duration>,
     module_visit_count: usize,
     canonical_state_count: usize,
@@ -1513,6 +1523,17 @@ fn collect_scale_warm_resume_evidence(
         module_checkpoint_bytes: persisted_checkpoint.as_bytes().len(),
         artifact_decode_wall_time_ns,
         bundle_load_phases,
+        owner_restore_phases: {
+            let phases = contract
+                .owner_restore_phases
+                .expect("warm resume records restore phases");
+            ScaleOwnerRestorePhases {
+                module_binding_wall_time_ns: duration_nanos(phases.module_binding)?,
+                topology_wall_time_ns: duration_nanos(phases.topology)?,
+                frontier_wall_time_ns: duration_nanos(phases.frontier)?,
+                destination_validation_wall_time_ns: duration_nanos(phases.destination_validation)?,
+            }
+        },
         owner_restore_wall_time_ns: duration_nanos(
             contract
                 .owner_restore_wall_time
@@ -1612,9 +1633,20 @@ fn run_scale_resume_contract<E>(
         ScaleResumeMeasurement::Record => Some(Instant::now()),
         ScaleResumeMeasurement::Omit => None,
     };
-    let restored_plan =
-        CompiledModuleAdamWPlan::restore_from_resume_bundle(destination, resume_bundle)
-            .map_err(|error| error.into_parts().1)?;
+    let (restored_plan, owner_restore_phases) = match measurement {
+        ScaleResumeMeasurement::Record => {
+            CompiledModuleAdamWPlan::restore_from_resume_bundle_with_timings(
+                destination,
+                resume_bundle,
+            )
+            .map(|(plan, timings)| (plan, Some(timings)))
+        }
+        ScaleResumeMeasurement::Omit => {
+            CompiledModuleAdamWPlan::restore_from_resume_bundle(destination, resume_bundle)
+                .map(|plan| (plan, None))
+        }
+    }
+    .map_err(|error| error.into_parts().1)?;
     let owner_restore_wall_time = owner_restore_started.map(|started| started.elapsed());
     assert_eq!(restored_plan.capture_identity(), capture_identity);
     assert_eq!(
@@ -1742,6 +1774,7 @@ fn run_scale_resume_contract<E>(
     Ok(ScaleResumeContractResult {
         preparation_evidence,
         owner_restore_wall_time,
+        owner_restore_phases,
         preparation_wall_time,
         module_visit_count,
         canonical_state_count,
@@ -2255,7 +2288,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let gradient_evidence = collect_scale_gradient_evidence()?;
 
     let objective = json!({
-        "schema_version": 10,
+        "schema_version": 11,
         "git_sha": &paths.git_sha,
         "workload": {
             "batch": BATCH,

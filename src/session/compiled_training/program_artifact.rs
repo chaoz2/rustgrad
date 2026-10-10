@@ -25,6 +25,22 @@ const METAL_FORMAT_VERSION: u8 = 2;
 const OPTIMIZER_FORMAT_VERSION: u8 = 3;
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Disjoint host-wall phases of a successful opt-in AdamW owner restore.
+///
+/// Topology includes first-use sealing or a cached lookup. These observations
+/// are not persisted, do not affect admission, and exclude outer orchestration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrainingOwnerRestoreTimings {
+    /// Snapshot destination identities and bind saved module descriptors.
+    pub module_binding: std::time::Duration,
+    /// Authenticate and construct the resource-free training topology.
+    pub topology: std::time::Duration,
+    /// Clone the sealed plan and restore its parameter/optimizer frontier.
+    pub frontier: std::time::Duration,
+    /// Verify the destination module remained unchanged before returning it.
+    pub destination_validation: std::time::Duration,
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct PortableResumeDecodeCounts {
@@ -1071,6 +1087,32 @@ impl<M: Module> CompiledModuleTrainingPlan<M, CompiledAdamWPlan, Option<u64>> {
             Err(source) => Err(CompiledModuleAdamWArtifactRestoreError { module, source }),
         }
     }
+
+    /// Restores exactly as `restore_from_resume_bundle`, with opt-in host timings.
+    ///
+    /// Failure returns the untouched destination through the same error type;
+    /// no partial timing report or runtime resources are published.
+    pub fn restore_from_resume_bundle_with_timings(
+        module: M,
+        bundle: &CompiledAdamWResumeBundle,
+    ) -> std::result::Result<
+        (Self, TrainingOwnerRestoreTimings),
+        CompiledModuleAdamWArtifactRestoreError<M>,
+    > {
+        let mut timings = TrainingOwnerRestoreTimings::default();
+        match restore_owner_from_admitted_timed(&module, bundle.admitted(), Some(&mut timings)) {
+            Ok((plan, seal)) => Ok((
+                Self {
+                    module,
+                    plan,
+                    seal,
+                    attachment: None,
+                },
+                timings,
+            )),
+            Err(source) => Err(CompiledModuleAdamWArtifactRestoreError { module, source }),
+        }
+    }
 }
 
 impl<M: Module> CompiledModuleTrainingPlan<M, CompiledMomentumSgdPlan> {
@@ -1355,6 +1397,15 @@ fn restore_owner_from_admitted<M: Module>(
     module: &M,
     admitted: &AdmittedArtifactCheckpointPair<CompiledAdamWCheckpoint>,
 ) -> Result<(CompiledAdamWPlan, CompiledModuleSeal)> {
+    restore_owner_from_admitted_timed(module, admitted, None)
+}
+
+fn restore_owner_from_admitted_timed<M: Module>(
+    module: &M,
+    admitted: &AdmittedArtifactCheckpointPair<CompiledAdamWCheckpoint>,
+    mut timings: Option<&mut TrainingOwnerRestoreTimings>,
+) -> Result<(CompiledAdamWPlan, CompiledModuleSeal)> {
+    let started = timings.as_ref().map(|_| std::time::Instant::now());
     let wire = &admitted.artifact.wire;
     let decoded_module = admitted.checkpoint.as_ref();
     let mut seal = CompiledModuleSeal::capture(module, &wire.frozen_parameters)?;
@@ -1367,7 +1418,15 @@ fn restore_owner_from_admitted<M: Module>(
             "compiled program artifact destination module mismatch",
         ));
     }
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.module_binding = started.expect("timed restore start").elapsed();
+    }
+    let started = timings.as_ref().map(|_| std::time::Instant::now());
     let plan = admitted.artifact.training_topology()?;
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.topology = started.expect("timed topology start").elapsed();
+    }
+    let started = timings.as_ref().map(|_| std::time::Instant::now());
     let plan = match plan.as_ref() {
         AdmittedTrainingTopology::AdamW(plan) => plan
             .as_ref()
@@ -1379,7 +1438,14 @@ fn restore_owner_from_admitted<M: Module>(
             ));
         }
     };
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.frontier = started.expect("timed frontier start").elapsed();
+    }
+    let started = timings.as_ref().map(|_| std::time::Instant::now());
     seal.validate_unchanged(module)?;
+    if let Some(timings) = timings {
+        timings.destination_validation = started.expect("timed destination start").elapsed();
+    }
     Ok((plan, seal))
 }
 

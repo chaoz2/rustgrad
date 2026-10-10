@@ -323,8 +323,9 @@ pub use session::{
     NativeTrainingReport, NativeTrainingScoreboard, NativeTrainingStepPhase,
     NativeTrainingStepPhaseReport, NativeTrainingWarmStepReport,
     ReportedNativeModuleInferenceResult, ResumeBundleLoadTimings, SessionDevice, SessionTarget,
-    Tensor, TrainingParameterInit, infer_module_cpu, infer_module_native_cpu,
-    infer_module_native_cpu_with_report, summarize_binary_classification, summarize_classification,
+    Tensor, TrainingOwnerRestoreTimings, TrainingParameterInit, infer_module_cpu,
+    infer_module_native_cpu, infer_module_native_cpu_with_report, summarize_binary_classification,
+    summarize_classification,
 };
 pub use sharded_cuda_execute::{
     BufferSubstitution, ShardedCudaExecutionEnvironment, ShardedCudaExecutionResult,
