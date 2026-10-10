@@ -17,7 +17,7 @@ use crate::uop::artifact::{
 };
 use crate::{
     CapturedSchedule, GgmlType, NodeId, QuantizedTensorData, ReplayInput, SymbolicDim,
-    SymbolicExpr, SymbolicShape, SymbolicVar,
+    SymbolicExpr, SymbolicShape, SymbolicVar, UOp,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -872,6 +872,33 @@ fn write_scheduled_outputs_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), 
 /// one explicit `Effect` boundary and v11 UOp payloads.
 pub(crate) fn write_effect_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
     write_item_inner(w, x, true)
+}
+
+/// Decoder-owned proof of complete UOp admission for immutable kernel roots.
+/// Keeping the roots alive prevents allocation identities from being reused.
+/// This does not authenticate any schedule metadata or artifact identity.
+pub(crate) struct DecodedKernels(Vec<UOp>);
+
+impl DecodedKernels {
+    pub(super) fn roots(&self) -> impl Iterator<Item = &UOp> {
+        self.0.iter()
+    }
+}
+
+pub(crate) fn read_effect_items(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<(Vec<ScheduleItem>, DecodedKernels), ArtifactError> {
+    if count > MAX_ITEMS {
+        return Err(ArtifactError::Format("item count"));
+    }
+    let items = (0..count)
+        .map(|_| read_effect_item(reader))
+        .collect::<Result<Vec<_>, _>>()?;
+    // read_effect_item delegates every kernel to the bounded UOp decoder,
+    // which validates the full DAG before returning it. No mutable UOp exists.
+    let kernels = DecodedKernels(items.iter().map(|item| item.kernel.clone()).collect());
+    Ok((items, kernels))
 }
 
 fn write_item_inner(w: &mut Writer, x: &ScheduleItem, effects: bool) -> Result<(), ArtifactError> {

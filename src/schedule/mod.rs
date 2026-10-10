@@ -414,7 +414,7 @@ pub(crate) fn validation_count() -> usize {
 }
 
 #[cfg(test)]
-fn kernel_validation_count() -> usize {
+pub(crate) fn kernel_validation_count() -> usize {
     KERNEL_VALIDATION_COUNT.get()
 }
 
@@ -437,6 +437,21 @@ impl Schedule {
             .flat_map(|capture| &capture.capture().items)
             .map(|item| item.kernel.node_identity())
             .collect::<BTreeSet<_>>();
+        self.validate_with_kernel_roots(&authenticated_roots)
+    }
+
+    pub(crate) fn validate_with_decoded_kernels(
+        &self,
+        decoded: &artifact::DecodedKernels,
+    ) -> Result<(), ScheduleError> {
+        let roots = decoded.roots().map(UOp::node_identity).collect();
+        self.validate_with_kernel_roots(&roots)
+    }
+
+    fn validate_with_kernel_roots(
+        &self,
+        authenticated_roots: &BTreeSet<usize>,
+    ) -> Result<(), ScheduleError> {
         #[cfg(test)]
         VALIDATION_COUNT.set(VALIDATION_COUNT.get() + 1);
         let ids = self
