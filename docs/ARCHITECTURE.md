@@ -1000,6 +1000,12 @@ Each derived recurrent prefix is rekeyed, assigned its canonical identity,
 checked for serialization-ineligible operations, and validated directly before
 its execution summary is built. Artifact-origin RGSM bytes retain their full
 bounded decoder and checksum admission; no capture or artifact identity changes.
+Execution summaries validate their projected schedule once and pass a
+crate-private `ValidatedSchedule` borrow to memory planning. The schedule module
+owns this proof and exposes only an immutable reference, preventing mutation
+between consumers. Public summary and memory-plan constructors still validate
+caller-owned schedules; allocation geometry and lifetime checks remain in the
+memory planner. This avoids repeated schedule validation, not artifact admission.
 Each immutable recurrent role also owns one capture-bound authenticated identity
 and version-zero frontier. Sibling projection, cursor restoration, and artifact
 inspection reuse that witness; raw replay APIs still perform full validation.
