@@ -112,7 +112,7 @@ impl ExecutionPlanSummary {
     ) -> Result<Self, ExecutionPlanSummaryError> {
         crate::schedule::artifact::validate_capture(capture)
             .map_err(|error| captured_summary_error(error.to_string()))?;
-        Self::from_validated_capture(capture, reuse_enabled)
+        Self::from_validated_capture(capture, reuse_enabled, None)
     }
 
     /// Reuses a private owned artifact proof while retaining the schedule and
@@ -121,12 +121,13 @@ impl ExecutionPlanSummary {
         capture: &super::artifact::AuthenticatedFreshCapture,
         reuse_enabled: bool,
     ) -> Result<Self, ExecutionPlanSummaryError> {
-        Self::from_validated_capture(capture.capture(), reuse_enabled)
+        Self::from_validated_capture(capture.capture(), reuse_enabled, Some(capture))
     }
 
     fn from_validated_capture(
         capture: &CapturedSchedule,
         reuse_enabled: bool,
+        authenticated: Option<&super::artifact::AuthenticatedFreshCapture>,
     ) -> Result<Self, ExecutionPlanSummaryError> {
         let requested_materializations = super::physical_requested_materializations(
             &capture.items,
@@ -172,8 +173,13 @@ impl ExecutionPlanSummary {
                 captured_requested_output(&outputs, &passthroughs, &inputs, &capture.constants, *id)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let validated = super::ValidatedSchedule::new(&schedule)
-            .map_err(ExecutionPlanSummaryError::Schedule)?;
+        let validated = match authenticated {
+            Some(capture) => {
+                super::ValidatedSchedule::with_authenticated_kernels(&schedule, capture)
+            }
+            None => super::ValidatedSchedule::new(&schedule),
+        }
+        .map_err(ExecutionPlanSummaryError::Schedule)?;
         Self::summarize(&validated, &requested, requested_outputs, reuse_enabled)
     }
 
@@ -357,6 +363,78 @@ mod tests {
             Err(MemoryPlanError::InvalidSchedule(expected.to_string()))
         );
         assert!(crate::schedule::ValidatedSchedule::new(&schedule).is_err());
+    }
+
+    #[test]
+    fn authenticated_kernel_reuse_preserves_summary_and_checks_replacements() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", Shape::from([2]));
+        let output = graph.square(input).unwrap();
+        let schedule = schedule_many(&graph, &[output]).unwrap();
+        let capture = CapturedSchedule::capture(&graph, &schedule, &[output]).unwrap();
+        let authenticated = super::super::artifact::begin_fresh_capture_seal(capture.clone())
+            .unwrap()
+            .authenticate()
+            .unwrap();
+        for reuse in [false, true] {
+            let expected = ExecutionPlanSummary::from_capture(&capture, reuse).unwrap();
+            let before = super::super::kernel_validation_count();
+            let actual =
+                ExecutionPlanSummary::from_authenticated_fresh_capture(&authenticated, reuse)
+                    .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(super::super::kernel_validation_count(), before);
+        }
+
+        let before = super::super::kernel_validation_count();
+        schedule.validate().unwrap();
+        assert_eq!(
+            super::super::kernel_validation_count() - before,
+            schedule.items.len()
+        );
+        let mut replaced = schedule.clone();
+        let root = &replaced.items[0].kernel;
+        replaced.items[0].kernel = crate::UOp::from_operation(
+            root.operation().clone(),
+            root.ty(),
+            root.sources().to_vec(),
+        );
+        let before = super::super::kernel_validation_count();
+        super::super::ValidatedSchedule::with_authenticated_kernels(&replaced, &authenticated)
+            .unwrap();
+        assert_eq!(super::super::kernel_validation_count() - before, 1);
+
+        // A kernel proof says nothing about the surrounding mutable schedule.
+        let mut malformed = schedule.clone();
+        malformed.items[0].id = 9;
+        let expected = malformed.validate().unwrap_err();
+        assert_eq!(
+            super::super::ValidatedSchedule::with_authenticated_kernels(&malformed, &authenticated)
+                .err(),
+            Some(expected)
+        );
+
+        // A replacement with invalid arity cannot inherit the old root proof.
+        replaced.items[0].boundary = Some(super::super::ScheduleBoundary::Unsupported("test"));
+        replaced.items[0].kernel = crate::UOp::from_operation(
+            crate::Operation::Load,
+            Some(crate::UType::scalar(DType::F32)),
+            vec![],
+        );
+        let expected = replaced.validate().unwrap_err();
+        assert!(matches!(expected, super::super::ScheduleError::UOp(_)));
+        assert_eq!(
+            super::super::ValidatedSchedule::with_authenticated_kernels(&replaced, &authenticated)
+                .err(),
+            Some(expected)
+        );
+        let mut malformed_capture = capture;
+        malformed_capture.items = replaced.items;
+        assert!(
+            super::super::artifact::begin_fresh_capture_seal(malformed_capture)
+                .and_then(|identified| identified.authenticate())
+                .is_err()
+        );
     }
 
     #[test]
