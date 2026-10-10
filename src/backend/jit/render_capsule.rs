@@ -585,11 +585,20 @@ fn authenticates_rendered_payload(rendered: &RenderedC) -> bool {
         && quantized_ordinals.len() == rendered.abi.quantized_buffers.len()
 }
 
+#[cfg(test)]
 fn authenticates_item_abi(item: &ScheduleItem, abi: &KernelAbi) -> bool {
+    authenticates_item_abi_with_order(item, abi, None)
+}
+
+fn authenticates_item_abi_with_order(
+    item: &ScheduleItem,
+    abi: &KernelAbi,
+    order: Option<&crate::uop::TopologicalOrder>,
+) -> bool {
     // This is the ordinary capsule-hit conjunction: authenticate the lowered
     // schedule bindings once, then derive and compare their exact native ABI.
     // Cold rendering retains CpuJitBackend::validate_rendered_schedule_item.
-    if !item.outputs.is_single() || item.validate_input_bindings().is_err() {
+    if !item.outputs.is_single() || item.validate_input_bindings_with_order(order).is_err() {
         return false;
     }
     let dense_inputs = item
@@ -962,7 +971,11 @@ fn authenticate_module(
                         entry.rendered.cache_key, item.cache_key
                     )
                 || validate_native_layout(item, layout).is_err()
-                || !authenticates_item_abi(item, &entry.rendered.abi)
+                || !authenticates_item_abi_with_order(
+                    item,
+                    &entry.rendered.abi,
+                    item_witness.render_topology.order(),
+                )
                 || !item_witness.authenticates(index, item, layout)
             {
                 return false;
@@ -2036,6 +2049,93 @@ mod tests {
 
         *rendered.source_map.values_mut().next().unwrap() = 0;
         assert!(!authenticates_rendered_payload(&rendered));
+    }
+
+    #[test]
+    fn capsule_authentication_rechecks_bindings_with_unchanged_kernel_identity() {
+        let mut graph = crate::Graph::new();
+        let input = graph.input_dtype("binding_owner", [7], crate::DType::F32);
+        let output = graph.square(input).unwrap();
+        let schedule = crate::schedule_many(&graph, &[output]).unwrap();
+        let layouts = schedule
+            .items
+            .iter()
+            .map(super::super::schedule_native_layout)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let backend = CpuJitBackend::new(crate::JitFallback::Error);
+        let recipe = capsule_recipe(&backend, 0, 1, &schedule.items, &layouts, &[]).unwrap();
+        let module =
+            super::super::render_schedule_module_entries(&backend, &schedule.items, &layouts, &[])
+                .unwrap();
+        assert!(authenticate_module(
+            &backend,
+            &recipe,
+            &module,
+            &schedule.items,
+            &layouts,
+            &[],
+        ));
+
+        let order = recipe.item_witnesses[0].render_topology.order().unwrap();
+        assert!(order.for_root(&schedule.items[0].kernel).is_some());
+        assert_eq!(
+            schedule.items[0].validate_input_bindings_with_order(Some(order)),
+            schedule.items[0].validate_input_bindings(),
+        );
+        type BindingMutation = (&'static str, fn(&mut ScheduleItem));
+        let mutations: [BindingMutation; 4] = [
+            ("missing inventory", |item| item.inputs.clear()),
+            ("binding ordinal", |item| {
+                item.input_bindings[0].abi_index += 1
+            }),
+            ("binding extent", |item| {
+                item.input_bindings[0].desc.bytes += 4
+            }),
+            ("output dtype", |item| {
+                let mut output = item.primary_output().clone();
+                output.dtype = crate::DType::I32;
+                item.outputs = crate::ScheduledOutputs::single(output);
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut items = schedule.items.clone();
+            mutate(&mut items[0]);
+            assert!(
+                items[0].kernel.shares_node_with(&schedule.items[0].kernel),
+                "{name}"
+            );
+            assert_eq!(items[0].cache_key, schedule.items[0].cache_key, "{name}");
+            assert_eq!(
+                items[0].validate_input_bindings_with_order(Some(order)),
+                items[0].validate_input_bindings(),
+                "retained order must preserve binding errors: {name}",
+            );
+            assert!(
+                !authenticate_module(&backend, &recipe, &module, &items, &layouts, &[],),
+                "stale descriptors must not inherit kernel ownership: {name}"
+            );
+        }
+
+        let mut replaced = schedule.items[0].clone();
+        replaced.kernel = crate::UOp::from_operation(
+            replaced.kernel.operation().clone(),
+            replaced.kernel.ty(),
+            replaced.kernel.sources().to_vec(),
+        );
+        assert!(order.for_root(&replaced.kernel).is_none());
+        assert_eq!(
+            replaced.validate_input_bindings_with_order(Some(order)),
+            replaced.validate_input_bindings(),
+            "equal but separately owned roots must use their own traversal",
+        );
+        replaced.kernel = crate::UOp::from_operation(crate::Operation::Load, None, Vec::new());
+        assert!(replaced.validate_input_bindings().is_err());
+        assert_eq!(
+            replaced.validate_input_bindings_with_order(Some(order)),
+            replaced.validate_input_bindings(),
+            "replacement roots must not borrow an unrelated load inventory",
+        );
     }
 
     #[test]

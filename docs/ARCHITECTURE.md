@@ -1442,9 +1442,12 @@ times. Wall times do not participate in identity.
   prepared-item authentication, remain unchanged. The witness is not persisted
   and changes no wire, key, version, API, schema, or identity.
   For ordinary Sink kernels, that recipe witness also retains the projected-index
-  fact derived during output-initialization traversal. The node list is dropped
-  immediately; only compact facts bound to the exact root and vector request
-  survive until batch completion. Warm authentication reuses those facts but
+  fact derived during output-initialization traversal. Its call-local canonical
+  order is retained with the exact immutable root until batch completion, so
+  schedule input-binding validation can reuse the traversal while checking the
+  current descriptors and ABI ordinals in full. A different root derives its
+  own order; the retained order proves no semantic validity. Dedicated kernels
+  keep their existing binding validation path. Warm authentication reuses those facts but
   still constructs and validates the linear policy at the original admission
   point. Cold misses do not eagerly derive linear policy. Frozen legacy recipe
   bytes, ownership rejection, and file/decode/authentication error ordering are

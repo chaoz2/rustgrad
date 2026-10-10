@@ -660,6 +660,31 @@ struct UOpNode {
 /// Immutable and structurally hashable. Cloning preserves DAG sharing.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct UOp(Arc<UOpNode>);
+
+/// A retained canonical traversal, not a semantic validation proof.
+/// Holding the root prevents identity reuse while consumers borrow the order.
+pub(crate) struct TopologicalOrder {
+    root: UOp,
+    nodes: Vec<UOp>,
+}
+
+impl TopologicalOrder {
+    pub(crate) fn new(root: &UOp) -> Result<Self, UOpError> {
+        Ok(Self {
+            nodes: root.topological()?,
+            root: root.clone(),
+        })
+    }
+
+    pub(crate) fn nodes(&self) -> &[UOp] {
+        &self.nodes
+    }
+
+    pub(crate) fn for_root(&self, root: &UOp) -> Option<&[UOp]> {
+        self.root.shares_node_with(root).then_some(&self.nodes)
+    }
+}
+
 impl UOp {
     pub fn from_operation(operation: Operation, ty: Option<UType>, sources: Vec<UOp>) -> Self {
         Self::from_parts(operation, ty, sources, None)
