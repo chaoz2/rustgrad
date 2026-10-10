@@ -11123,11 +11123,17 @@ fn compiled_resume_bundle_seals_one_decode_and_training_topology_for_restore() {
     let cloned = bundle.clone();
     assert!(bundle.shares_admission_with(&cloned));
     let before_restore = adamw_checkpoint_restore_counts();
-    let restored = CompiledModuleAdamWPlan::restore_from_resume_bundle(
+    let restore_started = std::time::Instant::now();
+    let (restored, timings) = CompiledModuleAdamWPlan::restore_from_resume_bundle_with_timings(
         TiedFrozenModule::new([9.0, 10.0]),
         &cloned,
     )
     .unwrap();
+    let phase_total = timings.module_binding
+        + timings.topology
+        + timings.frontier
+        + timings.destination_validation;
+    assert!(phase_total <= restore_started.elapsed());
     let independently_restored = CompiledModuleAdamWPlan::restore_from_resume_bundle(
         TiedFrozenModule::new([11.0, 12.0]),
         &bundle,
@@ -11196,13 +11202,14 @@ fn compiled_resume_bundle_seals_one_decode_and_training_topology_for_restore() {
     };
     let mismatched_before = mismatched_destination.shared.snapshot().unwrap();
     let before_mismatch = program_artifact::portable_resume_decode_counts();
-    let mismatched_destination = match CompiledModuleAdamWPlan::restore_from_resume_bundle(
-        mismatched_destination,
-        &bundle,
-    ) {
-        Ok(_) => panic!("admitted topology restored into a mismatched module"),
-        Err(error) => error.into_module(),
-    };
+    let mismatched_destination =
+        match CompiledModuleAdamWPlan::restore_from_resume_bundle_with_timings(
+            mismatched_destination,
+            &bundle,
+        ) {
+            Ok(_) => panic!("admitted topology restored into a mismatched module"),
+            Err(error) => error.into_module(),
+        };
     assert_parameter_snapshot_eq(
         &mismatched_destination.shared.snapshot().unwrap(),
         &mismatched_before,

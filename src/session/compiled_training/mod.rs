@@ -144,7 +144,7 @@ pub use self::program_artifact::{
     CompiledModuleMomentumSgdArtifactRestoreError, CompiledMomentumSgdProgramArtifact,
     CompiledMomentumSgdProgramArtifactFileError, CompiledTrainingOptimizer,
     CompiledTrainingProgramArtifact, CompiledTrainingProgramArtifactFileError,
-    CompiledTrainingProgramArtifactInfo,
+    CompiledTrainingProgramArtifactInfo, TrainingOwnerRestoreTimings,
 };
 use self::recurrent_effect::{RecurrentEffectReplacement, seal_recurrent_effects};
 use self::recurrent_phase::*;
