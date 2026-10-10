@@ -778,9 +778,8 @@ impl std::error::Error for ArtifactError {}
 /// retain their released envelopes; projected indices require v21 and tagged
 /// DAGs require v22; predicated projected indices require v23.
 pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
-    let nodes = root
-        .topological()
-        .map_err(|_| ArtifactError::Format("dag"))?;
+    let dag = EncodingDag::new(root)?;
+    let nodes = &dag.nodes;
     let version = if nodes
         .iter()
         .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
@@ -806,7 +805,7 @@ pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
         // standalone canonical bytes on the released v19 writer envelope.
         19
     };
-    encode_inner(root, false, version)
+    dag.encode(false, version)
 }
 
 /// Encodes the semantic kernel blob used by durable schedule identities.
@@ -818,9 +817,8 @@ pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
 /// logical UOp identity. Projected indices require the v21 envelope because
 /// their existing BufferIndex payload has a new authenticated source meaning.
 pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
-    let nodes = root
-        .topological()
-        .map_err(|_| ArtifactError::Format("dag"))?;
+    let dag = EncodingDag::new(root)?;
+    let nodes = &dag.nodes;
     // Tags are transient compiler metadata. A tagged executable kernel must be
     // explicitly stripped before scheduling rather than changing durable cache
     // identities or silently discarding metadata.
@@ -860,14 +858,43 @@ pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactEr
     } else {
         18
     };
-    encode_inner(root, effects, version)
+    dag.encode(effects, version)
 }
 
+// Own the canonical node order beside its borrowed immutable root. Version
+// selection and writing share this traversal, but it is not a validation proof:
+// full validation (including identity-based reduction ownership) still runs.
+struct EncodingDag<'a> {
+    root: &'a UOp,
+    nodes: Vec<UOp>,
+}
+
+impl<'a> EncodingDag<'a> {
+    fn new(root: &'a UOp) -> Result<Self, ArtifactError> {
+        let nodes = root
+            .topological()
+            .map_err(|_| ArtifactError::Format("dag"))?;
+        Ok(Self { root, nodes })
+    }
+
+    fn encode(&self, effects: bool, version: u8) -> Result<Vec<u8>, ArtifactError> {
+        self.root
+            .validate()
+            .map_err(|_| ArtifactError::Format("uop"))?;
+        encode_nodes(&self.nodes, effects, version)
+    }
+}
+
+#[cfg(test)]
 fn encode_inner(root: &UOp, effects: bool, version: u8) -> Result<Vec<u8>, ArtifactError> {
     root.validate().map_err(|_| ArtifactError::Format("uop"))?;
     let nodes = root
         .topological()
         .map_err(|_| ArtifactError::Format("dag"))?;
+    encode_nodes(&nodes, effects, version)
+}
+
+fn encode_nodes(nodes: &[UOp], effects: bool, version: u8) -> Result<Vec<u8>, ArtifactError> {
     if !effects
         && nodes.iter().any(|node| {
             matches!(
@@ -3472,6 +3499,41 @@ mod tests {
             }
         }
         finish(writer)
+    }
+
+    #[test]
+    fn encoding_reuses_canonical_order_without_changing_bytes_or_errors() {
+        let ty = UType::scalar(DType::I32);
+        let leaf = UOp::constant(7, ty);
+        let shared = UOp::binary(Binary::Add, leaf.clone(), leaf.clone());
+        let equal_but_distinct =
+            UOp::binary(Binary::Add, UOp::constant(7, ty), UOp::constant(7, ty));
+        for root in [leaf, shared, equal_but_distinct] {
+            // This fixture writer does not use EncodingDag or encode_nodes.
+            let fixture = encode_unvalidated_v21(&root);
+            for (version, actual) in [(19, encode(&root)), (18, encode_schedule_identity(&root))] {
+                let mut expected = fixture.clone();
+                expected[4] = version;
+                let body = expected.len() - 4;
+                let sum = checksum(&expected[..body]);
+                expected[body..].copy_from_slice(&sum.to_le_bytes());
+                assert_eq!(actual.unwrap(), expected);
+                assert_eq!(decode(&expected).unwrap(), root);
+            }
+        }
+
+        let malformed = UOp::from_operation(Operation::Cast, Some(ty), vec![]);
+        for root in [
+            malformed.clone(),
+            malformed.retag(Some(UOpTag::Text("invalid".into()))),
+        ] {
+            // Validation must precede tag rejection and wire-field admission.
+            assert_eq!(encode(&root), Err(ArtifactError::Format("uop")));
+            assert_eq!(
+                encode_schedule_identity(&root),
+                Err(ArtifactError::Format("uop"))
+            );
+        }
     }
 
     #[test]
