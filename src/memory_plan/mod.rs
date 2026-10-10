@@ -231,9 +231,17 @@ impl MemoryPlan {
         requested: &[NodeId],
         reuse: bool,
     ) -> Result<Self, MemoryPlanError> {
-        schedule
-            .validate()
+        let validated = crate::schedule::ValidatedSchedule::new(schedule)
             .map_err(|error| MemoryPlanError::InvalidSchedule(error.to_string()))?;
+        Self::from_validated_schedule(&validated, requested, reuse)
+    }
+
+    pub(crate) fn from_validated_schedule(
+        validated: &crate::schedule::ValidatedSchedule<'_>,
+        requested: &[NodeId],
+        reuse: bool,
+    ) -> Result<Self, MemoryPlanError> {
+        let schedule = validated.schedule();
         let temporaries = schedule.internal_temporaries(requested);
         Self::build(&schedule.items, &temporaries, reuse)
     }

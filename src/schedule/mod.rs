@@ -380,10 +380,36 @@ pub(crate) fn physical_requested_materializations(
         .collect()
 }
 
+/// Borrow-scoped proof: the schedule cannot change while consumers reuse it.
+pub(crate) struct ValidatedSchedule<'a>(&'a Schedule);
+
+impl<'a> ValidatedSchedule<'a> {
+    pub(crate) fn new(schedule: &'a Schedule) -> Result<Self, ScheduleError> {
+        schedule.validate()?;
+        Ok(Self(schedule))
+    }
+
+    pub(crate) fn schedule(&self) -> &'a Schedule {
+        self.0
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static VALIDATION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn validation_count() -> usize {
+    VALIDATION_COUNT.get()
+}
+
 impl Schedule {
     /// Validates deterministic DAG and universal effect-item invariants before
     /// a backend is allowed to inspect a kernel.
     pub fn validate(&self) -> Result<(), ScheduleError> {
+        #[cfg(test)]
+        VALIDATION_COUNT.set(VALIDATION_COUNT.get() + 1);
         let ids = self
             .items
             .iter()

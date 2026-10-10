@@ -82,9 +82,8 @@ impl ExecutionPlanSummary {
         requested: &[NodeId],
         reuse_enabled: bool,
     ) -> Result<Self, ExecutionPlanSummaryError> {
-        schedule
-            .validate()
-            .map_err(ExecutionPlanSummaryError::Schedule)?;
+        let validated =
+            super::ValidatedSchedule::new(schedule).map_err(ExecutionPlanSummaryError::Schedule)?;
         let outputs = schedule
             .items
             .iter()
@@ -100,7 +99,7 @@ impl ExecutionPlanSummary {
                     .ok_or(ExecutionPlanSummaryError::RequestedOutput(*node))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Self::summarize(schedule, requested, requested_outputs, reuse_enabled)
+        Self::summarize(&validated, requested, requested_outputs, reuse_enabled)
     }
 
     /// Summarizes one authenticated captured schedule, including direct
@@ -173,19 +172,19 @@ impl ExecutionPlanSummary {
                 captured_requested_output(&outputs, &passthroughs, &inputs, &capture.constants, *id)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Self::summarize(&schedule, &requested, requested_outputs, reuse_enabled)
+        let validated = super::ValidatedSchedule::new(&schedule)
+            .map_err(ExecutionPlanSummaryError::Schedule)?;
+        Self::summarize(&validated, &requested, requested_outputs, reuse_enabled)
     }
 
     fn summarize(
-        schedule: &Schedule,
+        validated: &super::ValidatedSchedule<'_>,
         requested: &[NodeId],
         requested_outputs: Vec<BufferDesc>,
         reuse_enabled: bool,
     ) -> Result<Self, ExecutionPlanSummaryError> {
-        schedule
-            .validate()
-            .map_err(ExecutionPlanSummaryError::Schedule)?;
-        let memory = MemoryPlan::from_schedule(schedule, requested, reuse_enabled)
+        let schedule = validated.schedule();
+        let memory = MemoryPlan::from_validated_schedule(validated, requested, reuse_enabled)
             .map_err(ExecutionPlanSummaryError::Memory)?;
         let items = schedule
             .items
@@ -305,8 +304,19 @@ mod tests {
         let output = graph.sum(squared, 1).unwrap();
         let schedule = schedule_many(&graph, &[output]).unwrap();
         for reuse in [false, true] {
+            let before = crate::schedule::validation_count();
+            let direct = ExecutionPlanSummary::from_schedule(&schedule, &[output], reuse).unwrap();
+            assert_eq!(crate::schedule::validation_count() - before, 1);
             let summary = ExecutionPlanSummary::from_graph(&graph, &[output], reuse).unwrap();
+            assert_eq!(direct, summary);
             let memory = MemoryPlan::from_schedule(&schedule, &[output], reuse).unwrap();
+            let validated = crate::schedule::ValidatedSchedule::new(&schedule).unwrap();
+            let before = crate::schedule::validation_count();
+            assert_eq!(
+                memory,
+                MemoryPlan::from_validated_schedule(&validated, &[output], reuse).unwrap()
+            );
+            assert_eq!(crate::schedule::validation_count(), before);
             assert_eq!(summary.temporary_allocation_count, memory.temporaries.len());
             assert_eq!(summary.schedule_item_count, schedule.items.len());
             assert_eq!(summary.peak_logical_allocations, memory.peak_allocations);
@@ -324,6 +334,29 @@ mod tests {
                 ExecutionPlanSummary::from_graph(&graph, &[output], reuse).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn mutated_schedule_requires_new_validation_before_planning() {
+        let mut graph = Graph::new();
+        let input = graph.input("input", Shape::from([2]));
+        let output = graph.square(input).unwrap();
+        let mut schedule = schedule_many(&graph, &[output]).unwrap();
+        {
+            let validated = crate::schedule::ValidatedSchedule::new(&schedule).unwrap();
+            assert!(MemoryPlan::from_validated_schedule(&validated, &[output], true).is_ok());
+        }
+        schedule.items[0].id = 9;
+        let expected = schedule.validate().unwrap_err();
+        assert_eq!(
+            ExecutionPlanSummary::from_schedule(&schedule, &[NodeId::from_index(999)], true),
+            Err(ExecutionPlanSummaryError::Schedule(expected.clone()))
+        );
+        assert_eq!(
+            MemoryPlan::from_schedule(&schedule, &[output], true),
+            Err(MemoryPlanError::InvalidSchedule(expected.to_string()))
+        );
+        assert!(crate::schedule::ValidatedSchedule::new(&schedule).is_err());
     }
 
     #[test]
