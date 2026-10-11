@@ -35,7 +35,18 @@ pub(super) fn specialized_item_key(
     source_identity: u64,
     bindings: &[(u64, i64)],
 ) -> Result<u64, ArtifactError> {
-    let item = item_bytes(item)?;
+    specialized_item_key_with_kernel(item, source_identity, bindings, || {
+        encode_schedule_identity(&item.kernel).map(Cow::Owned)
+    })
+}
+
+pub(super) fn specialized_item_key_with_kernel<'a>(
+    item: &ScheduleItem,
+    source_identity: u64,
+    bindings: &[(u64, i64)],
+    kernel: impl FnOnce() -> Result<Cow<'a, [u8]>, ArtifactError>,
+) -> Result<u64, ArtifactError> {
+    let item = item_bytes_with_kernel(item, kernel)?;
     let mut writer = domain_writer(SPECIALIZED_DOMAIN)?;
     write_blob(&mut writer, &item)?;
     writer.u64(source_identity)?;

@@ -195,10 +195,17 @@ pub fn decode_scheduled_outputs(bytes: &[u8]) -> Result<CapturedSchedule, Artifa
 }
 
 pub(crate) fn identity(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
+    identity_with_items(capture, |writer, item| write_item(writer, item, true))
+}
+
+fn identity_with_items(
+    capture: &CapturedSchedule,
+    write: impl FnMut(&mut Writer, &ScheduleItem) -> Result<(), ArtifactError>,
+) -> Result<u64, ArtifactError> {
     #[cfg(test)]
     IDENTITY_CALL_COUNT.with(|count| count.set(count.get() + 1));
     let mut w = Writer::new();
-    write_payload(&mut w, capture)?;
+    write_payload_with_items(&mut w, capture, write)?;
     if w.out
         .len()
         .checked_add(17)
@@ -239,7 +246,15 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 fn write_payload(w: &mut Writer, c: &CapturedSchedule) -> Result<(), ArtifactError> {
-    write_base(w, c, true, true, true)?;
+    write_payload_with_items(w, c, |writer, item| write_item(writer, item, true))
+}
+
+fn write_payload_with_items(
+    w: &mut Writer,
+    c: &CapturedSchedule,
+    write: impl FnMut(&mut Writer, &ScheduleItem) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    write_base_with_items(w, c, true, write)?;
     w.bool(c.symbolic.is_some())?;
     if let Some(schema) = &c.symbolic {
         write_symbolic_schema(w, schema)?;
@@ -384,6 +399,7 @@ fn write_payload_v1(w: &mut Writer, c: &CapturedSchedule) -> Result<(), Artifact
     write_base(w, c, false, false, false)
 }
 
+#[cfg(test)]
 fn write_base(
     w: &mut Writer,
     c: &CapturedSchedule,
@@ -391,8 +407,7 @@ fn write_base(
     output_lists: bool,
     affine_views: bool,
 ) -> Result<(), ArtifactError> {
-    write_len(w, c.items.len(), MAX_ITEMS)?;
-    for item in &c.items {
+    write_base_with_items(w, c, affine_views, |w, item| {
         if quantized_items {
             if output_lists {
                 write_item(w, item, affine_views)?;
@@ -405,6 +420,19 @@ fn write_base(
             }
             write_item_v3(w, item)?;
         }
+        Ok(())
+    })
+}
+
+fn write_base_with_items(
+    w: &mut Writer,
+    c: &CapturedSchedule,
+    affine_views: bool,
+    mut write: impl FnMut(&mut Writer, &ScheduleItem) -> Result<(), ArtifactError>,
+) -> Result<(), ArtifactError> {
+    write_len(w, c.items.len(), MAX_ITEMS)?;
+    for item in &c.items {
+        write(w, item)?;
     }
     write_len(w, c.inputs.len(), MAX_BINDINGS)?;
     for input in &c.inputs {
@@ -795,6 +823,17 @@ fn identity_v5(capture: &CapturedSchedule) -> Result<u64, ArtifactError> {
 }
 
 fn write_item(w: &mut Writer, x: &ScheduleItem, affine_views: bool) -> Result<(), ArtifactError> {
+    write_output_item_with_kernel(w, x, affine_views, || {
+        encode_schedule_identity(&x.kernel).map(Cow::Owned)
+    })
+}
+
+fn write_output_item_with_kernel<'a>(
+    w: &mut Writer,
+    x: &ScheduleItem,
+    affine_views: bool,
+    kernel: impl FnOnce() -> Result<Cow<'a, [u8]>, ArtifactError>,
+) -> Result<(), ArtifactError> {
     w.u64(x.id)?;
     w.u64(x.node.index() as u64)?;
     write_u64s(w, &x.dependencies)?;
@@ -823,7 +862,7 @@ fn write_item(w: &mut Writer, x: &ScheduleItem, affine_views: bool) -> Result<()
     for output in x.outputs.iter() {
         write_desc_inner(w, output, affine_views)?;
     }
-    let kernel = encode_schedule_identity(&x.kernel)?;
+    let kernel = kernel()?;
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
     w.bytes(&kernel)?;
     write_boundary(w, x.boundary.as_ref())?;
@@ -994,6 +1033,7 @@ fn write_item_with_kernel<'a>(
     w.u64(x.cache_key)
 }
 
+#[cfg(test)]
 fn write_item_v3(w: &mut Writer, x: &ScheduleItem) -> Result<(), ArtifactError> {
     w.u64(x.id)?;
     w.u64(x.node.index() as u64)?;
@@ -1814,6 +1854,9 @@ pub(crate) struct IdentifiedFreshCapture {
 pub(crate) struct RekeyedFreshCapture {
     capture: CapturedSchedule,
     keys: Box<[u64]>,
+    // The owned capture keeps every allocation alive and exposes no mutation.
+    // Only canonical kernel bytes are retained; item metadata stays uncached.
+    kernels: BTreeMap<usize, OnceCell<Result<Vec<u8>, ArtifactError>>>,
 }
 
 impl RekeyedFreshCapture {
@@ -1822,13 +1865,50 @@ impl RekeyedFreshCapture {
             .specialized_from
             .as_ref()
             .map(|source| (source.source_identity, source.bindings.as_slice()));
-        super::rekey_schedule_items(&mut capture.items, &[], specialization)?;
+        let mut kernels: BTreeMap<usize, OnceCell<Result<Vec<u8>, ArtifactError>>> =
+            BTreeMap::new();
+        for item in &mut capture.items {
+            let entry = kernels.entry(item.kernel.node_identity()).or_default();
+            let kernel = || {
+                entry
+                    .get_or_init(|| encode_schedule_identity(&item.kernel))
+                    .as_deref()
+                    .map_err(Clone::clone)
+            };
+            item.cache_key = match specialization {
+                Some((source, bindings)) => super::identity::specialized_item_key_with_kernel(
+                    item,
+                    source,
+                    bindings,
+                    || kernel().map(Cow::Borrowed),
+                ),
+                None => super::identity::item_key_with_kernel(item, kernel),
+            }
+            .map_err(|error| {
+                super::ScheduleError::Binding(format!("schedule identity: {error}"))
+            })?;
+        }
         let keys = capture.items.iter().map(|item| item.cache_key).collect();
-        Ok(Self { capture, keys })
+        Ok(Self {
+            capture,
+            keys,
+            kernels,
+        })
     }
 
     pub(crate) fn identify(mut self) -> Result<IdentifiedFreshCapture, ArtifactError> {
-        self.capture.identity = identity(&self.capture)?;
+        self.capture.identity = identity_with_items(&self.capture, |writer, item| {
+            write_output_item_with_kernel(writer, item, true, || {
+                match self.kernels.get(&item.kernel.node_identity()) {
+                    Some(entry) => entry
+                        .get_or_init(|| encode_schedule_identity(&item.kernel))
+                        .as_deref()
+                        .map(Cow::Borrowed)
+                        .map_err(Clone::clone),
+                    None => encode_schedule_identity(&item.kernel).map(Cow::Owned),
+                }
+            })
+        })?;
         Ok(IdentifiedFreshCapture {
             capture: self.capture,
             retained_keys: Some(self.keys),
@@ -2698,6 +2778,75 @@ mod tests {
         let legacy = legacy_fresh_capture_seal(capture).unwrap();
         assert_eq!(sealed.identity, legacy.identity);
         assert_eq!(encode(&sealed).unwrap(), encode(&legacy).unwrap());
+    }
+
+    #[test]
+    fn owned_rekeying_reuses_canonical_kernels_and_preserves_specialization() {
+        for specialized in [false, true] {
+            let mut capture = fixture();
+            // Shared immutable roots may reuse bytes, but distinct item metadata
+            // must still contribute independently to the item keys.
+            let mut second = capture.items[0].clone();
+            second.id += 1;
+            capture.items.push(second);
+            if specialized {
+                capture.specialized_from = Some(crate::engine::symbolic::SpecializedFrom {
+                    source_identity: 73,
+                    bindings: vec![(2, 4)],
+                });
+            }
+            let mut reference = capture.clone();
+            let specialization = reference
+                .specialized_from
+                .as_ref()
+                .map(|source| (source.source_identity, source.bindings.as_slice()));
+            super::super::rekey_schedule_items(&mut reference.items, &[], specialization).unwrap();
+            let owned = RekeyedFreshCapture::new(capture).unwrap();
+            assert_eq!(owned.kernels.len(), 1);
+            let canonical = encode_schedule_identity(&reference.items[0].kernel).unwrap();
+            assert_eq!(
+                owned
+                    .kernels
+                    .values()
+                    .next()
+                    .unwrap()
+                    .get()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap(),
+                &canonical
+            );
+            assert_eq!(
+                owned.keys.as_ref(),
+                reference
+                    .items
+                    .iter()
+                    .map(|item| item.cache_key)
+                    .collect::<Vec<_>>()
+            );
+            assert_ne!(owned.keys[0], owned.keys[1]);
+            let identified = owned.identify().unwrap();
+            assert_eq!(identified.capture.identity, identity(&reference).unwrap());
+            // This deliberately duplicated schedule is not valid for execution;
+            // reusing bytes must not bypass its ordinary structural rejection.
+            assert_eq!(
+                identified.authenticate().err().unwrap(),
+                validate(&reference, true, true).unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_rekeying_serializes_metadata_afresh() {
+        let mut owned = RekeyedFreshCapture::new(fixture()).unwrap();
+        // Production exposes no mutation. White-box mutation distinguishes
+        // kernel-only retention from accidentally retaining whole item bytes.
+        owned.capture.items[0].dependencies.push(u64::MAX);
+        let expected_identity = identity(&owned.capture).unwrap();
+        let expected_error = validate(&owned.capture, true, true).unwrap_err();
+        let identified = owned.identify().unwrap();
+        assert_eq!(identified.capture.identity, expected_identity);
+        assert_eq!(identified.authenticate().err().unwrap(), expected_error);
     }
 
     #[test]
