@@ -2438,14 +2438,15 @@ impl CapturedMixedSchedule {
             return Err(ReplayError::Corrupt("RGSM identity".into()));
         }
         if legacy {
-            crate::schedule::rekey_schedule_items(
+            crate::schedule::rekey_decoded_schedule_items(
                 &mut decoded.schedule.items,
                 &decoded.state_bindings,
-                None,
+                &decoded_kernels,
             )
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         }
-        decoded.schedule.identity = identity(&decoded)?;
+        decoded.schedule.identity =
+            identity_with_decoded_kernels(&decoded, Some(&decoded_kernels))?;
         // Current payloads already passed the same structural/key checks and
         // remain unchanged. Only legacy rekeying needs another validation;
         // the schedule identity above is not consumed by structural admission.
@@ -4978,6 +4979,60 @@ mod tests {
     }
 
     #[test]
+    fn decoded_kernel_reuse_preserves_mixed_keys_and_payload() {
+        let mut capture = captured_effect();
+        let mut writer = Writer::new();
+        for item in &capture.schedule.items {
+            crate::schedule::artifact::write_effect_item(&mut writer, item).unwrap();
+        }
+        let (items, kernels) = crate::schedule::artifact::read_effect_items(
+            &mut Reader::new(&writer.out),
+            capture.schedule.items.len(),
+        )
+        .unwrap();
+        capture.schedule.items = items;
+        validate_with_decoded_kernels(&capture, true, Some(&kernels)).unwrap();
+        assert_eq!(
+            capture
+                .payload_with_decoded_kernels(Some(&kernels))
+                .unwrap(),
+            capture.to_bytes_without_identity().unwrap(),
+        );
+        assert_eq!(
+            identity_with_decoded_kernels(&capture, Some(&kernels)).unwrap(),
+            identity(&capture).unwrap()
+        );
+        let mut retained = capture.schedule.items.clone();
+        let mut reference = retained.clone();
+        crate::schedule::rekey_decoded_schedule_items(
+            &mut retained,
+            &capture.state_bindings,
+            &kernels,
+        )
+        .unwrap();
+        crate::schedule::rekey_schedule_items(&mut reference, &capture.state_bindings, None)
+            .unwrap();
+        assert_eq!(
+            retained
+                .iter()
+                .map(|item| item.cache_key)
+                .collect::<Vec<_>>(),
+            reference
+                .iter()
+                .map(|item| item.cache_key)
+                .collect::<Vec<_>>()
+        );
+        let bytes = capture.to_bytes().unwrap();
+        assert_eq!(
+            CapturedMixedSchedule::from_bytes(&bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
     fn released_rgsm_v1_v2_layout_fixture_remains_decodable() {
         // Preserve the historical fixture used before the identity migration:
         // v1 and v2 share the released typed field layout, differing only in
@@ -5395,11 +5450,18 @@ fn validate_with_decoded_kernels(
             .specialized_from
             .as_ref()
             .map(|source| (source.source_identity, source.bindings.as_slice()));
-        crate::schedule::rekey_schedule_items(
-            &mut expected,
-            &schedule.state_bindings,
-            specialization,
-        )
+        match decoded {
+            Some(kernels) => crate::schedule::rekey_decoded_schedule_items(
+                &mut expected,
+                &schedule.state_bindings,
+                kernels,
+            ),
+            None => crate::schedule::rekey_schedule_items(
+                &mut expected,
+                &schedule.state_bindings,
+                specialization,
+            ),
+        }
         .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         if expected
             .iter()
@@ -5474,21 +5536,39 @@ fn validate_with_decoded_kernels(
     Ok(())
 }
 fn identity(value: &CapturedMixedSchedule) -> Result<u64, ReplayError> {
+    identity_with_decoded_kernels(value, None)
+}
+
+fn identity_with_decoded_kernels(
+    value: &CapturedMixedSchedule,
+    decoded: Option<&crate::schedule::artifact::DecodedKernels>,
+) -> Result<u64, ReplayError> {
     #[cfg(test)]
     record_prepared_replay_validation(|counts| counts.identity_serializations += 1);
     // The mixed-capture payload deliberately excludes the ordinary capture's
     // identity field, so hashing does not need to clone the immutable program.
-    let bytes = value.to_bytes_without_identity()?;
+    let bytes = value.payload_with_decoded_kernels(decoded)?;
     Ok(bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
     }))
 }
 impl CapturedMixedSchedule {
     fn to_bytes_without_identity(&self) -> Result<Vec<u8>, ReplayError> {
+        self.payload_with_decoded_kernels(None)
+    }
+
+    fn payload_with_decoded_kernels(
+        &self,
+        decoded: Option<&crate::schedule::artifact::DecodedKernels>,
+    ) -> Result<Vec<u8>, ReplayError> {
         let mut w = Writer::new();
         write_len(&mut w, self.schedule.items.len())?;
         for item in &self.schedule.items {
-            crate::schedule::artifact::write_effect_item(&mut w, item).map_err(codec)?;
+            match decoded {
+                Some(kernels) => kernels.write_effect_item(&mut w, item),
+                None => crate::schedule::artifact::write_effect_item(&mut w, item),
+            }
+            .map_err(codec)?;
         }
         write_inputs(&mut w, &self.schedule.inputs)?;
         write_constants(&mut w, &self.schedule.constants)?;

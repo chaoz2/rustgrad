@@ -1005,6 +1005,13 @@ ordered seal. It exposes no mutable capture access; structural authentication
 compares those keys at the usual gate instead of serializing each kernel again.
 Imported and caller-owned captures still recompute their expected keys. All
 kernel, descriptor, binding, dependency, and ownership checks remain unchanged.
+During mixed-artifact decoding, the decoder-owned kernel proof lazily retains
+canonical kernel bytes across item-key verification and payload identity
+serialization. Each entry owns its immutable root and is keyed by allocation
+identity; unrelated roots cannot borrow its bytes. The first encoding stays at
+the original validation gate, and schedule metadata is serialized afresh.
+Imported wire bytes are never substituted for canonical encoding. This cache
+is dropped with decoder admission; legacy rekeying and envelope checks remain.
 Execution summaries validate their projected schedule once and pass a
 crate-private `ValidatedSchedule` borrow to memory planning. The schedule module
 owns this proof and exposes only an immutable reference, preventing mutation

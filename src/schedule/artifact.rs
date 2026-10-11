@@ -22,6 +22,7 @@ use crate::{
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::{borrow::Cow, cell::OnceCell};
 
 const MAGIC: &[u8; 4] = b"RGSA";
 /// v7 replaces implementation-selected `DefaultHasher` item/specialization
@@ -877,11 +878,42 @@ pub(crate) fn write_effect_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), 
 /// Decoder-owned proof of complete UOp admission for immutable kernel roots.
 /// Keeping the roots alive prevents allocation identities from being reused.
 /// This does not authenticate any schedule metadata or artifact identity.
-pub(crate) struct DecodedKernels(Vec<UOp>);
+pub(crate) struct DecodedKernels {
+    roots: Vec<UOp>,
+    canonical: BTreeMap<usize, OnceCell<Result<Vec<u8>, ArtifactError>>>,
+}
 
 impl DecodedKernels {
     pub(super) fn roots(&self) -> impl Iterator<Item = &UOp> {
-        self.0.iter()
+        self.roots.iter()
+    }
+
+    // Entries are keyed by allocation identity, and roots keep each allocation
+    // alive. Bytes are produced lazily at the original codec gate, never copied
+    // from untrusted wire input or paired with an unrelated kernel.
+    fn canonical_bytes(&self, root: &UOp) -> Result<&[u8], ArtifactError> {
+        let entry = self
+            .canonical
+            .get(&root.node_identity())
+            .ok_or(ArtifactError::Format("decoded kernel ownership"))?;
+        entry
+            .get_or_init(|| encode_schedule_identity(root))
+            .as_deref()
+            .map_err(Clone::clone)
+    }
+
+    pub(super) fn item_key(&self, item: &ScheduleItem) -> Result<u64, ArtifactError> {
+        super::identity::item_key_with_kernel(item, || self.canonical_bytes(&item.kernel))
+    }
+
+    pub(crate) fn write_effect_item(
+        &self,
+        writer: &mut Writer,
+        item: &ScheduleItem,
+    ) -> Result<(), ArtifactError> {
+        write_item_with_kernel(writer, item, true, || {
+            self.canonical_bytes(&item.kernel).map(Cow::Borrowed)
+        })
     }
 }
 
@@ -897,11 +929,28 @@ pub(crate) fn read_effect_items(
         .collect::<Result<Vec<_>, _>>()?;
     // read_effect_item delegates every kernel to the bounded UOp decoder,
     // which validates the full DAG before returning it. No mutable UOp exists.
-    let kernels = DecodedKernels(items.iter().map(|item| item.kernel.clone()).collect());
+    let kernels = DecodedKernels {
+        roots: items.iter().map(|item| item.kernel.clone()).collect(),
+        canonical: items
+            .iter()
+            .map(|item| (item.kernel.node_identity(), OnceCell::new()))
+            .collect(),
+    };
     Ok((items, kernels))
 }
 
 fn write_item_inner(w: &mut Writer, x: &ScheduleItem, effects: bool) -> Result<(), ArtifactError> {
+    write_item_with_kernel(w, x, effects, || {
+        encode_schedule_identity(&x.kernel).map(Cow::Owned)
+    })
+}
+
+fn write_item_with_kernel<'a>(
+    w: &mut Writer,
+    x: &ScheduleItem,
+    effects: bool,
+    kernel: impl FnOnce() -> Result<Cow<'a, [u8]>, ArtifactError>,
+) -> Result<(), ArtifactError> {
     if !x.outputs.is_single() {
         return Err(ArtifactError::Unsupported);
     }
@@ -930,7 +979,7 @@ fn write_item_inner(w: &mut Writer, x: &ScheduleItem, effects: bool) -> Result<(
         w.u64(id.index() as u64)?;
     }
     write_desc_inner(w, x.primary_output(), effects)?;
-    let kernel = encode_schedule_identity(&x.kernel)?;
+    let kernel = kernel()?;
     write_len(w, kernel.len(), MAX_ARTIFACT_BYTES)?;
     w.bytes(&kernel)?;
     write_boundary_inner(w, x.boundary.as_ref(), effects)?;
@@ -2554,6 +2603,68 @@ mod tests {
         let y = graph.square(x).unwrap();
         let schedule = crate::schedule(&graph, y).unwrap();
         CapturedSchedule::capture(&graph, &schedule, &[y]).unwrap()
+    }
+
+    #[test]
+    fn decoded_kernel_bytes_are_lazy_canonical_and_allocation_bound() {
+        let original = fixture();
+        let mut wire = Writer::new();
+        for item in &original.items {
+            write_effect_item(&mut wire, item).unwrap();
+        }
+        let (items, kernels) =
+            read_effect_items(&mut Reader::new(&wire.out), original.items.len()).unwrap();
+        assert!(
+            kernels
+                .canonical
+                .values()
+                .all(|entry| entry.get().is_none())
+        );
+        for item in &items {
+            assert_eq!(
+                kernels.item_key(item).unwrap(),
+                super::super::identity::item_key(item).unwrap()
+            );
+            let bytes = kernels.canonical_bytes(&item.kernel).unwrap();
+            assert_eq!(bytes, encode_schedule_identity(&item.kernel).unwrap());
+            let pointer = bytes.as_ptr();
+            let mut retained = Writer::new();
+            kernels.write_effect_item(&mut retained, item).unwrap();
+            let mut reference = Writer::new();
+            write_effect_item(&mut reference, item).unwrap();
+            assert_eq!(retained.out, reference.out);
+            assert_eq!(
+                pointer,
+                kernels.canonical_bytes(&item.kernel).unwrap().as_ptr()
+            );
+
+            // Schedule fields are always serialized afresh, not cached with
+            // the root; sharing a kernel does not authorize stale metadata.
+            let mut changed = item.clone();
+            changed.id += 1;
+            assert_eq!(
+                kernels.item_key(&changed).unwrap(),
+                super::super::identity::item_key(&changed).unwrap()
+            );
+            assert_ne!(
+                kernels.item_key(&changed).unwrap(),
+                kernels.item_key(item).unwrap()
+            );
+
+            // Even a structurally equal decoded allocation is not this proof's
+            // root. Public callers still use the uncached canonical codec.
+            changed.kernel = decode_uop(bytes).unwrap();
+            assert_eq!(
+                kernels.item_key(&changed),
+                Err(ArtifactError::Format("decoded kernel ownership"))
+            );
+        }
+        assert!(
+            kernels
+                .canonical
+                .values()
+                .all(|entry| entry.get().is_some())
+        );
     }
 
     fn legacy_fresh_capture_seal(
