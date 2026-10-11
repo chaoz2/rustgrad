@@ -4,6 +4,7 @@ use crate::{DType, Shape, SymbolicExpr};
 pub mod artifact;
 mod operation;
 mod schema;
+mod traversal;
 pub use operation::{
     AddressValue, IndexAddressing, IndexValue, LiteralValue, MatmulValue, MovementValue, Operation,
     PrefixScanValue, ReductionValue, SortValue, TensorGuardValue, ThreefryValue, VariableValue,
@@ -783,30 +784,12 @@ impl UOp {
     pub fn sink(sources: Vec<UOp>) -> Self {
         Self::from_operation(Operation::Sink, None, sources)
     }
+    /// Returns source-ordered depth-first postorder, retaining the first
+    /// representative of each structurally equal node. Traversal uses a heap
+    /// work stack and call-local canonical child IDs; it does not validate
+    /// operation semantics or alter the immutable DAG.
     pub fn topological(&self) -> Result<Vec<UOp>, UOpError> {
-        fn visit(
-            n: &UOp,
-            seen: &mut BTreeSet<UOp>,
-            active: &mut BTreeSet<UOp>,
-            out: &mut Vec<UOp>,
-        ) -> Result<(), UOpError> {
-            if seen.contains(n) {
-                return Ok(());
-            }
-            if !active.insert(n.clone()) {
-                return Err(UOpError::Cycle);
-            }
-            for s in n.sources() {
-                visit(s, seen, active, out)?
-            }
-            active.remove(n);
-            seen.insert(n.clone());
-            out.push(n.clone());
-            Ok(())
-        }
-        let mut out = vec![];
-        visit(self, &mut BTreeSet::new(), &mut BTreeSet::new(), &mut out)?;
-        Ok(out)
+        traversal::topological(self)
     }
     pub fn is_pure(&self) -> bool {
         self.operation().is_pure()

@@ -76,6 +76,7 @@ src/
   benchmark.rs           normalized observations and offline comparisons
   uop/                   tinygrad-style universal operation IR
     mod.rs               typed operations, values, validation and rewrites
+    traversal.rs         call-local canonical DAG postorder and allocation memo
     artifact.rs          bounded typed UOp DAG node-table codec
   schedule/              realization, fusion, indexing and memory planning
     artifact.rs          portable schedule descriptors and bindings
@@ -2893,7 +2894,7 @@ byte-compatible schema validation.
 
 ## Universal UOp boundary
 
-`uop.rs` owns the backend-neutral immutable DAG used after the typed tensor
+`uop/mod.rs` owns the backend-neutral immutable DAG used after the typed tensor
 `Graph` has chosen an expression. It has typed payloads, address-space
 metadata, structural ordering, validation and deterministic rewrites. The
 portable `kernel.rs` layer adds owned typed bindings, logical element versus
@@ -2901,6 +2902,18 @@ byte addressing, normalized row-major/broadcast index plans, and a range/load/
 store interpreter for pure elementwise graphs. Bindings clone `TensorData` at
 the execution boundary, so the UOp runtime cannot borrow or alias caller
 storage. The CPU backend remains the differential semantic oracle.
+
+`uop/traversal.rs` derives source-ordered depth-first postorder with a heap work
+stack. A call-local allocation memo visits each shared allocation once, while
+canonical keys compare operation payload, result type, ordered child IDs, and
+tags instead of recursively comparing whole subgraphs. Canonical child IDs
+preserve structural deduplication across distinct equal allocations and retain
+the same first representative. Allocation addresses never determine output
+order or semantic equivalence; the borrowed root owns the entire DAG throughout
+the call. Traversal performs no semantic admission and leaves public UOp
+equality, hashing, ordering, and artifact identities unchanged. Deep traversal
+acceptance is separate from recursive validation, rewrite, and Arc destruction
+boundaries.
 
 `UOpNode` stores one typed `Operation`, its result type, its sources, and an
 optional immutable `UOpTag`. Tags are a small canonical value algebra covering
