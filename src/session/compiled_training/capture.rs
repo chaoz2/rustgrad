@@ -239,15 +239,13 @@ impl AuthenticatedRecurrentPrefix {
                 .iter()
                 .map(|binding| binding.producer_output.id),
         );
-        let specialization = pure
-            .specialized_from
-            .as_ref()
-            .map(|source| (source.source_identity, source.bindings.as_slice()));
-        crate::schedule::rekey_schedule_items(&mut pure.items, &[], specialization)
-            .map_err(schedule_error)?;
-        Self::identify_capture(pure)
+        crate::schedule::artifact::RekeyedFreshCapture::new(pure)
+            .map_err(schedule_error)?
+            .identify()
+            .map_err(|error| training(format!("compiled artifact capture identity: {error}")))
     }
 
+    #[cfg(test)]
     fn identify_capture(pure: CapturedSchedule) -> Result<IdentifiedFreshCapture> {
         crate::schedule::artifact::begin_fresh_capture_seal(pure)
             .map_err(|error| training(format!("compiled artifact capture identity: {error}")))

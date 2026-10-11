@@ -1000,6 +1000,11 @@ Each derived recurrent prefix is rekeyed, assigned its canonical identity,
 checked for serialization-ineligible operations, and validated directly before
 its execution summary is built. Artifact-origin RGSM bytes retain their full
 bounded decoder and checksum admission; no capture or artifact identity changes.
+An owned rekeying witness retains the freshly computed item keys through this
+ordered seal. It exposes no mutable capture access; structural authentication
+compares those keys at the usual gate instead of serializing each kernel again.
+Imported and caller-owned captures still recompute their expected keys. All
+kernel, descriptor, binding, dependency, and ownership checks remain unchanged.
 Execution summaries validate their projected schedule once and pass a
 crate-private `ValidatedSchedule` borrow to memory planning. The schedule module
 owns this proof and exposes only an immutable reference, preventing mutation
