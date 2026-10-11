@@ -11,6 +11,7 @@ thread_local! {
     static ORDERED_BANK_TRANSACTION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BANK_REQUEST_MAP_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BANK_ORDINAL_SORT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BANK_SLOT_LOOKUP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -308,47 +309,34 @@ impl HostSlotPool {
         } else {
             BANK_REQUEST_MAP_BUILD_COUNT.set(BANK_REQUEST_MAP_BUILD_COUNT.get().saturating_add(1));
         }
-        for (ordinal, request) in requests.iter().enumerate() {
-            if !Arc::ptr_eq(&self.inner, request.inner())
-                || requested
-                    .as_mut()
-                    .is_some_and(|requested| requested.insert(request.slot(), ordinal).is_some())
-            {
-                return Err(HostBufferBankTransactionError::Host(
-                    HostBufferError::OwnerMismatch,
-                ));
+        // The pool lock keeps this exact full-frontier order stable through
+        // staging and publication. Partial/reordered requests still look up
+        // their slots individually and preserve request-order error precedence.
+        if ordered_full_frontier {
+            for (request, slot) in requests.iter().zip(state.slots.values_mut()) {
+                if !Arc::ptr_eq(&self.inner, request.inner()) {
+                    return Err(HostBufferBankTransactionError::Host(
+                        HostBufferError::OwnerMismatch,
+                    ));
+                }
+                prepare_bank_slot(slot, request).map_err(HostBufferBankTransactionError::Host)?;
             }
-            let slot = live_slot(&mut state, request.slot(), request.generation())
-                .map_err(HostBufferBankTransactionError::Host)?;
-            if slot.views != 0 || slot.mutable_window {
-                return Err(HostBufferBankTransactionError::Host(
-                    HostBufferError::OutstandingBorrow {
-                        slot: request.slot(),
-                    },
-                ));
-            }
-            if slot.descriptor.as_ref() != Some(request.descriptor()) {
-                return Err(HostBufferBankTransactionError::Host(
-                    HostBufferError::IncompatibleDescriptor,
-                ));
-            }
-            let inactive = 1 - slot.active;
-            if !request.retain_active()
-                && slot.values[inactive]
-                    .as_ref()
-                    .is_none_or(|value| !tensor_matches_descriptor(value, request.descriptor()))
-            {
-                slot.values[inactive] = Some(
-                    TensorData::zeros_with_dtype(
-                        request.descriptor().shape.clone(),
-                        request.descriptor().dtype,
-                    )
-                    .map_err(|_| {
-                        HostBufferBankTransactionError::Host(
-                            HostBufferError::IncompatibleDescriptor,
-                        )
-                    })?,
-                );
+        } else {
+            for (ordinal, request) in requests.iter().enumerate() {
+                if !Arc::ptr_eq(&self.inner, request.inner())
+                    || requested
+                        .as_mut()
+                        .expect("generic bank transaction owns its request map")
+                        .insert(request.slot(), ordinal)
+                        .is_some()
+                {
+                    return Err(HostBufferBankTransactionError::Host(
+                        HostBufferError::OwnerMismatch,
+                    ));
+                }
+                let slot = bank_slot(&mut state.slots, request.slot())
+                    .map_err(HostBufferBankTransactionError::Host)?;
+                prepare_bank_slot(slot, request).map_err(HostBufferBankTransactionError::Host)?;
             }
         }
 
@@ -415,12 +403,18 @@ impl HostSlotPool {
             ));
         }
         drop(banks);
-        for request in requests.iter().filter(|request| !request.retain_active()) {
-            let slot = state
-                .slots
-                .get_mut(&request.slot())
-                .expect("validated inactive persistent bank remains live");
-            slot.active = 1 - slot.active;
+        if ordered_full_frontier {
+            for (request, slot) in requests.iter().zip(state.slots.values_mut()) {
+                if !request.retain_active() {
+                    slot.active = 1 - slot.active;
+                }
+            }
+        } else {
+            for request in requests.iter().filter(|request| !request.retain_active()) {
+                let slot = bank_slot(&mut state.slots, request.slot())
+                    .expect("validated inactive persistent bank remains live");
+                slot.active = 1 - slot.active;
+            }
         }
         Ok(value)
     }
@@ -940,6 +934,49 @@ impl Drop for HostBufferView {
     }
 }
 
+fn bank_slot(slots: &mut BTreeMap<u64, Slot>, slot: u64) -> Result<&mut Slot, HostBufferError> {
+    #[cfg(test)]
+    BANK_SLOT_LOOKUP_COUNT.set(BANK_SLOT_LOOKUP_COUNT.get().saturating_add(1));
+    slots
+        .get_mut(&slot)
+        .ok_or(HostBufferError::MissingSlot(slot))
+}
+
+fn prepare_bank_slot(
+    slot: &mut Slot,
+    request: &impl HostBufferBankRequestLike,
+) -> Result<(), HostBufferError> {
+    if slot.generation != request.generation() || !slot.leased {
+        return Err(HostBufferError::StaleGeneration {
+            slot: request.slot(),
+            generation: request.generation(),
+        });
+    }
+    if slot.views != 0 || slot.mutable_window {
+        return Err(HostBufferError::OutstandingBorrow {
+            slot: request.slot(),
+        });
+    }
+    if slot.descriptor.as_ref() != Some(request.descriptor()) {
+        return Err(HostBufferError::IncompatibleDescriptor);
+    }
+    let inactive = 1 - slot.active;
+    if !request.retain_active()
+        && slot.values[inactive]
+            .as_ref()
+            .is_none_or(|value| !tensor_matches_descriptor(value, request.descriptor()))
+    {
+        slot.values[inactive] = Some(
+            TensorData::zeros_with_dtype(
+                request.descriptor().shape.clone(),
+                request.descriptor().dtype,
+            )
+            .map_err(|_| HostBufferError::IncompatibleDescriptor)?,
+        );
+    }
+    Ok(())
+}
+
 fn live_slot(
     state: &mut PoolState,
     slot: u64,
@@ -1142,6 +1179,7 @@ mod tests {
             second.borrowed_bank_request(true),
         ];
         reset_host_bank_transaction_test_counts();
+        BANK_SLOT_LOOKUP_COUNT.set(0);
         pool.transact_ordered_inactive_banks(&requests, |banks| {
             assert_eq!(banks.len(), 2);
             assert_eq!((banks[0].ordinal(), banks[0].buffer_id()), (0, 7));
@@ -1153,6 +1191,7 @@ mod tests {
             Ok::<_, ()>(())
         })
         .unwrap();
+        assert_eq!(BANK_SLOT_LOOKUP_COUNT.get(), 0);
         assert_eq!(
             first.view().unwrap().tensor().unwrap().to_vec_f64(),
             vec![5.0, 6.0]
@@ -1169,6 +1208,169 @@ mod tests {
                 ordinal_sorts: 0,
             }
         );
+    }
+
+    #[test]
+    fn ordered_bank_admission_preserves_generic_errors_and_active_values() {
+        for ordered in [false, true] {
+            for fault in ["owner", "generation", "borrow", "descriptor", "precedence"] {
+                let pool = HostSlotPool::new();
+                let foreign = HostSlotPool::new();
+                let first = pool.lease(Some(7), desc(7, [2])).unwrap();
+                let second = pool.lease(Some(9), desc(9, [2])).unwrap();
+                first
+                    .write(TensorData::new([2], vec![1.0, 2.0]).unwrap())
+                    .unwrap();
+                second
+                    .write(TensorData::new([2], vec![3.0, 4.0]).unwrap())
+                    .unwrap();
+                let mut requests = [first.bank_request(), second.bank_request()];
+                let view = (fault == "borrow").then(|| second.view().unwrap());
+                let expected = match fault {
+                    "owner" => {
+                        requests[1].inner = foreign.inner.clone();
+                        HostBufferError::OwnerMismatch
+                    }
+                    "generation" => {
+                        requests[1].generation += 1;
+                        HostBufferError::StaleGeneration {
+                            slot: 9,
+                            generation: requests[1].generation,
+                        }
+                    }
+                    "borrow" => HostBufferError::OutstandingBorrow { slot: 9 },
+                    "descriptor" => {
+                        requests[1].descriptor.dtype = DType::I32;
+                        HostBufferError::IncompatibleDescriptor
+                    }
+                    "precedence" => {
+                        requests[0].generation += 1;
+                        requests[1].inner = foreign.inner.clone();
+                        HostBufferError::StaleGeneration {
+                            slot: 7,
+                            generation: requests[0].generation,
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                let result =
+                    pool.transact_inactive_banks_impl(&requests, ordered, |_| -> Result<(), ()> {
+                        panic!("{fault}: rejected request reached staging")
+                    });
+                let Err(HostBufferBankTransactionError::<()>::Host(actual)) = result else {
+                    panic!("{fault}: expected host admission error")
+                };
+                assert_eq!(actual, expected, "ordered={ordered}, fault={fault}");
+                drop(view);
+                assert_eq!(
+                    first.view().unwrap().tensor().unwrap().to_vec_f64(),
+                    vec![1.0, 2.0]
+                );
+                assert_eq!(
+                    second.view().unwrap().tensor().unwrap().to_vec_f64(),
+                    vec![3.0, 4.0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_bank_staging_retains_generic_rollback_and_retry() {
+        for ordered in [false, true] {
+            let pool = HostSlotPool::new();
+            let lease = pool.lease(Some(7), desc(7, [2])).unwrap();
+            lease
+                .write(TensorData::new([2], vec![1.0, 2.0]).unwrap())
+                .unwrap();
+            let requests = [lease.bank_request()];
+            for malformed in [false, true] {
+                let result = pool.transact_inactive_banks_impl(&requests, ordered, |banks| {
+                    let (_, successor) = banks[0].tensors();
+                    *successor = if malformed {
+                        TensorData::new([1], vec![9.0]).unwrap()
+                    } else {
+                        TensorData::new([2], vec![9.0, 8.0]).unwrap()
+                    };
+                    if malformed { Ok(()) } else { Err("reject") }
+                });
+                if malformed {
+                    assert!(matches!(
+                        result,
+                        Err(HostBufferBankTransactionError::Host(
+                            HostBufferError::IncompatibleDescriptor
+                        ))
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(HostBufferBankTransactionError::Stage("reject"))
+                    ));
+                }
+                assert_eq!(
+                    lease.view().unwrap().tensor().unwrap().to_vec_f64(),
+                    vec![1.0, 2.0]
+                );
+            }
+            BANK_SLOT_LOOKUP_COUNT.set(0);
+            pool.transact_inactive_banks_impl(&requests, ordered, |banks| {
+                let (_, successor) = banks[0].tensors();
+                *successor = TensorData::new([2], vec![5.0, 6.0]).unwrap();
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+            assert_eq!(BANK_SLOT_LOOKUP_COUNT.get(), if ordered { 0 } else { 2 });
+            assert_eq!(
+                lease.view().unwrap().tensor().unwrap().to_vec_f64(),
+                vec![5.0, 6.0]
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_bank_requests_fall_back_for_reordered_or_partial_frontiers() {
+        for partial in [false, true] {
+            let pool = HostSlotPool::new();
+            let first = pool.lease(Some(7), desc(7, [2])).unwrap();
+            let second = pool.lease(Some(9), desc(9, [2])).unwrap();
+            first
+                .write(TensorData::new([2], vec![1.0, 2.0]).unwrap())
+                .unwrap();
+            second
+                .write(TensorData::new([2], vec![3.0, 4.0]).unwrap())
+                .unwrap();
+            let mut requests = vec![second.borrowed_bank_request(false)];
+            if !partial {
+                requests.push(first.borrowed_bank_request(true));
+            }
+            reset_host_bank_transaction_test_counts();
+            pool.transact_ordered_inactive_banks(&requests, |banks| {
+                assert_eq!(banks.len(), requests.len());
+                assert_eq!(banks[0].buffer_id(), 9);
+                if !partial {
+                    assert_eq!(banks[1].buffer_id(), 7);
+                    assert!(banks[1].is_retained());
+                }
+                *banks[0].tensors().1 = TensorData::new([2], vec![5.0, 6.0]).unwrap();
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+            assert_eq!(
+                host_bank_transaction_test_counts(),
+                HostBankTransactionTestCounts {
+                    ordered_full_frontier_transactions: 0,
+                    request_map_builds: 1,
+                    ordinal_sorts: 1,
+                }
+            );
+            assert_eq!(
+                first.view().unwrap().tensor().unwrap().to_vec_f64(),
+                vec![1.0, 2.0]
+            );
+            assert_eq!(
+                second.view().unwrap().tensor().unwrap().to_vec_f64(),
+                vec![5.0, 6.0]
+            );
+        }
     }
 
     #[test]
