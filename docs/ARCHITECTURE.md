@@ -1013,8 +1013,13 @@ The same owned witness retains canonical kernel bytes from rekeying through
 payload identity serialization. Its immutable capture keeps the keyed root
 allocations alive; shared roots reuse bytes while each item's metadata is
 serialized afresh. Encoding remains lazy at the original item-key gate, and
-the retained bytes are dropped after identification. Artifact bytes, logical
-keys, and structural admission are unchanged.
+the retained bytes are dropped after identification. Successful encoding has
+already validated each complete immutable kernel DAG. The identified capture
+retains those roots through structural authentication, avoiding another kernel
+validation only for the exact same allocations. Replacement roots take the
+ordinary validation path; descriptors, bindings, dependencies, output ownership,
+keys, and subsequent memory planning are still checked. The roots are released
+with the temporary proof. Artifact bytes and logical keys are unchanged.
 Imported and caller-owned captures still recompute their expected keys. All
 kernel, descriptor, binding, dependency, and ownership checks remain unchanged.
 During mixed-artifact decoding, the decoder-owned kernel proof lazily retains
