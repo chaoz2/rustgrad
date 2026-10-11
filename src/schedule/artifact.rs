@@ -54,6 +54,7 @@ const MAX_BINDINGS: usize = 1 << 16;
 #[cfg(test)]
 std::thread_local! {
     static IDENTITY_CALL_COUNT: Cell<usize> = const { Cell::new(0) };
+    static STRUCTURAL_KERNEL_VALIDATION_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 pub fn encode(capture: &CapturedSchedule) -> Result<Vec<u8>, ArtifactError> {
@@ -1342,7 +1343,7 @@ fn validate(
     validate_keys: bool,
     allow_computed_passthroughs: bool,
 ) -> Result<(), ArtifactError> {
-    validate_with_retained_keys(c, validate_keys, allow_computed_passthroughs, None)
+    validate_with_retained_keys(c, validate_keys, allow_computed_passthroughs, None, &[])
 }
 
 fn validate_with_retained_keys(
@@ -1350,7 +1351,14 @@ fn validate_with_retained_keys(
     validate_keys: bool,
     allow_computed_passthroughs: bool,
     retained_keys: Option<&[u64]>,
+    validated_kernels: &[UOp],
 ) -> Result<(), ArtifactError> {
+    // Proof roots stay alive for this call. Only the exact immutable allocation
+    // inherits codec admission; caller-owned replacements validate normally.
+    let validated_roots = validated_kernels
+        .iter()
+        .map(UOp::node_identity)
+        .collect::<BTreeSet<_>>();
     if c.items.len() > MAX_ITEMS
         || c.inputs.len() > MAX_BINDINGS
         || c.constants.len() > MAX_BINDINGS
@@ -1401,9 +1409,13 @@ fn validate_with_retained_keys(
         }
         item.validate_input_bindings()
             .map_err(|_| ArtifactError::Format("input bindings"))?;
-        item.kernel
-            .validate()
-            .map_err(|_| ArtifactError::Format("kernel"))?;
+        if !validated_roots.contains(&item.kernel.node_identity()) {
+            #[cfg(test)]
+            STRUCTURAL_KERNEL_VALIDATION_COUNT.with(|count| count.set(count.get() + 1));
+            item.kernel
+                .validate()
+                .map_err(|_| ArtifactError::Format("kernel"))?;
+        }
         super::validate_item_output_bindings(item)
             .map_err(|_| ArtifactError::Format("kernel outputs"))?;
         let mut inventory = BTreeSet::new();
@@ -1846,6 +1858,9 @@ pub(crate) fn validate_capture(c: &CapturedSchedule) -> Result<(), ArtifactError
 pub(crate) struct IdentifiedFreshCapture {
     capture: CapturedSchedule,
     retained_keys: Option<Box<[u64]>>,
+    // Successful canonical encoding validates each complete immutable DAG.
+    // Retain the roots, not just addresses, until structural admission finishes.
+    validated_kernels: Vec<UOp>,
 }
 
 /// Owns the complete capture from key assignment through identity sealing.
@@ -1910,6 +1925,14 @@ impl RekeyedFreshCapture {
             })
         })?;
         Ok(IdentifiedFreshCapture {
+            validated_kernels: self
+                .capture
+                .items
+                .iter()
+                .map(|item| (item.kernel.node_identity(), item.kernel.clone()))
+                .collect::<BTreeMap<_, _>>()
+                .into_values()
+                .collect(),
             capture: self.capture,
             retained_keys: Some(self.keys),
         })
@@ -1929,6 +1952,7 @@ pub(crate) fn begin_fresh_capture_seal(
     Ok(IdentifiedFreshCapture {
         capture,
         retained_keys: None,
+        validated_kernels: Vec::new(),
     })
 }
 
@@ -1942,7 +1966,13 @@ impl IdentifiedFreshCapture {
     }
 
     pub(crate) fn authenticate(self) -> Result<AuthenticatedFreshCapture, ArtifactError> {
-        validate_with_retained_keys(&self.capture, true, true, self.retained_keys.as_deref())?;
+        validate_with_retained_keys(
+            &self.capture,
+            true,
+            true,
+            self.retained_keys.as_deref(),
+            &self.validated_kernels,
+        )?;
         Ok(AuthenticatedFreshCapture {
             capture: self.capture,
         })
@@ -2847,6 +2877,42 @@ mod tests {
         let identified = owned.identify().unwrap();
         assert_eq!(identified.capture.identity, expected_identity);
         assert_eq!(identified.authenticate().err().unwrap(), expected_error);
+    }
+
+    #[test]
+    fn owned_rekeying_reuses_only_exact_kernel_admission() {
+        let original = fixture();
+        let identified = RekeyedFreshCapture::new(original.clone())
+            .unwrap()
+            .identify()
+            .unwrap();
+        assert_eq!(identified.validated_kernels.len(), original.items.len());
+        STRUCTURAL_KERNEL_VALIDATION_COUNT.set(0);
+        let sealed = identified.authenticate().unwrap().into_inner();
+        assert_eq!(STRUCTURAL_KERNEL_VALIDATION_COUNT.get(), 0);
+
+        // Ordinary public admission never inherits a fresh-construction proof.
+        STRUCTURAL_KERNEL_VALIDATION_COUNT.set(0);
+        validate_capture(&sealed).unwrap();
+        assert_eq!(STRUCTURAL_KERNEL_VALIDATION_COUNT.get(), sealed.items.len());
+        assert_eq!(encode(&sealed).unwrap(), encode(&original).unwrap());
+
+        // Production exposes no mutation; a white-box replacement demonstrates
+        // that equal semantics are insufficient to borrow another root's proof.
+        let mut identified = RekeyedFreshCapture::new(original)
+            .unwrap()
+            .identify()
+            .unwrap();
+        let replacement = fixture().items.remove(0).kernel;
+        assert_ne!(
+            replacement.node_identity(),
+            identified.capture.items[0].kernel.node_identity()
+        );
+        identified.capture.items[0].kernel = replacement;
+        STRUCTURAL_KERNEL_VALIDATION_COUNT.set(0);
+        let replaced = identified.authenticate().unwrap().into_inner();
+        assert_eq!(STRUCTURAL_KERNEL_VALIDATION_COUNT.get(), 1);
+        assert_eq!(encode(&replaced).unwrap(), encode(&sealed).unwrap());
     }
 
     #[test]
