@@ -10,6 +10,7 @@ use crate::uop::artifact::{
     write_buffer_state, write_shape,
 };
 use crate::{ScheduleItem, ScheduleStateBinding};
+use std::borrow::Cow;
 
 const ITEM_DOMAIN: &[u8] = b"rustgrad-schedule-item";
 const SPECIALIZED_DOMAIN: &[u8] = b"rustgrad-schedule-specialization";
@@ -18,6 +19,15 @@ const KEY_VERSION: u8 = 1;
 
 pub(super) fn item_key(item: &ScheduleItem) -> Result<u64, ArtifactError> {
     Ok(fnv1a64(&item_bytes(item)?))
+}
+
+pub(super) fn item_key_with_kernel<'a>(
+    item: &ScheduleItem,
+    kernel: impl FnOnce() -> Result<&'a [u8], ArtifactError>,
+) -> Result<u64, ArtifactError> {
+    Ok(fnv1a64(&item_bytes_with_kernel(item, || {
+        kernel().map(Cow::Borrowed)
+    })?))
 }
 
 pub(super) fn specialized_item_key(
@@ -64,6 +74,15 @@ pub(super) fn canonical_item_bytes(item: &ScheduleItem) -> Result<Vec<u8>, Artif
 }
 
 fn item_bytes(item: &ScheduleItem) -> Result<Vec<u8>, ArtifactError> {
+    item_bytes_with_kernel(item, || {
+        encode_schedule_identity(&item.kernel).map(Cow::Owned)
+    })
+}
+
+fn item_bytes_with_kernel<'a>(
+    item: &ScheduleItem,
+    kernel: impl FnOnce() -> Result<Cow<'a, [u8]>, ArtifactError>,
+) -> Result<Vec<u8>, ArtifactError> {
     let mut writer = domain_writer(ITEM_DOMAIN)?;
     writer.u64(item.id)?;
     writer.u64(item.node.index() as u64)?;
@@ -77,7 +96,7 @@ fn item_bytes(item: &ScheduleItem) -> Result<Vec<u8>, ArtifactError> {
         write_desc(&mut writer, desc)?;
     }
     write_boundary(&mut writer, item.boundary.as_ref())?;
-    let kernel = encode_schedule_identity(&item.kernel)?;
+    let kernel = kernel()?;
     write_blob(&mut writer, &kernel)?;
     write_len(&mut writer, item.external_materializations.len())?;
     for node in &item.external_materializations {
