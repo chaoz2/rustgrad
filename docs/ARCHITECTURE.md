@@ -2801,6 +2801,14 @@ unfolded because signed zero, NaN ordering, and payload behavior are observable.
 Conditional control, guards, reductions, effects, and artifact decoding stay
 outside this normalization boundary.
 
+The UOp codec retains one root-bound canonical topological order per encode or
+decode call. Version selection, semantic validation, encoding, and decoder
+reachability checks reuse that order rather than reconstructing it. This is
+not a validation cache: semantic checks still run at their original gates,
+including the independent allocation-based reduction ownership walk. Wire
+field validation, historical version rejection, unreachable-node errors, and
+canonical artifact bytes remain unchanged.
+
 UPat matching keeps alternatives and exact/prefix/repeated/permuted source
 constraints inside the matcher rather than adding another operation taxonomy.
 Alternatives are tried in declaration order, and an apply callback that declines
