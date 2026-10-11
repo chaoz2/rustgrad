@@ -161,6 +161,24 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Caller-corpus training and cross-process resume
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --example compiled_corpus_train
+          cargo build --example compiled_corpus_train
+          python3 .github/scripts/check-corpus-training-resume.py target/debug/examples/compiled_corpus_train examples/fixtures/training-corpus.txt corpus-training-resume.json
+      - name: Upload corpus training resume evidence
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: corpus-training-resume-${{ github.sha }}
+          path: corpus-training-resume.json
+          if-no-files-found: error
+          retention-days: 30
+
   native-transformer-release-scoreboard:
     name: Native Transformer release scoreboard (Linux)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

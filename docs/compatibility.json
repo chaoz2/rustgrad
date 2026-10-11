@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:72d9dae13e12ccd1",
+  "source_fingerprint": "fnv1a64:7605c088dfaa9bda",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -613,6 +613,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "Canonical module traversal deduplicates tied trainable state into the recurrent AdamW frontier and captures frozen parameters and buffers as immutable values. The authenticated [state and atomicity](ARCHITECTURE.md#state-ownership-and-atomicity), [resume modes](ARCHITECTURE.md#resume-modes-and-module-ownership), [training policies](ARCHITECTURE.md#training-inputs-and-optimizer-policies), maintained Transformer acceptance, and [backend limits](ARCHITECTURE.md#compiled-training-backend-boundaries) define the complete contract. Stateful pending module effects, runtime freeze-policy mutation, automatic live-module synchronization, mixed-precision parameter state, dynamic loss scaling, and dynamic shapes remain unsupported."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "Caller-corpus compiled training and resume",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`compiled_corpus_train` connects a bounded caller-local byte corpus to the existing strict-native compiled AdamW runtime: fixed two-block causal Transformer, 256 byte tokens, two 16-token rows, right-padding-derived attention and loss masks, two-microbatch token-weighted accumulation, clipping, captured learning-rate policy, dropout, frozen positions, and tied output weights. A versioned atomic safetensors envelope stores exact corpus bytes and the authenticated executable/module/optimizer resume bundle; changed data rejects before executable decoding, and the next batch derives from committed replay progress. Linux acceptance compares six uninterrupted microbatches with separate-process 3+3 continuation, complete checkpoint bytes, probe losses, exact token weights, and zero fallback; short or changed corpus input must publish no output. This example is limited to 2 bytes through 1 MiB of byte data and fixed CPU geometry; no tokenizer, held-out generalization, large-corpus streaming, performance, or accelerator claim."
       }
     },
     {
