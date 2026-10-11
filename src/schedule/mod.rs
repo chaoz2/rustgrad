@@ -276,6 +276,13 @@ pub struct Schedule {
 /// output integrity is defined by the Store graph and descriptors rather than
 /// by a generic node/output identity projection.
 pub(crate) fn validate_item_output_bindings(item: &ScheduleItem) -> Result<(), ScheduleError> {
+    validate_item_output_bindings_with_order(item, None)
+}
+
+fn validate_item_output_bindings_with_order(
+    item: &ScheduleItem,
+    order: Option<&crate::uop::TopologicalOrder>,
+) -> Result<(), ScheduleError> {
     if item.boundary.is_some() || !matches!(item.kernel.operation(), crate::Operation::Sink) {
         return Ok(());
     }
@@ -298,7 +305,15 @@ pub(crate) fn validate_item_output_bindings(item: &ScheduleItem) -> Result<(), S
         .map(|output| (output.id, output))
         .collect::<BTreeMap<_, _>>();
     let mut stores = BTreeSet::new();
-    for node in item.kernel.topological().map_err(ScheduleError::UOp)? {
+    let derived;
+    let nodes = match order.and_then(|order| order.for_root(&item.kernel)) {
+        Some(nodes) => nodes,
+        None => {
+            derived = item.kernel.topological().map_err(ScheduleError::UOp)?;
+            &derived
+        }
+    };
+    for node in nodes {
         if !matches!(node.operation(), crate::Operation::Store) {
             continue;
         }
@@ -543,7 +558,19 @@ impl Schedule {
             for input in &item.inputs {
                 validate_buffer_desc(input)?;
             }
-            item.validate_input_bindings()?;
+            // Ordinary Sink bindings already require this walk at this point
+            // in error ordering. Retain it for semantic and Store checks,
+            // without granting admission or caching mutable item metadata.
+            // Plan-backed kernels and diagnostic boundaries keep their own
+            // validation order and do not pay for an unused traversal.
+            let order = if item.boundary.is_none()
+                && matches!(item.kernel.operation(), crate::Operation::Sink)
+            {
+                Some(crate::uop::TopologicalOrder::new(&item.kernel).map_err(ScheduleError::UOp)?)
+            } else {
+                None
+            };
+            item.validate_input_bindings_with_order(order.as_ref())?;
             let mut external_inputs = BTreeSet::new();
             for external in &item.external_materializations {
                 let buffer = external.index() as u64;
@@ -578,9 +605,13 @@ impl Schedule {
             if !authenticated_roots.contains(&item.kernel.node_identity()) {
                 #[cfg(test)]
                 KERNEL_VALIDATION_COUNT.set(KERNEL_VALIDATION_COUNT.get() + 1);
-                item.kernel.validate().map_err(ScheduleError::UOp)?;
+                match &order {
+                    Some(order) => order.validate_for(&item.kernel),
+                    None => item.kernel.validate(),
+                }
+                .map_err(ScheduleError::UOp)?;
             }
-            validate_item_output_bindings(item)?;
+            validate_item_output_bindings_with_order(item, order.as_ref())?;
             if item.is_effect() {
                 if !item.outputs.is_single()
                     || item.boundary != Some(ScheduleBoundary::Effect)

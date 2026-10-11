@@ -37,12 +37,79 @@ fn retained_order_preserves_bindings_and_independent_capture() {
         assert_eq!(BINDING_ORDER_REBUILDS.get(), before, "{name}");
 
         // Caller-visible validation and capture still inspect the schedule.
+        let binding_walks = BINDING_ORDER_REBUILDS.get();
+        let semantic_checks = KERNEL_VALIDATION_COUNT.get();
         scheduled.validate().unwrap();
+        assert_eq!(BINDING_ORDER_REBUILDS.get(), binding_walks, "{name}");
+        assert_eq!(
+            KERNEL_VALIDATION_COUNT.get(),
+            semantic_checks + scheduled.items.len(),
+            "{name}"
+        );
         let capture = crate::CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
         let bytes = capture.to_bytes().unwrap();
         let decoded = crate::CapturedSchedule::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.to_bytes().unwrap(), bytes, "{name}");
     }
+}
+
+#[test]
+fn shared_validation_order_preserves_rejection_and_precedence() {
+    let mut graph = Graph::new();
+    let input = graph.input("input", [2]);
+    let output = graph.neg(input).unwrap();
+    let valid = schedule(&graph, output).unwrap();
+    assert_eq!(valid.items.len(), 1);
+
+    let mut bad_kernel = valid.clone();
+    let item = &mut bad_kernel.items[0];
+    let mut sources = item.kernel.sources().to_vec();
+    sources.push(UOp::from_operation(
+        crate::Operation::Unary(crate::uop::Unary::Neg),
+        Some(crate::UType::scalar(crate::DType::F32)),
+        vec![],
+    ));
+    item.kernel = UOp::sink(sources);
+    // Binding discovery succeeds; retained ordering must not admit a malformed
+    // ALU node merely because it contributes no additional pointer resource.
+    item.validate_input_bindings().unwrap();
+    let expected = ScheduleError::UOp(item.kernel.validate().unwrap_err()).to_string();
+    assert_eq!(bad_kernel.validate().unwrap_err().to_string(), expected);
+
+    let mut bad_binding = bad_kernel.clone();
+    bad_binding.items[0].input_bindings[0].abi_index += 1;
+    let expected = bad_binding.items[0]
+        .validate_input_bindings()
+        .unwrap_err()
+        .to_string();
+    assert_eq!(bad_binding.validate().unwrap_err().to_string(), expected);
+
+    let mut bad_output = valid.clone();
+    let mut desc = bad_output.items[0].primary_output().clone();
+    desc.dtype = crate::DType::I32;
+    bad_output.items[0].outputs = ScheduledOutputs::single(desc);
+    let item = &bad_output.items[0];
+    item.validate_input_bindings().unwrap();
+    item.kernel.validate().unwrap();
+    let expected = validate_item_output_bindings(item).unwrap_err().to_string();
+    assert_eq!(bad_output.validate().unwrap_err().to_string(), expected);
+    let retained = crate::uop::TopologicalOrder::new(&item.kernel).unwrap();
+    let foreign = crate::uop::TopologicalOrder::new(&UOp::sink(vec![])).unwrap();
+    for order in [&retained, &foreign] {
+        assert_eq!(
+            validate_item_output_bindings_with_order(item, Some(order))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+
+    // Descriptor rejection still precedes both binding and semantic checks.
+    let mut desc = bad_binding.items[0].primary_output().clone();
+    desc.bytes += 1;
+    let expected = validate_buffer_desc(&desc).unwrap_err().to_string();
+    bad_binding.items[0].outputs = ScheduledOutputs::single(desc);
+    assert_eq!(bad_binding.validate().unwrap_err().to_string(), expected);
 }
 
 #[test]
