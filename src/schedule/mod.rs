@@ -275,7 +275,8 @@ pub struct Schedule {
 /// declares. Replay-local mixed schedules may deliberately rebind `node`, so
 /// output integrity is defined by the Store graph and descriptors rather than
 /// by a generic node/output identity projection.
-pub(crate) fn validate_item_output_bindings(item: &ScheduleItem) -> Result<(), ScheduleError> {
+#[cfg(test)]
+fn validate_item_output_bindings(item: &ScheduleItem) -> Result<(), ScheduleError> {
     validate_item_output_bindings_with_order(item, None)
 }
 

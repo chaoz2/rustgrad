@@ -1456,16 +1456,31 @@ fn validate_with_retained_keys(
         {
             return Err(ArtifactError::Format("external materialization"));
         }
-        item.validate_input_bindings()
+        // Ordinary Sink bindings already traverse the DAG here. Keep that
+        // order for semantic and Store checks, without granting admission or
+        // retaining caller-mutable item metadata beyond this validation.
+        let order = if item.boundary.is_none()
+            && matches!(item.kernel.operation(), crate::Operation::Sink)
+        {
+            Some(
+                crate::uop::TopologicalOrder::new(&item.kernel)
+                    .map_err(|_| ArtifactError::Format("input bindings"))?,
+            )
+        } else {
+            None
+        };
+        item.validate_input_bindings_with_order(order.as_ref())
             .map_err(|_| ArtifactError::Format("input bindings"))?;
         if !validated_roots.contains(&item.kernel.node_identity()) {
             #[cfg(test)]
             STRUCTURAL_KERNEL_VALIDATION_COUNT.with(|count| count.set(count.get() + 1));
-            item.kernel
-                .validate()
-                .map_err(|_| ArtifactError::Format("kernel"))?;
+            match &order {
+                Some(order) => order.validate_for(&item.kernel),
+                None => item.kernel.validate(),
+            }
+            .map_err(|_| ArtifactError::Format("kernel"))?;
         }
-        super::validate_item_output_bindings(item)
+        super::validate_item_output_bindings_with_order(item, order.as_ref())
             .map_err(|_| ArtifactError::Format("kernel outputs"))?;
         let mut inventory = BTreeSet::new();
         for desc in &item.inputs {
@@ -3482,6 +3497,77 @@ mod tests {
         assert_eq!(decoded.items[0].outputs.iter().count(), 2);
         assert_eq!(decoded.items[0].outputs.iter().nth(1), Some(&secondary));
         assert!(validate_for_replay(&decoded).is_err());
+    }
+
+    #[test]
+    fn capture_validation_reuses_order_without_semantic_admission() {
+        for (name, rows, transpose) in [("dense", 2, false), ("view", 2, true), ("empty", 0, false)]
+        {
+            let mut graph = Graph::new();
+            let input = graph.input("input", [rows, 3]);
+            let input = if transpose {
+                graph.permute(input, vec![1, 0]).unwrap()
+            } else {
+                input
+            };
+            let rhs = graph.input("rhs", []);
+            let output = graph.add(input, rhs).unwrap();
+            let scheduled = crate::schedule(&graph, output).unwrap();
+            let capture = CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+            let walks = super::super::BINDING_ORDER_REBUILDS.get();
+            let checks = STRUCTURAL_KERNEL_VALIDATION_COUNT.get();
+            validate(&capture, true, true).unwrap();
+            assert_eq!(super::super::BINDING_ORDER_REBUILDS.get(), walks, "{name}");
+            assert_eq!(
+                STRUCTURAL_KERNEL_VALIDATION_COUNT.get(),
+                checks + capture.items.len(),
+                "{name}"
+            );
+            let bytes = encode(&capture).unwrap();
+            assert_eq!(encode(&decode(&bytes).unwrap()).unwrap(), bytes, "{name}");
+        }
+    }
+
+    #[test]
+    fn capture_validation_order_preserves_rejection_precedence() {
+        fn independent(item: &ScheduleItem) -> Result<(), ArtifactError> {
+            item.validate_input_bindings()
+                .map_err(|_| ArtifactError::Format("input bindings"))?;
+            item.kernel
+                .validate()
+                .map_err(|_| ArtifactError::Format("kernel"))?;
+            super::super::validate_item_output_bindings(item)
+                .map_err(|_| ArtifactError::Format("kernel outputs"))
+        }
+
+        let valid = fixture();
+        let mut bad_kernel = valid.clone();
+        let item = &mut bad_kernel.items[0];
+        let mut sources = item.kernel.sources().to_vec();
+        sources.push(UOp::from_operation(
+            crate::Operation::Unary(crate::uop::Unary::Neg),
+            Some(crate::UType::scalar(DType::F32)),
+            vec![],
+        ));
+        item.kernel = UOp::sink(sources);
+        item.validate_input_bindings().unwrap();
+
+        let mut bad_binding = bad_kernel.clone();
+        bad_binding.items[0].input_bindings[0].abi_index += 1;
+        let mut bad_output = valid.clone();
+        let mut desc = bad_output.items[0].primary_output().clone();
+        desc.dtype = DType::I32;
+        bad_output.items[0].outputs = ScheduledOutputs::single(desc);
+        for (name, capture, reason) in [
+            ("semantic", bad_kernel, "kernel"),
+            ("binding before semantic", bad_binding, "input bindings"),
+            ("store type", bad_output, "kernel outputs"),
+        ] {
+            let expected = Err(ArtifactError::Format(reason));
+            assert_eq!(independent(&capture.items[0]), expected, "{name}");
+            assert_eq!(validate(&capture, true, true), expected, "{name}");
+            assert_eq!(encode(&capture), expected.map(|()| Vec::new()), "{name}");
+        }
     }
 
     #[test]
