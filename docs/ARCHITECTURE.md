@@ -2046,6 +2046,17 @@ through a three-replay window with a finite global norm limit.
 
 ##### Public plan and runtime contracts
 
+The private `examples/support/causal_transformer.rs` model is shared by the
+fixed scale/capacity evidence and the caller-corpus example. It does not add a
+public model API. `compiled_corpus_train` owns byte-window batching and a
+versioned safetensors envelope containing exact corpus bytes plus the existing
+authenticated AdamW resume bundle. Its batch cursor derives only from committed
+replay progress. Corpus equality is checked before executable decoding, while
+training-state ownership stays with the compiled runtime. Separate-process CI
+compares uninterrupted and resumed output bytes, including a pending window;
+the corpus adapter has independent target-shift and padding tests. See
+`CORPUS_TRAINING.md` for the bounded user contract.
+
 - `CompiledAdamWPlan` owns the resource-free authenticated capture, recurrent
   frontier, optimizer policy, and optional restored state before target choice.
   It prepares interpreter CPU, strict-native CPU, or strict resource-free Metal
