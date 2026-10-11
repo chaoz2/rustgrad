@@ -4,6 +4,7 @@ use super::{
     cache_dir, native_cache_key, run_compiler,
 };
 use std::{
+    borrow::Borrow,
     fs,
     ops::Range,
     path::{Path, PathBuf},
@@ -45,7 +46,7 @@ pub(super) fn render_capsule_environment() -> String {
         std::env::consts::OS,
     );
     environment.push('\u{1f}');
-    environment.push_str(&schedule_module_manifest(&[]));
+    environment.push_str(&schedule_module_manifest::<RenderedC>(&[]));
     environment
 }
 
@@ -85,7 +86,7 @@ struct ScheduleModuleBuildPlan {
 }
 
 impl ScheduleModuleBuildPlan {
-    fn new(rendered: &[RenderedC]) -> Result<Self, JitError> {
+    fn new(rendered: &[impl Borrow<RenderedC>]) -> Result<Self, JitError> {
         if rendered.is_empty() {
             return Err(JitError::InvalidBuffer(
                 "empty native schedule module has no build plan".into(),
@@ -127,7 +128,7 @@ pub(crate) struct NativeScheduleTranslationUnitEvidence {
 }
 
 pub(crate) fn schedule_module_translation_unit_evidence(
-    rendered: &[RenderedC],
+    rendered: &[impl Borrow<RenderedC>],
 ) -> Result<Vec<NativeScheduleTranslationUnitEvidence>, JitError> {
     if rendered.is_empty() {
         return Ok(Vec::new());
@@ -153,7 +154,7 @@ pub(crate) fn schedule_module_translation_unit_evidence(
             let entries = &rendered[chunk.entries.clone()];
             let rendered_source_bytes = entries.iter().try_fold(0usize, |total, entry| {
                 total
-                    .checked_add(entry.source.len())
+                    .checked_add(entry.borrow().source.len())
                     .ok_or_else(|| JitError::Io("native schedule source size overflowed".into()))
             })?;
             Ok(NativeScheduleTranslationUnitEvidence {
@@ -168,17 +169,17 @@ pub(crate) fn schedule_module_translation_unit_evidence(
         .collect()
 }
 
-fn balanced_split(rendered: &[RenderedC]) -> Result<usize, JitError> {
+fn balanced_split(rendered: &[impl Borrow<RenderedC>]) -> Result<usize, JitError> {
     let total = rendered.iter().try_fold(0usize, |total, entry| {
         total
-            .checked_add(entry.source.len())
+            .checked_add(entry.borrow().source.len())
             .ok_or_else(|| JitError::Io("native schedule source size overflowed".into()))
     })?;
     let mut prefix = 0usize;
     let mut best = (usize::MAX, 1usize);
     for split in 1..rendered.len() {
         prefix = prefix
-            .checked_add(rendered[split - 1].source.len())
+            .checked_add(rendered[split - 1].borrow().source.len())
             .ok_or_else(|| JitError::Io("native schedule source size overflowed".into()))?;
         let suffix = total
             .checked_sub(prefix)
@@ -332,13 +333,13 @@ pub(super) fn schedule_module_local_symbol(index: usize, symbol: &str) -> String
 }
 
 fn render_schedule_module_chunk(
-    rendered: &[RenderedC],
+    rendered: &[impl Borrow<RenderedC>],
     entries: Range<usize>,
     include_dispatcher: bool,
 ) -> String {
     let mut source = String::new();
     for index in entries {
-        let entry = &rendered[index];
+        let entry = rendered[index].borrow();
         source.push_str(&format!(
             "#define rustgrad_kernel {}\n",
             schedule_module_entry_symbol(index)
@@ -409,7 +410,7 @@ pub(super) fn render_schedule_module_source(rendered: &[RenderedC]) -> String {
     render_schedule_module_chunk(rendered, 0..rendered.len(), true)
 }
 
-pub(super) fn schedule_module_manifest(rendered: &[RenderedC]) -> String {
+pub(super) fn schedule_module_manifest<T: Borrow<RenderedC>>(rendered: &[T]) -> String {
     let mut manifest = format!("rustgrad-c11-schedule-module-v4\u{1f}{}", rendered.len());
     for helper in C11LocalHelper::ALL {
         manifest.push('\u{1f}');
@@ -419,12 +420,12 @@ pub(super) fn schedule_module_manifest(rendered: &[RenderedC]) -> String {
         manifest.push('\u{1f}');
         manifest.push_str(&schedule_module_entry_symbol(index));
         manifest.push('\u{1f}');
-        manifest.push_str(&entry.cache_key);
+        manifest.push_str(&entry.borrow().cache_key);
     }
     manifest
 }
 
-pub(crate) fn schedule_module_cache_key(rendered: &[RenderedC]) -> String {
+pub(crate) fn schedule_module_cache_key(rendered: &[impl Borrow<RenderedC>]) -> String {
     native_cache_key("schedule-module-v4", &schedule_module_manifest(rendered))
 }
 
@@ -742,6 +743,89 @@ mod tests {
             permit_requested: start,
             process_started: start,
             process_finished: start + Duration::from_nanos(nanos),
+        }
+    }
+
+    #[test]
+    fn borrowed_entries_preserve_module_identity_plan_and_source() {
+        for count in [0, 1, 512, 513] {
+            let owned = (0..count)
+                .map(|index| rendered(1 + index % 7, &index.to_string()))
+                .collect::<Vec<_>>();
+            let borrowed = owned.iter().collect::<Vec<_>>();
+            assert_eq!(
+                schedule_module_manifest(&owned),
+                schedule_module_manifest(&borrowed)
+            );
+            assert_eq!(
+                schedule_module_cache_key(&owned),
+                schedule_module_cache_key(&borrowed)
+            );
+            assert_eq!(
+                schedule_module_translation_unit_evidence(&owned).unwrap(),
+                schedule_module_translation_unit_evidence(&borrowed).unwrap(),
+                "entry count {count}"
+            );
+            if count == 0 {
+                for error in [
+                    ScheduleModuleBuildPlan::new(&owned).unwrap_err(),
+                    ScheduleModuleBuildPlan::new(&borrowed).unwrap_err(),
+                ] {
+                    assert!(matches!(error, JitError::InvalidBuffer(message)
+                        if message == "empty native schedule module has no build plan"));
+                }
+                continue;
+            }
+            let plan = ScheduleModuleBuildPlan::new(&owned).unwrap();
+            assert_eq!(plan, ScheduleModuleBuildPlan::new(&borrowed).unwrap());
+            for chunk in &plan.chunks {
+                let dispatcher = chunk.ordinal + 1 == plan.chunks.len();
+                assert_eq!(
+                    render_schedule_module_chunk(&owned, chunk.entries.clone(), dispatcher),
+                    render_schedule_module_chunk(&borrowed, chunk.entries.clone(), dispatcher),
+                    "entry count {count}, chunk {}",
+                    chunk.ordinal
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_suffix_and_reordering_retain_entry_order() {
+        let owned = [
+            rendered(2, "first"),
+            rendered(5, "second"),
+            rendered(3, "third"),
+        ];
+        for indices in [&[1, 2][..], &[2, 0, 1][..]] {
+            let borrowed = indices
+                .iter()
+                .map(|&index| &owned[index])
+                .collect::<Vec<_>>();
+            let copied = borrowed
+                .iter()
+                .map(|entry| (**entry).clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                schedule_module_manifest(&borrowed),
+                schedule_module_manifest(&copied)
+            );
+            assert_eq!(
+                schedule_module_cache_key(&borrowed),
+                schedule_module_cache_key(&copied)
+            );
+            assert_ne!(
+                schedule_module_cache_key(&borrowed),
+                schedule_module_cache_key(&owned)
+            );
+            assert_eq!(
+                render_schedule_module_chunk(&borrowed, 0..borrowed.len(), true),
+                render_schedule_module_source(&copied)
+            );
+            assert_eq!(
+                schedule_module_translation_unit_evidence(&borrowed).unwrap(),
+                schedule_module_translation_unit_evidence(&copied).unwrap()
+            );
         }
     }
 
