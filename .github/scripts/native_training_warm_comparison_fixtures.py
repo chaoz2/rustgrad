@@ -165,6 +165,7 @@ def fixture(support, root):
 
 def check(support):
     check_capsule_phases(support)
+    check_capsule_authentication_phases(support)
     check_bundle_load_phases(support)
     check_owner_restore_phases(support)
     cases = (
@@ -252,6 +253,58 @@ def check_capsule_phases(support):
             if case not in ("valid", "timing", "mixed-version"):
                 assert manifest["trials"][1]["status"] == "invalid", case
                 assert manifest["trials"][1]["files"], case
+
+
+def check_capsule_authentication_phases(support):
+    fields = ("recipe_wall_time_ns", "file_read_wall_time_ns",
+              "decode_wall_time_ns", "authentication_wall_time_ns")
+    parts = ("authentication_policy_wall_time_ns", "authentication_abi_wall_time_ns",
+             "authentication_remainder_wall_time_ns")
+    for case in ("valid", "timing", "missing", "extra", "bool", "negative",
+                 "overflow", "sum-overflow", "unbalanced", "legacy-field"):
+        with tempfile.TemporaryDirectory(prefix="rustgrad-authentication-phases-") as temporary:
+            root = pathlib.Path(temporary).resolve()
+            arguments = fixture(support, root)
+            for directory in sorted(root.glob("trial-*")):
+                path = directory / "objective-evidence.json"
+                objective = json.loads(path.read_text())
+                objective["schema_version"] = 12
+                warm = objective["warm_resume"]
+                warm["bundle_load_phases"] = dict.fromkeys(
+                    ("file_read_wall_time_ns", "envelope_wall_time_ns", "program_wall_time_ns",
+                     "checkpoint_wall_time_ns", "pair_admission_wall_time_ns"), 0)
+                warm["owner_restore_phases"] = dict.fromkeys(
+                    ("module_binding_wall_time_ns", "topology_wall_time_ns",
+                     "frontier_wall_time_ns", "destination_validation_wall_time_ns"), 0)
+                phases = [{"program_index": index, **dict.fromkeys((*fields, *parts), 0)}
+                          for index in range(5)]
+                warm["preparation"]["capsule_phases"] = phases
+                if directory.name == "trial-02-candidate":
+                    phase = phases[0]
+                    if case == "timing":
+                        phase.update(dict.fromkeys(parts, 1))
+                        # The independent fixture reserves two nanoseconds for
+                        # the enclosing capsule orchestration interval.
+                        phase[parts[2]] = 0
+                        phase["authentication_wall_time_ns"] = 2
+                    elif case == "missing":
+                        del phase[parts[0]]
+                    elif case == "extra":
+                        phase["unobserved_wall_time_ns"] = 0
+                    elif case in ("bool", "negative", "overflow", "unbalanced"):
+                        phase[parts[0]] = {"bool": True, "negative": -1,
+                                           "overflow": 2**64, "unbalanced": 1}[case]
+                    elif case == "sum-overflow":
+                        phase[parts[0]] = 2**64 - 1
+                        phase[parts[1]] = 1
+                    elif case == "legacy-field":
+                        objective["schema_version"] = 11
+                support.write_json(path, objective)
+                checksums(support, directory)
+            manifest, comparable = support.VALIDATOR.compare(arguments)
+            assert comparable is (case in ("valid", "timing")), (case, manifest)
+            if case not in ("valid", "timing"):
+                assert manifest["trials"][1]["status"] == "invalid", case
 
 
 def check_owner_restore_phases(support):
