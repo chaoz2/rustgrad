@@ -2054,7 +2054,12 @@ authenticated AdamW resume bundle. Its batch cursor derives only from committed
 replay progress. Corpus equality is checked before executable decoding, while
 training-state ownership stays with the compiled runtime. Separate-process CI
 compares uninterrupted and resumed output bytes, including a pending window;
-the corpus adapter has independent target-shift and padding tests. See
+the corpus adapter has independent target-shift and padding tests. Read-only
+evaluation restores that same executable against a separate bounded corpus,
+visits every batch, and weights losses by valid tokens. It checks the complete
+frontier unchanged and has no module publication or checkpoint writer path.
+The original corpus remains the training-resume identity; evaluation data does
+not replace it. See
 `CORPUS_TRAINING.md` for the bounded user contract.
 
 - `CompiledAdamWPlan` owns the resource-free authenticated capture, recurrent
