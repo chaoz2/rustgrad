@@ -5313,8 +5313,12 @@ fn cast_expression(source_dtype: DType, dtype: DType, value: String) -> String {
     }
 }
 fn key(s: &str) -> String {
+    key_bytes(s.bytes())
+}
+
+fn key_bytes(bytes: impl Iterator<Item = u8>) -> String {
     let mut h = 0xcbf29ce484222325u64;
-    for b in s.bytes() {
+    for b in bytes {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x100000001b3);
     }
@@ -5324,12 +5328,26 @@ fn key(s: &str) -> String {
 /// command and every fixed flag are part of the key rather than an unstated
 /// property of the temporary cache directory.
 fn native_cache_key(discriminator: &str, source: &str) -> String {
+    native_cache_key_parts(discriminator, [source])
+}
+
+fn native_cache_key_parts<'a>(
+    discriminator: &str,
+    source: impl IntoIterator<Item = &'a str>,
+) -> String {
     let flags = C11_COMPILER_FLAGS.join("\u{1f}");
-    key(&format!(
-        "{RENDERER_VERSION}\u{1f}{ABI_VERSION}\u{1f}{C11_COMPILER_COMMAND}\u{1f}{flags}\u{1f}{}\u{1f}{}\u{1f}{discriminator}\u{1f}{source}",
+    let prefix = format!(
+        "{RENDERER_VERSION}\u{1f}{ABI_VERSION}\u{1f}{C11_COMPILER_COMMAND}\u{1f}{flags}\u{1f}{}\u{1f}{}\u{1f}{discriminator}\u{1f}",
         std::env::consts::ARCH,
         std::env::consts::OS,
-    ))
+    );
+    // Parts are a byte-exact concatenation, not separately delimited fields.
+    // Preserve the identity format without copying the generated source.
+    key_bytes(
+        prefix
+            .bytes()
+            .chain(source.into_iter().flat_map(str::bytes)),
+    )
 }
 fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("rustgrad-cpu-jit-v1")
@@ -7078,6 +7096,37 @@ mod tests {
             Err(JitError::InvalidBuffer(_))
         ));
         assert_eq!(malformed[2].bytes(), output_before);
+    }
+
+    #[test]
+    fn streamed_native_keys_preserve_legacy_bytes() {
+        // Fixed FNV-1a vectors keep the oracle independent of the shared helper.
+        assert_eq!(key(""), "cbf29ce484222325");
+        assert_eq!(key("hello"), "a430d84680aabd0b");
+        let large_source = "int kernel(void) { return 0; }\n".repeat(4096);
+        for source in ["", "hello", "λ\0\u{1e}\u{1f}終", &large_source] {
+            for discriminator in ["", "scalar", "schedule-module-translation-unit-v1"] {
+                let flags = C11_COMPILER_FLAGS.join("\u{1f}");
+                let legacy = key(&format!(
+                    "{RENDERER_VERSION}\u{1f}{ABI_VERSION}\u{1f}{C11_COMPILER_COMMAND}\u{1f}{flags}\u{1f}{}\u{1f}{}\u{1f}{discriminator}\u{1f}{source}",
+                    std::env::consts::ARCH,
+                    std::env::consts::OS,
+                ));
+                assert_eq!(native_cache_key(discriminator, source), legacy);
+                for split in [0, source.len() / 2, source.len()] {
+                    if source.is_char_boundary(split) {
+                        assert_eq!(
+                            native_cache_key_parts(
+                                discriminator,
+                                ["", &source[..split], "", &source[split..], ""]
+                            ),
+                            legacy,
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(native_cache_key_parts("", []), native_cache_key("", ""));
     }
 
     #[test]
