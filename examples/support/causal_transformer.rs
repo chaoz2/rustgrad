@@ -3,7 +3,7 @@
 use super::{BATCH, EMBEDDING, FEED_FORWARD, HEADS, TIME, VOCAB};
 use rustgrad::nn::{Embedding, LayerNorm, Mode, StateKind};
 use rustgrad::{
-    Graph, Module, NodeId, Parameter, Result, Scalar, TensorData, TrainingDropoutProvider,
+    DType, Graph, Module, NodeId, Parameter, Result, Scalar, TensorData, TrainingDropoutProvider,
     TransformerBlock,
 };
 

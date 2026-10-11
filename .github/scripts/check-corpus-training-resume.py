@@ -69,6 +69,14 @@ def main():
         for content in (b"", b"x"):
             changed.write_bytes(content)
             reject(["train", changed], "corpus must contain")
+        # Existing outputs must survive refusal, even when the invocation
+        # would otherwise be a valid continuation.
+        original = pending_file.read_bytes()
+        overwrite = subprocess.run(
+            [str(executable), "resume", str(fixture), str(pending_file), str(pending_file), "1"],
+            capture_output=True, text=True)
+        assert overwrite.returncode != 0 and "output already exists" in overwrite.stderr
+        assert pending_file.read_bytes() == original
         receipt.write_text(json.dumps({
             "format_version": 1, "full": full, "pending": pending, "resumed": resumed,
             "corpus_sha256": hashlib.sha256(corpus).hexdigest(),
@@ -76,6 +84,7 @@ def main():
             "checkpoint_sha256": hashlib.sha256(full_bytes).hexdigest(),
             "exact_cross_process_resume": True,
             "changed_and_short_corpus_rejected": True,
+            "existing_checkpoint_preserved": True,
         }, indent=2) + "\n")
 
 

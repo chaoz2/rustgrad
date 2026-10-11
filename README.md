@@ -62,6 +62,10 @@ example exercises masked causal Transformer training end to end:
 - the interpreter and strict-native CPU paths execute the same program without
   silent fallback.
 
+For caller-owned data, [local corpus training](docs/CORPUS_TRAINING.md) uses a
+small byte-level Transformer and saves both the exact corpus and complete
+training program for separate-process resume.
+
 Strict Metal shares the capture and failure-atomic recurrent-state foundation
 for its admitted policy subset. CPU-only policies still fail closed, and live
 Apple-hardware training evidence remains an explicit follow-up rather than an
