@@ -321,7 +321,7 @@ def project_program(value: Any, label: str) -> dict[str, Any]:
 
 
 def validate_sidecar(value: dict[str, Any], expected_sha: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    require(value.get("format_version") == 1, "steady evidence format differs")
+    require(value.get("format_version") == 2, "steady evidence format differs")
     require(value.get("evidence_kind") == "native_cpu_compiled_transformer_steady_replay", "steady evidence kind differs")
     provenance = value.get("provenance")
     require(type(provenance) is dict, "steady provenance is absent")
@@ -416,7 +416,12 @@ def validate_sidecar(value: dict[str, Any], expected_sha: str) -> tuple[dict[str
     final_dropout = exact_int(checkpoints["final_checkpoint"].get("dropout_block_counter"), "final dropout")
     require(warmup_dropout - start_dropout == dropout_blocks_per_replay * 3, "steady warmup dropout progress differs")
     require(final_dropout - start_dropout == dropout_blocks_per_replay * 99, "steady dropout progress differs")
-    exact_int(value.get("final_checkpoint_byte_count"), "steady final checkpoint byte count", minimum=1)
+    checkpoint_size = exact_int(value.get("final_checkpoint_byte_count"), "steady final checkpoint byte count", minimum=1)
+    checkpoint_bytes = value.get("final_checkpoint_bytes")
+    require(type(checkpoint_bytes) is list and len(checkpoint_bytes) == checkpoint_size,
+            "steady final checkpoint payload size differs")
+    require(all(type(byte) is int and 0 <= byte <= 255 for byte in checkpoint_bytes),
+            "steady final checkpoint payload contains a non-byte")
 
     stable = copy.deepcopy(value)
     stable["provenance"].pop("git_sha")

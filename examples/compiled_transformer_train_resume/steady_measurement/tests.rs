@@ -74,6 +74,7 @@ fn evidence() -> NativeCpuSteadyTrainingEvidence {
         compiled_graph_build_count: 1,
         dropout_blocks_per_replay: 8,
         final_checkpoint_byte_count: 1024,
+        final_checkpoint_bytes: vec![0; 1024],
         starting_checkpoint: checkpoint(3, 1, 10),
         warmup_checkpoint: checkpoint(6, 2, 34),
         final_checkpoint: checkpoint(102, 34, 802),
@@ -139,6 +140,14 @@ fn bounded_measurement_inventory_is_canonical_and_phase_separated() {
 
 #[test]
 fn bounded_measurement_rejects_sample_or_progress_tampering() {
+    let mut truncated_checkpoint = evidence();
+    truncated_checkpoint.final_checkpoint_bytes.pop();
+    assert!(truncated_checkpoint.validate().is_err());
+
+    let mut metadata_only = evidence();
+    metadata_only.format_version = 1;
+    assert!(metadata_only.validate().is_err());
+
     let mut reordered = evidence();
     reordered.accumulation_only_samples.swap(0, 1);
     assert!(reordered.validate().is_err());

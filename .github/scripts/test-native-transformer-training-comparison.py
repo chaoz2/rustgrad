@@ -104,7 +104,7 @@ def sidecar(source_sha: str) -> dict[str, object]:
         }
         (commits if microbatch == 3 else accumulation).append(sample)
     return {
-        "format_version": 1,
+        "format_version": 2,
         "evidence_kind": "native_cpu_compiled_transformer_steady_replay",
         "provenance": {"git_sha": source_sha, "cargo_profile": "release"},
         "warmup_window_count": 1,
@@ -117,6 +117,7 @@ def sidecar(source_sha: str) -> dict[str, object]:
         "compiled_graph_build_count": 1,
         "dropout_blocks_per_replay": 42,
         "final_checkpoint_byte_count": 13740,
+        "final_checkpoint_bytes": [0] * 13740,
         "preparation": {
             "cache_scope": "same_process_warm_cache",
             "wall_time": duration(10),
@@ -820,6 +821,29 @@ def main() -> None:
         write_json(path, value)
 
     run_case(break_partition, expected=False, invalid_trial=3)
+
+    # Equal counters and byte counts must not hide changed optimizer/parameter
+    # payloads. Also reject metadata-only and malformed byte representations.
+    for mutation in ("changed", "truncated", "missing", "boolean", "overflow", "legacy"):
+        def change_checkpoint(root: pathlib.Path, mutation=mutation) -> None:
+            path = root / "trial-02-candidate/native-cpu-training-steady-replays.json"
+            value = json.loads(path.read_text())
+            if mutation == "changed":
+                value["final_checkpoint_bytes"][0] = 1
+            elif mutation == "truncated":
+                value["final_checkpoint_bytes"].pop()
+            elif mutation == "missing":
+                del value["final_checkpoint_bytes"]
+            elif mutation == "boolean":
+                value["final_checkpoint_bytes"][0] = True
+            elif mutation == "overflow":
+                value["final_checkpoint_bytes"][0] = 256
+            else:
+                value["format_version"] = 1
+            write_json(path, value)
+
+        run_case(change_checkpoint, expected=False,
+                 invalid_trial=None if mutation == "changed" else 2)
 
     def relabel_binary(root: pathlib.Path) -> None:
         path = root / "trial-04-baseline/provenance.txt"
