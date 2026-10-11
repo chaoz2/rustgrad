@@ -28,6 +28,8 @@ impl AuthenticatedRecurrentFrontier {
         Self::from_admitted_capture(Arc::new(capture), capture_identity)
     }
 
+    /// Independent raw-capture reference for admission and ownership tests.
+    #[cfg(test)]
     pub(crate) fn authenticate(capture: Arc<CapturedMixedSchedule>) -> Result<Self, ReplayError> {
         validate(capture.as_ref(), true)?;
         let capture_identity = identity(capture.as_ref())?;

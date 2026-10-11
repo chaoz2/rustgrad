@@ -1035,8 +1035,8 @@ canonical `CapturedMixedSchedule::from_parts` validator into an immutable
 canonical identity and recurrent schema without a second mixed-capture
 validation; no caller receives mutable access between admission and ownership.
 Main, accumulation, partial-flush, and nonempty zero-grad construction use this
-boundary. Arbitrary existing captures still use full authentication, and wire
-decoding retains its own admission path. Capture bytes, replay, and checkpoint
+boundary. The raw-capture test oracle still performs full authentication, and
+wire decoding retains its own admission path. Capture bytes, replay, and checkpoint
 contracts are unchanged. Fresh frontier identity/schema work is now included
 in effect assembly/mixed sealing; the subsequent authentication timing covers
 the independently validated pure-prefix/stateful projection. Compare total
