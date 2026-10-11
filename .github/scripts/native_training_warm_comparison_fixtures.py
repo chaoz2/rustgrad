@@ -283,7 +283,10 @@ def check_capsule_authentication_phases(support):
                     phase = phases[0]
                     if case == "timing":
                         phase.update(dict.fromkeys(parts, 1))
-                        phase["authentication_wall_time_ns"] = 3
+                        # The independent fixture reserves two nanoseconds for
+                        # the enclosing capsule orchestration interval.
+                        phase[parts[2]] = 0
+                        phase["authentication_wall_time_ns"] = 2
                     elif case == "missing":
                         del phase[parts[0]]
                     elif case == "extra":
