@@ -1719,8 +1719,12 @@ result publication. The existing `total_wall_time` remains the narrower runtime
 interval and retains its executor/recurrent partition. Every full-call sample
 must enclose that runtime interval. Input construction and post-call validation
 are outside the full-call timer. Historical version-2 samples have no full-call
-measurement; the comparator still compares only the shared runtime partitions,
-never substitutes those for full-call latency. No speedup is inferred from the
+measurement. Comparison manifest version 3 summarizes full-call median and p95
+separately from runtime partitions for each measured trial. A revision aggregate
+requires both trials to provide full-call timing; otherwise it is `null`. The
+full-call ratio is `null` unless both revision aggregates are available and the
+baseline median is nonzero. Legacy sidecars reject unversioned full-call fields;
+runtime timing is never substituted for missing full-call latency. No speedup is inferred from the
 ownership change without a same-runner comparison.
 
 Warm-resume comparison uses the same evidence validator as the standalone
