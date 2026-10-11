@@ -1561,12 +1561,13 @@ fn buffer(graph: &Graph, id: NodeId, read_only: bool) -> Result<BufferDesc, Sche
 /// bounded cross-backend redirection. A rejected ordinary kernel retains its
 /// raw Contiguous copy, so transport-only dtypes and backend-specific scalar
 /// gaps never lose an already-supported materialization route.
-fn portable_ordinary_kernel(kernel: &UOp) -> bool {
-    if kernel.topological().is_ok_and(|nodes| {
-        nodes
-            .iter()
-            .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
-    }) {
+fn portable_ordinary_kernel(order: &crate::uop::TopologicalOrder) -> bool {
+    let kernel = order.root();
+    if order
+        .nodes()
+        .iter()
+        .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
+    {
         // Predicated loads carry one backend-neutral authenticated plan. Keep
         // that plan visible in the schedule even when a particular renderer's
         // dtype or address-width capability will reject it before resources;
@@ -1663,8 +1664,9 @@ fn rehearse_reduction_epilogue(
         &materialized,
     )
     .ok()?;
-    let kernel = crate::uop::normalize_kernel(&kernel).ok()?;
-    let topology = kernel.topological().ok()?;
+    let order = crate::uop::normalize_kernel_with_order(&kernel).ok()?;
+    let kernel = order.root().clone();
+    let topology = order.nodes();
     let mut load_nodes = BTreeSet::new();
     for value in topology {
         if !matches!(value.operation(), crate::Operation::Load) {
@@ -1902,15 +1904,11 @@ fn checked_scalar_sink(
     // one trial Index incompatible with the scalar owner's iteration domain.
     // Preserve the explicit materialization boundary in that case; the
     // ordinary fallback is lowered and validated independently below.
-    let Ok(kernel) = crate::uop::normalize_kernel(&kernel) else {
+    let Ok(order) = crate::uop::normalize_kernel_with_order(&kernel) else {
         return Ok(None);
     };
-    if kernel.validate().is_err() {
-        return Ok(None);
-    }
-    let Ok(topology) = kernel.topological() else {
-        return Ok(None);
-    };
+    let kernel = order.root().clone();
+    let topology = order.nodes();
     let stores = topology
         .iter()
         .filter(|value| matches!(value.operation(), crate::Operation::Store))
@@ -1944,7 +1942,7 @@ fn checked_scalar_sink(
         return Ok(None);
     }
     let mut load_nodes = BTreeSet::new();
-    for value in &topology {
+    for value in topology {
         if crate::kernel::scalar_uop_may_fault(value.operation()) {
             return Ok(None);
         }
@@ -1973,7 +1971,7 @@ fn checked_scalar_sink(
         }
         load_nodes.insert(loaded);
     }
-    if !portable_ordinary_kernel(&kernel) {
+    if !portable_ordinary_kernel(&order) {
         return Ok(None);
     }
     Ok(Some((kernel, load_nodes)))
@@ -2344,15 +2342,11 @@ fn checked_contiguous_redirection(
     // Redirection is optional. If its rehearsed scalar index domain is not
     // valid, retain the producer plus movement item; their normal lowering
     // remains the authoritative validation path.
-    let Ok(kernel) = crate::uop::normalize_kernel(&kernel) else {
+    let Ok(order) = crate::uop::normalize_kernel_with_order(&kernel) else {
         return Ok(None);
     };
-    if kernel.validate().is_err() {
-        return Ok(None);
-    }
-    let Ok(topology) = kernel.topological() else {
-        return Ok(None);
-    };
+    let kernel = order.root().clone();
+    let topology = order.nodes();
     let stores = topology
         .iter()
         .filter(|value| matches!(value.operation(), crate::Operation::Store))
@@ -2385,7 +2379,7 @@ fn checked_contiguous_redirection(
         return Ok(None);
     }
     let mut load_nodes = BTreeSet::new();
-    for value in &topology {
+    for value in topology {
         if crate::kernel::scalar_uop_may_fault(value.operation()) {
             return Ok(None);
         }
@@ -2439,7 +2433,7 @@ fn checked_contiguous_redirection(
         }
         load_nodes.insert(loaded);
     }
-    if !portable_ordinary_kernel(&kernel) {
+    if !portable_ordinary_kernel(&order) {
         return Ok(None);
     }
     Ok(Some(ContiguousRedirection {
@@ -3273,13 +3267,13 @@ fn schedule_many_with_external(
         } else {
             UOp::sink(vec![])
         };
-        let kernel = if boundary.is_none() && matches!(kernel.operation(), crate::Operation::Sink) {
-            crate::uop::normalize_kernel(&kernel).map_err(ScheduleError::UOp)?
-        } else {
-            kernel
-        };
         let kernel_order =
-            crate::uop::TopologicalOrder::new(&kernel).map_err(ScheduleError::UOp)?;
+            if boundary.is_none() && matches!(kernel.operation(), crate::Operation::Sink) {
+                crate::uop::normalize_kernel_with_order(&kernel).map_err(ScheduleError::UOp)?
+            } else {
+                crate::uop::TopologicalOrder::new(&kernel).map_err(ScheduleError::UOp)?
+            };
+        let kernel = kernel_order.root().clone();
         for (buffer, view) in common_buffer_views(kernel_order.nodes()) {
             if let Some(desc) = inputs.iter_mut().find(|desc| desc.id == buffer) {
                 desc.view = view;

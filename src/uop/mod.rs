@@ -680,6 +680,14 @@ impl TopologicalOrder {
         &self.nodes
     }
 
+    pub(crate) fn root(&self) -> &UOp {
+        &self.root
+    }
+
+    pub(crate) fn into_root(self) -> UOp {
+        self.root
+    }
+
     pub(crate) fn for_root(&self, root: &UOp) -> Option<&[UOp]> {
         self.root.shares_node_with(root).then_some(&self.nodes)
     }
@@ -2080,10 +2088,18 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
 /// cache construction. Artifact decoding deliberately does not call this:
 /// historical encoded UOp tables retain their exact node and byte identity.
 pub(crate) fn normalize_kernel(root: &UOp) -> Result<UOp, UOpError> {
+    normalize_kernel_with_order(root).map(TopologicalOrder::into_root)
+}
+
+/// Normalizes and validates each rewrite result while retaining its final
+/// traversal for immediate resource and capability inspection. The order
+/// carries no admission proof for a later schedule or artifact validation.
+pub(crate) fn normalize_kernel_with_order(root: &UOp) -> Result<TopologicalOrder, UOpError> {
     root.validate()?;
     let (root, _) = rewrite(root, &mut projected_index_rules(), Walk::BottomUp)?;
-    root.validate()?;
-    let nodes = root.topological()?;
+    let order = TopologicalOrder::new(&root)?;
+    order.validate_for(&root)?;
+    let nodes = order.nodes();
     if !matches!(root.operation(), Operation::Sink)
         || nodes.iter().any(|node| {
             matches!(
@@ -2107,12 +2123,16 @@ pub(crate) fn normalize_kernel(root: &UOp) -> Result<UOp, UOpError> {
                 | Operation::TensorGuard(_)
         )
     }) {
-        return Ok(root);
+        return Ok(order);
     }
     let (normalized, _) = rewrite(&root, &mut builtin_rules(), Walk::BottomUp)?;
-    normalized.validate()?;
-    Ok(normalized)
+    let order = TopologicalOrder::new(&normalized)?;
+    order.validate_for(&normalized)?;
+    Ok(order)
 }
+
+#[cfg(test)]
+mod normalization_tests;
 
 fn is_projected_index_operation(operation: &Operation) -> bool {
     matches!(
