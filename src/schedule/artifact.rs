@@ -2821,7 +2821,7 @@ mod tests {
         );
 
         changed.kernel = UOp::from_operation(crate::Operation::Load, item.kernel.ty(), vec![]);
-        let malformed = KernelEncodings::fresh(&[changed.clone()]);
+        let malformed = KernelEncodings::fresh(std::slice::from_ref(&changed));
         assert!(
             malformed
                 .canonical
