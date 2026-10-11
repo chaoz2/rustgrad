@@ -1659,9 +1659,17 @@ sidecar) or `warm-resume` (the larger Transformer's fresh-executor restoration).
 |---|---|
 | Revisions | The candidate is one exact commit and the baseline is its exact requested ancestor; symbolic or moving refs are rejected. |
 | Runner and order | One runner builds both revisions before measurement, then runs serial A-B-B-A trials. Every trial receives a fresh native cache. |
-| Workload | `steady-replay` retains one warmup window and 32 measured windows. `warm-resume` uses the fixed two-block, six-replay workload, with replay-3 checkpoint restoration into a fresh executor and exact continuation through replay 6. Existing workload schemas and zero-fallback contracts remain unchanged. |
+| Workload | `steady-replay` retains one warmup window and 32 measured windows. Its version-2 sidecar includes the complete final checkpoint bytes after measurement. `warm-resume` uses the fixed two-block, six-replay workload, with replay-3 checkpoint restoration into a fresh executor and exact continuation through replay 6. Training workloads and zero-fallback contracts remain unchanged. |
 | Provenance and admission | Raw files remain artifacts. Each trial records its source commit, evidence-file identity, binary identity, Cargo profile, Rust toolchain, and runner provenance. The comparator retains semantic facts and rejects sets whose workload, schema, optimizer/capture, build, or runner facts are not comparable. |
 | Interpretation | Timings are observations with no threshold or speedup claim. Repeat workflow runs are required to assess runner noise; a matching hardware model alone does not establish comparability. |
+
+Steady-replay comparison requires version-2 evidence
+on both revisions: exact final checkpoint bytes participate in non-timing
+equality across all four trials, independently of matching sizes and progress
+counters. Missing, truncated, or non-byte payloads fail admission. Historical
+version-1 evidence remains metadata-only and is not admitted to this stronger
+comparison. Serialization is outside the measured replay interval and does
+not change the runtime checkpoint format.
 
 Warm-resume comparison uses the same evidence validator as the standalone
 larger-workload recorder. Each trial must authenticate five render-capsule hits

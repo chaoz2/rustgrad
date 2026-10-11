@@ -5,7 +5,7 @@ use std::{
     io::Write,
 };
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const EVIDENCE_KIND: &str = "native_cpu_compiled_transformer_steady_replay";
 const MAX_EVIDENCE_BYTES: usize = 1 << 20;
 const WARMUP_WINDOWS: u64 = 1;
@@ -292,6 +292,7 @@ struct NativeCpuSteadyTrainingEvidence {
     compiled_graph_build_count: u64,
     dropout_blocks_per_replay: u64,
     final_checkpoint_byte_count: u64,
+    final_checkpoint_bytes: Vec<u8>,
     preparation: MeasurementPreparationEvidence,
     captured_schedule: CapturedScheduleEvidence,
     starting_checkpoint: CheckpointProgressEvidence,
@@ -361,6 +362,8 @@ impl NativeCpuSteadyTrainingEvidence {
                 != MEASURED_WINDOWS * VALID_TOKEN_COUNTS.iter().copied().sum::<u64>()
             || self.compiled_graph_build_count != 1
             || self.final_checkpoint_byte_count == 0
+            || u64::try_from(self.final_checkpoint_bytes.len()).ok()
+                != Some(self.final_checkpoint_byte_count)
             || self.starting_checkpoint.replay_step != ACCUMULATION_STEPS
             || self.starting_checkpoint.optimizer_step != 1
             || self.starting_checkpoint.accumulation_index != 0
@@ -640,6 +643,7 @@ pub(super) fn record(
         final_checkpoint_byte_count: validation_report
             .checkpoint_byte_count()
             .ok_or("steady validator checkpoint evidence is absent")?,
+        final_checkpoint_bytes: final_checkpoint.as_bytes().to_vec(),
         preparation,
         captured_schedule,
         starting_checkpoint,
