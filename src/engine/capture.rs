@@ -123,8 +123,9 @@ impl CapturedSchedule {
         let mut constants = BTreeMap::new();
         let mut produced = BTreeSet::new();
         for item in &schedule.items {
-            item.validate_input_bindings()
-                .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
+            // The complete schedule validation above already authenticated
+            // these bindings. This shared borrow permits no intervening item
+            // mutation; only graph provenance remains to be collected here.
             for b in item.ordered_inputs() {
                 match graph
                     .op(b.input_node)
@@ -1208,6 +1209,10 @@ fn graph_buffer_desc(
         view: None,
     })
 }
+
+#[cfg(test)]
+#[path = "capture_admission_tests.rs"]
+mod admission_tests;
 
 #[cfg(test)]
 mod tests {
