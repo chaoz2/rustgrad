@@ -751,6 +751,8 @@ pub struct NativeCpuRenderCapsuleDiagnostic {
     file_read_wall_time: Option<Duration>,
     decode_wall_time: Option<Duration>,
     authentication_wall_time: Option<Duration>,
+    authentication_policy_wall_time: Option<Duration>,
+    authentication_abi_wall_time: Option<Duration>,
     store_wall_time: Option<Duration>,
 }
 
@@ -773,6 +775,20 @@ impl NativeCpuRenderCapsuleDiagnostic {
     /// Current-program authentication; absent if decoding failed.
     pub const fn authentication_wall_time(&self) -> Option<Duration> {
         self.authentication_wall_time
+    }
+
+    /// Ordinary-entry policy reconstruction within authentication. Includes
+    /// dedicated-kernel policy selection, but excludes source-key comparisons.
+    /// Absent before authentication; zero if no ordinary entry was visited.
+    pub const fn authentication_policy_wall_time(&self) -> Option<Duration> {
+        self.authentication_policy_wall_time
+    }
+
+    /// Ordinary-entry binding revalidation and ABI comparison within
+    /// authentication. Store groups and zero domains remain in the remainder.
+    /// Absent before authentication; zero if this phase was never reached.
+    pub const fn authentication_abi_wall_time(&self) -> Option<Duration> {
+        self.authentication_abi_wall_time
     }
 
     /// Encoding and atomic persistence after a local render; absent on a hit.
@@ -803,6 +819,8 @@ impl NativeCpuRenderCapsuleDiagnostic {
             file_read_wall_time: value.file_read_wall_time,
             decode_wall_time: value.decode_wall_time,
             authentication_wall_time: value.authentication_wall_time,
+            authentication_policy_wall_time: value.authentication_policy_wall_time,
+            authentication_abi_wall_time: value.authentication_abi_wall_time,
             store_wall_time: value.store_wall_time,
             load: match value.load {
                 NativeRenderCapsuleLoadStatus::Hit => NativeCpuRenderCapsuleLoadStatus::Hit,

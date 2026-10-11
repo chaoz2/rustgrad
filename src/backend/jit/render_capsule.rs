@@ -798,6 +798,7 @@ impl OrdinaryRenderWitness {
     }
 }
 
+#[cfg(test)]
 fn authenticate_module(
     backend: &CpuJitBackend,
     recipe: &CapsuleRecipe,
@@ -805,6 +806,39 @@ fn authenticate_module(
     items: &[ScheduleItem],
     layouts: &[NativeScheduleLayout],
     store_groups: &[NativeStoreGroup],
+) -> bool {
+    authenticate_module_observed(
+        backend,
+        recipe,
+        module,
+        items,
+        layouts,
+        store_groups,
+        &mut AuthenticationTimings::default(),
+    )
+}
+
+#[derive(Default)]
+struct AuthenticationTimings {
+    ordinary_policy: Duration,
+    ordinary_abi: Duration,
+}
+
+fn accumulate<T>(elapsed: &mut Duration, work: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = work();
+    *elapsed = elapsed.saturating_add(started.elapsed());
+    result
+}
+
+fn authenticate_module_observed(
+    backend: &CpuJitBackend,
+    recipe: &CapsuleRecipe,
+    module: &RenderedScheduleModule,
+    items: &[ScheduleItem],
+    layouts: &[NativeScheduleLayout],
+    store_groups: &[NativeStoreGroup],
+    timing: &mut AuthenticationTimings,
 ) -> bool {
     if items.len() != layouts.len() {
         return false;
@@ -953,12 +987,9 @@ fn authenticate_module(
             }
         } else {
             let item_witness = &recipe.item_witnesses[index];
-            let expected = match OrdinaryRenderWitness::new(
-                backend,
-                index,
-                item,
-                &item_witness.render_topology,
-            ) {
+            let expected = match accumulate(&mut timing.ordinary_policy, || {
+                OrdinaryRenderWitness::new(backend, index, item, &item_witness.render_topology)
+            }) {
                 Ok(expected) => expected,
                 Err(_) => return false,
             };
@@ -971,11 +1002,13 @@ fn authenticate_module(
                         entry.rendered.cache_key, item.cache_key
                     )
                 || validate_native_layout(item, layout).is_err()
-                || !authenticates_item_abi_with_order(
-                    item,
-                    &entry.rendered.abi,
-                    item_witness.render_topology.order(),
-                )
+                || !accumulate(&mut timing.ordinary_abi, || {
+                    authenticates_item_abi_with_order(
+                        item,
+                        &entry.rendered.abi,
+                        item_witness.render_topology.order(),
+                    )
+                })
                 || !item_witness.authenticates(index, item, layout)
             {
                 return false;
@@ -1073,6 +1106,8 @@ pub(super) struct CapsuleLoadTimings {
     pub(super) file_read: Option<Duration>,
     pub(super) decode: Option<Duration>,
     pub(super) authentication: Option<Duration>,
+    pub(super) ordinary_policy: Option<Duration>,
+    pub(super) ordinary_abi: Option<Duration>,
 }
 
 fn observe<T>(elapsed: &mut Option<Duration>, work: impl FnOnce() -> T) -> T {
@@ -1101,11 +1136,23 @@ pub(super) fn load_capsule_observed(
         .map_err(|_| CapsuleLoadStatus::FileUnavailable)?;
         let module = observe(&mut timing.decode, || decode(&bytes, &recipe.bytes))
             .ok_or(CapsuleLoadStatus::DecodeRejected)?;
-        observe(&mut timing.authentication, || {
-            authenticate_module(backend, recipe, &module, items, layouts, store_groups)
-        })
-        .then_some(module)
-        .ok_or(CapsuleLoadStatus::AuthenticationRejected)
+        let mut phases = AuthenticationTimings::default();
+        let authenticated = observe(&mut timing.authentication, || {
+            authenticate_module_observed(
+                backend,
+                recipe,
+                &module,
+                items,
+                layouts,
+                store_groups,
+                &mut phases,
+            )
+        });
+        timing.ordinary_policy = Some(phases.ordinary_policy);
+        timing.ordinary_abi = Some(phases.ordinary_abi);
+        authenticated
+            .then_some(module)
+            .ok_or(CapsuleLoadStatus::AuthenticationRejected)
     })();
     (result, timing)
 }
@@ -2077,6 +2124,41 @@ mod tests {
             &[],
         ));
 
+        let mut timing = AuthenticationTimings::default();
+        let started = Instant::now();
+        assert!(authenticate_module_observed(
+            &backend,
+            &recipe,
+            &module,
+            &schedule.items,
+            &layouts,
+            &[],
+            &mut timing,
+        ));
+        let total = started.elapsed();
+        assert!(
+            timing
+                .ordinary_policy
+                .checked_add(timing.ordinary_abi)
+                .unwrap()
+                <= total
+        );
+
+        let mut invalid_payload = module.clone();
+        invalid_payload.entries[0].rendered.abi.version ^= 1;
+        let mut skipped = AuthenticationTimings::default();
+        assert!(!authenticate_module_observed(
+            &backend,
+            &recipe,
+            &invalid_payload,
+            &schedule.items,
+            &layouts,
+            &[],
+            &mut skipped,
+        ));
+        assert_eq!(skipped.ordinary_policy, Duration::ZERO);
+        assert_eq!(skipped.ordinary_abi, Duration::ZERO);
+
         let order = recipe.item_witnesses[0].render_topology.order().unwrap();
         assert!(order.for_root(&schedule.items[0].kernel).is_some());
         assert_eq!(
@@ -2114,6 +2196,24 @@ mod tests {
             assert!(
                 !authenticate_module(&backend, &recipe, &module, &items, &layouts, &[],),
                 "stale descriptors must not inherit kernel ownership: {name}"
+            );
+            let mut timing = AuthenticationTimings::default();
+            let started = Instant::now();
+            assert!(!authenticate_module_observed(
+                &backend,
+                &recipe,
+                &module,
+                &items,
+                &layouts,
+                &[],
+                &mut timing,
+            ));
+            assert!(
+                timing
+                    .ordinary_policy
+                    .checked_add(timing.ordinary_abi)
+                    .unwrap()
+                    <= started.elapsed()
             );
         }
 

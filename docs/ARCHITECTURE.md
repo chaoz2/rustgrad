@@ -1411,6 +1411,18 @@ dispatch counts, successful full-writer clear elisions, static execution summari
 recurrent logical bytes, stable capture/native identities, and call-local wall
 times. Wall times do not participate in identity.
 
+Render-capsule diagnostics split ordinary-entry authentication into policy
+reconstruction and binding/ABI validation. Both are sequential subintervals of
+the existing authentication total, absent before authentication and zero when
+no relevant entry is reached. Policy reconstruction includes dedicated-kernel
+policy selection but not source-key comparison. Store-group and zero-domain
+admission, payload/key checks, layout checks, loop overhead, and observer
+overhead remain in the explicit remainder; it is not labeled as pure validation
+work. Larger Transformer evidence schema 12 checks that these three durations
+sum exactly to authentication without double-counting the enclosing batch.
+Schemas 8–11 retain their original admission rules. These observations change
+neither validation order nor artifact, cache, checkpoint, or capture identity.
+
 ##### Bounded parallel work
 
 - **Compilation.** An oversized unique schedule suffix is split

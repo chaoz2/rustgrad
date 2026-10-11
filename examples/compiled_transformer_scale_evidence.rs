@@ -640,6 +640,9 @@ struct ScaleWarmCapsulePhaseEvidence {
     file_read_wall_time_ns: u64,
     decode_wall_time_ns: u64,
     authentication_wall_time_ns: u64,
+    authentication_policy_wall_time_ns: u64,
+    authentication_abi_wall_time_ns: u64,
+    authentication_remainder_wall_time_ns: u64,
 }
 
 #[derive(Serialize)]
@@ -1395,6 +1398,17 @@ fn collect_scale_warm_preparation(
                     )
                     .into());
                 }
+                let authentication =
+                    duration_nanos(required(diagnostic.authentication_wall_time())?)?;
+                let policy =
+                    duration_nanos(required(diagnostic.authentication_policy_wall_time())?)?;
+                let abi = duration_nanos(required(diagnostic.authentication_abi_wall_time())?)?;
+                let remainder = policy
+                    .checked_add(abi)
+                    .and_then(|observed| authentication.checked_sub(observed))
+                    .ok_or_else(|| {
+                        std::io::Error::other("capsule authentication phases exceed total")
+                    })?;
                 Ok(ScaleWarmCapsulePhaseEvidence {
                     program_index,
                     recipe_wall_time_ns: duration_nanos(diagnostic.recipe_wall_time())?,
@@ -1402,9 +1416,10 @@ fn collect_scale_warm_preparation(
                         diagnostic.file_read_wall_time(),
                     )?)?,
                     decode_wall_time_ns: duration_nanos(required(diagnostic.decode_wall_time())?)?,
-                    authentication_wall_time_ns: duration_nanos(required(
-                        diagnostic.authentication_wall_time(),
-                    )?)?,
+                    authentication_wall_time_ns: authentication,
+                    authentication_policy_wall_time_ns: policy,
+                    authentication_abi_wall_time_ns: abi,
+                    authentication_remainder_wall_time_ns: remainder,
                 })
             },
         )
@@ -2288,7 +2303,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let gradient_evidence = collect_scale_gradient_evidence()?;
 
     let objective = json!({
-        "schema_version": 11,
+        "schema_version": 12,
         "git_sha": &paths.git_sha,
         "workload": {
             "batch": BATCH,

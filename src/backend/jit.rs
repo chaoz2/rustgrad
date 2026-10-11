@@ -506,6 +506,8 @@ pub(crate) struct NativeRenderCapsuleDiagnostic {
     pub(crate) file_read_wall_time: Option<Duration>,
     pub(crate) decode_wall_time: Option<Duration>,
     pub(crate) authentication_wall_time: Option<Duration>,
+    pub(crate) authentication_policy_wall_time: Option<Duration>,
+    pub(crate) authentication_abi_wall_time: Option<Duration>,
     pub(crate) store_wall_time: Option<Duration>,
 }
 
@@ -700,6 +702,8 @@ fn render_schedule_modules(
             file_read_wall_time: timing.file_read,
             decode_wall_time: timing.decode,
             authentication_wall_time: timing.authentication,
+            authentication_policy_wall_time: timing.ordinary_policy,
+            authentication_abi_wall_time: timing.ordinary_abi,
             store_wall_time: None,
         });
     }
@@ -3446,6 +3450,8 @@ mod tests {
                 && diagnostic.file_read_wall_time.is_some()
                 && diagnostic.decode_wall_time.is_none()
                 && diagnostic.authentication_wall_time.is_none()
+                && diagnostic.authentication_policy_wall_time.is_none()
+                && diagnostic.authentication_abi_wall_time.is_none()
                 && diagnostic.store_wall_time.is_some()
         }));
         assert!(cold.max_parallel_job_count > 0);
@@ -3467,9 +3473,19 @@ mod tests {
                 && diagnostic.file_read_wall_time.is_some()
                 && diagnostic.decode_wall_time.is_some()
                 && diagnostic.authentication_wall_time.is_some()
+                && diagnostic.authentication_policy_wall_time.is_some()
+                && diagnostic.authentication_abi_wall_time.is_some()
                 && diagnostic.store_wall_time.is_none()
         }));
         assert_eq!(warm.max_parallel_job_count, 0);
+        for diagnostic in &warm.capsule_diagnostics {
+            let observed = diagnostic
+                .authentication_policy_wall_time
+                .unwrap()
+                .checked_add(diagnostic.authentication_abi_wall_time.unwrap())
+                .unwrap();
+            assert!(observed <= diagnostic.authentication_wall_time.unwrap());
+        }
         assert_eq!(warm.parallel_overlap_wall_time, Duration::ZERO);
         assert_eq!(warm.orchestration_wall_time, warm.wall_time);
         assert!(
