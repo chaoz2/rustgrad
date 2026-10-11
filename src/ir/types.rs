@@ -619,7 +619,10 @@ define_graph_ops! {
 }
 
 /// Stateless seeded distributions used by replayable random graph nodes.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// Identity uses raw floating-point bits: signed zeros are distinct, and an
+/// identical NaN payload compares equal. Execution admission is separate.
+#[derive(Clone, Copy, Debug)]
 pub enum RandomKind {
     Uniform { low: f64, high: f64 },
     Normal { mean: f64, std: f64 },
@@ -630,6 +633,11 @@ pub enum RandomKind {
 // the semantic identity (rather than a lossy formatted float), which lets
 // captured kernels be ordered and keyed deterministically.
 impl Eq for RandomKind {}
+impl PartialEq for RandomKind {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
 impl core::hash::Hash for RandomKind {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         core::mem::discriminant(self).hash(state);
@@ -1332,6 +1340,80 @@ impl Op {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_distribution_identity_obeys_equality_hash_and_order_laws() {
+        use std::collections::{BTreeSet, HashSet, hash_map::DefaultHasher};
+        use std::hash::{Hash, Hasher};
+
+        let bits = [
+            0.0_f64.to_bits(),
+            (-0.0_f64).to_bits(),
+            1.0_f64.to_bits(),
+            (-1.0_f64).to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            0x7ff8_0000_0000_0001,
+            0x7ff8_0000_0000_0002,
+            0xfff8_0000_0000_0001,
+        ];
+        let mut cases = Vec::new();
+        for raw in bits {
+            let value = f64::from_bits(raw);
+            // A sentinel outside the table keeps all four field placements
+            // distinct, including distributions rejected by execution plans.
+            cases.extend([
+                RandomKind::Uniform {
+                    low: value,
+                    high: 2.0,
+                },
+                RandomKind::Uniform {
+                    low: 2.0,
+                    high: value,
+                },
+                RandomKind::Normal {
+                    mean: value,
+                    std: 2.0,
+                },
+                RandomKind::Normal {
+                    mean: 2.0,
+                    std: value,
+                },
+            ]);
+        }
+        cases.extend([
+            RandomKind::RandInt {
+                low: i64::MIN,
+                high: i64::MAX,
+            },
+            RandomKind::RandInt {
+                low: i64::MAX,
+                high: i64::MIN,
+            },
+            RandomKind::RandInt { low: 0, high: 1 },
+        ]);
+        let hash = |value: RandomKind| {
+            let mut state = DefaultHasher::new();
+            value.hash(&mut state);
+            state.finish()
+        };
+        for (i, lhs) in cases.iter().enumerate() {
+            for (j, rhs) in cases.iter().enumerate() {
+                assert_eq!(lhs == rhs, i == j, "identity {i}, {j}");
+                assert_eq!(lhs == rhs, lhs.cmp(rhs).is_eq(), "order {i}, {j}");
+                assert_eq!(lhs.partial_cmp(rhs), Some(lhs.cmp(rhs)));
+                if lhs == rhs {
+                    assert_eq!(hash(*lhs), hash(*rhs));
+                }
+            }
+        }
+        let duplicated = cases.iter().chain(&cases).copied();
+        let hashed: HashSet<_> = duplicated.clone().collect();
+        let ordered: BTreeSet<_> = duplicated.collect();
+        assert_eq!(hashed.len(), cases.len());
+        assert_eq!(ordered.len(), cases.len());
+        assert!(ordered.iter().all(|value| hashed.contains(value)));
+    }
 
     #[test]
     fn graph_op_schema_preserves_direct_edge_order_cardinality_and_aliases() {
