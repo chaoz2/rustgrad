@@ -2842,6 +2842,14 @@ disabled program, where scalar fallback can inspect them without manufacturing
 a lane instruction. Only the private artifact codec translates `Operation` to
 stable wire tags.
 
+Linearization derives virtual-register last uses in one input-operand pass,
+then emits lifetimes in the original definition order. A call-local index
+retains the maximum instruction index (not slice position), including malformed
+non-monotonic inputs; unused outputs retain their definition index. Register
+allocation, validation, narrow-storage classification and cache identity remain
+unchanged. This removes a full-program scan per definition without claiming
+an end-to-end speedup before measurement.
+
 Vector validation builds a private call-local register-lifetime index after
 its lane and address checks. Physical register, vector/scalar classification,
 and storage dtype select sorted start points with prefix-maximum end points;
