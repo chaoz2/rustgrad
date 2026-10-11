@@ -2838,6 +2838,17 @@ disabled program, where scalar fallback can inspect them without manufacturing
 a lane instruction. Only the private artifact codec translates `Operation` to
 stable wire tags.
 
+Vector validation builds a private call-local register-lifetime index after
+its lane and address checks. Physical register, vector/scalar classification,
+and storage dtype select sorted start points with prefix-maximum end points;
+an inclusive lifetime query then uses binary search instead of scanning every
+binding for each operand. This preserves the existing existential predicate
+even for unsorted, overlapping, duplicate, or reversed caller-provided ranges.
+It is not a validation proof or persistent cache: reaching descriptors, typed
+operands, error order, and memory-plan validation remain authoritative. The
+index uses linear temporary storage; no artifact identity or rendering policy
+changes, and an end-to-end speedup requires separate measurement.
+
 The direct enum does not replace semantic boundaries. Detailed type/control
 validation, portable interpretation, schedule lowering, artifact tag codecs,
 and CPU/PTX/OpenCL/Metal/WebGPU rendering remain local exhaustive matches because

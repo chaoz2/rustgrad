@@ -38,6 +38,55 @@ impl fmt::Display for VectorIrError {
 }
 impl std::error::Error for VectorIrError {}
 
+/// Call-local lookup of the existing existential live-binding predicate.
+/// Public memory plans may contain unsorted, overlapping, or reversed ranges;
+/// this index is not a substitute for their validation.
+struct RegisterLifetimes {
+    // Each sorted start is paired with the maximum end in its prefix.
+    ranges: BTreeMap<(u32, bool, crate::DType), Vec<(u32, u32)>>,
+}
+
+impl RegisterLifetimes {
+    fn new(bindings: &[RegisterBinding]) -> Self {
+        let mut ranges = BTreeMap::<_, Vec<_>>::new();
+        for binding in bindings {
+            // A reversed inclusive range cannot satisfy the original predicate.
+            if binding.start > binding.end {
+                continue;
+            }
+            let key = (
+                binding.physical_reg,
+                matches!(binding.space, crate::MemorySpace::RegisterVector),
+                binding.dtype,
+            );
+            ranges
+                .entry(key)
+                .or_default()
+                .push((binding.start, binding.end));
+        }
+        for endpoints in ranges.values_mut() {
+            endpoints.sort_unstable();
+            let mut max_end = 0;
+            for (_, end) in endpoints {
+                max_end = max_end.max(*end);
+                *end = max_end;
+            }
+        }
+        Self { ranges }
+    }
+
+    fn contains(&self, operand: &VectorOperand, instruction: u32) -> bool {
+        let Some(endpoints) = self
+            .ranges
+            .get(&(operand.physical, operand.vector, operand.dtype))
+        else {
+            return false;
+        };
+        let prefix = endpoints.partition_point(|(start, _)| *start <= instruction);
+        prefix != 0 && instruction <= endpoints[prefix - 1].1
+    }
+}
+
 impl VectorProgram {
     /// Validates the lane control shared by every instruction before a
     /// portable renderer can derive its main and tail loops. A tail has at
@@ -310,6 +359,7 @@ impl VectorProgram {
                 }
             }
         }
+        let lifetimes = RegisterLifetimes::new(&spaces.registers);
         crate::linearize::validate_lane_sequence(
             &self.instructions,
             &std::collections::BTreeSet::new(),
@@ -319,15 +369,7 @@ impl VectorProgram {
                     crate::DType::F16 | crate::DType::BF16 => crate::DType::F32,
                     dtype => dtype,
                 };
-                operand.dtype == expected_dtype
-                    && spaces.registers.iter().any(|binding| {
-                        binding.physical_reg == operand.physical
-                            && matches!(binding.space, crate::MemorySpace::RegisterVector)
-                                == operand.vector
-                            && binding.dtype == operand.dtype
-                            && binding.start <= instruction
-                            && instruction <= binding.end
-                    })
+                operand.dtype == expected_dtype && lifetimes.contains(operand, instruction)
             },
             |_, _| true,
         )
@@ -360,6 +402,69 @@ fn physical(
 mod tests {
     use super::*;
     use crate::{Graph, Shape, lower_graph_elementwise};
+
+    #[test]
+    fn register_lifetime_index_matches_scan_for_arbitrary_ranges() {
+        use crate::{DType, MemorySpace};
+        let mut bindings = Vec::new();
+        for (physical, space, dtype) in [
+            (0, MemorySpace::RegisterVector, DType::F32),
+            (0, MemorySpace::RegisterScalar, DType::F32),
+            (0, MemorySpace::RegisterVector, DType::I32),
+            // Preserve the original non-vector classification, even for a
+            // caller-mutated memory plan that has not passed space validation.
+            (1, MemorySpace::Shared, DType::F16),
+        ] {
+            for (start, end) in [
+                (8, 10),
+                (2, 6),
+                (3, 4),
+                (2, 2),
+                (12, 11),
+                (u32::MAX, u32::MAX),
+            ] {
+                bindings.push(RegisterBinding {
+                    virtual_reg: bindings.len() as u32,
+                    physical_reg: physical,
+                    space,
+                    dtype,
+                    start,
+                    end,
+                });
+            }
+        }
+        for input in [&bindings[..], &[]] {
+            let index = RegisterLifetimes::new(input);
+            for physical in 0..=2 {
+                for vector in [false, true] {
+                    for dtype in [DType::F32, DType::I32, DType::F16, DType::Bool] {
+                        let operand = VectorOperand {
+                            physical,
+                            vector,
+                            dtype,
+                        };
+                        for instruction in (0..=13).chain([u32::MAX - 1, u32::MAX]) {
+                            let expected = input.iter().any(|binding| {
+                                binding.physical_reg == physical
+                                    && matches!(binding.space, MemorySpace::RegisterVector)
+                                        == vector
+                                    && binding.dtype == dtype
+                                    && binding.start <= instruction
+                                    && instruction <= binding.end
+                            });
+                            assert_eq!(
+                                index.contains(&operand, instruction),
+                                expected,
+                                "{operand:?} at {instruction}, {} bindings",
+                                input.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn vector_program_is_stable_and_tailed() {
         let mut g = Graph::new();
