@@ -156,11 +156,13 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let initial_loss = evaluate(&mut runtime, &corpus)?;
     let mut weights = Vec::new();
     for replay in first..end {
+        // `end` was checked above, so this committed replay count cannot wrap.
+        let completed_replays = replay + 1;
         let step = runtime.step_batch_commit_only_scheduled(corpus.batch(replay)?)?;
         assert_eq!(step.report().fallback_count(), 0);
         assert!(step.report().executed_native_item_count() > 0);
-        assert_eq!(step.optimizer_step(), (replay + 1) / 2);
-        assert_eq!(step.accumulation_index(), (replay + 1) % 2);
+        assert_eq!(step.optimizer_step(), completed_replays / 2);
+        assert_eq!(step.accumulation_index(), completed_replays % 2);
         weights.push(step.loss_weight());
     }
     let checkpoint = runtime.module_checkpoint()?;
