@@ -1780,6 +1780,21 @@ validation/report scalars. Prefix reuse retains four fail-closed contracts:
 
 ##### Protected evidence
 
+- **Training capacity.** The stable `compiled_transformer_scale_evidence`
+  benchmark retains its original geometry. A separate
+  `compiled_transformer_capacity_evidence` binary uses batch 4, context 32,
+  vocabulary 128, width 32, four heads and two feed-forward-width-128 blocks:
+  29,568 trainable coordinates plus a frozen positional table. Both binaries
+  select fixed constants around one example-owned implementation in
+  `examples/support/transformer_training_evidence.rs`; neither adds a trainer
+  or runtime API. Linux CI runs the capacity lifecycle independently: six
+  strict-native microbatches, three AdamW updates, attention/residual dropout,
+  clipping, tied output weights, and unequal valid-token weights 88/64. It
+  requires decreasing deterministic evaluation loss and exact pending-window
+  continuation into a differently initialized owned module. The receipt
+  validator pins each workload separately and rejects cross-profile receipts.
+  This is bounded training correctness, not dataset generalization, hardware
+  scalability, a performance threshold, or a CUDA/Metal result.
 - **Correctness gate.** Protected CI retains the debug invocation as a smoke
   and executes the opt-in repeated-replay sidecar against the same compiled plan.
   Only after that matrix passes, and only on protected-main pushes, does it run

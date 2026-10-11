@@ -135,6 +135,32 @@ jobs:
           retention-days: 30
       - run: cargo test --doc
 
+      - name: Compiled Transformer capacity and exact-resume acceptance
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence=native-transformer-capacity-lifecycle.json
+          cargo run --quiet --example compiled_transformer_capacity_evidence -- lifecycle-only "$evidence"
+          python3 .github/scripts/check-transformer-scale-lifecycle-evidence.py "$evidence" --capacity
+          if python3 .github/scripts/check-transformer-scale-lifecycle-evidence.py "$evidence"; then
+            echo 'Capacity evidence must not authenticate as the stable benchmark' >&2
+            exit 1
+          fi
+          if python3 .github/scripts/check-transformer-scale-lifecycle-evidence.py native-transformer-scale-lifecycle.json --capacity; then
+            echo 'The stable benchmark must not authenticate as capacity evidence' >&2
+            exit 1
+          fi
+      - name: Upload compiled Transformer capacity evidence
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-transformer-capacity-lifecycle-${{ github.sha }}
+          path: native-transformer-capacity-lifecycle.json
+          if-no-files-found: error
+          retention-days: 30
+
   native-transformer-release-scoreboard:
     name: Native Transformer release scoreboard (Linux)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
