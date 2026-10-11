@@ -2,6 +2,7 @@
 //!
 //! `train CORPUS OUTPUT STEPS` starts from random initialization;
 //! `resume CORPUS CHECKPOINT OUTPUT STEPS` restores the executable and all state.
+//! `evaluate CORPUS CHECKPOINT EVALUATION_CORPUS` reads a separate corpus without updates.
 //! STEPS counts microbatches, not optimizer updates. Outputs are explicit new
 //! paths. Checkpoints include the exact corpus bytes; treat them as private data.
 
@@ -95,17 +96,67 @@ fn evaluate(
     runtime: &mut CompiledModuleAdamWSession<CausalTransformer, NativeCpuCompiledAdamW<'_>>,
     corpus: &Corpus,
 ) -> Result<f64> {
+    Ok(evaluate_batches(runtime, corpus, corpus.batch_count().min(4))?.0)
+}
+
+fn evaluate_batches(
+    runtime: &mut CompiledModuleAdamWSession<CausalTransformer, NativeCpuCompiledAdamW<'_>>,
+    corpus: &Corpus,
+    batches: usize,
+) -> Result<(f64, Vec<(f64, u64)>)> {
     let mut numerator = 0.0;
     let mut count = 0_u64;
-    // A fixed training-data probe, deliberately not a held-out generalization
-    // claim. Weight by actual tokens rather than averaging unequal batches.
-    for batch in 0..corpus.batch_count().min(4) {
+    let mut observations = Vec::with_capacity(batches);
+    // Weight by actual tokens rather than averaging unequal batches.
+    for batch in 0..batches {
         let result = runtime.evaluate_batch(corpus.batch(batch as u64)?)?;
         assert_eq!(result.report().fallback_count(), 0);
-        numerator += result.loss().scalar_at(0).as_f64() * result.loss_weight() as f64;
+        let loss = result.loss().scalar_at(0).as_f64();
+        numerator += loss * result.loss_weight() as f64;
         count += result.loss_weight();
+        observations.push((loss, result.loss_weight()));
     }
-    Ok(numerator / count as f64)
+    Ok((numerator / count as f64, observations))
+}
+
+fn evaluate_checkpoint(
+    corpus_path: &std::ffi::OsStr,
+    checkpoint_path: &std::ffi::OsStr,
+    evaluation_path: &std::ffi::OsStr,
+) -> std::result::Result<(), Box<dyn Error>> {
+    let corpus = Corpus::load(std::path::Path::new(corpus_path))?;
+    // Both local inputs are validated before native preparation. The original
+    // corpus still authenticates the training cursor; evaluation never replaces it.
+    let evaluation = Corpus::load(std::path::Path::new(evaluation_path))?;
+    let bundle = corpus.restore(std::path::Path::new(checkpoint_path))?;
+    let plan = CompiledModuleAdamWPlan::restore_from_resume_bundle(
+        CausalTransformer::new(0xc07_999)?,
+        &bundle,
+    )
+    .map_err(|e| e.into_parts().1)?;
+    let executor = CapturedReplayExecutor::default();
+    let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
+    let mut runtime = plan.prepare(&target).map_err(|e| e.into_parts().1)?;
+    let before = runtime.module_checkpoint()?;
+    let (loss, batches) = evaluate_batches(&mut runtime, &evaluation, evaluation.batch_count())?;
+    assert_eq!(
+        runtime.module_checkpoint()?,
+        before,
+        "evaluation must preserve the complete frontier"
+    );
+    // There is deliberately no finish/publication or save path in this mode.
+    println!(
+        "{}",
+        serde_json::json!({
+            "format_version": 1, "mode": "evaluate", "mean_token_loss": loss,
+            "valid_tokens": batches.iter().map(|(_, weight)| weight).sum::<u64>(),
+            "batch_losses": batches.iter().map(|(loss, _)| loss).collect::<Vec<_>>(),
+            "valid_tokens_per_batch": batches.iter().map(|(_, weight)| weight).collect::<Vec<_>>(),
+            "restored_without_graph_rebuild": true, "training_state_unchanged": true,
+            "fallback_count": 0,
+        })
+    );
+    Ok(())
 }
 
 enum Start {
@@ -115,10 +166,15 @@ enum Start {
 
 fn main() -> std::result::Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();
+    if let [mode, corpus, checkpoint, evaluation] = args.as_slice()
+        && mode == "evaluate"
+    {
+        return evaluate_checkpoint(corpus, checkpoint, evaluation);
+    }
     let (start, corpus_path, output, steps) = match args.as_slice() {
         [mode, corpus, output, steps] if mode == "train" => (Start::Fresh, corpus, output, steps),
         [mode, corpus, checkpoint, output, steps] if mode == "resume" => (Start::Resume(PathBuf::from(checkpoint)), corpus, output, steps),
-        _ => return Err("usage: compiled_corpus_train train CORPUS OUTPUT STEPS | resume CORPUS CHECKPOINT OUTPUT STEPS".into()),
+        _ => return Err("usage: compiled_corpus_train train CORPUS OUTPUT STEPS | resume CORPUS CHECKPOINT OUTPUT STEPS | evaluate CORPUS CHECKPOINT EVALUATION_CORPUS".into()),
     };
     let steps: u64 = steps.to_str().ok_or("STEPS must be UTF-8")?.parse()?;
     if !(1..=10_000).contains(&steps) {
