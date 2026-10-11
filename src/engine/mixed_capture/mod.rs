@@ -2326,6 +2326,15 @@ impl CapturedMixedSchedule {
         mixed: &Schedule,
         states: Vec<BufferState>,
     ) -> Result<Self, ReplayError> {
+        Self::from_parts_with_kernel_encodings(schedule, mixed, states, None)
+    }
+
+    fn from_parts_with_kernel_encodings(
+        schedule: CapturedSchedule,
+        mixed: &Schedule,
+        states: Vec<BufferState>,
+        kernels: Option<&crate::schedule::artifact::KernelEncodings>,
+    ) -> Result<Self, ReplayError> {
         mixed
             .validate()
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
@@ -2348,7 +2357,7 @@ impl CapturedMixedSchedule {
             state_bindings: mixed.state_bindings.clone(),
             states,
         };
-        validate(&value, true)?;
+        validate_with_kernel_encodings(&value, true, kernels)?;
         Ok(value)
     }
 
@@ -2439,13 +2448,13 @@ impl CapturedMixedSchedule {
         // Current envelopes must already carry canonical item identities.
         // Historical versions authenticate their opaque keys first and only
         // then derive the current representation below.
-        validate_with_decoded_kernels(&decoded, !legacy, Some(&decoded_kernels))?;
+        validate_with_kernel_encodings(&decoded, !legacy, Some(&decoded_kernels))?;
         let actual = fnv1a(&bytes[HEADER_LEN..body]);
         if actual != stored_identity {
             return Err(ReplayError::Corrupt("RGSM identity".into()));
         }
         if legacy {
-            crate::schedule::rekey_decoded_schedule_items(
+            crate::schedule::rekey_encoded_schedule_items(
                 &mut decoded.schedule.items,
                 &decoded.state_bindings,
                 &decoded_kernels,
@@ -2453,12 +2462,12 @@ impl CapturedMixedSchedule {
             .map_err(|error| ReplayError::Corrupt(error.to_string()))?;
         }
         decoded.schedule.identity =
-            identity_with_decoded_kernels(&decoded, Some(&decoded_kernels))?;
+            identity_with_kernel_encodings(&decoded, Some(&decoded_kernels))?;
         // Current payloads already passed the same structural/key checks and
         // remain unchanged. Only legacy rekeying needs another validation;
         // the schedule identity above is not consumed by structural admission.
         if legacy {
-            validate_with_decoded_kernels(&decoded, true, Some(&decoded_kernels))?;
+            validate_with_kernel_encodings(&decoded, true, Some(&decoded_kernels))?;
         }
         Ok(decoded)
     }
@@ -4749,6 +4758,61 @@ mod tests {
     }
 
     #[test]
+    fn fresh_kernel_encodings_preserve_validation_and_identity() {
+        let capture = captured_effect();
+        let kernels = crate::schedule::artifact::KernelEncodings::fresh(&capture.schedule.items);
+        let before = crate::schedule::kernel_validation_count();
+        validate_with_kernel_encodings(&capture, true, Some(&kernels)).unwrap();
+        assert_eq!(
+            crate::schedule::kernel_validation_count() - before,
+            capture.schedule.items.len()
+        );
+        assert_eq!(
+            identity_with_kernel_encodings(&capture, Some(&kernels)).unwrap(),
+            identity(&capture).unwrap()
+        );
+        assert_eq!(
+            capture
+                .payload_with_kernel_encodings(Some(&kernels))
+                .unwrap(),
+            capture.to_bytes_without_identity().unwrap()
+        );
+
+        // This effect-only fixture has no state bindings requiring a listed
+        // state. Empty state metadata is therefore valid in both paths.
+        let mut without_states = capture.clone();
+        without_states.states.clear();
+        validate(&without_states, true).unwrap();
+        validate_with_kernel_encodings(&without_states, true, Some(&kernels)).unwrap();
+
+        for case in ["metadata", "key", "kernel", "duplicate state"] {
+            let mut malformed = capture.clone();
+            match case {
+                "metadata" => malformed.schedule.items[0].id = 99,
+                "key" => malformed.schedule.items[0].cache_key ^= 1,
+                "kernel" => {
+                    malformed.schedule.items[0].kernel =
+                        crate::UOp::from_operation(crate::Operation::Load, None, vec![])
+                }
+                "duplicate state" => malformed.states.push(malformed.states[0].clone()),
+                _ => unreachable!(),
+            }
+            let expected = validate(&malformed, true).expect_err(case);
+            if case == "duplicate state" {
+                assert_eq!(
+                    expected,
+                    ReplayError::Corrupt("duplicate logical state version".into())
+                );
+            }
+            assert_eq!(
+                validate_with_kernel_encodings(&malformed, true, Some(&kernels)).expect_err(case),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn decoded_kernels_preserve_mixed_admission_and_validate_replacements() {
         let mut capture = captured_effect();
         let mut writer = Writer::new();
@@ -4763,7 +4827,7 @@ mod tests {
         capture.schedule.items = items;
 
         let before = crate::schedule::kernel_validation_count();
-        validate_with_decoded_kernels(&capture, true, Some(&proof)).unwrap();
+        validate_with_kernel_encodings(&capture, true, Some(&proof)).unwrap();
         assert_eq!(crate::schedule::kernel_validation_count(), before);
         validate(&capture, true).unwrap();
         assert_eq!(
@@ -4781,7 +4845,7 @@ mod tests {
         )
         .retag(root.tag().cloned());
         let before = crate::schedule::kernel_validation_count();
-        validate_with_decoded_kernels(&replaced, true, Some(&proof)).unwrap();
+        validate_with_kernel_encodings(&replaced, true, Some(&proof)).unwrap();
         assert_eq!(crate::schedule::kernel_validation_count(), before + 1);
 
         let mut bad_item = capture.clone();
@@ -4798,7 +4862,7 @@ mod tests {
         ] {
             let ordinary = validate(&malformed, true).unwrap_err();
             let retained =
-                validate_with_decoded_kernels(&malformed, true, Some(&proof)).unwrap_err();
+                validate_with_kernel_encodings(&malformed, true, Some(&proof)).unwrap_err();
             assert_eq!(ordinary, retained, "{name}");
         }
     }
@@ -5069,20 +5133,20 @@ mod tests {
         )
         .unwrap();
         capture.schedule.items = items;
-        validate_with_decoded_kernels(&capture, true, Some(&kernels)).unwrap();
+        validate_with_kernel_encodings(&capture, true, Some(&kernels)).unwrap();
         assert_eq!(
             capture
-                .payload_with_decoded_kernels(Some(&kernels))
+                .payload_with_kernel_encodings(Some(&kernels))
                 .unwrap(),
             capture.to_bytes_without_identity().unwrap(),
         );
         assert_eq!(
-            identity_with_decoded_kernels(&capture, Some(&kernels)).unwrap(),
+            identity_with_kernel_encodings(&capture, Some(&kernels)).unwrap(),
             identity(&capture).unwrap()
         );
         let mut retained = capture.schedule.items.clone();
         let mut reference = retained.clone();
-        crate::schedule::rekey_decoded_schedule_items(
+        crate::schedule::rekey_encoded_schedule_items(
             &mut retained,
             &capture.state_bindings,
             &kernels,
@@ -5484,13 +5548,13 @@ fn read_states(r: &mut Reader<'_>) -> Result<Vec<BufferState>, ReplayError> {
 }
 
 fn validate(value: &CapturedMixedSchedule, validate_keys: bool) -> Result<(), ReplayError> {
-    validate_with_decoded_kernels(value, validate_keys, None)
+    validate_with_kernel_encodings(value, validate_keys, None)
 }
 
-fn validate_with_decoded_kernels(
+fn validate_with_kernel_encodings(
     value: &CapturedMixedSchedule,
     validate_keys: bool,
-    decoded: Option<&crate::schedule::artifact::DecodedKernels>,
+    decoded: Option<&crate::schedule::artifact::KernelEncodings>,
 ) -> Result<(), ReplayError> {
     #[cfg(test)]
     record_prepared_replay_validation(|counts| {
@@ -5517,7 +5581,7 @@ fn validate_with_decoded_kernels(
         state_bindings: value.state_bindings.clone(),
     };
     match decoded {
-        Some(kernels) => schedule.validate_with_decoded_kernels(kernels),
+        Some(kernels) => schedule.validate_with_kernel_encodings(kernels),
         None => schedule.validate(),
     }
     .map_err(|e| ReplayError::Corrupt(e.to_string()))?;
@@ -5529,7 +5593,7 @@ fn validate_with_decoded_kernels(
             .as_ref()
             .map(|source| (source.source_identity, source.bindings.as_slice()));
         match decoded {
-            Some(kernels) => crate::schedule::rekey_decoded_schedule_items(
+            Some(kernels) => crate::schedule::rekey_encoded_schedule_items(
                 &mut expected,
                 &schedule.state_bindings,
                 kernels,
@@ -5614,30 +5678,30 @@ fn validate_with_decoded_kernels(
     Ok(())
 }
 fn identity(value: &CapturedMixedSchedule) -> Result<u64, ReplayError> {
-    identity_with_decoded_kernels(value, None)
+    identity_with_kernel_encodings(value, None)
 }
 
-fn identity_with_decoded_kernels(
+fn identity_with_kernel_encodings(
     value: &CapturedMixedSchedule,
-    decoded: Option<&crate::schedule::artifact::DecodedKernels>,
+    decoded: Option<&crate::schedule::artifact::KernelEncodings>,
 ) -> Result<u64, ReplayError> {
     #[cfg(test)]
     record_prepared_replay_validation(|counts| counts.identity_serializations += 1);
     // The mixed-capture payload deliberately excludes the ordinary capture's
     // identity field, so hashing does not need to clone the immutable program.
-    let bytes = value.payload_with_decoded_kernels(decoded)?;
+    let bytes = value.payload_with_kernel_encodings(decoded)?;
     Ok(bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
     }))
 }
 impl CapturedMixedSchedule {
     fn to_bytes_without_identity(&self) -> Result<Vec<u8>, ReplayError> {
-        self.payload_with_decoded_kernels(None)
+        self.payload_with_kernel_encodings(None)
     }
 
-    fn payload_with_decoded_kernels(
+    fn payload_with_kernel_encodings(
         &self,
-        decoded: Option<&crate::schedule::artifact::DecodedKernels>,
+        decoded: Option<&crate::schedule::artifact::KernelEncodings>,
     ) -> Result<Vec<u8>, ReplayError> {
         let mut w = Writer::new();
         write_len(&mut w, self.schedule.items.len())?;

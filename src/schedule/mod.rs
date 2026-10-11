@@ -442,11 +442,11 @@ impl Schedule {
         self.validate_with_kernel_roots(&authenticated_roots)
     }
 
-    pub(crate) fn validate_with_decoded_kernels(
+    pub(crate) fn validate_with_kernel_encodings(
         &self,
-        decoded: &artifact::DecodedKernels,
+        decoded: &artifact::KernelEncodings,
     ) -> Result<(), ScheduleError> {
-        let roots = decoded.roots().map(UOp::node_identity).collect();
+        let roots = decoded.admitted_roots().map(UOp::node_identity).collect();
         self.validate_with_kernel_roots(&roots)
     }
 
@@ -1021,10 +1021,10 @@ pub(crate) fn rekey_schedule_items(
     rekey_schedule_items_inner(items, state_bindings, specialization, None)
 }
 
-pub(crate) fn rekey_decoded_schedule_items(
+pub(crate) fn rekey_encoded_schedule_items(
     items: &mut [ScheduleItem],
     state_bindings: &[ScheduleStateBinding],
-    decoded: &artifact::DecodedKernels,
+    decoded: &artifact::KernelEncodings,
 ) -> Result<(), ScheduleError> {
     rekey_schedule_items_inner(items, state_bindings, None, Some(decoded))
 }
@@ -1033,7 +1033,7 @@ fn rekey_schedule_items_inner(
     items: &mut [ScheduleItem],
     state_bindings: &[ScheduleStateBinding],
     specialization: Option<(u64, &[(u64, i64)])>,
-    decoded: Option<&artifact::DecodedKernels>,
+    decoded: Option<&artifact::KernelEncodings>,
 ) -> Result<(), ScheduleError> {
     // Derive the base key exactly once before wrapping it with the canonical
     // state-binding sidecar. A symbolic specialization is the base identity;

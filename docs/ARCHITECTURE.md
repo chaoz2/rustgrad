@@ -1029,6 +1029,13 @@ identity; unrelated roots cannot borrow its bytes. The first encoding stays at
 the original validation gate, and schedule metadata is serialized afresh.
 Imported wire bytes are never substituted for canonical encoding. This cache
 is dropped with decoder admission; legacy rekeying and envelope checks remain.
+Fresh mixed-frontier construction uses the same allocation-bound encoding
+store across canonical item-key verification and payload identity calculation.
+Fresh entries carry no prior validation admission: both schedule validation
+passes still check their kernels, and the first byte encoding uses the ordinary
+validated codec at its original gate. Only immutable kernel bytes are reused;
+metadata, state bindings, errors, and durable identities remain unchanged. The
+temporary store is released before the frontier is returned.
 Fresh compiled-training mixed captures likewise transfer directly from the
 canonical `CapturedMixedSchedule::from_parts` validator into an immutable
 `AuthenticatedRecurrentFrontier`. The engine-owned constructor computes the
