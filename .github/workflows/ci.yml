@@ -90,6 +90,13 @@ jobs:
           set -euo pipefail
           cargo run --quiet --example compiled_transformer_scale_evidence -- compile-only > transformer-compile-only.json
           python3 .github/scripts/check-transformer-compile-profile.py compile transformer-compile-only.json
+          resource_guard="$RUNNER_TEMP/transformer-compile-only-resource-guard"
+          mkdir -- "$resource_guard"
+          PATH=/nonexistent TMPDIR="$resource_guard" \
+            target/debug/examples/compiled_transformer_scale_evidence compile-only > transformer-compile-only-guarded.json
+          python3 .github/scripts/check-transformer-compile-profile.py compile transformer-compile-only-guarded.json
+          cmp transformer-compile-only.json transformer-compile-only-guarded.json
+          test -z "$(find "$resource_guard" -mindepth 1 -print -quit)"
       - name: Compiled Transformer masked-batch resume smoke
         if: matrix.os == 'ubuntu-latest'
         run: cargo run --quiet --example compiled_transformer_train_resume -- cpu-reuse

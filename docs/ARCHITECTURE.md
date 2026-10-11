@@ -1687,7 +1687,9 @@ inclusive/exclusive instruction annotations remain separate from ordinary ABBA
 timings. A bounded format validator checks workload facts, positive instruction
 counts and the exact command before create-new manifest publication. Synthetic
 admission tests and the real compile-only example run in ordinary Linux CI;
-profiler installation/execution is manual-only and never required locally.
+the binary is also launched with no executable search path and an isolated
+temporary directory, requiring identical output and no temporary resources.
+Profiler installation/execution is manual-only and never required locally.
 The profile includes initialization, plan compilation, inspection and teardown;
 it is neither a compile-interval wall-clock measurement nor replay or accelerator
 evidence. Inclusive recursive call cycles require a cycle-aware reader such as
