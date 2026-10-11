@@ -1029,6 +1029,20 @@ identity; unrelated roots cannot borrow its bytes. The first encoding stays at
 the original validation gate, and schedule metadata is serialized afresh.
 Imported wire bytes are never substituted for canonical encoding. This cache
 is dropped with decoder admission; legacy rekeying and envelope checks remain.
+Fresh compiled-training mixed captures likewise transfer directly from the
+canonical `CapturedMixedSchedule::from_parts` validator into an immutable
+`AuthenticatedRecurrentFrontier`. The engine-owned constructor computes the
+canonical identity and recurrent schema without a second mixed-capture
+validation; no caller receives mutable access between admission and ownership.
+Main, accumulation, partial-flush, and nonempty zero-grad construction use this
+boundary. The raw-capture test oracle still performs full authentication, and
+wire decoding retains its own admission path. Capture bytes, replay, and checkpoint
+contracts are unchanged. Fresh frontier identity/schema work is now included
+in effect assembly/mixed sealing; the subsequent authentication timing covers
+the independently validated pure-prefix/stateful projection. Compare total
+compile or full-call times across this change, not those two subpartitions as
+if their attribution were unchanged. No performance improvement is claimed
+without a same-runner measurement.
 Execution summaries validate their projected schedule once and pass a
 crate-private `ValidatedSchedule` borrow to memory planning. The schedule module
 owns this proof and exposes only an immutable reference, preventing mutation

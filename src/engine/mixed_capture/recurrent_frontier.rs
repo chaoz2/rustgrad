@@ -15,6 +15,21 @@ pub(crate) struct AuthenticatedRecurrentFrontier {
 }
 
 impl AuthenticatedRecurrentFrontier {
+    /// Takes fresh construction directly into immutable ownership. The ordinary
+    /// constructor remains the sole structural validator; no caller can mutate
+    /// its admitted result before the frontier retains it.
+    pub(crate) fn from_parts(
+        schedule: CapturedSchedule,
+        mixed: &Schedule,
+        states: Vec<BufferState>,
+    ) -> Result<Self, ReplayError> {
+        let capture = CapturedMixedSchedule::from_parts(schedule, mixed, states)?;
+        let capture_identity = identity(&capture)?;
+        Self::from_admitted_capture(Arc::new(capture), capture_identity)
+    }
+
+    /// Independent raw-capture reference for admission and ownership tests.
+    #[cfg(test)]
     pub(crate) fn authenticate(capture: Arc<CapturedMixedSchedule>) -> Result<Self, ReplayError> {
         validate(capture.as_ref(), true)?;
         let capture_identity = identity(capture.as_ref())?;
@@ -30,7 +45,7 @@ impl AuthenticatedRecurrentFrontier {
         Self::from_admitted_capture(Arc::new(capture), capture_identity)
     }
 
-    // Both callers establish canonical structural admission and identity before
+    // All callers establish canonical structural admission and identity before
     // reaching this private constructor; no unchecked caller-owned path exists.
     fn from_admitted_capture(
         capture: Arc<CapturedMixedSchedule>,
