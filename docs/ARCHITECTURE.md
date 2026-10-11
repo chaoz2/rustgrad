@@ -1405,6 +1405,18 @@ descriptors on both paths. Partial, reordered, and zero-byte inventories retain
 the generic request-order lookup path; callbacks and successor validation still
 finish before any active bank flips. No slot references survive the pool lock.
 
+Native recurrent preparation also resolves each replaced bank's output buffer
+to a workspace slot and borrowed-binding ordinal once. The private prepared
+binding carries its workspace owner and no tensor or pointer; retained banks
+need no output binding. Replay uses that ordered replacement inventory rather
+than looking up every producer in the workspace owner map again. It still
+checks the binding's preparation owner, duplicate binding, and the live
+destination's shape, dtype, length, mutable dense storage, and traffic bounds
+before borrowing it. Checkpoint restore and rollback therefore cannot reuse a
+stale destination pointer; each invocation binds its current inactive banks.
+This changes no capture, checkpoint, kernel, or cache format and makes no
+unmeasured speedup claim.
+
 CPU native preparation reuses the same `Arc`-owned authenticated recurrent
 capture, canonical capture identity, and version-zero frontier when deriving
 replacement bindings and seeding the native replay trace. It therefore does

@@ -39,6 +39,15 @@ struct WorkspaceOwner {
     binding: Option<crate::cpu_jit::NativeReplayBindingOrdinal>,
 }
 
+/// An output's immutable location in one prepared workspace. It never retains
+/// a tensor or pointer; replay still authenticates the live destination.
+pub(super) struct PreparedNativeOutputBinding {
+    workspace_owner: Arc<()>,
+    buffer: u64,
+    slot: usize,
+    binding: crate::cpu_jit::NativeReplayBindingOrdinal,
+}
+
 #[derive(Debug)]
 struct NativeEgressSelection {
     physical: Box<[(u64, usize, crate::Shape)]>,
@@ -259,7 +268,7 @@ impl NativeReplayTraffic {
 /// inputs borrow caller storage for one invocation, while every mutable derived
 /// value is invalidated per run.
 pub(super) struct NativeReplayWorkspace {
-    egress_owner: Arc<()>,
+    preparation_owner: Arc<()>,
     buffers: Vec<crate::JitBuffer>,
     slots: Vec<WorkspaceSlot>,
     items: Vec<WorkspaceItem>,
@@ -388,7 +397,7 @@ impl NativeReplayWorkspace {
         items: &[PreparedNativeDispatch],
     ) -> Result<Self, ReplayError> {
         let mut workspace = Self {
-            egress_owner: Arc::new(()),
+            preparation_owner: Arc::new(()),
             buffers: Vec::new(),
             slots: Vec::new(),
             items: Vec::with_capacity(items.len()),
@@ -1303,12 +1312,10 @@ impl NativeReplayWorkspace {
         Ok(())
     }
 
-    pub(super) fn borrow_recurrent_output<'a>(
-        &mut self,
+    pub(super) fn prepare_output_binding(
+        &self,
         buffer: u64,
-        value: &'a mut TensorData,
-        borrowed: &mut NativeReplayBindings<'a>,
-    ) -> Result<(), ReplayError> {
+    ) -> Result<PreparedNativeOutputBinding, ReplayError> {
         let owner = self
             .owners
             .get(&buffer)
@@ -1320,6 +1327,31 @@ impl NativeReplayWorkspace {
                 "native workspace output {buffer} has no sealed binding"
             ))
         })?;
+        Ok(PreparedNativeOutputBinding {
+            workspace_owner: Arc::clone(&self.preparation_owner),
+            buffer,
+            slot,
+            binding,
+        })
+    }
+
+    pub(super) fn borrow_recurrent_output<'a>(
+        &mut self,
+        output: &PreparedNativeOutputBinding,
+        value: &'a mut TensorData,
+        borrowed: &mut NativeReplayBindings<'a>,
+    ) -> Result<(), ReplayError> {
+        if !Arc::ptr_eq(&self.preparation_owner, &output.workspace_owner) {
+            return Err(ReplayError::Corrupt(
+                "prepared native output binding owner mismatch".into(),
+            ));
+        }
+        let PreparedNativeOutputBinding {
+            buffer,
+            slot,
+            binding,
+            ..
+        } = *output;
         if borrowed.slots.get(binding).is_some() {
             return Err(ReplayError::Corrupt(format!(
                 "native workspace output {buffer} was bound twice"
@@ -1790,7 +1822,7 @@ impl NativeReplayWorkspace {
     ) -> PreparedNativeEgressProjection {
         let selected = selected_owner.iter().copied().collect::<BTreeSet<_>>();
         let projection = PreparedNativeEgressProjection {
-            workspace_owner: Arc::clone(&self.egress_owner),
+            workspace_owner: Arc::clone(&self.preparation_owner),
             selected_owner,
             selection: self.select_egress(capture, Some(&selected)),
         };
@@ -1814,7 +1846,7 @@ impl NativeReplayWorkspace {
         &self,
         projection: &PreparedNativeEgressProjection,
     ) -> Result<(), ReplayError> {
-        if !Arc::ptr_eq(&self.egress_owner, &projection.workspace_owner) {
+        if !Arc::ptr_eq(&self.preparation_owner, &projection.workspace_owner) {
             return Err(ReplayError::Corrupt(
                 "prepared native egress projection owner mismatch".into(),
             ));
