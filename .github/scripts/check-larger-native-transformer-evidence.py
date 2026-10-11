@@ -257,7 +257,7 @@ def validate_larger_evidence(
         except PREPARATION_EVIDENCE.PreparationEvidenceError:
             return None
 
-    if objective.get("schema_version") not in (8, 9, 10, 11, 12) or objective.get("git_sha") != expected_sha:
+    if objective.get("schema_version") not in (8, 9, 10, 11, 12, 13) or objective.get("git_sha") != expected_sha:
         raise LargerEvidenceError("larger Transformer objective provenance is invalid")
     expected_workload = {
         "batch": 4,
@@ -719,15 +719,17 @@ def validate_larger_evidence(
                   "decode_wall_time_ns", "authentication_wall_time_ns")
         subphases = ("authentication_policy_wall_time_ns", "authentication_abi_wall_time_ns",
                      "authentication_remainder_wall_time_ns") if objective["schema_version"] >= 12 else ()
+        policy_phases = ("authentication_linearization_wall_time_ns", "authentication_memory_spaces_wall_time_ns",
+                         "authentication_vector_program_wall_time_ns", "authentication_policy_remainder_wall_time_ns") if objective["schema_version"] >= 13 else ()
         if type(phases) is not list or len(phases) != 5:
             raise LargerEvidenceError("larger Transformer capsule phase inventory differs")
         total = 0
         for index, phase in enumerate(phases):
-            if (type(phase) is not dict or set(phase) != {"program_index", *fields, *subphases}
+            if (type(phase) is not dict or set(phase) != {"program_index", *fields, *subphases, *policy_phases}
                     or type(phase.get("program_index")) is not int
                     or phase["program_index"] != index):
                 raise LargerEvidenceError("larger Transformer capsule phase order differs")
-            for field in (*fields, *subphases):
+            for field in (*fields, *subphases, *policy_phases):
                 value = phase[field]
                 if type(value) is not int or not 0 <= value <= 2**64 - 1:
                     raise LargerEvidenceError("larger Transformer capsule phase timing is invalid")
@@ -735,6 +737,8 @@ def validate_larger_evidence(
                     total += value
             if subphases and sum(phase[field] for field in subphases) != phase["authentication_wall_time_ns"]:
                 raise LargerEvidenceError("larger Transformer capsule authentication phases do not balance")
+            if policy_phases and sum(phase[field] for field in policy_phases) != phase["authentication_policy_wall_time_ns"]:
+                raise LargerEvidenceError("larger Transformer capsule policy phases do not balance")
         enclosing = duration_nanos(preparation["prepare_finalization"].get(
             "render_batch_orchestration_wall_time"))
         if enclosing is None or total > enclosing:

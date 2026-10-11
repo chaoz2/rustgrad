@@ -1418,9 +1418,13 @@ no relevant entry is reached. Policy reconstruction includes dedicated-kernel
 policy selection but not source-key comparison. Store-group and zero-domain
 admission, payload/key checks, layout checks, loop overhead, and observer
 overhead remain in the explicit remainder; it is not labeled as pure validation
-work. Larger Transformer evidence schema 12 checks that these three durations
-sum exactly to authentication without double-counting the enclosing batch.
-Schemas 8–11 retain their original admission rules. These observations change
+work. Within ordinary policy, separate observations cover linearization/vector
+planning, initial memory-space planning, and vector-program construction and
+validation (including its memory-space revalidation). Dedicated-kernel selection,
+eligibility, key construction and observer overhead remain in the policy remainder.
+Larger Transformer evidence schema 13 checks both nested partitions sum exactly
+to their enclosing durations without double-counting the batch. Schemas 8–12
+retain their original admission rules. These observations change
 neither validation order nor artifact, cache, checkpoint, or capture identity.
 
 ##### Bounded parallel work

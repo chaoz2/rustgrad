@@ -27,7 +27,9 @@ mod render_policy;
 mod schedule_module;
 mod store_group;
 pub(crate) mod symbolic_runtime;
-pub(crate) use render_policy::{NativeRenderAuthentication, NativeRenderTopologyWitness};
+pub(crate) use render_policy::{
+    NativeRenderAuthentication, NativeRenderTopologyWitness, RenderPolicyTimings,
+};
 #[cfg(test)]
 pub(crate) use render_policy::{
     native_render_topology_derivation_counts, reset_native_render_topology_derivation_counts,
