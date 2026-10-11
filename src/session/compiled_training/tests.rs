@@ -4803,13 +4803,7 @@ fn cpu_step_transaction_rejects_output_layout_before_publication() {
     let mut interpreted_reference = plan.prepare_cpu().unwrap();
     let initial = interpreted.checkpoint().unwrap();
     let accumulation_owner = Arc::make_mut(
-        &mut interpreted
-            .inner
-            .accumulation
-            .as_mut()
-            .unwrap()
-            .phase
-            .capture,
+        &mut Arc::make_mut(&mut interpreted.inner.accumulation.as_mut().unwrap().phase).capture,
     )
     .schedule
     .requested
@@ -4822,13 +4816,7 @@ fn cpu_step_transaction_rejects_output_layout_before_publication() {
     assert!(error.to_string().contains("requested output layout"));
     assert_eq!(interpreted.checkpoint().unwrap(), initial);
     Arc::make_mut(
-        &mut interpreted
-            .inner
-            .accumulation
-            .as_mut()
-            .unwrap()
-            .phase
-            .capture,
+        &mut Arc::make_mut(&mut interpreted.inner.accumulation.as_mut().unwrap().phase).capture,
     )
     .schedule
     .requested
@@ -4878,14 +4866,7 @@ fn cpu_step_transaction_rejects_output_layout_before_publication() {
     let mut native_reference = target.prepare(&plan).unwrap();
     let initial = native.checkpoint().unwrap();
     let accumulation_owner = Arc::make_mut(
-        &mut native
-            .inner
-            .inner
-            .accumulation
-            .as_mut()
-            .unwrap()
-            .phase
-            .capture,
+        &mut Arc::make_mut(&mut native.inner.inner.accumulation.as_mut().unwrap().phase).capture,
     )
     .schedule
     .requested
@@ -4899,14 +4880,7 @@ fn cpu_step_transaction_rejects_output_layout_before_publication() {
     assert_eq!(native.checkpoint().unwrap(), initial);
     assert_eq!(native.successful_steps, 0);
     Arc::make_mut(
-        &mut native
-            .inner
-            .inner
-            .accumulation
-            .as_mut()
-            .unwrap()
-            .phase
-            .capture,
+        &mut Arc::make_mut(&mut native.inner.inner.accumulation.as_mut().unwrap().phase).capture,
     )
     .schedule
     .requested
