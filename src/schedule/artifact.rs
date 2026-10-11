@@ -920,7 +920,12 @@ pub(crate) fn write_effect_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), 
 /// This does not authenticate any schedule metadata or artifact identity.
 pub(crate) struct DecodedKernels {
     roots: Vec<UOp>,
-    canonical: BTreeMap<usize, OnceCell<Result<Vec<u8>, ArtifactError>>>,
+    canonical: BTreeMap<usize, DecodedKernelEncoding>,
+}
+
+struct DecodedKernelEncoding {
+    admitted: crate::uop::artifact::DecodedKernel,
+    bytes: OnceCell<Result<Vec<u8>, ArtifactError>>,
 }
 
 impl DecodedKernels {
@@ -937,7 +942,8 @@ impl DecodedKernels {
             .get(&root.node_identity())
             .ok_or(ArtifactError::Format("decoded kernel ownership"))?;
         entry
-            .get_or_init(|| encode_schedule_identity(root))
+            .bytes
+            .get_or_init(|| entry.admitted.encode_schedule_identity())
             .as_deref()
             .map_err(Clone::clone)
     }
@@ -972,17 +978,28 @@ pub(crate) fn read_effect_items(
     if count > MAX_ITEMS {
         return Err(ArtifactError::Format("item count"));
     }
+    let mut canonical = BTreeMap::new();
     let items = (0..count)
-        .map(|_| read_effect_item(reader))
+        .map(|_| {
+            read_item_with_decoder(reader, 4, true, |bytes| {
+                let admitted = crate::uop::artifact::decode_admitted(bytes)?;
+                let root = admitted.root().clone();
+                canonical.insert(
+                    root.node_identity(),
+                    DecodedKernelEncoding {
+                        admitted,
+                        bytes: OnceCell::new(),
+                    },
+                );
+                Ok(root)
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    // read_effect_item delegates every kernel to the bounded UOp decoder,
+    // Each item delegates its kernel to the bounded UOp decoder,
     // which validates the full DAG before returning it. No mutable UOp exists.
     let kernels = DecodedKernels {
         roots: items.iter().map(|item| item.kernel.clone()).collect(),
-        canonical: items
-            .iter()
-            .map(|item| (item.kernel.node_identity(), OnceCell::new()))
-            .collect(),
+        canonical,
     };
     Ok((items, kernels))
 }
@@ -1130,14 +1147,19 @@ fn read_scheduled_outputs_item(r: &mut Reader<'_>) -> Result<ScheduleItem, Artif
     })
 }
 
-pub(crate) fn read_effect_item(r: &mut Reader<'_>) -> Result<ScheduleItem, ArtifactError> {
-    read_item_inner(r, 4, true)
-}
-
 fn read_item_inner(
     r: &mut Reader<'_>,
     version: u8,
     effects: bool,
+) -> Result<ScheduleItem, ArtifactError> {
+    read_item_with_decoder(r, version, effects, decode_uop)
+}
+
+fn read_item_with_decoder(
+    r: &mut Reader<'_>,
+    version: u8,
+    effects: bool,
+    decode_kernel: impl FnOnce(&[u8]) -> Result<UOp, ArtifactError>,
 ) -> Result<ScheduleItem, ArtifactError> {
     let affine_views = effects || version >= 6;
     let id = r.u64()?;
@@ -1186,7 +1208,7 @@ fn read_item_inner(
         ScheduledOutputs::single(read_desc_inner(r, affine_views)?)
     };
     let kernel_len = r.count(MAX_ARTIFACT_BYTES)?;
-    let kernel = decode_uop(r.take(kernel_len)?)?;
+    let kernel = decode_kernel(r.take(kernel_len)?)?;
     let boundary = read_boundary_inner(r, effects)?;
     let cache_key = r.u64()?;
     Ok(ScheduleItem {
@@ -2736,7 +2758,7 @@ mod tests {
             kernels
                 .canonical
                 .values()
-                .all(|entry| entry.get().is_none())
+                .all(|entry| entry.bytes.get().is_none())
         );
         for item in &items {
             assert_eq!(
@@ -2790,7 +2812,7 @@ mod tests {
             kernels
                 .canonical
                 .values()
-                .all(|entry| entry.get().is_some())
+                .all(|entry| entry.bytes.get().is_some())
         );
     }
 
