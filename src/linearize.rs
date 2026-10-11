@@ -802,6 +802,10 @@ impl LinearKernel {
         source
             .validate()
             .map_err(|e| LinearizeError::Invalid(e.to_string()))?;
+        Self::from_validated_source(source)
+    }
+
+    fn from_validated_source(source: &UOp) -> Result<Self, LinearizeError> {
         let producers = LaneProducers::new(source);
         let nodes = &producers.nodes;
         let store = source
@@ -990,12 +994,26 @@ impl LinearKernel {
     /// Validate a freshly derived plan without reconstructing its source projection.
     pub(crate) fn from_uop_validated(source: &UOp) -> Result<Self, LinearizeError> {
         let plan = Self::from_uop(source)?;
-        // from_uop owns the projection through linear_program, which preserves
+        plan.validate_fresh()
+    }
+
+    pub(crate) fn from_order_validated(
+        source: &UOp,
+        order: &crate::uop::TopologicalOrder,
+    ) -> Result<Self, LinearizeError> {
+        order
+            .validate_for(source)
+            .map_err(|e| LinearizeError::Invalid(e.to_string()))?;
+        Self::from_validated_source(source)?.validate_fresh()
+    }
+
+    fn validate_fresh(self) -> Result<Self, LinearizeError> {
+        // from_validated_source owns the projection through linear_program, which preserves
         // its instructions and source records. No caller can modify that proof
         // before these remaining geometry and register checks.
-        plan.validate_geometry()?;
-        plan.validate_registers()?;
-        Ok(plan)
+        self.validate_geometry()?;
+        self.validate_registers()?;
+        Ok(self)
     }
 
     fn validate_geometry(&self) -> Result<(), LinearizeError> {
@@ -2049,6 +2067,27 @@ mod tests {
             assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
             assert_eq!(actual.cache_key, expected.cache_key);
 
+            let order = crate::uop::TopologicalOrder::new(&source).unwrap();
+            LANE_PROJECTIONS.with(|count| count.set(0));
+            let retained = LinearKernel::from_order_validated(&source, &order).unwrap();
+            assert_eq!(LANE_PROJECTIONS.with(|count| count.get()), 1);
+            assert_eq!(format!("{retained:?}"), format!("{expected:?}"));
+            assert_eq!(retained.cache_key, expected.cache_key);
+
+            let foreign = UOp::from_operation(
+                source.operation().clone(),
+                source.ty(),
+                source.sources().to_vec(),
+            )
+            .retag(source.tag().cloned());
+            assert_eq!(foreign, source);
+            LANE_PROJECTIONS.with(|count| count.set(0));
+            assert_eq!(
+                LinearKernel::from_order_validated(&foreign, &order).unwrap_err(),
+                LinearizeError::Invalid(crate::UOpError::InvalidArgument.to_string())
+            );
+            assert_eq!(LANE_PROJECTIONS.with(|count| count.get()), 0);
+
             let mut forged = actual.clone();
             forged.program.control_operations.clear();
             assert!(matches!(
@@ -2071,6 +2110,11 @@ mod tests {
                 .unwrap_err();
             assert_eq!(
                 LinearKernel::from_uop_validated(&source).unwrap_err(),
+                expected
+            );
+            let order = crate::uop::TopologicalOrder::new(&source).unwrap();
+            assert_eq!(
+                LinearKernel::from_order_validated(&source, &order).unwrap_err(),
                 expected
             );
         }

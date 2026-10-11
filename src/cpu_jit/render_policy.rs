@@ -104,6 +104,16 @@ impl ElementwiseRenderPolicy {
         root: &UOp,
         request_vector: bool,
         projected: bool,
+        timing: Option<&mut RenderPolicyTimings>,
+    ) -> Result<Self, JitError> {
+        Self::from_projection_with_order(root, request_vector, projected, None, timing)
+    }
+
+    fn from_projection_with_order(
+        root: &UOp,
+        request_vector: bool,
+        projected: bool,
+        order: Option<&crate::uop::TopologicalOrder>,
         mut timing: Option<&mut RenderPolicyTimings>,
     ) -> Result<Self, JitError> {
         if !request_vector || projected {
@@ -132,7 +142,7 @@ impl ElementwiseRenderPolicy {
             timing
                 .as_deref_mut()
                 .map(|timing| &mut timing.linearization),
-            || elementwise_vector_plan(root),
+            || elementwise_vector_plan_with_order(root, order),
         )?;
         let vector_program = vector_program_observed(&linear, timing)?;
         let linear_key = Some((
@@ -221,12 +231,14 @@ impl NativeRenderAuthentication {
         root: &UOp,
         request_vector: bool,
         projected: bool,
+        order: &crate::uop::TopologicalOrder,
         timing: Option<&mut RenderPolicyTimings>,
     ) -> Result<Self, JitError> {
-        let policy = ElementwiseRenderPolicy::from_projection_observed(
+        let policy = ElementwiseRenderPolicy::from_projection_with_order(
             root,
             request_vector,
             projected,
+            Some(order),
             timing,
         )?;
         Ok(Self {
@@ -340,11 +352,12 @@ impl NativeRenderTopologyWitness {
             NativeRenderTopologyState::Legacy => {
                 NativeRenderAuthentication::new(root, request_vector)
             }
-            NativeRenderTopologyState::Elementwise { projected, .. } => {
+            NativeRenderTopologyState::Elementwise { projected, order } => {
                 NativeRenderAuthentication::from_elementwise_projection(
                     root,
                     request_vector,
                     *projected,
+                    order,
                     timing,
                 )
             }
@@ -408,10 +421,20 @@ pub(super) fn vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
 }
 
 fn elementwise_vector_plan(root: &UOp) -> Result<(crate::LinearKernel, VectorPlan), JitError> {
+    elementwise_vector_plan_with_order(root, None)
+}
+
+fn elementwise_vector_plan_with_order(
+    root: &UOp,
+    order: Option<&crate::uop::TopologicalOrder>,
+) -> Result<(crate::LinearKernel, VectorPlan), JitError> {
     #[cfg(test)]
     POLICY_LINEAR_DERIVATIONS.with(|count| count.set(count.get().saturating_add(1)));
-    let linear = crate::LinearKernel::from_uop_validated(root)
-        .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    let linear = match order {
+        Some(order) => crate::LinearKernel::from_order_validated(root, order),
+        None => crate::LinearKernel::from_uop_validated(root),
+    }
+    .map_err(|error| JitError::Unsupported(error.to_string()))?;
     let vector = VectorPlan {
         lanes: linear.lanes,
         enabled: linear.enabled,
@@ -781,6 +804,10 @@ mod tests {
         POLICY_LINEAR_DERIVATIONS.with(|count| count.set(0));
         NativeRenderAuthentication::new(&root, true).unwrap();
         assert_eq!(POLICY_LINEAR_DERIVATIONS.with(|count| count.get()), 1);
+        let witness = NativeRenderTopologyWitness::new(&root, true);
+        POLICY_LINEAR_DERIVATIONS.with(|count| count.set(0));
+        witness.authentication(&root, true).unwrap();
+        assert_eq!(POLICY_LINEAR_DERIVATIONS.with(|count| count.get()), 1);
 
         let malformed = UOp::sink(vec![]);
         assert_eq!(
@@ -808,6 +835,11 @@ mod tests {
         let invalid_load = UOp::from_operation(Operation::Load, load.ty(), Vec::new());
         let invalid_abi_and_policy = UOp::sink(vec![store, invalid_load]);
         assert!(ElementwiseRenderPolicy::new(&invalid_abi_and_policy, true).is_err());
+        let witness = NativeRenderTopologyWitness::new(&invalid_abi_and_policy, true);
+        assert_eq!(
+            witness.authentication(&invalid_abi_and_policy, true).err(),
+            NativeRenderAuthentication::new(&invalid_abi_and_policy, true).err()
+        );
         assert_eq!(
             crate::CpuJit::render_vectorized(&invalid_abi_and_policy).unwrap_err(),
             JitError::Unsupported("load without index".into()),
