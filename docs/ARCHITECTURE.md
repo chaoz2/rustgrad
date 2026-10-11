@@ -2932,6 +2932,14 @@ including the independent allocation-based reduction ownership walk. Wire
 field validation, historical version rejection, unreachable-node errors, and
 canonical artifact bytes remain unchanged.
 
+Schedule construction similarly retains the finalized kernel's root-bound
+order while deriving common views, ordered input bindings, and checking those
+bindings. External-materialization provenance uses that same binding result.
+This order is not an admission token: descriptor and binding checks still run,
+an unrelated root triggers a fresh traversal, and final schedule validation and
+public capture keep their independent validation gates. No retained order is
+serialized or added to the public schedule state.
+
 UPat matching keeps alternatives and exact/prefix/repeated/permuted source
 constraints inside the matcher rather than adding another operation taxonomy.
 Alternatives are tried in declaration order, and an apply callback that declines
