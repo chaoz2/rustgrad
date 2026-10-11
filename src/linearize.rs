@@ -1056,16 +1056,40 @@ struct LaneProducers {
     owners: BTreeMap<usize, u32>,
 }
 
+/// Sources have already been canonicalized in postorder. Borrow metadata from
+/// the retained immutable DAG instead of recursively formatting its subtrees.
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct LaneProducerKey<'a> {
+    operation: &'a Operation,
+    ty: Option<UType>,
+    tag: Option<&'a crate::UOpTag>,
+    sources: Vec<u32>,
+}
+
 impl LaneProducers {
     fn new(root: &UOp) -> Self {
-        fn visit(node: &UOp, index: &mut LaneProducers, structural: &mut BTreeMap<String, u32>) {
+        fn visit<'a>(
+            node: &'a UOp,
+            index: &mut LaneProducers,
+            structural: &mut BTreeMap<LaneProducerKey<'a>, u32>,
+        ) {
             if index.owners.contains_key(&node.node_identity()) {
                 return;
             }
             for source in node.sources() {
                 visit(source, index, structural);
             }
-            let id = *structural.entry(format!("{node:?}")).or_insert_with(|| {
+            let key = LaneProducerKey {
+                operation: node.operation(),
+                ty: node.ty(),
+                tag: node.tag(),
+                sources: node
+                    .sources()
+                    .iter()
+                    .map(|source| index.owners[&source.node_identity()])
+                    .collect(),
+            };
+            let id = *structural.entry(key).or_insert_with(|| {
                 let id = index.nodes.len() as u32;
                 index.nodes.push(node.clone());
                 id
@@ -1760,6 +1784,126 @@ mod tests {
         assert_eq!(retained.owners.get(&first.node_identity()), Some(&0));
         assert_eq!(retained.owners.get(&equal.node_identity()), Some(&0));
         assert_eq!(retained.nodes.len(), 2);
+    }
+
+    #[test]
+    fn typed_producer_keys_preserve_metadata_and_ordered_sources() {
+        let ty = UType::scalar(DType::I32);
+        let one = UOp::constant(1, ty);
+        let equal_one = UOp::constant(1, ty);
+        let two = UOp::constant(2, ty);
+        let subtract = |lhs: UOp, rhs: UOp| {
+            UOp::from_operation(
+                Operation::GraphBinary(BinaryOp::Sub),
+                Some(ty),
+                vec![lhs, rhs],
+            )
+        };
+        let forward = subtract(one.clone(), two.clone());
+        let equal_forward = subtract(equal_one.clone(), two.clone());
+        let distinct = [
+            subtract(two.clone(), one.clone()),
+            one.retag(Some(crate::UOpTag::Int(1))),
+            one.retag(Some(crate::UOpTag::Text("1".into()))),
+            UOp::constant(1, UType::scalar(DType::U32)),
+            UOp::constant(1, UType::vector(DType::I32, 2).unwrap()),
+            UOp::from_operation(Operation::VConst(LiteralValue::Int(1)), Some(ty), vec![]),
+        ];
+        let mut roots = vec![forward.clone(), equal_forward.clone()];
+        roots.extend(distinct.iter().cloned());
+        let root = UOp::sink(roots);
+        let indexed = LaneProducers::new(&root);
+        let id = |node: &UOp| indexed.owners[&node.node_identity()];
+        assert_eq!(id(&one), id(&equal_one));
+        assert_eq!(id(&forward), id(&equal_forward));
+        let unique: BTreeSet<_> = distinct.iter().map(id).collect();
+        assert_eq!(unique.len(), distinct.len());
+        assert!(!unique.contains(&id(&one)));
+        assert!(!unique.contains(&id(&forward)));
+        let mut legacy = Vec::new();
+        producer_order(&root, &mut BTreeSet::new(), &mut legacy);
+        assert_eq!(indexed.nodes.len(), legacy.len());
+        assert!(
+            indexed
+                .nodes
+                .iter()
+                .zip(legacy)
+                .all(|(a, b)| a.shares_node_with(&b))
+        );
+    }
+
+    #[test]
+    fn typed_producer_keys_keep_shared_dag_size_bounded() {
+        let ty = UType::scalar(DType::I32);
+        let mut node = UOp::constant(1, ty);
+        for _ in 0..128 {
+            node = UOp::from_operation(
+                Operation::GraphBinary(BinaryOp::Add),
+                Some(ty),
+                vec![node.clone(), node],
+            );
+        }
+        let indexed = LaneProducers::new(&UOp::sink(vec![node]));
+        // The expanded tree has exponentially many edges, but each owner and
+        // its two source IDs occur only once in this index.
+        assert_eq!(indexed.nodes.len(), 130);
+        assert_eq!(indexed.owners.len(), 130);
+        for (id, node) in indexed.nodes.iter().enumerate() {
+            assert_eq!(indexed.owners[&node.node_identity()], id as u32);
+            assert!(
+                node.sources()
+                    .iter()
+                    .all(|source| indexed.owners[&source.node_identity()] < id as u32)
+            );
+        }
+    }
+
+    #[test]
+    fn typed_producer_keys_retain_random_parameter_bits() {
+        let random = |mean| {
+            let mut plan = crate::random::plan::RandomKernelPlan::new(
+                crate::NodeId::from_index(0),
+                Shape::from([1]),
+                DType::F32,
+                crate::RandomKind::Normal {
+                    mean: 0.0,
+                    std: 1.0,
+                },
+                crate::RandomStream {
+                    device: 0,
+                    key: [0, 0],
+                    counter: [0, 0],
+                },
+            )
+            .unwrap();
+            plan.kind = crate::RandomKind::Normal { mean, std: 1.0 };
+            assert_eq!(plan.validate().is_ok(), mean.is_finite());
+            UOp::from_operation(
+                Operation::Random(Box::new(plan)),
+                Some(UType::scalar(DType::F32)),
+                vec![],
+            )
+        };
+        let positive_zero = random(0.0);
+        let negative_zero = random(-0.0);
+        let nan = random(f64::from_bits(0x7ff8_0000_0000_0001));
+        let equal_nan = random(f64::from_bits(0x7ff8_0000_0000_0001));
+        let other_nan = random(f64::from_bits(0x7ff8_0000_0000_0002));
+        // This is a descriptor-identity test, not admission of NaN random
+        // execution. Debug loses those payload bits; typed keys must not.
+        let root = UOp::sink(vec![
+            positive_zero.clone(),
+            negative_zero.clone(),
+            nan.clone(),
+            equal_nan.clone(),
+            other_nan.clone(),
+        ]);
+        let indexed = LaneProducers::new(&root);
+        let id = |node: &UOp| indexed.owners[&node.node_identity()];
+        assert_ne!(id(&positive_zero), id(&negative_zero));
+        assert_eq!(id(&nan), id(&equal_nan));
+        assert_ne!(id(&nan), id(&other_nan));
+        assert_eq!(indexed.nodes.len(), 5);
     }
 
     #[test]

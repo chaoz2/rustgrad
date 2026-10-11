@@ -1478,9 +1478,12 @@ neither validation order nor artifact, cache, checkpoint, or capture identity.
   including separately allocated equal nodes excluded from the producer list.
   Each identity maps to the original first structural register ID, eliminating
   a second structural-key construction and equal-source formatting fallbacks.
-  The original structural keys are still used during the walk; this does not
-  replace them with pointer equality or change register numbering, cache
-  identities, or admission. Public validation constructs a fresh index rather
+  The walk keys producers by borrowed typed operation, dtype/lane type, tag,
+  and ordered canonical source IDs, rather than recursively formatting whole
+  subtrees. Pointer identity only skips repeated owners; separately allocated
+  equal producers still share a register. Raw random-parameter bits remain
+  distinct even where Debug would collapse NaN payloads; executable random
+  plans continue to reject nonfinite parameters. Public validation constructs a fresh index rather
   than trusting a previous result for the publicly mutable lane program.
   Missing, stale, or corrupt sidecars fall back in program order. No measured
   speedup is claimed.
