@@ -1,0 +1,99 @@
+name: Native Transformer Compile Profile
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: Exact reviewed lowercase 40-character commit SHA
+        required: true
+        type: string
+
+concurrency:
+  group: native-transformer-compile-profile-${{ inputs.expected_sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  compile-profile:
+    name: Compile-only Transformer instruction profile
+    runs-on: ubuntu-24.04
+    environment: native-transformer-scale-evidence
+    timeout-minutes: 45
+    env:
+      EXPECTED_SHA: ${{ inputs.expected_sha }}
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_RELEASE_DEBUG: 2
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Validate requested revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_SHA" = "$EXPECTED_SHA"
+      - name: Check out exact reviewed revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.expected_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05
+        with:
+          toolchain: 1.89.0
+      - name: Install runner-local profiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes valgrind
+      - name: Build the exact release example with debug information
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git status --short)"
+          cargo build --locked --release --example compiled_transformer_scale_evidence \
+            --target-dir "$RUNNER_TEMP/transformer-compile-profile-build"
+      - name: Record compile-only profile without target preparation
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_root="$GITHUB_WORKSPACE/native-transformer-compile-profile"
+          binary="$RUNNER_TEMP/transformer-compile-profile-build/release/examples/compiled_transformer_scale_evidence"
+          mkdir -- "$evidence_root"
+          {
+            printf 'source_sha=%s\n' "$EXPECTED_SHA"
+            printf 'scope=initialization_compile_inspection_and_teardown\n'
+            printf 'build=locked_release_debug2_jobs2_incremental0\n'
+            printf 'timing_policy=instruction_counts_not_wall_clock_benchmark\n'
+            printf 'trace_children=false\n'
+            printf 'runner_image=%s\n' "${ImageVersion:-unknown}"
+            rustc -Vv
+            cargo -Vv
+            valgrind --version
+            dpkg-query -W valgrind
+            LC_ALL=C lscpu
+          } > "$evidence_root/provenance.txt"
+          timeout 15m valgrind --tool=callgrind --trace-children=no \
+            --cache-sim=no --branch-sim=no \
+            --callgrind-out-file="$evidence_root/callgrind.out" \
+            "$binary" compile-only > "$evidence_root/compile-only.json" \
+            2> "$evidence_root/profiler.log"
+          callgrind_annotate --auto=no --inclusive=yes --tree=both \
+            "$evidence_root/callgrind.out" > "$evidence_root/inclusive.txt"
+          callgrind_annotate --auto=no --inclusive=no \
+            "$evidence_root/callgrind.out" > "$evidence_root/exclusive.txt"
+          python3 .github/scripts/check-transformer-compile-profile.py profile \
+            --root "$evidence_root" --expected-sha "$EXPECTED_SHA" --binary "$binary"
+      - name: Upload bounded instruction profile
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-transformer-compile-profile-${{ inputs.expected_sha }}
+          path: native-transformer-compile-profile/
+          if-no-files-found: error
+          retention-days: 30

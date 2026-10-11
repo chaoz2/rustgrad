@@ -23,6 +23,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: python3 .github/scripts/test-native-transformer-training-comparison.py
+      - run: python3 .github/scripts/test-transformer-compile-profile.py
       - run: cargo fmt --check
       - run: cargo check --all-targets
       - run: cargo clippy --all-targets -- -D warnings
@@ -82,6 +83,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+      - name: Compiled Transformer compile-only contract
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --quiet --example compiled_transformer_scale_evidence -- compile-only > transformer-compile-only.json
+          python3 .github/scripts/check-transformer-compile-profile.py compile transformer-compile-only.json
       - name: Compiled Transformer masked-batch resume smoke
         if: matrix.os == 'ubuntu-latest'
         run: cargo run --quiet --example compiled_transformer_train_resume -- cpu-reuse

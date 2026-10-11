@@ -1671,6 +1671,29 @@ The executor-host remainder includes workspace, binding, input/output, and any
 conservative per-entry execution outside sealed dispatcher segments. It is not
 a per-kernel profile.
 
+The maintained scale example also has a `compile-only` diagnostic mode. It
+constructs the identical plan and performs the same artifact/inspection checks,
+including all five attached roles, then emits bounded workload and identity
+facts before any target is prepared. It creates no executor workspace, native
+cache or generated-C compiler process and performs no replay. The capacity
+example shares this mode but the profile evidence validator deliberately admits
+only the stable batch-4/context-8/width-8 workload, not capacity evidence.
+
+The manual-only `native-transformer-compile-profile.yml` workflow runs that mode
+under Callgrind on a protected Linux runner. An exact dispatch SHA, clean checkout,
+locked optimized build with debug information, and executable digest bind the
+observation. Runner-local profiler/toolchain/CPU provenance, raw call graph and
+inclusive/exclusive instruction annotations remain separate from ordinary ABBA
+timings. A bounded format validator checks workload facts, positive instruction
+counts and the exact command before create-new manifest publication. Synthetic
+admission tests and the real compile-only example run in ordinary Linux CI;
+profiler installation/execution is manual-only and never required locally.
+The profile includes initialization, plan compilation, inspection and teardown;
+it is neither a compile-interval wall-clock measurement nor replay or accelerator
+evidence. Inclusive recursive call cycles require a cycle-aware reader such as
+KCachegrind rather than assuming text annotations partition costs. The workflow
+changes no library API, capture/checkpoint/cache bytes or normal benchmark mode.
+
 For nonempty dispatch tapes, segmentation authenticates one terminal segment,
 no fallback boundary, and one fewer module changes than distinct modules
 actually reached. Rendered entries omitted by authenticated elision do not

@@ -682,6 +682,7 @@ struct ScaleEvidencePaths {
 enum ScaleRunMode {
     Full(ScaleEvidencePaths),
     LifecycleOnly { evidence: PathBuf },
+    CompileOnly,
 }
 
 fn scale_module_state_witness(model: &ScaleTransformer) -> Vec<ScaleModuleStateWitness> {
@@ -1813,8 +1814,9 @@ fn scale_run_mode() -> std::result::Result<ScaleRunMode, Box<dyn Error>> {
                 evidence: PathBuf::from(evidence),
             })
         }
+        (Some("compile-only"), None) => Ok(ScaleRunMode::CompileOnly),
         _ => {
-            Err("usage: compiled_transformer_scale_evidence [lifecycle-only EVIDENCE.json]".into())
+            Err("usage: compiled_transformer_scale_evidence [lifecycle-only EVIDENCE.json | compile-only]".into())
         }
     }
 }
@@ -1864,6 +1866,36 @@ pub fn run() -> std::result::Result<(), Box<dyn Error>> {
     );
     assert!(compile_phases.measured_wall_time().unwrap() <= compile_wall_time);
 
+    if matches!(mode, ScaleRunMode::CompileOnly) {
+        // Profiling stops before target preparation: no generated C compiler,
+        // native cache, executor workspace, or training replay is involved.
+        // This uses the same plan and inspection as the lifecycle modes.
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "evidence_kind": "compiled_transformer_compile_only",
+                "workload": {
+                    "batch": BATCH, "time": TIME, "vocabulary": VOCAB,
+                    "embedding": EMBEDDING, "heads": HEADS,
+                    "feed_forward": FEED_FORWARD, "blocks": 2,
+                    "accumulation_steps": ACCUMULATION_STEPS,
+                },
+                "compile_count": compile_phases.compile_count(),
+                "initial_replay_step": inspection.initial_replay_step(),
+                "capture_identity": capture_identity,
+                "evaluation_capture_identity": evaluation_capture_identity,
+                "recurrent_state_count": inspection.recurrent_state_count(),
+                "recurrent_state_bytes": inspection.recurrent_state_bytes(),
+                "main_schedule_item_count": inspection.main().1.schedule_item_count,
+                "attached_roles": ["main", "accumulation", "partial_flush", "zero_grad", "evaluation"],
+                "target_prepared": false,
+                "replayed": false,
+            }))?
+        );
+        return Ok(());
+    }
+
     let executor = CapturedReplayExecutor::default();
     let target = NativeCpuSessionTarget::new(&executor).vectorized(true);
     let prepare_started = Instant::now();
@@ -1889,7 +1921,7 @@ pub fn run() -> std::result::Result<(), Box<dyn Error>> {
             compile_wall_time,
             prepare_wall_time,
         )?),
-        ScaleRunMode::LifecycleOnly { .. } => None,
+        ScaleRunMode::LifecycleOnly { .. } | ScaleRunMode::CompileOnly => None,
     };
 
     let mut evaluation_trajectory = vec![evaluate_scale_frontier(
