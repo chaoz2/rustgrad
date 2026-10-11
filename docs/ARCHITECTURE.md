@@ -1003,6 +1003,12 @@ bounded decoder and checksum admission; no capture or artifact identity changes.
 An owned rekeying witness retains the freshly computed item keys through this
 ordered seal. It exposes no mutable capture access; structural authentication
 compares those keys at the usual gate instead of serializing each kernel again.
+The same owned witness retains canonical kernel bytes from rekeying through
+payload identity serialization. Its immutable capture keeps the keyed root
+allocations alive; shared roots reuse bytes while each item's metadata is
+serialized afresh. Encoding remains lazy at the original item-key gate, and
+the retained bytes are dropped after identification. Artifact bytes, logical
+keys, and structural admission are unchanged.
 Imported and caller-owned captures still recompute their expected keys. All
 kernel, descriptor, binding, dependency, and ownership checks remain unchanged.
 During mixed-artifact decoding, the decoder-owned kernel proof lazily retains
