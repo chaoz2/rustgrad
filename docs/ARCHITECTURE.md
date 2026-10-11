@@ -3014,7 +3014,11 @@ descriptors are rejected during artifact validation.
 Captured Threefry sources use a zero-input `RandomKernelPlan` UOp whose shape,
 distribution, device/key/counter reservation, and planned word count are
 immutable artifact data. Interpreter replay executes that plan through the
-pure Threefry core without consulting the stream registry. The native C
+pure Threefry core without consulting the stream registry. Distribution
+equality, hashing, and ordering consistently use raw parameter bits: signed
+zeros remain distinct and identical NaN payloads have reflexive identity.
+This descriptor identity does not relax execution admission or change wire
+encodings. The native C
 renderer is isolated in `cpu_jit_random.rs` and renders static uniform,
 tinygrad's F32-source Box--Muller normal, and F32-uniform-scale-then-cast
 randint plans for every currently public CPU dtype contract. The CUDA PTX path
