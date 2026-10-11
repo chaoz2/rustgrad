@@ -16,7 +16,7 @@ import statistics
 import sys
 from typing import Any
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 EVIDENCE_KIND = "native_cpu_transformer_training_same_runner_comparison"
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -396,6 +396,8 @@ def validate_sidecar(value: dict[str, Any], expected_sha: str) -> tuple[dict[str
         if value["format_version"] == 3:
             call = duration_ns(sample.get("call_wall_time"), f"sample {index}.call_wall_time")
             require(call >= durations["total_wall_time"], "steady call duration is shorter than runtime duration")
+        else:
+            require("call_wall_time" not in sample, "legacy steady sample contains unversioned call timing")
 
     checkpoints = {}
     for field, replay, optimizer, accumulation_index in (
@@ -617,7 +619,13 @@ def timing_summary(samples: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
         by_role[destination].append(sample)
     result: dict[str, Any] = {}
     for role, entries in by_role.items():
-        result[role] = {"sample_count": len(entries), "partitions": {}}
+        result[role] = {"sample_count": len(entries), "partitions": {}, "call_wall_time": None}
+        if all("call_wall_time" in entry for entry in entries):
+            calls = [duration_ns(entry["call_wall_time"], f"{role}.call_wall_time") for entry in entries]
+            result[role]["call_wall_time"] = {
+                "median_ns": int(statistics.median(calls)),
+                "nearest_rank_p95_ns": nearest_rank(calls, 0.95),
+            }
         for field in SAMPLE_PARTITIONS:
             values = [duration_ns(entry[field], f"{role}.{field}") for entry in entries]
             result[role]["partitions"][field] = {
@@ -893,7 +901,18 @@ def compare(arguments: argparse.Namespace) -> tuple[dict[str, Any], bool]:
             }
         result: dict[str, Any] = {}
         for phase in ("accumulation", "commit"):
-            result[phase] = {"partitions": {}}
+            result[phase] = {"partitions": {}, "call_wall_time": None}
+            calls = [entry[phase]["call_wall_time"] for entry in summaries]
+            # Do not aggregate a subset of the fixed two-trial inventory.
+            if all(call is not None for call in calls):
+                medians = [call["median_ns"] for call in calls]
+                p95s = [call["nearest_rank_p95_ns"] for call in calls]
+                result[phase]["call_wall_time"] = {
+                    "trial_median_ns": medians,
+                    "median_of_trial_medians_ns": int(statistics.median(medians)),
+                    "trial_nearest_rank_p95_ns": p95s,
+                    "median_of_trial_p95_ns": int(statistics.median(p95s)),
+                }
             for partition in SAMPLE_PARTITIONS:
                 medians = [entry[phase]["partitions"][partition]["median_ns"] for entry in summaries]
                 p95s = [entry[phase]["partitions"][partition]["nearest_rank_p95_ns"] for entry in summaries]
@@ -926,7 +945,14 @@ def compare(arguments: argparse.Namespace) -> tuple[dict[str, Any], bool]:
                     )
             else:
                 for phase in ("accumulation", "commit"):
-                    ratios[phase] = {"candidate_over_baseline": {}}
+                    ratios[phase] = {"candidate_over_baseline": {"call_wall_time": None}}
+                    baseline_call = aggregates["baseline"][phase]["call_wall_time"]
+                    candidate_call = aggregates["candidate"][phase]["call_wall_time"]
+                    if baseline_call is not None and candidate_call is not None:
+                        ratios[phase]["candidate_over_baseline"]["call_wall_time"] = warm_timing_ratio(
+                            candidate_call["median_of_trial_medians_ns"],
+                            baseline_call["median_of_trial_medians_ns"],
+                        )
                     for partition in SAMPLE_PARTITIONS:
                         baseline = aggregates["baseline"][phase]["partitions"][partition]["median_of_trial_medians_ns"]
                         candidate = aggregates["candidate"][phase]["partitions"][partition]["median_of_trial_medians_ns"]

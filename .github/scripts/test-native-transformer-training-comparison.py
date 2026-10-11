@@ -533,7 +533,7 @@ def fixture(root: pathlib.Path) -> SimpleNamespace:
     )
 
 
-def run_case(mutator=None, expected: bool = True, invalid_trial: int | None = None) -> None:
+def run_case(mutator=None, expected: bool = True, invalid_trial: int | None = None, inspect=None) -> None:
     with tempfile.TemporaryDirectory(prefix="rustgrad-native-comparison-") as temporary:
         root = pathlib.Path(temporary).resolve()
         arguments = fixture(root)
@@ -546,11 +546,53 @@ def run_case(mutator=None, expected: bool = True, invalid_trial: int | None = No
             return
         assert comparable is expected
         assert manifest["status"] == ("comparable" if expected else "incomparable")
+        if inspect is not None:
+            inspect(manifest)
         if invalid_trial is not None:
             trial = manifest["trials"][invalid_trial - 1]
             assert trial["status"] == "invalid"
             assert trial["invalid_reason"]
             assert set(trial["files"]) == {"scoreboard", "steady", "provenance"}
+
+
+def check_full_call_reporting() -> None:
+    for selected in ((), (3,), (2, 3), (1, 2, 3, 4)):
+        def add_calls(root: pathlib.Path) -> None:
+            for ordinal in selected:
+                role = "baseline" if ordinal in (1, 4) else "candidate"
+                path = root / f"trial-{ordinal:02}-{role}/native-cpu-training-steady-replays.json"
+                value = json.loads(path.read_text())
+                value["format_version"] = 3
+                for samples in ("accumulation_only_samples", "optimizer_commit_samples"):
+                    for sample in value[samples]:
+                        sample["call_wall_time"] = duration(1000 if role == "baseline" else 500)
+                write_json(path, value)
+
+        def inspect(manifest) -> None:
+            assert manifest["format_version"] == 3
+            for phase in ("accumulation", "commit"):
+                for ordinal, trial in enumerate(manifest["trials"], 1):
+                    call = trial["timing"][phase]["call_wall_time"]
+                    if ordinal not in selected:
+                        assert call is None
+                    else:
+                        expected = 1000 if ordinal in (1, 4) else 500
+                        assert call == {"median_ns": expected, "nearest_rank_p95_ns": expected}
+                for role, ordinals, expected in (("baseline", (1, 4), 1000), ("candidate", (2, 3), 500)):
+                    call = manifest["aggregates"][role][phase]["call_wall_time"]
+                    if not all(ordinal in selected for ordinal in ordinals):
+                        assert call is None
+                    else:
+                        assert call == {
+                            "trial_median_ns": [expected, expected],
+                            "median_of_trial_medians_ns": expected,
+                            "trial_nearest_rank_p95_ns": [expected, expected],
+                            "median_of_trial_p95_ns": expected,
+                        }
+                ratio = manifest["observational_ratios"][phase]["candidate_over_baseline"]["call_wall_time"]
+                assert ratio == (0.5 if len(selected) == 4 else None)
+
+        run_case(add_calls, inspect=inspect)
 
 
 def check_warm_ratio_and_checksum_contracts() -> None:
@@ -635,6 +677,7 @@ def main() -> None:
     check_warm_ratio_and_checksum_contracts()
     check_warm_preparation_fixtures()
     run_case()
+    check_full_call_reporting()
 
     def use_v24_baseline(root: pathlib.Path) -> None:
         for ordinal, (role, _) in enumerate(VALIDATOR.ORDER, start=1):
@@ -841,6 +884,15 @@ def main() -> None:
         write_json(path, value)
 
     run_case(short_full_call_timing, expected=False, invalid_trial=3)
+
+    def unversioned_call_timing(root: pathlib.Path) -> None:
+        add_full_call_timing(root)
+        path = root / "trial-03-candidate/native-cpu-training-steady-replays.json"
+        value = json.loads(path.read_text())
+        value["format_version"] = 2
+        write_json(path, value)
+
+    run_case(unversioned_call_timing, expected=False, invalid_trial=3)
 
     # Equal counters and byte counts must not hide changed optimizer/parameter
     # payloads. Also reject metadata-only and malformed byte representations.
