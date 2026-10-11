@@ -379,6 +379,7 @@ pub(crate) struct NativeReplayWorkspaceStats {
     pub(crate) sealed_pointer_count: usize,
     pub(crate) sealed_dense_pointer_count: usize,
     pub(crate) sealed_quantized_pointer_count: usize,
+    pub(crate) sealed_packed_authentication_entry_count: usize,
     pub(crate) last_borrowed_binding_count: usize,
     pub(crate) borrowed_binding_capacity: usize,
     pub(crate) last_materialized_egress_count: u64,
@@ -2200,6 +2201,16 @@ impl NativeReplayWorkspace {
             .fold((0usize, 0usize), |(dense, quantized), next| {
                 (dense + next.0, quantized + next.1)
             });
+        let sealed_packed_authentication_entry_count = self
+            .dispatch_tape
+            .iter()
+            .filter_map(|step| match step {
+                WorkspaceDispatchStep::Segment(segment) => {
+                    Some(segment.dispatch.packed_entry_count())
+                }
+                WorkspaceDispatchStep::PerItem(_) => None,
+            })
+            .sum();
         NativeReplayWorkspaceStats {
             allocation_count: self.buffers.len(),
             input_import_count: self.input_import_count,
@@ -2225,6 +2236,7 @@ impl NativeReplayWorkspace {
             sealed_pointer_count,
             sealed_dense_pointer_count,
             sealed_quantized_pointer_count,
+            sealed_packed_authentication_entry_count,
             last_borrowed_binding_count: self.last_borrowed_binding_count,
             borrowed_binding_capacity: self.new_bindings().slots.capacity(),
             last_materialized_egress_count: self.current_traffic.materialized_egress_count,

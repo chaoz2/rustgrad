@@ -1417,6 +1417,14 @@ stale destination pointer; each invocation binds its current inactive banks.
 This changes no capture, checkpoint, kernel, or cache format and makes no
 unmeasured speedup claim.
 
+Native dispatcher preparation seals the ordered indices of entries that own
+packed resources. Dense-only segments therefore have an empty resource-check
+inventory rather than scanning every kernel entry on each replay. Packed
+values stay in their existing prepared owners; replay still validates their
+presence and exact contents before dispatch, in the original entry/resource
+order. This does not cache successful validation of a caller's resource map or
+change error attribution, pointer binding, or artifact identity.
+
 CPU native preparation reuses the same `Arc`-owned authenticated recurrent
 capture, canonical capture identity, and version-zero frontier when deriving
 replacement bindings and seeding the native replay trace. It therefore does
