@@ -791,6 +791,12 @@ recurrent keys, and failure ordinals remain unchanged; only the physical module
 dispatch inventory is smaller. Unsupported topology retains every original
 entry, while malformed or overlapping semantic metadata rejects before
 publication. Single-microbatch and zero-grad programs do not use the sidecar.
+Native store-group ABI inspection and rendering share one private admission
+plan owning ordered stores, same-lane output dependencies, broadcast input
+bindings, and the derived ABI. Rendering constructs this plan once, then
+emits code without repeating admission. The plan is invocation-local, not a
+validation cache; code-emission failures still reject preparation. Generated
+source, cache domains, and artifact formats are unchanged.
 `MixedReplayCursor` adds an in-memory interpreter-only recurrent
 frontier for one exact RGSM identity. It contains only the canonical logical
 buffer/version descriptors required by persistent reads and writes. Each step
