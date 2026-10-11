@@ -2940,6 +2940,12 @@ an unrelated root triggers a fresh traversal, and final schedule validation and
 public capture keep their independent validation gates. No retained order is
 serialized or added to the public schedule state.
 
+The same finalized order also feeds durable schedule-identity encoding. The
+codec still validates the actual kernel, including allocation-based reduction
+ownership, before tag rejection and wire emission; a foreign root uses the
+independent traversal path. This shares ordering only, not admission, and leaves
+canonical kernel bytes, item cache keys, and historical wire versions unchanged.
+
 UPat matching keeps alternatives and exact/prefix/repeated/permuted source
 constraints inside the matcher rather than adding another operation taxonomy.
 Alternatives are tried in declaration order, and an apply callback that declines

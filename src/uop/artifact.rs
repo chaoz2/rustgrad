@@ -823,6 +823,18 @@ pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactEr
     encode_schedule_nodes(dag.order.nodes())
 }
 
+/// Reuse only canonical ordering; the actual root still receives full validation.
+pub(crate) fn encode_schedule_identity_with_order(
+    root: &UOp,
+    order: &TopologicalOrder,
+) -> Result<Vec<u8>, ArtifactError> {
+    let Some(nodes) = order.for_root(root) else {
+        return encode_schedule_identity(root);
+    };
+    validate_encoding_order(root, order)?;
+    encode_schedule_nodes(nodes)
+}
+
 fn encode_schedule_nodes(nodes: &[UOp]) -> Result<Vec<u8>, ArtifactError> {
     // Tags are transient compiler metadata. A tagged executable kernel must be
     // explicitly stripped before scheduling rather than changing durable cache
@@ -875,6 +887,8 @@ struct EncodingDag<'a> {
 
 impl<'a> EncodingDag<'a> {
     fn new(root: &'a UOp) -> Result<Self, ArtifactError> {
+        #[cfg(test)]
+        ENCODING_ORDER_BUILDS.with(|count| count.set(count.get() + 1));
         let order = TopologicalOrder::new(root).map_err(|_| ArtifactError::Format("dag"))?;
         Ok(Self { root, order })
     }
@@ -885,17 +899,22 @@ impl<'a> EncodingDag<'a> {
     }
 
     fn validate(&self) -> Result<(), ArtifactError> {
-        #[cfg(test)]
-        ENCODING_VALIDATIONS.with(|count| count.set(count.get() + 1));
-        self.order
-            .validate_for(self.root)
-            .map_err(|_| ArtifactError::Format("uop"))
+        validate_encoding_order(self.root, &self.order)
     }
+}
+
+fn validate_encoding_order(root: &UOp, order: &TopologicalOrder) -> Result<(), ArtifactError> {
+    #[cfg(test)]
+    ENCODING_VALIDATIONS.with(|count| count.set(count.get() + 1));
+    order
+        .validate_for(root)
+        .map_err(|_| ArtifactError::Format("uop"))
 }
 
 #[cfg(test)]
 thread_local! {
     static ENCODING_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ENCODING_ORDER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -3540,6 +3559,38 @@ mod tests {
     }
 
     #[test]
+    fn retained_schedule_order_preserves_bytes_validation_and_foreign_root_fallback() {
+        let ty = UType::scalar(DType::I32);
+        let leaf = UOp::constant(7, ty);
+        let shared = UOp::binary(Binary::Add, leaf.clone(), leaf.clone());
+        let distinct = UOp::binary(Binary::Add, UOp::constant(7, ty), UOp::constant(7, ty));
+        let malformed = UOp::from_operation(Operation::Cast, Some(ty), vec![]);
+        let foreign = TopologicalOrder::new(&UOp::sink(vec![])).unwrap();
+        for root in [
+            leaf.clone(),
+            shared,
+            distinct,
+            leaf.retag(Some(UOpTag::Text("transient".into()))),
+            malformed.clone(),
+            malformed.retag(Some(UOpTag::Text("invalid".into()))),
+        ] {
+            let expected = encode_schedule_identity(&root);
+            let order = TopologicalOrder::new(&root).unwrap();
+            let builds = ENCODING_ORDER_BUILDS.get();
+            let validations = ENCODING_VALIDATIONS.get();
+            assert_eq!(encode_schedule_identity_with_order(&root, &order), expected);
+            assert_eq!(ENCODING_ORDER_BUILDS.get(), builds);
+            assert_eq!(ENCODING_VALIDATIONS.get(), validations + 1);
+            assert_eq!(
+                encode_schedule_identity_with_order(&root, &foreign),
+                expected
+            );
+            assert_eq!(ENCODING_ORDER_BUILDS.get(), builds + 1);
+            assert_eq!(ENCODING_VALIDATIONS.get(), validations + 2);
+        }
+    }
+
+    #[test]
     fn codec_order_reuse_preserves_reduction_ownership_and_unreachable_errors() {
         let ty = UType::scalar(DType::F32);
         let init = || {
@@ -3569,6 +3620,11 @@ mod tests {
         let valid = complete();
         let duplicated = UOp::sink(vec![complete(), complete()]);
         for root in [valid.clone(), init(), duplicated] {
+            let order = TopologicalOrder::new(&root).unwrap();
+            assert_eq!(
+                encode_schedule_identity_with_order(&root, &order),
+                encode_inner(&root, false, 18)
+            );
             assert_eq!(encode(&root), encode_inner(&root, false, 19));
             assert_eq!(
                 encode_schedule_identity(&root),

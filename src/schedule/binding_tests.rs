@@ -15,6 +15,12 @@ fn retained_order_preserves_bindings_and_independent_capture() {
         let scheduled = schedule_many(&graph, &[output]).unwrap();
         let item = scheduled.items.last().unwrap();
         let order = crate::uop::TopologicalOrder::new(&item.kernel).unwrap();
+        assert_eq!(item.cache_key, item_cache_key(item).unwrap(), "{name}");
+        assert_eq!(
+            identity::item_key_with_order(item, &order).unwrap(),
+            item.cache_key,
+            "{name}"
+        );
         let expected = input_bindings(&item.kernel, &item.inputs, item.primary_output()).unwrap();
         let before = BINDING_ORDER_REBUILDS.get();
         let actual = input_bindings_with_order(
@@ -80,6 +86,7 @@ fn external_provenance_uses_the_final_ordered_bindings() {
     let item = scheduled.items.last().unwrap();
     assert_eq!(item.external_materializations, vec![external]);
     let bindings = input_bindings(&item.kernel, &item.inputs, item.primary_output()).unwrap();
+    assert_eq!(item.cache_key, item_cache_key(item).unwrap());
     assert_eq!(item.input_bindings, bindings);
     assert!(
         bindings

@@ -21,6 +21,16 @@ pub(super) fn item_key(item: &ScheduleItem) -> Result<u64, ArtifactError> {
     Ok(fnv1a64(&item_bytes(item)?))
 }
 
+pub(super) fn item_key_with_order(
+    item: &ScheduleItem,
+    order: &crate::uop::TopologicalOrder,
+) -> Result<u64, ArtifactError> {
+    Ok(fnv1a64(&item_bytes_with_kernel(item, || {
+        crate::uop::artifact::encode_schedule_identity_with_order(&item.kernel, order)
+            .map(Cow::Owned)
+    })?))
+}
+
 pub(super) fn item_key_with_kernel<'a>(
     item: &ScheduleItem,
     kernel: impl FnOnce() -> Result<&'a [u8], ArtifactError>,
@@ -278,6 +288,11 @@ mod tests {
         let bytes = canonical_item_bytes(&item).unwrap();
         assert_eq!(bytes, expected);
         assert_eq!(item_key(&item).unwrap(), 0x087a_c53b_3e9b_f53f);
+        let order = crate::uop::TopologicalOrder::new(&item.kernel).unwrap();
+        assert_eq!(
+            item_key_with_order(&item, &order).unwrap(),
+            0x087a_c53b_3e9b_f53f
+        );
         assert_eq!(item_key(&item).unwrap(), item_key(&item).unwrap());
     }
 

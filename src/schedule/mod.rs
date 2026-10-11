@@ -3318,7 +3318,8 @@ fn schedule_many_with_external(
             boundary,
             cache_key: 0,
         };
-        item.cache_key = item_cache_key(&item)?;
+        item.cache_key = identity::item_key_with_order(&item, &kernel_order)
+            .map_err(|error| ScheduleError::Binding(format!("schedule identity: {error}")))?;
         item.validate_input_bindings_with_order(Some(&kernel_order))?;
         items.push(item);
     }
