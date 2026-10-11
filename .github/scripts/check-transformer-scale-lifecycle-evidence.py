@@ -18,7 +18,12 @@ def exact_keys(value: dict, expected: set[str], label: str) -> None:
 
 
 def main() -> None:
-    require(len(sys.argv) == 2, "usage: check-transformer-scale-lifecycle-evidence.py FILE")
+    require(
+        len(sys.argv) == 2 or (len(sys.argv) == 3 and sys.argv[2] == "--capacity"),
+        "usage: check-transformer-scale-lifecycle-evidence.py FILE [--capacity]",
+    )
+    capacity = len(sys.argv) == 3
+    token_weights = (88, 64) if capacity else (22, 16)
     path = pathlib.Path(sys.argv[1])
     raw = path.read_bytes()
     require(raw.endswith(b"\n") and raw.count(b"\n") == 1, "evidence is not compact canonical JSON")
@@ -58,11 +63,11 @@ def main() -> None:
         workload
         == {
             "batch": 4,
-            "time": 8,
-            "vocabulary": 16,
-            "embedding": 8,
-            "heads": 2,
-            "feed_forward": 32,
+            "time": 32 if capacity else 8,
+            "vocabulary": 128 if capacity else 16,
+            "embedding": 32 if capacity else 8,
+            "heads": 4 if capacity else 2,
+            "feed_forward": 128 if capacity else 32,
             "blocks": 2,
             "accumulation_steps": 2,
             "replays": 6,
@@ -147,7 +152,7 @@ def main() -> None:
         require(math.isfinite(frontier["token_mean_loss"]), f"evaluation r{replay} loss is nonfinite")
         samples = frontier["samples"]
         require(isinstance(samples, list) and len(samples) == 2, f"evaluation r{replay} samples differ")
-        for sample, batch_replay, tokens in zip(samples, (1, 2), (22, 16)):
+        for sample, batch_replay, tokens in zip(samples, (1, 2), token_weights):
             exact_keys(sample, sample_keys, f"evaluation r{replay} sample {batch_replay}")
             require(sample["batch_replay"] == batch_replay, "evaluation sample batch differs")
             require(sample["capture_identity"] == native["evaluation_capture_identity"], "evaluation capture identity differs")
@@ -157,8 +162,9 @@ def main() -> None:
             require(sample["executed_native_item_count"] > 0, "evaluation did no native work")
             require(sample["module_dispatch_count"] > 0, "evaluation dispatched no module")
         recomputed = (
-            samples[0]["token_mean_loss"] * 22.0 + samples[1]["token_mean_loss"] * 16.0
-        ) / 38.0
+            samples[0]["token_mean_loss"] * token_weights[0]
+            + samples[1]["token_mean_loss"] * token_weights[1]
+        ) / sum(token_weights)
         require(recomputed == frontier["token_mean_loss"], f"evaluation r{replay} weighting differs")
     require(
         trajectory[-1]["token_mean_loss"] < trajectory[0]["token_mean_loss"],

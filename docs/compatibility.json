@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:27427f90e66333e1",
+  "source_fingerprint": "fnv1a64:72d9dae13e12ccd1",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -613,6 +613,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "Canonical module traversal deduplicates tied trainable state into the recurrent AdamW frontier and captures frozen parameters and buffers as immutable values. The authenticated [state and atomicity](ARCHITECTURE.md#state-ownership-and-atomicity), [resume modes](ARCHITECTURE.md#resume-modes-and-module-ownership), [training policies](ARCHITECTURE.md#training-inputs-and-optimizer-policies), maintained Transformer acceptance, and [backend limits](ARCHITECTURE.md#compiled-training-backend-boundaries) define the complete contract. Stateful pending module effects, runtime freeze-policy mutation, automatic live-module synchronization, mixed-precision parameter state, dynamic loss scaling, and dynamic shapes remain unsupported."
+      }
+    },
+    {
+      "section": "NN, models and distributed",
+      "subject_header": "Capability",
+      "subject": "Fixed-capacity compiled Transformer training",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "`compiled_transformer_capacity_evidence` reuses the stable probe's example-owned training implementation at batch 4, context 32, vocabulary 128, width 32, four heads, and two width-128 feed-forward blocks (29,568 trainable coordinates). Linux acceptance requires six strict-native microbatches, three captured AdamW updates, zero fallback, decreasing deterministic evaluation loss, and exact pending-window resume into a different initialization, including attention/residual dropout, token weights 88/64, clipping, frozen positions, and tied output weights. Independently pinned receipts reject cross-profile substitution; the original benchmark geometry remains unchanged. This is bounded synthetic training acceptance, not generalization, performance, larger-scale closure, or accelerator evidence."
       }
     },
     {
