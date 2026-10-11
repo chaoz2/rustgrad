@@ -819,14 +819,15 @@ pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
 /// their existing BufferIndex payload has a new authenticated source meaning.
 pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let dag = EncodingDag::new(root)?;
-    let nodes = dag.order.nodes();
+    dag.validate()?;
+    encode_schedule_nodes(dag.order.nodes())
+}
+
+fn encode_schedule_nodes(nodes: &[UOp]) -> Result<Vec<u8>, ArtifactError> {
     // Tags are transient compiler metadata. A tagged executable kernel must be
     // explicitly stripped before scheduling rather than changing durable cache
     // identities or silently discarding metadata.
     if nodes.iter().any(|node| node.tag().is_some()) {
-        dag.order
-            .validate_for(root)
-            .map_err(|_| ArtifactError::Format("uop"))?;
         return Err(ArtifactError::Unsupported);
     }
     let effects = nodes.iter().any(|node| {
@@ -861,7 +862,7 @@ pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactEr
     } else {
         18
     };
-    dag.encode(effects, version)
+    encode_nodes(nodes, effects, version)
 }
 
 // Own the canonical node order beside its borrowed immutable root. Version
@@ -879,11 +880,22 @@ impl<'a> EncodingDag<'a> {
     }
 
     fn encode(&self, effects: bool, version: u8) -> Result<Vec<u8>, ArtifactError> {
-        self.order
-            .validate_for(self.root)
-            .map_err(|_| ArtifactError::Format("uop"))?;
+        self.validate()?;
         encode_nodes(self.order.nodes(), effects, version)
     }
+
+    fn validate(&self) -> Result<(), ArtifactError> {
+        #[cfg(test)]
+        ENCODING_VALIDATIONS.with(|count| count.set(count.get() + 1));
+        self.order
+            .validate_for(self.root)
+            .map_err(|_| ArtifactError::Format("uop"))
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ENCODING_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -957,6 +969,27 @@ fn encode_nodes(nodes: &[UOp], effects: bool, version: u8) -> Result<Vec<u8>, Ar
 
 /// Decodes and completely validates an artifact before returning its root.
 pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
+    decode_admitted(bytes).map(|decoded| decoded.root)
+}
+
+/// Decoder-owned admission, tied to one immutable root and its canonical order.
+/// It cannot be constructed from a caller's root or imported wire bytes alone.
+pub(crate) struct DecodedKernel {
+    root: UOp,
+    order: TopologicalOrder,
+}
+
+impl DecodedKernel {
+    pub(crate) fn root(&self) -> &UOp {
+        &self.root
+    }
+
+    pub(crate) fn encode_schedule_identity(&self) -> Result<Vec<u8>, ArtifactError> {
+        encode_schedule_nodes(self.order.nodes())
+    }
+}
+
+pub(crate) fn decode_admitted(bytes: &[u8]) -> Result<DecodedKernel, ArtifactError> {
     if bytes.len() > MAX_BYTES {
         return Err(ArtifactError::Format("byte limit"));
     }
@@ -1064,7 +1097,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
     if order.nodes().len() != count {
         return Err(ArtifactError::Format("unreachable node"));
     }
-    Ok(root)
+    Ok(DecodedKernel { root, order })
 }
 
 fn validate_fields(
@@ -3543,6 +3576,11 @@ mod tests {
             );
         }
         assert_eq!(decode(&encode(&valid).unwrap()).unwrap(), valid);
+        let admitted = decode_admitted(&encode(&valid).unwrap()).unwrap();
+        assert_eq!(
+            admitted.encode_schedule_identity(),
+            encode_schedule_identity(&valid)
+        );
 
         let dead = UOp::scalar_constant(DType::F32, 3.0f32.to_bits() as u64, ty);
         let constant = UOp::scalar_constant(DType::F32, 4.0f32.to_bits() as u64, ty);
@@ -3553,7 +3591,61 @@ mod tests {
             // Both have an unreachable node. Incomplete reduction ownership
             // must still fail before the final reachability gate.
             let bytes = encode_unvalidated_nodes_v21(&[dead.clone(), root]);
+            assert_eq!(decode_admitted(&bytes).err(), Some(expected.clone()));
             assert_eq!(decode(&bytes), Err(expected));
+        }
+    }
+
+    #[test]
+    fn decoded_admission_reuses_validation_but_preserves_canonical_encoding() {
+        let ty = UType::scalar(DType::I32);
+        let leaf = UOp::constant(7, ty);
+        let shared = UOp::binary(Binary::Add, leaf.clone(), leaf.clone());
+        let distinct = UOp::binary(Binary::Add, UOp::constant(7, ty), UOp::constant(7, ty));
+        for root in [leaf, shared, distinct] {
+            let fixture = encode_unvalidated_v21(&root);
+            for version in [18, 19, 21] {
+                let mut wire = fixture.clone();
+                wire[4] = version;
+                let body = wire.len() - 4;
+                let sum = checksum(&wire[..body]);
+                wire[body..].copy_from_slice(&sum.to_le_bytes());
+                let admitted = decode_admitted(&wire).unwrap();
+                assert_eq!(admitted.root(), &root);
+                ENCODING_VALIDATIONS.with(|count| count.set(0));
+                let actual = admitted.encode_schedule_identity().unwrap();
+                assert_eq!(ENCODING_VALIDATIONS.with(|count| count.get()), 0);
+                assert_eq!(actual, encode_schedule_identity(admitted.root()).unwrap());
+                assert_eq!(ENCODING_VALIDATIONS.with(|count| count.get()), 1);
+                let mut expected = fixture.clone();
+                expected[4] = 18;
+                let body = expected.len() - 4;
+                let sum = checksum(&expected[..body]);
+                expected[body..].copy_from_slice(&sum.to_le_bytes());
+                assert_eq!(actual, expected, "decoded v{version}");
+            }
+        }
+
+        // Successful standalone decoding does not authorize transient tags in
+        // durable schedule identities. No tag stripping or wire-byte reuse.
+        let tagged = UOp::constant(7, ty).retag(Some(UOpTag::Text("tagged".into())));
+        let admitted = decode_admitted(&encode(&tagged).unwrap()).unwrap();
+        assert_eq!(
+            admitted.encode_schedule_identity(),
+            Err(ArtifactError::Unsupported)
+        );
+
+        let malformed = UOp::from_operation(Operation::Cast, Some(ty), vec![]);
+        let malformed_wire = encode_unvalidated_v21(&malformed);
+        let unreachable_wire =
+            encode_unvalidated_nodes_v21(&[UOp::constant(1, ty), UOp::constant(2, ty)]);
+        for (wire, expected) in [
+            (vec![], ArtifactError::Format("length")),
+            (malformed_wire, ArtifactError::Format("uop")),
+            (unreachable_wire, ArtifactError::Format("unreachable node")),
+        ] {
+            assert_eq!(decode_admitted(&wire).err(), Some(expected.clone()));
+            assert_eq!(decode(&wire).err(), Some(expected));
         }
     }
 

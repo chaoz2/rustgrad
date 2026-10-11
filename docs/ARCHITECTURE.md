@@ -1045,8 +1045,14 @@ Mixed-artifact decoding likewise retains a private, owning `DecodedKernels`
 witness from the bounded UOp decoder through schedule admission. It authorizes
 only pointer-identical roots, including across legacy metadata rekeying; all
 envelope, canonical-key, binding, effect, and ownership checks remain unchanged.
-Identity serialization still performs its own validation. The witness is local
-to decoding and neither changes the artifact format nor survives as a global cache.
+The UOp decoder also owns the validated canonical node order. Lazy identity
+serialization uses that order and its completed semantic admission instead of
+traversing and validating the same immutable DAG again. Only successful bounded
+decoding can construct this proof; standalone caller-owned encoding still fully
+validates, and tags remain ineligible for schedule identities. Canonical bytes
+are generated from decoded operations, never copied from historical wire input.
+The witness is local to decoding and neither changes the artifact format nor
+survives as a global cache.
 Each immutable recurrent role also owns one capture-bound authenticated identity
 and version-zero frontier. Sibling projection, cursor restoration, and artifact
 inspection reuse that witness; raw replay APIs still perform full validation.
