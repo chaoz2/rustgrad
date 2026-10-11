@@ -1397,6 +1397,14 @@ follows the sealed bank layout directly, avoiding a per-call
 call-scoped: live owner, lease, generation, cursor/version, post-stage
 descriptor, finite-value, rollback, and retry checks are unchanged.
 
+When the locked host pool proves that a nonempty-byte request inventory covers
+every physical slot in canonical order, bank admission and publication traverse
+the slots directly rather than performing a map lookup per request. The same
+slot admission helper checks generation, lease, outstanding borrows, and exact
+descriptors on both paths. Partial, reordered, and zero-byte inventories retain
+the generic request-order lookup path; callbacks and successor validation still
+finish before any active bank flips. No slot references survive the pool lock.
+
 CPU native preparation reuses the same `Arc`-owned authenticated recurrent
 capture, canonical capture identity, and version-zero frontier when deriving
 replacement bindings and seeding the native replay trace. It therefore does
