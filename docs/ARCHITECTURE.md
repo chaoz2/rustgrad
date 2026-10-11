@@ -1473,11 +1473,15 @@ neither validation order nor artifact, cache, checkpoint, or capture identity.
   Shared subtrees are not recursively expanded again; separately allocated
   equal producers retain their original first-occurrence order and identity.
   This preserves lane numbering and validation rather than caching its result.
-  Lane projection also uses a call-local producer-identity index while its
-  immutable producer list remains alive. Each identity maps to the original
-  first structural register ID; separately allocated equal sources retain the
-  existing structural-key fallback. This avoids repeated subtree formatting
-  for retained source owners without changing register numbering or admission.
+  Lane projection reuses the call-local producer index built during that walk.
+  It retains the root, ordered producers, and every visited owner identity,
+  including separately allocated equal nodes excluded from the producer list.
+  Each identity maps to the original first structural register ID, eliminating
+  a second structural-key construction and equal-source formatting fallbacks.
+  The original structural keys are still used during the walk; this does not
+  replace them with pointer equality or change register numbering, cache
+  identities, or admission. Public validation constructs a fresh index rather
+  than trusting a previous result for the publicly mutable lane program.
   Missing, stale, or corrupt sidecars fall back in program order. No measured
   speedup is claimed.
 - **Cleanup and identity.** Chunk sources and objects are cleaned on every

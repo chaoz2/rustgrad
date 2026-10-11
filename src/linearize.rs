@@ -802,8 +802,8 @@ impl LinearKernel {
         source
             .validate()
             .map_err(|e| LinearizeError::Invalid(e.to_string()))?;
-        let mut nodes = Vec::new();
-        producer_order(source, &mut BTreeSet::new(), &mut nodes);
+        let producers = LaneProducers::new(source);
+        let nodes = &producers.nodes;
         let store = source
             .sources()
             .iter()
@@ -843,7 +843,7 @@ impl LinearKernel {
             reason = "reduction or effect requires scalar path".into();
         }
         let mut buffers = BTreeMap::new();
-        for node in &nodes {
+        for node in nodes {
             let Some(ty) = node.ty() else { continue };
             let (
                 buffer,
@@ -938,7 +938,7 @@ impl LinearKernel {
                 access,
             });
         }
-        let projection = lane_instructions(&nodes)?;
+        let projection = producers.project()?;
         if let Some(operation) = projection.unsupported_operations.first() {
             enabled = false;
             reason = format!("unsupported lane operation {:?}", operation.operation);
@@ -1025,9 +1025,8 @@ impl LinearKernel {
 
     pub fn validate(&self) -> Result<(), LinearizeError> {
         self.validate_geometry()?;
-        let mut source_nodes = Vec::new();
-        producer_order(&self.source, &mut BTreeSet::new(), &mut source_nodes);
-        let expected = lane_instructions(&source_nodes)?;
+        let producers = LaneProducers::new(&self.source);
+        let expected = producers.project()?;
         if self.program.instructions != expected.instructions
             || self.program.control_operations != expected.source_records
             || self.program.unsupported_operations != expected.unsupported_operations
@@ -1049,10 +1048,52 @@ impl LinearKernel {
     }
 }
 
+/// One call's producer order and source-register mapping. Retaining the root
+/// keeps even excluded equal nodes alive while their identities are indexed.
+struct LaneProducers {
+    _root: UOp,
+    nodes: Vec<UOp>,
+    owners: BTreeMap<usize, u32>,
+}
+
+impl LaneProducers {
+    fn new(root: &UOp) -> Self {
+        fn visit(node: &UOp, index: &mut LaneProducers, structural: &mut BTreeMap<String, u32>) {
+            if index.owners.contains_key(&node.node_identity()) {
+                return;
+            }
+            for source in node.sources() {
+                visit(source, index, structural);
+            }
+            let id = *structural.entry(format!("{node:?}")).or_insert_with(|| {
+                let id = index.nodes.len() as u32;
+                index.nodes.push(node.clone());
+                id
+            });
+            index.owners.insert(node.node_identity(), id);
+        }
+        let mut index = Self {
+            _root: root.clone(),
+            nodes: Vec::new(),
+            owners: BTreeMap::new(),
+        };
+        visit(root, &mut index, &mut BTreeMap::new());
+        index
+    }
+
+    fn project(&self) -> Result<LaneProjection, LinearizeError> {
+        project_lane_nodes(&self.nodes, |source| {
+            self.owners.get(&source.node_identity()).copied()
+        })
+    }
+}
+
+#[cfg(test)]
 fn producer_order(node: &UOp, seen: &mut BTreeSet<String>, output: &mut Vec<UOp>) {
     visit_producers(node, &mut BTreeSet::new(), seen, output);
 }
 
+#[cfg(test)]
 fn visit_producers(
     node: &UOp,
     visited: &mut BTreeSet<usize>,
@@ -1260,12 +1301,14 @@ pub(crate) fn project_lane_instruction(
     Ok(Some(instruction))
 }
 
+#[cfg(test)]
 struct LaneProducerIds<'a> {
     _producers: &'a [UOp],
     owners: BTreeMap<usize, u32>,
     structural: BTreeMap<String, u32>,
 }
 
+#[cfg(test)]
 impl<'a> LaneProducerIds<'a> {
     fn new(nodes: &'a [UOp]) -> Self {
         let mut ids = Self {
@@ -1298,16 +1341,24 @@ thread_local! {
     static LANE_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
 fn lane_instructions(nodes: &[UOp]) -> Result<LaneProjection, LinearizeError> {
+    let ids = LaneProducerIds::new(nodes);
+    project_lane_nodes(nodes, |source| ids.get(source))
+}
+
+fn project_lane_nodes(
+    nodes: &[UOp],
+    source_id: impl Fn(&UOp) -> Option<u32>,
+) -> Result<LaneProjection, LinearizeError> {
     #[cfg(test)]
     LANE_PROJECTIONS.with(|count| count.set(count.get() + 1));
-    let ids = LaneProducerIds::new(nodes);
     let mut instructions = Vec::with_capacity(nodes.len());
     let mut control_operations = Vec::new();
     let mut unsupported_operations = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         let instruction = project_lane_instruction(node, index as u32, |slot, source| {
-            ids.get(source).ok_or_else(|| {
+            source_id(source).ok_or_else(|| {
                 LinearizeError::Invalid(format!(
                     "{:?} source {slot} is unordered",
                     node.operation()
@@ -1660,6 +1711,55 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn retained_producers_match_legacy_order_and_projection() {
+        let ty = UType::scalar(DType::I32);
+        let first = UOp::constant(1, ty);
+        let equal = UOp::constant(1, ty);
+        let tagged = first.retag(Some(crate::UOpTag::Text("producer".into())));
+        let sum = UOp::from_operation(
+            Operation::GraphBinary(crate::BinaryOp::Add),
+            Some(ty),
+            vec![first.clone(), equal.clone()],
+        );
+        let mut roots = vec![UOp::sink(vec![]), UOp::sink(vec![sum.clone(), sum, tagged])];
+        for dtype in [DType::I32, DType::F16, DType::BF16, DType::F64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [9], dtype);
+            let sum = graph.add(input, input).unwrap();
+            let output = graph.mul(sum, input).unwrap();
+            roots.push(crate::lower_graph_elementwise(&graph, output).unwrap());
+        }
+        for root in roots {
+            let mut legacy = Vec::new();
+            producer_order(&root, &mut BTreeSet::new(), &mut legacy);
+            let indexed = LaneProducers::new(&root);
+            assert_eq!(indexed.nodes.len(), legacy.len());
+            assert!(
+                indexed
+                    .nodes
+                    .iter()
+                    .zip(&legacy)
+                    .all(|(a, b)| a.shares_node_with(b))
+            );
+            let ids = LaneProducerIds::new(&legacy);
+            for node in &legacy {
+                for source in node.sources() {
+                    assert_eq!(
+                        indexed.owners.get(&source.node_identity()).copied(),
+                        ids.get(source)
+                    );
+                }
+            }
+            drop(root);
+            assert_eq!(indexed.project(), lane_instructions(&legacy));
+        }
+        let retained = LaneProducers::new(&UOp::sink(vec![first.clone(), equal.clone()]));
+        assert_eq!(retained.owners.get(&first.node_identity()), Some(&0));
+        assert_eq!(retained.owners.get(&equal.node_identity()), Some(&0));
+        assert_eq!(retained.nodes.len(), 2);
     }
 
     #[test]
