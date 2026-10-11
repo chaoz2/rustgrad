@@ -2,7 +2,8 @@
 use super::{
     AddressSpace, AddressValue, AffineView, Binary, IndexValue, LiteralValue, MatmulValue,
     MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue, TensorGuardValue,
-    ThreefryValue, UOp, UOpTag, UType, Unary, VariableValue, ViewMap, graph_unary_type_is_valid,
+    ThreefryValue, TopologicalOrder, UOp, UOpTag, UType, Unary, VariableValue, ViewMap,
+    graph_unary_type_is_valid,
 };
 use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
@@ -779,7 +780,7 @@ impl std::error::Error for ArtifactError {}
 /// DAGs require v22; predicated projected indices require v23.
 pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let dag = EncodingDag::new(root)?;
-    let nodes = &dag.nodes;
+    let nodes = dag.order.nodes();
     let version = if nodes
         .iter()
         .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
@@ -818,12 +819,14 @@ pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
 /// their existing BufferIndex payload has a new authenticated source meaning.
 pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let dag = EncodingDag::new(root)?;
-    let nodes = &dag.nodes;
+    let nodes = dag.order.nodes();
     // Tags are transient compiler metadata. A tagged executable kernel must be
     // explicitly stripped before scheduling rather than changing durable cache
     // identities or silently discarding metadata.
     if nodes.iter().any(|node| node.tag().is_some()) {
-        root.validate().map_err(|_| ArtifactError::Format("uop"))?;
+        dag.order
+            .validate_for(root)
+            .map_err(|_| ArtifactError::Format("uop"))?;
         return Err(ArtifactError::Unsupported);
     }
     let effects = nodes.iter().any(|node| {
@@ -866,22 +869,20 @@ pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactEr
 // full validation (including identity-based reduction ownership) still runs.
 struct EncodingDag<'a> {
     root: &'a UOp,
-    nodes: Vec<UOp>,
+    order: TopologicalOrder,
 }
 
 impl<'a> EncodingDag<'a> {
     fn new(root: &'a UOp) -> Result<Self, ArtifactError> {
-        let nodes = root
-            .topological()
-            .map_err(|_| ArtifactError::Format("dag"))?;
-        Ok(Self { root, nodes })
+        let order = TopologicalOrder::new(root).map_err(|_| ArtifactError::Format("dag"))?;
+        Ok(Self { root, order })
     }
 
     fn encode(&self, effects: bool, version: u8) -> Result<Vec<u8>, ArtifactError> {
-        self.root
-            .validate()
+        self.order
+            .validate_for(self.root)
             .map_err(|_| ArtifactError::Format("uop"))?;
-        encode_nodes(&self.nodes, effects, version)
+        encode_nodes(self.order.nodes(), effects, version)
     }
 }
 
@@ -1045,22 +1046,22 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
         return Err(ArtifactError::Format("trailing bytes"));
     }
     let root = nodes[root].clone();
+    // Wire references only point backward, but retain the historical first
+    // traversal's error classification as well as the validation gate order.
+    let order = TopologicalOrder::new(&root)
+        .map_err(|_| ArtifactError::Format(if version < 21 { "dag" } else { "uop" }))?;
     if version < 21
-        && root
-            .topological()
-            .map_err(|_| ArtifactError::Format("dag"))?
+        && order
+            .nodes()
             .iter()
             .any(crate::projected_index::ProjectedIndexPlan::is_projected)
     {
         return Err(ArtifactError::Format("projected index version"));
     }
-    root.validate().map_err(|_| ArtifactError::Format("uop"))?;
-    if root
-        .topological()
-        .map_err(|_| ArtifactError::Format("dag"))?
-        .len()
-        != count
-    {
+    order
+        .validate_for(&root)
+        .map_err(|_| ArtifactError::Format("uop"))?;
+    if order.nodes().len() != count {
         return Err(ArtifactError::Format("unreachable node"));
     }
     Ok(root)
@@ -3481,6 +3482,10 @@ mod tests {
 
     fn encode_unvalidated_v21(root: &UOp) -> Vec<u8> {
         let nodes = root.topological().unwrap();
+        encode_unvalidated_nodes_v21(&nodes)
+    }
+
+    fn encode_unvalidated_nodes_v21(nodes: &[UOp]) -> Vec<u8> {
         let ids = nodes
             .iter()
             .enumerate()
@@ -3499,6 +3504,57 @@ mod tests {
             }
         }
         finish(writer)
+    }
+
+    #[test]
+    fn codec_order_reuse_preserves_reduction_ownership_and_unreachable_errors() {
+        let ty = UType::scalar(DType::F32);
+        let init = || {
+            UOp::from_operation(
+                Operation::ReduceInit(ReductionValue {
+                    input_shape: Shape::from([2]),
+                    output_shape: Shape::new([]),
+                    axes: vec![0],
+                    keepdim: false,
+                    kind: ReduceKind::Max,
+                }),
+                Some(ty),
+                vec![],
+            )
+        };
+        let complete = || {
+            let update = UOp::from_operation(
+                Operation::ReduceAccumulate,
+                Some(ty),
+                vec![
+                    init(),
+                    UOp::scalar_constant(DType::F32, 1.0f32.to_bits() as u64, ty),
+                ],
+            );
+            UOp::from_operation(Operation::ReduceFinalize, Some(ty), vec![update])
+        };
+        let valid = complete();
+        let duplicated = UOp::sink(vec![complete(), complete()]);
+        for root in [valid.clone(), init(), duplicated] {
+            assert_eq!(encode(&root), encode_inner(&root, false, 19));
+            assert_eq!(
+                encode_schedule_identity(&root),
+                encode_inner(&root, false, 18)
+            );
+        }
+        assert_eq!(decode(&encode(&valid).unwrap()).unwrap(), valid);
+
+        let dead = UOp::scalar_constant(DType::F32, 3.0f32.to_bits() as u64, ty);
+        let constant = UOp::scalar_constant(DType::F32, 4.0f32.to_bits() as u64, ty);
+        for (root, expected) in [
+            (constant, ArtifactError::Format("unreachable node")),
+            (init(), ArtifactError::Format("uop")),
+        ] {
+            // Both have an unreachable node. Incomplete reduction ownership
+            // must still fail before the final reachability gate.
+            let bytes = encode_unvalidated_nodes_v21(&[dead.clone(), root]);
+            assert_eq!(decode(&bytes), Err(expected));
+        }
     }
 
     #[test]
