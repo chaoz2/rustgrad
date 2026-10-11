@@ -7,6 +7,8 @@ use std::{
     fmt,
 };
 pub mod artifact;
+#[cfg(test)]
+mod binding_tests;
 pub(crate) mod dynamic;
 pub mod execution_summary;
 mod identity;
@@ -1066,6 +1068,11 @@ fn input_bindings(
     input_bindings_with_order(kernel, inputs, output, None)
 }
 
+#[cfg(test)]
+thread_local! {
+    static BINDING_ORDER_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn input_bindings_with_order(
     kernel: &UOp,
     inputs: &[BufferDesc],
@@ -1429,6 +1436,8 @@ fn input_bindings_with_order(
     let nodes = match order.and_then(|order| order.for_root(kernel)) {
         Some(nodes) => nodes,
         None => {
+            #[cfg(test)]
+            BINDING_ORDER_REBUILDS.set(BINDING_ORDER_REBUILDS.get() + 1);
             derived = kernel.topological().map_err(ScheduleError::UOp)?;
             &derived
         }
@@ -3237,19 +3246,21 @@ fn schedule_many_with_external(
         } else {
             kernel
         };
-        let kernel_nodes = kernel.topological().map_err(ScheduleError::UOp)?;
-        for (buffer, view) in common_buffer_views(&kernel_nodes) {
+        let kernel_order =
+            crate::uop::TopologicalOrder::new(&kernel).map_err(ScheduleError::UOp)?;
+        for (buffer, view) in common_buffer_views(kernel_order.nodes()) {
             if let Some(desc) = inputs.iter_mut().find(|desc| desc.id == buffer) {
                 desc.view = view;
             }
         }
         let id = *node_to_item.get(&index).ok_or(ScheduleError::Overflow)?;
-        let external_materializations = input_bindings(&kernel, &inputs, &output)?
+        let input_bindings =
+            input_bindings_with_order(&kernel, &inputs, &output, Some(&kernel_order))?;
+        let external_materializations = input_bindings
             .iter()
             .filter(|binding| external.contains(&binding.input_node.index()))
             .map(|binding| binding.input_node)
             .collect::<Vec<_>>();
-        let input_bindings = input_bindings(&kernel, &inputs, &output)?;
         let quantized_input_bindings = quantized_input_bindings(&kernel)?;
         // Executable dependencies follow the final ordered pointer ABI, not
         // the earlier traversal inventory. This keeps lifetime/reuse edges
@@ -3308,7 +3319,7 @@ fn schedule_many_with_external(
             cache_key: 0,
         };
         item.cache_key = item_cache_key(&item)?;
-        item.validate_input_bindings()?;
+        item.validate_input_bindings_with_order(Some(&kernel_order))?;
         items.push(item);
     }
     let positions: std::collections::BTreeMap<u64, usize> = items
