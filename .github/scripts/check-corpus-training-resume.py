@@ -57,8 +57,10 @@ def main():
         losses = evaluated["batch_losses"]
         assert len(losses) == len(eval_weights)
         assert all(math.isfinite(loss) and loss > 0 for loss in losses)
-        expected_mean = sum(loss * weight for loss, weight in zip(losses, eval_weights)) / sum(eval_weights)
-        assert evaluated["mean_token_loss"] == expected_mean
+        expected_mean = math.fsum(loss * weight for loss, weight in zip(losses, eval_weights)) / sum(eval_weights)
+        # Python's accurate summation is an independent oracle for the Rust
+        # sequential f64 fold, not a bit-identical implementation of that fold.
+        assert math.isclose(evaluated["mean_token_loss"], expected_mean, rel_tol=1e-14, abs_tol=1e-14)
         assert evaluated["restored_without_graph_rebuild"] is True
         assert evaluated["training_state_unchanged"] is True
         assert pending_file.read_bytes() == pending_bytes
