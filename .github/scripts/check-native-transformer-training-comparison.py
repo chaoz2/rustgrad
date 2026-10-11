@@ -321,7 +321,7 @@ def project_program(value: Any, label: str) -> dict[str, Any]:
 
 
 def validate_sidecar(value: dict[str, Any], expected_sha: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    require(value.get("format_version") == 2, "steady evidence format differs")
+    require(value.get("format_version") in (2, 3), "steady evidence format differs")
     require(value.get("evidence_kind") == "native_cpu_compiled_transformer_steady_replay", "steady evidence kind differs")
     provenance = value.get("provenance")
     require(type(provenance) is dict, "steady provenance is absent")
@@ -393,6 +393,9 @@ def validate_sidecar(value: dict[str, Any], expected_sha: str) -> tuple[dict[str
         durations = {field: duration_ns(sample.get(field), f"sample {index}.{field}") for field in SAMPLE_PARTITIONS}
         require(durations["native_dispatcher_wall_time"] + durations["executor_host_wall_time"] == durations["executor_wall_time"], "steady executor partition differs")
         require(durations["executor_wall_time"] + durations["recurrent_overhead_wall_time"] == durations["total_wall_time"], "steady total partition differs")
+        if value["format_version"] == 3:
+            call = duration_ns(sample.get("call_wall_time"), f"sample {index}.call_wall_time")
+            require(call >= durations["total_wall_time"], "steady call duration is shorter than runtime duration")
 
     checkpoints = {}
     for field, replay, optimizer, accumulation_index in (
@@ -424,10 +427,14 @@ def validate_sidecar(value: dict[str, Any], expected_sha: str) -> tuple[dict[str
             "steady final checkpoint payload contains a non-byte")
 
     stable = copy.deepcopy(value)
+    # Versions 2 and 3 have the same workload/checkpoint contract; version 3
+    # adds only the enclosing caller timer, absent from historical samples.
+    stable.pop("format_version")
     stable["provenance"].pop("git_sha")
     stable["preparation"].pop("wall_time")
     for role in ("accumulation_only_samples", "optimizer_commit_samples"):
         for sample in stable[role]:
+            sample.pop("call_wall_time", None)
             for field in SAMPLE_PARTITIONS:
                 sample.pop(field)
     return stable, {"samples": samples}

@@ -29,7 +29,9 @@ pub(super) struct CompiledTrainingPlan {
 
 #[derive(Clone)]
 pub(super) struct CompiledTrainingSiblingPlan {
-    pub(super) phase: CompiledRecurrentPhasePlan,
+    // Replay borrows this immutable program while mutating the session frontier.
+    // Cloning a replay handle must not copy captures or initial tensor storage.
+    pub(super) phase: Arc<CompiledRecurrentPhasePlan>,
 }
 
 #[derive(Clone)]
@@ -328,14 +330,14 @@ impl CompiledTrainingPlan {
                 .capture_measurement
                 .with_cursor_projection(cursor_projection_wall_time);
             let plan = CompiledTrainingSiblingPlan {
-                phase: CompiledRecurrentPhasePlan {
+                phase: Arc::new(CompiledRecurrentPhasePlan {
                     capture: phase.recurrent_frontier.capture_arc(),
                     recurrent_frontier: phase.recurrent_frontier,
                     recurrent_capture: phase.recurrent_capture,
                     state_buffers: phase.state_buffers,
                     cursor_projection: Arc::new(cursor_projection),
                     admission: CompiledRecurrentPhaseAdmission::RetainUnchanged,
-                },
+                }),
             };
             let accumulation_wall_time = accumulation_started.elapsed();
             let recurrent_capture = capture_measurement.finish(accumulation_wall_time)?;

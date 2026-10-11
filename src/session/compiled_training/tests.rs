@@ -3227,6 +3227,32 @@ fn native_cpu_adamw_materializes_transpose_colliding_with_dense_recurrent_parame
 }
 
 #[test]
+fn accumulation_replay_handles_share_immutable_phase_not_mutable_state() {
+    let plan = CompiledAdamWPlan::compile(
+        accumulated_adamw_config(3),
+        initial_parameters(),
+        build_tinybob,
+    )
+    .unwrap();
+    let original = plan.inner.accumulation.as_ref().unwrap();
+    let cloned = original.clone();
+    assert!(Arc::ptr_eq(&original.phase, &cloned.phase));
+
+    let mut first = plan.prepare_cpu().unwrap();
+    let second = plan.prepare_cpu().unwrap();
+    for session in [&first, &second] {
+        let handle = session.inner.accumulation.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&original.phase, &handle.phase));
+    }
+    // Cursors remain session-owned, even though their program is shared.
+    assert!(!std::ptr::eq(&first.inner.cursor, &second.inner.cursor));
+    let untouched = second.checkpoint().unwrap();
+    first.step(batch(), TensorData::scalar(0.01)).unwrap();
+    assert_eq!(second.checkpoint().unwrap(), untouched);
+    assert_ne!(first.checkpoint().unwrap(), untouched);
+}
+
+#[test]
 fn native_cpu_adamw_partial_flush_and_zero_grad_match_interpreter() {
     crate::engine::mixed_capture::reset_prepared_replay_validation_counts();
     let plan = CompiledAdamWPlan::compile(
