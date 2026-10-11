@@ -4778,7 +4778,14 @@ mod tests {
             capture.to_bytes_without_identity().unwrap()
         );
 
-        for case in ["metadata", "key", "kernel", "state"] {
+        // This effect-only fixture has no state bindings requiring a listed
+        // state. Empty state metadata is therefore valid in both paths.
+        let mut without_states = capture.clone();
+        without_states.states.clear();
+        validate(&without_states, true).unwrap();
+        validate_with_kernel_encodings(&without_states, true, Some(&kernels)).unwrap();
+
+        for case in ["metadata", "key", "kernel", "duplicate state"] {
             let mut malformed = capture.clone();
             match case {
                 "metadata" => malformed.schedule.items[0].id = 99,
@@ -4787,12 +4794,19 @@ mod tests {
                     malformed.schedule.items[0].kernel =
                         crate::UOp::from_operation(crate::Operation::Load, None, vec![])
                 }
-                "state" => malformed.states.clear(),
+                "duplicate state" => malformed.states.push(malformed.states[0].clone()),
                 _ => unreachable!(),
             }
+            let expected = validate(&malformed, true).expect_err(case);
+            if case == "duplicate state" {
+                assert_eq!(
+                    expected,
+                    ReplayError::Corrupt("duplicate logical state version".into())
+                );
+            }
             assert_eq!(
-                validate_with_kernel_encodings(&malformed, true, Some(&kernels)).unwrap_err(),
-                validate(&malformed, true).unwrap_err(),
+                validate_with_kernel_encodings(&malformed, true, Some(&kernels)).expect_err(case),
+                expected,
                 "{case}"
             );
         }
