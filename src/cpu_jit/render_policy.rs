@@ -8,7 +8,7 @@ thread_local! {
 }
 
 pub(super) struct ElementwiseTopology {
-    nodes: Vec<UOp>,
+    order: crate::uop::TopologicalOrder,
     request_vector: bool,
     projected: bool,
 }
@@ -17,21 +17,21 @@ impl ElementwiseTopology {
     pub(super) fn new(root: &UOp, request_vector: bool) -> Result<Self, JitError> {
         #[cfg(test)]
         TOPOLOGY_DERIVATIONS.with(|count| count.set(count.get().saturating_add(1)));
-        let nodes = root
-            .topological()
+        let order = crate::uop::TopologicalOrder::new(root)
             .map_err(|error| JitError::Unsupported(error.to_string()))?;
-        let projected = nodes
+        let projected = order
+            .nodes()
             .iter()
             .any(crate::projected_index::ProjectedIndexPlan::is_projected);
         Ok(Self {
-            nodes,
+            order,
             request_vector,
             projected,
         })
     }
 
     pub(super) fn nodes(&self) -> &[UOp] {
-        &self.nodes
+        self.order.nodes()
     }
 
     pub(super) fn render_policy(&self, root: &UOp) -> Result<ElementwiseRenderPolicy, JitError> {
@@ -204,12 +204,15 @@ impl NativeRenderAuthentication {
 
 enum NativeRenderTopologyState {
     Legacy,
-    Elementwise { projected: bool },
+    Elementwise {
+        projected: bool,
+        order: crate::uop::TopologicalOrder,
+    },
     Unavailable,
 }
 
 /// Call-local immutable facts derived from one native render-capsule recipe's
-/// topology. The node list is released immediately; the compact facts remain
+/// topology. The canonical order and derived facts remain
 /// bound to one exact UOp owner and vector-policy request and are never
 /// serialized or retained by a prepared runtime.
 pub(crate) struct NativeRenderTopologyWitness {
@@ -230,6 +233,7 @@ impl NativeRenderTopologyWitness {
                         super::native_output_initialization_from_topology(root, topology.nodes()),
                         NativeRenderTopologyState::Elementwise {
                             projected: topology.projected,
+                            order: topology.order,
                         },
                     )
                 }
@@ -263,6 +267,13 @@ impl NativeRenderTopologyWitness {
         self.root.shares_node_with(root)
     }
 
+    pub(crate) fn order(&self) -> Option<&crate::uop::TopologicalOrder> {
+        match &self.state {
+            NativeRenderTopologyState::Elementwise { order, .. } => Some(order),
+            _ => None,
+        }
+    }
+
     pub(crate) fn authentication(
         &self,
         root: &UOp,
@@ -277,7 +288,7 @@ impl NativeRenderTopologyWitness {
             NativeRenderTopologyState::Legacy => {
                 NativeRenderAuthentication::new(root, request_vector)
             }
-            NativeRenderTopologyState::Elementwise { projected } => {
+            NativeRenderTopologyState::Elementwise { projected, .. } => {
                 NativeRenderAuthentication::from_elementwise_projection(
                     root,
                     request_vector,

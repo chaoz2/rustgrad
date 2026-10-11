@@ -792,6 +792,13 @@ impl ScheduleItem {
         &self.quantized_input_bindings
     }
     pub fn validate_input_bindings(&self) -> Result<(), ScheduleError> {
+        self.validate_input_bindings_with_order(None)
+    }
+
+    pub(crate) fn validate_input_bindings_with_order(
+        &self,
+        order: Option<&crate::uop::TopologicalOrder>,
+    ) -> Result<(), ScheduleError> {
         // A visible unsupported boundary deliberately carries no lowered ABI;
         // its inventory is dependency metadata, not callable pointers.
         if self.boundary.is_some() && self.input_bindings.is_empty() {
@@ -804,7 +811,7 @@ impl ScheduleItem {
         // payloads as dependency-free UOp constants. Validate every binding
         // against the inventory below without requiring equal cardinality.
         if self.boundary.is_none()
-            && input_bindings(&self.kernel, &self.inputs, self.primary_output())?
+            && input_bindings_with_order(&self.kernel, &self.inputs, self.primary_output(), order)?
                 != self.input_bindings
         {
             return Err(ScheduleError::Binding(
@@ -1033,6 +1040,15 @@ fn input_bindings(
     kernel: &UOp,
     inputs: &[BufferDesc],
     output: &BufferDesc,
+) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
+    input_bindings_with_order(kernel, inputs, output, None)
+}
+
+fn input_bindings_with_order(
+    kernel: &UOp,
+    inputs: &[BufferDesc],
+    output: &BufferDesc,
+    order: Option<&crate::uop::TopologicalOrder>,
 ) -> Result<Vec<ScheduleInputBinding>, ScheduleError> {
     if let crate::Operation::Threefry(plan) = kernel.operation() {
         plan.validate()
@@ -1387,7 +1403,15 @@ fn input_bindings(
     }
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    for node in kernel.topological().map_err(ScheduleError::UOp)? {
+    let derived;
+    let nodes = match order.and_then(|order| order.for_root(kernel)) {
+        Some(nodes) => nodes,
+        None => {
+            derived = kernel.topological().map_err(ScheduleError::UOp)?;
+            &derived
+        }
+    };
+    for node in nodes {
         if !matches!(node.operation(), crate::Operation::Load) {
             continue;
         }
