@@ -2,7 +2,7 @@
 use super::capture::{CapturedSchedule, ReplayError};
 use super::native_replay_workspace::{
     NativeReplayTraffic, NativeReplayWorkspace, PreparedNativeEgressProjection,
-    ResolvedNativeReplayInput,
+    PreparedNativeOutputBinding, ResolvedNativeReplayInput,
 };
 use super::replay_liveness::ReplayLivenessPlan;
 use crate::backend::{
@@ -1270,6 +1270,13 @@ impl PlannedNativeItems {
 }
 
 impl SealedPlannedNativeItems {
+    pub(super) fn prepare_output_binding(
+        &self,
+        buffer: u64,
+    ) -> Result<PreparedNativeOutputBinding, ReplayError> {
+        self.plan.workspace.prepare_output_binding(buffer)
+    }
+
     pub(super) fn prepare_egress_projection(
         &mut self,
         capture: &CapturedSchedule,
@@ -3243,6 +3250,96 @@ mod tests {
                 if message == "prepared native physical entry count mismatch"
         ));
         assert_eq!(executor.native_item_plan_count(), 1);
+    }
+
+    #[test]
+    fn prepared_recurrent_output_bindings_validate_live_storage_and_owner() {
+        for width in [0, 2] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", [width], DType::F32);
+            let output = graph.square(input).unwrap();
+            let capture = captured(&graph, &[output]);
+            let provided = BTreeMap::from([(
+                "input".into(),
+                TensorData::new([width], vec![3.0; width]).unwrap(),
+            )]);
+            let executor = CapturedReplayExecutor::default();
+            let mut plan = executor
+                .plan_native_items(&capture, &provided, false)
+                .unwrap();
+            let foreign = executor
+                .plan_native_items(&capture, &provided, false)
+                .unwrap();
+            let output_id = output.index() as u64;
+            let binding = plan.workspace.prepare_output_binding(output_id).unwrap();
+            let foreign_binding = foreign.workspace.prepare_output_binding(output_id).unwrap();
+            assert!(matches!(
+                plan.workspace.prepare_output_binding(u64::MAX),
+                Err(ReplayError::Missing(_))
+            ));
+
+            for (shape, dtype) in [([width + 1], DType::F32), ([width], DType::I32)] {
+                let mut destination = TensorData::zeros_with_dtype(shape, dtype).unwrap();
+                let before = plan.workspace.stats();
+                let mut borrowed = plan.workspace.new_bindings();
+                assert!(matches!(
+                    plan.workspace.borrow_recurrent_output(
+                        &foreign_binding, &mut destination, &mut borrowed
+                    ),
+                    Err(ReplayError::Corrupt(message))
+                        if message == "prepared native output binding owner mismatch"
+                ));
+                assert_eq!(plan.workspace.stats(), before);
+                drop(borrowed);
+                let mut borrowed = plan.workspace.new_bindings();
+                assert!(matches!(
+                    plan.workspace.borrow_recurrent_output(
+                        &binding, &mut destination, &mut borrowed
+                    ),
+                    Err(ReplayError::Corrupt(message))
+                        if message.contains("descriptor mismatch")
+                ));
+                assert_eq!(plan.workspace.stats(), before);
+            }
+
+            let mut destination = TensorData::zeros_with_dtype([width], DType::F32).unwrap();
+            let mut duplicate = destination.clone();
+            let mut borrowed = plan.workspace.new_bindings();
+            plan.workspace
+                .borrow_recurrent_output(&binding, &mut destination, &mut borrowed)
+                .unwrap();
+            let before = plan.workspace.stats();
+            assert!(matches!(
+                plan.workspace.borrow_recurrent_output(&binding, &mut duplicate, &mut borrowed),
+                Err(ReplayError::Corrupt(message)) if message.contains("bound twice")
+            ));
+            assert_eq!(plan.workspace.stats(), before);
+            drop(borrowed);
+
+            // Reusing the prepared location must bind each call's destination,
+            // not retain a pointer from a previous invocation or failed bind.
+            for _ in 0..2 {
+                let mut destination = TensorData::new([width], vec![-1.0; width]).unwrap();
+                let mut borrowed = plan.workspace.new_bindings();
+                executor
+                    .execute_planned_native_items_resolved(
+                        &capture,
+                        &mut plan,
+                        &mut borrowed,
+                        None,
+                        |workspace, borrowed| {
+                            workspace.borrow_recurrent_output(&binding, &mut destination, borrowed)
+                        },
+                        |_ordinal, input, _workspace| {
+                            Ok(ResolvedNativeReplayInput::External(&provided[&input.name]))
+                        },
+                    )
+                    .unwrap();
+                drop(borrowed);
+                assert_eq!(destination.to_vec_f64(), vec![9.0; width]);
+                assert_eq!(duplicate.to_vec_f64(), vec![0.0; width]);
+            }
+        }
     }
 
     #[test]

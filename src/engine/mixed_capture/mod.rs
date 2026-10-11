@@ -3,6 +3,7 @@
 //! This type intentionally owns only logical schedule/state metadata. Runtime
 //! leases, slot generations, pointers, and current bytes remain caller-owned.
 use super::NativeReplayTraffic;
+use super::native_replay_workspace::PreparedNativeOutputBinding;
 use super::persistent_inputs::bind_persistent_inputs;
 use crate::uop::artifact::{ArtifactError, Reader, Writer, checksum};
 use crate::{
@@ -563,6 +564,7 @@ impl<'a> NativeReplayContext<'a> {
             plan,
             pure,
             banks: bank_layout,
+            output_bindings,
             output_projections,
         } = prepared;
         if cursor.capture_identity != trace.replay.artifact_identity {
@@ -632,26 +634,15 @@ impl<'a> NativeReplayContext<'a> {
                         &mut borrowed,
                         projection.native_egress(),
                         |workspace, borrowed| {
-                            for (ordinal, (binding, mode)) in bank_layout
-                                .banks
-                                .iter()
-                                .zip(bank_layout.transaction_schema.modes().iter())
-                                .enumerate()
-                            {
-                                if matches!(
-                                    mode,
-                                    crate::effects::runtime::RecurrentBankMode::Retain
-                                ) {
-                                    continue;
-                                }
-                                let successor = inactive[ordinal].take().ok_or_else(|| {
+                            for (ordinal, output) in output_bindings.iter() {
+                                let successor = inactive[*ordinal].take().ok_or_else(|| {
                                     ReplayError::Missing(format!(
                                         "recurrent successor state {}",
-                                        bank_layout.initial(ordinal).buffer
+                                        bank_layout.initial(*ordinal).buffer
                                     ))
                                 })?;
                                 workspace.borrow_recurrent_output(
-                                    binding.replacement.producer,
+                                    output,
                                     successor,
                                     borrowed,
                                 )?;
@@ -784,6 +775,7 @@ pub(crate) struct PreparedRecurrentNativeReplay {
     plan: super::captured_replay::SealedPlannedNativeItems,
     pure: CapturedSchedule,
     banks: PreparedRecurrentBankLayout,
+    output_bindings: Box<[(usize, PreparedNativeOutputBinding)]>,
     output_projections: Vec<PreparedRecurrentOutputProjection>,
 }
 
@@ -964,6 +956,20 @@ impl PreparedRecurrentNativeReplay {
                 "prepared recurrent full output projection mismatch".into(),
             ));
         }
+        let output_bindings = banks
+            .banks
+            .iter()
+            .zip(banks.transaction_schema.modes())
+            .enumerate()
+            .filter(|(_, (_, mode))| {
+                matches!(mode, crate::effects::runtime::RecurrentBankMode::Replace)
+            })
+            .map(|(ordinal, (bank, _))| {
+                plan.prepare_output_binding(bank.replacement.producer)
+                    .map(|output| (ordinal, output))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_boxed_slice();
         let mut output_projections = Vec::with_capacity(output_projection_requests.len());
         for selected in &output_projection_requests {
             let native_egress = plan.prepare_egress_projection(&pure, Arc::clone(selected));
@@ -985,6 +991,7 @@ impl PreparedRecurrentNativeReplay {
             plan,
             pure,
             banks,
+            output_bindings,
             output_projections,
         })
     }
