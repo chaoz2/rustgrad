@@ -342,7 +342,7 @@ fn native_schedule_wrapper_key(
         artifact: crate::cpu_jit::schedule_module_cache_key(
             &entries
                 .iter()
-                .map(|entry| entry.rendered.clone())
+                .map(|entry| &entry.rendered)
                 .collect::<Vec<_>>(),
         ),
         entries: entries
@@ -1890,7 +1890,7 @@ impl CpuJitBackend {
                 let suffix = &module.entries[reuse.entry_count..];
                 let rendered_suffix = suffix
                     .iter()
-                    .map(|entry| entry.rendered.clone())
+                    .map(|entry| &entry.rendered)
                     .collect::<Vec<_>>();
                 crate::cpu_jit::schedule_module_translation_unit_evidence(&rendered_suffix)
                     .map_err(jit_error)

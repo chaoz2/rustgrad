@@ -1497,7 +1497,10 @@ neither validation order nor artifact, cache, checkpoint, or capture identity.
   Both compile to ephemeral PIC objects under the process-wide two-compiler
   limit, then one ordered final link publishes and loads exactly one
   content-addressed schedule library. Smaller suffixes retain the single
-  combined compile/link command.
+  combined compile/link command. Read-only wrapper-key and translation-unit
+  evidence preparation borrow the retained rendered entries rather than cloning
+  their source, ABI, and source maps. Owned compiler-worker inputs, generated
+  source bytes, build policy, and cache identities are unchanged.
 - **Rendering.** At most two private workers render attached programs in
   parallel on a capsule miss. A bounded checksummed sidecar binds the canonical
   typed recipe to the complete rendered payload; an exact hit revalidates the
