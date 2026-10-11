@@ -903,6 +903,11 @@ impl DecodedKernels {
     }
 
     pub(super) fn item_key(&self, item: &ScheduleItem) -> Result<u64, ArtifactError> {
+        if !self.canonical.contains_key(&item.kernel.node_identity()) {
+            // A caller-owned replacement is not covered by decoder admission.
+            // Preserve the ordinary codec rather than rejecting a valid root.
+            return super::identity::item_key(item);
+        }
         super::identity::item_key_with_kernel(item, || self.canonical_bytes(&item.kernel))
     }
 
@@ -911,6 +916,9 @@ impl DecodedKernels {
         writer: &mut Writer,
         item: &ScheduleItem,
     ) -> Result<(), ArtifactError> {
+        if !self.canonical.contains_key(&item.kernel.node_identity()) {
+            return write_effect_item(writer, item);
+        }
         write_item_with_kernel(writer, item, true, || {
             self.canonical_bytes(&item.kernel).map(Cow::Borrowed)
         })
@@ -2655,9 +2663,18 @@ mod tests {
             // root. Public callers still use the uncached canonical codec.
             changed.kernel = decode_uop(bytes).unwrap();
             assert_eq!(
-                kernels.item_key(&changed),
+                kernels.canonical_bytes(&changed.kernel),
                 Err(ArtifactError::Format("decoded kernel ownership"))
             );
+            assert_eq!(
+                kernels.item_key(&changed).unwrap(),
+                super::super::identity::item_key(&changed).unwrap()
+            );
+            let mut retained = Writer::new();
+            kernels.write_effect_item(&mut retained, &changed).unwrap();
+            let mut reference = Writer::new();
+            write_effect_item(&mut reference, &changed).unwrap();
+            assert_eq!(retained.out, reference.out);
         }
         assert!(
             kernels
