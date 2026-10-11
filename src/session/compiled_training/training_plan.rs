@@ -850,10 +850,11 @@ impl CompiledAdamWAuxiliaryPlan {
         )?;
         let mixed = sealed.schedule;
         captured.items = mixed.items.clone();
-        let capture = Arc::new(
-            CapturedMixedSchedule::from_parts(captured, &mixed, sealed.states)
+        let recurrent_frontier = Arc::new(
+            AuthenticatedRecurrentFrontier::from_parts(captured, &mixed, sealed.states)
                 .map_err(replay_error)?,
         );
+        let capture = recurrent_frontier.capture_arc();
         validate_external_binding_ownership(capture.as_ref(), std::iter::empty::<&String>())?;
         let effect_assembly_sealing_wall_time = effect_assembly_sealing_started.elapsed();
         let recurrent_authentication_started = Instant::now();
@@ -864,9 +865,6 @@ impl CompiledAdamWAuxiliaryPlan {
             &state_links,
             initial_state,
         )?;
-        let recurrent_frontier = Arc::new(
-            AuthenticatedRecurrentFrontier::authenticate(capture.clone()).map_err(replay_error)?,
-        );
         let recurrent_authentication_wall_time = recurrent_authentication_started.elapsed();
         let cursor_projection_started = Instant::now();
         let cursor_projection = PreparedRecurrentCursorProjection::prepare_authenticated(

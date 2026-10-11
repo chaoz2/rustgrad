@@ -4456,6 +4456,77 @@ mod recurrent_tests {
     }
 
     #[test]
+    fn fresh_recurrent_frontier_retains_constructor_admission() {
+        let (capture, _runtime) = fixture(335);
+        let mixed = Schedule {
+            items: capture.schedule.items.clone(),
+            requested_materializations: requested_materializations(&capture.schedule),
+            requested_passthroughs: capture.schedule.requested_passthroughs.clone(),
+            value_bindings: capture.value_bindings.clone(),
+            state_bindings: capture.state_bindings.clone(),
+        };
+        reset_prepared_replay_validation_counts();
+        let reference = CapturedMixedSchedule::from_parts(
+            capture.schedule.clone(),
+            &mixed,
+            capture.states.clone(),
+        )
+        .unwrap();
+        let reference =
+            AuthenticatedRecurrentFrontier::authenticate(std::sync::Arc::new(reference)).unwrap();
+        let reference_counts = prepared_replay_validation_counts();
+        assert_eq!(reference_counts.mixed_capture_validations, 2);
+
+        reset_prepared_replay_validation_counts();
+        let fresh = AuthenticatedRecurrentFrontier::from_parts(
+            capture.schedule.clone(),
+            &mixed,
+            capture.states.clone(),
+        )
+        .unwrap();
+        let fresh_counts = prepared_replay_validation_counts();
+        assert_eq!(fresh_counts.mixed_capture_validations, 1);
+        assert_eq!(fresh_counts.schedule_rekeys, 1);
+        assert_eq!(fresh_counts.identity_serializations, 1);
+        assert_eq!(fresh_counts.recurrent_frontier_authentications, 1);
+        assert_eq!(fresh.initial_cursor(), reference.initial_cursor());
+        assert_eq!(
+            fresh.capture().to_bytes().unwrap(),
+            reference.capture().to_bytes().unwrap()
+        );
+
+        for case in ["cache key", "missing state", "duplicate state"] {
+            let mut invalid = capture.clone();
+            match case {
+                "cache key" => invalid.schedule.items[0].cache_key ^= 1,
+                "missing state" => invalid.states.clear(),
+                "duplicate state" => invalid.states.push(invalid.states[0].clone()),
+                _ => unreachable!(),
+            }
+            let expected = CapturedMixedSchedule::from_parts(
+                invalid.schedule.clone(),
+                &mixed,
+                invalid.states.clone(),
+            )
+            .unwrap_err();
+            reset_prepared_replay_validation_counts();
+            let actual = AuthenticatedRecurrentFrontier::from_parts(
+                invalid.schedule,
+                &mixed,
+                invalid.states,
+            )
+            .err()
+            .expect("malformed construction must reject before owning a frontier");
+            assert_eq!(actual.to_string(), expected.to_string(), "{case}");
+            assert_eq!(
+                prepared_replay_validation_counts().recurrent_frontier_authentications,
+                0,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn authenticated_frontier_keeps_same_descriptor_programs_associated() {
         let (first, _runtime) = fixture(334);
         let mut second = first.clone();
