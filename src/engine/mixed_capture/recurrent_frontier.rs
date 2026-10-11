@@ -23,8 +23,14 @@ impl AuthenticatedRecurrentFrontier {
         mixed: &Schedule,
         states: Vec<BufferState>,
     ) -> Result<Self, ReplayError> {
-        let capture = CapturedMixedSchedule::from_parts(schedule, mixed, states)?;
-        let capture_identity = identity(&capture)?;
+        let kernels = crate::schedule::artifact::KernelEncodings::fresh(&schedule.items);
+        let capture = CapturedMixedSchedule::from_parts_with_kernel_encodings(
+            schedule,
+            mixed,
+            states,
+            Some(&kernels),
+        )?;
+        let capture_identity = identity_with_kernel_encodings(&capture, Some(&kernels))?;
         Self::from_admitted_capture(Arc::new(capture), capture_identity)
     }
 

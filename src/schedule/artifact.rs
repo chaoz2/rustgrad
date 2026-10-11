@@ -915,22 +915,46 @@ pub(crate) fn write_effect_item(w: &mut Writer, x: &ScheduleItem) -> Result<(), 
     write_item_inner(w, x, true)
 }
 
-/// Decoder-owned proof of complete UOp admission for immutable kernel roots.
-/// Keeping the roots alive prevents allocation identities from being reused.
-/// This does not authenticate any schedule metadata or artifact identity.
-pub(crate) struct DecodedKernels {
-    roots: Vec<UOp>,
-    canonical: BTreeMap<usize, DecodedKernelEncoding>,
+/// Capture-scoped canonical encodings bound to immutable kernel allocations.
+/// Only decoded entries also carry prior UOp admission; fresh entries never
+/// authorize skipping validation. No schedule metadata is cached here.
+pub(crate) struct KernelEncodings {
+    admitted_roots: Vec<UOp>,
+    canonical: BTreeMap<usize, KernelEncodingEntry>,
 }
 
-struct DecodedKernelEncoding {
-    admitted: crate::uop::artifact::DecodedKernel,
+struct KernelEncodingEntry {
+    source: KernelEncodingSource,
     bytes: OnceCell<Result<Vec<u8>, ArtifactError>>,
 }
 
-impl DecodedKernels {
-    pub(super) fn roots(&self) -> impl Iterator<Item = &UOp> {
-        self.roots.iter()
+enum KernelEncodingSource {
+    Fresh(UOp),
+    Decoded(crate::uop::artifact::DecodedKernel),
+}
+
+impl KernelEncodings {
+    pub(crate) fn fresh(items: &[ScheduleItem]) -> Self {
+        Self {
+            admitted_roots: Vec::new(),
+            canonical: items
+                .iter()
+                .map(|item| {
+                    (
+                        item.kernel.node_identity(),
+                        KernelEncodingEntry {
+                            source: KernelEncodingSource::Fresh(item.kernel.clone()),
+                            bytes: OnceCell::new(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    // Fresh entries retain roots for byte ownership, not validation admission.
+    pub(super) fn admitted_roots(&self) -> impl Iterator<Item = &UOp> {
+        self.admitted_roots.iter()
     }
 
     // Entries are keyed by allocation identity, and roots keep each allocation
@@ -943,14 +967,17 @@ impl DecodedKernels {
             .ok_or(ArtifactError::Format("decoded kernel ownership"))?;
         entry
             .bytes
-            .get_or_init(|| entry.admitted.encode_schedule_identity())
+            .get_or_init(|| match &entry.source {
+                KernelEncodingSource::Fresh(root) => encode_schedule_identity(root),
+                KernelEncodingSource::Decoded(admitted) => admitted.encode_schedule_identity(),
+            })
             .as_deref()
             .map_err(Clone::clone)
     }
 
     pub(super) fn item_key(&self, item: &ScheduleItem) -> Result<u64, ArtifactError> {
         if !self.canonical.contains_key(&item.kernel.node_identity()) {
-            // A caller-owned replacement is not covered by decoder admission.
+            // A caller-owned replacement is not covered by this encoding store.
             // Preserve the ordinary codec rather than rejecting a valid root.
             return super::identity::item_key(item);
         }
@@ -974,7 +1001,7 @@ impl DecodedKernels {
 pub(crate) fn read_effect_items(
     reader: &mut Reader<'_>,
     count: usize,
-) -> Result<(Vec<ScheduleItem>, DecodedKernels), ArtifactError> {
+) -> Result<(Vec<ScheduleItem>, KernelEncodings), ArtifactError> {
     if count > MAX_ITEMS {
         return Err(ArtifactError::Format("item count"));
     }
@@ -986,8 +1013,8 @@ pub(crate) fn read_effect_items(
                 let root = admitted.root().clone();
                 canonical.insert(
                     root.node_identity(),
-                    DecodedKernelEncoding {
-                        admitted,
+                    KernelEncodingEntry {
+                        source: KernelEncodingSource::Decoded(admitted),
                         bytes: OnceCell::new(),
                     },
                 );
@@ -997,8 +1024,8 @@ pub(crate) fn read_effect_items(
         .collect::<Result<Vec<_>, _>>()?;
     // Each item delegates its kernel to the bounded UOp decoder,
     // which validates the full DAG before returning it. No mutable UOp exists.
-    let kernels = DecodedKernels {
-        roots: items.iter().map(|item| item.kernel.clone()).collect(),
+    let kernels = KernelEncodings {
+        admitted_roots: items.iter().map(|item| item.kernel.clone()).collect(),
         canonical,
     };
     Ok((items, kernels))
@@ -2743,6 +2770,68 @@ mod tests {
         let y = graph.square(x).unwrap();
         let schedule = crate::schedule(&graph, y).unwrap();
         CapturedSchedule::capture(&graph, &schedule, &[y]).unwrap()
+    }
+
+    #[test]
+    fn fresh_kernel_bytes_are_lazy_shared_and_do_not_grant_admission() {
+        let original = fixture();
+        let item = &original.items[0];
+        let kernels = KernelEncodings::fresh(&[item.clone(), item.clone()]);
+        assert_eq!(kernels.admitted_roots().count(), 0);
+        assert_eq!(kernels.canonical.len(), 1);
+        assert!(
+            kernels
+                .canonical
+                .values()
+                .all(|entry| entry.bytes.get().is_none())
+        );
+        assert_eq!(
+            kernels.item_key(item),
+            super::super::identity::item_key(item)
+        );
+        let bytes = kernels.canonical_bytes(&item.kernel).unwrap();
+        assert_eq!(bytes, encode_schedule_identity(&item.kernel).unwrap());
+        let pointer = bytes.as_ptr();
+        let mut actual = Writer::new();
+        kernels.write_effect_item(&mut actual, item).unwrap();
+        let mut expected = Writer::new();
+        write_effect_item(&mut expected, item).unwrap();
+        assert_eq!(actual.out, expected.out);
+        assert_eq!(
+            pointer,
+            kernels.canonical_bytes(&item.kernel).unwrap().as_ptr()
+        );
+
+        let mut changed = item.clone();
+        changed.id += 1;
+        assert_eq!(
+            kernels.item_key(&changed),
+            super::super::identity::item_key(&changed)
+        );
+        assert_ne!(kernels.item_key(&changed), kernels.item_key(item));
+        changed.kernel = decode_uop(bytes).unwrap();
+        assert!(
+            !kernels
+                .canonical
+                .contains_key(&changed.kernel.node_identity())
+        );
+        assert_eq!(
+            kernels.item_key(&changed),
+            super::super::identity::item_key(&changed)
+        );
+
+        changed.kernel = UOp::from_operation(crate::Operation::Load, item.kernel.ty(), vec![]);
+        let malformed = KernelEncodings::fresh(&[changed.clone()]);
+        assert!(
+            malformed
+                .canonical
+                .values()
+                .all(|entry| entry.bytes.get().is_none())
+        );
+        let error = super::super::identity::item_key(&changed).unwrap_err();
+        assert_eq!(malformed.item_key(&changed), Err(error.clone()));
+        assert_eq!(malformed.item_key(&changed), Err(error));
+        assert_eq!(malformed.admitted_roots().count(), 0);
     }
 
     #[test]
