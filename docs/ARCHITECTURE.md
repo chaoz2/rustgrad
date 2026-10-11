@@ -1087,6 +1087,11 @@ The accumulation sibling retains pass-through state; partial flush and
 `zero_grad` replace their selected recurrent state. All three authenticate a
 projection from the authoritative main frontier before execution.
 
+Accumulation replay handles share one immutable phase plan through `Arc`,
+including its capture and initial-state recipe. Cloning a handle does not copy
+that graph or its tensor payloads. Each prepared session still owns its mutable
+runtime and cursor; sharing the program does not share live parameter state.
+
 ###### Accumulation-only replay
 
 - Compilation derives a private CPU sibling from the same
@@ -1696,17 +1701,27 @@ sidecar) or `warm-resume` (the larger Transformer's fresh-executor restoration).
 |---|---|
 | Revisions | The candidate is one exact commit and the baseline is its exact requested ancestor; symbolic or moving refs are rejected. |
 | Runner and order | One runner builds both revisions before measurement, then runs serial A-B-B-A trials. Every trial receives a fresh native cache. |
-| Workload | `steady-replay` retains one warmup window and 32 measured windows. Its version-2 sidecar includes the complete final checkpoint bytes after measurement. `warm-resume` uses the fixed two-block, six-replay workload, with replay-3 checkpoint restoration into a fresh executor and exact continuation through replay 6. Training workloads and zero-fallback contracts remain unchanged. |
+| Workload | `steady-replay` retains one warmup window and 32 measured windows. Its sidecar includes the complete final checkpoint bytes after measurement. Version 3 also times the complete public step call. `warm-resume` uses the fixed two-block, six-replay workload, with replay-3 checkpoint restoration into a fresh executor and exact continuation through replay 6. Training workloads and zero-fallback contracts remain unchanged. |
 | Provenance and admission | Raw files remain artifacts. Each trial records its source commit, evidence-file identity, binary identity, Cargo profile, Rust toolchain, and runner provenance. The comparator retains semantic facts and rejects sets whose workload, schema, optimizer/capture, build, or runner facts are not comparable. |
 | Interpretation | Timings are observations with no threshold or speedup claim. Repeat workflow runs are required to assess runner noise; a matching hardware model alone does not establish comparability. |
 
-Steady-replay comparison requires version-2 evidence
+Steady-replay comparison accepts version-2 and version-3 evidence
 on both revisions: exact final checkpoint bytes participate in non-timing
 equality across all four trials, independently of matching sizes and progress
 counters. Missing, truncated, or non-byte payloads fail admission. Historical
 version-1 evidence remains metadata-only and is not admitted to this stronger
 comparison. Serialization is outside the measured replay interval and does
 not change the runtime checkpoint format.
+
+Version 3 additionally records `call_wall_time` around the public scheduled
+commit-only batch step, including admission, phase-handle acquisition, and
+result publication. The existing `total_wall_time` remains the narrower runtime
+interval and retains its executor/recurrent partition. Every full-call sample
+must enclose that runtime interval. Input construction and post-call validation
+are outside the full-call timer. Historical version-2 samples have no full-call
+measurement; the comparator still compares only the shared runtime partitions,
+never substitutes those for full-call latency. No speedup is inferred from the
+ownership change without a same-runner comparison.
 
 Warm-resume comparison uses the same evidence validator as the standalone
 larger-workload recorder. Each trial must authenticate five render-capsule hits

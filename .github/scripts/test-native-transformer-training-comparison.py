@@ -822,6 +822,26 @@ def main() -> None:
 
     run_case(break_partition, expected=False, invalid_trial=3)
 
+    def add_full_call_timing(root: pathlib.Path) -> None:
+        path = root / "trial-03-candidate/native-cpu-training-steady-replays.json"
+        value = json.loads(path.read_text())
+        value["format_version"] = 3
+        for role in ("accumulation_only_samples", "optimizer_commit_samples"):
+            for sample in value[role]:
+                sample["call_wall_time"] = sample["total_wall_time"].copy()
+        write_json(path, value)
+
+    run_case(add_full_call_timing, expected=True)
+
+    def short_full_call_timing(root: pathlib.Path) -> None:
+        add_full_call_timing(root)
+        path = root / "trial-03-candidate/native-cpu-training-steady-replays.json"
+        value = json.loads(path.read_text())
+        value["accumulation_only_samples"][0]["call_wall_time"] = duration(0)
+        write_json(path, value)
+
+    run_case(short_full_call_timing, expected=False, invalid_trial=3)
+
     # Equal counters and byte counts must not hide changed optimizer/parameter
     # payloads. Also reject metadata-only and malformed byte representations.
     for mutation in ("changed", "truncated", "missing", "boolean", "overflow", "legacy"):

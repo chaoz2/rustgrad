@@ -22,6 +22,7 @@ fn sample(measurement_ordinal: u64) -> ReplayTimingSample {
         replay_step,
         successful_invocation: WARMUP_REPLAYS + measurement_ordinal,
         valid_token_count: VALID_TOKEN_COUNTS[(microbatch_ordinal - 1) as usize],
+        call_wall_time: zero_duration(),
         total_wall_time: zero_duration(),
         executor_wall_time: zero_duration(),
         native_dispatcher_wall_time: zero_duration(),
@@ -140,6 +141,12 @@ fn bounded_measurement_inventory_is_canonical_and_phase_separated() {
 
 #[test]
 fn bounded_measurement_rejects_sample_or_progress_tampering() {
+    let mut short_call = evidence();
+    let sample = &mut short_call.accumulation_only_samples[0];
+    sample.total_wall_time = BenchmarkDuration::from_duration(Duration::from_nanos(1));
+    sample.recurrent_overhead_wall_time = sample.total_wall_time;
+    assert!(short_call.validate().is_err());
+
     let mut truncated_checkpoint = evidence();
     truncated_checkpoint.final_checkpoint_bytes.pop();
     assert!(truncated_checkpoint.validate().is_err());

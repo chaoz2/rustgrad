@@ -5,7 +5,7 @@ use std::{
     io::Write,
 };
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const EVIDENCE_KIND: &str = "native_cpu_compiled_transformer_steady_replay";
 const MAX_EVIDENCE_BYTES: usize = 1 << 20;
 const WARMUP_WINDOWS: u64 = 1;
@@ -203,6 +203,7 @@ struct ReplayTimingSample {
     replay_step: u64,
     successful_invocation: u64,
     valid_token_count: u64,
+    call_wall_time: BenchmarkDuration,
     total_wall_time: BenchmarkDuration,
     executor_wall_time: BenchmarkDuration,
     native_dispatcher_wall_time: BenchmarkDuration,
@@ -213,6 +214,7 @@ struct ReplayTimingSample {
 impl ReplayTimingSample {
     fn from_report(
         report: &NativeCpuRunReport,
+        call_wall_time: Duration,
         measurement_ordinal: u64,
         window_ordinal: u64,
         microbatch_ordinal: u64,
@@ -224,7 +226,8 @@ impl ReplayTimingSample {
         let executor_host = report.executor_host_wall_time();
         let overhead = report.replay_overhead_wall_time();
         let total = report.wall_time();
-        if dispatcher.checked_add(executor_host) != Some(executor)
+        if call_wall_time < total
+            || dispatcher.checked_add(executor_host) != Some(executor)
             || executor.checked_add(overhead) != Some(total)
         {
             return Err("steady replay timing partitions do not match".into());
@@ -236,6 +239,7 @@ impl ReplayTimingSample {
             replay_step,
             successful_invocation: report.successful_invocation(),
             valid_token_count,
+            call_wall_time: BenchmarkDuration::from_duration(call_wall_time),
             total_wall_time: BenchmarkDuration::from_duration(total),
             executor_wall_time: BenchmarkDuration::from_duration(executor),
             native_dispatcher_wall_time: BenchmarkDuration::from_duration(dispatcher),
@@ -263,11 +267,13 @@ impl ReplayTimingSample {
             return Err("steady replay sample order differs".into());
         }
         let total = self.total_wall_time.to_duration()?;
+        let call = self.call_wall_time.to_duration()?;
         let executor = self.executor_wall_time.to_duration()?;
         let dispatcher = self.native_dispatcher_wall_time.to_duration()?;
         let executor_host = self.executor_host_wall_time.to_duration()?;
         let overhead = self.recurrent_overhead_wall_time.to_duration()?;
-        if dispatcher.checked_add(executor_host) != Some(executor)
+        if call < total
+            || dispatcher.checked_add(executor_host) != Some(executor)
             || executor.checked_add(overhead) != Some(total)
         {
             return Err("steady replay sample timing partitions do not match".into());
@@ -534,7 +540,9 @@ pub(super) fn record(
         if loss_mask_weight(&batch.loss_mask) != valid_token_count {
             return Err("steady replay valid-token count differs".into());
         }
+        let call_started = Instant::now();
         let step = session.step_batch_commit_only_scheduled(batch)?;
+        let call_wall_time = call_started.elapsed();
         let did_update = microbatch_ordinal == ACCUMULATION_STEPS;
         if step.step() != replay_step
             || step.optimizer_step()
@@ -584,6 +592,7 @@ pub(super) fn record(
             let window_ordinal = (measurement_ordinal - 1) / ACCUMULATION_STEPS + 1;
             let sample = ReplayTimingSample::from_report(
                 step.report(),
+                call_wall_time,
                 measurement_ordinal,
                 window_ordinal,
                 microbatch_ordinal,

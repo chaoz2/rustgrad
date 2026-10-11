@@ -1506,7 +1506,7 @@ fn seal_admitted_training_topology(
             #[cfg(test)]
             update_decode_counts(|counts| counts.cursor_projections += 1);
             Ok(CompiledTrainingSiblingPlan {
-                phase: CompiledRecurrentPhasePlan {
+                phase: Arc::new(CompiledRecurrentPhasePlan {
                     recurrent_capture: CompiledRecurrentCapture::from_artifact(
                         phase_frontier.capture(),
                         None,
@@ -1516,7 +1516,7 @@ fn seal_admitted_training_topology(
                     state_buffers,
                     cursor_projection: Arc::new(cursor_projection),
                     admission: CompiledRecurrentPhaseAdmission::RetainUnchanged,
-                },
+                }),
             })
         })
         .transpose()?;
