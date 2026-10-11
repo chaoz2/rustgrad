@@ -27,6 +27,10 @@ fn uop_spec_and_dag_order_are_deterministic() {
     assert_eq!(order.last(), Some(&root));
     let bad = UOp::from_operation(Operation::Binary(Binary::Add), Some(i64t()), vec![x]);
     assert!(bad.validate().is_err());
+    for source in [&root, &bad] {
+        let retained = uop::TopologicalOrder::new(source).unwrap();
+        assert_eq!(retained.validate_for(source), source.validate());
+    }
 }
 
 #[test]
@@ -80,6 +84,10 @@ fn reduction_uops_require_one_exact_scalar_init_accumulate_finalize_chain() {
     );
     let finalize = UOp::from_operation(Operation::ReduceFinalize, Some(ty), vec![update.clone()]);
     finalize.validate().unwrap();
+    for source in [&init, &update, &finalize] {
+        let retained = uop::TopologicalOrder::new(source).unwrap();
+        assert_eq!(retained.validate_for(source), source.validate());
+    }
     assert!(init.validate().is_err());
     assert!(update.validate().is_err());
     assert!(
@@ -123,6 +131,12 @@ fn reduction_uops_require_one_exact_scalar_init_accumulate_finalize_chain() {
         .unwrap();
     let structurally_duplicated = UOp::sink(vec![first, second]);
     assert!(structurally_duplicated.validate().is_err());
+    let retained = uop::TopologicalOrder::new(&structurally_duplicated).unwrap();
+    assert_eq!(
+        retained.validate_for(&structurally_duplicated),
+        structurally_duplicated.validate(),
+        "deduplicated order must not bypass allocation-based reduction ownership"
+    );
     assert!(crate::uop::artifact::encode(&structurally_duplicated).is_err());
 
     let vector_ty = UType {

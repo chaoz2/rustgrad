@@ -683,6 +683,13 @@ impl TopologicalOrder {
     pub(crate) fn for_root(&self, root: &UOp) -> Option<&[UOp]> {
         self.root.shares_node_with(root).then_some(&self.nodes)
     }
+
+    /// Reuse ordering, not semantic admission. Reduction ownership still
+    /// examines the actual allocation graph rather than deduplicated nodes.
+    pub(crate) fn validate_for(&self, root: &UOp) -> Result<(), UOpError> {
+        let nodes = self.for_root(root).ok_or(UOpError::InvalidArgument)?;
+        root.validate_ordered_nodes(nodes)
+    }
 }
 
 impl UOp {
@@ -798,12 +805,16 @@ impl UOp {
     }
     pub fn validate(&self) -> Result<(), UOpError> {
         let nodes = self.topological()?;
+        self.validate_ordered_nodes(&nodes)
+    }
+
+    fn validate_ordered_nodes(&self, nodes: &[UOp]) -> Result<(), UOpError> {
         let mut ranges = BTreeSet::new();
         let mut ifs = Vec::new();
-        for n in &nodes {
+        for n in nodes {
             validate_one(n, &mut ranges, &mut ifs)?
         }
-        validate_projected_index_consumers(&nodes)?;
+        validate_projected_index_consumers(nodes)?;
         if !ifs.is_empty() || !ranges.is_empty() {
             return Err(UOpError::UnclosedControl);
         }

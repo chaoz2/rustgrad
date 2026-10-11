@@ -1474,7 +1474,12 @@ neither validation order nor artifact, cache, checkpoint, or capture identity.
   order is retained with the exact immutable root until batch completion, so
   schedule input-binding validation can reuse the traversal while checking the
   current descriptors and ABI ordinals in full. A different root derives its
-  own order; the retained order proves no semantic validity. Dedicated kernels
+  own order; the retained order proves no semantic validity. Linear-policy source
+  validation also reuses that exact-root order, but reruns every node, control,
+  and projected-index check. Reduction ownership still walks the actual
+  allocation graph independently, preserving rejection of separately allocated
+  structurally equal reduction chains. Lane projection and geometry/register
+  validation remain fresh. Dedicated kernels
   keep their existing binding validation path. Warm authentication reuses those facts but
   still constructs and validates the linear policy at the original admission
   point. Cold misses do not eagerly derive linear policy. Frozen legacy recipe
