@@ -1371,16 +1371,23 @@ fn linear_program(
     })
 }
 fn intervals(instructions: &[LaneProgramInstruction<u32>], lanes: u16) -> Vec<LiveInterval> {
+    // A use contributes its instruction index, not its position in the slice.
+    // Keep the maximum even for malformed/non-monotonic input so admission and
+    // its error ordering remain the responsibility of the existing validator.
+    let mut last_uses = BTreeMap::<u32, u32>::new();
+    for instruction in instructions {
+        for input in instruction.instruction.view().inputs() {
+            last_uses
+                .entry(*input)
+                .and_modify(|last| *last = (*last).max(instruction.index))
+                .or_insert(instruction.index);
+        }
+    }
     let mut result = Vec::new();
     for instruction in instructions {
         let view = instruction.instruction.view();
         if let Some(reg) = view.output().copied() {
-            let end = instructions
-                .iter()
-                .filter(|other| other.instruction.view().inputs().any(|input| *input == reg))
-                .map(|other| other.index)
-                .max()
-                .unwrap_or(instruction.index);
+            let end = last_uses.get(&reg).copied().unwrap_or(instruction.index);
             let dtype = view
                 .result_type()
                 .expect("value instruction output has a type")
@@ -1685,6 +1692,86 @@ mod tests {
                 ids.owners.contains_key(&equal.node_identity()),
                 nodes.len() == 3
             );
+        }
+    }
+
+    #[test]
+    fn indexed_intervals_match_full_scan_including_noncanonical_inputs() {
+        fn full_scan(
+            instructions: &[LaneProgramInstruction<u32>],
+            lanes: u16,
+        ) -> Vec<LiveInterval> {
+            instructions
+                .iter()
+                .filter_map(|instruction| {
+                    let view = instruction.instruction.view();
+                    let reg = *view.output()?;
+                    let dtype = view.result_type().unwrap().scalar;
+                    Some(LiveInterval {
+                        virtual_reg: reg,
+                        class: if lanes > 1 {
+                            RegisterClass::Vector
+                        } else {
+                            RegisterClass::Scalar
+                        },
+                        dtype: match dtype {
+                            DType::F16 | DType::BF16 => DType::F32,
+                            other => other,
+                        },
+                        start: instruction.index,
+                        end: instructions
+                            .iter()
+                            .filter(|other| {
+                                other.instruction.view().inputs().any(|input| *input == reg)
+                            })
+                            .map(|other| other.index)
+                            .max()
+                            .unwrap_or(instruction.index),
+                    })
+                })
+                .collect()
+        }
+        let mut cases = vec![Vec::new()];
+        for dtype in [DType::I32, DType::F16, DType::BF16, DType::F64] {
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("x", [9], dtype);
+            let sum = graph.add(input, input).unwrap();
+            let output = graph.mul(sum, input).unwrap();
+            let root = crate::lower_graph_elementwise(&graph, output).unwrap();
+            cases.push(LinearKernel::from_uop(&root).unwrap().program.instructions);
+        }
+        let cast = |index, output, input| LaneProgramInstruction {
+            index,
+            instruction: LaneInstruction::Cast {
+                output: TypedValue {
+                    register: output,
+                    ty: UType::scalar(DType::F16),
+                },
+                input: TypedValue {
+                    register: input,
+                    ty: UType::scalar(DType::F16),
+                },
+            },
+        };
+        // Preserve the old behavior even when a use precedes its definition;
+        // the lifetime builder must not silently normalize malformed input.
+        let early = vec![cast(8, 7, 99), cast(2, 3, 7)];
+        assert_eq!(intervals(&early, 1)[0].end, 2);
+        cases.push(early);
+        cases.push(vec![
+            cast(8, 7, 99),
+            cast(2, 3, 7),
+            cast(u32::MAX, 9, 7),
+            cast(4, 5, 99),
+        ]);
+        cases.push(vec![cast(3, 7, 7), cast(3, 7, 99)]);
+        for (case, instructions) in cases.iter().enumerate() {
+            for lanes in [1, 4] {
+                let expected = full_scan(instructions, lanes);
+                let actual = intervals(instructions, lanes);
+                assert_eq!(actual, expected, "case {case}, lanes {lanes}");
+                assert_eq!(allocate(&actual, 64), allocate(&expected, 64));
+            }
         }
     }
 
