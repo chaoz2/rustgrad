@@ -508,6 +508,7 @@ pub(crate) struct NativeRenderCapsuleDiagnostic {
     pub(crate) authentication_wall_time: Option<Duration>,
     pub(crate) authentication_policy_wall_time: Option<Duration>,
     pub(crate) authentication_abi_wall_time: Option<Duration>,
+    pub(crate) policy_phases: Option<crate::cpu_jit::RenderPolicyTimings>,
     pub(crate) store_wall_time: Option<Duration>,
 }
 
@@ -704,6 +705,7 @@ fn render_schedule_modules(
             authentication_wall_time: timing.authentication,
             authentication_policy_wall_time: timing.ordinary_policy,
             authentication_abi_wall_time: timing.ordinary_abi,
+            policy_phases: timing.policy_phases,
             store_wall_time: None,
         });
     }
@@ -3452,6 +3454,7 @@ mod tests {
                 && diagnostic.authentication_wall_time.is_none()
                 && diagnostic.authentication_policy_wall_time.is_none()
                 && diagnostic.authentication_abi_wall_time.is_none()
+                && diagnostic.policy_phases.is_none()
                 && diagnostic.store_wall_time.is_some()
         }));
         assert!(cold.max_parallel_job_count > 0);
@@ -3475,10 +3478,16 @@ mod tests {
                 && diagnostic.authentication_wall_time.is_some()
                 && diagnostic.authentication_policy_wall_time.is_some()
                 && diagnostic.authentication_abi_wall_time.is_some()
+                && diagnostic.policy_phases.is_some()
                 && diagnostic.store_wall_time.is_none()
         }));
         assert_eq!(warm.max_parallel_job_count, 0);
         for diagnostic in &warm.capsule_diagnostics {
+            let phases = diagnostic.policy_phases.unwrap();
+            assert!(
+                phases.linearization + phases.memory_spaces + phases.vector_program
+                    <= diagnostic.authentication_policy_wall_time.unwrap()
+            );
             let observed = diagnostic
                 .authentication_policy_wall_time
                 .unwrap()

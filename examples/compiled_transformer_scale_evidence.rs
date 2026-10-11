@@ -643,6 +643,10 @@ struct ScaleWarmCapsulePhaseEvidence {
     authentication_policy_wall_time_ns: u64,
     authentication_abi_wall_time_ns: u64,
     authentication_remainder_wall_time_ns: u64,
+    authentication_linearization_wall_time_ns: u64,
+    authentication_memory_spaces_wall_time_ns: u64,
+    authentication_vector_program_wall_time_ns: u64,
+    authentication_policy_remainder_wall_time_ns: u64,
 }
 
 #[derive(Serialize)]
@@ -1403,6 +1407,20 @@ fn collect_scale_warm_preparation(
                 let policy =
                     duration_nanos(required(diagnostic.authentication_policy_wall_time())?)?;
                 let abi = duration_nanos(required(diagnostic.authentication_abi_wall_time())?)?;
+                let linearization = duration_nanos(required(
+                    diagnostic.authentication_linearization_wall_time(),
+                )?)?;
+                let memory_spaces = duration_nanos(required(
+                    diagnostic.authentication_memory_spaces_wall_time(),
+                )?)?;
+                let vector_program = duration_nanos(required(
+                    diagnostic.authentication_vector_program_wall_time(),
+                )?)?;
+                let policy_remainder = linearization
+                    .checked_add(memory_spaces)
+                    .and_then(|observed| observed.checked_add(vector_program))
+                    .and_then(|observed| policy.checked_sub(observed))
+                    .ok_or_else(|| std::io::Error::other("capsule policy phases exceed total"))?;
                 let remainder = policy
                     .checked_add(abi)
                     .and_then(|observed| authentication.checked_sub(observed))
@@ -1420,6 +1438,10 @@ fn collect_scale_warm_preparation(
                     authentication_policy_wall_time_ns: policy,
                     authentication_abi_wall_time_ns: abi,
                     authentication_remainder_wall_time_ns: remainder,
+                    authentication_linearization_wall_time_ns: linearization,
+                    authentication_memory_spaces_wall_time_ns: memory_spaces,
+                    authentication_vector_program_wall_time_ns: vector_program,
+                    authentication_policy_remainder_wall_time_ns: policy_remainder,
                 })
             },
         )
@@ -2303,7 +2325,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
     let gradient_evidence = collect_scale_gradient_evidence()?;
 
     let objective = json!({
-        "schema_version": 12,
+        "schema_version": 13,
         "git_sha": &paths.git_sha,
         "workload": {
             "batch": BATCH,

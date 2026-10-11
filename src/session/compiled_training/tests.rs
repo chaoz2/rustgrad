@@ -111,6 +111,11 @@ fn native_training_program_roles_authenticate_batch_and_plan_assignment() {
         authentication_wall_time: Some(std::time::Duration::from_nanos(19)),
         authentication_policy_wall_time: Some(std::time::Duration::from_nanos(7)),
         authentication_abi_wall_time: Some(std::time::Duration::from_nanos(5)),
+        policy_phases: Some(crate::cpu_jit::RenderPolicyTimings {
+            linearization: std::time::Duration::from_nanos(1),
+            memory_spaces: std::time::Duration::from_nanos(2),
+            vector_program: std::time::Duration::from_nanos(3),
+        }),
         store_wall_time: None,
     };
     let main_evaluation = NativeCpuRenderCapsuleDiagnostic::from_ordered_native(
@@ -136,6 +141,13 @@ fn native_training_program_roles_authenticate_batch_and_plan_assignment() {
             Some(std::time::Duration::from_nanos(19))
         );
         assert_eq!(diagnostic.store_wall_time(), None);
+        for (actual, nanos) in [
+            (diagnostic.authentication_linearization_wall_time(), 1),
+            (diagnostic.authentication_memory_spaces_wall_time(), 2),
+            (diagnostic.authentication_vector_program_wall_time(), 3),
+        ] {
+            assert_eq!(actual, Some(std::time::Duration::from_nanos(nanos)));
+        }
         assert_eq!(
             diagnostic.authentication_policy_wall_time(),
             Some(std::time::Duration::from_nanos(7))

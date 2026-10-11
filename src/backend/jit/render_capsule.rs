@@ -755,13 +755,25 @@ impl CapsuleStoreGroupWitness {
 }
 
 impl OrdinaryRenderWitness {
+    #[cfg(test)]
     fn new(
         backend: &CpuJitBackend,
         logical_index: usize,
         item: &ScheduleItem,
         topology: &crate::cpu_jit::NativeRenderTopologyWitness,
     ) -> Result<Self, JitError> {
-        let authentication = topology.authentication(&item.kernel, backend.vectorized)?;
+        Self::new_observed(backend, logical_index, item, topology, None)
+    }
+
+    fn new_observed(
+        backend: &CpuJitBackend,
+        logical_index: usize,
+        item: &ScheduleItem,
+        topology: &crate::cpu_jit::NativeRenderTopologyWitness,
+        timing: Option<&mut crate::cpu_jit::RenderPolicyTimings>,
+    ) -> Result<Self, JitError> {
+        let authentication =
+            topology.authentication_observed(&item.kernel, backend.vectorized, timing)?;
         let vector = if backend.vectorized {
             authentication.vector().clone()
         } else {
@@ -822,6 +834,7 @@ fn authenticate_module(
 struct AuthenticationTimings {
     ordinary_policy: Duration,
     ordinary_abi: Duration,
+    policy_phases: crate::cpu_jit::RenderPolicyTimings,
 }
 
 fn accumulate<T>(elapsed: &mut Duration, work: impl FnOnce() -> T) -> T {
@@ -988,7 +1001,13 @@ fn authenticate_module_observed(
         } else {
             let item_witness = &recipe.item_witnesses[index];
             let expected = match accumulate(&mut timing.ordinary_policy, || {
-                OrdinaryRenderWitness::new(backend, index, item, &item_witness.render_topology)
+                OrdinaryRenderWitness::new_observed(
+                    backend,
+                    index,
+                    item,
+                    &item_witness.render_topology,
+                    Some(&mut timing.policy_phases),
+                )
             }) {
                 Ok(expected) => expected,
                 Err(_) => return false,
@@ -1108,6 +1127,7 @@ pub(super) struct CapsuleLoadTimings {
     pub(super) authentication: Option<Duration>,
     pub(super) ordinary_policy: Option<Duration>,
     pub(super) ordinary_abi: Option<Duration>,
+    pub(super) policy_phases: Option<crate::cpu_jit::RenderPolicyTimings>,
 }
 
 fn observe<T>(elapsed: &mut Option<Duration>, work: impl FnOnce() -> T) -> T {
@@ -1150,6 +1170,7 @@ pub(super) fn load_capsule_observed(
         });
         timing.ordinary_policy = Some(phases.ordinary_policy);
         timing.ordinary_abi = Some(phases.ordinary_abi);
+        timing.policy_phases = Some(phases.policy_phases);
         authenticated
             .then_some(module)
             .ok_or(CapsuleLoadStatus::AuthenticationRejected)
@@ -2158,6 +2179,10 @@ mod tests {
         ));
         assert_eq!(skipped.ordinary_policy, Duration::ZERO);
         assert_eq!(skipped.ordinary_abi, Duration::ZERO);
+        assert_eq!(
+            skipped.policy_phases,
+            crate::cpu_jit::RenderPolicyTimings::default()
+        );
 
         let order = recipe.item_witnesses[0].render_topology.order().unwrap();
         assert!(order.for_root(&schedule.items[0].kernel).is_some());

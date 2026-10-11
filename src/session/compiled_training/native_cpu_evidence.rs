@@ -753,6 +753,9 @@ pub struct NativeCpuRenderCapsuleDiagnostic {
     authentication_wall_time: Option<Duration>,
     authentication_policy_wall_time: Option<Duration>,
     authentication_abi_wall_time: Option<Duration>,
+    authentication_linearization_wall_time: Option<Duration>,
+    authentication_memory_spaces_wall_time: Option<Duration>,
+    authentication_vector_program_wall_time: Option<Duration>,
     store_wall_time: Option<Duration>,
 }
 
@@ -791,6 +794,26 @@ impl NativeCpuRenderCapsuleDiagnostic {
         self.authentication_abi_wall_time
     }
 
+    /// Linearization and vector planning nested within ordinary policy time.
+    /// Absent before authentication; zero when this phase was skipped.
+    pub const fn authentication_linearization_wall_time(&self) -> Option<Duration> {
+        self.authentication_linearization_wall_time
+    }
+
+    /// Initial memory-space planning nested within ordinary policy time.
+    /// Absent before authentication; zero when this phase was skipped.
+    pub const fn authentication_memory_spaces_wall_time(&self) -> Option<Duration> {
+        self.authentication_memory_spaces_wall_time
+    }
+
+    /// Vector-program construction and validation within ordinary policy time,
+    /// including its memory-space revalidation. Absent before authentication;
+    /// zero when this phase was skipped. These nested times are not extra work
+    /// to add to the enclosing policy or authentication totals.
+    pub const fn authentication_vector_program_wall_time(&self) -> Option<Duration> {
+        self.authentication_vector_program_wall_time
+    }
+
     /// Encoding and atomic persistence after a local render; absent on a hit.
     pub const fn store_wall_time(&self) -> Option<Duration> {
         self.store_wall_time
@@ -821,6 +844,9 @@ impl NativeCpuRenderCapsuleDiagnostic {
             authentication_wall_time: value.authentication_wall_time,
             authentication_policy_wall_time: value.authentication_policy_wall_time,
             authentication_abi_wall_time: value.authentication_abi_wall_time,
+            authentication_linearization_wall_time: value.policy_phases.map(|p| p.linearization),
+            authentication_memory_spaces_wall_time: value.policy_phases.map(|p| p.memory_spaces),
+            authentication_vector_program_wall_time: value.policy_phases.map(|p| p.vector_program),
             store_wall_time: value.store_wall_time,
             load: match value.load {
                 NativeRenderCapsuleLoadStatus::Hit => NativeCpuRenderCapsuleLoadStatus::Hit,

@@ -1,6 +1,28 @@
 use super::{JitError, RENDERER_VERSION, THREEFRY_RENDERER_VERSION, native_cache_key};
 use crate::{MatmulValue, MovementValue, Operation, UOp, VectorPlan};
 
+/// Nested, disjoint work observed only while authenticating a render capsule.
+/// These durations carry no cache or validation authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RenderPolicyTimings {
+    pub(crate) linearization: std::time::Duration,
+    pub(crate) memory_spaces: std::time::Duration,
+    pub(crate) vector_program: std::time::Duration,
+}
+
+fn observe_policy_phase<T>(
+    elapsed: Option<&mut std::time::Duration>,
+    work: impl FnOnce() -> T,
+) -> T {
+    let Some(elapsed) = elapsed else {
+        return work();
+    };
+    let started = std::time::Instant::now();
+    let result = work();
+    *elapsed = elapsed.saturating_add(started.elapsed());
+    result
+}
+
 #[cfg(test)]
 thread_local! {
     static POLICY_LINEAR_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -75,6 +97,15 @@ impl ElementwiseRenderPolicy {
         request_vector: bool,
         projected: bool,
     ) -> Result<Self, JitError> {
+        Self::from_projection_observed(root, request_vector, projected, None)
+    }
+
+    fn from_projection_observed(
+        root: &UOp,
+        request_vector: bool,
+        projected: bool,
+        mut timing: Option<&mut RenderPolicyTimings>,
+    ) -> Result<Self, JitError> {
         if !request_vector || projected {
             return Ok(Self {
                 reported_vector: VectorPlan {
@@ -97,8 +128,13 @@ impl ElementwiseRenderPolicy {
             });
         }
 
-        let (linear, vector) = elementwise_vector_plan(root)?;
-        let vector_program = vector_program(&linear)?;
+        let (linear, vector) = observe_policy_phase(
+            timing
+                .as_deref_mut()
+                .map(|timing| &mut timing.linearization),
+            || elementwise_vector_plan(root),
+        )?;
+        let vector_program = vector_program_observed(&linear, timing)?;
         let linear_key = Some((
             linear.cache_key,
             linear.program.instructions.len(),
@@ -185,8 +221,14 @@ impl NativeRenderAuthentication {
         root: &UOp,
         request_vector: bool,
         projected: bool,
+        timing: Option<&mut RenderPolicyTimings>,
     ) -> Result<Self, JitError> {
-        let policy = ElementwiseRenderPolicy::from_projection(root, request_vector, projected)?;
+        let policy = ElementwiseRenderPolicy::from_projection_observed(
+            root,
+            request_vector,
+            projected,
+            timing,
+        )?;
         Ok(Self {
             vector: policy.reported_vector().clone(),
             cache: NativeCachePolicy::Ordinary(policy.cache_discriminator()),
@@ -274,10 +316,20 @@ impl NativeRenderTopologyWitness {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn authentication(
         &self,
         root: &UOp,
         request_vector: bool,
+    ) -> Result<NativeRenderAuthentication, JitError> {
+        self.authentication_observed(root, request_vector, None)
+    }
+
+    pub(crate) fn authentication_observed(
+        &self,
+        root: &UOp,
+        request_vector: bool,
+        timing: Option<&mut RenderPolicyTimings>,
     ) -> Result<NativeRenderAuthentication, JitError> {
         if self.request_vector != request_vector || !self.root.shares_node_with(root) {
             return Err(JitError::Unsupported(
@@ -293,6 +345,7 @@ impl NativeRenderTopologyWitness {
                     root,
                     request_vector,
                     *projected,
+                    timing,
                 )
             }
             NativeRenderTopologyState::Unavailable => Err(JitError::Unsupported(
@@ -373,11 +426,26 @@ fn linear_kernel(root: &UOp) -> Result<crate::LinearKernel, JitError> {
     crate::LinearKernel::from_uop(root).map_err(|error| JitError::Unsupported(error.to_string()))
 }
 
+#[cfg(test)]
 fn vector_program(linear: &crate::LinearKernel) -> Result<crate::VectorProgram, JitError> {
-    let memory_spaces = crate::MemorySpacePlan::from_linear(linear)
-        .map_err(|error| JitError::Unsupported(error.to_string()))?;
-    crate::VectorProgram::from_linear(linear, &memory_spaces)
-        .map_err(|error| JitError::Unsupported(error.to_string()))
+    vector_program_observed(linear, None)
+}
+
+fn vector_program_observed(
+    linear: &crate::LinearKernel,
+    mut timing: Option<&mut RenderPolicyTimings>,
+) -> Result<crate::VectorProgram, JitError> {
+    let memory_spaces = observe_policy_phase(
+        timing
+            .as_deref_mut()
+            .map(|timing| &mut timing.memory_spaces),
+        || crate::MemorySpacePlan::from_linear(linear),
+    )
+    .map_err(|error| JitError::Unsupported(error.to_string()))?;
+    observe_policy_phase(timing.map(|timing| &mut timing.vector_program), || {
+        crate::VectorProgram::from_linear(linear, &memory_spaces)
+    })
+    .map_err(|error| JitError::Unsupported(error.to_string()))
 }
 
 #[cfg(test)]
@@ -426,6 +494,43 @@ fn dedicated_cache_policy(root: &UOp) -> Option<NativeCachePolicy> {
 mod tests {
     use super::*;
     use crate::{DType, Graph, Shape};
+
+    #[test]
+    fn observed_policy_preserves_results_and_skipped_phases() {
+        let mut graph = Graph::new();
+        let input = graph.input("x", Shape::from([8]));
+        let output = graph.square(input).unwrap();
+        let root = crate::lower_graph_elementwise(&graph, output).unwrap();
+        for (request_vector, projected) in [(false, false), (true, true), (true, false)] {
+            let expected =
+                ElementwiseRenderPolicy::from_projection(&root, request_vector, projected).unwrap();
+            let mut timing = RenderPolicyTimings::default();
+            let started = std::time::Instant::now();
+            let actual = ElementwiseRenderPolicy::from_projection_observed(
+                &root,
+                request_vector,
+                projected,
+                Some(&mut timing),
+            )
+            .unwrap();
+            let total = started.elapsed();
+            assert_eq!(actual.reported_vector(), expected.reported_vector());
+            assert_eq!(actual.rendered_vector(), expected.rendered_vector());
+            assert_eq!(actual.linear_key(), expected.linear_key());
+            assert_eq!(actual.cache_discriminator(), expected.cache_discriminator());
+            assert_eq!(actual.b1_program(), expected.b1_program());
+            assert!(timing.linearization + timing.memory_spaces + timing.vector_program <= total);
+            if !request_vector || projected {
+                assert_eq!(timing, RenderPolicyTimings::default());
+            }
+        }
+        let topology = NativeRenderTopologyWitness::new(&root, true);
+        let mut timing = RenderPolicyTimings::default();
+        let observed = topology.authentication_observed(&root, false, Some(&mut timing));
+        let plain = topology.authentication(&root, false);
+        assert_eq!(observed.err(), plain.err());
+        assert_eq!(timing, RenderPolicyTimings::default());
+    }
 
     fn legacy_vector_plan(root: &UOp) -> Result<VectorPlan, JitError> {
         if matches!(
