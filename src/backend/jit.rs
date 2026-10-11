@@ -438,6 +438,9 @@ struct PreparedScheduleSegmentEntry {
 pub(crate) struct PreparedScheduleSegment {
     dispatcher: Arc<JitScheduleDispatcher>,
     entries: Vec<PreparedScheduleSegmentEntry>,
+    // Keep source entry order for deterministic failures, without visiting
+    // dense-only entries on every replay. Values remain owned by `entries`.
+    packed_entries: Box<[usize]>,
     pointers: Box<[crate::cpu_jit::NativeSchedulePointerSource]>,
 }
 
@@ -1217,6 +1220,11 @@ impl PreparedScheduleDispatch {
             .collect::<Result<Vec<_>, JitBackendError>>()?;
         Ok(PreparedScheduleSegment {
             dispatcher: first.dispatcher.clone(),
+            packed_entries: entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| (!entry.quantized.is_empty()).then_some(index))
+                .collect(),
             entries,
             pointers: pointers.into_boxed_slice(),
         })
@@ -1224,6 +1232,11 @@ impl PreparedScheduleDispatch {
 }
 
 impl PreparedScheduleSegment {
+    #[cfg(test)]
+    pub(crate) fn packed_entry_count(&self) -> usize {
+        self.packed_entries.len()
+    }
+
     pub(crate) fn entry_count(&self) -> usize {
         self.entries.len()
     }
@@ -1248,7 +1261,8 @@ impl PreparedScheduleSegment {
         &self,
         quantized: &BTreeMap<u64, crate::QuantizedTensorData>,
     ) -> Result<(), PreparedScheduleDispatchFailure> {
-        for (entry, prepared) in self.entries.iter().enumerate() {
+        for &entry in &self.packed_entries {
+            let prepared = &self.entries[entry];
             for (id, expected) in prepared.quantized_ids.iter().zip(&prepared.quantized) {
                 let actual = quantized
                     .get(id)

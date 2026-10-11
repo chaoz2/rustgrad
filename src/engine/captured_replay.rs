@@ -3123,6 +3123,7 @@ mod tests {
             prepared.sealed_dense_pointer_count
         );
         assert_eq!(prepared.sealed_quantized_pointer_count, 0);
+        assert_eq!(prepared.sealed_packed_authentication_entry_count, 0);
         assert_eq!(prepared.last_borrowed_binding_count, 0);
         assert!(prepared.borrowed_binding_capacity > 0);
         assert_eq!(prepared.dispatch_scratch_capacity_growth_count, 0);
@@ -3970,6 +3971,7 @@ mod tests {
         assert_eq!(prepared.dispatch_metadata_build_count, 1);
         assert!(prepared.sealed_dense_pointer_count > 0);
         assert!(prepared.sealed_quantized_pointer_count > 0);
+        assert_eq!(prepared.sealed_packed_authentication_entry_count, 1);
         assert_eq!(
             prepared.sealed_pointer_count,
             prepared.sealed_dense_pointer_count + prepared.sealed_quantized_pointer_count
@@ -3998,6 +4000,15 @@ mod tests {
         assert_eq!(rejected.dispatch_scratch_capacity_growth_count, 0);
         assert!(rejected.dispatch_scratch_is_empty);
 
+        capture.quantized_constants.remove(&id);
+        assert!(matches!(
+            executor.execute_planned_native_items(&capture, &bindings, &mut plan),
+            Err(ReplayError::Backend(reason))
+                if reason.contains("missing packed captured buffer")
+        ));
+        assert_eq!(plan.last_module_dispatch_counts(), (0, 0));
+        assert!(plan.workspace_stats().dispatch_scratch_is_empty);
+
         capture.quantized_constants.insert(id, expected);
         executor
             .execute_planned_native_items(&capture, &bindings, &mut plan)
@@ -4010,6 +4021,78 @@ mod tests {
             0
         );
         assert!(plan.workspace_stats().dispatch_scratch_is_empty);
+    }
+
+    #[test]
+    fn native_module_packed_checks_preserve_entry_order_across_dense_entries() {
+        let mut graph = Graph::new();
+        let activation = graph.input("activation", [1, 32]);
+        let expected = crate::QuantizedTensorData::new(
+            crate::GgmlType::Q4_0,
+            Shape::from([2, 32]),
+            vec![0; 36],
+        )
+        .unwrap();
+        let mut packed = Vec::new();
+        let mut products = Vec::new();
+        for name in ["first_weight", "second_weight"] {
+            let weight = graph.input(name, [2, 32]);
+            let transposed = graph.permute(weight, [1, 0]).unwrap();
+            let output = graph.matmul(activation, transposed).unwrap();
+            packed.push(QuantizedCaptureBinding::Matmul {
+                output,
+                activation,
+                weight,
+                value: expected.clone(),
+            });
+            products.push(output);
+        }
+        let output = graph.add(products[0], products[1]).unwrap();
+        let schedule = crate::schedule(&graph, output).unwrap();
+        let mut capture = CapturedSchedule::capture_with_quantized_bindings(
+            &graph,
+            &schedule,
+            &[output],
+            &packed,
+        )
+        .unwrap();
+        let bindings = BTreeMap::from([(
+            "activation".into(),
+            TensorData::new([1, 32], vec![1.0; 32]).unwrap(),
+        )]);
+        let executor = CapturedReplayExecutor::default();
+        let mut plan = executor
+            .plan_native_items(&capture, &bindings, false)
+            .unwrap();
+        assert_eq!(
+            plan.workspace_stats()
+                .sealed_packed_authentication_entry_count,
+            2
+        );
+        let ordered_ids = capture
+            .items
+            .iter()
+            .flat_map(|item| item.ordered_quantized_inputs())
+            .map(|input| input.input_node.index() as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_ids.len(), 2);
+        capture.quantized_constants.clear();
+        for id in ordered_ids {
+            assert!(matches!(
+                executor.execute_planned_native_items(&capture, &bindings, &mut plan),
+                Err(ReplayError::Backend(reason))
+                    if reason.contains(&format!("missing packed captured buffer {id}"))
+            ));
+            assert_eq!(plan.last_module_dispatch_counts(), (0, 0));
+            capture.quantized_constants.insert(id, expected.clone());
+        }
+        let actual = executor
+            .execute_planned_native_items(&capture, &bindings, &mut plan)
+            .unwrap();
+        assert_eq!(
+            actual.requested(&capture.requested).unwrap()[0].storage(),
+            &Storage::F32(vec![0.0; 2])
+        );
     }
 
     #[test]
