@@ -1499,7 +1499,10 @@ neither validation order nor artifact, cache, checkpoint, or capture identity.
   content-addressed schedule library. Smaller suffixes retain the single
   combined compile/link command. Read-only wrapper-key and translation-unit
   evidence preparation borrow the retained rendered entries rather than cloning
-  their source, ABI, and source maps. Owned compiler-worker inputs, generated
+  their source, ABI, and source maps. Native cache keys stream the existing
+  environment prefix and source bytes into the same hash; translation-unit
+  evidence also streams its flag fields without concatenating source-sized
+  identity strings. Owned compiler-worker inputs, generated
   source bytes, build policy, and cache identities are unchanged.
 - **Rendering.** At most two private workers render attached programs in
   parallel on a capsule miss. A bounded checksummed sidecar binds the canonical

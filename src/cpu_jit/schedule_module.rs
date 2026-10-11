@@ -1,7 +1,7 @@
 use super::{
     C11_COMPILER_COMMAND, C11_COMPILER_FLAGS, C11LocalHelper, COMPILE_SEQUENCE, JitError,
     JitScheduleModuleLoad, NativeCompilerProcessKind, NativeCompilerProcessObservation, RenderedC,
-    cache_dir, native_cache_key, run_compiler,
+    cache_dir, native_cache_key, native_cache_key_parts, run_compiler,
 };
 use std::{
     borrow::Borrow,
@@ -140,14 +140,19 @@ pub(crate) fn schedule_module_translation_unit_evidence(
             let include_dispatcher = chunk.ordinal + 1 == plan.chunks.len();
             let source =
                 render_schedule_module_chunk(rendered, chunk.entries.clone(), include_dispatcher);
-            let identity_source = format!(
-                "{}\u{1f}{}\u{1f}{}",
-                C11_TRANSLATION_UNIT_FLAGS.join("\u{1e}"),
-                C11_LINK_FLAGS.join("\u{1e}"),
-                source
-            );
+            let compile_flags = C11_TRANSLATION_UNIT_FLAGS.join("\u{1e}");
+            let link_flags = C11_LINK_FLAGS.join("\u{1e}");
             let generated_source_identity = u64::from_str_radix(
-                &native_cache_key("schedule-module-translation-unit-v1", &identity_source),
+                &native_cache_key_parts(
+                    "schedule-module-translation-unit-v1",
+                    [
+                        compile_flags.as_str(),
+                        "\u{1f}",
+                        link_flags.as_str(),
+                        "\u{1f}",
+                        &source,
+                    ],
+                ),
                 16,
             )
             .map_err(|_| JitError::Io("native translation-unit identity is invalid".into()))?;
@@ -826,6 +831,33 @@ mod tests {
                 schedule_module_translation_unit_evidence(&borrowed).unwrap(),
                 schedule_module_translation_unit_evidence(&copied).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn translation_unit_evidence_preserves_legacy_identity_format() {
+        for count in [1, 512, 513] {
+            let rendered = (0..count)
+                .map(|index| rendered(2, &format!("entry-{index}")))
+                .collect::<Vec<_>>();
+            let plan = ScheduleModuleBuildPlan::new(&rendered).unwrap();
+            let evidence = schedule_module_translation_unit_evidence(&rendered).unwrap();
+            for (chunk, unit) in plan.chunks.iter().zip(&evidence) {
+                let source = render_schedule_module_chunk(
+                    &rendered,
+                    chunk.entries.clone(),
+                    chunk.ordinal + 1 == plan.chunks.len(),
+                );
+                let legacy_source = format!(
+                    "{}\u{1f}{}\u{1f}{}",
+                    C11_TRANSLATION_UNIT_FLAGS.join("\u{1e}"),
+                    C11_LINK_FLAGS.join("\u{1e}"),
+                    source,
+                );
+                let legacy =
+                    native_cache_key("schedule-module-translation-unit-v1", &legacy_source);
+                assert_eq!(format!("{:016x}", unit.generated_source_identity), legacy);
+            }
         }
     }
 
