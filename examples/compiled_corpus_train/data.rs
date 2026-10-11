@@ -1,7 +1,6 @@
 //! Deterministic byte windows and a corpus-bound resume envelope.
 
 use super::{BATCH, TARGETS, TIME, TOKENS};
-use rustgrad::nn::StateDict;
 use rustgrad::{
     CompiledAdamWResumeBundle, CompiledInputBatch, CompiledInputSpec, DType, Result, TensorData,
 };
@@ -75,7 +74,7 @@ impl Corpus {
         if bundle.as_bytes().len() > MAX_CHECKPOINT_BYTES - MAX_CORPUS_BYTES - 4096 {
             return Err("training bundle exceeds the example checkpoint budget".into());
         }
-        let state = StateDict::from(BTreeMap::from([
+        let state = BTreeMap::from([
             (
                 "corpus".into(),
                 TensorData::from_le_bytes([self.0.len()], DType::U8, &self.0)?,
@@ -84,7 +83,7 @@ impl Corpus {
                 "training".into(),
                 TensorData::from_le_bytes([bundle.as_bytes().len()], DType::U8, bundle.as_bytes())?,
             ),
-        ]));
+        ]);
         rustgrad::save_safetensors_file(path, &state, &metadata())?;
         Ok(())
     }
@@ -99,14 +98,11 @@ impl Corpus {
                 max_file_bytes: MAX_CHECKPOINT_BYTES,
             },
         )?;
-        if actual_metadata != metadata() || state.tensors().len() != 2 {
+        if actual_metadata != metadata() || state.len() != 2 {
             return Err("not a version-one corpus training checkpoint".into());
         }
         let bytes = |name: &str| -> std::result::Result<Vec<u8>, Box<dyn Error>> {
-            let value = state
-                .tensors()
-                .get(name)
-                .ok_or("missing corpus checkpoint field")?;
+            let value = state.get(name).ok_or("missing corpus checkpoint field")?;
             if value.dtype() != DType::U8 || value.shape().rank() != 1 {
                 return Err("corpus checkpoint fields must be rank-one U8".into());
             }
