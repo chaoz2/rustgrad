@@ -1245,6 +1245,15 @@ fn validate(
     validate_keys: bool,
     allow_computed_passthroughs: bool,
 ) -> Result<(), ArtifactError> {
+    validate_with_retained_keys(c, validate_keys, allow_computed_passthroughs, None)
+}
+
+fn validate_with_retained_keys(
+    c: &CapturedSchedule,
+    validate_keys: bool,
+    allow_computed_passthroughs: bool,
+    retained_keys: Option<&[u64]>,
+) -> Result<(), ArtifactError> {
     if c.items.len() > MAX_ITEMS
         || c.inputs.len() > MAX_BINDINGS
         || c.constants.len() > MAX_BINDINGS
@@ -1317,16 +1326,21 @@ fn validate(
             return Err(ArtifactError::Format("quantized kernel bindings"));
         }
         if validate_keys {
-            let expected_cache_key = if let Some(provenance) = &c.specialized_from {
+            let expected_cache_key = if let Some(keys) = retained_keys {
+                *keys
+                    .get(index)
+                    .ok_or(ArtifactError::Format("item cache identity"))?
+            } else if let Some(provenance) = &c.specialized_from {
                 super::specialized_item_cache_key(
                     item,
                     provenance.source_identity,
                     &provenance.bindings,
                 )
+                .map_err(|_| ArtifactError::Format("item cache identity"))?
             } else {
                 super::item_cache_key(item)
-            }
-            .map_err(|_| ArtifactError::Format("item cache identity"))?;
+                    .map_err(|_| ArtifactError::Format("item cache identity"))?
+            };
             if item.cache_key != expected_cache_key {
                 return Err(ArtifactError::Format("item cache identity"));
             }
@@ -1734,6 +1748,35 @@ pub(crate) fn validate_capture(c: &CapturedSchedule) -> Result<(), ArtifactError
 /// payload from changing between those two ordered stages.
 pub(crate) struct IdentifiedFreshCapture {
     capture: CapturedSchedule,
+    retained_keys: Option<Box<[u64]>>,
+}
+
+/// Owns the complete capture from key assignment through identity sealing.
+/// No mutable capture access is exposed, so retained keys cannot be paired
+/// with changed items or specialization metadata.
+pub(crate) struct RekeyedFreshCapture {
+    capture: CapturedSchedule,
+    keys: Box<[u64]>,
+}
+
+impl RekeyedFreshCapture {
+    pub(crate) fn new(mut capture: CapturedSchedule) -> Result<Self, super::ScheduleError> {
+        let specialization = capture
+            .specialized_from
+            .as_ref()
+            .map(|source| (source.source_identity, source.bindings.as_slice()));
+        super::rekey_schedule_items(&mut capture.items, &[], specialization)?;
+        let keys = capture.items.iter().map(|item| item.cache_key).collect();
+        Ok(Self { capture, keys })
+    }
+
+    pub(crate) fn identify(mut self) -> Result<IdentifiedFreshCapture, ArtifactError> {
+        self.capture.identity = identity(&self.capture)?;
+        Ok(IdentifiedFreshCapture {
+            capture: self.capture,
+            retained_keys: Some(self.keys),
+        })
+    }
 }
 
 /// One freshly assembled capture whose assigned identity and complete
@@ -1746,7 +1789,10 @@ pub(crate) fn begin_fresh_capture_seal(
     mut capture: CapturedSchedule,
 ) -> Result<IdentifiedFreshCapture, ArtifactError> {
     capture.identity = identity(&capture)?;
-    Ok(IdentifiedFreshCapture { capture })
+    Ok(IdentifiedFreshCapture {
+        capture,
+        retained_keys: None,
+    })
 }
 
 impl IdentifiedFreshCapture {
@@ -1759,7 +1805,7 @@ impl IdentifiedFreshCapture {
     }
 
     pub(crate) fn authenticate(self) -> Result<AuthenticatedFreshCapture, ArtifactError> {
-        validate(&self.capture, true, true)?;
+        validate_with_retained_keys(&self.capture, true, true, self.retained_keys.as_deref())?;
         Ok(AuthenticatedFreshCapture {
             capture: self.capture,
         })
@@ -2524,6 +2570,58 @@ mod tests {
         let legacy = legacy_fresh_capture_seal(capture).unwrap();
         assert_eq!(sealed.identity, legacy.identity);
         assert_eq!(encode(&sealed).unwrap(), encode(&legacy).unwrap());
+    }
+
+    #[test]
+    fn owned_rekeying_retains_keys_without_weakening_authentication() {
+        let original = fixture();
+        let identified = RekeyedFreshCapture::new(original.clone())
+            .unwrap()
+            .identify()
+            .unwrap();
+        assert!(identified.retained_keys.is_some());
+        let sealed = identified.authenticate().unwrap().into_inner();
+        let mut reference = original.clone();
+        super::super::rekey_schedule_items(&mut reference.items, &[], None).unwrap();
+        let reference = seal_fresh_capture(reference).unwrap();
+        assert_eq!(encode(&sealed).unwrap(), encode(&reference).unwrap());
+
+        for case in 0..3 {
+            let mut malformed = original.clone();
+            match case {
+                0 => malformed.items[0].id = 1,
+                1 => malformed.items[0].dependencies.push(u64::MAX),
+                _ => malformed.requested.push(u64::MAX),
+            }
+            let identified = RekeyedFreshCapture::new(malformed)
+                .unwrap()
+                .identify()
+                .unwrap();
+            let reference_error = validate(&identified.capture, true, true).unwrap_err();
+            assert_eq!(
+                identified.authenticate().err().unwrap(),
+                reference_error,
+                "case {case}"
+            );
+        }
+
+        // White-box corruption cannot be performed through the production API;
+        // it proves the retained value is still compared at the ordinary gate.
+        let mut identified = RekeyedFreshCapture::new(original)
+            .unwrap()
+            .identify()
+            .unwrap();
+        identified.capture.items[0].cache_key ^= 1;
+        assert_eq!(
+            identified.authenticate().err().unwrap(),
+            ArtifactError::Format("item cache identity")
+        );
+        let mut mutated = sealed;
+        mutated.items[0].cache_key ^= 1;
+        assert_eq!(
+            validate_capture(&mutated),
+            Err(ArtifactError::Format("item cache identity"))
+        );
     }
 
     #[test]
