@@ -15,6 +15,7 @@ use std::{
     fmt,
     sync::Arc,
 };
+pub(crate) use traversal::CanonicalNodeTable;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AddressSpace {
@@ -1998,11 +1999,16 @@ pub(crate) fn normalize_kernel(root: &UOp) -> Result<UOp, UOpError> {
 /// traversal for immediate resource and capability inspection. The order
 /// carries no admission proof for a later schedule or artifact validation.
 pub(crate) fn normalize_kernel_with_order(root: &UOp) -> Result<TopologicalOrder, UOpError> {
+    normalize_kernel_with_table(root).map(CanonicalNodeTable::into_order)
+}
+
+/// Schedule identity consumes canonical edges; node-only consumers drop them.
+pub(crate) fn normalize_kernel_with_table(root: &UOp) -> Result<CanonicalNodeTable, UOpError> {
     root.validate()?;
     let (root, _) = rewrite(root, &mut projected_index_rules(), Walk::BottomUp)?;
-    let order = TopologicalOrder::new(&root)?;
-    order.validate_for(&root)?;
-    let nodes = order.nodes();
+    let order = CanonicalNodeTable::new(&root)?;
+    order.order().validate_for(&root)?;
+    let nodes = order.order().nodes();
     if !matches!(root.operation(), Operation::Sink)
         || nodes.iter().any(|node| {
             matches!(
@@ -2029,8 +2035,11 @@ pub(crate) fn normalize_kernel_with_order(root: &UOp) -> Result<TopologicalOrder
         return Ok(order);
     }
     let (normalized, _) = rewrite(&root, &mut builtin_rules(), Walk::BottomUp)?;
-    let order = TopologicalOrder::new(&normalized)?;
-    order.validate_for(&normalized)?;
+    // The original root still owns its DAG; only the preliminary canonical
+    // table is released before allocating the final edge sidecar.
+    drop(order);
+    let order = CanonicalNodeTable::new(&normalized)?;
+    order.order().validate_for(&normalized)?;
     Ok(order)
 }
 

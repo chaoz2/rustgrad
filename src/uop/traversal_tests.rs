@@ -47,6 +47,80 @@ fn assert_reference_order(root: &UOp) {
 }
 
 #[test]
+fn canonical_source_table_matches_independent_structural_lookup() {
+    let ty = UType::scalar(DType::I32);
+    let first = UOp::constant(1, ty);
+    let equal = UOp::constant(1, ty);
+    let shared = UOp::binary(Binary::Add, first.clone(), equal.clone());
+    let independent = UOp::binary(Binary::Add, UOp::constant(1, ty), UOp::constant(1, ty));
+    let tagged = first.retag(Some(UOpTag::Int(9)));
+    let float = UOp::scalar_constant(
+        DType::F32,
+        (-0.0f32).to_bits() as u64,
+        UType::scalar(DType::F32),
+    );
+    for root in [
+        first,
+        UOp::sink(vec![]),
+        UOp::sink(vec![shared.clone(), independent]),
+        UOp::sink(vec![shared, equal, tagged, float]),
+    ] {
+        let expected = recursive_reference(&root).unwrap();
+        let ids = expected
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(id, node)| (node, id))
+            .collect::<BTreeMap<_, _>>();
+        let table = CanonicalNodeTable::new(&root).unwrap();
+        assert_eq!(table.order().nodes().len(), expected.len());
+        for (id, (actual, expected)) in table.order().nodes().iter().zip(&expected).enumerate() {
+            assert!(actual.shares_node_with(expected), "representative {id}");
+            let sources = expected
+                .sources()
+                .iter()
+                .map(|source| *ids.get(source).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(table.sources(id).unwrap(), sources, "edges {id}");
+        }
+        assert!(table.sources(expected.len()).is_none());
+        assert!(table.sources(usize::MAX).is_none());
+    }
+}
+
+#[test]
+fn canonical_source_table_keeps_deep_edges_flat_and_releases_owners() {
+    let ty = UType::scalar(DType::I32);
+    let leaf = UOp::constant(1, ty);
+    // Keep individual owners during teardown; this tests traversal, not the
+    // separate recursive Arc-destruction boundary.
+    let mut owners = vec![leaf.clone()];
+    for _ in 0..4096 {
+        owners.push(UOp::binary(
+            Binary::Add,
+            owners.last().unwrap().clone(),
+            leaf.clone(),
+        ));
+    }
+    let root = UOp::sink(vec![owners.last().unwrap().clone()]);
+    let weak = std::sync::Arc::downgrade(&root.0);
+    let table = CanonicalNodeTable::new(&root).unwrap();
+    assert_eq!(table.order().nodes().len(), 4098);
+    assert_eq!(table.sources(0).unwrap(), []);
+    for id in 1..=4096 {
+        assert_eq!(table.sources(id).unwrap(), [id - 1, 0]);
+    }
+    assert_eq!(table.sources(4097).unwrap(), [4096]);
+    drop(root);
+    assert!(weak.upgrade().is_some());
+    let order = table.into_order();
+    assert!(weak.upgrade().is_some());
+    drop(order);
+    assert!(weak.upgrade().is_none());
+    while owners.pop().is_some() {}
+}
+
+#[test]
 fn canonical_order_preserves_sharing_tags_types_and_operand_order() {
     let ty = UType::scalar(DType::I32);
     let first = UOp::constant(1, ty);
