@@ -3815,15 +3815,35 @@ mod tests {
                 "{name}"
             );
         }
-        for root in [
-            UOp::from_operation(Operation::Cast, Some(ty), vec![]),
-            UOp::constant(7, ty).retag(Some(UOpTag::Text("metadata".into()))),
+        for (name, root, expected) in [
+            (
+                "lane width before missing source row",
+                UOp::from_operation(
+                    Operation::Cast,
+                    Some(UType {
+                        scalar: DType::I32,
+                        lanes: 0,
+                    }),
+                    vec![],
+                ),
+                ArtifactError::Format("lane width"),
+            ),
+            (
+                "tag version before missing source row",
+                UOp::constant(7, ty).retag(Some(UOpTag::Text("metadata".into()))),
+                ArtifactError::Format("tag version"),
+            ),
         ] {
             let order = TopologicalOrder::new(&root).unwrap();
-            let expected = encode_nodes_legacy(order.nodes(), false, 21);
-            assert!(expected.is_err());
+            // Arity is an earlier semantic-admission gate; use a field error
+            // the released low-level writer itself rejects for this oracle.
+            assert_eq!(
+                encode_nodes_legacy(order.nodes(), false, 21),
+                Err(expected.clone()),
+                "{name}"
+            );
             let table = CanonicalNodeTable::from_test_parts(order, vec![], vec![]);
-            assert_eq!(encode_nodes(&table, false, 21), expected);
+            assert_eq!(encode_nodes(&table, false, 21), Err(expected), "{name}");
         }
     }
 
