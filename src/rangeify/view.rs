@@ -896,6 +896,35 @@ fn projection_for_output(
     projected_view(graph, node, output_shape, &range)
 }
 
+/// Source-only discovery from the exact projector. This is not an address or
+/// kernel-admission witness: concrete lowering still needs its own Range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectionSource {
+    Unconditional(NodeId),
+    Predicated(NodeId),
+}
+
+impl ProjectionSource {
+    pub(crate) fn source(self) -> NodeId {
+        match self {
+            Self::Unconditional(source) | Self::Predicated(source) => source,
+        }
+    }
+}
+
+pub(crate) fn projection_source(
+    graph: &Graph,
+    node: NodeId,
+    output_shape: &Shape,
+) -> Result<ProjectionSource, RangeifyError> {
+    let projection = projection_for_output(graph, node, output_shape)?;
+    Ok(if projection.predicate.is_some() {
+        ProjectionSource::Predicated(projection.source)
+    } else {
+        ProjectionSource::Unconditional(projection.source)
+    })
+}
+
 pub(crate) fn projected_source(
     graph: &Graph,
     node: NodeId,
