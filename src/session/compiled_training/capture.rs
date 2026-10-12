@@ -51,14 +51,33 @@ impl CompiledRecurrentCapture {
         })
     }
 
-    pub(super) fn from_canonical_mixed(
+    pub(super) fn from_finalized_mixed(
         graph: &Graph,
         capture: &CapturedMixedSchedule,
         public_requested: &[NodeId],
         state_links: &[InferenceStateLink],
         initial_state: BTreeMap<String, TensorData>,
+        finalized: &crate::schedule::FinalizedSchedule,
     ) -> Result<Self> {
-        let prefix = AuthenticatedRecurrentPrefix::from_mixed(capture)?;
+        Self::from_canonical_mixed_inner(
+            graph,
+            capture,
+            public_requested,
+            state_links,
+            initial_state,
+            Some(finalized.kernels()),
+        )
+    }
+
+    fn from_canonical_mixed_inner(
+        graph: &Graph,
+        capture: &CapturedMixedSchedule,
+        public_requested: &[NodeId],
+        state_links: &[InferenceStateLink],
+        initial_state: BTreeMap<String, TensorData>,
+        kernels: Option<&crate::schedule::artifact::KernelEncodings>,
+    ) -> Result<Self> {
+        let prefix = AuthenticatedRecurrentPrefix::from_mixed_with_encodings(capture, kernels)?;
         #[cfg(test)]
         let reference_initial_state = initial_state.clone();
         let stateful = CapturedStatefulInference::from_captured_graph(
@@ -207,11 +226,26 @@ struct AuthenticatedRecurrentPrefix {
 
 impl AuthenticatedRecurrentPrefix {
     fn from_mixed(capture: &CapturedMixedSchedule) -> Result<Self> {
-        let pure = Self::derive_canonical_capture(capture)?;
+        Self::from_mixed_with_encodings(capture, None)
+    }
+
+    fn from_mixed_with_encodings(
+        capture: &CapturedMixedSchedule,
+        kernels: Option<&crate::schedule::artifact::KernelEncodings>,
+    ) -> Result<Self> {
+        let pure = Self::derive_canonical_capture_with_encodings(capture, kernels)?;
         Self::authenticate_directly(pure)
     }
 
+    #[cfg(test)]
     fn derive_canonical_capture(capture: &CapturedMixedSchedule) -> Result<IdentifiedFreshCapture> {
+        Self::derive_canonical_capture_with_encodings(capture, None)
+    }
+
+    fn derive_canonical_capture_with_encodings(
+        capture: &CapturedMixedSchedule,
+        kernels: Option<&crate::schedule::artifact::KernelEncodings>,
+    ) -> Result<IdentifiedFreshCapture> {
         let split = capture
             .schedule
             .items
@@ -239,6 +273,18 @@ impl AuthenticatedRecurrentPrefix {
                 .iter()
                 .map(|binding| binding.producer_output.id),
         );
+        if let Some(kernels) = kernels {
+            return kernels
+                .identify_fresh_capture(pure)
+                .map_err(|error| match error {
+                    crate::schedule::artifact::FreshCaptureEncodingError::Rekey(error) => {
+                        schedule_error(error)
+                    }
+                    crate::schedule::artifact::FreshCaptureEncodingError::Identity(error) => {
+                        training(format!("compiled artifact capture identity: {error}"))
+                    }
+                });
+        }
         crate::schedule::artifact::RekeyedFreshCapture::new(pure)
             .map_err(schedule_error)?
             .identify()

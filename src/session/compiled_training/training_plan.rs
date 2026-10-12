@@ -823,9 +823,15 @@ impl CompiledAdamWAuxiliaryPlan {
             checked_descriptor(graph.shape(*node)?, graph.dtype(*node)?)?;
         }
         let final_schedule_started = Instant::now();
-        let pure = schedule_many(&graph, &requested).map_err(schedule_error)?;
+        let pure =
+            crate::schedule::schedule_many_finalized(&graph, &requested).map_err(schedule_error)?;
         let final_schedule_wall_time = final_schedule_started.elapsed();
-        if let Some(item) = pure.items.iter().find(|item| item.boundary.is_some()) {
+        if let Some(item) = pure
+            .schedule()
+            .items
+            .iter()
+            .find(|item| item.boundary.is_some())
+        {
             return Err(training(format!(
                 "compiled partial flush has an unsupported boundary at node {}",
                 item.node.index()
@@ -833,13 +839,13 @@ impl CompiledAdamWAuxiliaryPlan {
         }
         let pure_capture_binding_started = Instant::now();
         let mut captured =
-            CapturedSchedule::capture(&graph, &pure, &requested[..public_output_count])
+            CapturedSchedule::capture_finalized(&graph, &pure, &requested[..public_output_count])
                 .map_err(replay_error)?;
-        let state_bindings = collect_state_bindings(&pure, &state_by_input)?;
-        let pure = bind_schedule_states(pure, state_bindings).map_err(schedule_error)?;
+        let state_bindings = collect_state_bindings(pure.schedule(), &state_by_input)?;
+        let pure = pure.bind_states(state_bindings).map_err(schedule_error)?;
         let pure_capture_binding_wall_time = pure_capture_binding_started.elapsed();
         let effect_assembly_sealing_started = Instant::now();
-        let sealed = seal_recurrent_effects(
+        let sealed = seal_finalized_recurrent_effects(
             pure,
             specs
                 .iter()
@@ -848,22 +854,23 @@ impl CompiledAdamWAuxiliaryPlan {
                     destination: state_by_input[input].clone(),
                 }),
         )?;
-        let mixed = sealed.schedule;
-        captured.items = mixed.items.clone();
+        let finalized = sealed.schedule;
+        captured.items = finalized.schedule().items.clone();
         let recurrent_frontier = Arc::new(
-            AuthenticatedRecurrentFrontier::from_parts(captured, &mixed, sealed.states)
+            AuthenticatedRecurrentFrontier::from_finalized(captured, &finalized, sealed.states)
                 .map_err(replay_error)?,
         );
         let capture = recurrent_frontier.capture_arc();
         validate_external_binding_ownership(capture.as_ref(), std::iter::empty::<&String>())?;
         let effect_assembly_sealing_wall_time = effect_assembly_sealing_started.elapsed();
         let recurrent_authentication_started = Instant::now();
-        let recurrent_capture = CompiledRecurrentCapture::from_canonical_mixed(
+        let recurrent_capture = CompiledRecurrentCapture::from_finalized_mixed(
             &graph,
             capture.as_ref(),
             &public_requested,
             &state_links,
             initial_state,
+            &finalized,
         )?;
         let recurrent_authentication_wall_time = recurrent_authentication_started.elapsed();
         let cursor_projection_started = Instant::now();

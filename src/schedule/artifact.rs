@@ -925,6 +925,12 @@ pub(crate) struct KernelEncodings {
     canonical: BTreeMap<usize, KernelEncodingEntry>,
 }
 
+#[derive(Debug)]
+pub(crate) enum FreshCaptureEncodingError {
+    Rekey(super::ScheduleError),
+    Identity(ArtifactError),
+}
+
 struct KernelEncodingEntry {
     source: KernelEncodingSource,
     bytes: OnceCell<Result<Vec<u8>, ArtifactError>>,
@@ -932,10 +938,67 @@ struct KernelEncodingEntry {
 
 enum KernelEncodingSource {
     Fresh(UOp),
+    Finalized(EncodedScheduleKernel),
     Decoded(crate::uop::artifact::DecodedKernel),
 }
 
 impl KernelEncodings {
+    pub(crate) fn identify_fresh_capture(
+        &self,
+        mut capture: CapturedSchedule,
+    ) -> Result<IdentifiedFreshCapture, FreshCaptureEncodingError> {
+        // Compiled recurrent prefixes are unspecialized. Retain the ordinary
+        // constructor for any other caller rather than inventing an identity.
+        if capture.specialized_from.is_some() {
+            return RekeyedFreshCapture::new(capture)
+                .map_err(FreshCaptureEncodingError::Rekey)?
+                .identify()
+                .map_err(FreshCaptureEncodingError::Identity);
+        }
+        for item in &mut capture.items {
+            item.cache_key = self.item_key(item).map_err(|error| {
+                FreshCaptureEncodingError::Rekey(super::ScheduleError::Binding(format!(
+                    "schedule identity: {error}"
+                )))
+            })?;
+        }
+        let keys = capture.items.iter().map(|item| item.cache_key).collect();
+        capture.identity = identity_with_items(&capture, |writer, item| {
+            self.write_output_item(writer, item)
+        })
+        .map_err(FreshCaptureEncodingError::Identity)?;
+        Ok(IdentifiedFreshCapture {
+            capture,
+            retained_keys: Some(keys),
+            validated_orders: BTreeMap::new(),
+        })
+    }
+
+    // This opaque value owns the writer's exact root and bytes, not freely
+    // pairable caller-provided slices. Fresh entries are never decoded receipts.
+    pub(super) fn retain_finalized(&mut self, encoded: EncodedScheduleKernel) {
+        self.canonical.insert(
+            encoded.order().root().node_identity(),
+            KernelEncodingEntry {
+                source: KernelEncodingSource::Finalized(encoded),
+                bytes: OnceCell::new(),
+            },
+        );
+    }
+
+    // Newly added effect roots remain lazy and use the ordinary encoder at its
+    // first writer gate. Root ownership prevents pointer-address reuse.
+    pub(crate) fn retain_new_roots(&mut self, items: &[ScheduleItem]) {
+        for item in items {
+            self.canonical
+                .entry(item.kernel.node_identity())
+                .or_insert_with(|| KernelEncodingEntry {
+                    source: KernelEncodingSource::Fresh(item.kernel.clone()),
+                    bytes: OnceCell::new(),
+                });
+        }
+    }
+
     pub(crate) fn fresh(items: &[ScheduleItem]) -> Self {
         Self {
             admitted_roots: Vec::new(),
@@ -967,11 +1030,19 @@ impl KernelEncodings {
             .canonical
             .get(&root.node_identity())
             .ok_or(ArtifactError::Format("decoded kernel ownership"))?;
+        if let KernelEncodingSource::Finalized(encoded) = &entry.source {
+            if encoded.order().for_root(root).is_none() {
+                return Err(ArtifactError::Format("finalized kernel ownership"));
+            }
+            encoded.validate_actual_root(root)?;
+            return Ok(encoded.bytes());
+        }
         entry
             .bytes
             .get_or_init(|| match &entry.source {
                 KernelEncodingSource::Fresh(root) => encode_schedule_identity(root),
                 KernelEncodingSource::Decoded(admitted) => admitted.encode_schedule_identity(),
+                KernelEncodingSource::Finalized(_) => unreachable!("handled retained bytes"),
             })
             .as_deref()
             .map_err(Clone::clone)
@@ -995,6 +1066,19 @@ impl KernelEncodings {
             return write_effect_item(writer, item);
         }
         write_item_with_kernel(writer, item, true, || {
+            self.canonical_bytes(&item.kernel).map(Cow::Borrowed)
+        })
+    }
+
+    fn write_output_item(
+        &self,
+        writer: &mut Writer,
+        item: &ScheduleItem,
+    ) -> Result<(), ArtifactError> {
+        if !self.canonical.contains_key(&item.kernel.node_identity()) {
+            return write_item(writer, item, true);
+        }
+        write_output_item_with_kernel(writer, item, true, || {
             self.canonical_bytes(&item.kernel).map(Cow::Borrowed)
         })
     }
@@ -1410,6 +1494,24 @@ fn validate_with_retained_keys(
     retained_keys: Option<&[u64]>,
     validated_orders: &BTreeMap<usize, TopologicalOrder>,
 ) -> Result<(), ArtifactError> {
+    validate_with_retained_keys_and_encodings(
+        c,
+        validate_keys,
+        allow_computed_passthroughs,
+        retained_keys,
+        validated_orders,
+        None,
+    )
+}
+
+fn validate_with_retained_keys_and_encodings(
+    c: &CapturedSchedule,
+    validate_keys: bool,
+    allow_computed_passthroughs: bool,
+    retained_keys: Option<&[u64]>,
+    validated_orders: &BTreeMap<usize, TopologicalOrder>,
+    kernels: Option<&KernelEncodings>,
+) -> Result<(), ArtifactError> {
     if c.items.len() > MAX_ITEMS
         || c.inputs.len() > MAX_BINDINGS
         || c.constants.len() > MAX_BINDINGS
@@ -1521,6 +1623,10 @@ fn validate_with_retained_keys(
                     &provenance.bindings,
                 )
                 .map_err(|_| ArtifactError::Format("item cache identity"))?
+            } else if let Some(kernels) = kernels {
+                kernels
+                    .item_key(item)
+                    .map_err(|_| ArtifactError::Format("item cache identity"))?
             } else {
                 super::item_cache_key(item)
                     .map_err(|_| ArtifactError::Format("item cache identity"))?
@@ -2091,6 +2197,26 @@ pub(crate) fn seal_fresh_capture(
     Ok(begin_fresh_capture_seal(capture)?
         .authenticate()?
         .into_inner())
+}
+
+pub(crate) fn seal_fresh_capture_with_encodings(
+    mut capture: CapturedSchedule,
+    kernels: &KernelEncodings,
+) -> Result<CapturedSchedule, ArtifactError> {
+    capture.identity = identity_with_items(&capture, |writer, item| {
+        kernels.write_output_item(writer, item)
+    })?;
+    // Recompute each metadata key at the existing validation gate, not ahead
+    // of structural failures. Empty orders keep full actual-DAG admission.
+    validate_with_retained_keys_and_encodings(
+        &capture,
+        true,
+        true,
+        None,
+        &BTreeMap::new(),
+        Some(kernels),
+    )?;
+    Ok(capture)
 }
 
 fn write_symbolic_schema(w: &mut Writer, schema: &SymbolicSchema) -> Result<(), ArtifactError> {
@@ -2801,6 +2927,144 @@ mod tests {
         let y = graph.square(x).unwrap();
         let schedule = crate::schedule(&graph, y).unwrap();
         CapturedSchedule::capture(&graph, &schedule, &[y]).unwrap()
+    }
+
+    #[test]
+    fn finalized_encodings_reuse_only_exact_roots_and_keep_key_failure_order() {
+        let original = fixture();
+        let item = &original.items[0];
+        let table = crate::uop::CanonicalNodeTable::new(&item.kernel).unwrap();
+        let (key, encoded) =
+            super::super::identity::item_key_with_owned_table(item, table).unwrap();
+        assert_eq!(key, super::super::identity::item_key(item).unwrap());
+        let mut kernels = KernelEncodings::fresh(&[]);
+        kernels.retain_finalized(encoded);
+        assert_eq!(kernels.admitted_roots().count(), 0);
+        let encodings = crate::uop::artifact::schedule_kernel_encoding_count();
+        assert_eq!(kernels.item_key(item).unwrap(), key);
+        assert_eq!(
+            crate::uop::artifact::schedule_kernel_encoding_count(),
+            encodings
+        );
+        let bytes = kernels.canonical_bytes(&item.kernel).unwrap();
+        let mut changed = item.clone();
+        changed.id += 1;
+        assert_eq!(
+            kernels.item_key(&changed),
+            super::super::identity::item_key(&changed)
+        );
+        changed.kernel = decode_uop(bytes).unwrap();
+        assert!(
+            !kernels
+                .canonical
+                .contains_key(&changed.kernel.node_identity())
+        );
+        let before = crate::uop::artifact::schedule_kernel_encoding_count();
+        assert!(kernels.item_key(&changed).is_ok());
+        assert!(crate::uop::artifact::schedule_kernel_encoding_count() > before);
+        changed.kernel = UOp::from_operation(crate::Operation::Load, item.kernel.ty(), vec![]);
+        assert_eq!(
+            kernels.item_key(&changed),
+            super::super::identity::item_key(&changed)
+        );
+        let table = crate::uop::CanonicalNodeTable::new(&changed.kernel).unwrap();
+        assert_eq!(
+            super::super::identity::item_key_with_owned_table(&changed, table).err(),
+            super::super::identity::item_key(&changed).err(),
+        );
+        let ty = crate::UType::scalar(DType::I64);
+        let open_range = UOp::from_operation(
+            crate::Operation::Range(0),
+            Some(ty),
+            vec![UOp::constant(4, ty)],
+        );
+        let open_if = UOp::from_operation(
+            crate::Operation::If,
+            None,
+            vec![UOp::scalar_constant(
+                DType::Bool,
+                1,
+                crate::UType::scalar(DType::Bool),
+            )],
+        );
+        for root in [
+            item.kernel
+                .retag(Some(crate::UOpTag::Text("transient".into()))),
+            changed
+                .kernel
+                .retag(Some(crate::UOpTag::Text("invalid".into()))),
+            UOp::sink(vec![open_range]),
+            UOp::sink(vec![open_if]),
+        ] {
+            changed.kernel = root;
+            let expected = super::super::identity::item_key(&changed).err().unwrap();
+            let table = crate::uop::CanonicalNodeTable::new(&changed.kernel).unwrap();
+            assert_eq!(
+                super::super::identity::item_key_with_owned_table(&changed, table).err(),
+                Some(expected.clone())
+            );
+            assert_eq!(kernels.item_key(&changed), Err(expected));
+        }
+        changed.kernel = item
+            .kernel
+            .retag(Some(crate::UOpTag::Text("tagged".into())));
+        changed.inputs[0].view = Some(crate::AffineView {
+            source_shape: Shape::from([2]),
+            logical_shape: Shape::from([2]),
+            strides: Vec::new(),
+            offset: 0,
+        });
+        let expected = super::super::identity::item_key(&changed).err().unwrap();
+        assert_ne!(
+            expected,
+            ArtifactError::Unsupported,
+            "metadata failure must precede tag policy"
+        );
+        let before = crate::uop::artifact::schedule_kernel_encoding_count();
+        let table = crate::uop::CanonicalNodeTable::new(&changed.kernel).unwrap();
+        assert_eq!(
+            super::super::identity::item_key_with_owned_table(&changed, table).err(),
+            Some(expected)
+        );
+        assert_eq!(
+            crate::uop::artifact::schedule_kernel_encoding_count(),
+            before
+        );
+    }
+
+    #[test]
+    fn finalized_effect_roots_still_reject_non_store_after_sources() {
+        let mut effects = crate::EffectGraph::default();
+        let target = effects.insert(1, TensorData::scalar(0.0)).unwrap();
+        let source = effects.insert(2, TensorData::scalar(1.0)).unwrap();
+        effects.assign(&target, &source).unwrap();
+        let effect_schedule = crate::schedule_effects(&effects).unwrap();
+        let effect = &effect_schedule.items[0];
+        let (key, encoded) = super::super::identity::item_key_with_owned_table(
+            effect,
+            crate::uop::CanonicalNodeTable::new(&effect.kernel).unwrap(),
+        )
+        .unwrap();
+        let mut kernels = KernelEncodings::fresh(&[]);
+        kernels.retain_finalized(encoded);
+        assert_eq!(kernels.item_key(effect).unwrap(), key);
+        assert_eq!(kernels.admitted_roots().count(), 0);
+        let mut malformed = effect.clone();
+        let crate::Operation::After(payload) = effect.kernel.operation() else {
+            panic!("effect fixture must own AFTER")
+        };
+        malformed.kernel = UOp::from_operation(
+            crate::Operation::After(payload.clone()),
+            effect.kernel.ty(),
+            vec![UOp::constant(1, crate::UType::scalar(DType::I64))],
+        );
+        let expected = super::super::identity::item_key(&malformed).err().unwrap();
+        assert_eq!(kernels.item_key(&malformed), Err(expected.clone()));
+        let table = crate::uop::CanonicalNodeTable::new(&malformed.kernel).unwrap();
+        assert_eq!(
+            super::super::identity::item_key_with_owned_table(&malformed, table).err(),
+            Some(expected)
+        );
     }
 
     #[test]

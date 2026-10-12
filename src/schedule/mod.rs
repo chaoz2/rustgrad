@@ -11,7 +11,9 @@ pub mod artifact;
 mod binding_tests;
 pub(crate) mod dynamic;
 pub mod execution_summary;
+mod finalized;
 mod identity;
+pub(crate) use finalized::FinalizedSchedule;
 pub mod mixed;
 mod ownership;
 #[cfg(test)]
@@ -2891,6 +2893,31 @@ fn schedule_many_with_external(
     external: &BTreeSet<usize>,
     policy: SchedulePolicy,
 ) -> Result<Schedule, ScheduleError> {
+    schedule_many_with_retention(graph, outputs, external, policy, None)
+}
+
+pub(crate) fn schedule_many_finalized(
+    graph: &Graph,
+    outputs: &[NodeId],
+) -> Result<FinalizedSchedule, ScheduleError> {
+    let mut kernels = artifact::KernelEncodings::fresh(&[]);
+    let schedule = schedule_many_with_retention(
+        graph,
+        outputs,
+        &BTreeSet::new(),
+        SchedulePolicy::ORDINARY,
+        Some(&mut kernels),
+    )?;
+    Ok(FinalizedSchedule::new(schedule, kernels))
+}
+
+fn schedule_many_with_retention(
+    graph: &Graph,
+    outputs: &[NodeId],
+    external: &BTreeSet<usize>,
+    policy: SchedulePolicy,
+    mut retained: Option<&mut artifact::KernelEncodings>,
+) -> Result<Schedule, ScheduleError> {
     if outputs.is_empty() {
         return Ok(Schedule {
             items: vec![],
@@ -3403,9 +3430,17 @@ fn schedule_many_with_external(
             boundary,
             cache_key: 0,
         };
-        item.cache_key = identity::item_key_with_table(&item, &kernel_table)
-            .map_err(|error| ScheduleError::Binding(format!("schedule identity: {error}")))?;
-        item.validate_input_bindings_with_order(Some(kernel_order))?;
+        if let Some(kernels) = retained.as_deref_mut() {
+            let (key, encoded) = identity::item_key_with_owned_table(&item, kernel_table)
+                .map_err(|error| ScheduleError::Binding(format!("schedule identity: {error}")))?;
+            item.cache_key = key;
+            item.validate_input_bindings_with_order(Some(encoded.order()))?;
+            kernels.retain_finalized(encoded);
+        } else {
+            item.cache_key = identity::item_key_with_table(&item, &kernel_table)
+                .map_err(|error| ScheduleError::Binding(format!("schedule identity: {error}")))?;
+            item.validate_input_bindings_with_order(Some(kernel_order))?;
+        }
         items.push(item);
     }
     let positions: std::collections::BTreeMap<u64, usize> = items

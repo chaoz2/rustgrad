@@ -757,6 +757,20 @@ copying placeholder host payloads during compilation. The general
 `EffectGraph` view/index/runtime path, mixed-schedule validation, capture bytes,
 and cache identities remain unchanged.
 
+The private `schedule::finalized::FinalizedSchedule` retains the final
+schedule together with opaque exact-root kernel encodings. Final assembly
+creates each encoding at the existing metadata-before-kernel item-key gate
+and installs it only after key and ABI validation succeed. Compiled recurrent
+construction consumes this owner through pure capture, state binding, effect
+assembly, frontier sealing, and recurrent-prefix authentication. Metadata and
+keys are recomputed at their original gates; retained-byte hits revalidate the
+actual DAG and tag policy. Fresh entries never become decoded admission
+receipts. New effect or replacement roots use the ordinary lazy encoder, and
+generic normalization is not repeated. The owner drops before the compiled
+phase is published; no encoded-byte store enters runtime plans, artifacts, or
+cache-key domains. Public scheduling/capture and imported validation retain
+their independent implementations.
+
 `schedule::mixed` adds a typed,
 immutable pure-output-to-STORE binding and transactional realization: pure
 values are owned until the pool-wide effect commit. Typed

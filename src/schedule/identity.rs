@@ -31,6 +31,34 @@ pub(super) fn item_key_with_table(
     })?))
 }
 
+// Owned encoding is created lazily at the released metadata-before-kernel
+// writer gate. A failed key returns no reusable root/bytes owner.
+pub(super) fn item_key_with_owned_table(
+    item: &ScheduleItem,
+    table: crate::uop::CanonicalNodeTable,
+) -> Result<(u64, crate::uop::artifact::EncodedScheduleKernel), ArtifactError> {
+    let table = std::cell::RefCell::new(Some(table));
+    let encoded = std::cell::OnceCell::new();
+    let key = fnv1a64(&item_bytes_with_kernel(item, || {
+        encoded
+            .get_or_init(|| {
+                crate::uop::artifact::encode_schedule_kernel_with_owned_table(
+                    &item.kernel,
+                    table.borrow_mut().take().expect("one writer gate"),
+                )
+            })
+            .as_ref()
+            .map(|kernel| Cow::Borrowed(kernel.bytes()))
+            .map_err(Clone::clone)
+    })?);
+    Ok((
+        key,
+        encoded
+            .into_inner()
+            .expect("successful key invoked its writer")?,
+    ))
+}
+
 #[cfg(test)]
 pub(super) fn item_key_with_order(
     item: &ScheduleItem,

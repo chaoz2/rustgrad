@@ -146,7 +146,7 @@ pub use self::program_artifact::{
     CompiledTrainingProgramArtifact, CompiledTrainingProgramArtifactFileError,
     CompiledTrainingProgramArtifactInfo, TrainingOwnerRestoreTimings,
 };
-use self::recurrent_effect::{RecurrentEffectReplacement, seal_recurrent_effects};
+use self::recurrent_effect::{RecurrentEffectReplacement, seal_finalized_recurrent_effects};
 use self::recurrent_phase::*;
 pub use self::resume_bundle::{
     CompiledAdamWResumeBundle, CompiledAdamWResumeBundleFileError, CompiledMomentumSgdResumeBundle,
@@ -199,10 +199,10 @@ use crate::{
     BufferState, CapturedMixedSchedule, CapturedReplayExecutor, CapturedSchedule,
     CapturedStatefulInference, CompareOp, DType, EffectRuntime, Error, ExecutionPlanSummary, Graph,
     InferenceStateLink, LoadReport, MixedReplayCursor, Module, NativeMixedReplayTrace, NodeId,
-    ReplayError, Result, Scalar, Shape, TensorData, bind_schedule_states, schedule_many,
+    ReplayError, Result, Scalar, Shape, TensorData,
 };
 #[cfg(test)]
-use crate::{load_safetensors, save_safetensors};
+use crate::{bind_schedule_states, load_safetensors, save_safetensors, schedule_many};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
