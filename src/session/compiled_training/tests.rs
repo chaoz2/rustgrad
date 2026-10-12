@@ -16,6 +16,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[path = "program_artifact/produced_tests.rs"]
+mod produced_program_tests;
+
 struct TemporaryCheckpointPath {
     path: PathBuf,
 }
@@ -6951,15 +6954,25 @@ fn single_step_ignore_index_artifact_restores_for_native_evaluation() {
     assert_eq!(
         crate::engine::mixed_capture::prepared_replay_validation_counts()
             .recurrent_frontier_authentications,
-        1,
-        "a single-step artifact must authenticate its one recurrent role once"
+        0,
+        "a produced artifact retains its already authenticated recurrent owner"
     );
     assert_eq!(owner.program_artifact().unwrap(), artifact);
     assert_eq!(
         crate::engine::mixed_capture::prepared_replay_validation_counts()
             .recurrent_frontier_authentications,
-        2,
-        "an independent artifact admission must authenticate exactly one recurrent role"
+        0,
+        "producing the same artifact again must not reconstruct its recurrent owner"
+    );
+    assert_eq!(
+        CompiledAdamWProgramArtifact::from_bytes(artifact.as_bytes().to_vec()).unwrap(),
+        artifact
+    );
+    assert_eq!(
+        crate::engine::mixed_capture::prepared_replay_validation_counts()
+            .recurrent_frontier_authentications,
+        1,
+        "independent byte import must still authenticate its recurrent role"
     );
     assert_eq!(artifact.info().format_version(), 1);
     assert_eq!(

@@ -66,7 +66,7 @@ fn auxiliary_wire(plan: &CompiledAdamWAuxiliaryPlan) -> Result<PhaseWire> {
         .report_flags()
         .ok_or_else(|| training("compiled AdamW auxiliary observation schema is not canonical"))?;
     phase_wire(
-        &plan.phase().capture,
+        plan.phase().recurrent_frontier.capture(),
         &plan.phase().state_buffers,
         &plan.state_input_keys,
         plan.phase().store_groups(),
@@ -114,6 +114,42 @@ struct ProgramWireEncoder<'a, M> {
     owner: &'a CompiledModuleAdamWPlan<M>,
 }
 
+/// Only this encoder can construct the coupled envelope and admitted owners.
+/// There is no constructor accepting a freely pairable wire/capture tuple.
+struct ProducedProgram {
+    wire: ProgramWire,
+    captures: ProgramCaptures,
+    bytes: Vec<u8>,
+    identity: u64,
+}
+
+impl ProducedProgram {
+    fn admit(self) -> Result<CompiledTrainingProgramArtifact> {
+        let Self {
+            mut wire,
+            captures,
+            bytes,
+            identity,
+        } = self;
+        wire.validate_format_inventory()?;
+        let captures = captures.with_metal_wrappers()?;
+        let info = wire.validate_captures(identity, &captures)?;
+        wire.discard_capture_bytes();
+        Ok(CompiledTrainingProgramArtifact {
+            bytes,
+            info,
+            admitted: Some(Arc::new(AdmittedProgramArtifact::new(wire, captures))),
+        })
+    }
+}
+
+struct MetalProgramEncoding {
+    wire: MetalProgramWire,
+    main: PortableCapturedInferenceRecipe,
+    partial_flush: Option<PortableCapturedInferenceRecipe>,
+    evaluation: Option<PortableCapturedInferenceRecipe>,
+}
+
 impl<'a, M> ProgramWireEncoder<'a, M> {
     fn new(owner: &'a CompiledModuleAdamWPlan<M>) -> Self {
         Self { owner }
@@ -158,7 +194,7 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
         let main = self.main();
         Ok(MainWire {
             phase: phase_wire(
-                &main.capture,
+                main.recurrent_frontier.capture(),
                 state_buffers,
                 &main.state_input_keys,
                 &main.recurrent_store_groups,
@@ -181,7 +217,7 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
             .as_ref()
             .map(|phase| {
                 phase_wire(
-                    &phase.phase().capture,
+                    phase.phase().recurrent_frontier.capture(),
                     &phase.phase().state_buffers,
                     &main.state_input_keys,
                     &[],
@@ -215,20 +251,17 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
             .transpose()
     }
 
-    fn metal_wire(&self) -> Result<Option<MetalProgramWire>> {
+    fn metal_encoding(&self) -> Result<Option<MetalProgramEncoding>> {
         let plan = self.plan();
         if plan.contract.metal().is_err() {
             return Ok(None);
         }
         let main = self.main();
-        let main = main
-            .recurrent_capture
-            .portable_training_recipe(
-                &plan.contract.host_token_inputs,
-                &main.frozen_parameter_nodes,
-            )?
-            .to_bytes()
-            .map_err(captured_inference_error)?;
+        let main = main.recurrent_capture.portable_training_recipe(
+            &plan.contract.host_token_inputs,
+            &main.frozen_parameter_nodes,
+        )?;
+        let main_bytes = main.to_bytes().map_err(captured_inference_error)?;
         let partial_flush = plan
             .partial_flush
             .as_ref()
@@ -236,23 +269,31 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
                 transition
                     .phase()
                     .recurrent_capture
-                    .portable_recipe(PortableInferenceHostPolicy::None)?
-                    .to_bytes()
-                    .map_err(captured_inference_error)
+                    .portable_recipe(PortableInferenceHostPolicy::None)
+                    .and_then(|recipe| {
+                        let bytes = recipe.to_bytes().map_err(captured_inference_error)?;
+                        Ok((recipe, bytes))
+                    })
             })
             .transpose()?;
         let evaluation = plan
             .evaluation
             .as_ref()
             .map(|evaluation| {
-                evaluation
-                    .inference
-                    .portable_recipe()?
-                    .to_bytes()
-                    .map_err(captured_inference_error)
+                evaluation.inference.portable_recipe().and_then(|recipe| {
+                    let bytes = recipe.to_bytes().map_err(captured_inference_error)?;
+                    Ok((recipe, bytes))
+                })
             })
             .transpose()?;
-        Ok(Some(MetalProgramWire {
+        let (partial_flush, partial_flush_bytes) = partial_flush.unzip();
+        let (evaluation, evaluation_bytes) = evaluation.unzip();
+        Ok(Some(MetalProgramEncoding {
+            wire: MetalProgramWire {
+                main: main_bytes,
+                partial_flush: partial_flush_bytes,
+                evaluation: evaluation_bytes,
+            },
             main,
             partial_flush,
             evaluation,
@@ -281,12 +322,48 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
         }
     }
 
-    fn encode(self) -> Result<ProgramWire> {
+    fn capture_owners(&self) -> ProgramCaptures {
+        let plan = self.plan();
+        ProgramCaptures {
+            main: self.main().recurrent_frontier.clone(),
+            accumulation: self
+                .main()
+                .accumulation
+                .as_ref()
+                .map(|phase| phase.phase().recurrent_frontier.clone()),
+            partial_flush: plan
+                .partial_flush
+                .as_ref()
+                .map(|phase| phase.phase().recurrent_frontier.clone()),
+            zero_grad: plan
+                .zero_grad
+                .as_ref()
+                .map(|phase| phase.phase().recurrent_frontier.clone()),
+            evaluation: plan
+                .evaluation
+                .as_ref()
+                .map(|evaluation| evaluation.inference.capture_arc()),
+            metal_main: None,
+            metal_partial_flush: None,
+            metal_evaluation: None,
+            metal_main_recurrent: None,
+            metal_partial_flush_recurrent: None,
+            metal_evaluation_capture: None,
+        }
+    }
+
+    fn encode(self) -> Result<ProducedProgram> {
         self.validate_observations()?;
         let main_state_buffers = self.main_state_buffers();
         let accumulation = self.accumulation_wire()?;
         let evaluation = self.evaluation_wire()?;
-        let metal = self.metal_wire()?;
+        let mut captures = self.capture_owners();
+        let metal = self.metal_encoding()?.map(|encoding| {
+            captures.metal_main = Some(encoding.main);
+            captures.metal_partial_flush = encoding.partial_flush;
+            captures.metal_evaluation = encoding.evaluation;
+            encoding.wire
+        });
         let module = module_wire(&self.owner.seal);
         let main = self.main_wire(&main_state_buffers)?;
         let partial_flush = self
@@ -302,7 +379,7 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
             .map(auxiliary_wire)
             .transpose()?;
         let plan = self.plan();
-        Ok(ProgramWire {
+        let wire = ProgramWire {
             format_version: if metal.is_some() {
                 METAL_FORMAT_VERSION
             } else {
@@ -332,12 +409,21 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
                 adamw: self.adamw_wire(),
             },
             metal,
+        };
+        let (bytes, identity) = encode_with_identity(&wire)?;
+        Ok(ProducedProgram {
+            wire,
+            captures,
+            bytes,
+            identity,
         })
     }
 }
 
-pub(super) fn program_wire<M>(owner: &CompiledModuleAdamWPlan<M>) -> Result<ProgramWire> {
-    ProgramWireEncoder::new(owner).encode()
+pub(super) fn produced_program_artifact<M>(
+    owner: &CompiledModuleAdamWPlan<M>,
+) -> Result<CompiledTrainingProgramArtifact> {
+    ProgramWireEncoder::new(owner).encode()?.admit()
 }
 
 pub(super) fn momentum_program_wire<M>(

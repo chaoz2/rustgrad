@@ -1922,6 +1922,16 @@ for momentum-SGD.
 - **Save.** An owned AdamW or momentum-SGD module plan emits deterministic
   artifact bytes. Existing RGAP v1/v2 AdamW and complete-module checkpoint
   bytes remain unchanged.
+- **Produced AdamW ownership.** The private encoder couples those exact bytes,
+  their canonical payload identity, and the immutable recurrent/evaluation
+  captures from one plan. Artifact construction retains those authenticated
+  allocations rather than importing its own envelope. Metal recipes come from
+  the same encoding pass; recipe/capture agreement and the common cross-wire
+  schema/policy checks still run. No module, mutable parameter frontier, or
+  source stateful wrapper is retained. Raw embedded capture/recipe buffers are
+  released after admission. Independent byte/file import, historical migration,
+  durable-save revalidation, and lazy topology sealing remain unchanged;
+  momentum-SGD retains its independent import path.
 - **Restore.** `restore_from_program_artifact` consumes a differently
   initialized compatible module and its complete-module checkpoint. It rebuilds
   the resource-free plan without invoking the workload builder, autograd,

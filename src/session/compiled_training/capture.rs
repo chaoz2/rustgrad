@@ -494,6 +494,10 @@ impl CompiledEvaluationCapture {
         self.capture.as_ref()
     }
 
+    pub(super) fn capture_arc(&self) -> Arc<CapturedSchedule> {
+        self.capture.clone()
+    }
+
     pub(super) fn execution_plan(&self) -> &ExecutionPlanSummary {
         self.execution_plan.as_ref()
     }
