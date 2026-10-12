@@ -1,3 +1,4 @@
+use super::ordering_tests::ReferenceKey;
 use super::*;
 use std::cell::Cell;
 
@@ -20,8 +21,8 @@ fn with_legacy<T>(legacy: bool, run: impl FnOnce() -> T) -> T {
     run()
 }
 
-// Independent released bookkeeping driver: keep recursive UOp keys and
-// comparisons rather than share the new ID owner or its equality operations.
+// Independent released driver: ReferenceKey recursively compares every node
+// field and never uses the production shared-allocation ordering shortcut.
 pub(super) fn recursive_driver<C, R: RewriteRuleSpec<C>>(
     root: &UOp,
     rules: &mut [R],
@@ -45,23 +46,24 @@ pub(super) fn recursive_driver<C, R: RewriteRuleSpec<C>>(
         n: &UOp,
         r: &[PreparedRewriteRule<'_, R>],
         w: Walk,
-        m: &mut BTreeMap<UOp, UOp>,
-        active: &mut BTreeSet<UOp>,
+        m: &mut BTreeMap<ReferenceKey, UOp>,
+        active: &mut BTreeSet<ReferenceKey>,
         t: &mut RewriteTrace,
         context: &mut C,
     ) -> Result<UOp, UOpError> {
-        if let Some(x) = m.get(n) {
+        let key = ReferenceKey(n.clone());
+        if let Some(x) = m.get(&key) {
             return Ok(x.clone());
         }
-        if !active.insert(n.clone()) {
+        if !active.insert(key.clone()) {
             return Err(UOpError::RewriteCycle);
         }
 
         let mut x = n.clone();
         let mut seen = BTreeSet::new();
         for _ in 0..STEP_LIMIT {
-            if !seen.insert(x.clone()) {
-                active.remove(n);
+            if !seen.insert(ReferenceKey(x.clone())) {
+                active.remove(&key);
                 return Err(UOpError::RewriteCycle);
             }
             let before = x.clone();
@@ -97,7 +99,7 @@ pub(super) fn recursive_driver<C, R: RewriteRuleSpec<C>>(
                     });
                 if let Some(next) = next {
                     if !x.is_pure() || !next.is_pure() {
-                        active.remove(n);
+                        active.remove(&key);
                         return Err(UOpError::EffectRewrite);
                     }
                     t.rules.push(rule.rule.name());
@@ -118,12 +120,12 @@ pub(super) fn recursive_driver<C, R: RewriteRuleSpec<C>>(
             }
 
             if x == before {
-                active.remove(n);
-                m.insert(n.clone(), x.clone());
+                active.remove(&key);
+                m.insert(key, x.clone());
                 return Ok(x);
             }
         }
-        active.remove(n);
+        active.remove(&key);
         Err(UOpError::RewriteStepLimit)
     }
     let x = go(
@@ -239,7 +241,7 @@ fn bind_or_equal(context: &mut Context, _: &Captures, node: &UOp) -> Option<UOp>
 }
 
 #[test]
-fn rewrite_ids_preserve_structural_memo_and_actual_source_allocations() {
+fn rewrite_preserves_structural_memo_and_actual_source_allocations() {
     let rules = [rule(
         "bind",
         0,
@@ -305,7 +307,7 @@ fn select_rhs(context: &mut Context, _: &Captures, node: &UOp) -> Option<UOp> {
 }
 
 #[test]
-fn rewrite_ids_preserve_alternatives_permutations_and_equal_acceptance() {
+fn rewrite_preserves_alternatives_permutations_and_equal_acceptance() {
     let root = UOp::binary(Binary::Add, literal(1), literal(2));
     let pattern = UPat::any_of([
         UPat::op(Operation::Binary(Binary::Add)).sources(vec![
@@ -389,7 +391,7 @@ fn ancestor(context: &mut Context, _: &Captures, node: &UOp) -> Option<UOp> {
 }
 
 #[test]
-fn rewrite_ids_preserve_error_contracts_and_callback_counts() {
+fn rewrite_preserves_error_contracts_and_callback_counts() {
     for walk in [Walk::BottomUp, Walk::TopDown] {
         for (name, callback, error, count) in [
             (
@@ -443,7 +445,7 @@ fn collapse(context: &mut Context, _: &Captures, _: &UOp) -> Option<UOp> {
 }
 
 #[test]
-fn rewrite_ids_preserve_walk_error_precedence() {
+fn rewrite_preserves_walk_error_precedence() {
     let root = UOp::binary(Binary::Add, literal(0), literal(1));
     let rules = [
         rule(
@@ -473,7 +475,7 @@ fn rewrite_ids_preserve_walk_error_precedence() {
 }
 
 #[test]
-fn rewrite_ids_do_not_canonicalize_independent_reduction_allocations() {
+fn rewrite_keeps_reduction_ownership_and_rebuild_behavior() {
     let reduction = || {
         let ty = UType::scalar(crate::DType::F32);
         let init = UOp::from_operation(
@@ -500,11 +502,39 @@ fn rewrite_ids_do_not_canonicalize_independent_reduction_allocations() {
         assert!(!output.sources()[0].shares_node_with(&output.sources()[1]));
         assert_eq!(output.validate(), Err(UOpError::InvalidArgument));
         assert!(trace.is_empty());
+        let valid = UOp::sink(vec![reduction()]);
+        let (result, _, _) = compare_drivers(&valid, &[], walk, Context::default());
+        assert_eq!(result.unwrap().validate(), Ok(()));
+        let shared = reduction();
+        let duplicate_use = UOp::sink(vec![shared.clone(), shared]);
+        assert_eq!(duplicate_use.validate(), Err(UOpError::InvalidArgument));
+        let (result, _, _) = compare_drivers(&duplicate_use, &[], walk, Context::default());
+        assert_eq!(result.unwrap().validate(), Err(UOpError::InvalidArgument));
+
+        // A genuine sibling change rebuilds the parent. Preserve the released
+        // driver's actual memo-result sharing, not an invented identity rule.
+        let rebuilt = UOp::sink(vec![reduction(), reduction(), literal(0)]);
+        let rules = [rule(
+            "advance-zero",
+            0,
+            UPat::op(Operation::Const(LiteralValue::Int(0))),
+            |context, _, _| {
+                context.calls.push("zero".into());
+                Some(literal(1))
+            },
+        )];
+        let (result, trace, context) = compare_drivers(&rebuilt, &rules, walk, Context::default());
+        let result = result.unwrap();
+        assert!(!result.shares_node_with(&rebuilt));
+        assert!(result.sources()[0].shares_node_with(&result.sources()[1]));
+        assert_eq!(result.validate(), Err(UOpError::InvalidArgument));
+        assert_eq!(trace, ["advance-zero"]);
+        assert_eq!(context.calls, ["zero"]);
     }
 }
 
 #[test]
-fn rewrite_ids_preserve_builtin_tag_and_raw_literal_behavior() {
+fn rewrite_preserves_builtin_tag_and_raw_literal_behavior() {
     let ty = UType::scalar(crate::DType::F32);
     for bits in [0, 0x8000_0000, 0x7fc0_1234, 0x7fc0_5678, 0x7f80_0000] {
         let value = UOp::scalar_constant(crate::DType::F32, bits, ty);
@@ -523,7 +553,7 @@ fn rewrite_ids_preserve_builtin_tag_and_raw_literal_behavior() {
 }
 
 #[test]
-fn rewrite_ids_preserve_schedule_capture_and_cpu_results() {
+fn rewrite_preserves_schedule_capture_and_cpu_results() {
     use crate::{Backend, CapturedSchedule, CpuBackend, Graph, Scalar, Shape, TensorData};
     for shape in [[2, 3], [0, 3]] {
         let mut graph = Graph::new();
@@ -570,6 +600,66 @@ fn rewrite_ids_preserve_schedule_capture_and_cpu_results() {
             let replay = capture.replay(&bindings).unwrap();
             assert_eq!(replay[0].shape(), oracle.shape());
             assert_eq!(replay[0].storage(), oracle.storage());
+        }
+    }
+}
+
+#[derive(Default)]
+struct TransientContext {
+    intermediate: Option<std::sync::Weak<UOpNode>>,
+    observed_release: bool,
+}
+
+fn transient(context: &mut TransientContext, _: &Captures, node: &UOp) -> Option<UOp> {
+    match integer_value(node) {
+        0 => {
+            let next = literal(1);
+            context.intermediate = Some(Arc::downgrade(&next.0));
+            Some(next)
+        }
+        1 => Some(literal(2)),
+        _ => None,
+    }
+}
+
+fn observe_release(context: &mut TransientContext, _: &Captures, _: &UOp) -> Option<UOp> {
+    let intermediate = context.intermediate.as_ref()?;
+    assert!(
+        intermediate.upgrade().is_none(),
+        "completed child rewrite retained its intermediate"
+    );
+    context.observed_release = true;
+    Some(literal(99))
+}
+
+#[test]
+fn rewrite_releases_child_intermediates_before_parent_callback() {
+    for walk in [Walk::BottomUp, Walk::TopDown] {
+        for legacy in [false, true] {
+            let root = UOp::binary(Binary::Add, literal(0), literal(5));
+            let mut context = TransientContext::default();
+            let mut rules = [
+                ContextRewriteRule {
+                    name: "advance",
+                    priority: 0,
+                    pattern: UPat::operation_predicate(integer),
+                    apply: transient,
+                },
+                ContextRewriteRule {
+                    name: "finish",
+                    priority: 1,
+                    pattern: UPat::op(Operation::Binary(Binary::Add)),
+                    apply: observe_release,
+                },
+            ];
+            let (output, trace) = with_legacy(legacy, || {
+                rewrite_with_context(&root, &mut rules, walk, &mut context)
+            })
+            .unwrap();
+            assert_eq!(output, literal(99));
+            assert_eq!(trace.rules, ["advance", "advance", "finish"]);
+            assert!(context.observed_release);
+            assert!(context.intermediate.unwrap().upgrade().is_none());
         }
     }
 }

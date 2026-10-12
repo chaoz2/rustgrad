@@ -11,12 +11,12 @@ pub use operation::{
     PrefixScanValue, ReductionValue, SortValue, TensorGuardValue, ThreefryValue, VariableValue,
 };
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     sync::Arc,
 };
 pub(crate) use traversal::CanonicalNodeTable;
-use traversal::{RewriteNodeId, RewriteNodeIds};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AddressSpace {
@@ -662,8 +662,33 @@ struct UOpNode {
     tag: Option<UOpTag>,
 }
 /// Immutable and structurally hashable. Cloning preserves DAG sharing.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct UOp(Arc<UOpNode>);
+
+impl Ord for UOp {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        // The pointee is immutable, so shared ownership already proves the
+        // structural result. Addresses never order independent allocations.
+        if Arc::ptr_eq(&self.0, &other.0) {
+            Ordering::Equal
+        } else {
+            #[cfg(test)]
+            ordering_tests::record_fallback();
+            self.0.cmp(&other.0)
+        }
+    }
+}
+
+impl PartialOrd for UOp {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests;
 
 /// A retained canonical traversal, not a semantic validation proof.
 /// Holding the root prevents identity reuse while consumers borrow the order.
@@ -1893,51 +1918,41 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
             rule,
         })
         .collect::<Vec<_>>();
-    struct RewriteState {
-        memo: BTreeMap<RewriteNodeId, UOp>,
-        active: BTreeSet<RewriteNodeId>,
-        ids: RewriteNodeIds,
-        trace: RewriteTrace,
-    }
-    let mut state = RewriteState {
-        memo: BTreeMap::new(),
-        active: BTreeSet::new(),
-        ids: RewriteNodeIds::default(),
-        trace: RewriteTrace { rules: vec![] },
-    };
+    let mut trace = RewriteTrace { rules: vec![] };
+    let mut memo = BTreeMap::new();
+    let mut active = BTreeSet::new();
     fn go<C, R: RewriteRuleSpec<C>>(
         n: &UOp,
         r: &[PreparedRewriteRule<'_, R>],
         w: Walk,
-        state: &mut RewriteState,
+        m: &mut BTreeMap<UOp, UOp>,
+        active: &mut BTreeSet<UOp>,
+        t: &mut RewriteTrace,
         context: &mut C,
     ) -> Result<UOp, UOpError> {
-        let original = state.ids.id(n)?;
-        if let Some(x) = state.memo.get(&original) {
+        if let Some(x) = m.get(n) {
             return Ok(x.clone());
         }
-        if !state.active.insert(original) {
+        if !active.insert(n.clone()) {
             return Err(UOpError::RewriteCycle);
         }
 
         let mut x = n.clone();
-        let mut current = original;
         let mut seen = BTreeSet::new();
         for _ in 0..STEP_LIMIT {
-            if !seen.insert(current) {
-                state.active.remove(&original);
+            if !seen.insert(x.clone()) {
+                active.remove(n);
                 return Err(UOpError::RewriteCycle);
             }
-            let before = current;
+            let before = x.clone();
             if w == Walk::BottomUp {
                 let sources = x
                     .sources()
                     .iter()
-                    .map(|source| go(source, r, w, state, context))
+                    .map(|source| go(source, r, w, m, active, t, context))
                     .collect::<Result<Vec<_>, _>>()?;
-                if !state.ids.same_sources(&sources, x.sources())? {
+                if sources.as_slice() != x.sources() {
                     x = x.replace_sources(sources);
-                    current = state.ids.id(&x)?;
                 }
             }
 
@@ -1946,7 +1961,6 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
                     continue;
                 }
                 let mut next = None;
-                let mut key_error = None;
                 rule.rule
                     .pattern()
                     .visit_matches(&x, &Captures::default(), &mut |captures| match rule
@@ -1954,26 +1968,20 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
                         .apply(context, &captures, &x)
                     {
                         Some(candidate) => {
-                            match state.ids.id(&candidate) {
-                                Ok(id) if id != current => next = Some((candidate, id)),
-                                Ok(_) => {}
-                                Err(error) => key_error = Some(error),
+                            if candidate != x {
+                                next = Some(candidate);
                             }
                             true
                         }
                         None => false,
                     });
-                if let Some(error) = key_error {
-                    return Err(error);
-                }
-                if let Some((next, id)) = next {
+                if let Some(next) = next {
                     if !x.is_pure() || !next.is_pure() {
-                        state.active.remove(&original);
+                        active.remove(n);
                         return Err(UOpError::EffectRewrite);
                     }
-                    state.trace.rules.push(rule.rule.name());
+                    t.rules.push(rule.rule.name());
                     x = next;
-                    current = id;
                     break;
                 }
             }
@@ -1982,25 +1990,32 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
                 let sources = x
                     .sources()
                     .iter()
-                    .map(|source| go(source, r, w, state, context))
+                    .map(|source| go(source, r, w, m, active, t, context))
                     .collect::<Result<Vec<_>, _>>()?;
-                if !state.ids.same_sources(&sources, x.sources())? {
+                if sources.as_slice() != x.sources() {
                     x = x.replace_sources(sources);
-                    current = state.ids.id(&x)?;
                 }
             }
 
-            if current == before {
-                state.active.remove(&original);
-                state.memo.insert(original, x.clone());
+            if x == before {
+                active.remove(n);
+                m.insert(n.clone(), x.clone());
                 return Ok(x);
             }
         }
-        state.active.remove(&original);
+        active.remove(n);
         Err(UOpError::RewriteStepLimit)
     }
-    let x = go(root, &rules, walk, &mut state, context)?;
-    Ok((x, state.trace))
+    let x = go(
+        root,
+        &rules,
+        walk,
+        &mut memo,
+        &mut active,
+        &mut trace,
+        context,
+    )?;
+    Ok((x, trace))
 }
 
 #[cfg(test)]
