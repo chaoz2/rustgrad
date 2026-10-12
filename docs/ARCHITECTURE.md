@@ -2993,6 +2993,18 @@ ownership, before tag rejection and wire emission; a foreign root uses the
 independent traversal path. This shares ordering only, not admission, and leaves
 canonical kernel bytes, item cache keys, and historical wire versions unchanged.
 
+Fresh recurrent-prefix sealing retains each successful kernel encoder's
+root-bound order alongside its canonical bytes through key and identity
+assignment. Structural authentication then borrows that same order for dense
+input and output binding checks, preserving the existing exact-allocation codec
+admission instead of traversing an already encoded kernel again. Item metadata,
+descriptors, dependencies, resources, and keys remain independently checked.
+Encoding stays lazy at the existing writer gate, so earlier metadata errors
+still win. Equal independent or foreign roots and identity-only sealing use
+the ordinary traversal and semantic-validation path. The owned seal releases
+these orders after authentication; neither public captures nor artifact bytes
+retain them.
+
 UPat matching keeps alternatives and exact/prefix/repeated/permuted source
 constraints inside the matcher rather than adding another operation taxonomy.
 Alternatives are tried in declaration order, and an apply callback that declines

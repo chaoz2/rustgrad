@@ -10,10 +10,11 @@ use crate::engine::symbolic_projected::SymbolicProjectedIndexMap;
 use crate::engine::symbolic_view::SymbolicViewMap;
 use crate::projected_index::ProjectedExpr;
 use crate::tensor::artifact as tensor_artifact;
+use crate::uop::TopologicalOrder;
 use crate::uop::artifact::{
-    ArtifactError, Reader, Writer, checksum, decode as decode_uop, dtype, dtype_tag,
-    encode_schedule_identity, read_affine_view, read_shape, read_symbolic, read_view,
-    write_affine_view, write_shape, write_symbolic, write_view,
+    ArtifactError, EncodedScheduleKernel, Reader, Writer, checksum, decode as decode_uop, dtype,
+    dtype_tag, encode_schedule_identity, encode_schedule_kernel, read_affine_view, read_shape,
+    read_symbolic, read_view, write_affine_view, write_shape, write_symbolic, write_view,
 };
 use crate::{
     CapturedSchedule, GgmlType, NodeId, QuantizedTensorData, ReplayInput, SymbolicDim,
@@ -55,6 +56,7 @@ const MAX_BINDINGS: usize = 1 << 16;
 std::thread_local! {
     static IDENTITY_CALL_COUNT: Cell<usize> = const { Cell::new(0) };
     static STRUCTURAL_KERNEL_VALIDATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    static AUTHENTICATION_ORDER_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
 pub fn encode(capture: &CapturedSchedule) -> Result<Vec<u8>, ArtifactError> {
@@ -1392,7 +1394,13 @@ fn validate(
     validate_keys: bool,
     allow_computed_passthroughs: bool,
 ) -> Result<(), ArtifactError> {
-    validate_with_retained_keys(c, validate_keys, allow_computed_passthroughs, None, &[])
+    validate_with_retained_keys(
+        c,
+        validate_keys,
+        allow_computed_passthroughs,
+        None,
+        &BTreeMap::new(),
+    )
 }
 
 fn validate_with_retained_keys(
@@ -1400,14 +1408,8 @@ fn validate_with_retained_keys(
     validate_keys: bool,
     allow_computed_passthroughs: bool,
     retained_keys: Option<&[u64]>,
-    validated_kernels: &[UOp],
+    validated_orders: &BTreeMap<usize, TopologicalOrder>,
 ) -> Result<(), ArtifactError> {
-    // Proof roots stay alive for this call. Only the exact immutable allocation
-    // inherits codec admission; caller-owned replacements validate normally.
-    let validated_roots = validated_kernels
-        .iter()
-        .map(UOp::node_identity)
-        .collect::<BTreeSet<_>>();
     if c.items.len() > MAX_ITEMS
         || c.inputs.len() > MAX_BINDINGS
         || c.constants.len() > MAX_BINDINGS
@@ -1456,31 +1458,40 @@ fn validate_with_retained_keys(
         {
             return Err(ArtifactError::Format("external materialization"));
         }
-        // Ordinary Sink bindings already traverse the DAG here. Keep that
-        // order for semantic and Store checks, without granting admission or
-        // retaining caller-mutable item metadata beyond this validation.
-        let order = if item.boundary.is_none()
-            && matches!(item.kernel.operation(), crate::Operation::Sink)
-        {
+        // Only the exact immutable allocation inherits codec admission and its
+        // order. Item metadata and bindings still pass their independent gates.
+        let admitted_order = validated_orders
+            .get(&item.kernel.node_identity())
+            .filter(|order| order.for_root(&item.kernel).is_some());
+        let ordinary_sink =
+            item.boundary.is_none() && matches!(item.kernel.operation(), crate::Operation::Sink);
+        let fallback_order = if ordinary_sink && admitted_order.is_none() {
+            #[cfg(test)]
+            AUTHENTICATION_ORDER_BUILDS.with(|count| count.set(count.get() + 1));
             Some(
-                crate::uop::TopologicalOrder::new(&item.kernel)
+                TopologicalOrder::new(&item.kernel)
                     .map_err(|_| ArtifactError::Format("input bindings"))?,
             )
         } else {
             None
         };
-        item.validate_input_bindings_with_order(order.as_ref())
+        let order = if ordinary_sink {
+            admitted_order.or(fallback_order.as_ref())
+        } else {
+            None
+        };
+        item.validate_input_bindings_with_order(order)
             .map_err(|_| ArtifactError::Format("input bindings"))?;
-        if !validated_roots.contains(&item.kernel.node_identity()) {
+        if admitted_order.is_none() {
             #[cfg(test)]
             STRUCTURAL_KERNEL_VALIDATION_COUNT.with(|count| count.set(count.get() + 1));
-            match &order {
+            match order {
                 Some(order) => order.validate_for(&item.kernel),
                 None => item.kernel.validate(),
             }
             .map_err(|_| ArtifactError::Format("kernel"))?;
         }
-        super::validate_item_output_bindings_with_order(item, order.as_ref())
+        super::validate_item_output_bindings_with_order(item, order)
             .map_err(|_| ArtifactError::Format("kernel outputs"))?;
         let mut inventory = BTreeSet::new();
         for desc in &item.inputs {
@@ -1923,8 +1934,8 @@ pub(crate) struct IdentifiedFreshCapture {
     capture: CapturedSchedule,
     retained_keys: Option<Box<[u64]>>,
     // Successful canonical encoding validates each complete immutable DAG.
-    // Retain the roots, not just addresses, until structural admission finishes.
-    validated_kernels: Vec<UOp>,
+    // Retain each encoder's root-bound order until structural admission finishes.
+    validated_orders: BTreeMap<usize, TopologicalOrder>,
 }
 
 /// Owns the complete capture from key assignment through identity sealing.
@@ -1934,8 +1945,8 @@ pub(crate) struct RekeyedFreshCapture {
     capture: CapturedSchedule,
     keys: Box<[u64]>,
     // The owned capture keeps every allocation alive and exposes no mutation.
-    // Only canonical kernel bytes are retained; item metadata stays uncached.
-    kernels: BTreeMap<usize, OnceCell<Result<Vec<u8>, ArtifactError>>>,
+    // Canonical bytes and their writer's order are retained; metadata is uncached.
+    kernels: BTreeMap<usize, OnceCell<Result<EncodedScheduleKernel, ArtifactError>>>,
 }
 
 impl RekeyedFreshCapture {
@@ -1944,14 +1955,15 @@ impl RekeyedFreshCapture {
             .specialized_from
             .as_ref()
             .map(|source| (source.source_identity, source.bindings.as_slice()));
-        let mut kernels: BTreeMap<usize, OnceCell<Result<Vec<u8>, ArtifactError>>> =
+        let mut kernels: BTreeMap<usize, OnceCell<Result<EncodedScheduleKernel, ArtifactError>>> =
             BTreeMap::new();
         for item in &mut capture.items {
             let entry = kernels.entry(item.kernel.node_identity()).or_default();
             let kernel = || {
                 entry
-                    .get_or_init(|| encode_schedule_identity(&item.kernel))
-                    .as_deref()
+                    .get_or_init(|| encode_schedule_kernel(&item.kernel))
+                    .as_ref()
+                    .map(EncodedScheduleKernel::bytes)
                     .map_err(Clone::clone)
             };
             item.cache_key = match specialization {
@@ -1975,30 +1987,34 @@ impl RekeyedFreshCapture {
         })
     }
 
-    pub(crate) fn identify(mut self) -> Result<IdentifiedFreshCapture, ArtifactError> {
-        self.capture.identity = identity_with_items(&self.capture, |writer, item| {
+    pub(crate) fn identify(self) -> Result<IdentifiedFreshCapture, ArtifactError> {
+        let Self {
+            mut capture,
+            keys,
+            mut kernels,
+        } = self;
+        capture.identity = identity_with_items(&capture, |writer, item| {
             write_output_item_with_kernel(writer, item, true, || {
-                match self.kernels.get(&item.kernel.node_identity()) {
-                    Some(entry) => entry
-                        .get_or_init(|| encode_schedule_identity(&item.kernel))
-                        .as_deref()
-                        .map(Cow::Borrowed)
-                        .map_err(Clone::clone),
-                    None => encode_schedule_identity(&item.kernel).map(Cow::Owned),
-                }
+                kernels
+                    .entry(item.kernel.node_identity())
+                    .or_default()
+                    .get_or_init(|| encode_schedule_kernel(&item.kernel))
+                    .as_ref()
+                    .map(|kernel| Cow::Borrowed(kernel.bytes()))
+                    .map_err(Clone::clone)
             })
         })?;
         Ok(IdentifiedFreshCapture {
-            validated_kernels: self
-                .capture
-                .items
-                .iter()
-                .map(|item| (item.kernel.node_identity(), item.kernel.clone()))
-                .collect::<BTreeMap<_, _>>()
-                .into_values()
-                .collect(),
-            capture: self.capture,
-            retained_keys: Some(self.keys),
+            validated_orders: kernels
+                .into_iter()
+                .filter_map(|(identity, entry)| {
+                    entry
+                        .into_inner()
+                        .map(|encoded| encoded.map(|kernel| (identity, kernel.into_order())))
+                })
+                .collect::<Result<_, _>>()?,
+            capture,
+            retained_keys: Some(keys),
         })
     }
 }
@@ -2016,7 +2032,7 @@ pub(crate) fn begin_fresh_capture_seal(
     Ok(IdentifiedFreshCapture {
         capture,
         retained_keys: None,
-        validated_kernels: Vec::new(),
+        validated_orders: BTreeMap::new(),
     })
 }
 
@@ -2035,7 +2051,7 @@ impl IdentifiedFreshCapture {
             true,
             true,
             self.retained_keys.as_deref(),
-            &self.validated_kernels,
+            &self.validated_orders,
         )?;
         Ok(AuthenticatedFreshCapture {
             capture: self.capture,
@@ -2969,8 +2985,9 @@ mod tests {
                     .get()
                     .unwrap()
                     .as_ref()
-                    .unwrap(),
-                &canonical
+                    .unwrap()
+                    .bytes(),
+                canonical.as_slice()
             );
             assert_eq!(
                 owned.keys.as_ref(),
@@ -2982,13 +2999,15 @@ mod tests {
             );
             assert_ne!(owned.keys[0], owned.keys[1]);
             let identified = owned.identify().unwrap();
+            assert_eq!(identified.validated_orders.len(), 1);
             assert_eq!(identified.capture.identity, identity(&reference).unwrap());
             // This deliberately duplicated schedule is not valid for execution;
             // reusing bytes must not bypass its ordinary structural rejection.
-            assert_eq!(
-                identified.authenticate().err().unwrap(),
-                validate(&reference, true, true).unwrap_err()
-            );
+            AUTHENTICATION_ORDER_BUILDS.set(0);
+            let owned_error = identified.authenticate().err().unwrap();
+            assert_eq!(AUTHENTICATION_ORDER_BUILDS.get(), 0);
+            assert_eq!(owned_error, validate(&reference, true, true).unwrap_err());
+            assert_eq!(AUTHENTICATION_ORDER_BUILDS.get(), 1);
         }
     }
 
@@ -3012,15 +3031,19 @@ mod tests {
             .unwrap()
             .identify()
             .unwrap();
-        assert_eq!(identified.validated_kernels.len(), original.items.len());
+        assert_eq!(identified.validated_orders.len(), original.items.len());
         STRUCTURAL_KERNEL_VALIDATION_COUNT.set(0);
+        AUTHENTICATION_ORDER_BUILDS.set(0);
         let sealed = identified.authenticate().unwrap().into_inner();
         assert_eq!(STRUCTURAL_KERNEL_VALIDATION_COUNT.get(), 0);
+        assert_eq!(AUTHENTICATION_ORDER_BUILDS.get(), 0);
 
         // Ordinary public admission never inherits a fresh-construction proof.
         STRUCTURAL_KERNEL_VALIDATION_COUNT.set(0);
+        AUTHENTICATION_ORDER_BUILDS.set(0);
         validate_capture(&sealed).unwrap();
         assert_eq!(STRUCTURAL_KERNEL_VALIDATION_COUNT.get(), sealed.items.len());
+        assert_eq!(AUTHENTICATION_ORDER_BUILDS.get(), sealed.items.len());
         assert_eq!(encode(&sealed).unwrap(), encode(&original).unwrap());
 
         // Production exposes no mutation; a white-box replacement demonstrates
@@ -3036,9 +3059,156 @@ mod tests {
         );
         identified.capture.items[0].kernel = replacement;
         STRUCTURAL_KERNEL_VALIDATION_COUNT.set(0);
+        AUTHENTICATION_ORDER_BUILDS.set(0);
         let replaced = identified.authenticate().unwrap().into_inner();
         assert_eq!(STRUCTURAL_KERNEL_VALIDATION_COUNT.get(), 1);
+        assert_eq!(AUTHENTICATION_ORDER_BUILDS.get(), 1);
         assert_eq!(encode(&replaced).unwrap(), encode(&sealed).unwrap());
+    }
+
+    #[test]
+    fn owned_rekeying_order_reuse_preserves_scalar_empty_view_and_reduction_bytes() {
+        for (name, shape, transpose, reduction) in [
+            ("scalar", vec![], false, false),
+            ("empty", vec![0, 3], false, false),
+            ("view", vec![2, 3], true, false),
+            ("reduction", vec![2, 3], false, true),
+        ] {
+            let mut graph = Graph::new();
+            let input = graph.input("input", Shape::new(shape));
+            let input = if transpose {
+                graph.permute(input, vec![1, 0]).unwrap()
+            } else {
+                input
+            };
+            let output = if reduction {
+                graph
+                    .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
+                    .unwrap()
+            } else {
+                graph.square(input).unwrap()
+            };
+            let scheduled = crate::schedule(&graph, output).unwrap();
+            let capture = CapturedSchedule::capture(&graph, &scheduled, &[output]).unwrap();
+            let expected = encode(&capture).unwrap();
+            let identified = RekeyedFreshCapture::new(capture)
+                .unwrap()
+                .identify()
+                .unwrap();
+            AUTHENTICATION_ORDER_BUILDS.set(0);
+            STRUCTURAL_KERNEL_VALIDATION_COUNT.set(0);
+            let sealed = identified.authenticate().unwrap().into_inner();
+            assert_eq!(AUTHENTICATION_ORDER_BUILDS.get(), 0, "{name}");
+            assert_eq!(STRUCTURAL_KERNEL_VALIDATION_COUNT.get(), 0, "{name}");
+            assert_eq!(encode(&sealed).unwrap(), expected, "{name}");
+            assert_eq!(
+                encode(&decode(&expected).unwrap()).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_rekeying_matches_root_before_reusing_order() {
+        let original = fixture();
+        let mut identified = RekeyedFreshCapture::new(original.clone())
+            .unwrap()
+            .identify()
+            .unwrap();
+        let identity = identified.capture.items[0].kernel.node_identity();
+        // Even a corrupted map entry cannot make a foreign order authenticate
+        // this kernel. Production never exposes either the map or capture.
+        identified
+            .validated_orders
+            .insert(identity, TopologicalOrder::new(&UOp::sink(vec![])).unwrap());
+        AUTHENTICATION_ORDER_BUILDS.set(0);
+        STRUCTURAL_KERNEL_VALIDATION_COUNT.set(0);
+        let sealed = identified.authenticate().unwrap().into_inner();
+        assert_eq!(AUTHENTICATION_ORDER_BUILDS.get(), 1);
+        assert_eq!(STRUCTURAL_KERNEL_VALIDATION_COUNT.get(), 1);
+        assert_eq!(encode(&sealed).unwrap(), encode(&original).unwrap());
+
+        // Identity-only sealing deliberately has no retained encoder admission.
+        let identified = begin_fresh_capture_seal(original.clone()).unwrap();
+        AUTHENTICATION_ORDER_BUILDS.set(0);
+        STRUCTURAL_KERNEL_VALIDATION_COUNT.set(0);
+        let sealed = identified.authenticate().unwrap().into_inner();
+        assert_eq!(AUTHENTICATION_ORDER_BUILDS.get(), original.items.len());
+        assert_eq!(
+            STRUCTURAL_KERNEL_VALIDATION_COUNT.get(),
+            original.items.len()
+        );
+        assert_eq!(encode(&sealed).unwrap(), encode(&original).unwrap());
+    }
+
+    #[test]
+    fn owned_rekeying_retains_identify_fallback_order() {
+        let original = fixture();
+        let mut owned = RekeyedFreshCapture::new(original.clone()).unwrap();
+        // This equal independent allocation was not part of rekeying. The
+        // identity writer must encode and retain it at the usual writer gate.
+        let replacement = fixture().items.remove(0).kernel;
+        let identity = replacement.node_identity();
+        assert!(!owned.kernels.contains_key(&identity));
+        owned.capture.items[0].kernel = replacement;
+        let identified = owned.identify().unwrap();
+        assert!(identified.validated_orders.contains_key(&identity));
+        AUTHENTICATION_ORDER_BUILDS.set(0);
+        STRUCTURAL_KERNEL_VALIDATION_COUNT.set(0);
+        let sealed = identified.authenticate().unwrap().into_inner();
+        assert_eq!(AUTHENTICATION_ORDER_BUILDS.get(), 0);
+        assert_eq!(STRUCTURAL_KERNEL_VALIDATION_COUNT.get(), 0);
+        assert_eq!(encode(&sealed).unwrap(), encode(&original).unwrap());
+    }
+
+    #[test]
+    fn owned_rekeying_preserves_writer_and_authentication_error_order() {
+        let original = fixture();
+        let mut bad_kernel = original.items[0].kernel.sources().to_vec();
+        bad_kernel.push(UOp::from_operation(
+            crate::Operation::Unary(crate::uop::Unary::Neg),
+            Some(crate::UType::scalar(DType::F32)),
+            vec![],
+        ));
+        let bad_kernel = UOp::sink(bad_kernel);
+
+        // A metadata writer failure must still precede encoding a replacement
+        // kernel; retaining orders must not turn lazy encoding into a pre-pass.
+        let mut owned = RekeyedFreshCapture::new(original.clone()).unwrap();
+        owned.capture.items[0].kernel = bad_kernel.clone();
+        let mut desc = owned.capture.items[0].primary_output().clone();
+        desc.bytes += 1;
+        owned.capture.items[0].outputs = ScheduledOutputs::single(desc);
+        let expected = identity(&owned.capture).unwrap_err();
+        assert_eq!(expected, ArtifactError::Format("buffer descriptor"));
+        assert_eq!(owned.identify().err(), Some(expected));
+
+        for (case, reason) in [(0, "kernel"), (1, "input bindings"), (2, "kernel outputs")] {
+            let mut identified = RekeyedFreshCapture::new(original.clone())
+                .unwrap()
+                .identify()
+                .unwrap();
+            match case {
+                0 => identified.capture.items[0].kernel = bad_kernel.clone(),
+                1 => {
+                    identified.capture.items[0].kernel = bad_kernel.clone();
+                    identified.capture.items[0].input_bindings[0].abi_index += 1;
+                }
+                _ => {
+                    let mut desc = identified.capture.items[0].primary_output().clone();
+                    desc.dtype = DType::I32;
+                    identified.capture.items[0].outputs = ScheduledOutputs::single(desc);
+                }
+            }
+            let expected = validate(&identified.capture, true, true).unwrap_err();
+            assert_eq!(expected, ArtifactError::Format(reason), "case {case}");
+            assert_eq!(
+                identified.authenticate().err(),
+                Some(expected),
+                "case {case}"
+            );
+        }
     }
 
     #[test]

@@ -818,9 +818,34 @@ pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
 /// logical UOp identity. Projected indices require the v21 envelope because
 /// their existing BufferIndex payload has a new authenticated source meaning.
 pub(crate) fn encode_schedule_identity(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
+    encode_schedule_kernel(root).map(|kernel| kernel.bytes)
+}
+
+/// Canonical bytes and the exact immutable DAG admitted by their writer.
+/// The order remains call-local and is never part of an artifact or cache key.
+pub(crate) struct EncodedScheduleKernel {
+    bytes: Vec<u8>,
+    order: TopologicalOrder,
+}
+
+impl EncodedScheduleKernel {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(crate) fn into_order(self) -> TopologicalOrder {
+        self.order
+    }
+}
+
+pub(crate) fn encode_schedule_kernel(root: &UOp) -> Result<EncodedScheduleKernel, ArtifactError> {
     let dag = EncodingDag::new(root)?;
     dag.validate()?;
-    encode_schedule_nodes(dag.order.nodes())
+    let bytes = encode_schedule_nodes(dag.order.nodes())?;
+    Ok(EncodedScheduleKernel {
+        bytes,
+        order: dag.order,
+    })
 }
 
 /// Reuse only canonical ordering; the actual root still receives full validation.
@@ -3556,6 +3581,43 @@ mod tests {
             }
         }
         finish(writer)
+    }
+
+    #[test]
+    fn encoded_schedule_kernel_retains_only_its_validated_root_and_releases_owners() {
+        let ty = UType::scalar(DType::I32);
+        let root = UOp::binary(Binary::Add, UOp::constant(7, ty), UOp::constant(9, ty));
+        let weak = std::sync::Arc::downgrade(&root.0);
+        let builds = ENCODING_ORDER_BUILDS.get();
+        let validations = ENCODING_VALIDATIONS.get();
+        let encoded = encode_schedule_kernel(&root).unwrap();
+        assert_eq!(ENCODING_ORDER_BUILDS.get(), builds + 1);
+        assert_eq!(ENCODING_VALIDATIONS.get(), validations + 1);
+        assert_eq!(encoded.bytes(), encode_inner(&root, false, 18).unwrap());
+        let order = encoded.into_order();
+        assert!(order.for_root(&root).is_some());
+        let equal = UOp::binary(Binary::Add, UOp::constant(7, ty), UOp::constant(9, ty));
+        assert!(order.for_root(&equal).is_none());
+        drop(root);
+        assert!(weak.upgrade().is_some());
+        drop(order);
+        assert!(weak.upgrade().is_none());
+
+        let malformed = UOp::from_operation(Operation::Cast, Some(ty), vec![]);
+        for (root, expected) in [
+            (
+                equal.retag(Some(UOpTag::Text("transient".into()))),
+                ArtifactError::Unsupported,
+            ),
+            (malformed.clone(), ArtifactError::Format("uop")),
+            (
+                malformed.retag(Some(UOpTag::Text("invalid".into()))),
+                ArtifactError::Format("uop"),
+            ),
+        ] {
+            // Complete semantic admission still precedes executable tag policy.
+            assert_eq!(encode_schedule_kernel(&root).err(), Some(expected));
+        }
     }
 
     #[test]
