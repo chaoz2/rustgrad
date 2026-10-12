@@ -2934,18 +2934,13 @@ stack. A call-local allocation memo visits each shared allocation once, while
 canonical keys compare operation payload, result type, ordered child IDs, and
 tags instead of recursively comparing whole subgraphs. Canonical child IDs
 preserve structural deduplication across distinct equal allocations and retain
-the same first representative. The call-local interner hashes only those
-shallow fields and never iterates its buckets: IDs and representatives are
-assigned by source-ordered postorder, not hash seeds or collision order. Tests
-compare independent random hash states and a forced all-collision hasher with
-the previous structural traversal, including exact artifact bytes. Public UOp
-hashing is not used for these keys, and no interner state survives the call.
-Allocation addresses never determine output
+the same first representative. Allocation addresses never determine output
 order or semantic equivalence; the borrowed root owns the entire DAG throughout
 the call. Traversal performs no semantic admission and leaves public UOp
 equality, hashing, ordering, and artifact identities unchanged. Deep traversal
 acceptance is separate from recursive validation, rewrite, and Arc destruction
-boundaries.
+boundaries. Focused acceptance also preserves control closure and independent
+reduction ownership, and verifies release after the returned order is dropped.
 
 `UOpNode` stores one typed `Operation`, its result type, its sources, and an
 optional immutable `UOpTag`. Tags are a small canonical value algebra covering
