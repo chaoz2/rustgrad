@@ -16,6 +16,7 @@ pub mod mixed;
 mod ownership;
 #[cfg(test)]
 mod rehearsal_tests;
+mod scalar_alias_analysis;
 mod scalar_fallback;
 pub use execution_summary::{
     ExecutionPlanItemSummary, ExecutionPlanSummary, ExecutionPlanSummaryError,
@@ -25,6 +26,7 @@ pub use mixed::{
     combine as combine_mixed_schedules,
 };
 use ownership::{ScheduleOwnershipPlan, sort_sibling};
+use scalar_alias_analysis::{ProjectionQueries, ScalarAliasAnalysis};
 use scalar_fallback::OrdinaryScalarFallbackRehearsals;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1750,7 +1752,7 @@ struct ScalarAliasCandidates {
     projected_view_roots: BTreeMap<usize, BTreeSet<usize>>,
 }
 
-struct ScalarAliasCollector<'a> {
+struct ScalarAliasCollector<'a, 'queries> {
     graph: &'a Graph,
     output: NodeId,
     iteration_shape: &'a Shape,
@@ -1759,9 +1761,10 @@ struct ScalarAliasCollector<'a> {
     requested: &'a BTreeSet<usize>,
     candidates: ScalarAliasCandidates,
     seen: BTreeSet<NodeId>,
+    queries: &'queries mut ProjectionQueries<'a>,
 }
 
-impl ScalarAliasCollector<'_> {
+impl ScalarAliasCollector<'_, '_> {
     fn record_affine_view_roots(
         &mut self,
         terminal: NodeId,
@@ -1847,8 +1850,7 @@ impl ScalarAliasCollector<'_> {
             if is_view
                 && !self.requested.contains(&node.index())
                 && !self.external.contains(&node.index())
-                && let Ok(source) =
-                    crate::rangeify::predicated_source(self.graph, node, self.iteration_shape)
+                && let Ok(source) = self.queries.predicated_source(node, self.iteration_shape)
                 && (self.roots.contains(&source.index())
                     || self.external.contains(&source.index())
                     || matches!(
@@ -1883,8 +1885,7 @@ impl ScalarAliasCollector<'_> {
                 && self.roots.contains(&node.index())
                 && !self.requested.contains(&node.index())
                 && !self.external.contains(&node.index())
-                && let Ok(source) =
-                    crate::rangeify::projected_source(self.graph, node, self.iteration_shape)
+                && let Ok(source) = self.queries.projected_source(node, self.iteration_shape)
                 && (self.roots.contains(&source.index())
                     || self.external.contains(&source.index())
                     || matches!(
@@ -1910,12 +1911,13 @@ impl ScalarAliasCollector<'_> {
 }
 
 impl ScalarAliasCandidates {
-    fn collect(
-        graph: &Graph,
+    fn collect<'a>(
+        graph: &'a Graph,
         output: NodeId,
-        roots: &BTreeSet<usize>,
-        external: &BTreeSet<usize>,
-        requested: &BTreeSet<usize>,
+        roots: &'a BTreeSet<usize>,
+        external: &'a BTreeSet<usize>,
+        requested: &'a BTreeSet<usize>,
+        queries: &mut ProjectionQueries<'a>,
     ) -> Result<Self, ScheduleError> {
         // Scalar elementwise lowering iterates the output shape. Reduction
         // lowering first lowers its producer over the complete reduction
@@ -1934,6 +1936,7 @@ impl ScalarAliasCandidates {
             requested,
             candidates: Self::default(),
             seen: BTreeSet::new(),
+            queries,
         };
         collector.visit(output)?;
         Ok(collector.candidates)
@@ -2215,25 +2218,19 @@ struct ScalarAliasOwnership<'a> {
 fn checked_scalar_alias_fusion(
     graph: &Graph,
     output: NodeId,
+    candidates: &ScalarAliasCandidates,
     ownership: &ScalarAliasOwnership<'_>,
 ) -> Result<Option<ScalarAliasFusion>, ScheduleError> {
     if !scalar_alias_output(graph.op(output).map_err(ScheduleError::Graph)?) {
         return Ok(None);
     }
-    let candidates = ScalarAliasCandidates::collect(
-        graph,
-        output,
-        ownership.roots,
-        ownership.external,
-        ownership.requested,
-    )?;
     let mut accepted = BTreeSet::new();
     for source in candidates.affine_maps.keys().copied() {
         let Some(group) = exclusive_affine_alias_group(
             graph,
             output,
             source,
-            &candidates,
+            candidates,
             ownership.external,
             ownership.requested,
             ownership.consumers,
@@ -2255,7 +2252,7 @@ fn checked_scalar_alias_fusion(
             graph,
             output,
             source,
-            &candidates,
+            candidates,
             ownership.external,
             ownership.requested,
             ownership.consumers,
@@ -3083,20 +3080,26 @@ fn schedule_many_with_external(
     let mut scalar_alias_fusions = if policy.redirect_contiguous {
         let mut fallback_rehearsals =
             OrdinaryScalarFallbackRehearsals::new(graph, &roots, &external);
+        let mut alias_analysis = ScalarAliasAnalysis::new(graph, &roots, &external, &requested);
         // Proposal acceptance and ordinary fallback are both load-bearing.
         // Grow one monotone reservation frontier until every root is evaluated
         // against every other root's exact current load inventory; mutate
         // ownership only after that fixed point is stable.
         loop {
             fallback_rehearsals.begin_fixed_point_pass();
+            alias_analysis.begin_fixed_point_pass();
             let mut next_reserved = scalar_alias_reserved.clone();
             let mut next_loads = scalar_alias_loads.clone();
             let mut next_fusions = BTreeMap::new();
             for root in roots.iter().copied() {
                 let node = NodeId::from_index(root);
+                let Some(candidates) = alias_analysis.candidates(node)? else {
+                    continue;
+                };
                 if let Some(fusion) = checked_scalar_alias_fusion(
                     graph,
                     node,
+                    candidates,
                     &ScalarAliasOwnership {
                         roots: &roots,
                         external: &external,
@@ -3626,6 +3629,7 @@ mod ownership_traversal_tests {
                     &BTreeSet::new(),
                     &BTreeSet::new(),
                     &BTreeSet::new(),
+                    &mut ProjectionQueries::new(&graph),
                 )
                 .unwrap();
                 assert!(candidates.affine_maps.is_empty());
@@ -3644,6 +3648,7 @@ mod ownership_traversal_tests {
                     &BTreeSet::from([alias_source.index()]),
                     &BTreeSet::new(),
                     &BTreeSet::new(),
+                    &mut ProjectionQueries::new(&graph),
                 )
                 .unwrap();
                 assert!(

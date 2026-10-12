@@ -3028,6 +3028,32 @@ compares captures, cache keys, source order, bindings, dependencies, and CPU
 results. The original-tag scan and temporarily retained rehearsal tables have
 allocation costs; no general speed or peak-memory improvement is claimed.
 
+Scalar-alias discovery is owned by a private `ScalarAliasAnalysis` for the
+immutable pre-fusion frontier. It lazily collects each eligible root's
+candidates once and shares source queries keyed by graph node and complete
+iteration shape (the reduction input shape for reductions). Each query uses
+the existing rangeify projector, then discards the synthetic Range, address,
+and predicate UOps, retaining only a terminal source classification or exact
+projection error. Guarded and unguarded callers keep their distinct admission
+rules. Roots, requested values, and external materializations are borrowed for
+the object's lifetime; it drops before root removal. Reservations, exclusivity,
+and each proposed kernel rehearsal are reevaluated on every fixed-point pass.
+Concrete Range-bound lowering, index validation, final schedule validation,
+and capture admission never consume this metadata as a validation receipt.
+A test-only uncached discovery path retains the previous source wrappers and
+per-pass candidate collection as an independent byte/error/CPU oracle. Memory
+is bounded by retained candidate records and actual distinct `(node, shape)`
+queries; the latter can be quadratic in graph size. No global memo, wire or
+cache-identity change, speedup, or peak-memory improvement is claimed.
+
+Rangeify computes checked suffix products before constructing dense identity
+seeds or quotient/remainder coordinates. Checked numel alone is insufficient:
+a leading zero can hide an overflowing suffix stride. Identity seeds also
+check conversion into the signed affine-address representation. Malformed
+layouts return `RangeifyError::Invalid` instead of panicking during discovery;
+the scheduler still independently validates the eventual producer kernel.
+Representable scalar, empty, and nonempty maps retain their existing layouts.
+
 Fresh recurrent-prefix sealing retains each successful kernel encoder's
 root-bound order alongside its canonical bytes through key and identity
 assignment. Structural authentication then borrows that same order for dense

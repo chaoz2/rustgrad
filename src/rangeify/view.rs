@@ -1,5 +1,5 @@
 use crate::uop::{Binary, Operation, UOp};
-use crate::{AffineView, DType, Graph, NodeId, Op, Shape, UType, ViewMap};
+use crate::{AffineView, DType, Graph, NodeId, Op, Shape, UType};
 use std::{
     collections::hash_map::DefaultHasher,
     fmt,
@@ -31,6 +31,33 @@ impl fmt::Display for RangeifyError {
 }
 impl std::error::Error for RangeifyError {}
 
+// Numel alone cannot authenticate suffix strides: a leading zero may hide an
+// overflowing suffix product. Rangeify must reject it before unchecked layout
+// construction, including when discovery will later treat failure as a miss.
+fn checked_contiguous_strides(shape: &Shape) -> Result<Vec<usize>, RangeifyError> {
+    shape.numel().map_err(|_| RangeifyError::Invalid)?;
+    let mut stride = 1usize;
+    for dim in shape.dims().iter().rev() {
+        stride = stride.checked_mul(*dim).ok_or(RangeifyError::Invalid)?;
+    }
+    // Keep Shape authoritative for the layout after proving that every one of
+    // its unchecked suffix multiplications is representable, before allocation.
+    Ok(shape.contiguous_strides())
+}
+
+fn checked_identity(shape: Shape) -> Result<AffineView, RangeifyError> {
+    let strides = checked_contiguous_strides(&shape)?
+        .into_iter()
+        .map(checked_i64)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AffineView {
+        source_shape: shape.clone(),
+        logical_shape: shape,
+        strides,
+        offset: 0,
+    })
+}
+
 /// Resolves the statically provable shrink subset into one source storage map.
 /// Computed producers deliberately remain an explicit materialization boundary.
 pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView, RangeifyError> {
@@ -41,7 +68,7 @@ pub(crate) fn static_view(graph: &Graph, node: NodeId) -> Result<RangeifiedView,
         match g.op(n).map_err(|_| RangeifyError::Invalid)? {
             Op::Input { .. } | Op::Constant(_) => {
                 let s = g.shape(n).map_err(|_| RangeifyError::Invalid)?.clone();
-                Ok((n, AffineView::from(ViewMap::identity(s))))
+                Ok((n, checked_identity(s)?))
             }
             Op::Shrink { input, bounds } => {
                 let (src, v) = go(g, *input)?;
@@ -204,7 +231,7 @@ fn computed_view_seeded(
             Op::Input { .. } | Op::Constant(_) => Err(RangeifyError::Unsupported(n)),
             _ if seed.is_none() => {
                 let shape = g.shape(n).map_err(|_| RangeifyError::Invalid)?.clone();
-                Ok((n, AffineView::from(ViewMap::identity(shape))))
+                Ok((n, checked_identity(shape)?))
             }
             _ => Err(RangeifyError::Unsupported(n)),
         }
@@ -241,7 +268,7 @@ pub(crate) fn computed_broadcast_view(
         .shape(producer)
         .map_err(|_| RangeifyError::Invalid)?
         .clone();
-    let seed = AffineView::identity(leaf_shape)
+    let seed = checked_identity(leaf_shape)?
         .expand(producer_shape)
         .map_err(|_| RangeifyError::Unsupported(producer))?;
     seed.validate_read().map_err(|_| RangeifyError::Invalid)?;
@@ -365,7 +392,7 @@ fn logical_coordinates(
         return Err(RangeifyError::Invalid);
     }
     let rank_delta = output.rank() - logical.rank();
-    let output_strides = output.contiguous_strides();
+    let output_strides = checked_contiguous_strides(output)?;
     let zero = zero_from(range);
     logical
         .dims()
@@ -430,7 +457,7 @@ fn recomposed_linear(
     coordinates: &[UOp],
     range: &UOp,
 ) -> Result<Option<UOp>, RangeifyError> {
-    let strides = shape.contiguous_strides();
+    let strides = checked_contiguous_strides(shape)?;
     // Reshape decomposes one already-authenticated linear address into every
     // source coordinate. A later dense/computed boundary commonly linearizes
     // those same coordinates again. Recover that exact shared numerator before
@@ -513,7 +540,7 @@ fn linearize_coordinates(
     if let Some(recomposed) = recomposed_linear(shape, coordinates, range)? {
         return Ok(recomposed);
     }
-    let strides = shape.contiguous_strides();
+    let strides = checked_contiguous_strides(shape)?;
     let mut expression = zero_from(range);
     for (coordinate, stride) in coordinates.iter().zip(strides) {
         let term = if stride == 1 {
@@ -531,7 +558,7 @@ fn linearize_coordinates(
 }
 
 fn decompose_linear(shape: &Shape, linear: UOp, range: &UOp) -> Result<Vec<UOp>, RangeifyError> {
-    let strides = shape.contiguous_strides();
+    let strides = checked_contiguous_strides(shape)?;
     let zero = zero_from(range);
     shape
         .dims()
@@ -896,6 +923,35 @@ fn projection_for_output(
     projected_view(graph, node, output_shape, &range)
 }
 
+/// Source-only discovery from the exact projector. This is not an address or
+/// kernel-admission witness: concrete lowering still needs its own Range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectionSource {
+    Unconditional(NodeId),
+    Predicated(NodeId),
+}
+
+impl ProjectionSource {
+    pub(crate) fn source(self) -> NodeId {
+        match self {
+            Self::Unconditional(source) | Self::Predicated(source) => source,
+        }
+    }
+}
+
+pub(crate) fn projection_source(
+    graph: &Graph,
+    node: NodeId,
+    output_shape: &Shape,
+) -> Result<ProjectionSource, RangeifyError> {
+    let projection = projection_for_output(graph, node, output_shape)?;
+    Ok(if projection.predicate.is_some() {
+        ProjectionSource::Predicated(projection.source)
+    } else {
+        ProjectionSource::Unconditional(projection.source)
+    })
+}
+
 pub(crate) fn projected_source(
     graph: &Graph,
     node: NodeId,
@@ -904,6 +960,7 @@ pub(crate) fn projected_source(
     projection_for_output(graph, node, output_shape).map(|projection| projection.source)
 }
 
+#[cfg(test)]
 pub(crate) fn predicated_source(
     graph: &Graph,
     node: NodeId,
@@ -920,7 +977,88 @@ pub(crate) fn predicated_source(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Shape, Slice};
+    use crate::{Shape, Slice, ViewMap};
+
+    #[test]
+    fn checked_layout_seeds_preserve_representable_maps() {
+        for shape in [
+            Shape::new([]),
+            Shape::from([2, 3]),
+            Shape::from([0, 3]),
+            Shape::from([2, 3, 4]),
+        ] {
+            let expected = AffineView::from(ViewMap::identity(shape.clone()));
+            assert_eq!(checked_identity(shape.clone()).unwrap(), expected);
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", shape, DType::F32);
+            let producer = graph.neg(input).unwrap();
+            assert_eq!(static_view(&graph, input).unwrap().view, expected);
+            assert_eq!(computed_view(&graph, producer).unwrap().view, expected);
+        }
+    }
+
+    #[test]
+    fn overflowing_layout_seeds_reject_before_stride_construction() {
+        assert_eq!(Shape::from([0, usize::MAX, 2]).numel().unwrap(), 0);
+        let mut shapes = vec![
+            Shape::from([usize::MAX, 2]),
+            Shape::from([0, usize::MAX, 2]),
+            Shape::from([usize::MAX, 2, 0]),
+        ];
+        if usize::BITS > 63 {
+            shapes.extend([Shape::from([1, usize::MAX]), Shape::from([0, usize::MAX])]);
+        }
+        for shape in shapes {
+            assert_eq!(checked_identity(shape.clone()), Err(RangeifyError::Invalid));
+            let mut graph = Graph::new();
+            let input = graph.input_dtype("input", shape.clone(), DType::F32);
+            let producer = graph.push(
+                Op::Unary {
+                    op: crate::UnaryOp::Neg,
+                    input,
+                },
+                shape.clone(),
+                DType::F32,
+            );
+            assert_eq!(static_view(&graph, input), Err(RangeifyError::Invalid));
+            assert_eq!(computed_view(&graph, producer), Err(RangeifyError::Invalid));
+            assert_eq!(
+                computed_broadcast_view(&graph, producer, producer, shape.clone()),
+                Err(RangeifyError::Invalid)
+            );
+            assert_eq!(
+                projection_source(&graph, input, &shape),
+                Err(RangeifyError::Invalid)
+            );
+        }
+    }
+
+    #[test]
+    fn coordinate_planning_rejects_hidden_suffix_overflow() {
+        let shape = Shape::from([0, usize::MAX, 2]);
+        let range = UOp::from_operation(
+            Operation::Range(0),
+            Some(UType::scalar(DType::I64)),
+            vec![iconstant(0)],
+        );
+        let coordinates = vec![iconstant(0); shape.rank()];
+        assert_eq!(
+            logical_coordinates(&shape, &shape, &range),
+            Err(RangeifyError::Invalid)
+        );
+        assert_eq!(
+            decompose_linear(&shape, iconstant(0), &range),
+            Err(RangeifyError::Invalid)
+        );
+        assert_eq!(
+            recomposed_linear(&shape, &coordinates, &range),
+            Err(RangeifyError::Invalid)
+        );
+        assert_eq!(
+            linearize_coordinates(&shape, &coordinates, &range),
+            Err(RangeifyError::Invalid)
+        );
+    }
 
     #[test]
     fn reshape_linear_recomposition_requires_the_complete_domain_to_fit() {
