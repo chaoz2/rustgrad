@@ -299,9 +299,26 @@ mod tests {
             crate::schedule::kernel_validation_count() - before
                 >= retained.schedule.schedule().items.len()
         );
+        let mut reference_capture =
+            CapturedSchedule::capture(&graph, &ordinary, &[output]).unwrap();
+        reference_capture.items = reference.schedule.items.clone();
+        let reference_capture = CapturedMixedSchedule::from_parts(
+            reference_capture,
+            &reference.schedule,
+            reference.states,
+        )
+        .unwrap();
+        assert_eq!(
+            frontier.capture().schedule.requested,
+            vec![output.index() as u64]
+        );
+        assert_eq!(
+            frontier.capture().schedule.requested,
+            reference_capture.schedule.requested
+        );
         assert_eq!(
             frontier.capture().to_bytes().unwrap(),
-            mixed_bytes(&graph, &ordinary, reference)
+            reference_capture.to_bytes().unwrap()
         );
         let identity = frontier.capture_identity();
         drop(retained.schedule);
