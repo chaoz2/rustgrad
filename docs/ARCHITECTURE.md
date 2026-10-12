@@ -77,6 +77,7 @@ src/
   uop/                   tinygrad-style universal operation IR
     mod.rs               typed operations, values, validation and rewrites
     traversal.rs         call-local canonical DAG postorder and allocation memo
+    projected_consumers.rs load-only admission for projected/predicated indices
     artifact.rs          bounded typed UOp DAG node-table codec
   schedule/              realization, fusion, indexing and memory planning
     artifact.rs          portable schedule descriptors and bindings
@@ -3045,6 +3046,20 @@ Validation also binds address semantics to the defining operation:
 `AddressValue` memory space. `LinearKernel::from_uop` validates the complete
 source DAG before deriving instruction order, so a structurally sortable but
 semantically invalid address graph cannot enter late linearization.
+
+`uop/projected_consumers.rs` owns the existing load-only rule for projected and
+predicated indices. It inspects every direct edge but retains structural keys
+only for those index nodes, rather than recursively hashing unrelated ordinary
+subgraphs. Equal independent allocations still share the same consumer
+conjunction; tags, payloads, types and sources remain part of equality. Missing
+consumers and any non-Load consumer retain their original rejection, including
+empty domains. The admission stage stays after per-node semantic checks and
+before unclosed-control and allocation-based reduction ownership checks. This
+is not a validation cache and does not change public UOp hashing or artifact
+identity. An independent previous summary/validator covers admission and error
+precedence; an ordinary shared-diamond regression exercises bounded consumer
+work without claiming general deep-validation or destruction support. Any
+training latency improvement requires a separate uninstrumented comparison.
 
 This is an intentional pre-1.0 Rust source migration. `UOp::from_operation`
 is the typed constructor and `UOp::operation()` exposes the borrowed enum.
