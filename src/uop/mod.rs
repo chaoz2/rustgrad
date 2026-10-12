@@ -3,6 +3,7 @@
 use crate::{DType, Shape, SymbolicExpr};
 pub mod artifact;
 mod operation;
+mod projected_consumers;
 mod schema;
 mod traversal;
 pub use operation::{
@@ -805,93 +806,12 @@ impl UOp {
         for n in nodes {
             validate_one(n, &mut ranges, &mut ifs)?
         }
-        validate_projected_index_consumers(nodes)?;
+        projected_consumers::validate(nodes)?;
         if !ifs.is_empty() || !ranges.is_empty() {
             return Err(UOpError::UnclosedControl);
         }
         validate_reduction_topology(self)?;
         Ok(())
-    }
-}
-
-fn validate_projected_index_consumers(nodes: &[UOp]) -> Result<(), UOpError> {
-    let mut consumers = HashMap::<UOp, bool>::new();
-    for consumer in nodes {
-        let is_load = matches!(consumer.operation(), Operation::Load);
-        for source in consumer.sources() {
-            consumers
-                .entry(source.clone())
-                .and_modify(|only_loads| *only_loads &= is_load)
-                .or_insert(is_load);
-        }
-    }
-    for index in nodes
-        .iter()
-        .filter(|node| crate::projected_index::ProjectedIndexPlan::is_projected(node))
-    {
-        if consumers.get(index) != Some(&true) {
-            return Err(UOpError::InvalidIndex);
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod projected_consumer_tests {
-    use super::*;
-
-    #[test]
-    fn large_projected_consumer_summary_uses_one_edge_pass() {
-        let value_type = UType::scalar(DType::F32);
-        let index_type = UType::scalar(DType::I64);
-        let shape = Shape::from([1]);
-        let mut nodes = Vec::with_capacity(8193);
-        let mut first = None;
-        for buffer in 0..4096_u64 {
-            let address = UOp::from_operation(
-                Operation::DefineGlobal(AddressValue {
-                    space: AddressSpace::Global,
-                    name: format!("b{buffer}"),
-                    element: value_type,
-                }),
-                Some(value_type),
-                vec![],
-            );
-            let index = UOp::from_operation(
-                Operation::Index(IndexValue::Buffer {
-                    buffer,
-                    elements: 1,
-                    input_shape: shape.clone(),
-                    output_shape: shape.clone(),
-                    addressing: IndexAddressing::Projected,
-                }),
-                Some(value_type),
-                vec![address, UOp::constant(0, index_type)],
-            );
-            if first.is_none() {
-                first = Some(index.clone());
-            }
-            nodes.push(index.clone());
-            nodes.push(UOp::from_operation(
-                Operation::Load,
-                Some(value_type),
-                vec![index],
-            ));
-        }
-        assert_eq!(validate_projected_index_consumers(&nodes), Ok(()));
-
-        nodes.push(UOp::from_operation(
-            Operation::Store,
-            None,
-            vec![
-                first.unwrap(),
-                UOp::scalar_constant(DType::F32, 0, value_type),
-            ],
-        ));
-        assert_eq!(
-            validate_projected_index_consumers(&nodes),
-            Err(UOpError::InvalidIndex)
-        );
     }
 }
 
