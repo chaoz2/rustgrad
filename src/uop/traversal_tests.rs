@@ -106,7 +106,7 @@ fn canonical_source_table_keeps_deep_edges_flat_and_releases_owners() {
     let weak = std::sync::Arc::downgrade(&root.0);
     let table = CanonicalNodeTable::new(&root).unwrap();
     assert_eq!(table.order().nodes().len(), 4098);
-    assert_eq!(table.sources(0).unwrap(), []);
+    assert!(table.sources(0).unwrap().is_empty());
     for id in 1..=4096 {
         assert_eq!(table.sources(id).unwrap(), [id - 1, 0]);
     }
