@@ -1,9 +1,9 @@
 //! Bounded portable node-table encoding for validated UOps.
 use super::{
-    AddressSpace, AddressValue, AffineView, Binary, IndexValue, LiteralValue, MatmulValue,
-    MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue, TensorGuardValue,
-    ThreefryValue, TopologicalOrder, UOp, UOpTag, UType, Unary, VariableValue, ViewMap,
-    graph_unary_type_is_valid,
+    AddressSpace, AddressValue, AffineView, Binary, CanonicalNodeTable, IndexValue, LiteralValue,
+    MatmulValue, MovementValue, Operation, PrefixScanValue, ReductionValue, SortValue,
+    TensorGuardValue, ThreefryValue, TopologicalOrder, UOp, UOpTag, UType, Unary, VariableValue,
+    ViewMap, graph_unary_type_is_valid,
 };
 use crate::{
     BinaryOp, CompareOp, DType, GgmlType, LogicalOp, MatmulBarrierKind, MatmulBarrierPhase,
@@ -780,7 +780,7 @@ impl std::error::Error for ArtifactError {}
 /// DAGs require v22; predicated projected indices require v23.
 pub fn encode(root: &UOp) -> Result<Vec<u8>, ArtifactError> {
     let dag = EncodingDag::new(root)?;
-    let nodes = dag.order.nodes();
+    let nodes = dag.table.order().nodes();
     let version = if nodes
         .iter()
         .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
@@ -841,26 +841,31 @@ impl EncodedScheduleKernel {
 pub(crate) fn encode_schedule_kernel(root: &UOp) -> Result<EncodedScheduleKernel, ArtifactError> {
     let dag = EncodingDag::new(root)?;
     dag.validate()?;
-    let bytes = encode_schedule_nodes(dag.order.nodes())?;
+    let bytes = encode_schedule_nodes(&dag.table)?;
     Ok(EncodedScheduleKernel {
         bytes,
-        order: dag.order,
+        order: dag.table.into_order(),
     })
 }
 
 /// Reuse only canonical ordering; the actual root still receives full validation.
-pub(crate) fn encode_schedule_identity_with_order(
+pub(crate) fn encode_schedule_identity_with_table(
     root: &UOp,
-    order: &TopologicalOrder,
+    table: &CanonicalNodeTable,
 ) -> Result<Vec<u8>, ArtifactError> {
-    let Some(nodes) = order.for_root(root) else {
+    if table.order().for_root(root).is_none() {
         return encode_schedule_identity(root);
-    };
-    validate_encoding_order(root, order)?;
-    encode_schedule_nodes(nodes)
+    }
+    validate_encoding_order(root, table.order())?;
+    encode_schedule_nodes(table)
 }
 
-fn encode_schedule_nodes(nodes: &[UOp]) -> Result<Vec<u8>, ArtifactError> {
+fn encode_schedule_nodes(table: &CanonicalNodeTable) -> Result<Vec<u8>, ArtifactError> {
+    let (effects, version) = schedule_encoding_policy(table.order().nodes())?;
+    encode_nodes(table, effects, version)
+}
+
+fn schedule_encoding_policy(nodes: &[UOp]) -> Result<(bool, u8), ArtifactError> {
     // Tags are transient compiler metadata. A tagged executable kernel must be
     // explicitly stripped before scheduling rather than changing durable cache
     // identities or silently discarding metadata.
@@ -899,7 +904,7 @@ fn encode_schedule_nodes(nodes: &[UOp]) -> Result<Vec<u8>, ArtifactError> {
     } else {
         18
     };
-    encode_nodes(nodes, effects, version)
+    Ok((effects, version))
 }
 
 // Own the canonical node order beside its borrowed immutable root. Version
@@ -907,24 +912,24 @@ fn encode_schedule_nodes(nodes: &[UOp]) -> Result<Vec<u8>, ArtifactError> {
 // full validation (including identity-based reduction ownership) still runs.
 struct EncodingDag<'a> {
     root: &'a UOp,
-    order: TopologicalOrder,
+    table: CanonicalNodeTable,
 }
 
 impl<'a> EncodingDag<'a> {
     fn new(root: &'a UOp) -> Result<Self, ArtifactError> {
         #[cfg(test)]
         ENCODING_ORDER_BUILDS.with(|count| count.set(count.get() + 1));
-        let order = TopologicalOrder::new(root).map_err(|_| ArtifactError::Format("dag"))?;
-        Ok(Self { root, order })
+        let table = CanonicalNodeTable::new(root).map_err(|_| ArtifactError::Format("dag"))?;
+        Ok(Self { root, table })
     }
 
     fn encode(&self, effects: bool, version: u8) -> Result<Vec<u8>, ArtifactError> {
         self.validate()?;
-        encode_nodes(self.order.nodes(), effects, version)
+        encode_nodes(&self.table, effects, version)
     }
 
     fn validate(&self) -> Result<(), ArtifactError> {
-        validate_encoding_order(self.root, &self.order)
+        validate_encoding_order(self.root, self.table.order())
     }
 }
 
@@ -948,10 +953,84 @@ fn encode_inner(root: &UOp, effects: bool, version: u8) -> Result<Vec<u8>, Artif
     let nodes = root
         .topological()
         .map_err(|_| ArtifactError::Format("dag"))?;
-    encode_nodes(&nodes, effects, version)
+    encode_nodes_legacy(&nodes, effects, version)
 }
 
-fn encode_nodes(nodes: &[UOp], effects: bool, version: u8) -> Result<Vec<u8>, ArtifactError> {
+fn encode_nodes(
+    table: &CanonicalNodeTable,
+    effects: bool,
+    version: u8,
+) -> Result<Vec<u8>, ArtifactError> {
+    let nodes = table.order().nodes();
+    if !effects
+        && nodes.iter().any(|node| {
+            matches!(
+                node.operation(),
+                Operation::EffectStore(_) | Operation::After(_)
+            )
+        })
+    {
+        return Err(ArtifactError::Unsupported);
+    }
+    if nodes.is_empty() || nodes.len() > MAX_NODES {
+        return Err(ArtifactError::Format("count"));
+    }
+    let mut w = Writer::new();
+    w.bytes(MAGIC)?;
+    w.u8(version)?;
+    w.u32(nodes.len() as u32)?;
+    w.u32((nodes.len() - 1) as u32)?;
+    for (id, node) in nodes.iter().enumerate() {
+        let (kind, arg) = operation_to_wire(node.operation());
+        if version < 21 && matches!(&arg, WireArg::ProjectedBufferIndex { .. }) {
+            return Err(ArtifactError::Format("projected index version"));
+        }
+        if version < VERSION && matches!(&arg, WireArg::PredicatedBufferIndex { .. }) {
+            return Err(ArtifactError::Format("predicated index version"));
+        }
+        validate_fields(&kind, node.ty(), &arg, node.sources(), effects)?;
+        w.u32(id as u32)?;
+        write_kind(&mut w, &kind, effects)?;
+        write_type(&mut w, node.ty())?;
+        write_arg(&mut w, &arg, effects)?;
+        if version < TAG_VERSION && node.tag().is_some() {
+            return Err(ArtifactError::Format("tag version"));
+        }
+        if version >= TAG_VERSION {
+            write_tag(&mut w, node.tag())?;
+        }
+        if node.sources().len() > MAX_SOURCES {
+            return Err(ArtifactError::Format("source limit"));
+        }
+        w.u32(node.sources().len() as u32)?;
+        // Consult retained IDs only at the released source-writing gate.
+        // Earlier payload/version failures retain their original precedence.
+        let sources = table.sources(id).ok_or(ArtifactError::Format("source"))?;
+        for (position, _) in node.sources().iter().enumerate() {
+            let source = *sources
+                .get(position)
+                .ok_or(ArtifactError::Format("source"))?;
+            if source >= id {
+                return Err(ArtifactError::Format("source order"));
+            }
+            w.u32(source as u32)?;
+        }
+        if sources.len() != node.sources().len() {
+            return Err(ArtifactError::Format("source"));
+        }
+    }
+    let sum = checksum(&w.out);
+    w.u32(sum)?;
+    Ok(w.out)
+}
+
+/// Independent released writer used only as the byte/error oracle in tests.
+#[cfg(test)]
+fn encode_nodes_legacy(
+    nodes: &[UOp],
+    effects: bool,
+    version: u8,
+) -> Result<Vec<u8>, ArtifactError> {
     if !effects
         && nodes.iter().any(|node| {
             matches!(
@@ -1011,6 +1090,19 @@ fn encode_nodes(nodes: &[UOp], effects: bool, version: u8) -> Result<Vec<u8>, Ar
     Ok(w.out)
 }
 
+#[cfg(test)]
+pub(crate) fn encode_schedule_identity_with_order(
+    root: &UOp,
+    order: &TopologicalOrder,
+) -> Result<Vec<u8>, ArtifactError> {
+    let Some(nodes) = order.for_root(root) else {
+        return encode_schedule_identity(root);
+    };
+    validate_encoding_order(root, order)?;
+    let (effects, version) = schedule_encoding_policy(nodes)?;
+    encode_nodes_legacy(nodes, effects, version)
+}
+
 /// Decodes and completely validates an artifact before returning its root.
 pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
     decode_admitted(bytes).map(|decoded| decoded.root)
@@ -1020,7 +1112,7 @@ pub fn decode(bytes: &[u8]) -> Result<UOp, ArtifactError> {
 /// It cannot be constructed from a caller's root or imported wire bytes alone.
 pub(crate) struct DecodedKernel {
     root: UOp,
-    order: TopologicalOrder,
+    table: CanonicalNodeTable,
 }
 
 impl DecodedKernel {
@@ -1029,7 +1121,7 @@ impl DecodedKernel {
     }
 
     pub(crate) fn encode_schedule_identity(&self) -> Result<Vec<u8>, ArtifactError> {
-        encode_schedule_nodes(self.order.nodes())
+        encode_schedule_nodes(&self.table)
     }
 }
 
@@ -1125,23 +1217,25 @@ pub(crate) fn decode_admitted(bytes: &[u8]) -> Result<DecodedKernel, ArtifactErr
     let root = nodes[root].clone();
     // Wire references only point backward, but retain the historical first
     // traversal's error classification as well as the validation gate order.
-    let order = TopologicalOrder::new(&root)
+    let table = CanonicalNodeTable::new(&root)
         .map_err(|_| ArtifactError::Format(if version < 21 { "dag" } else { "uop" }))?;
     if version < 21
-        && order
+        && table
+            .order()
             .nodes()
             .iter()
             .any(crate::projected_index::ProjectedIndexPlan::is_projected)
     {
         return Err(ArtifactError::Format("projected index version"));
     }
-    order
+    table
+        .order()
         .validate_for(&root)
         .map_err(|_| ArtifactError::Format("uop"))?;
-    if order.nodes().len() != count {
+    if table.order().nodes().len() != count {
         return Err(ArtifactError::Format("unreachable node"));
     }
-    Ok(DecodedKernel { root, order })
+    Ok(DecodedKernel { root, table })
 }
 
 fn validate_fields(
@@ -3621,13 +3715,146 @@ mod tests {
     }
 
     #[test]
+    fn canonical_edge_writer_matches_released_bytes_and_errors() {
+        let ty = UType::scalar(DType::I32);
+        let first = UOp::constant(7, ty);
+        let equal = UOp::constant(7, ty);
+        let shared = UOp::binary(Binary::Add, first.clone(), equal);
+        let independent = UOp::binary(Binary::Add, UOp::constant(7, ty), UOp::constant(7, ty));
+        let index_ty = UType::scalar(DType::I64);
+        let range = UOp::from_operation(
+            Operation::Range(0),
+            Some(index_ty),
+            vec![UOp::constant(0, index_ty)],
+        );
+        let closed = UOp::sink(vec![
+            range.clone(),
+            UOp::from_operation(Operation::EndRange, None, vec![range]),
+        ]);
+        let raw = [0, 0x8000_0000, 0x7fc0_0001, 0x7fc0_0002]
+            .map(|bits| UOp::scalar_constant(DType::F32, bits, UType::scalar(DType::F32)));
+        let roots = [
+            first.clone(),
+            UOp::sink(vec![]),
+            UOp::sink(vec![shared, independent]),
+            UOp::binary(Binary::Sub, first.clone(), UOp::constant(9, ty)),
+            UOp::binary(Binary::Sub, UOp::constant(9, ty), first.clone()),
+            UOp::sink(raw.to_vec()),
+            UOp::sink(vec![
+                first.clone(),
+                UOp::constant(7, UType::scalar(DType::I64)),
+            ]),
+            first.retag(Some(UOpTag::Tuple(vec![
+                UOpTag::Text("metadata".into()),
+                UOpTag::Int(1),
+            ]))),
+            closed,
+            UOp::from_operation(Operation::Cast, Some(ty), vec![]),
+        ];
+        for (case, root) in roots.iter().enumerate() {
+            for version in [1, 14, 16, 18, 19, 20, 21, 22, 23] {
+                assert_eq!(
+                    EncodingDag::new(root).unwrap().encode(false, version),
+                    encode_inner(root, false, version),
+                    "case {case}, version {version}"
+                );
+            }
+            let order = TopologicalOrder::new(root).unwrap();
+            assert_eq!(
+                encode_schedule_identity(root),
+                encode_schedule_identity_with_order(root, &order),
+                "schedule case {case}"
+            );
+            if let Ok(bytes) = encode(root) {
+                assert_eq!(
+                    encode(&decode(&bytes).unwrap()).unwrap(),
+                    bytes,
+                    "roundtrip case {case}"
+                );
+                let admitted = decode_admitted(&bytes).unwrap();
+                assert_eq!(
+                    admitted.encode_schedule_identity(),
+                    encode_schedule_identity(root),
+                    "decoded case {case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_edge_writer_rejects_bad_edges_at_the_source_gate() {
+        let ty = UType::scalar(DType::I32);
+        let leaf = UOp::constant(7, ty);
+        let root = UOp::binary(Binary::Add, leaf.clone(), leaf);
+        for (name, offsets, sources, expected) in [
+            ("missing row", vec![0, 0], vec![], "source"),
+            ("missing source", vec![0, 0, 1], vec![0], "source"),
+            ("extra source", vec![0, 0, 3], vec![0, 0, 0], "source"),
+            ("forward source", vec![0, 0, 2], vec![1, 0], "source order"),
+            (
+                "forward before missing",
+                vec![0, 0, 1],
+                vec![1],
+                "source order",
+            ),
+            (
+                "no integer narrowing",
+                vec![0, 0, 2],
+                vec![usize::MAX, 0],
+                "source order",
+            ),
+        ] {
+            let table = CanonicalNodeTable::from_test_parts(
+                TopologicalOrder::new(&root).unwrap(),
+                offsets,
+                sources,
+            );
+            assert_eq!(
+                encode_nodes(&table, false, 18),
+                Err(ArtifactError::Format(expected)),
+                "{name}"
+            );
+        }
+        for (name, root, expected) in [
+            (
+                "lane width before missing source row",
+                UOp::from_operation(
+                    Operation::Cast,
+                    Some(UType {
+                        scalar: DType::I32,
+                        lanes: 0,
+                    }),
+                    vec![],
+                ),
+                ArtifactError::Format("lane width"),
+            ),
+            (
+                "tag version before missing source row",
+                UOp::constant(7, ty).retag(Some(UOpTag::Text("metadata".into()))),
+                ArtifactError::Format("tag version"),
+            ),
+        ] {
+            let order = TopologicalOrder::new(&root).unwrap();
+            // Arity is an earlier semantic-admission gate; use a field error
+            // the released low-level writer itself rejects for this oracle.
+            assert_eq!(
+                encode_nodes_legacy(order.nodes(), false, 21),
+                Err(expected.clone()),
+                "{name}"
+            );
+            let table = CanonicalNodeTable::from_test_parts(order, vec![], vec![]);
+            assert_eq!(encode_nodes(&table, false, 21), Err(expected), "{name}");
+        }
+    }
+
+    #[test]
     fn retained_schedule_order_preserves_bytes_validation_and_foreign_root_fallback() {
         let ty = UType::scalar(DType::I32);
         let leaf = UOp::constant(7, ty);
         let shared = UOp::binary(Binary::Add, leaf.clone(), leaf.clone());
         let distinct = UOp::binary(Binary::Add, UOp::constant(7, ty), UOp::constant(7, ty));
         let malformed = UOp::from_operation(Operation::Cast, Some(ty), vec![]);
-        let foreign = TopologicalOrder::new(&UOp::sink(vec![])).unwrap();
+        let foreign = CanonicalNodeTable::new(&UOp::sink(vec![])).unwrap();
         for root in [
             leaf.clone(),
             shared,
@@ -3637,14 +3864,14 @@ mod tests {
             malformed.retag(Some(UOpTag::Text("invalid".into()))),
         ] {
             let expected = encode_schedule_identity(&root);
-            let order = TopologicalOrder::new(&root).unwrap();
+            let order = CanonicalNodeTable::new(&root).unwrap();
             let builds = ENCODING_ORDER_BUILDS.get();
             let validations = ENCODING_VALIDATIONS.get();
-            assert_eq!(encode_schedule_identity_with_order(&root, &order), expected);
+            assert_eq!(encode_schedule_identity_with_table(&root, &order), expected);
             assert_eq!(ENCODING_ORDER_BUILDS.get(), builds);
             assert_eq!(ENCODING_VALIDATIONS.get(), validations + 1);
             assert_eq!(
-                encode_schedule_identity_with_order(&root, &foreign),
+                encode_schedule_identity_with_table(&root, &foreign),
                 expected
             );
             assert_eq!(ENCODING_ORDER_BUILDS.get(), builds + 1);
@@ -3682,9 +3909,9 @@ mod tests {
         let valid = complete();
         let duplicated = UOp::sink(vec![complete(), complete()]);
         for root in [valid.clone(), init(), duplicated] {
-            let order = TopologicalOrder::new(&root).unwrap();
+            let order = CanonicalNodeTable::new(&root).unwrap();
             assert_eq!(
-                encode_schedule_identity_with_order(&root, &order),
+                encode_schedule_identity_with_table(&root, &order),
                 encode_inner(&root, false, 18)
             );
             assert_eq!(encode(&root), encode_inner(&root, false, 19));
@@ -4409,6 +4636,16 @@ mod tests {
                 .any(crate::projected_index::ProjectedIndexPlan::is_predicated)
         );
         let predicated_bytes = encode(&predicated).unwrap();
+        assert_eq!(
+            predicated_bytes,
+            encode_inner(&predicated, false, VERSION).unwrap()
+        );
+        assert_eq!(
+            EncodingDag::new(&predicated)
+                .unwrap()
+                .encode(false, VERSION - 1),
+            encode_inner(&predicated, false, VERSION - 1)
+        );
         assert_eq!(predicated_bytes[4], VERSION);
         assert_eq!(decode(&predicated_bytes).unwrap(), predicated);
         assert_eq!(encode_schedule_identity(&predicated).unwrap()[4], VERSION);
@@ -4475,6 +4712,11 @@ mod tests {
                 .any(crate::projected_index::ProjectedIndexPlan::is_projected)
         );
         let same_shape_bytes = encode(&root).unwrap();
+        assert_eq!(same_shape_bytes, encode_inner(&root, false, 21).unwrap());
+        assert_eq!(
+            EncodingDag::new(&root).unwrap().encode(false, 20),
+            encode_inner(&root, false, 20)
+        );
         assert_eq!(same_shape_bytes[4], 21);
         assert_eq!(decode(&same_shape_bytes).unwrap(), root);
         assert!(matches!(

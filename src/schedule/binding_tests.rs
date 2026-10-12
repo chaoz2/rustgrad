@@ -15,6 +15,12 @@ fn retained_order_preserves_bindings_and_independent_capture() {
         let scheduled = schedule_many(&graph, &[output]).unwrap();
         let item = scheduled.items.last().unwrap();
         let order = crate::uop::TopologicalOrder::new(&item.kernel).unwrap();
+        let table = crate::uop::CanonicalNodeTable::new(&item.kernel).unwrap();
+        assert_eq!(
+            identity::item_key_with_table(item, &table).unwrap(),
+            item.cache_key,
+            "{name}"
+        );
         assert_eq!(item.cache_key, item_cache_key(item).unwrap(), "{name}");
         assert_eq!(
             identity::item_key_with_order(item, &order).unwrap(),

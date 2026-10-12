@@ -2993,6 +2993,24 @@ ownership, before tag rejection and wire emission; a foreign root uses the
 independent traversal path. This shares ordering only, not admission, and leaves
 canonical kernel bytes, item cache keys, and historical wire versions unchanged.
 
+Encoding additionally owns a private `CanonicalNodeTable`: the exact-root
+order plus flat canonical source IDs and per-node offsets. The same traversal
+records those IDs only when publishing a first representative; it discards the
+allocation memo on return, so retained metadata follows canonical nodes and
+edges rather than every equal allocation. The writer consumes these IDs at its
+existing source gate without rebuilding a structurally keyed UOp map. Field,
+version, tag, source-limit, source-order, and actual-allocation reduction checks
+remain independent and keep their existing precedence. Schedule normalization
+retains the table through key emission; node-only consumers receive the lean
+order after temporarily constructing edge metadata. Normalization releases its
+preliminary table after rewriting and before constructing the final table;
+these sidecars do not overlap. Their transient allocation cost remains a
+tradeoff, and no general or measured peak-memory reduction is claimed.
+Successful fresh encoding drops edge metadata before authentication,
+while decoded kernels retain it only through their local re-encoding boundary.
+An independent test-only released writer remains the byte/error oracle. No
+addresses, retained tables, or new identities enter public state or wire bytes.
+
 Fresh recurrent-prefix sealing retains each successful kernel encoder's
 root-bound order alongside its canonical bytes through key and identity
 assignment. Structural authentication then borrows that same order for dense

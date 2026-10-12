@@ -3267,12 +3267,13 @@ fn schedule_many_with_external(
         } else {
             UOp::sink(vec![])
         };
-        let kernel_order =
+        let kernel_table =
             if boundary.is_none() && matches!(kernel.operation(), crate::Operation::Sink) {
-                crate::uop::normalize_kernel_with_order(&kernel).map_err(ScheduleError::UOp)?
+                crate::uop::normalize_kernel_with_table(&kernel).map_err(ScheduleError::UOp)?
             } else {
-                crate::uop::TopologicalOrder::new(&kernel).map_err(ScheduleError::UOp)?
+                crate::uop::CanonicalNodeTable::new(&kernel).map_err(ScheduleError::UOp)?
             };
+        let kernel_order = kernel_table.order();
         let kernel = kernel_order.root().clone();
         for (buffer, view) in common_buffer_views(kernel_order.nodes()) {
             if let Some(desc) = inputs.iter_mut().find(|desc| desc.id == buffer) {
@@ -3281,7 +3282,7 @@ fn schedule_many_with_external(
         }
         let id = *node_to_item.get(&index).ok_or(ScheduleError::Overflow)?;
         let input_bindings =
-            input_bindings_with_order(&kernel, &inputs, &output, Some(&kernel_order))?;
+            input_bindings_with_order(&kernel, &inputs, &output, Some(kernel_order))?;
         let external_materializations = input_bindings
             .iter()
             .filter(|binding| external.contains(&binding.input_node.index()))
@@ -3344,9 +3345,9 @@ fn schedule_many_with_external(
             boundary,
             cache_key: 0,
         };
-        item.cache_key = identity::item_key_with_order(&item, &kernel_order)
+        item.cache_key = identity::item_key_with_table(&item, &kernel_table)
             .map_err(|error| ScheduleError::Binding(format!("schedule identity: {error}")))?;
-        item.validate_input_bindings_with_order(Some(&kernel_order))?;
+        item.validate_input_bindings_with_order(Some(kernel_order))?;
         items.push(item);
     }
     let positions: std::collections::BTreeMap<u64, usize> = items
