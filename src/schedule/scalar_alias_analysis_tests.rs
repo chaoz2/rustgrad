@@ -362,7 +362,29 @@ fn scheduling_failures_keep_the_previous_error_contract() {
 
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [usize::MAX, 2], DType::F32);
-    let (cached, _) = with_mode(true, || schedule(&graph, input));
-    let (legacy, _) = with_mode(false, || schedule(&graph, input));
-    assert_eq!(cached.unwrap_err(), legacy.unwrap_err());
+    // An external input alone deliberately produces no scheduled item and
+    // does not enter kernel extent validation. Preserve that contract too.
+    for reuse in [true, false] {
+        let (passthrough, counts) = with_mode(reuse, || schedule(&graph, input));
+        assert!(passthrough.unwrap().items.is_empty());
+        assert_eq!(counts.candidate_collections, 0);
+    }
+    // Inject a malformed producer directly: the public graph constructor
+    // would reject its overflowing descriptor before scheduling can observe it.
+    let output = graph.push(
+        Op::Unary {
+            op: crate::UnaryOp::Neg,
+            input,
+        },
+        Shape::from([usize::MAX, 2]),
+        DType::F32,
+    );
+    for reuse in [true, false] {
+        let (result, counts) = with_mode(reuse, || schedule(&graph, output));
+        assert_eq!(
+            result.unwrap_err(),
+            ScheduleError::UOp(UOpError::InvalidArgument)
+        );
+        assert!(counts.candidate_collections > 0);
+    }
 }
