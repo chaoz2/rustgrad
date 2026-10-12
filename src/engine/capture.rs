@@ -65,7 +65,21 @@ impl CapturedSchedule {
         schedule: &Schedule,
         requested: &[NodeId],
     ) -> Result<Self, ReplayError> {
-        Self::capture_impl(graph, schedule, requested, BTreeMap::new())
+        Self::capture_impl(graph, schedule, requested, BTreeMap::new(), None)
+    }
+
+    pub(crate) fn capture_finalized(
+        graph: &Graph,
+        finalized: &crate::schedule::FinalizedSchedule,
+        requested: &[NodeId],
+    ) -> Result<Self, ReplayError> {
+        Self::capture_impl(
+            graph,
+            finalized.schedule(),
+            requested,
+            BTreeMap::new(),
+            Some(finalized.kernels()),
+        )
     }
 
     pub(crate) fn capture_with_quantized_bindings(
@@ -76,7 +90,7 @@ impl CapturedSchedule {
     ) -> Result<Self, ReplayError> {
         let mut schedule = schedule.clone();
         let quantized_constants = authenticate_quantized_bindings(graph, &mut schedule, bindings)?;
-        Self::capture_impl(graph, &schedule, requested, quantized_constants)
+        Self::capture_impl(graph, &schedule, requested, quantized_constants, None)
     }
 
     fn capture_impl(
@@ -84,6 +98,7 @@ impl CapturedSchedule {
         schedule: &Schedule,
         requested: &[NodeId],
         quantized_constants: BTreeMap<u64, crate::QuantizedTensorData>,
+        kernels: Option<&crate::schedule::artifact::KernelEncodings>,
     ) -> Result<Self, ReplayError> {
         // Generic captured schedules have no durable representation for a
         // persistent-state version or view. Validate the complete source
@@ -312,8 +327,13 @@ impl CapturedSchedule {
             symbolic: None,
             specialized_from: None,
         };
-        crate::schedule::artifact::seal_fresh_capture(capture)
-            .map_err(|error| ReplayError::Corrupt(error.to_string()))
+        match kernels {
+            Some(kernels) => {
+                crate::schedule::artifact::seal_fresh_capture_with_encodings(capture, kernels)
+            }
+            None => crate::schedule::artifact::seal_fresh_capture(capture),
+        }
+        .map_err(|error| ReplayError::Corrupt(error.to_string()))
     }
 
     /// Builds one graph-independent Llama-orientation quantized linear
