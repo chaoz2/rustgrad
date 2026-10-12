@@ -69,7 +69,7 @@ impl ProgramWire {
         })
     }
 
-    fn validate_format_inventory(&self) -> Result<()> {
+    pub(super) fn validate_format_inventory(&self) -> Result<()> {
         if self.format_version == LEGACY_FORMAT_VERSION {
             if self.metal.is_some() || !matches!(&self.optimizer, OptimizerPolicyWire::AdamW { .. })
             {
@@ -154,17 +154,29 @@ impl ProgramWire {
         let canonical = serde_json::to_vec(self)
             .map_err(|error| training(format!("compiled program artifact validation: {error}")))?;
         let captures = ProgramCaptures::decode(self)?;
-        self.validate_metal_host_policy(&captures)?;
-        let info = self.info(checksum(&canonical), &captures)?;
+        let info = self.validate_captures(checksum(&canonical), &captures)?;
+        Ok((info, captures))
+    }
+
+    // Imported bytes establish capture admission through the decoder above;
+    // the encoder's private producer bundle retains the exact immutable owners
+    // it serialized. Both paths still check every cross-wire policy/schema.
+    pub(super) fn validate_captures(
+        &self,
+        identity: u64,
+        captures: &ProgramCaptures,
+    ) -> Result<CompiledTrainingProgramArtifactInfo> {
+        self.validate_metal_host_policy(captures)?;
+        let info = self.info(identity, captures)?;
         validate_module_wire(&self.module, &self.frozen_parameters)?;
 
         self.validate_policy(&info)?;
         let main = self.validate_main(captures.main.as_ref())?;
-        self.validate_auxiliary_programs(&main, &captures)?;
+        self.validate_auxiliary_programs(&main, captures)?;
         self.validate_evaluation(captures.main.as_ref(), captures.evaluation.as_deref())?;
         self.validate_sibling_identities(&info)?;
         self.validate_optimizer_policy()?;
-        Ok((info, captures))
+        Ok(info)
     }
 
     fn optimizer(&self) -> CompiledTrainingOptimizer {

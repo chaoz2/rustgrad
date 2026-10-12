@@ -17,7 +17,7 @@ use self::wire_decode::{
     decode_auxiliary, decode_input_key_map, decode_key_map, decode_manifest,
     optimizer_resets_state, optimizer_state_schema, validate_phase_capture, zero_frontier,
 };
-use self::wire_encode::{module_wire, momentum_program_wire, program_wire};
+use self::wire_encode::{module_wire, momentum_program_wire, produced_program_artifact};
 
 const MAGIC: &[u8; 4] = b"RGAP";
 const LEGACY_FORMAT_VERSION: u8 = 1;
@@ -379,6 +379,32 @@ impl CompiledTrainingProgramArtifact {
             .as_ref()
             .zip(other.admitted.as_ref())
             .is_some_and(|(left, right)| Arc::ptr_eq(left, right))
+    }
+
+    #[cfg(test)]
+    pub(super) fn recurrent_capture_owners(&self) -> Vec<Arc<AuthenticatedRecurrentFrontier>> {
+        let captures = &self.admitted.as_ref().expect("admitted artifact").captures;
+        std::iter::once(captures.main.clone())
+            .chain(
+                [
+                    captures.accumulation.clone(),
+                    captures.partial_flush.clone(),
+                    captures.zero_grad.clone(),
+                ]
+                .into_iter()
+                .flatten(),
+            )
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn evaluation_capture_owner(&self) -> Option<Arc<CapturedSchedule>> {
+        self.admitted
+            .as_ref()
+            .expect("admitted artifact")
+            .captures
+            .evaluation
+            .clone()
     }
 }
 
@@ -907,25 +933,7 @@ impl ProgramCaptures {
             .and_then(|metal| metal.evaluation.as_ref())
             .map(|recipe| Self::decode_metal_recipe(recipe))
             .transpose()?;
-        let metal_main_recurrent = metal_main
-            .clone()
-            .map(|recipe| CompiledRecurrentCapture::from_artifact(main.capture(), Some(recipe)))
-            .transpose()?;
-        let metal_partial_flush_recurrent = metal_partial_flush
-            .clone()
-            .zip(partial_flush.as_ref())
-            .map(|(recipe, frontier)| {
-                CompiledRecurrentCapture::from_artifact(frontier.capture(), Some(recipe))
-            })
-            .transpose()?;
-        let metal_evaluation_capture = metal_evaluation
-            .clone()
-            .zip(evaluation.as_ref())
-            .map(|(recipe, capture)| {
-                CompiledEvaluationCapture::from_artifact(capture.clone(), Some(recipe))
-            })
-            .transpose()?;
-        Ok(Self {
+        Self {
             main,
             accumulation,
             partial_flush,
@@ -934,10 +942,40 @@ impl ProgramCaptures {
             metal_main,
             metal_partial_flush,
             metal_evaluation,
-            metal_main_recurrent,
-            metal_partial_flush_recurrent,
-            metal_evaluation_capture,
-        })
+            metal_main_recurrent: None,
+            metal_partial_flush_recurrent: None,
+            metal_evaluation_capture: None,
+        }
+        .with_metal_wrappers()
+    }
+
+    // Recipe/capture agreement remains independently checked even when both
+    // came from the same producer. No stateful source-plan wrapper is retained.
+    fn with_metal_wrappers(mut self) -> Result<Self> {
+        self.metal_main_recurrent = self
+            .metal_main
+            .clone()
+            .map(|recipe| {
+                CompiledRecurrentCapture::from_artifact(self.main.capture(), Some(recipe))
+            })
+            .transpose()?;
+        self.metal_partial_flush_recurrent = self
+            .metal_partial_flush
+            .clone()
+            .zip(self.partial_flush.as_ref())
+            .map(|(recipe, frontier)| {
+                CompiledRecurrentCapture::from_artifact(frontier.capture(), Some(recipe))
+            })
+            .transpose()?;
+        self.metal_evaluation_capture = self
+            .metal_evaluation
+            .clone()
+            .zip(self.evaluation.as_ref())
+            .map(|(recipe, capture)| {
+                CompiledEvaluationCapture::from_artifact(capture.clone(), Some(recipe))
+            })
+            .transpose()?;
+        Ok(self)
     }
 }
 
@@ -972,6 +1010,15 @@ fn encode(wire: &ProgramWire) -> Result<Vec<u8>> {
     bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(&checksum(&bytes).to_le_bytes());
     Ok(bytes)
+}
+
+// The encoder above guarantees the header/trailer bounds. Identity hashes
+// exactly its serialized payload, without rebuilding the wire or imposing
+// another payload hash on the independent momentum-SGD encoding path.
+fn encode_with_identity(wire: &ProgramWire) -> Result<(Vec<u8>, u64)> {
+    let bytes = encode(wire)?;
+    let identity = checksum(&bytes[13..bytes.len() - 8]);
+    Ok((bytes, identity))
 }
 
 fn decode(bytes: &[u8]) -> Result<ProgramWire> {
@@ -1041,9 +1088,7 @@ impl<M: Module> CompiledModuleTrainingPlan<M, CompiledAdamWPlan, Option<u64>> {
     /// Serializes the resource-free executable plan separately from tensor state.
     pub fn program_artifact(&self) -> Result<CompiledAdamWProgramArtifact> {
         self.validate_ready_for_preparation()?;
-        let wire = program_wire(self)?;
-        let bytes = encode(&wire)?;
-        CompiledAdamWProgramArtifact::from_bytes(bytes)
+        produced_program_artifact(self)
     }
 
     /// Restores a differently initialized owned module from one executable
