@@ -28,6 +28,86 @@ fn recursive_reference(root: &UOp) -> Result<Vec<UOp>, UOpError> {
     Ok(out)
 }
 
+#[test]
+fn rewrite_ids_match_structural_equality_for_dynamic_dags() {
+    let ty = UType::scalar(DType::I32);
+    let first = UOp::constant(1, ty);
+    let second = UOp::constant(2, ty);
+    let mut nodes = vec![
+        first.clone(),
+        UOp::constant(1, ty),
+        second.clone(),
+        UOp::constant(1, UType::scalar(DType::I64)),
+        first.retag(Some(UOpTag::Int(7))),
+        first.retag(Some(UOpTag::Tuple(vec![
+            UOpTag::Text("rewrite".into()),
+            UOpTag::Int(7),
+        ]))),
+        UOp::binary(Binary::Add, first.clone(), second.clone()),
+        UOp::binary(Binary::Add, second, first),
+    ];
+    nodes.extend(
+        [0, 0x8000_0000, 0x7fc0_1234, 0x7fc0_5678]
+            .map(|bits| UOp::scalar_constant(DType::F32, bits, UType::scalar(DType::F32))),
+    );
+    // Ordered children, sharing, and independently allocated equal copies
+    // enter the owner incrementally, as callback results do during rewriting.
+    for index in 0..48 {
+        let left = nodes[index % nodes.len()].clone();
+        let right = nodes[(index * 7 + 1) % nodes.len()].clone();
+        let node = UOp::from_operation(Operation::Binary(Binary::Add), Some(ty), vec![left, right]);
+        let equal =
+            UOp::from_operation(node.operation().clone(), node.ty(), node.sources().to_vec());
+        nodes.extend([node, equal]);
+    }
+    let mut ids = RewriteNodeIds::default();
+    for left in &nodes {
+        for right in &nodes {
+            assert_eq!(
+                ids.id(left).unwrap() == ids.id(right).unwrap(),
+                left == right
+            );
+        }
+    }
+    assert!(!ids.same_sources(&nodes[..1], &nodes[..2]).unwrap());
+    assert!(ids.same_sources(&nodes[..1], &nodes[1..2]).unwrap());
+    assert!(!ids.same_sources(&nodes[..1], &nodes[2..3]).unwrap());
+}
+
+#[test]
+fn rewrite_allocation_cache_authenticates_weak_owners_and_releases_them() {
+    let ty = UType::scalar(DType::I32);
+    let representative = UOp::constant(7, ty);
+    let representative_weak = Arc::downgrade(&representative.0);
+    let equal = UOp::constant(7, ty);
+    let expired = Arc::downgrade(&equal.0);
+    let live = UOp::constant(8, ty);
+    let live_weak = Arc::downgrade(&live.0);
+    {
+        let mut ids = RewriteNodeIds::default();
+        let seven = ids.id(&representative).unwrap();
+        assert_eq!(ids.id(&equal).unwrap(), seven);
+        drop(equal);
+        assert!(expired.upgrade().is_none());
+        // Simulate address reuse without relying on allocator timing. Neither
+        // an expired token nor a different live owner may answer this lookup.
+        ids.allocations
+            .insert(live.node_identity(), (expired.clone(), seven));
+        assert!(ids.cached(&live).is_none());
+        ids.allocations
+            .insert(live.node_identity(), (representative_weak.clone(), seven));
+        assert!(ids.cached(&live).is_none());
+        assert_ne!(ids.id(&live).unwrap(), seven);
+        drop(representative);
+        drop(live);
+        assert!(representative_weak.upgrade().is_some());
+        assert!(live_weak.upgrade().is_some());
+    }
+    assert!(representative_weak.upgrade().is_none());
+    assert!(live_weak.upgrade().is_none());
+    assert!(expired.upgrade().is_none());
+}
+
 fn assert_reference_order(root: &UOp) {
     let expected = recursive_reference(root).unwrap();
     let actual = topological(root).unwrap();

@@ -3103,6 +3103,22 @@ capture behavior are unchanged. Built-in constant identities use this path to
 avoid entering source matching when no direct constant exists. This is Rust's
 compiled dispatch metadata, not another operation kind or serialized matcher IR.
 
+Its memo, active-recursion set, convergence set, and equality checks use private
+call-local structural IDs from `uop/traversal.rs`. Ordered canonical keys retain
+the complete operation, result type, ordered child IDs, and tag. The dynamic
+allocation accelerator authenticates addresses with weak allocation owners;
+addresses alone never establish equality, including for short-lived callback
+results. IDs are never recycled during the call. One representative per distinct
+structure and weak control-block tokens for every observed allocation remain
+until the invocation ends, including callback-generated DAGs: retention is not
+bounded by the original root size, and this is not a peak-memory improvement
+claim. Keying performs no semantic admission and does not substitute canonical
+representatives into the returned DAG. Equal callback results and unchanged
+sources preserve their previous acceptance, trace, and allocation behavior;
+independent reduction ownership is still validated separately. An independent
+copy of the previous recursive-key driver checks both traversal orders, callback
+and capture ordering, error precedence, and schedule/capture identities.
+
 `rewrite_with_context` runs that same prepared matcher and shared-DAG traversal
 with one caller-owned mutable compiler context. Context is passed only after a
 complete capture candidate succeeds, so failed source/alternative/permutation

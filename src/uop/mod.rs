@@ -16,6 +16,7 @@ use std::{
     sync::Arc,
 };
 pub(crate) use traversal::CanonicalNodeTable;
+use traversal::{RewriteNodeId, RewriteNodeIds};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AddressSpace {
@@ -1878,6 +1879,10 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
     walk: Walk,
     context: &mut C,
 ) -> Result<(UOp, RewriteTrace), UOpError> {
+    #[cfg(test)]
+    if rewrite_key_tests::legacy_enabled() {
+        return rewrite_key_tests::recursive_driver(root, rules, walk, context);
+    }
     const STEP_LIMIT: usize = 128;
 
     rules.sort_by_key(|rule| rule.priority());
@@ -1888,41 +1893,51 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
             rule,
         })
         .collect::<Vec<_>>();
-    let mut trace = RewriteTrace { rules: vec![] };
-    let mut memo = BTreeMap::new();
-    let mut active = BTreeSet::new();
+    struct RewriteState {
+        memo: BTreeMap<RewriteNodeId, UOp>,
+        active: BTreeSet<RewriteNodeId>,
+        ids: RewriteNodeIds,
+        trace: RewriteTrace,
+    }
+    let mut state = RewriteState {
+        memo: BTreeMap::new(),
+        active: BTreeSet::new(),
+        ids: RewriteNodeIds::default(),
+        trace: RewriteTrace { rules: vec![] },
+    };
     fn go<C, R: RewriteRuleSpec<C>>(
         n: &UOp,
         r: &[PreparedRewriteRule<'_, R>],
         w: Walk,
-        m: &mut BTreeMap<UOp, UOp>,
-        active: &mut BTreeSet<UOp>,
-        t: &mut RewriteTrace,
+        state: &mut RewriteState,
         context: &mut C,
     ) -> Result<UOp, UOpError> {
-        if let Some(x) = m.get(n) {
+        let original = state.ids.id(n)?;
+        if let Some(x) = state.memo.get(&original) {
             return Ok(x.clone());
         }
-        if !active.insert(n.clone()) {
+        if !state.active.insert(original) {
             return Err(UOpError::RewriteCycle);
         }
 
         let mut x = n.clone();
+        let mut current = original;
         let mut seen = BTreeSet::new();
         for _ in 0..STEP_LIMIT {
-            if !seen.insert(x.clone()) {
-                active.remove(n);
+            if !seen.insert(current) {
+                state.active.remove(&original);
                 return Err(UOpError::RewriteCycle);
             }
-            let before = x.clone();
+            let before = current;
             if w == Walk::BottomUp {
                 let sources = x
                     .sources()
                     .iter()
-                    .map(|source| go(source, r, w, m, active, t, context))
+                    .map(|source| go(source, r, w, state, context))
                     .collect::<Result<Vec<_>, _>>()?;
-                if sources.as_slice() != x.sources() {
+                if !state.ids.same_sources(&sources, x.sources())? {
                     x = x.replace_sources(sources);
+                    current = state.ids.id(&x)?;
                 }
             }
 
@@ -1931,6 +1946,7 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
                     continue;
                 }
                 let mut next = None;
+                let mut key_error = None;
                 rule.rule
                     .pattern()
                     .visit_matches(&x, &Captures::default(), &mut |captures| match rule
@@ -1938,20 +1954,26 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
                         .apply(context, &captures, &x)
                     {
                         Some(candidate) => {
-                            if candidate != x {
-                                next = Some(candidate);
+                            match state.ids.id(&candidate) {
+                                Ok(id) if id != current => next = Some((candidate, id)),
+                                Ok(_) => {}
+                                Err(error) => key_error = Some(error),
                             }
                             true
                         }
                         None => false,
                     });
-                if let Some(next) = next {
+                if let Some(error) = key_error {
+                    return Err(error);
+                }
+                if let Some((next, id)) = next {
                     if !x.is_pure() || !next.is_pure() {
-                        active.remove(n);
+                        state.active.remove(&original);
                         return Err(UOpError::EffectRewrite);
                     }
-                    t.rules.push(rule.rule.name());
+                    state.trace.rules.push(rule.rule.name());
                     x = next;
+                    current = id;
                     break;
                 }
             }
@@ -1960,33 +1982,29 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
                 let sources = x
                     .sources()
                     .iter()
-                    .map(|source| go(source, r, w, m, active, t, context))
+                    .map(|source| go(source, r, w, state, context))
                     .collect::<Result<Vec<_>, _>>()?;
-                if sources.as_slice() != x.sources() {
+                if !state.ids.same_sources(&sources, x.sources())? {
                     x = x.replace_sources(sources);
+                    current = state.ids.id(&x)?;
                 }
             }
 
-            if x == before {
-                active.remove(n);
-                m.insert(n.clone(), x.clone());
+            if current == before {
+                state.active.remove(&original);
+                state.memo.insert(original, x.clone());
                 return Ok(x);
             }
         }
-        active.remove(n);
+        state.active.remove(&original);
         Err(UOpError::RewriteStepLimit)
     }
-    let x = go(
-        root,
-        &rules,
-        walk,
-        &mut memo,
-        &mut active,
-        &mut trace,
-        context,
-    )?;
-    Ok((x, trace))
+    let x = go(root, &rules, walk, &mut state, context)?;
+    Ok((x, state.trace))
 }
+
+#[cfg(test)]
+mod rewrite_key_tests;
 
 /// Produces the canonical pure scalar subexpressions used by schedule ABI and
 /// cache construction. Artifact decoding deliberately does not call this:
