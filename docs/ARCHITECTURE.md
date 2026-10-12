@@ -3011,6 +3011,23 @@ while decoded kernels retain it only through their local re-encoding boundary.
 An independent test-only released writer remains the byte/error oracle. No
 addresses, retained tables, or new identities enter public state or wire bytes.
 
+Accepted reduction-epilogue, scalar-alias, and Contiguous-redirection rehearsals
+retain that table in a private, non-cloneable `PreparedRehearsalKernel`. This is
+a closed graph-lowering boundary, not a claim that arbitrary UOp normalization
+is idempotent. Its projected addresses already use the rangeify canonicalizer;
+the applicable builtin address identities cannot expose another projected
+rewrite. Empty domains and reduction/control validation keep their existing
+rules. Original allocations are checked for tags before rewriting, because a
+tagged wrapper can disappear and enable a later normalization pass.
+Final item assembly consumes accepted owners in the existing redirection,
+scalar-alias, then epilogue priority and drops their sidecars per item. Ordinary
+and rejected fallback lowering still normalizes independently; final schedule
+validation, artifact decoding, and public schedule state are unchanged. A
+test-only previous-finalization oracle re-normalizes the retained root and
+compares captures, cache keys, source order, bindings, dependencies, and CPU
+results. The original-tag scan and temporarily retained rehearsal tables have
+allocation costs; no general speed or peak-memory improvement is claimed.
+
 Fresh recurrent-prefix sealing retains each successful kernel encoder's
 root-bound order alongside its canonical bytes through key and identity
 assignment. Structural authentication then borrows that same order for dense

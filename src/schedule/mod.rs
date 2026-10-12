@@ -14,6 +14,8 @@ pub mod execution_summary;
 mod identity;
 pub mod mixed;
 mod ownership;
+#[cfg(test)]
+mod rehearsal_tests;
 mod scalar_fallback;
 pub use execution_summary::{
     ExecutionPlanItemSummary, ExecutionPlanSummary, ExecutionPlanSummaryError,
@@ -1601,6 +1603,49 @@ fn portable_ordinary_kernel(order: &crate::uop::TopologicalOrder) -> bool {
     ptx.is_ok() && opencl.is_ok() && metal.is_ok() && webgpu.is_ok()
 }
 
+// This owner is constructed only from the three graph-lowering rehearsals
+// below. Their projected addresses are already canonical and tag-free; the
+// builtin rewrite pass cannot expose a later projected-index rewrite. Generic
+// UOp normalization is not idempotent and must not use this reuse boundary.
+struct PreparedRehearsalKernel {
+    table: crate::uop::CanonicalNodeTable,
+}
+
+impl PreparedRehearsalKernel {
+    fn from_graph_lowering(kernel: &UOp) -> Result<Self, crate::uop::UOpError> {
+        // Inspect the original allocations: a builtin rewrite can erase a
+        // tagged wrapper and enable projected normalization on a later pass.
+        let mut pending = vec![kernel];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node.node_identity()) {
+                continue;
+            }
+            if node.tag().is_some() {
+                return Err(crate::uop::UOpError::InvalidArgument);
+            }
+            pending.extend(node.sources());
+        }
+        let table = crate::uop::normalize_kernel_with_table(kernel)?;
+        Ok(Self { table })
+    }
+
+    fn order(&self) -> &crate::uop::TopologicalOrder {
+        self.table.order()
+    }
+
+    fn into_table(self) -> crate::uop::CanonicalNodeTable {
+        #[cfg(test)]
+        {
+            rehearsal_tests::finalize(self.table)
+        }
+        #[cfg(not(test))]
+        {
+            self.table
+        }
+    }
+}
+
 /// One rehearsed Contiguous ownership rewrite. The exact loaded graph nodes
 /// come from the accepted Sink, not from the pre-rewrite movement inventory;
 /// this keeps descriptor/dependency discovery aligned after the producer root
@@ -1608,13 +1653,13 @@ fn portable_ordinary_kernel(order: &crate::uop::TopologicalOrder) -> bool {
 struct ContiguousRedirection {
     producer: usize,
     load_nodes: BTreeSet<usize>,
-    kernel: UOp,
+    kernel: PreparedRehearsalKernel,
 }
 
 struct ScalarAliasFusion {
     removed_roots: BTreeSet<usize>,
     load_nodes: BTreeSet<usize>,
-    kernel: UOp,
+    kernel: PreparedRehearsalKernel,
 }
 
 /// One rehearsed reduction plus scalar epilogue. The final normalized Sink is
@@ -1622,7 +1667,7 @@ struct ScalarAliasFusion {
 /// graph-only ownership probe considered inlineable.
 struct ReductionEpilogueFusion {
     load_nodes: BTreeSet<usize>,
-    kernel: UOp,
+    kernel: PreparedRehearsalKernel,
 }
 
 /// One graph-eligible fusion root and its reusable immutable edge analysis.
@@ -1664,8 +1709,8 @@ fn rehearse_reduction_epilogue(
         &materialized,
     )
     .ok()?;
-    let order = crate::uop::normalize_kernel_with_order(&kernel).ok()?;
-    let kernel = order.root().clone();
+    let prepared = PreparedRehearsalKernel::from_graph_lowering(&kernel).ok()?;
+    let order = prepared.order();
     let topology = order.nodes();
     let mut load_nodes = BTreeSet::new();
     for value in topology {
@@ -1691,7 +1736,10 @@ fn rehearse_reduction_epilogue(
         }
         load_nodes.insert(loaded);
     }
-    (!load_nodes.contains(&reduction)).then_some(ReductionEpilogueFusion { load_nodes, kernel })
+    (!load_nodes.contains(&reduction)).then_some(ReductionEpilogueFusion {
+        load_nodes,
+        kernel: prepared,
+    })
 }
 
 #[derive(Default)]
@@ -1898,15 +1946,16 @@ fn checked_scalar_sink(
     kernel: UOp,
     materialized: &BTreeSet<usize>,
     removed: &BTreeSet<usize>,
-) -> Result<Option<(UOp, BTreeSet<usize>)>, ScheduleError> {
+) -> Result<Option<(PreparedRehearsalKernel, BTreeSet<usize>)>, ScheduleError> {
     // This is an optimization rehearsal, not the authoritative lowering of
     // the graph. An affine projection can be individually valid while making
     // one trial Index incompatible with the scalar owner's iteration domain.
     // Preserve the explicit materialization boundary in that case; the
     // ordinary fallback is lowered and validated independently below.
-    let Ok(order) = crate::uop::normalize_kernel_with_order(&kernel) else {
+    let Ok(prepared) = PreparedRehearsalKernel::from_graph_lowering(&kernel) else {
         return Ok(None);
     };
+    let order = prepared.order();
     let kernel = order.root().clone();
     let topology = order.nodes();
     let stores = topology
@@ -1971,10 +2020,10 @@ fn checked_scalar_sink(
         }
         load_nodes.insert(loaded);
     }
-    if !portable_ordinary_kernel(&order) {
+    if !portable_ordinary_kernel(order) {
         return Ok(None);
     }
-    Ok(Some((kernel, load_nodes)))
+    Ok(Some((prepared, load_nodes)))
 }
 
 fn graph_node_uses(graph: &Graph, output: NodeId, target: NodeId) -> Result<usize, ScheduleError> {
@@ -2118,7 +2167,7 @@ fn rehearse_scalar_alias_fusion(
     roots: &BTreeSet<usize>,
     external: &BTreeSet<usize>,
     removed: &BTreeSet<usize>,
-) -> Result<Option<(UOp, BTreeSet<usize>)>, ScheduleError> {
+) -> Result<Option<(PreparedRehearsalKernel, BTreeSet<usize>)>, ScheduleError> {
     let materialized = scalar_alias_materialized(output, roots, external, removed);
     let lowered = match graph.op(output).map_err(ScheduleError::Graph)? {
         Op::Reduce { .. } => {
@@ -2342,9 +2391,10 @@ fn checked_contiguous_redirection(
     // Redirection is optional. If its rehearsed scalar index domain is not
     // valid, retain the producer plus movement item; their normal lowering
     // remains the authoritative validation path.
-    let Ok(order) = crate::uop::normalize_kernel_with_order(&kernel) else {
+    let Ok(prepared) = PreparedRehearsalKernel::from_graph_lowering(&kernel) else {
         return Ok(None);
     };
+    let order = prepared.order();
     let kernel = order.root().clone();
     let topology = order.nodes();
     let stores = topology
@@ -2433,13 +2483,13 @@ fn checked_contiguous_redirection(
         }
         load_nodes.insert(loaded);
     }
-    if !portable_ordinary_kernel(&order) {
+    if !portable_ordinary_kernel(order) {
         return Ok(None);
     }
     Ok(Some(ContiguousRedirection {
         producer: producer.index(),
         load_nodes,
-        kernel,
+        kernel: prepared,
     }))
 }
 
@@ -3030,7 +3080,7 @@ fn schedule_many_with_external(
         .chain(movement_operands.iter().copied())
         .collect::<BTreeSet<_>>();
     let mut scalar_alias_reserved = epilogue_reserved;
-    let scalar_alias_fusions = if policy.redirect_contiguous {
+    let mut scalar_alias_fusions = if policy.redirect_contiguous {
         let mut fallback_rehearsals =
             OrdinaryScalarFallbackRehearsals::new(graph, &roots, &external);
         // Proposal acceptance and ordinary fallback are both load-bearing.
@@ -3128,6 +3178,10 @@ fn schedule_many_with_external(
     for redirection in contiguous_redirections.values() {
         roots.remove(&redirection.producer);
     }
+    // A redirected producer no longer owns a final item. Release any earlier
+    // accepted rehearsal's edge sidecar before assembling the surviving roots.
+    scalar_alias_fusions.retain(|root, _| roots.contains(root));
+    fused_epilogues.retain(|root, _| roots.contains(root));
 
     let mut node_to_item: std::collections::BTreeMap<usize, u64> = roots
         .iter()
@@ -3142,19 +3196,19 @@ fn schedule_many_with_external(
     let mut items = Vec::with_capacity(roots.len());
     for &index in &roots {
         let node = NodeId::from_index(index);
-        let redirection = contiguous_redirections.get(&index);
-        let alias_fusion = scalar_alias_fusions.get(&index);
-        let mut leaf_ids = match (redirection, alias_fusion) {
+        let redirection = contiguous_redirections.remove(&index);
+        let alias_fusion = scalar_alias_fusions.remove(&index);
+        let epilogue_fusion = fused_epilogues.remove(&index);
+        let mut leaf_ids = match (redirection.as_ref(), alias_fusion.as_ref()) {
             (Some(value), _) => value.load_nodes.clone(),
             (None, Some(value)) => value.load_nodes.clone(),
-            (None, None) => fused_epilogues
-                .get(&index)
+            (None, None) => epilogue_fusion
+                .as_ref()
                 .map(|value| value.load_nodes.clone())
                 .unwrap_or_default(),
         };
         let mut boundary = None;
-        if redirection.is_none() && alias_fusion.is_none() && !fused_epilogues.contains_key(&index)
-        {
+        if redirection.is_none() && alias_fusion.is_none() && epilogue_fusion.is_none() {
             match crate::MovementKernelPlan::from_scheduled_graph(graph, node) {
                 Ok(plan) => {
                     // Movement kernels can bypass observable graph-view roots.
@@ -3194,13 +3248,13 @@ fn schedule_many_with_external(
         let paired_output = sort_sibling(graph, node)?
             .map(|sibling| buffer(graph, sibling, false))
             .transpose()?;
+        let prepared = redirection
+            .map(|value| value.kernel)
+            .or_else(|| alias_fusion.map(|value| value.kernel))
+            .or_else(|| epilogue_fusion.map(|value| value.kernel));
         let kernel = if boundary.is_none() {
-            if let Some(redirection) = contiguous_redirections.get(&index) {
-                redirection.kernel.clone()
-            } else if let Some(fusion) = scalar_alias_fusions.get(&index) {
-                fusion.kernel.clone()
-            } else if let Some(fusion) = fused_epilogues.get(&index) {
-                fusion.kernel.clone()
+            if let Some(prepared) = &prepared {
+                prepared.order().root().clone()
             } else {
                 match graph.op(node).map_err(ScheduleError::Graph)? {
                     Op::Random { .. } => crate::kernel::lower_graph_random(graph, node)
@@ -3267,12 +3321,13 @@ fn schedule_many_with_external(
         } else {
             UOp::sink(vec![])
         };
-        let kernel_table =
-            if boundary.is_none() && matches!(kernel.operation(), crate::Operation::Sink) {
-                crate::uop::normalize_kernel_with_table(&kernel).map_err(ScheduleError::UOp)?
-            } else {
-                crate::uop::CanonicalNodeTable::new(&kernel).map_err(ScheduleError::UOp)?
-            };
+        let kernel_table = if let Some(prepared) = prepared {
+            prepared.into_table()
+        } else if boundary.is_none() && matches!(kernel.operation(), crate::Operation::Sink) {
+            crate::uop::normalize_kernel_with_table(&kernel).map_err(ScheduleError::UOp)?
+        } else {
+            crate::uop::CanonicalNodeTable::new(&kernel).map_err(ScheduleError::UOp)?
+        };
         let kernel_order = kernel_table.order();
         let kernel = kernel_order.root().clone();
         for (buffer, view) in common_buffer_views(kernel_order.nodes()) {
