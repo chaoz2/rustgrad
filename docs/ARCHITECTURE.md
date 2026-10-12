@@ -3103,21 +3103,20 @@ capture behavior are unchanged. Built-in constant identities use this path to
 avoid entering source matching when no direct constant exists. This is Rust's
 compiled dispatch metadata, not another operation kind or serialized matcher IR.
 
-Its memo, active-recursion set, convergence set, and equality checks use private
-call-local structural IDs from `uop/traversal.rs`. Ordered canonical keys retain
-the complete operation, result type, ordered child IDs, and tag. The dynamic
-allocation accelerator authenticates addresses with weak allocation owners;
-addresses alone never establish equality, including for short-lived callback
-results. IDs are never recycled during the call. One representative per distinct
-structure and weak control-block tokens for every observed allocation remain
-until the invocation ends, including callback-generated DAGs: retention is not
-bounded by the original root size, and this is not a peak-memory improvement
-claim. Keying performs no semantic admission and does not substitute canonical
-representatives into the returned DAG. Equal callback results and unchanged
-sources preserve their previous acceptance, trace, and allocation behavior;
-independent reduction ownership is still validated separately. An independent
-copy of the previous recursive-key driver checks both traversal orders, callback
-and capture ordering, error precedence, and schedule/capture identities.
+Its memo, active-recursion set, and convergence set retain structural `UOp`
+keys. `UOp::Ord` returns `Equal` immediately for the same immutable Arc allocation;
+distinct allocations follow the unchanged derived `UOpNode` field order:
+operation, type, recursively ordered sources, then tag. Addresses never order
+nodes or contribute to equality, hashes, or artifact identities. This avoids a
+rewrite-only interner and its allocation-token/representative inventory; the
+existing closed-DAG canonical traversal and encoding tables remain separate.
+Memo keys/results live until the call ends, while each node's convergence keys
+release when its rewrite finishes. Independent deep comparisons retain the
+released recursive resource boundary: this is not an unbounded-depth or
+peak-memory guarantee. Matching, callback timing, traces, source allocation
+retention, and reduction ownership validation are unchanged. A field-recursive
+comparator oracle bypasses the shortcut in the previous driver, traversal,
+ordered-container, and schedule/capture acceptance tests.
 
 `rewrite_with_context` runs that same prepared matcher and shared-DAG traversal
 with one caller-owned mutable compiler context. Context is passed only after a
