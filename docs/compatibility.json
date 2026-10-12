@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:2bd371aeba5e49e4",
+  "source_fingerprint": "fnv1a64:bc9a31037f782970",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -766,6 +766,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "The dependency-free `viz` facade normalizes every current typed Graph Op family, compile/realization/CUDA/captured-specialization/native-mixed replay traces, Schedule/CapturedSchedule DAGs, shared UOp DAGs, and Linear/MemorySpace/Vector plans into a validated canonical model with stable DOT rendering. It does not invoke Graphviz, retain live runtime objects, or claim event-timed runtime launch profiling."
+      }
+    },
+    {
+      "section": "Tooling and release quality",
+      "subject_header": "Capability",
+      "subject": "Compiled Transformer construction profiling",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "The maintained scale example's `compile-only` mode constructs and inspects the same fixed two-block AdamW plan, including accumulation, partial flush, zero-grad and evaluation, then exits before target preparation or replay. Linux CI validates its bounded JSON workload/identity/count contract. The manual-only protected `native-transformer-compile-profile` workflow binds an exact reviewed SHA and debug-info release executable to runner-local Callgrind instruction counts, raw call graphs, inclusive/exclusive annotations and hashed provenance. Its bounded validator rejects malformed or empty profiles and preserves create-new manifest publication. Scope includes initialization, compilation, inspection and teardown; instruction counts are not ordinary wall-clock timings, speedup evidence, native replay, or accelerator profiling. Profiler-dependent evidence requires a successful exact-SHA manual run."
       }
     },
     {
