@@ -1,6 +1,7 @@
-use super::{TopologicalOrder, UOp, UOpError};
+use super::{TopologicalOrder, UOp, UOpError, UOpNode};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry};
+use std::sync::{Arc, Weak};
 
 /// Child IDs make equality shallow while preserving every field of UOpNode.
 /// The representative retains payload ownership without copying large plans.
@@ -37,6 +38,87 @@ impl Eq for NodeKey {}
 enum Frame {
     Enter(UOp),
     Finish(UOp),
+}
+
+/// Equality-only identities for one rewrite invocation, not allocation IDs or
+/// semantic admission. They never select a replacement UOp representative.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct RewriteNodeId(usize);
+
+/// Dynamic rewrite results can outlive the original input DAG. Weak tokens
+/// pin every observed allocation's control block, while canonical keys retain
+/// one representative per complete structure. Both owners drop with the call.
+#[derive(Default)]
+pub(super) struct RewriteNodeIds {
+    allocations: HashMap<usize, (Weak<UOpNode>, RewriteNodeId)>,
+    canonical: BTreeMap<NodeKey, RewriteNodeId>,
+}
+
+impl RewriteNodeIds {
+    fn cached(&self, node: &UOp) -> Option<RewriteNodeId> {
+        let (allocation, id) = self.allocations.get(&node.node_identity())?;
+        allocation
+            .upgrade()
+            .filter(|owner| Arc::ptr_eq(owner, &node.0))
+            .map(|_| *id)
+    }
+
+    pub(super) fn id(&mut self, root: &UOp) -> Result<RewriteNodeId, UOpError> {
+        if let Some(id) = self.cached(root) {
+            return Ok(id);
+        }
+        let mut pending = vec![Frame::Enter(root.clone())];
+        let mut active = BTreeSet::new();
+        while let Some(frame) = pending.pop() {
+            match frame {
+                Frame::Enter(node) => {
+                    if self.cached(&node).is_some() {
+                        continue;
+                    }
+                    if !active.insert(node.node_identity()) {
+                        return Err(UOpError::Cycle);
+                    }
+                    pending.push(Frame::Finish(node.clone()));
+                    pending.extend(node.sources().iter().rev().cloned().map(Frame::Enter));
+                }
+                Frame::Finish(node) => {
+                    let sources = node
+                        .sources()
+                        .iter()
+                        .map(|source| {
+                            self.cached(source)
+                                .map(|id| id.0)
+                                .ok_or(UOpError::UseBeforeDefinition)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let next = RewriteNodeId(self.canonical.len());
+                    let id = *self
+                        .canonical
+                        .entry(NodeKey {
+                            representative: node.clone(),
+                            sources,
+                        })
+                        .or_insert(next);
+                    self.allocations
+                        .insert(node.node_identity(), (Arc::downgrade(&node.0), id));
+                    active.remove(&node.node_identity());
+                }
+            }
+        }
+        self.cached(root).ok_or(UOpError::UseBeforeDefinition)
+    }
+
+    pub(super) fn same_sources(&mut self, lhs: &[UOp], rhs: &[UOp]) -> Result<bool, UOpError> {
+        if lhs.len() != rhs.len() {
+            return Ok(false);
+        }
+        for (lhs, rhs) in lhs.iter().zip(rhs) {
+            if self.id(lhs)? != self.id(rhs)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// Encoding-only adjacency for the canonical first representatives.
