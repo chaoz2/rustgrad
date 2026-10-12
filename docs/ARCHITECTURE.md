@@ -3046,6 +3046,14 @@ is bounded by retained candidate records and actual distinct `(node, shape)`
 queries; the latter can be quadratic in graph size. No global memo, wire or
 cache-identity change, speedup, or peak-memory improvement is claimed.
 
+Rangeify computes checked suffix products before constructing dense identity
+seeds or quotient/remainder coordinates. Checked numel alone is insufficient:
+a leading zero can hide an overflowing suffix stride. Identity seeds also
+check conversion into the signed affine-address representation. Malformed
+layouts return `RangeifyError::Invalid` instead of panicking during discovery;
+the scheduler still independently validates the eventual producer kernel.
+Representable scalar, empty, and nonempty maps retain their existing layouts.
+
 Fresh recurrent-prefix sealing retains each successful kernel encoder's
 root-bound order alongside its canonical bytes through key and identity
 assignment. Structural authentication then borrows that same order for dense
