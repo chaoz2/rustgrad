@@ -933,6 +933,7 @@ pub(crate) fn projected_source(
     projection_for_output(graph, node, output_shape).map(|projection| projection.source)
 }
 
+#[cfg(test)]
 pub(crate) fn predicated_source(
     graph: &Graph,
     node: NodeId,
