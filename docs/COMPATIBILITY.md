@@ -6,6 +6,13 @@ Status: ✅ verified · 🚧 partial · ⬜ not started · 🚫 user-approved ex
 
 Validation note: reduction semantics are covered by RustGrad regressions against the checked-in tinygrad implementation and tests. A live tinygrad differential run is still unavailable in this workspace because tinygrad reports no usable device; this is an environment-validation gap, not an unimplemented reduction semantic.
 
+## Native Windows and single-device CUDA validation
+
+| Capability | Status | Acceptance requirement |
+|---|---:|---|
+| Windows C11 library ownership | 🚧 | Private platform loader uses UTF-16 LoadLibraryW, GetProcAddress, and FreeLibrary; MinGW gcc generates platform-suffixed single-kernel and schedule-module libraries. Missing-library rejection and a Unicode-path load/call/missing-symbol/unload regression accompany the existing native CPU tests. This is not an MSVC C compiler contract or a claim that every default test is Windows-portable. |
+| Native single-device CUDA acceptance | 🚧 | Opt-in tests/cuda_live.rs compares native prepared-graph F32 square/broadcast/axis-sum replay and shape-rejection retry with the CPU oracle; F32 serial/tiled/broadcast/K=0/empty matmul and exact-fixture F16/BF16 tensor-core replay share that native path. CUDA JIT option IDs and scalar void-pointer values follow the Driver ABI, PTX headers match the admitted target version, pointer parameters have a namespace separate from scratch registers, and matmul emits width-correct indices and valid shared-memory/kernel directives. See docs/CUDA_LIVE.md for commands, numerical tolerances, and evidence boundaries. Broader operations, devices, collectives, CUDA training, and performance remain unclaimed. |
+
 ## Multi-device collectives
 
 | Capability | Status | Acceptance requirement |

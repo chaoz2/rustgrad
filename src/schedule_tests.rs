@@ -2174,7 +2174,7 @@ fn projected_permute_reshape_reads_feed_elementwise_and_typed_sum() {
         .unwrap()
         .render(&many_item.kernel)
         .unwrap();
-    assert!(ptx.source.contains("ld.param.u64 %rd100, [p9]"));
+    assert!(ptx.source.contains("ld.param.u64 %rgb10, [p9]"));
     assert!(ptx.source.contains("%rgi0"));
 
     let mut raw = Graph::new();

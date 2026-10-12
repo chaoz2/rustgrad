@@ -11,7 +11,7 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
-    ffi::{CString, c_char, c_int, c_void},
+    ffi::{CString, c_int, c_void},
     fmt, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -21,8 +21,10 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod library;
 #[path = "cpu_jit_random.rs"]
 mod random;
+use library::Library;
 mod render_policy;
 mod schedule_module;
 mod store_group;
@@ -51,7 +53,10 @@ const MOVEMENT_RENDERER_VERSION: &str = "rustgrad-c11-movement-v2";
 const STATIC_POSITION_RENDERER_VERSION: &str = "rustgrad-c11-static-position-v1";
 const THREEFRY_RENDERER_VERSION: &str = "rustgrad-c11-live-threefry-v1";
 pub const ABI_VERSION: u32 = 2;
+#[cfg(not(windows))]
 const C11_COMPILER_COMMAND: &str = "cc";
+#[cfg(windows)]
+const C11_COMPILER_COMMAND: &str = "gcc";
 // This historical combined flag identity remains part of every durable native
 // cache key. Schedule-module construction may split compilation and linking,
 // but the final library retains the same semantic artifact identity.
@@ -5449,11 +5454,7 @@ fn compile_cached_under_gate(r: &RenderedC) -> Result<PathBuf, JitError> {
     let lib = d.join(format!(
         "{}.{}",
         r.cache_key,
-        if cfg!(target_os = "macos") {
-            "dylib"
-        } else {
-            "so"
-        }
+        std::env::consts::DLL_EXTENSION
     ));
     match fs::symlink_metadata(&lib) {
         Ok(metadata) if metadata.file_type().is_file() => return Ok(lib),
@@ -5494,7 +5495,11 @@ fn compile_cached_under_gate(r: &RenderedC) -> Result<PathBuf, JitError> {
                     .collect(),
             });
         }
-        fs::File::open(&temp)
+        // Windows FlushFileBuffers requires a writable handle. This temporary
+        // compiler artifact is owned by this invocation and is not truncated.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)
             .and_then(|file| file.sync_all())
             .map_err(|e| JitError::Io(e.to_string()))?;
         match fs::rename(&temp, &lib) {
@@ -5522,27 +5527,6 @@ fn evict_cached_library(path: &Path) -> Result<(), JitError> {
     }
     fs::remove_file(path).map_err(|error| JitError::Io(error.to_string()))
 }
-struct Library(*mut c_void);
-unsafe impl Send for Library {}
-unsafe impl Sync for Library {}
-impl Library {
-    fn open(p: &Path) -> Result<Self, JitError> {
-        let s = CString::new(p.to_string_lossy().as_bytes())
-            .map_err(|e| JitError::Loader(e.to_string()))?;
-        let h = unsafe { dlopen(s.as_ptr(), 2) };
-        if h.is_null() {
-            return Err(JitError::Loader(last_error()));
-        }
-        Ok(Self(h))
-    }
-    unsafe fn symbol<T: Copy>(&self, n: &[u8]) -> Result<T, JitError> {
-        let p = unsafe { dlsym(self.0, n.as_ptr().cast()) };
-        if p.is_null() {
-            return Err(JitError::Loader(last_error()));
-        }
-        Ok(unsafe { std::mem::transmute_copy(&p) })
-    }
-}
 fn load_library_call(
     path: &Path,
 ) -> Result<
@@ -5555,29 +5539,6 @@ fn load_library_call(
     let lib = Arc::new(Library::open(path)?);
     let call = unsafe { lib.symbol(b"rustgrad_kernel\0")? };
     Ok((lib, call))
-}
-impl Drop for Library {
-    fn drop(&mut self) {
-        unsafe {
-            dlclose(self.0);
-        }
-    }
-}
-unsafe extern "C" {
-    fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
-    fn dlsym(h: *mut c_void, n: *const c_char) -> *mut c_void;
-    fn dlclose(h: *mut c_void) -> c_int;
-    fn dlerror() -> *const c_char;
-}
-fn last_error() -> String {
-    unsafe {
-        let p = dlerror();
-        if p.is_null() {
-            "unknown loader error".into()
-        } else {
-            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -7230,14 +7191,7 @@ mod tests {
             entry.cache_key = format!("{}-schedule-module-test-{index}", entry.cache_key);
         }
         let cache_key = schedule_module_cache_key(&rendered);
-        let path = cache_dir().join(format!(
-            "{cache_key}.{}",
-            if cfg!(target_os = "macos") {
-                "dylib"
-            } else {
-                "so"
-            }
-        ));
+        let path = cache_dir().join(format!("{cache_key}.{}", std::env::consts::DLL_EXTENSION));
         let _ = std::fs::remove_file(&path);
 
         let (kernels, dispatcher, cold) = JitKernel::load_schedule_module(&rendered).unwrap();
@@ -7446,6 +7400,9 @@ mod tests {
         );
         assert_eq!(dispatcher.invocation_count(), 4);
         assert!(scratch.is_empty());
+        // Windows keeps a DLL locked until every owning dispatcher/kernel
+        // reference is released; retire both before deleting the fixture.
+        drop(dispatcher);
         drop(kernels);
 
         let (restored, _, warm) = JitKernel::load_schedule_module(&rendered).unwrap();
@@ -7627,14 +7584,7 @@ mod tests {
         rendered.cache_key = format!("{}-concurrent-corruption-retry", rendered.cache_key);
         let rendered = vec![rendered];
         let cache_key = schedule_module_cache_key(&rendered);
-        let path = cache_dir().join(format!(
-            "{cache_key}.{}",
-            if cfg!(target_os = "macos") {
-                "dylib"
-            } else {
-                "so"
-            }
-        ));
+        let path = cache_dir().join(format!("{cache_key}.{}", std::env::consts::DLL_EXTENSION));
         std::fs::create_dir_all(cache_dir()).unwrap();
         std::fs::write(&path, b"not a shared module").unwrap();
 
