@@ -51,7 +51,7 @@ pub(super) fn render(
     let count_bytes = portable.axis_len().max(1) * 4;
     let mut lines = vec![
         format!("// {PTX_PORTABLE_SORT_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         String::new(),

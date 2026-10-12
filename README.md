@@ -204,6 +204,7 @@ See:
 - [Compatibility and evidence](docs/COMPATIBILITY.md)
 - [Fuzzing and replay](docs/FUZZING.md)
 - [Contributing](CONTRIBUTING.md)
+- [Opt-in native CUDA acceptance](docs/CUDA_LIVE.md)
 
 GitHub Actions is the release gate for formatting, compilation, Clippy, the
 compatibility manifest, Linux and macOS tests, and sanitizer coverage.

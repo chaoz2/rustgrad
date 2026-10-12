@@ -589,14 +589,7 @@ pub(super) fn compile_cached_schedule_module_under_gate(
     let cache_key = schedule_module_cache_key(rendered);
     let directory = cache_dir();
     fs::create_dir_all(&directory).map_err(|error| JitError::Io(error.to_string()))?;
-    let library = directory.join(format!(
-        "{cache_key}.{}",
-        if cfg!(target_os = "macos") {
-            "dylib"
-        } else {
-            "so"
-        }
-    ));
+    let library = directory.join(format!("{cache_key}.{}", std::env::consts::DLL_EXTENSION));
     match fs::symlink_metadata(&library) {
         Ok(metadata) if metadata.file_type().is_file() => {
             return Ok((
@@ -684,7 +677,9 @@ pub(super) fn compile_cached_schedule_module_under_gate(
         observations
     };
     let evidence = ScheduleModuleBuildEvidence::new(plan.mode, &observations)?;
-    fs::File::open(&temporary)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&temporary)
         .and_then(|file| file.sync_all())
         .map_err(|error| JitError::Io(error.to_string()))?;
     match fs::rename(&temporary, &library) {
