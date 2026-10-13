@@ -3180,6 +3180,19 @@ operation, type, recursively ordered sources, then tag. Addresses never order
 nodes or contribute to equality, hashes, or artifact identities. This avoids a
 rewrite-only interner and its allocation-token/representative inventory; the
 existing closed-DAG canonical traversal and encoding tables remain separate.
+`uop/rewrite_memo.rs` adds a call-local lookup for completed exact allocations
+ahead of that structural memo. Its input/result owners are the same allocations
+already retained by the structural key/value; equal-but-distinct structural hits
+never populate the sidecar and keep their released drop point. Replacement
+retains the structural map's original key allocation. The additional lookup
+map and Arc references end with this rewrite call, including on error, and
+never contain in-progress nodes or failed queries. They are not a global
+interner, validation proof, or cross-call normalization cache. Active/seen
+structural sets, matching, rule/callback/trace order, convergence limits, and
+actual-root validation remain unchanged. Independent recursive-driver fixtures
+cover both walks and shared/distinct sources; focused lookup and Weak probes
+check completed work, alias release, replacement, and error cleanup. No
+peak-memory or speedup claim follows from these call-local lookup counts.
 Memo keys/results live until the call ends, while each node's convergence keys
 release when its rewrite finishes. Independent deep comparisons retain the
 released recursive resource boundary: this is not an unbounded-depth or
