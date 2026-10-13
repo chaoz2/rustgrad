@@ -364,6 +364,32 @@ fn maintained_transformer_scale_compile_preserves_full_artifact_across_cache_mod
 
     let (cached, cached_counts) = crate::rangeify::with_projected_forest_mode(true, compile);
     let (uncached, uncached_counts) = crate::rangeify::with_projected_forest_mode(false, compile);
+    // Hosted observations of this exact maintained topology pin actual work,
+    // not elapsed time. A drift needs renewed artifact and ownership review.
+    assert_eq!(
+        cached_counts,
+        crate::rangeify::ProjectedForestCounts {
+            queries: 1301,
+            source_queries: 4510,
+            hits: 2456,
+            extractions: 3297,
+            emissions: 1285,
+            released_builds: 3355,
+            retention_bypasses: 0,
+        }
+    );
+    assert_eq!(
+        uncached_counts,
+        crate::rangeify::ProjectedForestCounts {
+            queries: 1301,
+            source_queries: 4510,
+            hits: 0,
+            extractions: 0,
+            emissions: 0,
+            released_builds: 5811,
+            retention_bypasses: 0,
+        }
+    );
 
     let inspect = |plan: &CompiledModuleAdamWPlan<SharedScaleTransformer>| {
         let inspection = plan.inspection().unwrap();
