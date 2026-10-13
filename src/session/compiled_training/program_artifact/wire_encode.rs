@@ -40,7 +40,7 @@ fn manifest_wire(
 }
 
 fn phase_wire(
-    capture: &CapturedMixedSchedule,
+    capture: &AuthenticatedRecurrentFrontier,
     state_buffers: &BTreeMap<RecurrentStateKey, u64>,
     state_input_keys: &BTreeMap<String, RecurrentStateKey>,
     native_updates: &[crate::engine::RecurrentStoreGroupManifest],
@@ -66,7 +66,7 @@ fn auxiliary_wire(plan: &CompiledAdamWAuxiliaryPlan) -> Result<PhaseWire> {
         .report_flags()
         .ok_or_else(|| training("compiled AdamW auxiliary observation schema is not canonical"))?;
     phase_wire(
-        plan.phase().recurrent_frontier.capture(),
+        &plan.phase().recurrent_frontier,
         &plan.phase().state_buffers,
         &plan.state_input_keys,
         plan.phase().store_groups(),
@@ -194,7 +194,7 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
         let main = self.main();
         Ok(MainWire {
             phase: phase_wire(
-                main.recurrent_frontier.capture(),
+                &main.recurrent_frontier,
                 state_buffers,
                 &main.state_input_keys,
                 &main.recurrent_store_groups,
@@ -217,7 +217,7 @@ impl<'a, M> ProgramWireEncoder<'a, M> {
             .as_ref()
             .map(|phase| {
                 phase_wire(
-                    phase.phase().recurrent_frontier.capture(),
+                    &phase.phase().recurrent_frontier,
                     &phase.phase().state_buffers,
                     &main.state_input_keys,
                     &[],
@@ -450,7 +450,7 @@ pub(super) fn momentum_program_wire<M>(
         module: module_wire(&owner.seal),
         main: MainWire {
             phase: phase_wire(
-                &main.capture,
+                &main.recurrent_frontier,
                 &state_buffers,
                 &main.state_input_keys,
                 &main.recurrent_store_groups,

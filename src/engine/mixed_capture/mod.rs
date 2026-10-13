@@ -16,6 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod encoding;
+use encoding::{identity, identity_with_kernel_encodings};
 mod recurrent_frontier;
 pub(crate) use recurrent_frontier::AuthenticatedRecurrentFrontier;
 mod output_projection;
@@ -2359,33 +2361,6 @@ impl CapturedMixedSchedule {
         };
         validate_with_kernel_encodings(&value, true, kernels)?;
         Ok(value)
-    }
-
-    /// Bounded deterministic RGSM encoding. It intentionally excludes every
-    /// runtime lease, slot, pointer, generation, and current buffer byte.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ReplayError> {
-        validate(self, true)?;
-        let mut w = Writer::new();
-        w.bytes(MAGIC).map_err(codec)?;
-        w.u8(VERSION).map_err(codec)?;
-        let identity = identity(self)?;
-        w.u64(identity).map_err(codec)?;
-        write_len(&mut w, self.schedule.items.len())?;
-        for item in &self.schedule.items {
-            crate::schedule::artifact::write_effect_item(&mut w, item).map_err(codec)?;
-        }
-        write_inputs(&mut w, &self.schedule.inputs)?;
-        write_constants(&mut w, &self.schedule.constants)?;
-        write_u64s(&mut w, &self.schedule.requested)?;
-        write_value_bindings(&mut w, &self.value_bindings)?;
-        write_state_bindings(&mut w, &self.state_bindings)?;
-        write_states(&mut w, &self.states)?;
-        if w.out.len().checked_add(4).is_none_or(|n| n > MAX_BYTES) {
-            return Err(ReplayError::Corrupt("RGSM byte limit".into()));
-        }
-        let sum = checksum(&w.out);
-        w.u32(sum).map_err(codec)?;
-        Ok(w.out)
     }
 
     /// Decodes and validates every logical relationship before returning a
@@ -5676,48 +5651,4 @@ fn validate_with_kernel_encodings(
         return Err(ReplayError::Corrupt("invalid requested output".into()));
     }
     Ok(())
-}
-fn identity(value: &CapturedMixedSchedule) -> Result<u64, ReplayError> {
-    identity_with_kernel_encodings(value, None)
-}
-
-fn identity_with_kernel_encodings(
-    value: &CapturedMixedSchedule,
-    decoded: Option<&crate::schedule::artifact::KernelEncodings>,
-) -> Result<u64, ReplayError> {
-    #[cfg(test)]
-    record_prepared_replay_validation(|counts| counts.identity_serializations += 1);
-    // The mixed-capture payload deliberately excludes the ordinary capture's
-    // identity field, so hashing does not need to clone the immutable program.
-    let bytes = value.payload_with_kernel_encodings(decoded)?;
-    Ok(bytes.iter().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
-    }))
-}
-impl CapturedMixedSchedule {
-    fn to_bytes_without_identity(&self) -> Result<Vec<u8>, ReplayError> {
-        self.payload_with_kernel_encodings(None)
-    }
-
-    fn payload_with_kernel_encodings(
-        &self,
-        decoded: Option<&crate::schedule::artifact::KernelEncodings>,
-    ) -> Result<Vec<u8>, ReplayError> {
-        let mut w = Writer::new();
-        write_len(&mut w, self.schedule.items.len())?;
-        for item in &self.schedule.items {
-            match decoded {
-                Some(kernels) => kernels.write_effect_item(&mut w, item),
-                None => crate::schedule::artifact::write_effect_item(&mut w, item),
-            }
-            .map_err(codec)?;
-        }
-        write_inputs(&mut w, &self.schedule.inputs)?;
-        write_constants(&mut w, &self.schedule.constants)?;
-        write_u64s(&mut w, &self.schedule.requested)?;
-        write_value_bindings(&mut w, &self.value_bindings)?;
-        write_state_bindings(&mut w, &self.state_bindings)?;
-        write_states(&mut w, &self.states)?;
-        Ok(w.out)
-    }
 }
