@@ -362,8 +362,8 @@ fn maintained_transformer_scale_compile_preserves_full_artifact_across_cache_mod
         .unwrap()
     };
 
-    let (cached, cached_counts) = crate::rangeify::with_projected_forest_mode(true, &compile);
-    let (uncached, uncached_counts) = crate::rangeify::with_projected_forest_mode(false, &compile);
+    let (cached, cached_counts) = crate::rangeify::with_projected_forest_mode(true, compile);
+    let (uncached, uncached_counts) = crate::rangeify::with_projected_forest_mode(false, compile);
 
     let inspect = |plan: &CompiledModuleAdamWPlan<SharedScaleTransformer>| {
         let inspection = plan.inspection().unwrap();
