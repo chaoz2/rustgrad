@@ -2966,6 +2966,15 @@ acceptance is separate from recursive validation, rewrite, and Arc destruction
 boundaries. Focused acceptance also preserves control closure and independent
 reduction ownership, and verifies release after the returned order is dropped.
 
+Validation detects reduction-chain operations during its existing ordered-node
+checks. Because canonical keys include the exact `Operation`, deduplication
+cannot erase the presence of a reduction. Reduction-free roots therefore do
+not allocate a reduction-only actual-Arc inventory or consumer map. Every
+reduction-bearing root still receives the unchanged allocation-sensitive
+ownership walk. Operation, projected-consumer, and control checks retain their
+original order; the canonical order gains no admission authority. An independent
+released validator and call-scoped counters cover both paths and error precedence.
+
 `UOpNode` stores one typed `Operation`, its result type, its sources, and an
 optional immutable `UOpTag`. Tags are a small canonical value algebra covering
 the checked-in compiler uses: text, signed integers, concrete `DType` values,
@@ -3010,6 +3019,17 @@ This order is not an admission token: descriptor and binding checks still run,
 an unrelated root triggers a fresh traversal, and final schedule validation and
 public capture keep their independent validation gates. No retained order is
 serialized or added to the public schedule state.
+
+Ordinary scalar-fallback load discovery consumes normalization's final order
+directly instead of discarding it and traversing the same immutable root again.
+Original-root, projected-rewrite, final-root, and normalization-policy checks
+are unchanged. The order lives only through this load scan; the fixed-frontier
+rehearsal cache still owns only numeric load identities, never kernels or
+orders. Generic normalization is performed once. A released two-traversal
+oracle verifies exact inventories and errors for scalar, empty, nonempty,
+reduction, external-materialization, and malformed/control cases; call-scoped
+counters prove one fewer traversal on each successful miss. Final scheduling,
+capture validation, cache identities, and artifact bytes remain independent.
 
 The same finalized order also feeds durable schedule-identity encoding. The
 codec still validates the actual kernel, including allocation-based reduction
