@@ -376,6 +376,81 @@ fn index_admission_keeps_exact_depth_combined_occurrence_and_byte_gates() {
 }
 
 #[test]
+fn predicate_depth_and_independent_byte_overflows_remain_final_index_gates() {
+    use crate::projected_index::{MAX_PROJECTED_INDEX_DEPTH, ProjectedIndexPlan};
+    use crate::uop::UOpError;
+    let integer = UType::scalar(DType::I64);
+    let boolean = UType::scalar(DType::Bool);
+    let mut graph = Graph::new();
+    let small = graph.input_dtype("small", [1], DType::F64);
+    let shape = Shape::from([1]);
+    let range = ProjectedForestCache::range(&shape).unwrap();
+    for depth in [MAX_PROJECTED_INDEX_DEPTH, MAX_PROJECTED_INDEX_DEPTH + 1] {
+        let mut predicate = UOp::scalar_constant(DType::Bool, 1, boolean);
+        for _ in 0..depth {
+            predicate = UOp::from_operation(
+                Operation::GraphLogical(crate::LogicalOp::Not),
+                Some(boolean),
+                vec![predicate],
+            );
+        }
+        let original = RangeifiedProjection {
+            source: small,
+            expression: UOp::constant(0, integer),
+            predicate: Some(predicate),
+        };
+        let emitted = ProjectedForest::extract(&original, &range).emit(&range);
+        for projection in [&original, &emitted] {
+            let result = ProjectedIndexPlan::from_index(&index_for(&graph, projection, &shape));
+            if depth == MAX_PROJECTED_INDEX_DEPTH {
+                assert!(result.unwrap().valid(0).unwrap());
+            } else {
+                assert!(matches!(result, Err(UOpError::InvalidIndex)));
+            }
+        }
+    }
+
+    let extent = usize::MAX / DType::F64.itemsize() + 1;
+    let huge_shape = Shape::from([extent]);
+    let huge = graph.input_dtype("huge", huge_shape.clone(), DType::F64);
+    for (name, source, output_shape) in [
+        ("input only", huge, &shape),
+        ("output only", small, &huge_shape),
+    ] {
+        let caller = ProjectedForestCache::range(output_shape).unwrap();
+        let original = RangeifiedProjection {
+            source,
+            expression: UOp::constant(0, integer),
+            predicate: None,
+        };
+        let emitted = ProjectedForest::extract(&original, &caller).emit(&caller);
+        for projection in [&original, &emitted] {
+            assert!(
+                matches!(
+                    ProjectedIndexPlan::from_index(&index_for(&graph, projection, output_shape)),
+                    Err(UOpError::InvalidIndex)
+                ),
+                "{name}"
+            );
+        }
+    }
+    // A valid one-element broadcast can still overflow output storage bytes.
+    // Successful cached coordinate construction must not admit that Index.
+    let caller = ProjectedForestCache::range(&huge_shape).unwrap();
+    let mut cache = ProjectedForestCache::new(&graph);
+    for _ in 0..2 {
+        let projection = cache
+            .projection(&graph, small, &huge_shape, &caller)
+            .unwrap();
+        assert!(matches!(
+            ProjectedIndexPlan::from_index(&index_for(&graph, &projection, &huge_shape)),
+            Err(UOpError::InvalidIndex)
+        ));
+    }
+    assert_eq!(cache.retained_forests, 1);
+}
+
+#[test]
 fn held_forest_releases_projector_owners() {
     let mut graph = Graph::new();
     let input = graph.input_dtype("input", [2], DType::F32);
@@ -491,6 +566,41 @@ fn source_queries_do_not_emit_and_noncanonical_ranges_bypass_cache() {
             cache.projection(&graph, node, &shape, &range),
         ]
     });
+    assert_eq!(
+        (counts.hits, counts.extractions, counts.emissions),
+        (0, 0, 0)
+    );
+    assert_eq!(counts.released_builds, 2);
+
+    let tagged_range = ProjectedForestCache::range(&shape)
+        .unwrap()
+        .retag(Some(UOpTag::Text("valid noncanonical caller".into())));
+    let oracle = projected_view(&graph, node, &shape, &tagged_range).unwrap();
+    let (results, counts) = with_projected_forest_mode(true, || {
+        let mut cache = ProjectedForestCache::new(&graph);
+        let results = [
+            cache
+                .projection(&graph, node, &shape, &tagged_range)
+                .unwrap(),
+            cache
+                .projection(&graph, node, &shape, &tagged_range)
+                .unwrap(),
+        ];
+        assert_eq!(cache.retained_forests, 0);
+        results
+    });
+    for result in results {
+        assert_eq!(
+            snapshot(&result, &tagged_range),
+            snapshot(&oracle, &tagged_range)
+        );
+        assert!(
+            crate::projected_index::ProjectedIndexPlan::from_index(&index_for(
+                &graph, &result, &shape
+            ))
+            .is_ok()
+        );
+    }
     assert_eq!(
         (counts.hits, counts.extractions, counts.emissions),
         (0, 0, 0)

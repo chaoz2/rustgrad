@@ -408,15 +408,21 @@ fn maintained_transformer_scale_compile_preserves_full_artifact_across_cache_mod
     let cached_artifact = cached.program_artifact().unwrap();
     let uncached_artifact = uncached.program_artifact().unwrap();
     assert_eq!(cached_artifact.as_bytes(), uncached_artifact.as_bytes());
+    let artifacts_equal = cached_artifact.as_bytes() == uncached_artifact.as_bytes();
     assert!(cached_counts.hits > uncached_counts.hits);
     assert!(cached_counts.emissions > uncached_counts.emissions);
 
     let report = |mode: &str,
                   counts: crate::rangeify::ProjectedForestCounts,
                   identities: (u64, u64),
-                  artifact_bytes: usize| {
+                  artifact: &[u8]| {
+        // A bounded diagnostic content fingerprint, not a cryptographic proof.
+        // Exact compatibility is established by the full byte assertion above.
+        let fingerprint = artifact.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
         println!(
-            "{{\"mode\":\"{mode}\",\"queries\":{},\"source_queries\":{},\"hits\":{},\"extractions\":{},\"emissions\":{},\"released_builds\":{},\"retention_bypasses\":{},\"capture_roles\":5,\"main_capture_identity\":{},\"evaluation_capture_identity\":{},\"artifact_bytes\":{},\"artifact_bytes_equal\":true}}",
+            "{{\"mode\":\"{mode}\",\"queries\":{},\"source_queries\":{},\"hits\":{},\"extractions\":{},\"emissions\":{},\"released_builds\":{},\"retention_bypasses\":{},\"capture_roles\":5,\"main_capture_identity\":{},\"evaluation_capture_identity\":{},\"artifact_bytes\":{},\"artifact_fingerprint\":\"fnv1a64:{fingerprint:016x}\",\"artifact_bytes_equal\":{artifacts_equal}}}",
             counts.queries,
             counts.source_queries,
             counts.hits,
@@ -426,20 +432,20 @@ fn maintained_transformer_scale_compile_preserves_full_artifact_across_cache_mod
             counts.retention_bypasses,
             identities.0,
             identities.1,
-            artifact_bytes,
+            artifact.len(),
         );
     };
     report(
         "cached",
         cached_counts,
         cached_identities,
-        cached_artifact.as_bytes().len(),
+        cached_artifact.as_bytes(),
     );
     report(
         "uncached",
         uncached_counts,
         uncached_identities,
-        uncached_artifact.as_bytes().len(),
+        uncached_artifact.as_bytes(),
     );
 }
 
