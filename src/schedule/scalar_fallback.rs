@@ -35,7 +35,11 @@ impl<'a> OrdinaryScalarFallbackRehearsals<'a> {
         record_rehearsal(|counts| counts.fixed_point_passes += 1);
     }
 
-    pub(super) fn load_nodes(&mut self, output: NodeId) -> Result<&[usize], ScheduleError> {
+    pub(super) fn load_nodes(
+        &mut self,
+        output: NodeId,
+        projections: &mut crate::rangeify::ProjectedForestCache<'_>,
+    ) -> Result<&[usize], ScheduleError> {
         #[cfg(test)]
         record_rehearsal(|counts| counts.queries += 1);
         if rehearsal_reuse_enabled() && self.rehearsals.contains_key(&output.index()) {
@@ -43,11 +47,16 @@ impl<'a> OrdinaryScalarFallbackRehearsals<'a> {
             record_rehearsal(|counts| counts.cache_hits += 1);
             return Ok(self.rehearsals[&output.index()].load_nodes.as_ref());
         }
-        let load_nodes =
-            ordinary_scalar_fallback_loads(self.graph, output, self.roots, self.external)?
-                .into_iter()
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+        let load_nodes = ordinary_scalar_fallback_loads(
+            self.graph,
+            output,
+            self.roots,
+            self.external,
+            projections,
+        )?
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
         self.rehearsals.insert(
             output.index(),
             OrdinaryScalarFallbackRehearsal { load_nodes },
@@ -61,6 +70,7 @@ fn ordinary_scalar_fallback_loads(
     output: NodeId,
     roots: &BTreeSet<usize>,
     external: &BTreeSet<usize>,
+    projections: &mut crate::rangeify::ProjectedForestCache<'_>,
 ) -> Result<BTreeSet<usize>, ScheduleError> {
     if !scalar_alias_output(graph.op(output).map_err(ScheduleError::Graph)?) {
         return Ok(BTreeSet::new());
@@ -70,9 +80,19 @@ fn ordinary_scalar_fallback_loads(
     let materialized = scalar_alias_materialized(output, roots, external, &BTreeSet::new());
     let kernel = match graph.op(output).map_err(ScheduleError::Graph)? {
         Op::Reduce { .. } => {
-            crate::kernel::lower_graph_reduction_with_materialized(graph, output, &materialized)
+            crate::kernel::lower_graph_reduction_with_materialized_and_projections(
+                graph,
+                output,
+                &materialized,
+                projections,
+            )
         }
-        _ => crate::kernel::lower_graph_elementwise_with_materialized(graph, output, &materialized),
+        _ => crate::kernel::lower_graph_elementwise_with_materialized_and_projections(
+            graph,
+            output,
+            &materialized,
+            projections,
+        ),
     }
     .map_err(ScheduleError::UOp)?;
     scalar_fallback_kernel_loads(&kernel)

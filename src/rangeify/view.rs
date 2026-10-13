@@ -952,6 +952,7 @@ pub(crate) fn projection_source(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn projected_source(
     graph: &Graph,
     node: NodeId,

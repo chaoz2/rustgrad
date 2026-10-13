@@ -28,7 +28,7 @@ pub use mixed::{
     combine as combine_mixed_schedules,
 };
 use ownership::{ScheduleOwnershipPlan, sort_sibling};
-use scalar_alias_analysis::{ProjectionQueries, ScalarAliasAnalysis};
+use scalar_alias_analysis::ScalarAliasAnalysis;
 use scalar_fallback::OrdinaryScalarFallbackRehearsals;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1699,6 +1699,7 @@ fn rehearse_reduction_epilogue(
     roots: &BTreeSet<usize>,
     external: &BTreeSet<usize>,
     candidates: &BTreeSet<usize>,
+    projections: &mut crate::rangeify::ProjectedForestCache<'_>,
 ) -> Option<ReductionEpilogueFusion> {
     let materialized = roots
         .iter()
@@ -1706,11 +1707,12 @@ fn rehearse_reduction_epilogue(
         .filter(|candidate| *candidate != root && !candidates.contains(candidate))
         .chain(external.iter().copied())
         .collect::<BTreeSet<_>>();
-    let kernel = crate::kernel::lower_graph_reduction_epilogue_with_materialized(
+    let kernel = crate::kernel::lower_graph_reduction_epilogue_with_materialized_and_projections(
         graph,
         NodeId::from_index(root),
         NodeId::from_index(reduction),
         &materialized,
+        projections,
     )
     .ok()?;
     let prepared = PreparedRehearsalKernel::from_graph_lowering(&kernel).ok()?;
@@ -1763,7 +1765,7 @@ struct ScalarAliasCollector<'a, 'queries> {
     requested: &'a BTreeSet<usize>,
     candidates: ScalarAliasCandidates,
     seen: BTreeSet<NodeId>,
-    queries: &'queries mut ProjectionQueries<'a>,
+    queries: &'queries mut crate::rangeify::ProjectedForestCache<'a>,
 }
 
 impl ScalarAliasCollector<'_, '_> {
@@ -1852,7 +1854,9 @@ impl ScalarAliasCollector<'_, '_> {
             if is_view
                 && !self.requested.contains(&node.index())
                 && !self.external.contains(&node.index())
-                && let Ok(source) = self.queries.predicated_source(node, self.iteration_shape)
+                && let Ok(source) =
+                    self.queries
+                        .predicated_source(self.graph, node, self.iteration_shape)
                 && (self.roots.contains(&source.index())
                     || self.external.contains(&source.index())
                     || matches!(
@@ -1887,7 +1891,9 @@ impl ScalarAliasCollector<'_, '_> {
                 && self.roots.contains(&node.index())
                 && !self.requested.contains(&node.index())
                 && !self.external.contains(&node.index())
-                && let Ok(source) = self.queries.projected_source(node, self.iteration_shape)
+                && let Ok(source) =
+                    self.queries
+                        .projected_source(self.graph, node, self.iteration_shape)
                 && (self.roots.contains(&source.index())
                     || self.external.contains(&source.index())
                     || matches!(
@@ -1919,7 +1925,7 @@ impl ScalarAliasCandidates {
         roots: &'a BTreeSet<usize>,
         external: &'a BTreeSet<usize>,
         requested: &'a BTreeSet<usize>,
-        queries: &mut ProjectionQueries<'a>,
+        queries: &mut crate::rangeify::ProjectedForestCache<'a>,
     ) -> Result<Self, ScheduleError> {
         // Scalar elementwise lowering iterates the output shape. Reduction
         // lowering first lowers its producer over the complete reduction
@@ -2172,17 +2178,24 @@ fn rehearse_scalar_alias_fusion(
     roots: &BTreeSet<usize>,
     external: &BTreeSet<usize>,
     removed: &BTreeSet<usize>,
+    projections: &mut crate::rangeify::ProjectedForestCache<'_>,
 ) -> Result<Option<(PreparedRehearsalKernel, BTreeSet<usize>)>, ScheduleError> {
     let materialized = scalar_alias_materialized(output, roots, external, removed);
     let lowered = match graph.op(output).map_err(ScheduleError::Graph)? {
         Op::Reduce { .. } => {
-            crate::kernel::lower_graph_reduction_with_materialized(graph, output, &materialized)
+            crate::kernel::lower_graph_reduction_with_materialized_and_projections(
+                graph,
+                output,
+                &materialized,
+                projections,
+            )
         }
-        _ => crate::kernel::lower_graph_elementwise_with_owned_aliases(
+        _ => crate::kernel::lower_graph_elementwise_with_owned_aliases_and_projections(
             graph,
             output,
             &materialized,
             removed,
+            projections,
         ),
     };
     let kernel = match lowered {
@@ -2222,6 +2235,7 @@ fn checked_scalar_alias_fusion(
     output: NodeId,
     candidates: &ScalarAliasCandidates,
     ownership: &ScalarAliasOwnership<'_>,
+    projections: &mut crate::rangeify::ProjectedForestCache<'_>,
 ) -> Result<Option<ScalarAliasFusion>, ScheduleError> {
     if !scalar_alias_output(graph.op(output).map_err(ScheduleError::Graph)?) {
         return Ok(None);
@@ -2243,8 +2257,15 @@ fn checked_scalar_alias_fusion(
         if !group.is_disjoint(ownership.protected) {
             continue;
         }
-        if rehearse_scalar_alias_fusion(graph, output, ownership.roots, ownership.external, &group)?
-            .is_some()
+        if rehearse_scalar_alias_fusion(
+            graph,
+            output,
+            ownership.roots,
+            ownership.external,
+            &group,
+            projections,
+        )?
+        .is_some()
         {
             accepted.extend(group);
         }
@@ -2270,8 +2291,15 @@ fn checked_scalar_alias_fusion(
         ) {
             continue;
         }
-        if rehearse_scalar_alias_fusion(graph, output, ownership.roots, ownership.external, &group)?
-            .is_some()
+        if rehearse_scalar_alias_fusion(
+            graph,
+            output,
+            ownership.roots,
+            ownership.external,
+            &group,
+            projections,
+        )?
+        .is_some()
         {
             accepted.extend(group);
         }
@@ -2285,6 +2313,7 @@ fn checked_scalar_alias_fusion(
         ownership.roots,
         ownership.external,
         &accepted,
+        projections,
     )?
     else {
         return Ok(None);
@@ -2306,6 +2335,7 @@ fn checked_contiguous_redirection(
     external: &BTreeSet<usize>,
     requested: &BTreeSet<usize>,
     consumers: &[usize],
+    projections: &mut crate::rangeify::ProjectedForestCache<'_>,
 ) -> Result<Option<ContiguousRedirection>, ScheduleError> {
     let plan = crate::MovementKernelPlan::from_scheduled_graph(graph, output)
         .map_err(|error| ScheduleError::Binding(error.to_string()))?;
@@ -2370,18 +2400,22 @@ fn checked_contiguous_redirection(
     materialized.remove(&producer.index());
     materialized.extend(external.iter().copied());
     let lowered = match iteration_view {
-        Some(view) => crate::kernel::lower_graph_elementwise_affine_into_with_materialized(
+        Some(view) => {
+            crate::kernel::lower_graph_elementwise_affine_into_with_materialized_and_projections(
+                graph,
+                producer,
+                output,
+                view,
+                &materialized,
+                projections,
+            )
+        }
+        None => crate::kernel::lower_graph_elementwise_into_with_materialized_and_projections(
             graph,
             producer,
             output,
-            view,
             &materialized,
-        ),
-        None => crate::kernel::lower_graph_elementwise_into_with_materialized(
-            graph,
-            producer,
-            output,
-            &materialized,
+            projections,
         ),
     };
     let Ok(kernel) = lowered else {
@@ -2530,17 +2564,18 @@ fn supported(op: &Op) -> bool {
     )
 }
 
-struct LeafTraversal<'a> {
+struct LeafTraversal<'a, 'projections> {
     graph: &'a Graph,
     roots: &'a BTreeSet<usize>,
     owner: usize,
     external: &'a BTreeSet<usize>,
     allow_projected: bool,
+    projections: &'projections mut crate::rangeify::ProjectedForestCache<'a>,
 }
 
-impl LeafTraversal<'_> {
+impl LeafTraversal<'_, '_> {
     fn visit_one(
-        &self,
+        &mut self,
         id: NodeId,
         out: &mut BTreeSet<usize>,
         boundary: &mut Option<ScheduleBoundary>,
@@ -2598,7 +2633,8 @@ impl LeafTraversal<'_> {
                         Err(_) if self.allow_projected => {
                             match self.graph.shape(id).map_err(ScheduleError::Graph).and_then(
                                 |shape| {
-                                    crate::rangeify::projected_source(self.graph, id, shape)
+                                    self.projections
+                                        .projected_source(self.graph, id, shape)
                                         .map_err(|_| {
                                             ScheduleError::Binding(
                                                 "view is outside static owned index projection"
@@ -2631,7 +2667,9 @@ impl LeafTraversal<'_> {
                                 .shape(id)
                                 .ok()
                                 .and_then(|shape| {
-                                    crate::rangeify::projected_source(self.graph, id, shape).ok()
+                                    self.projections
+                                        .projected_source(self.graph, id, shape)
+                                        .ok()
                                 })
                                 .unwrap_or(*input);
                             out.insert(source.index());
@@ -2699,7 +2737,7 @@ impl LeafTraversal<'_> {
     }
 
     fn visit(
-        &self,
+        &mut self,
         id: NodeId,
         out: &mut BTreeSet<usize>,
         boundary: &mut Option<ScheduleBoundary>,
@@ -2730,7 +2768,9 @@ pub(crate) fn requested_schedule_ownership(
     graph: &Graph,
     outputs: &[NodeId],
 ) -> Result<ownership::RequestedScheduleOwnership, ScheduleError> {
-    ScheduleOwnershipPlan::build(graph, outputs, &BTreeSet::new())?.requested_ownership(graph)
+    let mut projections = crate::rangeify::ProjectedForestCache::new(graph);
+    ScheduleOwnershipPlan::build(graph, outputs, &BTreeSet::new(), &mut projections)?
+        .requested_ownership(graph)
 }
 
 /// Symbolic families retain explicit computed-affine producer and movement
@@ -2927,6 +2967,7 @@ fn schedule_many_with_retention(
             state_bindings: vec![],
         });
     }
+    let mut projections = crate::rangeify::ProjectedForestCache::new(graph);
     let ScheduleOwnershipPlan {
         outputs,
         external,
@@ -2939,7 +2980,7 @@ fn schedule_many_with_retention(
         requested_passthrough_sources,
         mut roots,
         ..
-    } = ScheduleOwnershipPlan::build(graph, outputs, external)?;
+    } = ScheduleOwnershipPlan::build(graph, outputs, external, &mut projections)?;
     let fusion_candidates = roots
         .iter()
         .copied()
@@ -3030,6 +3071,7 @@ fn schedule_many_with_retention(
             &roots,
             &external,
             &candidates,
+            &mut projections,
         ) else {
             continue;
         };
@@ -3066,6 +3108,7 @@ fn schedule_many_with_retention(
             &roots,
             &external,
             &candidates,
+            &mut projections,
         ) else {
             continue;
         };
@@ -3120,7 +3163,7 @@ fn schedule_many_with_retention(
             let mut next_fusions = BTreeMap::new();
             for root in roots.iter().copied() {
                 let node = NodeId::from_index(root);
-                let Some(candidates) = alias_analysis.candidates(node)? else {
+                let Some(candidates) = alias_analysis.candidates(node, &mut projections)? else {
                     continue;
                 };
                 if let Some(fusion) = checked_scalar_alias_fusion(
@@ -3136,6 +3179,7 @@ fn schedule_many_with_retention(
                         hard_loads: &scalar_alias_loads,
                         movement_operand_owners: &movement_operand_owners,
                     },
+                    &mut projections,
                 )? {
                     next_reserved.insert(root);
                     next_reserved.extend(fusion.load_nodes.iter().copied());
@@ -3151,7 +3195,8 @@ fn schedule_many_with_retention(
                 if next_fusions.contains_key(&root) || proposed_removals.contains(&root) {
                     continue;
                 }
-                let loads = fallback_rehearsals.load_nodes(NodeId::from_index(root))?;
+                let loads =
+                    fallback_rehearsals.load_nodes(NodeId::from_index(root), &mut projections)?;
                 if !loads.is_empty() {
                     next_reserved.insert(root);
                     next_reserved.extend(loads.iter().copied());
@@ -3194,7 +3239,13 @@ fn schedule_many_with_retention(
             // root ownership. Specialized roots lower as a load of `producer` and
             // are rejected below; ordinary scalar DAGs lower to one checked Store.
             let Some(redirection) = checked_contiguous_redirection(
-                graph, node, &roots, &external, &requested, &consumers,
+                graph,
+                node,
+                &roots,
+                &external,
+                &requested,
+                &consumers,
+                &mut projections,
             )?
             else {
                 continue;
@@ -3256,6 +3307,7 @@ fn schedule_many_with_retention(
                     owner: index,
                     external: &external,
                     allow_projected: policy.allow_projected,
+                    projections: &mut projections,
                 }
                 .visit(node, &mut leaf_ids, &mut boundary)?,
                 Err(error) => return Err(ScheduleError::Binding(error.to_string())),
@@ -3316,11 +3368,14 @@ fn schedule_many_with_retention(
                         crate::kernel::lower_graph_computed_affine_view(graph, node)
                             .map_err(ScheduleError::UOp)?
                     }
-                    Op::Reduce { .. } => crate::kernel::lower_graph_reduction_with_materialized(
-                        graph,
-                        node,
-                        &materialized,
-                    )
+                    Op::Reduce { .. } => {
+                        crate::kernel::lower_graph_reduction_with_materialized_and_projections(
+                            graph,
+                            node,
+                            &materialized,
+                            &mut projections,
+                        )
+                    }
                     .map_err(ScheduleError::UOp)?,
                     Op::PrefixScan { .. } => crate::kernel::lower_graph_prefix_scan(graph, node)
                         .map_err(ScheduleError::UOp)?,
@@ -3340,10 +3395,11 @@ fn schedule_many_with_retention(
                         )
                         .map_err(ScheduleError::UOp)?
                     }
-                    _ => crate::kernel::lower_graph_elementwise_with_materialized(
+                    _ => crate::kernel::lower_graph_elementwise_with_materialized_and_projections(
                         graph,
                         node,
                         &materialized,
+                        &mut projections,
                     )
                     .map_err(ScheduleError::UOp)?,
                 }
@@ -3664,7 +3720,7 @@ mod ownership_traversal_tests {
                     &BTreeSet::new(),
                     &BTreeSet::new(),
                     &BTreeSet::new(),
-                    &mut ProjectionQueries::new(&graph),
+                    &mut crate::rangeify::ProjectedForestCache::new(&graph),
                 )
                 .unwrap();
                 assert!(candidates.affine_maps.is_empty());
@@ -3683,7 +3739,7 @@ mod ownership_traversal_tests {
                     &BTreeSet::from([alias_source.index()]),
                     &BTreeSet::new(),
                     &BTreeSet::new(),
-                    &mut ProjectionQueries::new(&graph),
+                    &mut crate::rangeify::ProjectedForestCache::new(&graph),
                 )
                 .unwrap();
                 assert!(
@@ -3704,6 +3760,7 @@ mod ownership_traversal_tests {
                     owner: deep.index(),
                     external: &BTreeSet::new(),
                     allow_projected: true,
+                    projections: &mut crate::rangeify::ProjectedForestCache::new(&graph),
                 }
                 .visit(deep, &mut leaf_ids, &mut boundary)
                 .unwrap();
