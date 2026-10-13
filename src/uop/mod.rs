@@ -830,6 +830,8 @@ impl UOp {
     }
 
     fn validate_ordered_nodes(&self, nodes: &[UOp]) -> Result<(), UOpError> {
+        #[cfg(test)]
+        ORDERED_VALIDATIONS.with(|count| count.set(count.get() + 1));
         let mut ranges = BTreeSet::new();
         let mut ifs = Vec::new();
         let mut has_reduction = false;
@@ -937,8 +939,14 @@ fn validate_reduction_topology(root: &UOp) -> Result<(), UOpError> {
 
 #[cfg(test)]
 std::thread_local! {
+    static ORDERED_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REDUCTION_TOPOLOGY_INSPECTIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn ordered_validation_count() -> usize {
+    ORDERED_VALIDATIONS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -2061,9 +2069,15 @@ pub(crate) fn normalize_kernel_with_order(root: &UOp) -> Result<TopologicalOrder
 
 /// Schedule identity consumes canonical edges; node-only consumers drop them.
 pub(crate) fn normalize_kernel_with_table(root: &UOp) -> Result<CanonicalNodeTable, UOpError> {
-    root.validate()?;
+    let mut order = CanonicalNodeTable::new(root)?;
+    order.order().validate_for(root)?;
     let (root, _) = rewrite(root, &mut projected_index_rules(), Walk::BottomUp)?;
-    let order = CanonicalNodeTable::new(&root)?;
+    // Reuse only the exact immutable allocation, not structural equality or a
+    // successful validation. A changed root releases its old edge sidecar.
+    if order.order().for_root(&root).is_none() {
+        drop(order);
+        order = CanonicalNodeTable::new(&root)?;
+    }
     order.order().validate_for(&root)?;
     let nodes = order.order().nodes();
     if !matches!(root.operation(), Operation::Sink)
@@ -2092,10 +2106,10 @@ pub(crate) fn normalize_kernel_with_table(root: &UOp) -> Result<CanonicalNodeTab
         return Ok(order);
     }
     let (normalized, _) = rewrite(&root, &mut builtin_rules(), Walk::BottomUp)?;
-    // The original root still owns its DAG; only the preliminary canonical
-    // table is released before allocating the final edge sidecar.
-    drop(order);
-    let order = CanonicalNodeTable::new(&normalized)?;
+    if order.order().for_root(&normalized).is_none() {
+        drop(order);
+        order = CanonicalNodeTable::new(&normalized)?;
+    }
     order.order().validate_for(&normalized)?;
     Ok(order)
 }
