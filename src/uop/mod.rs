@@ -4,6 +4,7 @@ use crate::{DType, Shape, SymbolicExpr};
 pub mod artifact;
 mod operation;
 mod projected_consumers;
+mod rewrite_memo;
 mod schema;
 mod traversal;
 pub use operation::{
@@ -1951,19 +1952,19 @@ fn rewrite_rules<C, R: RewriteRuleSpec<C>>(
         })
         .collect::<Vec<_>>();
     let mut trace = RewriteTrace { rules: vec![] };
-    let mut memo = BTreeMap::new();
+    let mut memo = rewrite_memo::RewriteMemo::default();
     let mut active = BTreeSet::new();
     fn go<C, R: RewriteRuleSpec<C>>(
         n: &UOp,
         r: &[PreparedRewriteRule<'_, R>],
         w: Walk,
-        m: &mut BTreeMap<UOp, UOp>,
+        m: &mut rewrite_memo::RewriteMemo,
         active: &mut BTreeSet<UOp>,
         t: &mut RewriteTrace,
         context: &mut C,
     ) -> Result<UOp, UOpError> {
         if let Some(x) = m.get(n) {
-            return Ok(x.clone());
+            return Ok(x);
         }
         if !active.insert(n.clone()) {
             return Err(UOpError::RewriteCycle);
