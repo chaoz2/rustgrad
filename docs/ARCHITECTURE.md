@@ -82,6 +82,9 @@ src/
   schedule/              realization, fusion, indexing and memory planning
     artifact.rs          portable schedule descriptors and bindings
     execution_summary.rs immutable static schedule and logical-memory summary
+  rangeify/              pure checked movement-to-index planning
+    view.rs              released projection and affine-planning semantics
+    projection.rs        pass-local, allocation-faithful projection descriptors
   matmul/                normalized and tiled matmul compiler contracts
     mod.rs               generalized serial semantic plan
     tile.rs              target caps, candidates, cost and tiled simulator
@@ -212,6 +215,29 @@ it has an equivalent raw-storage path, while Metal's portable subset already
 rejects narrow storage. Symbolic programs, vector lanes, guarded fault
 transactions, unsupported dtypes, and unproved live-device configurations
 remain rejected before resource work.
+
+Concrete scheduling borrows one immutable Graph in a private
+`ProjectedForestCache`. Successful `(NodeId, full Shape)` projections retain
+only existing operation/type/tag records, ordered child slots, both root slots,
+and proven caller Range/bound aliases. The descriptor preserves actual DAG
+sharing rather than structural deduplication and retains no projector UOp owner.
+Source-classification hits read that descriptor without constructing UOps;
+concrete hits create a fresh allocation forest for the current canonical caller.
+Discovery, rehearsal, leaf planning, and final lowering share this pass owner,
+but materialization policy, kernel assembly, and Index validation stay fresh.
+
+Checked retention caps bound the pass to 1,024 forests and 65,536 logical
+node/edge/key units. Exhaustion, foreign Graphs, and noncanonical caller ranges
+use the released projector without changing admission or caching failures.
+Those units are not measured bytes. Depth, combined occurrence, typed-byte,
+binding, and backend admission still occur at their original boundaries.
+Independent projection-sharing/lane-map, schedule/capture-byte, and CPU oracles
+cover this seam. A private compile-only probe uses the maintained two-block
+causal Transformer and all five AdamW program roles to compare complete
+artifacts and report reuse counters; it prepares no target or replay. Hosted
+exact-head workload measurements, not source inspection or hit counts alone,
+must justify the optimization. No public operation, artifact schema, cache
+identity, runtime, or performance-scoreboard field is added.
 
 `reduction_native.rs` is the single checked reduction recurrence boundary for
 CPU, capture, and native renderers. It derives exact source/accumulator/output

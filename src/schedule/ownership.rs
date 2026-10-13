@@ -37,6 +37,7 @@ impl ScheduleOwnershipPlan {
         graph: &Graph,
         outputs: &[NodeId],
         external: &BTreeSet<usize>,
+        projections: &mut crate::rangeify::ProjectedForestCache<'_>,
     ) -> Result<Self, ScheduleError> {
         let outputs = outputs
             .iter()
@@ -177,7 +178,7 @@ impl ScheduleOwnershipPlan {
                             let shape = graph
                                 .shape(id)
                                 .map_err(|_| crate::rangeify::RangeifyError::Invalid)?;
-                            crate::rangeify::projected_source(graph, id, shape)
+                            projections.projected_source(graph, id, shape)
                         })
                         .ok()
                 })
@@ -199,7 +200,7 @@ impl ScheduleOwnershipPlan {
                         let shape = graph
                             .shape(id)
                             .map_err(|_| crate::rangeify::RangeifyError::Invalid)?;
-                        crate::rangeify::projected_source(graph, id, shape)
+                        projections.projected_source(graph, id, shape)
                     })
                     .ok()
                     .filter(|source| external.contains(&source.index()))

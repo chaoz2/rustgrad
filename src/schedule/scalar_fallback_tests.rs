@@ -72,7 +72,14 @@ fn fallback_loads_reuse_the_final_normalization_order() {
             assert_eq!(actual, reference, "{name}");
             assert_eq!(released_walks, retained_walks + 1, "{name}");
             assert_eq!(
-                ordinary_scalar_fallback_loads(&graph, node, &roots, &external).unwrap(),
+                ordinary_scalar_fallback_loads(
+                    &graph,
+                    node,
+                    &roots,
+                    &external,
+                    &mut crate::rangeify::ProjectedForestCache::new(&graph),
+                )
+                .unwrap(),
                 actual,
                 "graph path: {name}"
             );
@@ -187,15 +194,22 @@ fn rehearsals_are_scoped_to_one_immutable_frontier() {
     let no_external = BTreeSet::new();
 
     let mut fused = OrdinaryScalarFallbackRehearsals::new(&graph, &roots, &no_external);
-    assert_eq!(fused.load_nodes(output).unwrap(), &[input.index()]);
+    let mut projections = crate::rangeify::ProjectedForestCache::new(&graph);
+    assert_eq!(
+        fused.load_nodes(output, &mut projections).unwrap(),
+        &[input.index()]
+    );
 
     let external = BTreeSet::from([producer.index()]);
     let mut materialized = OrdinaryScalarFallbackRehearsals::new(&graph, &roots, &external);
     assert_eq!(
-        materialized.load_nodes(output).unwrap(),
+        materialized.load_nodes(output, &mut projections).unwrap(),
         &[producer.index()]
     );
-    assert_eq!(fused.load_nodes(output).unwrap(), &[input.index()]);
+    assert_eq!(
+        fused.load_nodes(output, &mut projections).unwrap(),
+        &[input.index()]
+    );
 }
 
 #[test]
@@ -205,9 +219,14 @@ fn failed_queries_preserve_the_error_and_are_not_cached() {
     let external = BTreeSet::new();
     let unknown = NodeId::from_index(7);
     let mut rehearsals = OrdinaryScalarFallbackRehearsals::new(&graph, &roots, &external);
+    let mut projections = crate::rangeify::ProjectedForestCache::new(&graph);
 
-    let first = rehearsals.load_nodes(unknown).unwrap_err();
-    let second = rehearsals.load_nodes(unknown).unwrap_err();
+    let first = rehearsals
+        .load_nodes(unknown, &mut projections)
+        .unwrap_err();
+    let second = rehearsals
+        .load_nodes(unknown, &mut projections)
+        .unwrap_err();
     assert!(matches!(
         first,
         ScheduleError::Graph(crate::Error::UnknownNode(node)) if node == unknown
@@ -223,12 +242,13 @@ fn failed_queries_preserve_the_error_and_are_not_cached() {
     let output = malformed.dropout(input, 0.5, true, Some(1)).unwrap();
     let roots = BTreeSet::from([output.index()]);
     let mut rehearsals = OrdinaryScalarFallbackRehearsals::new(&malformed, &roots, &external);
+    let mut projections = crate::rangeify::ProjectedForestCache::new(&malformed);
     assert!(matches!(
-        rehearsals.load_nodes(output),
+        rehearsals.load_nodes(output, &mut projections),
         Err(ScheduleError::UOp(UOpError::InvalidArgument))
     ));
     assert!(matches!(
-        rehearsals.load_nodes(output),
+        rehearsals.load_nodes(output, &mut projections),
         Err(ScheduleError::UOp(UOpError::InvalidArgument))
     ));
     assert!(rehearsals.rehearsals.is_empty());
