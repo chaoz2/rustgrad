@@ -1,0 +1,221 @@
+name: PR Training Performance Evidence
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, labeled, ready_for_review]
+
+# Never cancel a running observation merely because another event fires.
+concurrency:
+  group: pr-training-performance-${{ github.event.pull_request.number }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Optional PR native training comparison
+    if: >-
+      !github.event.pull_request.draft &&
+      contains(github.event.pull_request.labels.*.name, 'performance-evidence') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'performance-evidence')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      BASELINE_SHA: ${{ github.event.pull_request.base.sha }}
+      CANDIDATE_SHA: ${{ github.sha }}
+      AUTHORED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      MEASUREMENT_MODE: warm-resume
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: -D warnings
+    steps:
+      - name: Retain event context before checkout
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          event = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          pr = event['pull_request']
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'native-transformer-training-comparison'
+          root.mkdir()
+          value = {
+              'format_version': 1, 'evidence_kind': 'unverified_pr_event_context',
+              'repository': event['repository']['full_name'], 'pr_number': event['number'],
+              'baseline_sha': pr['base']['sha'], 'authored_head_sha': pr['head']['sha'],
+              'context': {k: os.environ[k] for k in (
+                  'GITHUB_SHA', 'GITHUB_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_WORKFLOW_REF',
+                  'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_JOB')},
+          }
+          with (root / 'event-context.json').open('x') as output:
+              json.dump(value, output, indent=2, sort_keys=True)
+          PY
+      # Ordinary pull_request context: no privileged target event, environment,
+      # secrets, dependency cache, persistent runner or write token.
+      - name: Check out exact tested merge
+        id: candidate
+        timeout-minutes: 5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: candidate-source
+          persist-credentials: false
+      - name: Check out exact PR base
+        id: baseline
+        timeout-minutes: 5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          path: baseline-source
+          persist-credentials: false
+      - name: Authenticate PR source and run identity
+        id: source
+        timeout-minutes: 1
+        shell: bash
+        run: python3 candidate-source/.github/scripts/bind-pr-training-performance.py source
+      - name: Install pinned Rust toolchain
+        id: toolchain
+        timeout-minutes: 3
+        uses: dtolnay/rust-toolchain@1d1eb14921d9c2d8ea575663e5fe3a0b57868a05
+        with:
+          toolchain: 1.89.0
+      - name: Validate tooling fixtures
+        id: fixtures
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          python3 candidate-source/.github/scripts/test-pr-training-performance.py
+          python3 candidate-source/.github/scripts/test-native-transformer-training-comparison.py
+      - name: Build both release executables before measurement
+        id: build
+        timeout-minutes: 15
+        shell: bash
+        run: bash candidate-source/.github/scripts/run-native-transformer-training-comparison.sh build
+      - name: Record fixed ABBA trials with isolated native caches
+        id: record
+        timeout-minutes: 30
+        shell: bash
+        run: bash candidate-source/.github/scripts/run-native-transformer-training-comparison.sh record
+      - name: Validate and compare immutable evidence
+        id: admission
+        timeout-minutes: 2
+        if: always()
+        shell: bash
+        run: bash candidate-source/.github/scripts/run-native-transformer-training-comparison.sh validate
+      - name: Bind complete or partial PR evidence
+        id: binding
+        timeout-minutes: 1
+        if: always()
+        shell: bash
+        env:
+          COMPARISON_ADMISSION_OUTCOME: ${{ steps.admission.outcome }}
+        run: python3 candidate-source/.github/scripts/bind-pr-training-performance.py evidence
+      - name: Retain stage outcomes independently of checkout
+        id: finalize
+        timeout-minutes: 3
+        if: always()
+        shell: bash
+        env:
+          ENVELOPE_PR_NUMBER: ${{ github.event.pull_request.number }}
+          ENVELOPE_BASELINE_SHA: ${{ github.event.pull_request.base.sha }}
+          ENVELOPE_AUTHORED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ENVELOPE_CANDIDATE_SHA: ${{ github.sha }}
+          CANDIDATE: ${{ steps.candidate.outcome }}
+          BASELINE: ${{ steps.baseline.outcome }}
+          SOURCE: ${{ steps.source.outcome }}
+          TOOLCHAIN: ${{ steps.toolchain.outcome }}
+          FIXTURES: ${{ steps.fixtures.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          RECORD: ${{ steps.record.outcome }}
+          ADMISSION: ${{ steps.admission.outcome }}
+          BINDING: ${{ steps.binding.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, stat, tempfile
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE']) / 'native-transformer-training-comparison'
+          upload = pathlib.Path(tempfile.mkdtemp(prefix='rustgrad-pr-upload-', dir=os.environ['RUNNER_TEMP']))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'upload_path={upload}\n')
+          names = ('GITHUB_REPOSITORY', 'GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA',
+                   'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_JOB')
+          context = {k: os.environ[k] for k in names}
+          context.update({k: os.environ['ENVELOPE_' + k] for k in (
+              'PR_NUMBER', 'BASELINE_SHA', 'AUTHORED_HEAD_SHA', 'CANDIDATE_SHA')})
+          value = {'format_version': 1, 'evidence_kind': 'pr_training_stage_outcomes',
+                   'context': context,
+                   'observation_role': 'initial_attempt' if os.environ['GITHUB_RUN_ATTEMPT'] == '1' else 'diagnostic_rerun',
+                   'source_authentication': os.environ['SOURCE'],
+                   'outcomes': {k.lower(): os.environ[k] for k in (
+                       'CANDIDATE', 'BASELINE', 'SOURCE', 'TOOLCHAIN', 'FIXTURES',
+                       'BUILD', 'RECORD', 'ADMISSION', 'BINDING')},
+                   'files': {}, 'retention_error': None}
+          retained = {}
+          root_fd = None
+          def open_relative(parts):
+              current = os.dup(root_fd)
+              try:
+                  for part in parts[:-1]:
+                      child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+                      os.close(current)
+                      current = child
+                  return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=current)
+              finally:
+                  os.close(current)
+          try:
+              root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              total = entries = 0
+              for path in root.rglob('*'):
+                  entries += 1
+                  if entries > 64:
+                      raise ValueError('evidence entry budget exceeded')
+                  parts = path.relative_to(root).parts
+                  if parts[0] == 'job-outcomes.json':
+                      raise ValueError('raw evidence cannot impersonate the final envelope')
+                  if parts == ('pr-evidence.json',) and os.environ['BINDING'] != 'success':
+                      raise ValueError('failed binding cannot publish a claimed sidecar')
+                  fd = open_relative(parts)
+                  info = os.fstat(fd)
+                  if stat.S_ISDIR(info.st_mode):
+                      os.close(fd)
+                      continue
+                  if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                      os.close(fd)
+                      raise ValueError('evidence contains a non-regular or hard-linked file')
+                  with os.fdopen(fd, 'rb') as source:
+                      raw = source.read(8 * 1024 * 1024 + 1)
+                  total += len(raw)
+                  if len(raw) > 8 * 1024 * 1024 or total > 64 * 1024 * 1024:
+                      raise ValueError('evidence byte budget exceeded')
+                  retained[path.relative_to(root).as_posix()] = raw
+              # Publish no unsanitized prefix if any later file is invalid.
+              for name, raw in sorted(retained.items()):
+                  destination = upload / name
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  with destination.open('xb') as output:
+                      output.write(raw)
+                  value['files'][name] = {'byte_count': len(raw),
+                                         'sha256': hashlib.sha256(raw).hexdigest()}
+          except (OSError, ValueError) as error:
+              value['retention_error'] = str(error)
+          finally:
+              if root_fd is not None:
+                  os.close(root_fd)
+          with (upload / 'job-outcomes.json').open('x') as output:
+              json.dump(value, output, indent=2, sort_keys=True)
+          if value['retention_error'] is not None:
+              raise SystemExit(1)
+          PY
+      - name: Upload raw trials and PR binding
+        timeout-minutes: 5
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr-training-performance-${{ github.event.pull_request.number }}-${{ github.event.pull_request.base.sha }}-${{ github.event.pull_request.head.sha }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.finalize.outputs.upload_path }}
+          if-no-files-found: error
+          retention-days: 30
