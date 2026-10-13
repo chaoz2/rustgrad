@@ -1756,7 +1756,9 @@ struct ScalarAliasCandidates {
     projected_view_roots: BTreeMap<usize, BTreeSet<usize>>,
 }
 
-struct ScalarAliasCollector<'a, 'queries> {
+// The cache borrows the immutable Graph for the complete pass; discovery
+// borrows a shorter-lived fusion frontier that may change after this walk.
+struct ScalarAliasCollector<'a, 'queries, 'graph> {
     graph: &'a Graph,
     output: NodeId,
     iteration_shape: &'a Shape,
@@ -1765,10 +1767,10 @@ struct ScalarAliasCollector<'a, 'queries> {
     requested: &'a BTreeSet<usize>,
     candidates: ScalarAliasCandidates,
     seen: BTreeSet<NodeId>,
-    queries: &'queries mut crate::rangeify::ProjectedForestCache<'a>,
+    queries: &'queries mut crate::rangeify::ProjectedForestCache<'graph>,
 }
 
-impl ScalarAliasCollector<'_, '_> {
+impl ScalarAliasCollector<'_, '_, '_> {
     fn record_affine_view_roots(
         &mut self,
         terminal: NodeId,
@@ -1925,7 +1927,7 @@ impl ScalarAliasCandidates {
         roots: &'a BTreeSet<usize>,
         external: &'a BTreeSet<usize>,
         requested: &'a BTreeSet<usize>,
-        queries: &mut crate::rangeify::ProjectedForestCache<'a>,
+        queries: &mut crate::rangeify::ProjectedForestCache<'_>,
     ) -> Result<Self, ScheduleError> {
         // Scalar elementwise lowering iterates the output shape. Reduction
         // lowering first lowers its producer over the complete reduction

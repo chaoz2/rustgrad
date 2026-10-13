@@ -464,6 +464,14 @@ fn source_queries_do_not_emit_and_noncanonical_ranges_bypass_cache() {
     assert_eq!(first, Ok(ProjectionSource::Predicated(input)));
     assert_eq!(second, first);
     assert_eq!(
+        super::super::view::predicated_source(&graph, node, &shape),
+        Ok(input)
+    );
+    assert_eq!(
+        super::super::view::projected_source(&graph, node, &shape),
+        Ok(input)
+    );
+    assert_eq!(
         (counts.extractions, counts.hits, counts.emissions),
         (1, 1, 0)
     );

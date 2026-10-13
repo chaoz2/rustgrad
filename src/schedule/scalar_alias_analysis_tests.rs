@@ -1,10 +1,11 @@
 use super::*;
+use crate::nn::StateKind;
 use crate::rangeify::{ProjectionSource, RangeifyError};
 use crate::{
     Backend, CompiledAdamWConfig, CompiledAdamWGraph, CompiledAdamWIgnoreIndexContext,
     CompiledDropoutConfig, CompiledDropoutKey, CompiledInputBatch, CompiledInputSpec,
     CompiledModuleAdamWPlan, CompiledMultiStepLr, DType, LossOptions, Module, Operation, Parameter,
-    Reduction, Scalar, StateKind, TensorData, TrainingDropoutProvider, UType,
+    Reduction, Scalar, TensorData, TrainingDropoutProvider, UType,
     sparse_categorical_cross_entropy,
 };
 
@@ -115,7 +116,7 @@ fn scale_config() -> crate::Result<CompiledAdamWConfig> {
         .with_input_batch::<ScaleBatch>()?
         .with_token_weighted_ignore_index(TARGETS, IGNORE_INDEX)?
         .with_frozen_parameters([FROZEN_POSITION_WEIGHT])?
-        .with_captured_multi_step_lr(CompiledMultiStepLr::new(2e-3, 0.5, [1])?)?
+        .with_captured_multi_step_lr(CompiledMultiStepLr::new(2e-3, 0.5, [1])?)
         .with_clip_report()
         .with_window_loss_report())
 }

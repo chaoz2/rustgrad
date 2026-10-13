@@ -37,7 +37,7 @@ impl<'a> ScalarAliasAnalysis<'a> {
     pub(super) fn candidates(
         &mut self,
         output: NodeId,
-        projections: &mut crate::rangeify::ProjectedForestCache<'a>,
+        projections: &mut crate::rangeify::ProjectedForestCache<'_>,
     ) -> Result<Option<&ScalarAliasCandidates>, ScheduleError> {
         if !scalar_alias_output(self.graph.op(output).map_err(ScheduleError::Graph)?) {
             return Ok(None);
