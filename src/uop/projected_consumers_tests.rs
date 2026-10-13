@@ -96,6 +96,125 @@ fn store(index: UOp) -> UOp {
     UOp::from_operation(Operation::Store, None, vec![index, value])
 }
 
+fn reduction_chain() -> (UOp, UOp) {
+    let ty = UType::scalar(DType::F32);
+    let init = UOp::from_operation(
+        Operation::ReduceInit(crate::ReductionValue {
+            input_shape: Shape::from([2]),
+            output_shape: Shape::new([]),
+            axes: vec![0],
+            keepdim: false,
+            kind: crate::ReduceKind::Sum,
+        }),
+        Some(ty),
+        vec![],
+    );
+    let value = UOp::scalar_constant(DType::F32, 1.0_f32.to_bits() as u64, ty);
+    let accumulate = UOp::from_operation(
+        Operation::ReduceAccumulate,
+        Some(ty),
+        vec![init.clone(), value],
+    );
+    let finalize = UOp::from_operation(Operation::ReduceFinalize, Some(ty), vec![accumulate]);
+    (init, finalize)
+}
+
+#[test]
+fn reduction_free_validation_preserves_errors_without_ownership_bookkeeping() {
+    let ty = UType::scalar(DType::I64);
+    let range = UOp::from_operation(Operation::Range(0), Some(ty), vec![UOp::constant(2, ty)]);
+    let end = UOp::from_operation(Operation::EndRange, None, vec![range.clone()]);
+    let ordinary = UOp::binary(Binary::Add, UOp::constant(1, ty), UOp::constant(2, ty));
+    for (name, root, expected) in [
+        ("empty", UOp::sink(vec![]), Ok(())),
+        ("ordinary", ordinary, Ok(())),
+        ("closed control", UOp::sink(vec![end]), Ok(())),
+        (
+            "open control",
+            UOp::sink(vec![range]),
+            Err(UOpError::UnclosedControl),
+        ),
+        (
+            "projected load",
+            load(index(0, IndexAddressing::Projected, 1)),
+            Ok(()),
+        ),
+        (
+            "unused projection",
+            index(0, IndexAddressing::Projected, 1),
+            Err(UOpError::InvalidIndex),
+        ),
+    ] {
+        let before = crate::uop::reduction_topology_inspection_count();
+        let actual = root.validate();
+        assert_eq!(
+            crate::uop::reduction_topology_inspection_count(),
+            before,
+            "{name}"
+        );
+        assert_eq!(actual, expected, "{name}");
+        assert_eq!(
+            actual,
+            previous_validation(&root),
+            "released validation: {name}"
+        );
+        if expected.is_ok() {
+            assert_eq!(
+                crate::uop::reduction_topology_inspection_count(),
+                before + 1,
+                "released ownership walk: {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn reduction_detection_retains_actual_allocations_and_failure_precedence() {
+    let (init, complete) = reduction_chain();
+    let (_, equal) = reduction_chain();
+    assert_eq!(complete, equal);
+    assert!(!complete.shares_node_with(&equal));
+    let ty = UType::scalar(DType::I64);
+    let range = UOp::from_operation(Operation::Range(0), Some(ty), vec![UOp::constant(2, ty)]);
+    let duplicate = UOp::sink(vec![complete.clone(), equal]);
+    for (name, root, expected, inspections) in [
+        ("complete", complete.clone(), Ok(()), 1),
+        ("incomplete", init, Err(UOpError::InvalidArgument), 1),
+        (
+            "equal distinct owners",
+            duplicate.clone(),
+            Err(UOpError::InvalidArgument),
+            1,
+        ),
+        (
+            "finalize fanout",
+            UOp::sink(vec![complete.clone(), complete]),
+            Err(UOpError::InvalidArgument),
+            1,
+        ),
+        (
+            "control before ownership",
+            UOp::sink(vec![range, duplicate]),
+            Err(UOpError::UnclosedControl),
+            0,
+        ),
+    ] {
+        let before = crate::uop::reduction_topology_inspection_count();
+        let actual = root.validate();
+        assert_eq!(
+            crate::uop::reduction_topology_inspection_count() - before,
+            inspections,
+            "{name}"
+        );
+        assert_eq!(actual, expected, "{name}");
+        assert_eq!(
+            actual,
+            previous_validation(&root),
+            "released validation: {name}"
+        );
+    }
+}
+
 #[test]
 fn projected_admission_matches_previous_summary_and_validation() {
     for addressing in [IndexAddressing::Projected, IndexAddressing::Predicated] {

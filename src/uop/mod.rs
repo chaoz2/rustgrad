@@ -17,6 +17,8 @@ use std::{
     sync::Arc,
 };
 pub(crate) use traversal::CanonicalNodeTable;
+#[cfg(test)]
+pub(crate) use traversal::canonical_traversal_count;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AddressSpace {
@@ -830,19 +832,30 @@ impl UOp {
     fn validate_ordered_nodes(&self, nodes: &[UOp]) -> Result<(), UOpError> {
         let mut ranges = BTreeSet::new();
         let mut ifs = Vec::new();
+        let mut has_reduction = false;
         for n in nodes {
-            validate_one(n, &mut ranges, &mut ifs)?
+            validate_one(n, &mut ranges, &mut ifs)?;
+            has_reduction |= matches!(
+                n.operation(),
+                Operation::ReduceInit(_) | Operation::ReduceAccumulate | Operation::ReduceFinalize
+            );
         }
         projected_consumers::validate(nodes)?;
         if !ifs.is_empty() || !ranges.is_empty() {
             return Err(UOpError::UnclosedControl);
         }
-        validate_reduction_topology(self)?;
+        // Canonical keys include Operation, so deduplication cannot hide the
+        // existence of a reduction. Only its ownership needs actual Arc edges.
+        if has_reduction {
+            validate_reduction_topology(self)?;
+        }
         Ok(())
     }
 }
 
 fn validate_reduction_topology(root: &UOp) -> Result<(), UOpError> {
+    #[cfg(test)]
+    REDUCTION_TOPOLOGY_INSPECTIONS.with(|count| count.set(count.get() + 1));
     fn visit(node: &UOp, seen: &mut BTreeSet<usize>, out: &mut Vec<UOp>) {
         if !seen.insert(node.node_identity()) {
             return;
@@ -920,6 +933,17 @@ fn validate_reduction_topology(root: &UOp) -> Result<(), UOpError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static REDUCTION_TOPOLOGY_INSPECTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reduction_topology_inspection_count() -> usize {
+    REDUCTION_TOPOLOGY_INSPECTIONS.with(std::cell::Cell::get)
 }
 
 /// Returns whether raw scalar storage metadata can faithfully inhabit `ty`.
