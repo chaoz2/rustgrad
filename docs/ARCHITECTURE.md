@@ -1946,6 +1946,24 @@ for momentum-SGD.
   released after admission. Independent byte/file import, historical migration,
   durable-save revalidation, and lazy topology sealing remain unchanged;
   momentum-SGD retains its independent import path.
+- **Recurrent phase encoding.** `engine/mixed_capture/encoding.rs` owns the
+  canonical RGSM payload and envelope writer. Public mutable-capture encoding
+  still validates/rekeys and derives identity at its original gates. Compiled
+  AdamW and momentum-SGD phase export instead calls the existing immutable
+  `AuthenticatedRecurrentFrontier`: it uses that owner's mixed identity and
+  writes the payload once, without recomputing admission or identity. Each
+  kernel still receives ordinary canonical encoding and actual-root checks.
+  The identity is not the embedded ordinary schedule identity, and no caller
+  can supply a freely pairable capture/hash tuple. Header-first field writing
+  preserves both the writer's 64 MiB bound and the distinct checksum-headroom
+  error. Fresh headerless payload admission and legacy migration do not prove
+  complete-envelope capacity. Public encoding, current/legacy import, and
+  replay remain independent; no additional kernel bytes or capture owners are
+  retained. A frozen released writer checks exact bytes and errors, typed
+  scalar/empty captures, raw constant lanes, mutable-capture rejection,
+  corrupted and historical envelopes, real near-limit payloads, encoding
+  work, and owner release. This changes no wire version, cache identity, or
+  public API and makes no speedup or peak-memory claim.
 - **Restore.** `restore_from_program_artifact` consumes a differently
   initialized compatible module and its complete-module checkpoint. It rebuilds
   the resource-free plan without invoking the workload builder, autograd,

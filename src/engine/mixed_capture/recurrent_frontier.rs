@@ -89,6 +89,12 @@ impl AuthenticatedRecurrentFrontier {
         self.capture_identity
     }
 
+    /// Encodes the immutable admitted logical program once, retaining every
+    /// field/envelope bound without repeating admission or identity derivation.
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, ReplayError> {
+        super::encoding::encode_frontier(self)
+    }
+
     pub(crate) fn capture(&self) -> &CapturedMixedSchedule {
         self.capture.as_ref()
     }
