@@ -1755,6 +1755,40 @@ include the excluded warmup and are not presented as the 96 measured samples.
 
 ##### Manual same-runner training comparison
 
+An optional `pr-training-performance.yml` lane measures the fixed warm-resume
+workload before merge. It is an ordinary `pull_request` workflow on hosted Linux,
+enabled for non-draft PRs bearing `performance-evidence`, not a required check.
+Its source-binding adapter admits only the exact event base and authored head
+as the two ordered parents of the checked-out tested merge. A separate sidecar
+records repository/PR, workflow source, run/attempt and build/comparison digests;
+it does not change the comparison, checkpoint or runtime formats.
+
+Both adapters use one build/record/validate shell recipe and the existing
+numerical and exact-resume validators. The PR lane has no protected environment,
+repository/environment secrets, write token, persistent runner or shared cache.
+It neither authorizes a merge nor imposes a performance threshold. Failed builds,
+partial trials and incomparable schemas remain inspectable artifacts.
+Regular raw files are copied to a unique bounded upload directory; unsafe or
+oversized output yields only the run-bound failure envelope, never an
+unsanitized upload. A retrigger does not automatically cancel a running
+observation.
+Full action SHAs, read-only checkout credentials and exact revision bindings keep
+the lane separate from privileged deployment work; the manual candidate-SHA
+guard and required CI contexts remain unchanged.
+These are PR-authored observations, not independent trusted admission: the PR
+can change its own workflow, helper and validator. Review must inspect those
+sources and independently verify the raw evidence before any merge decision.
+
+Run attempts after the first are marked diagnostic. The first observation,
+including failed or incomparable attempts, for an exact base/head/tested-merge
+tuple is retained as the initial observation, not automatically selected: label cycling can start
+a new run, and stateless CI cannot guarantee global uniqueness. Reviews retain
+the original observation and disclose later
+runs rather than selecting a favorable result. The artifact name includes all
+three revisions plus run and attempt; two trials per revision remain too few
+to establish a general speedup. Optional evidence costs two isolated release
+builds and four serial executions, bounded by 75 hosted-runner minutes.
+
 The manual native-Transformer comparison workflow selects one fixed evidence
 workload: `steady-replay` (the unchanged cold scoreboard plus 96-sample warm
 sidecar) or `warm-resume` (the larger Transformer's fresh-executor restoration).

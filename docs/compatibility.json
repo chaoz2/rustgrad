@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "source": "docs/COMPATIBILITY.md",
-  "source_fingerprint": "fnv1a64:e313e0f941b2cfec",
+  "source_fingerprint": "fnv1a64:cf33bf6032cc9e73",
   "entries": [
     {
       "section": "Multi-device collectives",
@@ -775,6 +775,15 @@
       "status": "partial",
       "fields": {
         "Acceptance requirement": "The maintained scale example's `compile-only` mode constructs and inspects the same fixed two-block AdamW plan, including accumulation, partial flush, zero-grad and evaluation, then exits before target preparation or replay. Linux CI validates its bounded JSON workload/identity/count contract. The manual-only protected `native-transformer-compile-profile` workflow binds an exact reviewed SHA and debug-info release executable to runner-local Callgrind instruction counts, raw call graphs, inclusive/exclusive annotations and hashed provenance. Its bounded validator rejects malformed or empty profiles and preserves create-new manifest publication. Scope includes initialization, compilation, inspection and teardown; instruction counts are not ordinary wall-clock timings, speedup evidence, native replay, or accelerator profiling. Profiler-dependent evidence requires a successful exact-SHA manual run."
+      }
+    },
+    {
+      "section": "Tooling and release quality",
+      "subject_header": "Capability",
+      "subject": "PR-time compiled-training performance evidence",
+      "status": "partial",
+      "fields": {
+        "Acceptance requirement": "An optional ordinary `pull_request` workflow runs the fixed strict-native two-block Transformer warm-resume A-B-B-A comparison on hosted Linux when a maintainer applies `performance-evidence`. A separate sidecar binds exact base, authored head, tested two-parent merge, workflow source, run and attempt identities to raw build/comparison digests. The shared recipe retains isolated per-trial caches, whole-frontier gradient projections, decreasing weighted objective, zero fallback, and exact checkpoint/resume admission; bounded regular raw trials remain artifacts, with an envelope-only result if output violates the upload budget or file-safety rules. This is PR-authored, non-required observational evidence, not independent trusted admission, a speed threshold, or merge authorization; source review and independent raw-evidence verification remain required. Rerun attempts are diagnostic; a stateless workflow cannot enforce global uniqueness across label cycling, so reviewers retain the first exact-revision observation, including failures. No repository/environment secrets, protected environment, shared cache, self-hosted runner, or write token is configured. The protected manual exact-candidate guard and required CI contexts remain unchanged."
       }
     },
     {
