@@ -3046,9 +3046,17 @@ existing source gate without rebuilding a structurally keyed UOp map. Field,
 version, tag, source-limit, source-order, and actual-allocation reduction checks
 remain independent and keep their existing precedence. Schedule normalization
 retains the table through key emission; node-only consumers receive the lean
-order after temporarily constructing edge metadata. Normalization releases its
-preliminary table after rewriting and before constructing the final table;
-these sidecars do not overlap. Their transient allocation cost remains a
+order after temporarily constructing edge metadata. Normalization constructs
+the original table before its first semantic gate and reuses it only when a
+rewrite preserves the exact root allocation. Original, projected-result, and
+final-result semantic validation still execute at their established gates;
+root identity shares ordering, never admission. A changed root releases the
+prior table before constructing its replacement, so edge sidecars do not
+overlap. Original edge metadata now remains alive during projected rewriting,
+including attempts that change the root.
+Released-sequence fixtures check exact traversal savings, unchanged validation
+counts, rewritten adjacency, canonical bytes, errors, and owner release.
+Their transient allocation and lifetime cost remains a
 tradeoff, and no general or measured peak-memory reduction is claimed.
 Successful fresh encoding drops edge metadata before authentication,
 while decoded kernels retain it only through their local re-encoding boundary.
