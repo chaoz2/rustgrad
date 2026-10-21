@@ -667,6 +667,16 @@ struct UOpNode {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct UOp(Arc<UOpNode>);
 
+#[cfg(test)]
+pub(crate) struct WeakUOp(std::sync::Weak<UOpNode>);
+
+#[cfg(test)]
+impl WeakUOp {
+    pub(crate) fn is_released(&self) -> bool {
+        self.0.upgrade().is_none()
+    }
+}
+
 impl Ord for UOp {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -735,7 +745,7 @@ impl UOp {
     pub fn from_operation(operation: Operation, ty: Option<UType>, sources: Vec<UOp>) -> Self {
         Self::from_parts(operation, ty, sources, None)
     }
-    fn from_parts(
+    pub(crate) fn from_parts(
         operation: Operation,
         ty: Option<UType>,
         sources: Vec<UOp>,
@@ -753,6 +763,10 @@ impl UOp {
     }
     pub(crate) fn node_identity(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
+    }
+    #[cfg(test)]
+    pub(crate) fn weak_owner(&self) -> WeakUOp {
+        WeakUOp(Arc::downgrade(&self.0))
     }
     pub fn operation(&self) -> &Operation {
         &self.0.operation

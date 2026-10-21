@@ -84,6 +84,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+      - name: Projected forest maintained Transformer compile equivalence
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --lib schedule::scalar_alias_analysis::tests::maintained_transformer_scale_compile_preserves_full_artifact_across_cache_modes -- --exact --nocapture
       - name: Compiled Transformer compile-only contract
         if: matrix.os == 'ubuntu-latest'
         shell: bash
