@@ -31,7 +31,7 @@ mod prefix_scan;
 #[path = "ptx_sort.rs"]
 mod sort;
 
-pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v34";
+pub const PTX_RENDERER_VERSION: &str = "rustgrad-ptx-elementwise-v35";
 /// Separate identity for raw storage-width computed affine materialization.
 pub const PTX_AFFINE_COPY_RENDERER_VERSION: &str = "rustgrad-ptx-affine-copy-v1";
 /// Separate identity for dense raw storage-width materialization.
@@ -510,6 +510,15 @@ pub struct PtxRenderer {
     pub block_size: u32,
 }
 impl PtxRenderer {
+    fn isa_version_directive(&self) -> &'static str {
+        // NVIDIA introduced sm_86 in PTX 7.1, and sm_87/89/90 are covered by
+        // PTX 7.8. Retain 7.0 for the existing older-target source contract.
+        match self.sm {
+            0..=80 => ".version 7.0",
+            81..=86 => ".version 7.1",
+            _ => ".version 7.8",
+        }
+    }
     pub fn new(sm: u32) -> Result<Self, PtxError> {
         if !(20..=90).contains(&sm) {
             return Err(PtxError::Unsupported(format!(
@@ -980,7 +989,7 @@ fn render(
     }
     let mut lines = vec![
         format!("// {PTX_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         "".into(),
@@ -1041,7 +1050,10 @@ fn render(
         lines.push("  .reg .pred %rgp<128>;".into());
     }
     for n in 0..buffers.len() {
-        lines.push(format!("  ld.param.u64 %rd{}0, [p{n}];", n + 1));
+        if n == 0 {
+            lines.push(format!("  .reg .b64 %rgb<{}>;", buffers.len() + 1));
+        }
+        lines.push(format!("  ld.param.u64 %rgb{}, [p{n}];", n + 1));
     }
     lines.extend([
         "  ld.param.u64 %rd0, [extent];".into(),
@@ -1081,7 +1093,7 @@ fn render(
         "  mul.wide.u32 %rd31, %r3, {};",
         out.dtype.itemsize()
     ));
-    lines.push(format!("  add.u64 %rd31, %rd{oi}0, %rd31;"));
+    lines.push(format!("  add.u64 %rd31, %rgb{oi}, %rd31;"));
     lines.push(format!(
         "  st.global.{} [%rd31], {value};",
         ptx_type(out.dtype)
@@ -1146,7 +1158,7 @@ fn render_portable_bitcast(
     };
     let mut lines = vec![
         format!("// {PTX_PORTABLE_BITCAST_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         String::new(),
@@ -1327,7 +1339,7 @@ fn render_portable_dense_materialization(
     let entry = "rg_portable_dense_materialization".to_owned();
     let mut lines = vec![
         format!("// {PTX_PORTABLE_DENSE_MATERIALIZATION_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         String::new(),
@@ -1443,7 +1455,7 @@ fn render_contiguous_copy(
     let value = if width == 8 { "%rd4" } else { "%r4" };
     let source = [
         format!("// {PTX_CONTIGUOUS_COPY_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         String::new(),
@@ -1561,7 +1573,7 @@ fn render_affine_copy(
     let entry = format!("rg_affine_copy_w{width}_r{}", plan.output_shape.rank());
     let mut lines = vec![
         format!("// {PTX_AFFINE_COPY_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         String::new(),
@@ -1689,7 +1701,7 @@ fn render_static_positions(
     let value = if width == 8 { "%rd20" } else { "%r4" };
     let mut lines = vec![
         format!("// {PTX_STATIC_POSITION_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         String::new(),
@@ -1839,7 +1851,7 @@ fn render_random(
     let entry = format!("rg_random_e{extent}");
     let mut lines = vec![
         format!("// {PTX_RENDERER_VERSION} captured-threefry ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         "".into(),
@@ -2085,7 +2097,7 @@ fn render_live_threefry(
     let entry = format!("rg_live_threefry_e{extent}_b{}", buffers.len());
     let mut lines = vec![
         format!("// {PTX_THREEFRY_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         String::new(),
@@ -5621,7 +5633,7 @@ fn emit(
             // All affine maps address elements.  Convert only after the signed
             // map has been proven in-range by its immutable descriptor.
             lines.push(format!("  mul.lo.u64 %rd28, %rd28, {};", ty.itemsize()));
-            lines.push(format!("  add.u64 %rd29, %rd{b}0, %rd28;"));
+            lines.push(format!("  add.u64 %rd29, %rgb{b}, %rd28;"));
             if projected_predicate.is_some() {
                 match ty {
                     DType::F16 | DType::BF16 | DType::Bool | DType::I32 | DType::U32 => {
@@ -6971,7 +6983,7 @@ fn render_reduction(
     let entry = format!("rg_reduce_e{extent}_r{reduction_len}_b{}", buffers.len());
     let mut lines = vec![
         format!("// {PTX_RENDERER_VERSION} ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         "".into(),
@@ -7018,7 +7030,10 @@ fn render_reduction(
         lines.push("  .reg .s64 %rgi<128>;".into());
     }
     for index in 0..buffers.len() {
-        lines.push(format!("  ld.param.u64 %rd{}0, [p{index}];", index + 1));
+        if index == 0 {
+            lines.push(format!("  .reg .b64 %rgb<{}>;", buffers.len() + 1));
+        }
+        lines.push(format!("  ld.param.u64 %rgb{}, [p{index}];", index + 1));
     }
     lines.extend([
         "  ld.param.u64 %rd0, [extent];".into(),
@@ -7230,7 +7245,7 @@ fn render_reduction(
         "  mul.wide.u32 %rd31, %r3, {};",
         out.dtype.itemsize()
     ));
-    lines.push(format!("  add.u64 %rd31, %rd{output_index}0, %rd31;"));
+    lines.push(format!("  add.u64 %rd31, %rgb{output_index}, %rd31;"));
     lines.push(format!(
         "  st.global.{} [%rd31], {result};",
         ptx_type(out.dtype)
@@ -8429,7 +8444,7 @@ mod tests {
 
     #[test]
     fn exact_u64_word_shifts_render_while_guarded_counts_stay_closed() {
-        assert_eq!(PTX_RENDERER_VERSION, "rustgrad-ptx-elementwise-v34");
+        assert_eq!(PTX_RENDERER_VERSION, "rustgrad-ptx-elementwise-v35");
         let renderer = PtxRenderer::new(80).unwrap();
         let mut graph = Graph::new();
         let words = graph.input_dtype("words", [2], DType::U64);
@@ -8488,9 +8503,9 @@ mod tests {
         let rendered = renderer.render(&item.kernel).unwrap();
         assert_eq!(rendered.buffers.len(), 11);
         assert!(rendered.source.contains(".reg .b64 %rgv<256>;"));
-        assert!(rendered.source.contains("ld.param.u64 %rd100, [p9];"));
+        assert!(rendered.source.contains("ld.param.u64 %rgb10, [p9];"));
         assert!(rendered.source.contains("add.u64 %rgv"));
-        assert!(!rendered.source.contains("add.u64 %rd100,"));
+        assert!(!rendered.source.contains("add.u64 %rgb10,"));
 
         let reduced = graph.sum(output, 0).unwrap();
         let item = crate::schedule(&graph, reduced)
@@ -8502,9 +8517,9 @@ mod tests {
         assert_eq!(rendered.buffers.len(), 11);
         assert!(rendered.source.contains("REDUCE:"));
         assert!(rendered.source.contains(".reg .b64 %rgv<256>;"));
-        assert!(rendered.source.contains("ld.param.u64 %rd100, [p9];"));
+        assert!(rendered.source.contains("ld.param.u64 %rgb10, [p9];"));
         assert!(rendered.source.contains("add.u64 %rgv"));
-        assert!(!rendered.source.contains("add.u64 %rd100,"));
+        assert!(!rendered.source.contains("add.u64 %rgb10,"));
     }
 
     #[test]

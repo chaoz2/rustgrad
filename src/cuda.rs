@@ -561,10 +561,10 @@ impl fmt::Display for CudaError {
 /// CUDA JIT option identifiers from `cuda.h` (`CUjit_option`).
 pub const CU_JIT_OPTIMIZATION_LEVEL: u32 = 7;
 pub const CU_JIT_TARGET_FROM_CUCONTEXT: u32 = 8;
-pub const CU_JIT_INFO_LOG_BUFFER: u32 = 4;
-pub const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: u32 = 5;
-pub const CU_JIT_ERROR_LOG_BUFFER: u32 = 6;
-pub const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: u32 = 7;
+pub const CU_JIT_INFO_LOG_BUFFER: u32 = 3;
+pub const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: u32 = 4;
+pub const CU_JIT_ERROR_LOG_BUFFER: u32 = 5;
+pub const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES: u32 = 6;
 /// Bounded writable log buffers used by `cuModuleLoadDataEx`.
 #[derive(Clone, Debug)]
 pub struct ModuleLoadOptions {
@@ -1549,9 +1549,6 @@ impl Owner {
         }
         let mut info = vec![0u8; options.log_bytes];
         let mut error = vec![0u8; options.log_bytes];
-        let mut info_size = info.len();
-        let mut error_size = error.len();
-        let mut opt = options.optimization_level;
         let keys = [
             CU_JIT_OPTIMIZATION_LEVEL,
             CU_JIT_TARGET_FROM_CUCONTEXT,
@@ -1561,12 +1558,15 @@ impl Owner {
             CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
         ];
         let mut values = [
-            (&mut opt as *mut u32).cast(),
+            // CUjit_option scalar inputs are values cast to void*, not pointers
+            // to scalar storage. Log buffers remain actual writable pointers.
+            // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__MODULE.html
+            options.optimization_level as usize as *mut c_void,
             ptr::null_mut(),
             info.as_mut_ptr().cast(),
-            (&mut info_size as *mut usize).cast(),
+            info.len() as *mut c_void,
             error.as_mut_ptr().cast(),
-            (&mut error_size as *mut usize).cast(),
+            error.len() as *mut c_void,
         ];
         let result = d.module_load_data_ex(&mut raw, ptx.as_ptr().cast(), &keys, &mut values);
         if result != CUDA_SUCCESS {
@@ -7694,28 +7694,21 @@ pub(crate) mod tests {
             self.call("module_load_ex");
             assert_eq!(
                 options,
-                [
-                    CU_JIT_OPTIMIZATION_LEVEL,
-                    CU_JIT_TARGET_FROM_CUCONTEXT,
-                    CU_JIT_INFO_LOG_BUFFER,
-                    CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
-                    CU_JIT_ERROR_LOG_BUFFER,
-                    CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES
-                ]
+                // Independent cuda.h numeric ABI, not the runtime constants.
+                [7, 8, 3, 4, 5, 6]
             );
             unsafe {
-                assert_eq!(*(values[0] as *const u32), 4);
+                assert_eq!(values[0] as usize, 4);
+                assert!(values[1].is_null());
                 let info = values[2] as *mut u8;
-                let info_len = values[3] as *mut usize;
                 let err = values[4] as *mut u8;
-                let err_len = values[5] as *mut usize;
                 assert_ne!(info, err);
-                assert_eq!(*info_len, 4096);
-                assert_eq!(*err_len, 4096);
+                assert_eq!(values[3] as usize, 4096);
+                assert_eq!(values[5] as usize, 4096);
                 std::ptr::copy_nonoverlapping(b"info\0tail".as_ptr(), info, 9);
                 std::ptr::copy_nonoverlapping(b"error-full".as_ptr(), err, 10);
-                *info_len = 9;
-                *err_len = 10;
+                values[3] = 9usize as *mut c_void;
+                values[5] = 10usize as *mut c_void;
             }
             *out = if self.null_module.load(Ordering::Acquire) {
                 ptr::null_mut()

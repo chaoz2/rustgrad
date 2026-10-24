@@ -55,7 +55,7 @@ pub(super) fn render(
     .to_ascii_lowercase();
     let mut lines = vec![
         format!("// {PTX_RENDERER_VERSION} prefix-scan ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
         String::new(),
