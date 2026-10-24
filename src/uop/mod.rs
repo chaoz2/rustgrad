@@ -17,6 +17,8 @@ use std::{
     sync::Arc,
 };
 pub(crate) use traversal::CanonicalNodeTable;
+#[cfg(test)]
+pub(crate) use traversal::canonical_traversal_count;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AddressSpace {
@@ -665,6 +667,16 @@ struct UOpNode {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct UOp(Arc<UOpNode>);
 
+#[cfg(test)]
+pub(crate) struct WeakUOp(std::sync::Weak<UOpNode>);
+
+#[cfg(test)]
+impl WeakUOp {
+    pub(crate) fn is_released(&self) -> bool {
+        self.0.upgrade().is_none()
+    }
+}
+
 impl Ord for UOp {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
@@ -733,7 +745,7 @@ impl UOp {
     pub fn from_operation(operation: Operation, ty: Option<UType>, sources: Vec<UOp>) -> Self {
         Self::from_parts(operation, ty, sources, None)
     }
-    fn from_parts(
+    pub(crate) fn from_parts(
         operation: Operation,
         ty: Option<UType>,
         sources: Vec<UOp>,
@@ -751,6 +763,10 @@ impl UOp {
     }
     pub(crate) fn node_identity(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
+    }
+    #[cfg(test)]
+    pub(crate) fn weak_owner(&self) -> WeakUOp {
+        WeakUOp(Arc::downgrade(&self.0))
     }
     pub fn operation(&self) -> &Operation {
         &self.0.operation
@@ -828,21 +844,34 @@ impl UOp {
     }
 
     fn validate_ordered_nodes(&self, nodes: &[UOp]) -> Result<(), UOpError> {
+        #[cfg(test)]
+        ORDERED_VALIDATIONS.with(|count| count.set(count.get() + 1));
         let mut ranges = BTreeSet::new();
         let mut ifs = Vec::new();
+        let mut has_reduction = false;
         for n in nodes {
-            validate_one(n, &mut ranges, &mut ifs)?
+            validate_one(n, &mut ranges, &mut ifs)?;
+            has_reduction |= matches!(
+                n.operation(),
+                Operation::ReduceInit(_) | Operation::ReduceAccumulate | Operation::ReduceFinalize
+            );
         }
         projected_consumers::validate(nodes)?;
         if !ifs.is_empty() || !ranges.is_empty() {
             return Err(UOpError::UnclosedControl);
         }
-        validate_reduction_topology(self)?;
+        // Canonical keys include Operation, so deduplication cannot hide the
+        // existence of a reduction. Only its ownership needs actual Arc edges.
+        if has_reduction {
+            validate_reduction_topology(self)?;
+        }
         Ok(())
     }
 }
 
 fn validate_reduction_topology(root: &UOp) -> Result<(), UOpError> {
+    #[cfg(test)]
+    REDUCTION_TOPOLOGY_INSPECTIONS.with(|count| count.set(count.get() + 1));
     fn visit(node: &UOp, seen: &mut BTreeSet<usize>, out: &mut Vec<UOp>) {
         if !seen.insert(node.node_identity()) {
             return;
@@ -920,6 +949,23 @@ fn validate_reduction_topology(root: &UOp) -> Result<(), UOpError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ORDERED_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REDUCTION_TOPOLOGY_INSPECTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn ordered_validation_count() -> usize {
+    ORDERED_VALIDATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reduction_topology_inspection_count() -> usize {
+    REDUCTION_TOPOLOGY_INSPECTIONS.with(std::cell::Cell::get)
 }
 
 /// Returns whether raw scalar storage metadata can faithfully inhabit `ty`.
@@ -2037,9 +2083,15 @@ pub(crate) fn normalize_kernel_with_order(root: &UOp) -> Result<TopologicalOrder
 
 /// Schedule identity consumes canonical edges; node-only consumers drop them.
 pub(crate) fn normalize_kernel_with_table(root: &UOp) -> Result<CanonicalNodeTable, UOpError> {
-    root.validate()?;
+    let mut order = CanonicalNodeTable::new(root)?;
+    order.order().validate_for(root)?;
     let (root, _) = rewrite(root, &mut projected_index_rules(), Walk::BottomUp)?;
-    let order = CanonicalNodeTable::new(&root)?;
+    // Reuse only the exact immutable allocation, not structural equality or a
+    // successful validation. A changed root releases its old edge sidecar.
+    if order.order().for_root(&root).is_none() {
+        drop(order);
+        order = CanonicalNodeTable::new(&root)?;
+    }
     order.order().validate_for(&root)?;
     let nodes = order.order().nodes();
     if !matches!(root.operation(), Operation::Sink)
@@ -2068,10 +2120,10 @@ pub(crate) fn normalize_kernel_with_table(root: &UOp) -> Result<CanonicalNodeTab
         return Ok(order);
     }
     let (normalized, _) = rewrite(&root, &mut builtin_rules(), Walk::BottomUp)?;
-    // The original root still owns its DAG; only the preliminary canonical
-    // table is released before allocating the final edge sidecar.
-    drop(order);
-    let order = CanonicalNodeTable::new(&normalized)?;
+    if order.order().for_root(&normalized).is_none() {
+        drop(order);
+        order = CanonicalNodeTable::new(&normalized)?;
+    }
     order.order().validate_for(&normalized)?;
     Ok(order)
 }

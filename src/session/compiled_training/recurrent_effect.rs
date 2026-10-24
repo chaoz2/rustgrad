@@ -10,9 +10,21 @@ pub(super) struct RecurrentEffectReplacement {
     pub(super) destination: BufferState,
 }
 
+#[cfg(test)]
 pub(super) struct RecurrentEffectSeal {
     pub(super) schedule: crate::Schedule,
     pub(super) states: Vec<BufferState>,
+}
+
+pub(super) struct FinalizedRecurrentEffectSeal {
+    pub(super) schedule: crate::schedule::FinalizedSchedule,
+    pub(super) states: Vec<BufferState>,
+}
+
+struct RecurrentEffectParts {
+    effects: crate::Schedule,
+    bindings: Vec<crate::ScheduleValueBinding>,
+    states: Vec<BufferState>,
 }
 
 struct PureOutputIndex<'a> {
@@ -47,11 +59,39 @@ impl<'a> PureOutputIndex<'a> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn seal_recurrent_effects(
     pure: crate::Schedule,
     replacements: impl IntoIterator<Item = RecurrentEffectReplacement>,
 ) -> Result<RecurrentEffectSeal> {
-    let outputs = PureOutputIndex::new(&pure);
+    let parts = recurrent_effect_parts(&pure, replacements)?;
+    let schedule = crate::combine_mixed_schedules(pure, parts.effects, parts.bindings)
+        .map_err(schedule_error)?;
+    Ok(RecurrentEffectSeal {
+        schedule,
+        states: parts.states,
+    })
+}
+
+pub(super) fn seal_finalized_recurrent_effects(
+    pure: crate::schedule::FinalizedSchedule,
+    replacements: impl IntoIterator<Item = RecurrentEffectReplacement>,
+) -> Result<FinalizedRecurrentEffectSeal> {
+    let parts = recurrent_effect_parts(pure.schedule(), replacements)?;
+    let schedule = pure
+        .combine_effects(parts.effects, parts.bindings)
+        .map_err(schedule_error)?;
+    Ok(FinalizedRecurrentEffectSeal {
+        schedule,
+        states: parts.states,
+    })
+}
+
+fn recurrent_effect_parts(
+    pure: &crate::Schedule,
+    replacements: impl IntoIterator<Item = RecurrentEffectReplacement>,
+) -> Result<RecurrentEffectParts> {
+    let outputs = PureOutputIndex::new(pure);
     let mut builder = WholeBufferEffectPlanBuilder::default();
     let mut bindings = Vec::new();
     for (ordinal, replacement) in replacements.into_iter().enumerate() {
@@ -69,9 +109,11 @@ pub(super) fn seal_recurrent_effects(
     let plan = builder.finish().map_err(effect_error)?;
     let effects = schedule_whole_buffer_effects(&plan).map_err(schedule_error)?;
     let states = plan.states().to_vec();
-    let schedule =
-        crate::combine_mixed_schedules(pure, effects, bindings).map_err(schedule_error)?;
-    Ok(RecurrentEffectSeal { schedule, states })
+    Ok(RecurrentEffectParts {
+        effects,
+        bindings,
+        states,
+    })
 }
 
 #[cfg(test)]
@@ -200,6 +242,91 @@ mod tests {
             assert_eq!(actual_item.boundary, expected_item.boundary);
             assert_eq!(actual_item.cache_key, expected_item.cache_key);
         }
+    }
+
+    #[test]
+    fn finalized_reduction_effect_assembly_matches_the_independent_public_path() {
+        let mut graph = Graph::new();
+        let input = graph.input_dtype("x", [2, 3], DType::F32);
+        let reduction = graph
+            .reduce(input, crate::ReduceKind::Sum, Some(vec![1]), false)
+            .unwrap();
+        let squared = graph.square(reduction).unwrap();
+        let bias = graph.input_dtype("state", [2], DType::F32);
+        let output = graph.add(squared, bias).unwrap();
+        let ordinary = schedule_many(&graph, &[output]).unwrap();
+        let finalized = crate::schedule::schedule_many_finalized(&graph, &[output]).unwrap();
+        let mut captured =
+            CapturedSchedule::capture_finalized(&graph, &finalized, &[output]).unwrap();
+        let state_inputs =
+            BTreeMap::from([(bias, state(STATE_BUFFER_BASE, Shape::from([2]), DType::F32))]);
+        let bindings = collect_state_bindings(&ordinary, &state_inputs).unwrap();
+        assert!(!bindings.is_empty());
+        let finalized = finalized.bind_states(bindings.clone()).unwrap();
+        let ordinary_bound = bind_schedule_states(ordinary.clone(), bindings).unwrap();
+        let replacement = RecurrentEffectReplacement {
+            source: output,
+            destination: state(STATE_BUFFER_BASE, Shape::from([2]), DType::F32),
+        };
+        let reference = seal_recurrent_effects(ordinary_bound, [replacement.clone()]).unwrap();
+        let retained = seal_finalized_recurrent_effects(finalized, [replacement]).unwrap();
+        assert_schedule_fields_equal(retained.schedule.schedule(), &reference.schedule);
+        assert_eq!(retained.states, reference.states);
+        assert!(retained.schedule.schedule().items.iter().any(|item| {
+            item.kernel
+                .topological()
+                .unwrap()
+                .iter()
+                .any(|node| matches!(node.operation(), crate::Operation::ReduceFinalize))
+        }));
+        assert!(
+            retained
+                .schedule
+                .schedule()
+                .items
+                .iter()
+                .any(crate::ScheduleItem::is_effect)
+        );
+        captured.items = retained.schedule.schedule().items.clone();
+        let before = crate::schedule::kernel_validation_count();
+        let frontier = AuthenticatedRecurrentFrontier::from_finalized(
+            captured,
+            &retained.schedule,
+            retained.states,
+        )
+        .unwrap();
+        assert!(
+            crate::schedule::kernel_validation_count() - before
+                >= retained.schedule.schedule().items.len()
+        );
+        let mut reference_capture =
+            CapturedSchedule::capture(&graph, &ordinary, &[output]).unwrap();
+        reference_capture.items = reference.schedule.items.clone();
+        let reference_capture = CapturedMixedSchedule::from_parts(
+            reference_capture,
+            &reference.schedule,
+            reference.states,
+        )
+        .unwrap();
+        assert_eq!(
+            frontier.capture().schedule.requested,
+            vec![output.index() as u64]
+        );
+        assert_eq!(
+            frontier.capture().schedule.requested,
+            reference_capture.schedule.requested
+        );
+        assert_eq!(
+            frontier.capture().to_bytes().unwrap(),
+            reference_capture.to_bytes().unwrap()
+        );
+        let identity = frontier.capture_identity();
+        drop(retained.schedule);
+        assert_eq!(frontier.capture_identity(), identity);
+        let imported =
+            AuthenticatedRecurrentFrontier::from_bytes(&frontier.capture().to_bytes().unwrap())
+                .unwrap();
+        assert_eq!(imported.capture_identity(), identity);
     }
 
     #[test]

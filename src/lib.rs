@@ -1,6 +1,9 @@
 //! RustGrad is an inspectable tensor compiler inspired by tinygrad and built
 //! around Rust's explicit ownership and backend traits.
 
+#[cfg(test)]
+extern crate self as rustgrad;
+
 pub mod autograd;
 pub mod backend;
 pub mod benchmark;

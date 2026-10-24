@@ -18,6 +18,7 @@ impl AuthenticatedRecurrentFrontier {
     /// Takes fresh construction directly into immutable ownership. The ordinary
     /// constructor remains the sole structural validator; no caller can mutate
     /// its admitted result before the frontier retains it.
+    #[cfg(test)]
     pub(crate) fn from_parts(
         schedule: CapturedSchedule,
         mixed: &Schedule,
@@ -32,6 +33,21 @@ impl AuthenticatedRecurrentFrontier {
         )?;
         let capture_identity = identity_with_kernel_encodings(&capture, Some(&kernels))?;
         Self::from_admitted_capture(Arc::new(capture), capture_identity)
+    }
+
+    pub(crate) fn from_finalized(
+        schedule: CapturedSchedule,
+        finalized: &crate::schedule::FinalizedSchedule,
+        states: Vec<BufferState>,
+    ) -> Result<Self, ReplayError> {
+        let capture = CapturedMixedSchedule::from_parts_with_kernel_encodings(
+            schedule,
+            finalized.schedule(),
+            states,
+            Some(finalized.kernels()),
+        )?;
+        let identity = identity_with_kernel_encodings(&capture, Some(finalized.kernels()))?;
+        Self::from_admitted_capture(Arc::new(capture), identity)
     }
 
     /// Independent raw-capture reference for admission and ownership tests.
@@ -71,6 +87,12 @@ impl AuthenticatedRecurrentFrontier {
 
     pub(crate) const fn capture_identity(&self) -> u64 {
         self.capture_identity
+    }
+
+    /// Encodes the immutable admitted logical program once, retaining every
+    /// field/envelope bound without repeating admission or identity derivation.
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, ReplayError> {
+        super::encoding::encode_frontier(self)
     }
 
     pub(crate) fn capture(&self) -> &CapturedMixedSchedule {

@@ -57,8 +57,16 @@ impl ScheduleStateBinding {
 /// mixed schedule. The ABI descriptor remains the Graph input descriptor;
 /// `state` supplies the independent persistent identity and version.
 pub fn bind_states(
+    schedule: Schedule,
+    bindings: Vec<ScheduleStateBinding>,
+) -> Result<Schedule, ScheduleError> {
+    bind_states_with_encodings(schedule, bindings, None)
+}
+
+pub(super) fn bind_states_with_encodings(
     mut schedule: Schedule,
     bindings: Vec<ScheduleStateBinding>,
+    kernels: Option<&super::artifact::KernelEncodings>,
 ) -> Result<Schedule, ScheduleError> {
     if !schedule.state_bindings.is_empty() {
         return Err(ScheduleError::Binding(
@@ -67,7 +75,14 @@ pub fn bind_states(
     }
     schedule.state_bindings = bindings;
     schedule.validate()?;
-    super::rekey_schedule_items(&mut schedule.items, &schedule.state_bindings, None)?;
+    match kernels {
+        Some(kernels) => super::rekey_encoded_schedule_items(
+            &mut schedule.items,
+            &schedule.state_bindings,
+            kernels,
+        )?,
+        None => super::rekey_schedule_items(&mut schedule.items, &schedule.state_bindings, None)?,
+    }
     Ok(schedule)
 }
 
@@ -88,8 +103,17 @@ impl ScheduleValueBinding {
 /// matches. Effect identifiers in `bindings` are relative to `effects`.
 pub fn combine(
     pure: Schedule,
+    effects: Schedule,
+    bindings: Vec<ScheduleValueBinding>,
+) -> Result<Schedule, ScheduleError> {
+    combine_with_encodings(pure, effects, bindings, None)
+}
+
+pub(super) fn combine_with_encodings(
+    pure: Schedule,
     mut effects: Schedule,
     mut bindings: Vec<ScheduleValueBinding>,
+    kernels: Option<&super::artifact::KernelEncodings>,
 ) -> Result<Schedule, ScheduleError> {
     pure.validate()?;
     effects.validate()?;
@@ -190,7 +214,10 @@ pub fn combine(
     for item in &mut items {
         item.consumers.sort_unstable();
     }
-    super::rekey_schedule_items(&mut items, &state_bindings, None)?;
+    match kernels {
+        Some(kernels) => super::rekey_encoded_schedule_items(&mut items, &state_bindings, kernels)?,
+        None => super::rekey_schedule_items(&mut items, &state_bindings, None)?,
+    }
     let schedule = Schedule {
         items,
         requested_materializations,

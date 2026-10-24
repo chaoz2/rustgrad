@@ -82,6 +82,9 @@ src/
   schedule/              realization, fusion, indexing and memory planning
     artifact.rs          portable schedule descriptors and bindings
     execution_summary.rs immutable static schedule and logical-memory summary
+  rangeify/              pure checked movement-to-index planning
+    view.rs              released projection and affine-planning semantics
+    projection.rs        pass-local, allocation-faithful projection descriptors
   matmul/                normalized and tiled matmul compiler contracts
     mod.rs               generalized serial semantic plan
     tile.rs              target caps, candidates, cost and tiled simulator
@@ -212,6 +215,29 @@ it has an equivalent raw-storage path, while Metal's portable subset already
 rejects narrow storage. Symbolic programs, vector lanes, guarded fault
 transactions, unsupported dtypes, and unproved live-device configurations
 remain rejected before resource work.
+
+Concrete scheduling borrows one immutable Graph in a private
+`ProjectedForestCache`. Successful `(NodeId, full Shape)` projections retain
+only existing operation/type/tag records, ordered child slots, both root slots,
+and proven caller Range/bound aliases. The descriptor preserves actual DAG
+sharing rather than structural deduplication and retains no projector UOp owner.
+Source-classification hits read that descriptor without constructing UOps;
+concrete hits create a fresh allocation forest for the current canonical caller.
+Discovery, rehearsal, leaf planning, and final lowering share this pass owner,
+but materialization policy, kernel assembly, and Index validation stay fresh.
+
+Checked retention caps bound the pass to 1,024 forests and 65,536 logical
+node/edge/key units. Exhaustion, foreign Graphs, and noncanonical caller ranges
+use the released projector without changing admission or caching failures.
+Those units are not measured bytes. Depth, combined occurrence, typed-byte,
+binding, and backend admission still occur at their original boundaries.
+Independent projection-sharing/lane-map, schedule/capture-byte, and CPU oracles
+cover this seam. A private compile-only probe uses the maintained two-block
+causal Transformer and all five AdamW program roles to compare complete
+artifacts and report reuse counters; it prepares no target or replay. Hosted
+exact-head workload measurements, not source inspection or hit counts alone,
+must justify the optimization. No public operation, artifact schema, cache
+identity, runtime, or performance-scoreboard field is added.
 
 `reduction_native.rs` is the single checked reduction recurrence boundary for
 CPU, capture, and native renderers. It derives exact source/accumulator/output
@@ -756,6 +782,20 @@ canonical state inventory from the sealed value. This avoids allocating and
 copying placeholder host payloads during compilation. The general
 `EffectGraph` view/index/runtime path, mixed-schedule validation, capture bytes,
 and cache identities remain unchanged.
+
+The private `schedule::finalized::FinalizedSchedule` retains the final
+schedule together with opaque exact-root kernel encodings. Final assembly
+creates each encoding at the existing metadata-before-kernel item-key gate
+and installs it only after key and ABI validation succeed. Compiled recurrent
+construction consumes this owner through pure capture, state binding, effect
+assembly, frontier sealing, and recurrent-prefix authentication. Metadata and
+keys are recomputed at their original gates; retained-byte hits revalidate the
+actual DAG and tag policy. Fresh entries never become decoded admission
+receipts. New effect or replacement roots use the ordinary lazy encoder, and
+generic normalization is not repeated. The owner drops before the compiled
+phase is published; no encoded-byte store enters runtime plans, artifacts, or
+cache-key domains. Public scheduling/capture and imported validation retain
+their independent implementations.
 
 `schedule::mixed` adds a typed,
 immutable pure-output-to-STORE binding and transactional realization: pure
@@ -1741,6 +1781,40 @@ include the excluded warmup and are not presented as the 96 measured samples.
 
 ##### Manual same-runner training comparison
 
+An optional `pr-training-performance.yml` lane measures the fixed warm-resume
+workload before merge. It is an ordinary `pull_request` workflow on hosted Linux,
+enabled for non-draft PRs bearing `performance-evidence`, not a required check.
+Its source-binding adapter admits only the exact event base and authored head
+as the two ordered parents of the checked-out tested merge. A separate sidecar
+records repository/PR, workflow source, run/attempt and build/comparison digests;
+it does not change the comparison, checkpoint or runtime formats.
+
+Both adapters use one build/record/validate shell recipe and the existing
+numerical and exact-resume validators. The PR lane has no protected environment,
+repository/environment secrets, write token, persistent runner or shared cache.
+It neither authorizes a merge nor imposes a performance threshold. Failed builds,
+partial trials and incomparable schemas remain inspectable artifacts.
+Regular raw files are copied to a unique bounded upload directory; unsafe or
+oversized output yields only the run-bound failure envelope, never an
+unsanitized upload. A retrigger does not automatically cancel a running
+observation.
+Full action SHAs, read-only checkout credentials and exact revision bindings keep
+the lane separate from privileged deployment work; the manual candidate-SHA
+guard and required CI contexts remain unchanged.
+These are PR-authored observations, not independent trusted admission: the PR
+can change its own workflow, helper and validator. Review must inspect those
+sources and independently verify the raw evidence before any merge decision.
+
+Run attempts after the first are marked diagnostic. The first observation,
+including failed or incomparable attempts, for an exact base/head/tested-merge
+tuple is retained as the initial observation, not automatically selected: label cycling can start
+a new run, and stateless CI cannot guarantee global uniqueness. Reviews retain
+the original observation and disclose later
+runs rather than selecting a favorable result. The artifact name includes all
+three revisions plus run and attempt; two trials per revision remain too few
+to establish a general speedup. Optional evidence costs two isolated release
+builds and four serial executions, bounded by 75 hosted-runner minutes.
+
 The manual native-Transformer comparison workflow selects one fixed evidence
 workload: `steady-replay` (the unchanged cold scoreboard plus 96-sample warm
 sidecar) or `warm-resume` (the larger Transformer's fresh-executor restoration).
@@ -1932,6 +2006,24 @@ for momentum-SGD.
   released after admission. Independent byte/file import, historical migration,
   durable-save revalidation, and lazy topology sealing remain unchanged;
   momentum-SGD retains its independent import path.
+- **Recurrent phase encoding.** `engine/mixed_capture/encoding.rs` owns the
+  canonical RGSM payload and envelope writer. Public mutable-capture encoding
+  still validates/rekeys and derives identity at its original gates. Compiled
+  AdamW and momentum-SGD phase export instead calls the existing immutable
+  `AuthenticatedRecurrentFrontier`: it uses that owner's mixed identity and
+  writes the payload once, without recomputing admission or identity. Each
+  kernel still receives ordinary canonical encoding and actual-root checks.
+  The identity is not the embedded ordinary schedule identity, and no caller
+  can supply a freely pairable capture/hash tuple. Header-first field writing
+  preserves both the writer's 64 MiB bound and the distinct checksum-headroom
+  error. Fresh headerless payload admission and legacy migration do not prove
+  complete-envelope capacity. Public encoding, current/legacy import, and
+  replay remain independent; no additional kernel bytes or capture owners are
+  retained. A frozen released writer checks exact bytes and errors, typed
+  scalar/empty captures, raw constant lanes, mutable-capture rejection,
+  corrupted and historical envelopes, real near-limit payloads, encoding
+  work, and owner release. This changes no wire version, cache identity, or
+  public API and makes no speedup or peak-memory claim.
 - **Restore.** `restore_from_program_artifact` consumes a differently
   initialized compatible module and its complete-module checkpoint. It rebuilds
   the resource-free plan without invoking the workload builder, autograd,
@@ -2952,6 +3044,15 @@ acceptance is separate from recursive validation, rewrite, and Arc destruction
 boundaries. Focused acceptance also preserves control closure and independent
 reduction ownership, and verifies release after the returned order is dropped.
 
+Validation detects reduction-chain operations during its existing ordered-node
+checks. Because canonical keys include the exact `Operation`, deduplication
+cannot erase the presence of a reduction. Reduction-free roots therefore do
+not allocate a reduction-only actual-Arc inventory or consumer map. Every
+reduction-bearing root still receives the unchanged allocation-sensitive
+ownership walk. Operation, projected-consumer, and control checks retain their
+original order; the canonical order gains no admission authority. An independent
+released validator and call-scoped counters cover both paths and error precedence.
+
 `UOpNode` stores one typed `Operation`, its result type, its sources, and an
 optional immutable `UOpTag`. Tags are a small canonical value algebra covering
 the checked-in compiler uses: text, signed integers, concrete `DType` values,
@@ -2997,6 +3098,17 @@ an unrelated root triggers a fresh traversal, and final schedule validation and
 public capture keep their independent validation gates. No retained order is
 serialized or added to the public schedule state.
 
+Ordinary scalar-fallback load discovery consumes normalization's final order
+directly instead of discarding it and traversing the same immutable root again.
+Original-root, projected-rewrite, final-root, and normalization-policy checks
+are unchanged. The order lives only through this load scan; the fixed-frontier
+rehearsal cache still owns only numeric load identities, never kernels or
+orders. Generic normalization is performed once. A released two-traversal
+oracle verifies exact inventories and errors for scalar, empty, nonempty,
+reduction, external-materialization, and malformed/control cases; call-scoped
+counters prove one fewer traversal on each successful miss. Final scheduling,
+capture validation, cache identities, and artifact bytes remain independent.
+
 The same finalized order also feeds durable schedule-identity encoding. The
 codec still validates the actual kernel, including allocation-based reduction
 ownership, before tag rejection and wire emission; a foreign root uses the
@@ -3012,9 +3124,17 @@ existing source gate without rebuilding a structurally keyed UOp map. Field,
 version, tag, source-limit, source-order, and actual-allocation reduction checks
 remain independent and keep their existing precedence. Schedule normalization
 retains the table through key emission; node-only consumers receive the lean
-order after temporarily constructing edge metadata. Normalization releases its
-preliminary table after rewriting and before constructing the final table;
-these sidecars do not overlap. Their transient allocation cost remains a
+order after temporarily constructing edge metadata. Normalization constructs
+the original table before its first semantic gate and reuses it only when a
+rewrite preserves the exact root allocation. Original, projected-result, and
+final-result semantic validation still execute at their established gates;
+root identity shares ordering, never admission. A changed root releases the
+prior table before constructing its replacement, so edge sidecars do not
+overlap. Original edge metadata now remains alive during projected rewriting,
+including attempts that change the root.
+Released-sequence fixtures check exact traversal savings, unchanged validation
+counts, rewritten adjacency, canonical bytes, errors, and owner release.
+Their transient allocation and lifetime cost remains a
 tradeoff, and no general or measured peak-memory reduction is claimed.
 Successful fresh encoding drops edge metadata before authentication,
 while decoded kernels retain it only through their local re-encoding boundary.

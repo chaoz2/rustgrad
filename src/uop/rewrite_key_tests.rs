@@ -439,6 +439,79 @@ fn rewrite_preserves_error_contracts_and_callback_counts() {
     }
 }
 
+type ReplacementOwners = Vec<std::sync::Weak<UOpNode>>;
+
+fn probed(owners: &mut ReplacementOwners, node: UOp) -> UOp {
+    owners.push(Arc::downgrade(&node.0));
+    node
+}
+
+fn probed_bind(owners: &mut ReplacementOwners, _: &Captures, _: &UOp) -> Option<UOp> {
+    Some(probed(owners, special("bound")))
+}
+
+fn probed_increment(owners: &mut ReplacementOwners, _: &Captures, node: &UOp) -> Option<UOp> {
+    Some(probed(owners, literal(integer_value(node) + 1)))
+}
+
+fn probed_toggle(owners: &mut ReplacementOwners, _: &Captures, node: &UOp) -> Option<UOp> {
+    Some(probed(owners, literal(1 - integer_value(node))))
+}
+
+fn probed_effect(owners: &mut ReplacementOwners, _: &Captures, _: &UOp) -> Option<UOp> {
+    Some(probed(
+        owners,
+        UOp::from_operation(Operation::Barrier, None, vec![]),
+    ))
+}
+
+#[test]
+fn rewrite_errors_release_completed_siblings_and_dynamic_replacements() {
+    for walk in [Walk::BottomUp, Walk::TopDown] {
+        for (name, callback, expected, replacements) in [
+            (
+                "step limit",
+                probed_increment as ContextRewriteFn<ReplacementOwners>,
+                UOpError::RewriteStepLimit,
+                129,
+            ),
+            ("cycle", probed_toggle, UOpError::RewriteCycle, 3),
+            ("effect", probed_effect, UOpError::EffectRewrite, 2),
+        ] {
+            for legacy in [false, true] {
+                // The first child completes and enters the structural memo;
+                // the second child fails after creating dynamic replacements.
+                let root = UOp::sink(vec![special("unbound"), literal(0)]);
+                let mut rules = [
+                    ContextRewriteRule {
+                        name: "bind",
+                        priority: 0,
+                        pattern: UPat::op(Operation::Special("unbound".into())),
+                        apply: probed_bind,
+                    },
+                    ContextRewriteRule {
+                        name,
+                        priority: 1,
+                        pattern: UPat::operation_predicate(integer),
+                        apply: callback,
+                    },
+                ];
+                let mut owners = vec![];
+                let error = with_legacy(legacy, || {
+                    rewrite_with_context(&root, &mut rules, walk, &mut owners)
+                })
+                .unwrap_err();
+                assert_eq!(error, expected, "{name}/{walk:?}/{legacy}");
+                assert_eq!(owners.len(), replacements, "{name}/{walk:?}/{legacy}");
+                assert!(
+                    owners.iter().all(|owner| owner.upgrade().is_none()),
+                    "{name}/{walk:?}/{legacy}: replacement owner survived unwind"
+                );
+            }
+        }
+    }
+}
+
 fn collapse(context: &mut Context, _: &Captures, _: &UOp) -> Option<UOp> {
     context.calls.push("collapse".into());
     Some(literal(99))

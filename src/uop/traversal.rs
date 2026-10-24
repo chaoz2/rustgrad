@@ -101,6 +101,8 @@ fn with_sources(
     root: &UOp,
     mut publish_sources: impl FnMut(&[usize]),
 ) -> Result<Vec<UOp>, UOpError> {
+    #[cfg(test)]
+    CANONICAL_TRAVERSALS.with(|count| count.set(count.get() + 1));
     let mut pending = vec![Frame::Enter(root.clone())];
     let mut active = BTreeSet::new();
     let mut allocations = HashMap::new();
@@ -154,6 +156,16 @@ fn with_sources(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CANONICAL_TRAVERSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn canonical_traversal_count() -> usize {
+    CANONICAL_TRAVERSALS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

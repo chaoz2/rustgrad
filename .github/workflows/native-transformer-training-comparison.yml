@@ -94,110 +94,19 @@ jobs:
           toolchain: 1.89.0
       - name: Validate comparison tooling fixtures
         shell: bash
-        run: python3 candidate-source/.github/scripts/test-native-transformer-training-comparison.py
+        run: |
+          python3 candidate-source/.github/scripts/test-native-transformer-training-comparison.py
+          python3 candidate-source/.github/scripts/test-pr-training-performance.py
       - name: Build both release executables before measurement
         shell: bash
-        run: |
-          set -euo pipefail
-          build_root="$RUNNER_TEMP/native-transformer-comparison-build"
-          mkdir -- "$build_root"
-          if [[ "$MEASUREMENT_MODE" == steady-replay ]]; then
-            example=compiled_transformer_train_resume
-          else
-            example=compiled_transformer_scale_evidence
-          fi
-          cargo build --locked --release \
-            --manifest-path baseline-source/Cargo.toml \
-            --target-dir "$build_root/baseline" \
-            --example "$example"
-          cargo build --locked --release \
-            --manifest-path candidate-source/Cargo.toml \
-            --target-dir "$build_root/candidate" \
-            --example "$example"
-          baseline_binary="$build_root/baseline/release/examples/$example"
-          candidate_binary="$build_root/candidate/release/examples/$example"
-          evidence_root="$GITHUB_WORKSPACE/native-transformer-training-comparison"
-          mkdir -- "$evidence_root"
-          python3 candidate-source/.github/scripts/write-native-transformer-training-build-manifest.py \
-            --baseline-sha "$BASELINE_SHA" \
-            --candidate-sha "$CANDIDATE_SHA" \
-            --baseline-binary "$baseline_binary" \
-            --candidate-binary "$candidate_binary" \
-            --measurement-mode "$MEASUREMENT_MODE" \
-            --output "$evidence_root/build-manifest.json"
+        run: bash candidate-source/.github/scripts/run-native-transformer-training-comparison.sh build
       - name: Record fixed ABBA trials with isolated native caches
         shell: bash
-        run: |
-          set -uo pipefail
-          build_root="$RUNNER_TEMP/native-transformer-comparison-build"
-          evidence_root="$GITHUB_WORKSPACE/native-transformer-training-comparison"
-          measurement_failed=0
-
-          record_trial() {
-            local ordinal="$1"
-            local role="$2"
-            local source_sha source_dir binary output example recorder
-            if [[ "$MEASUREMENT_MODE" == steady-replay ]]; then
-              example=compiled_transformer_train_resume
-              recorder="$GITHUB_WORKSPACE/candidate-source/.github/scripts/record-native-transformer-release-scoreboard.sh"
-            else
-              example=compiled_transformer_scale_evidence
-              recorder="$GITHUB_WORKSPACE/candidate-source/.github/scripts/record-larger-native-transformer-evidence.sh"
-            fi
-            if [[ "$role" == baseline ]]; then
-              source_sha="$BASELINE_SHA"
-              source_dir="$GITHUB_WORKSPACE/baseline-source"
-              binary="$build_root/baseline/release/examples/$example"
-            else
-              source_sha="$CANDIDATE_SHA"
-              source_dir="$GITHUB_WORKSPACE/candidate-source"
-              binary="$build_root/candidate/release/examples/$example"
-            fi
-            output="$evidence_root/trial-${ordinal}-${role}"
-            (
-              cd "$source_dir"
-              if [[ "$MEASUREMENT_MODE" == steady-replay ]]; then
-                RUSTGRAD_NATIVE_SCOREBOARD_MEASURED_SHA="$source_sha" \
-                RUSTGRAD_NATIVE_SCOREBOARD_OUTPUT_DIR="$output" \
-                RUSTGRAD_NATIVE_SCOREBOARD_BINARY="$binary" \
-                bash "$recorder"
-              else
-                RUSTGRAD_SCALE_EVIDENCE_MEASURED_SHA="$source_sha" \
-                RUSTGRAD_SCALE_EVIDENCE_OUTPUT_DIR="$output" \
-                RUSTGRAD_SCALE_EVIDENCE_BINARY="$binary" \
-                RUSTGRAD_SCALE_EVIDENCE_WORKFLOW_TIMEOUT_MINUTES=75 \
-                bash "$recorder"
-              fi
-            ) || measurement_failed=1
-          }
-
-          record_trial 01 baseline
-          record_trial 02 candidate
-          record_trial 03 candidate
-          record_trial 04 baseline
-          printf '%s\n' "$measurement_failed" > "$evidence_root/measurement-failed.txt"
-          exit "$measurement_failed"
+        run: bash candidate-source/.github/scripts/run-native-transformer-training-comparison.sh record
       - name: Validate and compare immutable evidence
         if: always()
         shell: bash
-        run: |
-          set -uo pipefail
-          build_root="$RUNNER_TEMP/native-transformer-comparison-build"
-          evidence_root="$GITHUB_WORKSPACE/native-transformer-training-comparison"
-          if [[ "$MEASUREMENT_MODE" == steady-replay ]]; then
-            example=compiled_transformer_train_resume
-          else
-            example=compiled_transformer_scale_evidence
-          fi
-          python3 candidate-source/.github/scripts/check-native-transformer-training-comparison.py \
-            --root "$evidence_root" \
-            --baseline-sha "$BASELINE_SHA" \
-            --candidate-sha "$CANDIDATE_SHA" \
-            --baseline-binary "$build_root/baseline/release/examples/$example" \
-            --candidate-binary "$build_root/candidate/release/examples/$example" \
-            --measurement-mode "$MEASUREMENT_MODE" \
-            --build-manifest "$evidence_root/build-manifest.json" \
-            --output "$evidence_root/comparison.json"
+        run: bash candidate-source/.github/scripts/run-native-transformer-training-comparison.sh validate
       - name: Upload raw trials and comparison manifest
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

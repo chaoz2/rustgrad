@@ -836,6 +836,16 @@ impl EncodedScheduleKernel {
     pub(crate) fn into_order(self) -> TopologicalOrder {
         self.order
     }
+
+    pub(crate) fn order(&self) -> &TopologicalOrder {
+        &self.order
+    }
+
+    pub(crate) fn validate_actual_root(&self, root: &UOp) -> Result<(), ArtifactError> {
+        validate_encoding_order(root, &self.order)?;
+        schedule_encoding_policy(self.order.nodes())?;
+        Ok(())
+    }
 }
 
 pub(crate) fn encode_schedule_kernel(root: &UOp) -> Result<EncodedScheduleKernel, ArtifactError> {
@@ -845,6 +855,21 @@ pub(crate) fn encode_schedule_kernel(root: &UOp) -> Result<EncodedScheduleKernel
     Ok(EncodedScheduleKernel {
         bytes,
         order: dag.table.into_order(),
+    })
+}
+
+pub(crate) fn encode_schedule_kernel_with_owned_table(
+    root: &UOp,
+    table: CanonicalNodeTable,
+) -> Result<EncodedScheduleKernel, ArtifactError> {
+    if table.order().for_root(root).is_none() {
+        return encode_schedule_kernel(root);
+    }
+    validate_encoding_order(root, table.order())?;
+    let bytes = encode_schedule_nodes(&table)?;
+    Ok(EncodedScheduleKernel {
+        bytes,
+        order: table.into_order(),
     })
 }
 
@@ -861,8 +886,28 @@ pub(crate) fn encode_schedule_identity_with_table(
 }
 
 fn encode_schedule_nodes(table: &CanonicalNodeTable) -> Result<Vec<u8>, ArtifactError> {
+    #[cfg(test)]
+    SCHEDULE_KERNEL_ENCODINGS.with(|count| count.set(count.get() + 1));
     let (effects, version) = schedule_encoding_policy(table.order().nodes())?;
     encode_nodes(table, effects, version)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCHEDULE_KERNEL_ENCODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn schedule_kernel_encoding_count() -> usize {
+    SCHEDULE_KERNEL_ENCODINGS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+impl UOp {
+    pub(crate) fn allocation_liveness_probe(&self) -> Box<dyn Fn() -> bool> {
+        let weak = std::sync::Arc::downgrade(&self.0);
+        Box::new(move || weak.upgrade().is_some())
+    }
 }
 
 fn schedule_encoding_policy(nodes: &[UOp]) -> Result<(bool, u8), ArtifactError> {
@@ -3675,6 +3720,43 @@ mod tests {
             }
         }
         finish(writer)
+    }
+
+    #[test]
+    fn owned_schedule_table_rechecks_actual_roots_and_releases_the_writer_owner() {
+        let ty = UType::scalar(DType::I32);
+        let root = UOp::binary(Binary::Add, UOp::constant(7, ty), UOp::constant(9, ty));
+        let weak = std::sync::Arc::downgrade(&root.0);
+        let table = CanonicalNodeTable::new(&root).unwrap();
+        let before = ENCODING_ORDER_BUILDS.get();
+        let encoded = encode_schedule_kernel_with_owned_table(&root, table).unwrap();
+        assert_eq!(
+            ENCODING_ORDER_BUILDS.get(),
+            before,
+            "do not rebuild the finalized table"
+        );
+        assert_eq!(encoded.bytes(), encode_inner(&root, false, 18).unwrap());
+        let validations = ENCODING_VALIDATIONS.get();
+        encoded.validate_actual_root(&root).unwrap();
+        assert_eq!(ENCODING_VALIDATIONS.get(), validations + 1);
+        let equal = UOp::binary(Binary::Add, UOp::constant(7, ty), UOp::constant(9, ty));
+        assert!(encoded.order().for_root(&equal).is_none());
+        drop(root);
+        assert!(weak.upgrade().is_some());
+        drop(encoded);
+        assert!(weak.upgrade().is_none());
+        let malformed = UOp::from_operation(Operation::Cast, Some(ty), vec![]);
+        for root in [
+            equal.retag(Some(UOpTag::Text("transient".into()))),
+            malformed.retag(Some(UOpTag::Text("invalid".into()))),
+        ] {
+            let expected = encode_schedule_kernel(&root).err().unwrap();
+            let table = CanonicalNodeTable::new(&root).unwrap();
+            assert_eq!(
+                encode_schedule_kernel_with_owned_table(&root, table).err(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
