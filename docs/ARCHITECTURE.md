@@ -3924,8 +3924,14 @@ division/modulo or shift error together with its first linear index. Buffer orde
 alignment, ABI version, and symbol count are checked by Rust before the call.
 `JitKernel` owns the dynamic library (and therefore outlives its function
 pointer); calls borrow all buffers for their whole duration. The sole unsafe
-boundary is `dlopen`/`dlsym` plus that C ABI call. No writable executable memory
-is allocated by Rust.
+boundary is OS library loading plus that C ABI call. The private
+`cpu_jit::library` module owns mappings and symbol resolution: Unix uses
+`dlopen`/`dlsym`, while Windows uses UTF-16 `LoadLibraryW`/`GetProcAddress` and
+`FreeLibrary`. Rust allocates no writable executable memory. Single-kernel and
+schedule-module artifacts use the platform shared-library extension. The C11
+compiler command is `cc` on Unix and MinGW `gcc` on Windows; that command and
+the target OS remain part of the existing cache identity. This Windows path
+does not add an MSVC C compiler contract.
 
 Quantized linear C kernels receive dense activation/output buffers and one
 separate read-only packed byte resource. Format-specific code decodes one GGML

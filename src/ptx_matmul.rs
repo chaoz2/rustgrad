@@ -52,7 +52,7 @@ pub(super) fn render_serial(
     };
     let item = plan.dtype.itemsize();
     let entry = format!("rg_matmul_{}_{}", plan.cache_key, renderer.sm);
-    let mut lines=vec![format!("// {PTX_RENDERER_VERSION} matmul ABI {PTX_ABI_VERSION}"),".version 7.0".into(),format!(".target sm_{}",renderer.sm),".address_size 64".into(),format!(".visible .entry {entry}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 extent){{"),".reg .pred %p<4>;".into(),".reg .b32 %r<32>;".into(),".reg .b64 %rd<32>;".into(),".reg .f32 %f<8>;".into(),".reg .f64 %fd<8>;".into(),"ld.param.u64 %rd10,[p0]; ld.param.u64 %rd11,[p1]; ld.param.u64 %rd12,[p2]; ld.param.u64 %rd0,[extent];".into(),"mov.u32 %r0,%ctaid.x; mov.u32 %r1,%ntid.x; mov.u32 %r2,%tid.x; mad.lo.u32 %r3,%r0,%r1,%r2; cvt.u64.u32 %rd1,%r3; setp.ge.u64 %p0,%rd1,%rd0; @%p0 bra DONE;".into()];
+    let mut lines=vec![format!("// {PTX_RENDERER_VERSION} matmul ABI {PTX_ABI_VERSION}"),renderer.isa_version_directive().into(),format!(".target sm_{}",renderer.sm),".address_size 64".into(),format!(".visible .entry {entry}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 extent){{"),".reg .pred %p<4>;".into(),".reg .b32 %r<32>;".into(),".reg .b64 %rd<32>;".into(),".reg .f32 %f<8>;".into(),".reg .f64 %fd<8>;".into(),"ld.param.u64 %rd10,[p0]; ld.param.u64 %rd11,[p1]; ld.param.u64 %rd12,[p2]; ld.param.u64 %rd0,[extent];".into(),"mov.u32 %r0,%ctaid.x; mov.u32 %r1,%ntid.x; mov.u32 %r2,%tid.x; mad.lo.u32 %r3,%r0,%r1,%r2; cvt.u64.u32 %rd1,%r3; setp.ge.u64 %p0,%rd1,%rd0; @%p0 bra DONE;".into()];
     // Decompose the linear output into N, M and broadcast batch. Static dimensions
     // make this deterministic and avoid any host-side coordinate reconstruction.
     lines.push("mov.u64 %rd2,%rd1; mov.u64 %rd3,0; mov.u64 %rd4,0;".into());
@@ -118,7 +118,7 @@ pub(super) fn render_serial(
             + "; @%p1 bra STORE;",
     );
     // lhs: batch*M*K + row*K + k; rhs: batch*K*N + k*N + col.
-    lines.push(format!("mad.lo.u64 %rd21,%rd7,{},%rd3; mad.lo.u64 %rd21,%rd21,{},%r4; mad.lo.u64 %rd22,%rd8,{},%r4; mad.lo.u64 %rd22,%rd22,{},%rd4;",plan.m,plan.k,plan.k,plan.n));
+    lines.push(format!("cvt.u64.u32 %rd23,%r4; mad.lo.u64 %rd21,%rd7,{},%rd3; mad.lo.u64 %rd21,%rd21,{},%rd23; mad.lo.u64 %rd22,%rd8,{},%rd23; mad.lo.u64 %rd22,%rd22,{},%rd4;",plan.m,plan.k,plan.k,plan.n));
     lines.push(if ty == "f32" {
         format!("mul.lo.u64 %rd21,%rd21,{item}; add.u64 %rd21,%rd10,%rd21; mul.lo.u64 %rd22,%rd22,{item}; add.u64 %rd22,%rd11,%rd22; ld.global.f32 %f1,[%rd21]; ld.global.f32 %f2,[%rd22]; cvt.f64.f32 %fd1,%f1; cvt.f64.f32 %fd2,%f2; mul.rn.f64 %fd3,%fd1,%fd2; add.rn.f64 %fd0,%fd0,%fd3; add.u32 %r4,%r4,1; bra LOOP;")
     } else {
@@ -195,17 +195,18 @@ pub(super) fn render_tiled(
     let entry = format!("rg_tiled_matmul_{}_{}", tile.cache_key, renderer.sm);
     let mut lines = vec![
         format!("// {PTX_RENDERER_VERSION} tiled-matmul ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
+        ".extern .shared .align 16 .b8 smem[];".into(),
         format!(
-            ".visible .entry {entry}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 extent){{"
+            ".visible .entry {entry}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 extent)"
         ),
         format!(
-            ".reqntid {},{},1;",
+            ".reqntid {},{},1",
             tile.workgroup[0], tile.workgroup[1]
         ),
-        ".extern .shared .align 16 .b8 smem[];".into(),
+        "{".into(),
         ".reg .pred %p<16>;".into(),
         ".reg .b32 %r<96>;".into(),
         ".reg .b64 %rd<96>;".into(),
@@ -227,7 +228,9 @@ pub(super) fn render_tiled(
     lines.push("mov.u64 %rd4,%rd3;".into());
     lines.push(batch_projection(plan, &plan.rhs_shape, "%rd4", "%rd6"));
     lines.extend([
-        "cvta.to.shared.u64 %rd30,smem;".into(),
+        // A shared symbol's address already belongs to shared space; applying
+        // cvta.to.shared would reinterpret that offset as a generic pointer.
+        "mov.u64 %rd30,smem;".into(),
         "mov.f64 %fd0,0d0000000000000000;".into(),
         "mov.u32 %r20,0;".into(),
         "K_TILE:".into(),
@@ -406,14 +409,15 @@ pub(super) fn render_tensor_core(
     );
     let mut lines = vec![
         format!("// {PTX_RENDERER_VERSION} tensor-core-matmul ABI {PTX_ABI_VERSION}"),
-        ".version 7.0".into(),
+        renderer.isa_version_directive().into(),
         format!(".target sm_{}", renderer.sm),
         ".address_size 64".into(),
-        format!(
-            ".visible .entry {entry}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 extent){{"
-        ),
-        ".reqntid 32,1,1;".into(),
         ".extern .shared .align 16 .b8 smem[];".into(),
+        format!(
+            ".visible .entry {entry}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 extent)"
+        ),
+        ".reqntid 32,1,1".into(),
+        "{".into(),
         ".reg .pred %p<8>;".into(),
         ".reg .b16 %h<16>;".into(),
         ".reg .b32 %r<128>;".into(),
@@ -427,7 +431,7 @@ pub(super) fn render_tensor_core(
     lines.push("mov.u64 %rd4,%rd3;".into());
     lines.push(batch_projection(plan, &plan.rhs_shape, "%rd4", "%rd6"));
     lines.extend([
-        "cvta.to.shared.u64 %rd30,smem;".into(),
+        "mov.u64 %rd30,smem;".into(),
         "mov.f32 %f0,0f00000000; mov.f32 %f1,0f00000000; mov.f32 %f2,0f00000000; mov.f32 %f3,0f00000000;".into(),
         "mov.u32 %r20,0;".into(),
         "K_TILE:".into(),
